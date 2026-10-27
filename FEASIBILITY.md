@@ -1,7 +1,7 @@
 # Feasibility: WebKit + WebXR on a jailbroken PS5 with PS VR2
 
-_Status: **console phase under way: the key gate (Spike 3) passed on
-2026-10-27; title ↔ payload IPC (Spike 8) passed the same day.**_
+_Status: **study complete (2026-10-27). Verdict: go (§1); estimate ~7–11
+months to an end-to-end WebXR demo (§7).**_
 
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
@@ -11,41 +11,48 @@ claims as unverified until a spike confirms them.
 
 ## 1. Verdict so far
 
-**Go, with a revised architecture.** The key gate (GL → PS VR2, Spike 3)
-passed zero-copy at 60 fps; JavaScriptCore runs (Spike 4); multi-process
-works between payloads (Spike 1) and between the title and payloads it
-launches (Spike 8); GLES 3.2 works (Spike 2). The measured payload/title
-split (§4.4b) points to a GPU-process design (§4.4c). Earlier
-host-side findings:
+**Go.** Every platform question the plan set out to answer has a console
+result:
 
-- **There's now a second GPU route.** pacbrew's Mesa port (RADV Vulkan +
-  zink + a Mesa EGL "videoout" platform, GLES built in) claims to work in
-  elfldr payloads. That would fix ps5-opengl's three gaps for WebKit: no
-  GLES, no EGLImage, and title-only. It's unvalidated on hardware (§4.2).
-- **The PS VR2 hand-off is a texture descriptor, not a graphics API.**
-  Hmd2 takes a GFX10 T# over GPU memory. ps5-opengl's driver already builds
-  T#s internally, so a zero-copy GL → headset path is a small driver patch,
-  not an AGC rewrite (§4.3).
-- **Sony's JIT API is reachable.** `sceKernelJitCreateSharedMemory` and
-  friends (what the system browser uses) are exported to payloads. JIT may
-  be possible later, not just the LLInt interpreter (§4.4).
+- **GL → PS VR2 works zero-copy** (Spike 3b): GL 4.6 renders into textures
+  that Hmd2 samples directly, 60 fps reprojected to 120 Hz, head-tracked.
+- **Multi-process works** between payloads (Spike 1) and between a title and
+  the payloads it launches (Spike 8). The rendezvous is reversed (the title
+  listens), then fd passing and shared memory work as WebKit expects.
+- **GLES 3.2 works** in a title on patched ps5-opengl (Spike 2). Draw cost is
+  down from 72 to 8 µs per draw (Spike 2b), which is enough for modest
+  three.js scenes.
+- **JavaScriptCore runs** (Spike 4), about 3× slower than an M4 Max with
+  the interpreter. Payloads can map JIT memory, so the WebProcess can get a
+  JIT later.
 
-The decisive unknowns are all console runs: **Spike 3** (does GL-rendered
-memory reach the headset), **Spike 1** (multi-process from a title, and
-cross-process direct memory), and **Spike 2** (which GPU stack works in
-which process).
+The architecture that fits these results (§4.4c, §4.8):
+
+- **One title process: UIProcess + GPU process + OpenXR runtime.** It owns
+  the headset, GL, WebGL and compositing, so WebXR frames never leave the
+  process.
+- **Payloads: WebProcess(es) and NetworkProcess**, launched through elfldr.
+  They have 8 GB of memory and the JIT. Pages are painted on the CPU and sent
+  as shared bitmaps (WebKit's WC mode), so payloads need no GL.
+
+What remains is port work, not unknowns. The largest new items are running
+WebKit's GPU process inside the UIProcess (a patch WebKit doesn't have) and
+a direct-memory heap for the title (§4.8). The estimate is in §7.
 
 ## 2. Engine choice: WebKit, not Chromium
 
-Decided: WebKit (WPE port). Chromium is reconsidered only if Spike 1 shows
-no multi-process model at all.
+Decided: WebKit (WPE port). Chromium was to be reconsidered only if there
+was no multi-process model at all. Spikes 1 and 8 found one, so WebKit stays.
+Chromium's one advantage is that it can run its GPU work inside the browser
+process out of the box, while WebKit needs a patch (§4.8).
 
 | | WebKit (WPE) | Chromium |
 | --- | --- | --- |
 | Port cost | CMake (`prospero-cmake` exists), FreeBSD support and `OS(PLAYSTATION)` paths upstream. Sony ships WebKit on PS4/PS5 | GN + its own toolchain, new `target_os`. The FreeBSD port alone carries 1000+ patches |
 | WebXR backend | OpenXR on EGL/GLES, Unix-like, so close to our case | OpenXR on Windows (D3D11) and Android only, as far as known |
 | WebGL | ANGLE | ANGLE (same) |
-| No multi-process | no supported single-process mode, so a large patch | `--single-process` / `--in-process-gpu` exist |
+| No multi-process | no supported single-process mode, so a large patch (not needed: Spike 8) | `--single-process` / `--in-process-gpu` exist |
+| GPU work in the browser process | patch: GPU process started inside the UIProcess (§4.8) | `--in-process-gpu` |
 | JS without JIT | JSC LLInt/CLoop (Spike 4) | V8 `--jitless` (mature) |
 
 ## 3. Spike results
@@ -58,14 +65,14 @@ no multi-process model at all.
 | 3 GL → PS VR2 | **verified:** `psvr2` backend, `hmd2_probe.elf` (3a), `gl_hmd2` title (3b) | **3a (payload): FAIL by design.** Libraries load, 13.60 offset tables match, Hmd2 initialises and reports FOV, but `sceHmd2Open` refuses every user id from a non-application process (0x8a720009). **3b (title): PASS.** Zero-copy: GL 4.6 renders into ps5-opengl textures (SW_64KB_R_X) exported as T#s; 3600 frames at 60.0 fps (120 Hz out), render 1.13 ms + hand-off 0.06 ms, 0 submit errors, 3600/3600 tracked, tracker eye positions valid. Visual check: world-locked, correct stereo depth, no judder noticed; floor grid right in front looked slightly off (likely aliasing of 1-px lines and an assumed floor height, not the pipeline) | **go** |
 | 4 JSC | **verified:** `jsc` links (JSCOnly, JIT off, asm LLInt, bmalloc/libpas, ICU 76 static; 36 MB slim). 6 patches + `memmem` shim; needs libc++ 19 | **PASS** (payload): correctness **30/30** (regex, typed arrays, BigInt, generators, stack-overflow RangeError, ICU Intl, GC churn); bench **3.41 s** vs 1.04–1.10 s on M4 Max (same build): richards 596, deltablue 592, numeric 890, strings 424, alloc 906 ms. Fixes needed on device: `-DLD_PACK_RELATIVE_RELOCS=OFF` (SDK loader ignores DT_RELR), libpas commit/decommit on 16 KiB pages (patch 0006). Open: `Date` reads 1970 (wall clock source) | **go** |
 | 8 title ↔ payload IPC | **verified:** builds as title PPSA99009 with the server payload embedded | **PASS** ([README](spikes/08-title-ipc/README.md)): **the title spawns the payload through the local elfldr** (listening after 1.6–5.2 s); title → payload unix `connect` **EPERM**; **reversed works: the title listens in a 0777 directory the payload made (`/system_tmp/ps5wk`), the payload connects, shm fds pass both ways with SCM_RIGHTS**; named shm both ways; loopback TCP. RTT 131 µs (unix) / 186–249 µs (tcp); in-process baseline 18 µs in the title vs 73 µs in a payload; 112 MB/s (unix), 350 MB/s (tcp). `sceShellCoreUtilExitApp` returns 0 and the title closes **with no debug error** (user-checked) | **go** |
-| 5 OpenXR runtime | **verified:** `libopenxr_psvr2` covers all ~50 calls WebKit makes (+ the rest of 1.0 core); host smoke test replaying WebKit's sequence **18/18 PASS** via dlopen, static link and the official Khronos loader (1.1.65); PS5 backend cross-compiles (`libopenxr_psvr2.a`) | pending (needs Spike 3b first) | — |
-| 6 MiniBrowser | design ([README](spikes/06-wpe-minibrowser/README.md)) | — | — |
-| 7 WebXR e2e | design ([README](spikes/07-webxr-e2e/README.md)) | — | — |
+| 5 OpenXR runtime | **verified:** `libopenxr_psvr2` covers all ~50 calls WebKit makes (+ the rest of 1.0 core); host smoke test replaying WebKit's sequence **18/18 PASS** via dlopen, static link and the official Khronos loader (1.1.65); PS5 backend cross-compiles (`libopenxr_psvr2.a`) | not run; the study closed without it. Its PS5 backend is Spike 3b's code path, which passed. The first port task | — (not a gate) |
+| 6 MiniBrowser | design ([README](spikes/06-wpe-minibrowser/README.md)); superseded in part by §4.8 (WC mode, CPU-painted WebProcess, no GL in payloads) | — | port work |
+| 7 WebXR e2e | design ([README](spikes/07-webxr-e2e/README.md)); §4.8 picks the single-title option (OpenXR and WebGL in one process) | — | port work |
 
 Console logs for every run above are in
 [`evidence/2026-10-27/`](evidence/2026-10-27/): `00-sysinfo`, `01-*` (incl.
-the run that panicked), `03a-hmd2-probe-payload`, `titles-02-03b` (Spikes 2
-and 3b over TCP), `04-jsc-*` and `08-title-ipc`.
+the run that panicked), `02b-draw-bench`, `03a-hmd2-probe-payload`,
+`titles-02-03b` (Spikes 2 and 3b over TCP), `04-jsc-*` and `08-title-ipc`.
 
 ### What it took to get Spike 3b running (worth knowing for the port)
 
@@ -127,7 +134,7 @@ and 3b over TCP), `04-jsc-*` and `08-title-ipc`.
 - **Risk:** 28 patches written over a few days (many co-authored by an AI
   assistant), with no on-device validation recorded in the repo. Spike 2
   route B tests it with the same `gl_egl` program.
-- _Build and capability findings: pending (agent)._
+- Build and capability findings: §4.2b. It has not been run on the console.
 
 ### 4.2b Spike 2 builds: what they settled
 
@@ -268,8 +275,8 @@ along the PS5's payload/title line:
   From then on SCM_RIGHTS and shared memory work as WebKit expects. So a PS5
   ProcessLauncher needs a reversed rendezvous, but `IPC::Connection` itself
   can stay unchanged.
-- **Still to prove:** WPE's GPU-process WebGL path must be enabled and work
-  (upstream status to check).
+- **Revised by §4.8:** the GPU process can't be a separate title, so it has to
+  run inside the UIProcess (a patch), with compositing moved into it (WC mode).
 
 ### 4.5 Process model
 
@@ -305,6 +312,51 @@ pose), WebKit reports two phantom controllers when none are active, and
 WebKit checks for `XR_EXT_local_floor` without enabling it. Those last two
 are upstream WebKit bugs.
 
+### 4.8 WebKit's GPU process on PS5 (read from source, WebKit 15486a0178)
+
+- **Upstream WPE builds the GPU process but doesn't use it for WebGL.**
+  `ENABLE_GPU_PROCESS_BY_DEFAULT` is Cocoa-only, so `UseGPUProcessForWebGL`
+  and `…ForCanvasRendering` default to false on WPE. WebGL and the threaded
+  compositor run with GL **in the WebProcess** (a payload: no ps5-opengl,
+  ~55 MB direct memory).
+- **WPE's GPU process requires GBM** (`OptionsWPE.cmake:155`). Its WebGL
+  backend (`RemoteGraphicsContextGLGBM.cpp`) hands frames to the WebProcess
+  compositor as DMA-buf + fence fds. The PS5 has no cross-process GPU memory
+  (Spike 1 `dmem-share`), so this path can't work as it is.
+- **The fit is WebKit's "WC" mode (`USE_GRAPHICS_LAYER_WC`, `Platform/WC.cmake`),
+  used by WinCairo and by Sony's own port when its GPU process is on.** The
+  WebProcess paints tiles on the CPU into shared bitmaps and sends the layer
+  tree. The GPU process composites with TextureMapper GL, WebGL included, in
+  one process (`WCScene.cpp`), and returns the frame as a bitmap. The
+  WebProcess needs no GL. WPE also has a CPU-only page path
+  (`HardwareAccelerationEnabled=false`, `NonCompositedFrameRenderer`) for
+  first light.
+- **The GPU process has to share the title with the UIProcess.** Hmd2
+  (OpenXR, in the UIProcess) and GL both need the title, and a title can't
+  start a second title. WebKit has no in-process mode for it.
+  `AuxiliaryProcess::initialize` sets process-global state: the process type,
+  `Process::setIdentifier`, `SessionID`/`WebPageProxyIdentifier` generation
+  protection (which would break the UIProcess), and `terminate()` stops the
+  main run loop. So the patch is an in-process start of `GPUProcess` on the
+  UI main run loop that skips those. The heavy work already runs on its own
+  stream work queues. There are 8 `isInGPUProcess()`-style checks to review.
+  Chromium has this built in (`--in-process-gpu`); this is the one point where
+  Chromium has the edge (§2).
+- **WebXR in that process stays zero-copy:** the OpenXR swapchain and the
+  WebGL context live in the same process. The remote WebGL path already
+  forwards `CreateExternalImage`. What's left is a PS5 `ExternalImageSource`
+  (an in-process texture instead of DMA-buf fds), plus a way for ANGLE's
+  context to use a native ps5-opengl texture. That means EGLImage, or a T#
+  import added to the driver.
+- **Lead, untested:** Sony's port launches `/app0/*Process.self` as
+  app-local children of the app (`ProcessLauncherPlayStation.cpp`,
+  `PlayStation::launchProcess`). If a homebrew title can reach the system call
+  underneath, and those children keep app rights (AGC, title memory), the GPU
+  process could stay a separate process.
+- **Title memory:** with the UIProcess and the GPU process in the title, its
+  251 MB of flexible memory is tight. Heaps need a direct-memory backend
+  (risk R8).
+
 ## 5. Risk register
 
 | # | Risk | Likelihood | Impact | Mitigation / deciding spike |
@@ -312,15 +364,17 @@ are upstream WebKit bugs.
 | R1a | Kernel panic when a forked child with shared-memory mappings exits (seen on 13.60, run 1). WebKit children map shared memory constantly | observed once | high if it also hits non-forked children | Bisect (`fork` group: inherited SHM_ANON vs received fd); `spawn` group checks the elfldr-child case; avoid fork |
 | R1 | No multi-process from a title (no spawn, no fd passing) | **retired** (Spike 8) | — | The title spawns via elfldr; reversed unix rendezvous carries SCM_RIGHTS |
 | R13 | IPC latency: ~130 µs per round trip title ↔ payload (payload threads alone are 4× slower than the title's), against 10–20 µs on desktop | observed | medium: WebKit's sync IPC (layout queries, input) adds up | Payload thread priority/affinity; shared-memory streams (WebKit's StreamConnection) for hot paths; prewarm processes (spawn takes seconds) |
-| R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | medium | blocking for WebXR | Spike 3a (linear T#), 3b (zero-copy); AGC/GL blit into SW_64KB_R_X as plan B |
-| R3 | GPU only usable in the title process | medium (ps5-opengl: likely) | high: WebGL must run where XR runs (Spike 7 options B/C) | Spike 2 on both stacks in a payload; pacbrew Mesa claims payload support |
-| R4 | No cross-process GPU memory | medium | medium: XR via option B/C, pages via SHM readback | Spike 1 `dmem-share` |
+| R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | **retired** (Spike 3b) | — | Zero-copy via T# export, 3600/3600 frames |
+| R3 | GPU only usable in the title process | **accepted** (ps5-opengl is title-only; payload direct memory ~55 MB) | designed around | All GL in the title (§4.8); pacbrew Mesa in a payload is still untested |
+| R4 | No cross-process GPU memory | **observed** (Spike 1 `dmem-share` EACCES) | designed around | WC mode: the WebProcess sends CPU-painted bitmaps; WebGL, compositing and XR share one process (§4.8) |
+| R14 | GPU process inside the UIProcess: WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
+| R15 | WebGL (ANGLE) can't use the OpenXR runtime's native ps5-opengl textures in the same process; ANGLE port to the PS5 target | medium | high for WebXR | Add EGLImage or a T# import to ps5-opengl (we carry its patches); ANGLE GL backend on Mesa GL 4.6 / GLES 3.2 |
 | R5 | pacbrew Mesa / ps5-opengl immature or abandoned (upstreams already deleted) | high | medium | Keep both routes; vendor sources and patches; pin hashes |
 | R6 | Per-firmware fragility (export tables, SCE stubs, Relapse limited to ≤13.60) | high | medium | Anchor-checked tables, one generator script, document the supported firmware |
-| R7 | JIT unavailable, so slow JS | medium | medium for WebXR (three.js frame budgets) | Spike 1 JIT probes, Spike 4 perf numbers |
+| R7 | JIT unavailable, so slow JS | low (reduced) | medium for WebXR (three.js frame budgets) | JS runs in payloads, where RWX, RW→RX and `sceKernelJit*` all work (Spike 1). The LLInt interpreter is ~3× slower than an M4 Max (Spike 4); enabling the JIT is optional port work |
 | R11 | GL draw-call overhead makes busy WebGL/three.js scenes CPU-bound | medium (reduced) | medium for WebXR content | Measured and partly fixed (§4.2c): 72 → 8 µs per draw with patch 0003, profiling off and async preparation. Left: driver state caching (port work), compare pacbrew Mesa/zink. glthread takes the work off the calling thread |
 | R12 | Clean exit/suspend: titles were killed by the system on close (0xa0d0c00f, "debug error") | **fixed** | low (UX) | Cause: ps5-opengl's `catchReturnFromMain` sleeps forever after `main`. `spikes/common/title_exit.c` replaces it with `sceShellCoreUtilExitApp` (as PS5VR): Spike 8 closes with no error (2026-10-27). Still to do: handle suspend/resume events in the browser |
-| R8 | Memory budget (WebKit + JSC + GPU + 60 MB hand-tracking work memory) | medium | medium | Spike 1 `mem-flex`/`mem-direct` |
+| R8 | Memory budget: the title has ~251 MB of flexible memory for the UIProcess + GPU process (ANGLE, Mesa shader compiler, compositor) | high | high | Measured (§4.4b). Heaps on a direct-memory backend (bmalloc/libpas over `sceKernelAllocateDirectMemory`, as Sony's port does); payloads hold the JS/DOM heaps (8 GB) |
 | R9 | Dependency porting (glib, libsoup, ICU, Skia deps) is larger than estimated | high | schedule | pacbrew covers ~60%; budget it explicitly (Spike 6) |
 | R10 | Tethered jailbreak: re-run after every reboot | certain | UX only | Document it; autoload scripts |
 
@@ -339,26 +393,47 @@ are upstream WebKit bugs.
 
 ## 7. Recommendation and estimate
 
-_To be finalised after the console runs._ Provisional, for one experienced
-engineer:
+**Recommendation: go**, on the single-title architecture in §1 and §4.8,
+targeting firmware 13.60 only (R6). Build it in two milestones, so that 2D
+browsing works before any of the XR-specific risks (R14, R15) are taken on.
+
+For one experienced engineer:
 
 | Phase | Effort |
 | --- | --- |
-| Spikes 0–3 on device, fixes | 1–2 weeks |
-| JSC + dependency ports (glib, libsoup, ICU, …) | 4–8 weeks |
-| WPE build + PS5 WPE Platform backend + process provider | 4–6 weeks |
-| OpenXR runtime on psvr2 + controllers (+ hands) | 2–4 weeks |
-| WebXR texture path (Spike 7 option A/B) + polish | 3–6 weeks |
-| **Total to an end-to-end WebXR demo** | **~4–6 months** |
+| Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) and the ANGLE build (R9) | 6–10 weeks |
+| JSC fixes on device (`Date`, plus what Spike 4 already found) | 1–2 weeks |
+| WPE build + PS5 WPE Platform backend (VideoOut display, DualSense, IME, fonts), CPU-painted pages | 4–6 weeks |
+| Process launcher: elfldr spawn, reversed rendezvous, prewarming | 2–3 weeks |
+| **Milestone 1: 2D browsing on the TV** | **~3–5 months** |
+| GPU process inside the UIProcess + WC compositing on WPE (R14) | 4–6 weeks |
+| Direct-memory heap for the title (R8) | 2–3 weeks |
+| Driver work: in-process texture sharing for ANGLE, state caching (R11, R15) | 3–6 weeks |
+| OpenXR runtime on device, WebKit XR binding patch, controllers | 3–5 weeks |
+| Integration, stability, suspend/resume | 3–4 weeks |
+| **Total to an end-to-end WebXR demo** | **~7–11 months** |
 
-Add 2–3 months if R1 forces an in-process WebKit.
+This is up from the provisional 4–6 months. The increase comes from the
+GPU-process merge, WC compositing on WPE and the title's memory limit, none of
+which were known before the console runs and the source review. Optional
+extras: the JIT in the WebProcess (2–4 weeks), hand tracking (~2 weeks).
 
-## 8. What to run on the console (in order)
+## 8. Optional console runs before the port
 
-1. `make -C spikes/00-baseline hello send`. Install PS5VR and play a video
-   in the headset.
-2. `make -C spikes/01-procs-ipc send`.
-3. `make -C spikes/03-gl-hmd2 send` (3a: wear the headset).
-4. Spike 2: the pacbrew Mesa payload (`spikes/02-gl-egl/pacbrew-mesa/deploy.sh`)
-   and the ps5-opengl title (with `WITH_PROCS_TESTS`).
-5. Spike 3b title. Then Spike 4 `jsc`.
+None of these changes the verdict. Each settles a detail of the port plan
+cheaply.
+
+1. **Spike 5 on the console:** `hello_xr`-style check of `libopenxr_psvr2`
+   in a title.
+2. **pacbrew Mesa in a payload** (`spikes/02-gl-egl/pacbrew-mesa/deploy.sh`).
+   If it works within the payload's memory budget, R3 softens.
+3. **Sony-style app-local child processes:** find the system call behind
+   `PlayStation::launchProcess`, and check whether such a child can use AGC
+   and the title's memory. If it can, R14 goes away.
+4. **Payload thread priority/affinity** against Spike 8's 131 µs round trip
+   (R13).
+5. **JSC `Date`:** fix the wall-clock source and re-run Spike 4.
+6. Re-run Spike 2b to capture the driver profile breakdown (the log now uses
+   `freopen`).
+
+The spike READMEs list the build and run commands for each spike.
