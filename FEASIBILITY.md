@@ -1,8 +1,8 @@
 # Feasibility: WebKit + WebXR on a jailbroken PS5 with PS VR2
 
 _Status: **study complete (2026-10-27). Verdict: go. The goal is now a
-browser with VR video in the headset rather than WebXR (§1a); estimate ~3–5
-days of agent sessions, bound by console debugging (§7).**_
+browser that plays VR video from tube sites, in the page and in the
+headset, rather than WebXR (§1a); estimate ~4–7 days of agent sessions, bound by console debugging (§7).**_
 
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
@@ -56,17 +56,40 @@ removes the hardest parts of the plan above:
 
 What it adds:
 
-- **A VR video player inside the browser title.** It reuses Spike 3b's
-  zero-copy headset path and draws the video on a sphere (360°) or dome
-  (180°), mono or side-by-side/top-bottom 3D. It decodes video itself;
-  WebKit's media stack (GStreamer) stays off. The new risk is decoding
-  (R16).
-- **"View in VR":** the browser reads a page's `<video>` sources and
-  `.mp4`/`.m3u8` links and hands one to the player. Sites that stream through
-  Media Source Extensions (YouTube: `blob:` URLs) need a separate
-  extraction step, which comes later. DRM-protected sites are out of reach
-  (no Widevine for homebrew). Videos don't play inside pages in the first
-  version.
+- **Video plays inside pages.** The owner's sources are tube-style sites
+  that stream VR video (2026-10-27). They play it with their own JavaScript
+  players, which fetch HLS/DASH segments and feed them to Media Source
+  Extensions (hls.js, dash.js, Shaka, video.js), or give Safari an `.m3u8`
+  directly. The URLs are signed and short-lived and are hidden behind that
+  JavaScript, so lifting a link out of the page and playing it elsewhere
+  would mean per-site extraction that breaks often. Instead, WebKit's own
+  media stack plays the video, so every site works the way it does in
+  Safari:
+  - **GStreamer**, WPE's only media backend, ported like the other
+    dependencies. MSE and native HLS (`adaptivedemux2`) come with it.
+  - **A decoder element of our own** wrapping Sony's hardware decoder
+    (R16), with FFmpeg (`gst-libav`) as the software fallback.
+    `MediaSource.isTypeSupported` reports HEVC only if the hardware decoder
+    works, so sites send H.264 otherwise.
+  - **Hole-punch video**, as WPE set-top boxes do: the page leaves a
+    transparent hole where the `<video>` is, and the title draws the decoded
+    frame under the page bitmap. Decoded frames never touch the CPU, which
+    matters because pages are painted on the CPU.
+- **"View in VR":** a button (and pad shortcut) takes the `<video>` that is
+  playing into the headset. The player keeps running; the title just draws
+  the same decoded frame on a sphere (360°) or dome (180°), mono or
+  side-by-side/top-bottom 3D, through Spike 3b's zero-copy path. It works
+  whatever player the site uses, because it starts from the decoded frame,
+  not the site's player. The projection is guessed from the page and the
+  stream URL (`180`, `360`, `SBS`/`LR`, `TB`, `fisheye`, `MKX200`, which these
+  sites put in titles and filenames), and the pad changes it. Back returns
+  to the page with playback continuing.
+- **Out of reach:** DRM-protected streams (no Widevine or PlayReady for
+  homebrew). Free tube sites rarely use DRM; some paid VR sites do.
+- **Site players that need WebGL or WebXR** (R17). These players usually
+  hide their VR button when `navigator.xr` is missing and show the flat
+  video, which is all we need. Players that refuse to play at all without
+  WebGL would bring WebGL back into scope.
 - **Browsing in the headset, two ways:**
   - **Free:** PS VR2's Cinematic Mode shows a non-VR title on a large
     virtual screen. The owner confirmed it shows the home screen and our
@@ -403,7 +426,9 @@ are upstream WebKit bugs.
 | R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | **retired** (Spike 3b) | — | Zero-copy via T# export, 3600/3600 frames |
 | R3 | GPU only usable in the title process | **accepted** (ps5-opengl is title-only; payload direct memory ~55 MB) | designed around | All GL in the title (§4.8); pacbrew Mesa in a payload is still untested |
 | R4 | No cross-process GPU memory | **observed** (Spike 1 `dmem-share` EACCES) | designed around | WC mode: the WebProcess sends CPU-painted bitmaps; WebGL, compositing and XR share one process (§4.8) |
-| R16 | Video decoding for VR video (§1a): 180° 3D is often 6K–8K HEVC, too much for software decoding on the PS5's CPU; it's unknown whether a homebrew title can use Sony's hardware decoder (AvPlayer/Videodec2) | medium | high for VR video (4K in software is likely fine) | Hardware-decode spike first: 4K and 8K files into a GL texture in the headset |
+| R16 | Video decoding for VR video (§1a): 180° 3D is often 6K–8K HEVC, too much for software decoding on the PS5's CPU; it's unknown whether a homebrew title can use Sony's hardware decoder (AvPlayer/Videodec2) | medium | high for VR video (4K in software is likely fine) | Hardware-decode spike first: 4K H.264 and 8K HEVC, fed as fragmented-MP4 segments (what MSE delivers), into a GL texture in the headset |
+| R17 | Tube sites' players misbehave in our browser: they need WebGL to play at all, or serve a lesser stream or an "unsupported browser" page to an unknown user agent | medium | medium: per site | Check the owner's sites on a desktop browser with WebGL and WebXR off; send a Safari user agent; WebGL (R14/R15) only if a site the owner needs demands it |
+| R18 | GStreamer port (core, base, good with `adaptivedemux2`, our decoder element, hole-punch sink) is larger than the other dependencies | medium | schedule | It shares glib with WPE; plugins are built static and only the few needed; set-top-box WPE ports have done hole-punch on similar hardware |
 | R14 | GPU process inside the UIProcess (WebXR goal only; not needed for §1a): WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
 | R15 | (WebXR goal only) WebGL (ANGLE) can't use the OpenXR runtime's native ps5-opengl textures in the same process; ANGLE port to the PS5 target | medium | high for WebXR | Add EGLImage or a T# import to ps5-opengl (we carry its patches); ANGLE GL backend on Mesa GL 4.6 / GLES 3.2 |
 | R5 | pacbrew Mesa / ps5-opengl immature or abandoned (upstreams already deleted) | high | medium | Keep both routes; vendor sources and patches; pin hashes |
@@ -454,19 +479,19 @@ things are:
 
 | Phase | Agent work | What sets the pace |
 | --- | --- | --- |
-| Hardware-decode spike: 4K and 8K video into a GL texture in the headset (R16) | small | console runs, headset check |
+| Hardware-decode spike: 4K H.264 and 8K HEVC segments into a GL texture in the headset (R16) | small | console runs, headset check |
 | Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) (R9); no ANGLE | large, but parallel and Mac-only | build time |
 | JSC fixes (`Date`, plus Spike 4's patches carried over) | small | one console run |
 | WPE build + PS5 WPE Platform backend (VideoOut, DualSense, IME, fonts), CPU-painted pages | medium | console crash-and-fix loop |
 | Process launcher: elfldr spawn, reversed rendezvous, prewarming | small (Spike 8 code) | console loop |
 | **Milestone 1: browsing on the TV, and in the headset through Cinematic Mode** | | **~1–3 days of sessions** |
-| VR video player in the title: decode, sphere/dome, 3D formats, pad controls, audio | small–medium (Spike 3b path) | headset checks |
-| "View in VR": video sources and links from the page; switching into and out of VR mode | small | headset checks |
-| **Milestone 2: VR video from the browser** | | **~1–2 more days of sessions** |
+| Media stack: GStreamer port, MSE and HLS, our hardware-decoder element, audio out, hole-punch video in pages (R18) | medium–large | console loop, TV checks on real sites |
+| "View in VR": the playing `<video>`'s frames on a sphere/dome, 3D formats, projection guess, pad controls, switching into and out of VR | small–medium (Spike 3b path) | headset checks |
+| Owner's sites checked one by one: user agent, player quirks (R17) | small | owner at the TV |
+| **Milestone 2: VR video from tube sites, in the page and in the headset** | | **~2–4 more days of sessions** |
 | VR panel mode: the page on a curved panel, Sense-controller pointing, VR keyboard | small–medium | headset checks |
-| Later: YouTube (MSE) extraction; video inside pages | medium each | — |
 
-So it is roughly **3–5 days of sessions to Milestone 2**, plus about a day
+So it is roughly **4–7 days of sessions to Milestone 2**, plus about a day
 for the VR panel mode, with wide error bars. The spikes were small programs;
 the browser is a multi-million-line program whose bugs will show up mostly
 as crashes on the console. R16 decides how well high-resolution VR video
