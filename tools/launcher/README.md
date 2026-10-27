@@ -16,7 +16,7 @@ tools/launch.sh --quit                 # stop the launcher
 ```
 
 Only titles listed in `PS5WK_OWN_TITLES` are stopped without `-f`. The
-default list is PPSA99006/07/09–14, so the owner's own games (such as
+default list is PPSA99006/07/09–14 and PPSA99020 (the browser), so the owner's own games (such as
 PPSA99008) are never closed by accident.
 
 Titles end through the launcher too: `spikes/common/title_exit.c` asks it to
