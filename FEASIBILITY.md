@@ -434,12 +434,13 @@ range assumes no blocker as hard as Spike 3 could have been. R14 and R15 are
 the likeliest to become one. Optional extras (the JIT in the WebProcess, hand
 tracking) are a few hours each.
 
-**Biggest speed-up: let agents launch titles themselves.** A small payload
-that starts a registered title by ID (homebrew launchers use
-`sceLncUtilLaunchApp` for this), plus Spike 8's clean exit, would let agents
-run the build → launch → read-log → fix loop without the owner. Only the TV
-and headset checks would still need a person. Build it first, before the
-port starts.
+**Biggest speed-up, now built: agents launch titles themselves.**
+[`tools/launch.sh`](tools/launcher/README.md) starts a registered title
+through a resident payload (`sceLncUtilLaunchApp`), and stops one with
+SIGKILL, because no kill API accepts a payload on 13.60. The
+build → launch → read-log → fix loop no longer needs the owner. Only the TV
+and headset checks, and registering each new title ID once, still need a
+person.
 
 ## 8. Optional console runs before the port
 
