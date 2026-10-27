@@ -16,6 +16,10 @@ make -s -C "$ROOT/spikes/01-procs-ipc" child.elf
 prospero-clang "${CF[@]}" -DPROCS_IPC_LIBRARY -DSPIKE01_GROUP=5 -DSPIKE_NAME='"01-procs-ipc-title"' \
     -c "$ROOT/spikes/01-procs-ipc/procs_ipc.c" -o "$OBJ/procs_ipc.o"
 (cd "$ROOT/spikes/01-procs-ipc" && prospero-clang -c child_blob.S -o "$OBJ/child_blob.o")
+# Clean exit (title_exit.c); psvr2.c holds the export binding it uses.
+prospero-clang "${CF[@]}" -c "$ROOT/spikes/common/psvr2/psvr2.c" -o "$OBJ/psvr2.o"
+prospero-clang "${CF[@]}" -c "$ROOT/spikes/common/title_exit.c" -o "$OBJ/title_exit.o"
 "$ROOT/spikes/02-gl-egl/ps5-opengl/package-title.sh" -p "$PREFIX" -t PPSA99006 \
     -n "ps5webkit spike 02" -o "$ROOT/spikes/02-gl-egl/build/titles" \
-    "$OBJ/gl_egl.o" "$OBJ/procs_ipc.o" "$OBJ/child_blob.o"
+    "$OBJ/gl_egl.o" "$OBJ/procs_ipc.o" "$OBJ/child_blob.o" \
+    "$OBJ/psvr2.o" "$OBJ/title_exit.o"

@@ -1,7 +1,7 @@
 # Feasibility: WebKit + WebXR on a jailbroken PS5 with PS VR2
 
 _Status: **console phase under way: the key gate (Spike 3) passed on
-2026-10-27.**_
+2026-10-27; title ↔ payload IPC (Spike 8) passed the same day.**_
 
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
@@ -13,8 +13,9 @@ claims as unverified until a spike confirms them.
 
 **Go, with a revised architecture.** The key gate (GL → PS VR2, Spike 3)
 passed zero-copy at 60 fps; JavaScriptCore runs (Spike 4); multi-process
-works between payloads (Spike 1); GLES 3.2 works (Spike 2). The measured
-payload/title split (§4.4b) points to a GPU-process design (§4.4c). Earlier
+works between payloads (Spike 1) and between the title and payloads it
+launches (Spike 8); GLES 3.2 works (Spike 2). The measured payload/title
+split (§4.4b) points to a GPU-process design (§4.4c). Earlier
 host-side findings:
 
 - **There's now a second GPU route.** pacbrew's Mesa port (RADV Vulkan +
@@ -52,10 +53,11 @@ no multi-process model at all.
 | Spike | Host phase | Console phase | Gate |
 | --- | --- | --- | --- |
 | 0 baseline | **verified:** SDK + libc++ built (LLVM 18.1.8), hello_world + `sysinfo.elf` build | **PASS** (2026-10-27): FW 13.60 (kernel 0x13600007), payload authid 0x480000001000000e, direct 12.4 GB / flexible 8.1 GB, 16 threads, Hmd2/VrTracker2/VrHand + hand models present | **go** |
-| 1 procs/IPC | **verified:** builds; split into groups `safe`/`spawn`/`jit`/`fork`/`title` | **Payload:** threads, `fork`, **fd passing (SCM_RIGHTS)**, named shm, Unix socket in `/system_tmp` (not `/data`, `/user`), 6 GB anonymous memory, **all 3 JIT probes** PASS; **kernel panic** after a forked child with shared mappings exited; direct-memory budget only ~55 MB. **Title (unjailed):** threads, named shm PASS; **no directory accepts an AF_UNIX socket** (`/system_tmp` EACCES); **flexible memory 251 MB**, direct ≥2 GB; JIT: RWX FAIL, **RW→RX `mprotect` PASS**, `sceKernelJit*` FAIL (0x80020001). **`spawn` (payload): PASS:** child started through the local elfldr in 375 ms, rendezvous over `/system_tmp`, shm + pipe fds passed both ways, child has 8 GB flexible memory. **`dmem-share` FAIL** (0x8002000d, EACCES): no cross-process direct-memory mapping by API | **go** (payload↔payload); title↔payload IPC still to test |
-| 2 GL/EGL | **verified:** ps5-opengl from source + patches (GLES 3.2, T# export); pacbrew Mesa built | **PASS (title, ps5-opengl+patches):** EGL "OpenGL OpenGL_ES"; GL 4.6 core, 199 ext; surfaceless; FBO render; **GLES 3.2 context + `#version 300 es` rendering**; shared context on a 2nd thread (needs a big stack); T# export (SW_64KB_R_X). **FAIL:** EGLImage (expected); WebGL-like load **132.7 ms/frame for 2000 small draws** (8 fps): per-draw CPU cost is high, needs profiling (batching off for uniforms?). pacbrew Mesa not run yet | **go** (perf risk) |
+| 1 procs/IPC | **verified:** builds; split into groups `safe`/`spawn`/`jit`/`fork`/`title` | **Payload:** threads, `fork`, **fd passing (SCM_RIGHTS)**, named shm, Unix socket in `/system_tmp` (not `/data`, `/user`), 6 GB anonymous memory, **all 3 JIT probes** PASS; **kernel panic** after a forked child with shared mappings exited; direct-memory budget only ~55 MB. **Title (unjailed):** threads, named shm PASS; **no directory accepts an AF_UNIX socket** (`/system_tmp` EACCES); **flexible memory 251 MB**, direct ≥2 GB; JIT: RWX FAIL, **RW→RX `mprotect` PASS**, `sceKernelJit*` FAIL (0x80020001). **`spawn` (payload): PASS:** child started through the local elfldr in 375 ms, rendezvous over `/system_tmp`, shm + pipe fds passed both ways, child has 8 GB flexible memory. **`dmem-share` FAIL** (0x8002000d, EACCES): no cross-process direct-memory mapping by API | **go** (payload↔payload; title↔payload: Spike 8) |
+| 2 GL/EGL | **verified:** ps5-opengl from source + patches (GLES 3.2, T# export); pacbrew Mesa built | **PASS (title, ps5-opengl+patches):** EGL "OpenGL OpenGL_ES"; GL 4.6 core, 199 ext; surfaceless; FBO render; **GLES 3.2 context + `#version 300 es` rendering**; shared context on a 2nd thread (needs a big stack); T# export (SW_64KB_R_X). **FAIL:** EGLImage (expected); WebGL-like load **132.7 ms/frame for 2000 small draws** (8 fps). **2b:** the cost is CPU time in the driver; with patch 0003 (strips batched), profiling off and async preparation it is **8 µs per draw, 17 ms for 2000** (§4.2c). pacbrew Mesa not run yet | **go** (perf risk reduced) |
 | 3 GL → PS VR2 | **verified:** `psvr2` backend, `hmd2_probe.elf` (3a), `gl_hmd2` title (3b) | **3a (payload): FAIL by design.** Libraries load, 13.60 offset tables match, Hmd2 initialises and reports FOV, but `sceHmd2Open` refuses every user id from a non-application process (0x8a720009). **3b (title): PASS.** Zero-copy: GL 4.6 renders into ps5-opengl textures (SW_64KB_R_X) exported as T#s; 3600 frames at 60.0 fps (120 Hz out), render 1.13 ms + hand-off 0.06 ms, 0 submit errors, 3600/3600 tracked, tracker eye positions valid. Visual check: world-locked, correct stereo depth, no judder noticed; floor grid right in front looked slightly off (likely aliasing of 1-px lines and an assumed floor height, not the pipeline) | **go** |
 | 4 JSC | **verified:** `jsc` links (JSCOnly, JIT off, asm LLInt, bmalloc/libpas, ICU 76 static; 36 MB slim). 6 patches + `memmem` shim; needs libc++ 19 | **PASS** (payload): correctness **30/30** (regex, typed arrays, BigInt, generators, stack-overflow RangeError, ICU Intl, GC churn); bench **3.41 s** vs 1.04–1.10 s on M4 Max (same build): richards 596, deltablue 592, numeric 890, strings 424, alloc 906 ms. Fixes needed on device: `-DLD_PACK_RELATIVE_RELOCS=OFF` (SDK loader ignores DT_RELR), libpas commit/decommit on 16 KiB pages (patch 0006). Open: `Date` reads 1970 (wall clock source) | **go** |
+| 8 title ↔ payload IPC | **verified:** builds as title PPSA99009 with the server payload embedded | **PASS** ([README](spikes/08-title-ipc/README.md)): **the title spawns the payload through the local elfldr** (listening after 1.6–5.2 s); title → payload unix `connect` **EPERM**; **reversed works: the title listens in a 0777 directory the payload made (`/system_tmp/ps5wk`), the payload connects, shm fds pass both ways with SCM_RIGHTS**; named shm both ways; loopback TCP. RTT 131 µs (unix) / 186–249 µs (tcp); in-process baseline 18 µs in the title vs 73 µs in a payload; 112 MB/s (unix), 350 MB/s (tcp). `sceShellCoreUtilExitApp` returns 0 and the title closes **with no debug error** (user-checked) | **go** |
 | 5 OpenXR runtime | **verified:** `libopenxr_psvr2` covers all ~50 calls WebKit makes (+ the rest of 1.0 core); host smoke test replaying WebKit's sequence **18/18 PASS** via dlopen, static link and the official Khronos loader (1.1.65); PS5 backend cross-compiles (`libopenxr_psvr2.a`) | pending (needs Spike 3b first) | — |
 | 6 MiniBrowser | design ([README](spikes/06-wpe-minibrowser/README.md)) | — | — |
 | 7 WebXR e2e | design ([README](spikes/07-webxr-e2e/README.md)) | — | — |
@@ -63,7 +65,7 @@ no multi-process model at all.
 Console logs for every run above are in
 [`evidence/2026-10-27/`](evidence/2026-10-27/): `00-sysinfo`, `01-*` (incl.
 the run that panicked), `03a-hmd2-probe-payload`, `titles-02-03b` (Spikes 2
-and 3b over TCP) and `04-jsc-*`.
+and 3b over TCP), `04-jsc-*` and `08-title-ipc`.
 
 ### What it took to get Spike 3b running (worth knowing for the port)
 
@@ -153,6 +155,47 @@ and 3b over TCP) and `04-jsc-*`.
   buffers is a few tens of MB, so GPU-heavy processes (WebGL, XR) almost
   certainly have to be titles or get a raised budget (R3).
 
+### 4.2c Draw-call cost (Spike 2b): measured, found, fixed in part
+
+Spike 2's `webgl-load` ran 2000 small draws in 132 ms. `gl_draw_bench`
+(title, `build-bench.sh`) splits that cost; logs in
+[`evidence/2026-10-27/02b-draw-bench.log`](evidence/2026-10-27/02b-draw-bench.log).
+
+| 2000 draws (strip + 2 `glUniform4f`), 1080p target | per draw | frame |
+| --- | --- | --- |
+| stock ps5-opengl | 72 µs | 144 ms |
+| + patch 0003 (strips, lines, points batched) | 26.6 µs | 53.6 ms |
+| + profiling compiled out (`gles-noprof`) | 19.7 µs | 39.7 ms |
+| + `PS5_ASYNC_NATIVE_PREP=1` (`gles-async`) | **8.1 µs** | **17.2 ms** |
+
+- **All of it is CPU time in the driver.** Issue time equals thread CPU time,
+  `glFinish` waits ~0–1 ms, and the cost does not change with the size of
+  the target. A single instanced draw of all 2000 quads takes 0.1 ms. The GPU
+  is not the limit. `glUniform*` is cheap (0.2 µs).
+- **Cause 1 (fixed by patch 0003):** the driver only batched
+  `GL_TRIANGLES`. Every strip draw allocated GPU memory, submitted alone and
+  spin-waited for the GPU (`ps5_screen.c` `ps5_multidraw_eligible`). Each
+  batched draw carries its own command stream and primitive type, so strips,
+  lines and points batch safely. Fans still take the synchronous path.
+- **Cause 2:** every draw re-encodes all state and builds a fresh command
+  buffer (no dirty tracking). The async build hands that to two pinned worker
+  threads, which spin while waiting, so it costs two CPU cores. The real fix
+  is state caching in the driver: port work, not a spike.
+- **Cause 3:** per-draw profiling (rdtsc scopes, atomics, printf bursts) is
+  on by default in ps5-opengl's build (`PS5_DRAW_PROFILE=1`): ~7 µs per draw.
+- `glBufferSubData` on a UBO in flight costs 30 µs per draw in every build,
+  because it waits for retire. Per-draw uniforms belong in `glUniform*` or
+  `glBindBufferRange` (8 µs).
+- **glthread works** once `PS5_GLTHREAD=1` is set before `eglInitialize`
+  (the screen reads it there, and each context when created). The calling
+  thread then spends 0.1 ms per frame on 2000 draws, and the driver work
+  (the same 17–54 ms) moves to Mesa's own thread. Throughput does not change.
+  For WebKit's GPU process it frees the thread that decodes IPC.
+- What this means for WebXR: at 8 µs, 250 draws take 2.4 ms and 1000 draws
+  8.8 ms. Three.js renders each eye separately, so a 150-object scene costs
+  about 2.5 ms per frame. That fits the 60 fps (reprojected to 120 Hz) budget
+  Spike 3b ran at. Heavy scenes stay CPU-bound until the driver caches state.
+
 ### 4.3 The PS VR2 path (from PS5VR's source)
 
 - Hmd2 reprojection at 120 Hz with half-rate rendering (60 fps). A type 0x10
@@ -193,16 +236,17 @@ then: LLInt, no JIT (Spike 4).
 | ps5-opengl | no (title-only by design) | **yes** |
 | Flexible (CPU) memory | ~8 GB | **~251 MB** |
 | Direct (GPU) memory | **~55 MB** | ≥2 GB |
-| AF_UNIX socket at a path | `/system_tmp` | none found (EACCES/EOPNOTSUPP) |
+| AF_UNIX socket at a path | `/system_tmp` | **bind only in a 0777 directory a payload created** (`/system_tmp/ps5wk`); `connect` to a payload's socket EPERM |
+| Launch a payload | via elfldr | **via the local elfldr** (127.0.0.1:9021), 1.6–5.2 s |
+| Socket RTT within the process | 73 µs | 18 µs |
 | JIT | RWX, RW→RX, `sceKernelJit*` all work | **RW→RX `mprotect` only** |
 
 Consequences: the browser's UI/XR/GPU side must be a title, and its large
 heaps (JS, DOM) have to live in direct memory (a libpas/bmalloc backend over
 `sceKernelAllocateDirectMemory`, as Sony's own port does), or in payload
 child processes with their 8 GB of flexible memory. JSC's JIT would need a
-mprotect-flip executable allocator in a title. IPC rendezvous from a title
-needs another mechanism (e.g. the payload side creates the socket, or a
-title-writable directory such as `/download0` is tested).
+mprotect-flip executable allocator in a title. IPC rendezvous is reversed
+(Spike 8): the title listens, the payloads connect.
 
 ### 4.4c The process architecture this points to
 
@@ -218,11 +262,14 @@ along the PS5's payload/title line:
   of flexible memory for JS/DOM heaps, and the full JIT toolbox (RWX,
   `sceKernelJit*`) for JSC. WebGL calls are serialised to the GPU process over
   IPC, as on Apple platforms.
-- **Still to prove:** title ↔ payload IPC. The title can't bind an AF_UNIX
-  socket anywhere tested, so either the payload side creates the rendezvous
-  socket (in `/system_tmp`, made world-accessible) and the title connects, or
-  a title-writable directory is found. And WPE's GPU-process WebGL path must
-  be enabled and work (upstream status to check).
+- **Title ↔ payload IPC: proven (Spike 8).** The title spawns payloads via
+  the local elfldr. It listens on a unix socket in a 0777 directory that a
+  payload created, and the payloads connect (the other direction is EPERM).
+  From then on SCM_RIGHTS and shared memory work as WebKit expects. So a PS5
+  ProcessLauncher needs a reversed rendezvous, but `IPC::Connection` itself
+  can stay unchanged.
+- **Still to prove:** WPE's GPU-process WebGL path must be enabled and work
+  (upstream status to check).
 
 ### 4.5 Process model
 
@@ -263,15 +310,16 @@ are upstream WebKit bugs.
 | # | Risk | Likelihood | Impact | Mitigation / deciding spike |
 | --- | --- | --- | --- | --- |
 | R1a | Kernel panic when a forked child with shared-memory mappings exits (seen on 13.60, run 1). WebKit children map shared memory constantly | observed once | high if it also hits non-forked children | Bisect (`fork` group: inherited SHM_ANON vs received fd); `spawn` group checks the elfldr-child case; avoid fork |
-| R1 | No multi-process from a title (no spawn, no fd passing) | medium | high: in-process launcher, large WebKit patch, or a Chromium rethink | Spike 1 in payload **and** title context; fork-server fallback |
+| R1 | No multi-process from a title (no spawn, no fd passing) | **retired** (Spike 8) | — | The title spawns via elfldr; reversed unix rendezvous carries SCM_RIGHTS |
+| R13 | IPC latency: ~130 µs per round trip title ↔ payload (payload threads alone are 4× slower than the title's), against 10–20 µs on desktop | observed | medium: WebKit's sync IPC (layout queries, input) adds up | Payload thread priority/affinity; shared-memory streams (WebKit's StreamConnection) for hot paths; prewarm processes (spawn takes seconds) |
 | R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | medium | blocking for WebXR | Spike 3a (linear T#), 3b (zero-copy); AGC/GL blit into SW_64KB_R_X as plan B |
 | R3 | GPU only usable in the title process | medium (ps5-opengl: likely) | high: WebGL must run where XR runs (Spike 7 options B/C) | Spike 2 on both stacks in a payload; pacbrew Mesa claims payload support |
 | R4 | No cross-process GPU memory | medium | medium: XR via option B/C, pages via SHM readback | Spike 1 `dmem-share` |
 | R5 | pacbrew Mesa / ps5-opengl immature or abandoned (upstreams already deleted) | high | medium | Keep both routes; vendor sources and patches; pin hashes |
 | R6 | Per-firmware fragility (export tables, SCE stubs, Relapse limited to ≤13.60) | high | medium | Anchor-checked tables, one generator script, document the supported firmware |
 | R7 | JIT unavailable, so slow JS | medium | medium for WebXR (three.js frame budgets) | Spike 1 JIT probes, Spike 4 perf numbers |
-| R11 | GL draw-call overhead (Spike 2 `webgl-load`: ~66 µs per draw+uniforms) makes busy WebGL/three.js scenes CPU-bound | medium | high for WebXR content | Profile ps5-opengl's draw path (batching, descriptor publication), compare pacbrew Mesa/zink, ANGLE's own batching |
-| R12 | Clean exit/suspend: titles that leave `main` with GPU work open are killed by the system (0xa0d0c00f) | certain today | low (UX) | Exit through ShellCoreUtil like PS5VR; handle suspend events |
+| R11 | GL draw-call overhead makes busy WebGL/three.js scenes CPU-bound | medium (reduced) | medium for WebXR content | Measured and partly fixed (§4.2c): 72 → 8 µs per draw with patch 0003, profiling off and async preparation. Left: driver state caching (port work), compare pacbrew Mesa/zink. glthread takes the work off the calling thread |
+| R12 | Clean exit/suspend: titles were killed by the system on close (0xa0d0c00f, "debug error") | **fixed** | low (UX) | Cause: ps5-opengl's `catchReturnFromMain` sleeps forever after `main`. `spikes/common/title_exit.c` replaces it with `sceShellCoreUtilExitApp` (as PS5VR): Spike 8 closes with no error (2026-10-27). Still to do: handle suspend/resume events in the browser |
 | R8 | Memory budget (WebKit + JSC + GPU + 60 MB hand-tracking work memory) | medium | medium | Spike 1 `mem-flex`/`mem-direct` |
 | R9 | Dependency porting (glib, libsoup, ICU, Skia deps) is larger than estimated | high | schedule | pacbrew covers ~60%; budget it explicitly (Spike 6) |
 | R10 | Tethered jailbreak: re-run after every reboot | certain | UX only | Document it; autoload scripts |

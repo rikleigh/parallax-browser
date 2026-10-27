@@ -526,6 +526,33 @@ void psvr2_close(void)
           r3, r4, r5);
 }
 
+/* -- leaving the title -------------------------------------------------------- */
+/* Returning from main leaves the title to the system, which kills it
+ * (0xa0d0c00f, a "debug error" when the user closes it). PS5VR asks ShellUI to
+ * close the app instead. libSceSystemService exports this from a library the
+ * import table cannot name, so it is bound like the VR functions. */
+int psvr2_exit_app(void)
+{
+    static const char file[] = "libSceSystemService.sprx";
+    const char *word = sceKernelGetFsSandboxRandomWord();
+    char paths[2][128];
+    snprintf(paths[0], sizeof paths[0], "/%s/common/lib/%s", word ? word : "system", file);
+    snprintf(paths[1], sizeof paths[1], "/system/common/lib/%s", file);
+    int h = -1;
+    for (int i = 0; i < 2 && h < 0; i++) {
+        int res = 0;
+        h = sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, &res);
+    }
+    int (*exit_app)(void) = NULL;
+    if (h >= 0 && (sceKernelDlsym(h, "sceShellCoreUtilExitApp", (void **)&exit_app) != 0 ||
+                   !exit_app)) {
+        const uintptr_t base = module_base(h, file, &klibSceSystemServiceAnchor);
+        exit_app = base ? (int (*)(void))(base + klibSceSystemServiceExports[0].offset) : NULL;
+    }
+    logf_("psvr2: %s -> 0x%x, sceShellCoreUtilExitApp %p", file, h, (void *)exit_app);
+    return exit_app ? exit_app() : -1;
+}
+
 /* -- T# --------------------------------------------------------------------- */
 enum {
     GFX10_FORMAT_8_8_8_8_UNORM = 56,

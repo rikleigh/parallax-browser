@@ -1,0 +1,31 @@
+ps5 driver: batch strips, lines and points (spike 02b)
+
+Only GL_TRIANGLES entered the deferred multi-draw batch. Every other
+primitive submitted and spin-waited alone: ~70 us per GL_TRIANGLE_STRIP
+draw on FW 13.60, against 27 us batched. Fans stay synchronous.
+
+--- a/src/gallium/ps5/ps5_screen.c	2026-10-27 18:43:53
++++ b/src/gallium/ps5/ps5_screen.c	2026-10-27 18:43:53
+@@ -11411,9 +11411,21 @@
+       (const struct ps5_resource *)context->framebuffer.zsbuf.texture;
+    const struct pipe_depth_stencil_alpha_state *dsa = context->depth_stencil_alpha;
+    unsigned rejects = 0;
++
++   /* ps5webkit: strips, lines and points batch too. Each batched draw
++    * carries its own command stream and primitive type (runtime main()).
++    * Fans stay on the synchronous path, as before (not tested here).
++    * Before: every GL_TRIANGLE_STRIP draw submitted and spin-waited alone,
++    * ~70 us per draw on 13.60 (spike 02b). */
++   const bool batchable_mode =
++      info && (info->mode == MESA_PRIM_TRIANGLES ||
++               info->mode == MESA_PRIM_TRIANGLE_STRIP ||
++               info->mode == MESA_PRIM_LINES ||
++               info->mode == MESA_PRIM_LINE_STRIP ||
++               info->mode == MESA_PRIM_POINTS);
+ 
+    if (!info || !draws || !num_draws || indirect ||
+-       (info->mode != MESA_PRIM_TRIANGLES &&
++       (!batchable_mode &&
+         !(context->deferred_blitter_draw && context->blitter && context->blitter->running &&
+           info->mode == MESA_PRIM_TRIANGLE_FAN && num_draws == 1 &&
+           !info->index_size && info->instance_count == 1 && !info->start_instance &&

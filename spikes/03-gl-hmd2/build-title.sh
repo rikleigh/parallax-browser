@@ -10,8 +10,10 @@ CF=(-std=c11 -O2 -g -Wall -Werror -DGL_GLEXT_PROTOTYPES=1 -I"$PREFIX/include" -I
     -DLOG_HOST="\"$PS5WK_LOG_HOST\"" -DLOG_PORT="$PS5WK_LOG_PORT")
 prospero-clang "${CF[@]}" -c "$ROOT/spikes/03-gl-hmd2/gl_hmd2.c" -o "$OBJ/gl_hmd2.o"
 prospero-clang "${CF[@]}" -c "$ROOT/spikes/common/psvr2/psvr2.c" -o "$OBJ/psvr2.o"
+prospero-clang "${CF[@]}" -c "$ROOT/spikes/common/title_exit.c" -o "$OBJ/title_exit.o"
 "$ROOT/spikes/02-gl-egl/ps5-opengl/package-title.sh" -p "$PREFIX" -t PPSA99007 \
-    -n "ps5webkit spike 03b" -o "$ROOT/spikes/03-gl-hmd2/build/titles" "$OBJ/gl_hmd2.o" "$OBJ/psvr2.o"
+    -n "ps5webkit spike 03b" -o "$ROOT/spikes/03-gl-hmd2/build/titles" "$OBJ/gl_hmd2.o" "$OBJ/psvr2.o" \
+    "$OBJ/title_exit.o"
 # PS VR2 titles declare it in param.json: Hmd2 refused this title with
 # 0x8a72001f while its attribute words were 0. Take PS5VR's (a working VR
 # title); keep ps5-opengl's memory (amm/kernel) settings.

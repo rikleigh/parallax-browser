@@ -64,6 +64,9 @@ int psvr2_begin_frame(psvr2_frame_t *f);
 int psvr2_submit(int index, const psvr2_frame_t *f, const float tan[2][4]);
 void psvr2_stop(void);
 void psvr2_close(void);
+/* Asks ShellUI to close the title (as the PS menu's Close does); 0 when asked.
+ * The process is ended shortly after, so wait rather than return from main. */
+int psvr2_exit_app(void);
 
 /* GFX10 T# for an RGBA8 2D texture. sw_mode 0 = linear (pitch in bytes,
  * 256-byte aligned base), 27 = SW_64KB_R_X (what PS5VR and Sony titles hand

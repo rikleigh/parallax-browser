@@ -8,8 +8,14 @@
 #           facade, Mesa -Dgles2=enabled, GLES2/GLES3 headers, and the PS5
 #           texture-descriptor export entry point)
 #           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles
+#   gles-noprof : the gles tree reinstalled with the driver's per-draw
+#           profiling compiled out (PS5_DRAW_PROFILE=0 PS5_RUNTIME_QUIET=1)
+#           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles-noprof
+#   gles-async : gles-noprof + PS5_ASYNC_NATIVE_PREP=1 (two pinned worker
+#           threads build the native command streams of batched draws)
+#           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles-async
 #
-# usage: build.sh [stock|gles|all] [--clean]     (default: all)
+# usage: build.sh [stock|gles|gles-noprof|gles-async|all] [--clean]     (default: all)
 #
 # No sudo, no Docker. Inputs: ref/ps5-opengl (git checkout, read only), the
 # pinned sources from its dependencies.json (fetched into each variant's own
@@ -31,9 +37,9 @@ JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 variant=all clean=0
 for arg in "$@"; do
     case "$arg" in
-        stock|gles|all) variant=$arg ;;
+        stock|gles|gles-noprof|gles-async|all) variant=$arg ;;
         --clean) clean=1 ;;
-        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -165,5 +171,13 @@ case "$variant" in
         patches=()
         for p in "$HERE"/patches/*.patch; do patches+=("$p"); done
         build_variant gles "$ROOT/toolchain/ps5-opengl-gles" "${patches[@]}" ;;
+    gles-noprof|gles-async)
+        # native-app.mk takes these with ?=. The tree's objects are rebuilt
+        # with them; a later `build.sh gles` rebuilds them as before.
+        patches=()
+        for p in "$HERE"/patches/*.patch; do patches+=("$p"); done
+        (export PS5_DRAW_PROFILE=0 PS5_RUNTIME_QUIET=1
+         [[ $variant == gles-async ]] && export PS5_ASYNC_NATIVE_PREP=1
+         build_variant gles "$ROOT/toolchain/ps5-opengl-$variant" "${patches[@]}") ;;
 esac
 log "done"

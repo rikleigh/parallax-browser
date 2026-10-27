@@ -51,7 +51,11 @@ fi
 #    and C++ allocation runtime from PS5VR; ps5-opengl's heap + shims.
 TF=(-fno-plt -fno-stack-protector -ffunction-sections -fdata-sections)
 prospero-clang++ -std=c++20 -O2 -fno-exceptions -fno-rtti "${TF[@]}" -c "$NATIVE/app_crt.cpp" -o "$W/obj/app_crt.o"
-prospero-clang -std=c11 -O2 "${TF[@]}" -c "$PSGL/runtime_shims.c" -o "$W/obj/runtime_shims.o"
+# runtime_shims.c's catchReturnFromMain sleeps forever after main, and the
+# system then kills the title ("debug error" on close). Renamed here, so a
+# title links spikes/common/title_exit.c (or the CRT's empty default) instead.
+prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchReturnFromMain \
+    -c "$PSGL/runtime_shims.c" -o "$W/obj/runtime_shims.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -c "$PSGL/app_heap.c" -o "$W/obj/app_heap.o"
 
 # 3. Intermediate PIE link (flags of ps5-opengl's tools/build-native-test-app.sh
@@ -79,7 +83,7 @@ done
     "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
     --as-needed "${sdk_stubs[@]}" --start-group "$SYS/lib/libc.a" --end-group \
     2> "$W/link.log" || {
-        grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -40
+        { grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -40; } || true
         tail -5 "$W/link.log"; exit 1; }
 
 # 4. Convert (SCE dynamic metadata), fake-sign, assemble the folder title.
