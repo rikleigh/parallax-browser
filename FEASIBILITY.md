@@ -84,6 +84,22 @@ What it adds:
   stream URL (`180`, `360`, `SBS`/`LR`, `TB`, `fisheye`, `MKX200`, which these
   sites put in titles and filenames), and the pad changes it. Back returns
   to the page with playback continuing.
+- **The owner's sources, checked 2026-10-27:** VR video sites and
+  YouTube 360/180. 4K is enough; 6K–8K is a bonus.
+  - **VR site:** plain progressive MP4 (no MSE needed), signed URLs. HEVC goes
+    up to 7680×3840 (one sample: HEVC Main 8-bit, 29.97 fps, ~35 Mbit/s,
+    AAC-LC stereo), with 5760 and 4320 versions too. H.264 stops at 1080p,
+    so VR video above 1080p means HEVC. Its public JSON feed
+    (`/video/id/<n>`), a format other VR sites also publish for the
+    site's app, gives every source and the exact projection (`viewAngle`,
+    `stereoMode`). "View in VR" uses it when a site has it, and can then
+    pick a sharper source than the page player.
+  - **YouTube:** MSE with VP9 (WebM) or AV1 (MP4) at 3840×2160; H.264 stops at
+    1080p and there's no HEVC. So YouTube in 4K needs VP9 or AV1 decoding.
+    The projection comes from the player data, and YouTube may repack 360
+    frames (3840×2160, not 2:1), which "View in VR" must unpack.
+  - **Audio:** AAC on both, plus Opus on YouTube. Both are cheap in
+    software.
 - **Out of reach:** DRM-protected streams (no Widevine or PlayReady for
   homebrew). Free tube sites rarely use DRM; some paid VR sites do.
 - **Site players that need WebGL or WebXR** (R17). These players usually
@@ -426,7 +442,7 @@ are upstream WebKit bugs.
 | R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | **retired** (Spike 3b) | — | Zero-copy via T# export, 3600/3600 frames |
 | R3 | GPU only usable in the title process | **accepted** (ps5-opengl is title-only; payload direct memory ~55 MB) | designed around | All GL in the title (§4.8); pacbrew Mesa in a payload is still untested |
 | R4 | No cross-process GPU memory | **observed** (Spike 1 `dmem-share` EACCES) | designed around | WC mode: the WebProcess sends CPU-painted bitmaps; WebGL, compositing and XR share one process (§4.8) |
-| R16 | Video decoding for VR video (§1a): 180° 3D is often 6K–8K HEVC, too much for software decoding on the PS5's CPU; it's unknown whether a homebrew title can use Sony's hardware decoder (AvPlayer/Videodec2) | medium | high for VR video (4K in software is likely fine) | Hardware-decode spike first: 4K H.264 and 8K HEVC, fed as fragmented-MP4 segments (what MSE delivers), into a GL texture in the headset |
+| R16 | Video decoding for VR video (§1a): the owner's sources need HEVC (VR site, 4K–8K) and VP9 or AV1 (YouTube, 4K). 8K is too much for software decoding on the PS5's CPU; it's unknown whether a homebrew title can use Sony's hardware decoder (AvPlayer/Videodec2), and whether it does VP9 | medium | medium: 4K is the owner's minimum, and 4K HEVC/VP9/AV1 in software is plausible on 8 Zen 2 cores; 6K–8K needs the hardware | Spike 9: HEVC 4K–8K (a real VR site clip), VP9 4K, into a GL texture in the headset; software numbers at 4K as the fallback |
 | R17 | Tube sites' players misbehave in our browser: they need WebGL to play at all, or serve a lesser stream or an "unsupported browser" page to an unknown user agent | medium | medium: per site | Check the owner's sites on a desktop browser with WebGL and WebXR off; send a Safari user agent; WebGL (R14/R15) only if a site the owner needs demands it |
 | R18 | GStreamer port (core, base, good with `adaptivedemux2`, our decoder element, hole-punch sink) is larger than the other dependencies | medium | schedule | It shares glib with WPE; plugins are built static and only the few needed; set-top-box WPE ports have done hole-punch on similar hardware |
 | R14 | GPU process inside the UIProcess (WebXR goal only; not needed for §1a): WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
