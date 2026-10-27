@@ -1,0 +1,8 @@
+# 10-bit and VP9 again (fixed converters, hidden frames dropped), then zero-copy GL on the TV
+bench mp4  hevc10_8k.mp4   hevc 2 7680 3840 30
+bench ivf  vp9_57k.ivf     vp9 0 5760 2880 30
+bench ivf  vp9p2_4k.ivf    vp9 2 3840 2160 30
+gl    mp4  vrclip_4320x2160.mp4  hevc 1 4320 2160 20
+gl    mp4  vrclip_7680x3840.mp4  hevc 1 7680 3840 20
+gl    mp4  hevc10_8k.mp4   hevc 2 7680 3840 15
+gl    ivf  vp9_4k.ivf      vp9 0 3840 2160 15

@@ -1,0 +1,4 @@
+# mode kind file codec profile width height [seconds]
+bench mp4  vrclip_4320x2160.mp4  hevc 1 4320 2160 40
+bench hevc vrclip_7680x3840.h265 hevc 1 7680 3840 40
+bench mp4  vrclip_7680x3840.mp4  hevc 1 7680 3840 40

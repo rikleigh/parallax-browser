@@ -1,0 +1,18 @@
+# mode kind file codec profile width height [seconds] [depth]
+# Real content (VR site, owner's sample; local only)
+bench mp4  vrclip_5760x2880.mp4  hevc 1 5760 2880 40
+bench mp4  vrclip_7680x3840.mp4  hevc 1 7680 3840 40 1
+bench mp4  vrclip_7680x3840.mp4  hevc 1 7680 3840 40 2
+# Synthetic: SBS testsrc2 + noise, tube bitrates
+bench mp4  h264_1080p.mp4  h264 100 1920 1080 30
+bench mp4  h264_4k.mp4     h264 100 3840 2160 30
+bench mp4  hevc_4k.mp4     hevc 1 3840 2160 30
+bench mp4  hevc_6k.mp4     hevc 1 5760 2880 30
+bench mp4  hevc_8k.mp4     hevc 1 7680 3840 30
+bench hevc hevc_8k.h265    hevc 1 7680 3840 30
+bench mp4  hevc10_8k.mp4   hevc 2 7680 3840 30
+bench mp4  hevc_8192.mp4   hevc 1 8192 4096 30
+bench ivf  vp9_4k.ivf      vp9 0 3840 2160 30
+bench mp4  vp9_4k.mp4      vp9 0 3840 2160 30
+bench ivf  vp9_57k.ivf     vp9 0 5760 2880 30
+bench ivf  vp9p2_4k.ivf    vp9 2 3840 2160 30
