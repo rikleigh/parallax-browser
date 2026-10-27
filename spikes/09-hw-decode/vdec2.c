@@ -256,6 +256,9 @@ static size_t align16k(uint64_t v)
 }
 
 /* -- decoder ----------------------------------------------------------------- */
+volatile const char *vdec2_stage = "idle";
+int vdec2_verbose;
+
 #define INPUT_SLOTS 4
 #define MAX_SLOTS 16
 
@@ -315,6 +318,9 @@ vdec2_t *vdec2_open(const vdec2_config_t *c, vdec2_info_t *info, const char **st
 #define STEP(name, call)            \
     do {                            \
         *stage = (name);            \
+        vdec2_stage = (name);       \
+        if (vdec2_verbose)          \
+            logf_("vdec2: %s", (name)); \
         if ((rc = (call)) != 0)     \
             goto fail;              \
     } while (0)
@@ -382,6 +388,7 @@ vdec2_t *vdec2_open(const vdec2_config_t *c, vdec2_info_t *info, const char **st
     STEP("CreateDecoder", sceVideodec2CreateDecoder(cfg, mem, &v->decoder));
     STEP("Reset", sceVideodec2Reset(v->decoder));
     *stage = "ok";
+    vdec2_stage = "decoding";
     *rc_out = 0;
     return v;
 fail:

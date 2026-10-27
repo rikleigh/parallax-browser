@@ -92,6 +92,11 @@ void *vdec2_input_slot(vdec2_t *v);
 /* Input ring slot size: the largest access unit vdec2_decode accepts. */
 #define VDEC2_INPUT_SLOT_BYTES (8u << 20)
 
+/* The bring-up step in progress (for a watchdog), and whether vdec2_open
+ * logs each step as it enters it. */
+extern volatile const char *vdec2_stage;
+extern int vdec2_verbose;
+
 /* GPU-visible direct memory (WB onion, CPU r/w), as the decoder and
  * ps5-opengl both allocate it. NULL on failure. */
 void *vdec2_direct_alloc(size_t size, size_t align);

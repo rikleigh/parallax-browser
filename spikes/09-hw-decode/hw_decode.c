@@ -689,8 +689,10 @@ static int vr_setup(gl_ctx_t *c)
         glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2 * EYE, EYE);
         glBindFramebuffer(GL_FRAMEBUFFER, c->eye_fbo[b]);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->eye_tex[b], 0);
-        if (!exp || !exp(c->dpy, c->ctx, c->eye_tex[b], t[b], NULL, NULL, NULL, NULL, NULL)) {
-            SPIKE_FAIL("vr", "eye buffer %d: T# export refused", b);
+        uint64_t addr = 0;
+        uint32_t tw = 0, th = 0, tp = 0, sw = 0;
+        if (!exp || !exp(c->dpy, c->ctx, c->eye_tex[b], t[b], &addr, &tw, &th, &tp, &sw)) {
+            SPIKE_FAIL("vr", "eye buffer %d: T# export refused (0x%04x)", b, eglGetError());
             psvr2_close();
             return -1;
         }
@@ -888,18 +890,50 @@ static int read_jobs(job_t *jobs, int max)
     return count;
 }
 
+#ifdef PAYLOAD
+#include <pthread.h>
+/* A payload that blocks inside the decoder would stay on the console:
+ * report where, then leave. */
+static void *watchdog(void *arg)
+{
+    (void)arg;
+    const char *last = NULL;
+    double since = spike_now_ms();
+    for (;;) {
+        usleep(1000 * 1000);
+        const char *now = (const char *)vdec2_stage;
+        if (now != last) {
+            last = now;
+            since = spike_now_ms();
+        } else if (strcmp(now, "idle") && strcmp(now, "decoding") && spike_now_ms() - since > 15000) {
+            SPIKE_FAIL("watchdog", "blocked in %s for 15 s; exiting", now);
+            _exit(3);
+        }
+    }
+    return NULL;
+}
+#endif
+
 int main(void)
 {
     /* Before the unjail (PS5VR: the module won't load after it). */
     const int lrc = vdec2_load();
+    /* AAC for the same streams would go through libSceAudiodec (PS5VR's
+     * sysmodule id); only whether it loads alongside is recorded here. */
+    extern int sceSysmoduleLoadModule(uint32_t id);
+    const int arc = sceSysmoduleLoadModule(0x88);
 #ifdef PAYLOAD
     spike_log("ps5webkit spike 09 (payload): hardware video decode, pid %d", (int)getpid());
+    vdec2_verbose = 1;
+    pthread_t wd;
+    pthread_create(&wd, NULL, watchdog, NULL);
 #else
     spike_title_init("spike09", LOG_HOST, LOG_PORT);
     spike_log("ps5webkit spike 09 (title): hardware video decode, pid %d", (int)getpid());
 #endif
     vdec2_set_logger(log_line);
     spike_log("vdec2: %s", vdec2_load_report());
+    spike_log("libSceAudiodec: sysmodule 0x88 -> 0x%08x", (unsigned)arc);
     if (lrc != 0) {
         SPIKE_FAIL("load", "libSceVideodec2 not bound (0x%08x)", (unsigned)lrc);
         return 1;

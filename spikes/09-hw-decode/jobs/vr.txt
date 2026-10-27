@@ -1,0 +1,3 @@
+# Headset (needs a person to look): VR clip 8K 360 mono, then the synthetic 8K as 180 SBS
+vr360 mp4  vrclip_7680x3840.mp4  hevc 1 7680 3840 30
+vr180 mp4  hevc_8k.mp4          hevc 1 7680 3840 20

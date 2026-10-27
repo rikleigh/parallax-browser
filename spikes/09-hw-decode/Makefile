@@ -5,7 +5,7 @@ ELF := hw_decode.elf
 include ../common/payload.mk
 
 CFLAGS += -DPAYLOAD -std=gnu11
-LDLIBS := -lSceSysmodule -lkernel_sys
+LDLIBS := -lSceSysmodule -lkernel_sys -lpthread
 
 $(ELF): hw_decode.c vdec2.c au.c vdec2.h au.h exports/videodec2_exports_1360.h ../common/spike.h
 	$(CC) $(CFLAGS) -o $@ hw_decode.c vdec2.c au.c $(LDLIBS)
