@@ -1,8 +1,8 @@
 # Feasibility: WebKit + WebXR on a jailbroken PS5 with PS VR2
 
-_Status: **study complete (2026-10-27). Verdict: go (§1); estimate ~a week of
-agent sessions to an end-to-end WebXR demo, bound by console
-debugging (§7).**_
+_Status: **study complete (2026-10-27). Verdict: go. The goal is now a
+browser with VR video in the headset rather than WebXR (§1a); estimate ~3–5
+days of agent sessions, bound by console debugging (§7).**_
 
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
@@ -39,6 +39,41 @@ The architecture that fits these results (§4.4c, §4.8):
 What remains is port work, not unknowns. The largest new items are running
 WebKit's GPU process inside the UIProcess (a patch WebKit doesn't have) and
 a direct-memory heap for the title (§4.8). The estimate is in §7.
+
+## 1a. Revised goal (2026-10-27): browse, and watch VR video in the headset
+
+The owner's actual aim is a web browser, plus the option to watch a 360° or
+180° video found while browsing in the PS VR2. WebXR isn't needed. That
+removes the hardest parts of the plan above:
+
+- **No WebGL, so no ANGLE and no GPU process.** Pages are painted on the CPU
+  in the WebProcess (payload) and handed to the title as shared bitmaps,
+  which upstream WPE supports (`HardwareAccelerationEnabled=false`, §4.8).
+  R14 (GPU process inside the UIProcess) and R15 (ANGLE texture sharing) go
+  away, and R8 eases because only the UIProcess lives in the title.
+- **No WebXR, no OpenXR runtime, no XR patches to WebKit.** Spike 5 stays on
+  the shelf.
+
+What it adds:
+
+- **A VR video player inside the browser title.** It reuses Spike 3b's
+  zero-copy headset path and draws the video on a sphere (360°) or dome
+  (180°), mono or side-by-side/top-bottom 3D. It decodes video itself;
+  WebKit's media stack (GStreamer) stays off. The new risk is decoding
+  (R16).
+- **"View in VR":** the browser reads a page's `<video>` sources and
+  `.mp4`/`.m3u8` links and hands one to the player. Sites that stream through
+  Media Source Extensions (YouTube: `blob:` URLs) need a separate
+  extraction step, which comes later. DRM-protected sites are out of reach
+  (no Widevine for homebrew). Videos don't play inside pages in the first
+  version.
+- **Browsing in the headset, two ways:**
+  - **Free:** PS VR2's Cinematic Mode shows a non-VR title on a large
+    virtual screen. The owner confirmed it shows the home screen and our
+    titles (2026-10-27).
+  - **Later:** our own VR panel mode, which draws the page on a curved
+    panel in the headset at higher resolution, with Sense-controller
+    pointing. It needs its own VR keyboard.
 
 ## 2. Engine choice: WebKit, not Chromium
 
@@ -368,8 +403,9 @@ are upstream WebKit bugs.
 | R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | **retired** (Spike 3b) | — | Zero-copy via T# export, 3600/3600 frames |
 | R3 | GPU only usable in the title process | **accepted** (ps5-opengl is title-only; payload direct memory ~55 MB) | designed around | All GL in the title (§4.8); pacbrew Mesa in a payload is still untested |
 | R4 | No cross-process GPU memory | **observed** (Spike 1 `dmem-share` EACCES) | designed around | WC mode: the WebProcess sends CPU-painted bitmaps; WebGL, compositing and XR share one process (§4.8) |
-| R14 | GPU process inside the UIProcess: WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
-| R15 | WebGL (ANGLE) can't use the OpenXR runtime's native ps5-opengl textures in the same process; ANGLE port to the PS5 target | medium | high for WebXR | Add EGLImage or a T# import to ps5-opengl (we carry its patches); ANGLE GL backend on Mesa GL 4.6 / GLES 3.2 |
+| R16 | Video decoding for VR video (§1a): 180° 3D is often 6K–8K HEVC, too much for software decoding on the PS5's CPU; it's unknown whether a homebrew title can use Sony's hardware decoder (AvPlayer/Videodec2) | medium | high for VR video (4K in software is likely fine) | Hardware-decode spike first: 4K and 8K files into a GL texture in the headset |
+| R14 | GPU process inside the UIProcess (WebXR goal only; not needed for §1a): WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
+| R15 | (WebXR goal only) WebGL (ANGLE) can't use the OpenXR runtime's native ps5-opengl textures in the same process; ANGLE port to the PS5 target | medium | high for WebXR | Add EGLImage or a T# import to ps5-opengl (we carry its patches); ANGLE GL backend on Mesa GL 4.6 / GLES 3.2 |
 | R5 | pacbrew Mesa / ps5-opengl immature or abandoned (upstreams already deleted) | high | medium | Keep both routes; vendor sources and patches; pin hashes |
 | R6 | Per-firmware fragility (export tables, SCE stubs, Relapse limited to ≤13.60) | high | medium | Anchor-checked tables, one generator script, document the supported firmware |
 | R7 | JIT unavailable, so slow JS | low (reduced) | medium for WebXR (three.js frame budgets) | JS runs in payloads, where RWX, RW→RX and `sceKernelJit*` all work (Spike 1). The LLInt interpreter is ~3× slower than an M4 Max (Spike 4); enabling the JIT is optional port work |
@@ -394,45 +430,47 @@ are upstream WebKit bugs.
 
 ## 7. Recommendation and estimate
 
-**Recommendation: go**, on the single-title architecture in §1 and §4.8,
-targeting firmware 13.60 only (R6). Build it in two milestones, so that 2D
-browsing works before any of the XR-specific risks (R14, R15) are taken on.
+**Recommendation: go**, for the revised goal in §1a, targeting firmware
+13.60 only (R6). The title is the UIProcess plus the VR video player; the
+payloads are the WebProcess (CPU-painted pages) and the NetworkProcess. The
+WebXR architecture (§4.4c, §4.8) stays documented in case WebXR is wanted
+later.
 
-**The work is done by Claude agents with the owner running the console**, as
-in this study, so the estimate is not in engineer-months. For calibration,
-the provisional plan put Spikes 0–3 at 1–2 weeks. With agents they took a
-few hours, dozens of console runs included: the whole study, Spikes 0–8,
-ran from about 16:00 one afternoon. Writing code and porting dependencies are not the limit. Three
+**The work is done by Claude agents with the owner at the console**, so the
+estimate is not in engineer-months. For calibration, the provisional plan put
+Spikes 0–3 at 1–2 weeks. With agents they took a few hours, dozens of console
+runs included: the whole study, Spikes 0–8, ran from about 16:00 one
+afternoon. Writing code and porting dependencies are not the limit. Three
 things are:
 
-1. **The console loop.** Each run needs the owner to launch the title
-   (PS5Upload → Play). Crashes can need a reboot and a re-run of the
-   jailbreak (R1a, R10). A large WebKit binary will crash far more often than
-   the spikes did, with only the kernel log and the TCP log to debug it.
+1. **The console loop.** The launcher (below) now registers, starts and stops
+   titles without the owner. Crashes can still need a reboot and a re-run of
+   the jailbreak (R1a, R10), and rest mode stops payloads until the console
+   wakes. A large WebKit binary will crash far more often than the spikes
+   did, with only the kernel log and the TCP log to debug it.
 2. **Build time.** A full WPE build probably takes an hour or more on the
    Mac (not yet timed); incremental builds take minutes.
 3. **Checks only a person can do:** the TV picture and the headset.
 
 | Phase | Agent work | What sets the pace |
 | --- | --- | --- |
-| Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) and the ANGLE build (R9) | large, but parallel and Mac-only | build time |
+| Hardware-decode spike: 4K and 8K video into a GL texture in the headset (R16) | small | console runs, headset check |
+| Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) (R9); no ANGLE | large, but parallel and Mac-only | build time |
 | JSC fixes (`Date`, plus Spike 4's patches carried over) | small | one console run |
 | WPE build + PS5 WPE Platform backend (VideoOut, DualSense, IME, fonts), CPU-painted pages | medium | console crash-and-fix loop |
 | Process launcher: elfldr spawn, reversed rendezvous, prewarming | small (Spike 8 code) | console loop |
-| **Milestone 1: 2D browsing on the TV** | | **~1–3 days of sessions** |
-| GPU process inside the UIProcess + WC compositing on WPE (R14) | medium; new design, not porting | console loop |
-| Direct-memory heap for the title (R8) | small–medium | console loop |
-| Driver work: in-process texture sharing for ANGLE, state caching (R11, R15) | medium | console loop |
-| OpenXR runtime on device, WebKit XR binding patch, controllers | small–medium (Spike 5 exists) | headset checks |
-| Integration, stability, suspend/resume | open-ended | console loop, headset checks |
-| **Milestone 2: end-to-end WebXR demo** | | **~2–5 more days of sessions** |
+| **Milestone 1: browsing on the TV, and in the headset through Cinematic Mode** | | **~1–3 days of sessions** |
+| VR video player in the title: decode, sphere/dome, 3D formats, pad controls, audio | small–medium (Spike 3b path) | headset checks |
+| "View in VR": video sources and links from the page; switching into and out of VR mode | small | headset checks |
+| **Milestone 2: VR video from the browser** | | **~1–2 more days of sessions** |
+| VR panel mode: the page on a curved panel, Sense-controller pointing, VR keyboard | small–medium | headset checks |
+| Later: YouTube (MSE) extraction; video inside pages | medium each | — |
 
-So it is roughly **a week of sessions at this study's pace**, with wide
-error bars. The spikes were small programs; the port is a multi-million-
-line browser whose bugs will show up mostly as crashes on the console. The
-range assumes no blocker as hard as Spike 3 could have been. R14 and R15 are
-the likeliest to become one. Optional extras (the JIT in the WebProcess, hand
-tracking) are a few hours each.
+So it is roughly **3–5 days of sessions to Milestone 2**, plus about a day
+for the VR panel mode, with wide error bars. The spikes were small programs;
+the browser is a multi-million-line program whose bugs will show up mostly
+as crashes on the console. R16 decides how well high-resolution VR video
+plays, not whether the project works.
 
 **Biggest speed-up, now built: agents launch titles themselves.**
 [`tools/launch.sh`](tools/launcher/README.md) registers a title
