@@ -12,6 +12,9 @@
  *          NV12/P010 from it as an SSBO and writes RGBA8, which is drawn on
  *          the TV. No CPU copy of the picture. A readback PPM of the RGBA8
  *          result shows whether the zero-copy path is the right image.
+ *   vr360  (title only) as gl, then the RGBA8 frame drawn on a sphere per eye
+ *   vr180  (360 mono) or front dome (180 side-by-side) in the PS VR2 through
+ *          Spike 3b's zero-copy T# path, paced at the video's frame rate.
  *
  * Built twice: as a registered title (PPSA99014, build-title.sh) and, with
  * -DPAYLOAD, as an elfldr payload (make), the secondary data point.
@@ -25,6 +28,7 @@
 #else
 #include "../common/title.h"
 #include "../common/glutil.h"
+#include "../common/psvr2/psvr2.h"
 #endif
 #include "au.h"
 #include "vdec2.h"
@@ -385,6 +389,31 @@ static const char *kFsConvert =
     "  u = (u - 0.5) * (255.0 / 224.0); v = (v - 0.5) * (255.0 / 224.0);\n"
     "  o = vec4(y + 1.5748 * v, y - 0.1873 * u - 0.4681 * v, y + 1.8556 * u, 1.0);\n"
     "}\n";
+/* Equirectangular video on a sphere (360 mono) or front dome (180 SBS),
+ * sampled along each eye pixel's view ray; video sits at infinity, so only
+ * the eye orientation matters. Memory row 0 of the eye buffer is the top. */
+static const char *kFsSphere =
+    "#version 430 core\n"
+    "in vec2 uv;\n"
+    "uniform sampler2D t;\n"
+    "uniform vec4 tan_lrud;\n"
+    "uniform mat3 rot;\n"
+    "uniform int layout_;\n"
+    "uniform int eye;\n"
+    "out vec4 o;\n"
+    "const float PI = 3.14159265;\n"
+    "void main() {\n"
+    "  vec3 dv = normalize(vec3(mix(-tan_lrud.x, tan_lrud.y, uv.x), mix(tan_lrud.z, -tan_lrud.w, uv.y), -1.0));\n"
+    "  vec3 d = rot * dv;\n"
+    "  float lon = atan(d.x, -d.z), lat = asin(clamp(d.y, -1.0, 1.0));\n"
+    "  vec2 tc;\n"
+    "  if (layout_ == 0) tc = vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);\n"
+    "  else {\n"
+    "    if (abs(lon) > 0.5 * PI) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }\n"
+    "    tc = vec2((lon / PI + 0.5) * 0.5 + 0.5 * float(eye), 0.5 - lat / PI);\n"
+    "  }\n"
+    "  o = texture(t, tc);\n"
+    "}\n";
 static const char *kFsShow =
     "#version 430 core\n"
     "in vec2 uv;\n"
@@ -397,6 +426,7 @@ typedef struct {
     char name[96];
     EGLDisplay dpy;
     EGLSurface surf;
+    EGLContext ctx;
     GLuint buf[GL_SLOTS];
     uint8_t *map[GL_SLOTS];
     size_t slot_off[GL_SLOTS], slot_bytes;
@@ -406,6 +436,16 @@ typedef struct {
     double conv_ms, present_ms;
     unsigned timed;
     int slot_mismatch;
+    /* vr */
+    int vr, layout;
+    GLuint sphere, eye_tex[PSVR2_MAX_BUFFERS], eye_fbo[PSVR2_MAX_BUFFERS];
+    GLint u_tan, u_rot, u_layout, u_eye;
+    float tan[2][4];
+    double video_t0, fps;
+    uint64_t hmd_frames, hmd_errors, hmd_tracked, hmd_late;
+    double hmd_render_ms;
+    int have_yaw;
+    float yaw0;
 } gl_ctx_t;
 
 static void gl_dump_readback(gl_ctx_t *c)
@@ -432,6 +472,57 @@ static void gl_dump_readback(gl_ctx_t *c)
     }
     free(rgba);
     free(rgb);
+}
+
+#define EYE 1536
+#define OVERSCAN 1.15f
+
+/* Show the current RGBA video frame in the headset until the next video
+ * frame is due (60 Hz rendering, 120 Hz out; a 30 fps video gets 2). */
+static void vr_present(gl_ctx_t *c, unsigned index)
+{
+    const double due = c->video_t0 + (index + 1) * 1000.0 / c->fps;
+    do {
+        psvr2_frame_t f;
+        if (psvr2_begin_frame(&f) != 0) {
+            c->hmd_errors++;
+            return;
+        }
+        c->hmd_tracked += f.tracked != 0;
+        if (f.tracked && !c->have_yaw) { /* the video's front = where the head first looked */
+            const float *q = f.head.quat;
+            c->yaw0 = atan2f(2 * (q[3] * q[1] + q[0] * q[2]), 1 - 2 * (q[1] * q[1] + q[0] * q[0]));
+            c->have_yaw = 1;
+        }
+        const double r0 = spike_now_ms();
+        const int b = (int)(f.frame % PSVR2_MAX_BUFFERS);
+        glBindFramebuffer(GL_FRAMEBUFFER, c->eye_fbo[b]);
+        glUseProgram(c->sphere);
+        glBindTexture(GL_TEXTURE_2D, c->rgba);
+        glUniform1i(c->u_layout, c->layout);
+        const float yq[4] = {0, sinf(-c->yaw0 / 2), 0, cosf(-c->yaw0 / 2)};
+        const mat4 yaw = mat4_quat(yq);
+        for (int eye = 0; eye < 2; eye++) {
+            const int have_q = f.eye[eye].quat[3] != 0 || f.eye[eye].quat[1] != 0;
+            const mat4 er = mat4_quat(have_q ? f.eye[eye].quat : f.head.quat);
+            const mat4 r = mat4_mul(yaw, er);
+            float m[9];
+            for (int col = 0; col < 3; col++)
+                for (int k = 0; k < 3; k++)
+                    m[col * 3 + k] = r.m[col * 4 + k];
+            glViewport(eye * EYE, 0, EYE, EYE);
+            glUniform4fv(c->u_tan, 1, c->tan[eye]);
+            glUniformMatrix3fv(c->u_rot, 1, GL_FALSE, m);
+            glUniform1i(c->u_eye, eye);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glFinish(); /* the compositor must not sample a half-drawn buffer */
+        c->hmd_render_ms += spike_now_ms() - r0;
+        if (psvr2_submit(b, &f, c->tan) != 0)
+            c->hmd_errors++;
+        c->hmd_frames++;
+    } while (spike_now_ms() < due - 8.0);
+    c->hmd_late += spike_now_ms() > due + 17.0;
 }
 
 static int gl_picture(void *vctx, const vdec2_picture_t *p, unsigned index)
@@ -462,6 +553,18 @@ static int gl_picture(void *vctx, const vdec2_picture_t *p, unsigned index)
     if (timed)
         glFinish();
     const double t1 = spike_now_ms();
+    if (c->vr) {
+        if (timed) {
+            c->conv_ms += t1 - t0;
+            c->timed++;
+        }
+        if (index == 0)
+            c->video_t0 = spike_now_ms();
+        vr_present(c, index);
+        if (index == THUMB_FRAME)
+            gl_dump_readback(c);
+        return 0;
+    }
     /* Letterboxed onto the TV. */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glClearColor(0, 0, 0, 1);
@@ -488,34 +591,136 @@ static int gl_picture(void *vctx, const vdec2_picture_t *p, unsigned index)
     return 0;
 }
 
+/* One window surface and context for the whole run: a second
+ * eglCreateWindowSurface fails (EGL_BAD_ALLOC, seen on 13.60). */
+static int gl_once(EGLDisplay *dpy_out, EGLSurface *surf_out, EGLContext *ctx_out)
+{
+    static EGLDisplay dpy;
+    static EGLSurface surf = EGL_NO_SURFACE;
+    static EGLContext ctx = EGL_NO_CONTEXT;
+    if (ctx == EGL_NO_CONTEXT) {
+        dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        static const EGLint cfg_attrs[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE,
+                                           EGL_OPENGL_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
+                                           EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+        static const EGLint ctx_attrs[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 4,
+                                           EGL_CONTEXT_MINOR_VERSION_KHR, 6,
+                                           EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
+                                           EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR, EGL_NONE};
+        EGLConfig cfg;
+        EGLint n = 0;
+        if (eglInitialize(dpy, NULL, NULL) && eglBindAPI(EGL_OPENGL_API) &&
+            eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &n) && n == 1) {
+            surf = eglCreateWindowSurface(dpy, cfg, (EGLNativeWindowType)0, NULL);
+            ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+        }
+        if (ctx == EGL_NO_CONTEXT || surf == EGL_NO_SURFACE || !eglMakeCurrent(dpy, surf, surf, ctx)) {
+            SPIKE_FAIL("gl-init", "EGL 0x%04x", eglGetError());
+            ctx = EGL_NO_CONTEXT;
+            return -1;
+        }
+    }
+    *dpy_out = dpy;
+    *surf_out = surf;
+    *ctx_out = ctx;
+    return 0;
+}
+
+static void gl_release(gl_ctx_t *c)
+{
+    for (int i = 0; i < GL_SLOTS; i++)
+        if (c->buf[i]) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, c->buf[i]);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        }
+    glDeleteBuffers(GL_SLOTS, c->buf);
+    glDeleteFramebuffers(1, &c->fbo);
+    glDeleteFramebuffers(1, &c->small_fbo);
+    glDeleteTextures(1, &c->rgba);
+    glDeleteTextures(1, &c->small);
+    glDeleteVertexArrays(1, &c->vao);
+    glDeleteProgram(c->conv);
+    glDeleteProgram(c->show);
+    if (c->vr) {
+        glDeleteProgram(c->sphere);
+        glDeleteFramebuffers(PSVR2_MAX_BUFFERS, c->eye_fbo);
+        glDeleteTextures(PSVR2_MAX_BUFFERS, c->eye_tex);
+    }
+    glFinish();
+}
+
+int sceUserServiceInitialize(void *);
+int sceUserServiceGetInitialUser(int *);
+
+static int vr_setup(gl_ctx_t *c)
+{
+    char err[512];
+    c->sphere = glu_program(kVsFull, kFsSphere, err, sizeof err);
+    if (!c->sphere) {
+        SPIKE_FAIL("vr", "sphere shader: %s", err);
+        return -1;
+    }
+    c->u_tan = glGetUniformLocation(c->sphere, "tan_lrud");
+    c->u_rot = glGetUniformLocation(c->sphere, "rot");
+    c->u_layout = glGetUniformLocation(c->sphere, "layout_");
+    c->u_eye = glGetUniformLocation(c->sphere, "eye");
+    glUseProgram(c->sphere);
+    glUniform1i(glGetUniformLocation(c->sphere, "flip"), 0);
+    psvr2_set_logger(log_line);
+    if (psvr2_preload() != 0) {
+        SPIKE_FAIL("vr", "Hmd2/VrTracker2 not bound");
+        return -1;
+    }
+    int user = -1;
+    sceUserServiceInitialize(NULL);
+    sceUserServiceGetInitialUser(&user);
+    if (psvr2_open(user) != 0) {
+        SPIKE_FAIL("vr", "headset setup failed (user 0x%x)", user);
+        return -1;
+    }
+    typedef EGLBoolean (*export_fn)(EGLDisplay, EGLContext, GLuint, uint32_t[8], uint64_t *,
+                                    uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+    export_fn exp = (export_fn)eglGetProcAddress("eglExportTextureDescriptorPS5");
+    uint32_t t[PSVR2_MAX_BUFFERS][8];
+    glGenTextures(PSVR2_MAX_BUFFERS, c->eye_tex);
+    glGenFramebuffers(PSVR2_MAX_BUFFERS, c->eye_fbo);
+    for (int b = 0; b < PSVR2_MAX_BUFFERS; b++) {
+        glBindTexture(GL_TEXTURE_2D, c->eye_tex[b]);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2 * EYE, EYE);
+        glBindFramebuffer(GL_FRAMEBUFFER, c->eye_fbo[b]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->eye_tex[b], 0);
+        if (!exp || !exp(c->dpy, c->ctx, c->eye_tex[b], t[b], NULL, NULL, NULL, NULL, NULL)) {
+            SPIKE_FAIL("vr", "eye buffer %d: T# export refused", b);
+            psvr2_close();
+            return -1;
+        }
+    }
+    if (psvr2_start(t, PSVR2_MAX_BUFFERS, EYE, EYE) != 0) {
+        SPIKE_FAIL("vr", "VR mode / registration failed");
+        psvr2_close();
+        return -1;
+    }
+    psvr2_eye_tangents(0, OVERSCAN, c->tan[0]);
+    psvr2_eye_tangents(1, OVERSCAN, c->tan[1]);
+    c->fps = c->j->seconds > 0 && c->fps <= 0 ? 29.97 : c->fps;
+    spike_log("headset up: %dx%d eye buffers, zero-copy T#s, video paced at %.2f fps", 2 * EYE, EYE, c->fps);
+    return 0;
+}
+
 static void run_gl(const job_t *j)
 {
     static gl_ctx_t c;
     memset(&c, 0, sizeof c);
     c.j = j;
     c.ten_bit = j->profile == 2;
-    snprintf(c.name, sizeof c.name, "%s-%s", base_name(j->path), j->kind);
-    spike_log("== gl %s: %s %dx%d", c.name, j->codec, j->width, j->height);
+    c.vr = !strncmp(j->mode, "vr", 2);
+    c.layout = !strcmp(j->mode, "vr180");
+    c.fps = 29.97;
+    snprintf(c.name, sizeof c.name, "%s-%s%s", base_name(j->path), j->kind, c.vr ? "-vr" : "");
+    spike_log("== %s %s: %s %dx%d", j->mode, c.name, j->codec, j->width, j->height);
 
-    c.dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    static const EGLint cfg_attrs[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE,
-                                       EGL_OPENGL_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
-                                       EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
-    static const EGLint ctx_attrs[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 4, EGL_CONTEXT_MINOR_VERSION_KHR, 6,
-                                       EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
-                                       EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR, EGL_NONE};
-    EGLConfig cfg;
-    EGLint n = 0;
-    EGLContext ctx = EGL_NO_CONTEXT;
-    if (eglInitialize(c.dpy, NULL, NULL) && eglBindAPI(EGL_OPENGL_API) &&
-        eglChooseConfig(c.dpy, cfg_attrs, &cfg, 1, &n) && n == 1) {
-        c.surf = eglCreateWindowSurface(c.dpy, cfg, (EGLNativeWindowType)0, NULL);
-        ctx = eglCreateContext(c.dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
-    }
-    if (ctx == EGL_NO_CONTEXT || c.surf == EGL_NO_SURFACE || !eglMakeCurrent(c.dpy, c.surf, c.surf, ctx)) {
-        SPIKE_FAIL("gl-init", "EGL 0x%04x", eglGetError());
+    if (gl_once(&c.dpy, &c.surf, &c.ctx) != 0)
         return;
-    }
     eglQuerySurface(c.dpy, c.surf, EGL_WIDTH, &c.win_w);
     eglQuerySurface(c.dpy, c.surf, EGL_HEIGHT, &c.win_h);
     char err[512];
@@ -548,6 +753,18 @@ static void run_gl(const job_t *j)
     glGenFramebuffers(1, &c.fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, c.fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c.rgba, 0);
+    {
+        typedef EGLBoolean (*export_fn)(EGLDisplay, EGLContext, GLuint, uint32_t[8], uint64_t *,
+                                        uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+        export_fn exp = (export_fn)eglGetProcAddress("eglExportTextureDescriptorPS5");
+        uint32_t t[8], tw = 0, th = 0, tp = 0, sw = 0;
+        uint64_t addr = 0;
+        if (exp && exp(c.dpy, c.ctx, c.rgba, t, &addr, &tw, &th, &tp, &sw))
+            spike_log("RGBA target exports as a T# (Spike 3b path to Hmd2): addr 0x%llx %ux%u "
+                      "pitch %u sw_mode %u", (unsigned long long)addr, tw, th, tp, sw);
+        else
+            spike_log("RGBA target: T# export unavailable (0x%04x)", eglGetError());
+    }
     glGenTextures(1, &c.small);
     glBindTexture(GL_TEXTURE_2D, c.small);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, j->width / THUMB_SCALE, j->height / THUMB_SCALE);
@@ -613,6 +830,11 @@ static void run_gl(const job_t *j)
         return;
     }
     spike_log("decoder up with its output slots in GL buffer storage");
+    if (c.vr && vr_setup(&c) != 0) {
+        vdec2_close(v);
+        gl_release(&c);
+        return;
+    }
     stats_t st;
     decode_loop(v, &src, j, 600, &st, gl_picture, &c);
     vdec2_close(v);
@@ -623,7 +845,21 @@ static void run_gl(const job_t *j)
                  "NV12->RGBA %.2f ms, present %.2f ms (avg of %u timed); %u rc errors, %d outside GL slots",
                  st.frames, st.elapsed_ms, fps, c.timed ? c.conv_ms / c.timed : 0,
                  c.timed ? c.present_ms / c.timed : 0, c.timed, st.errors, c.slot_mismatch);
-    spike_log("VISUAL CHECK (TV): the clip played letterboxed, picture correct (colours, no blocks)?");
+    if (c.vr) {
+        psvr2_close();
+        SPIKE_RESULT("vr", c.hmd_errors == 0 && c.hmd_frames > 0 ? "PASS" : "FAIL",
+                     "%s %s: %llu headset frames for %u video frames (%.1f fps), render %.2f ms avg, "
+                     "%llu submit errors, %llu tracked, %llu late video frames",
+                     c.layout ? "180 SBS" : "360 mono", c.name, (unsigned long long)c.hmd_frames,
+                     st.frames, fps, c.hmd_frames ? c.hmd_render_ms / c.hmd_frames : 0,
+                     (unsigned long long)c.hmd_errors, (unsigned long long)c.hmd_tracked,
+                     (unsigned long long)c.hmd_late);
+        spike_log("VISUAL CHECK (headset): the video surrounds you, world-locked, right way up, "
+                  "front where you first looked; 180 SBS: correct depth, not cross-eyed?");
+    } else {
+        spike_log("VISUAL CHECK (TV): the clip played letterboxed, picture correct (colours, no blocks)?");
+    }
+    gl_release(&c);
 }
 #endif
 
@@ -680,7 +916,7 @@ int main(void)
         if (!strcmp(jobs[i].mode, "bench"))
             run_bench(&jobs[i]);
 #ifndef PAYLOAD
-        else if (!strcmp(jobs[i].mode, "gl"))
+        else if (!strcmp(jobs[i].mode, "gl") || !strncmp(jobs[i].mode, "vr", 2))
             run_gl(&jobs[i]);
 #endif
     }

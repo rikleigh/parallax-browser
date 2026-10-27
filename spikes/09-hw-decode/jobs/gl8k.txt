@@ -1,0 +1,4 @@
+gl    mp4  vrclip_7680x3840.mp4  hevc 1 7680 3840 20
+gl    mp4  hevc10_8k.mp4   hevc 2 7680 3840 12
+gl    ivf  vp9_4k.ivf      vp9 0 3840 2160 12
+gl    mp4  vrclip_4320x2160.mp4  hevc 1 4320 2160 12
