@@ -1,7 +1,8 @@
 # Feasibility: WebKit + WebXR on a jailbroken PS5 with PS VR2
 
-_Status: **study complete (2026-10-27). Verdict: go (§1); estimate ~7–11
-months to an end-to-end WebXR demo (§7).**_
+_Status: **study complete (2026-10-27). Verdict: go (§1); estimate ~2–3
+weeks of agent sessions to an end-to-end WebXR demo, bound by console
+debugging (§7).**_
 
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
@@ -397,26 +398,47 @@ are upstream WebKit bugs.
 targeting firmware 13.60 only (R6). Build it in two milestones, so that 2D
 browsing works before any of the XR-specific risks (R14, R15) are taken on.
 
-For one experienced engineer:
+**The work is done by Claude agents with the owner running the console**, as
+in this study, so the estimate is not in engineer-months. For calibration,
+the provisional plan put Spikes 0–3 at 1–2 weeks, and with agents they took
+about a day. Writing code and porting dependencies are not the limit. Three
+things are:
 
-| Phase | Effort |
-| --- | --- |
-| Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) and the ANGLE build (R9) | 6–10 weeks |
-| JSC fixes on device (`Date`, plus what Spike 4 already found) | 1–2 weeks |
-| WPE build + PS5 WPE Platform backend (VideoOut display, DualSense, IME, fonts), CPU-painted pages | 4–6 weeks |
-| Process launcher: elfldr spawn, reversed rendezvous, prewarming | 2–3 weeks |
-| **Milestone 1: 2D browsing on the TV** | **~3–5 months** |
-| GPU process inside the UIProcess + WC compositing on WPE (R14) | 4–6 weeks |
-| Direct-memory heap for the title (R8) | 2–3 weeks |
-| Driver work: in-process texture sharing for ANGLE, state caching (R11, R15) | 3–6 weeks |
-| OpenXR runtime on device, WebKit XR binding patch, controllers | 3–5 weeks |
-| Integration, stability, suspend/resume | 3–4 weeks |
-| **Total to an end-to-end WebXR demo** | **~7–11 months** |
+1. **The console loop.** Each run needs the owner to launch the title
+   (PS5Upload → Play). Crashes can need a reboot and a re-run of the
+   jailbreak (R1a, R10). A large WebKit binary will crash far more often than
+   the spikes did, with only the kernel log and the TCP log to debug it.
+2. **Build time.** A full WPE build probably takes an hour or more on the
+   Mac (not yet timed); incremental builds take minutes.
+3. **Checks only a person can do:** the TV picture and the headset.
 
-This is up from the provisional 4–6 months. The increase comes from the
-GPU-process merge, WC compositing on WPE and the title's memory limit, none of
-which were known before the console runs and the source review. Optional
-extras: the JIT in the WebProcess (2–4 weeks), hand tracking (~2 weeks).
+| Phase | Agent work | What sets the pace |
+| --- | --- | --- |
+| Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) and the ANGLE build (R9) | large, but parallel and Mac-only | build time |
+| JSC fixes (`Date`, plus Spike 4's patches carried over) | small | one console run |
+| WPE build + PS5 WPE Platform backend (VideoOut, DualSense, IME, fonts), CPU-painted pages | medium | console crash-and-fix loop |
+| Process launcher: elfldr spawn, reversed rendezvous, prewarming | small (Spike 8 code) | console loop |
+| **Milestone 1: 2D browsing on the TV** | | **~3–7 days of sessions** |
+| GPU process inside the UIProcess + WC compositing on WPE (R14) | medium; new design, not porting | console loop |
+| Direct-memory heap for the title (R8) | small–medium | console loop |
+| Driver work: in-process texture sharing for ANGLE, state caching (R11, R15) | medium | console loop |
+| OpenXR runtime on device, WebKit XR binding patch, controllers | small–medium (Spike 5 exists) | headset checks |
+| Integration, stability, suspend/resume | open-ended | console loop, headset checks |
+| **Milestone 2: end-to-end WebXR demo** | | **~4–10 more days of sessions** |
+
+So it is roughly **2–3 weeks of calendar time at this study's pace**, with
+wide error bars. The spikes were small programs; the port is a multi-million-
+line browser whose bugs will show up mostly as crashes on the console. The
+range assumes no blocker as hard as Spike 3 could have been. R14 and R15 are
+the likeliest to become one. Optional extras (the JIT in the WebProcess, hand
+tracking) are about a day each.
+
+**Biggest speed-up: let agents launch titles themselves.** A small payload
+that starts a registered title by ID (homebrew launchers use
+`sceLncUtilLaunchApp` for this), plus Spike 8's clean exit, would let agents
+run the build → launch → read-log → fix loop without the owner. Only the TV
+and headset checks would still need a person. Build it first, before the
+port starts.
 
 ## 8. Optional console runs before the port
 
