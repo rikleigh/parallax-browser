@@ -31,6 +31,8 @@ CLIPS=(
   "vp9_4k       vp9  3840 2160 30 30M  yuv420p"
   "vp9_57k      vp9  5760 2880 30 40M  yuv420p"
   "vp9p2_4k     vp9  3840 2160 30 30M  yuv420p10le"
+  "av1_4k       av1  3840 2160 30 20M  yuv420p"
+  "av1_8k       av1  7680 3840 30 40M  yuv420p"
 )
 
 make_clip() {
@@ -40,7 +42,11 @@ make_clip() {
     local src="testsrc2=s=${eye}x${h}:r=$fps:d=$((FRAMES / fps + 1))"
     local fg="[0:v]split[a][b];[a]$text,noise=alls=12:allf=t[l];[b]hue=h=120,$text,noise=alls=12:allf=t[r];[l][r]hstack,format=$pix[v]"
     local enc ext params
-    if [[ $codec == vp9 ]]; then
+    if [[ $codec == av1 ]]; then
+        # No hardware route on the PS5: software (dav1d) only. MP4 + IVF.
+        ext=ivf
+        enc=(-c:v libsvtav1 -preset 10 -g 60 -svtav1-params "tile-columns=2:tile-rows=1")
+    elif [[ $codec == vp9 ]]; then
         # VP9 has no Annex-B: the elementary stream is IVF (32-byte header,
         # then 12-byte frame headers), and superframes stay as muxed.
         ext=ivf
@@ -57,6 +63,7 @@ make_clip() {
         enc=(-c:v libx265 -preset superfast -profile:v $prof -x265-params "$params:log-level=error")
     fi
     local rc=(-b:v "$br" -maxrate "$br" -bufsize "$br")
+    [[ $codec == av1 ]] && rc=(-b:v "$br")  # SVT-AV1 refuses maxrate without CRF
     echo "==> $name: $codec ${w}x${h} $pix $br, $FRAMES frames"
     local t0=$SECONDS
     # Encode once into fragmented MP4 (proper timestamps; one fragment per
@@ -65,7 +72,7 @@ make_clip() {
     local tag=() bsf=h264_mp4toannexb fmt=h264
     case $codec in
         hevc) tag=(-tag:v hvc1); bsf=hevc_mp4toannexb; fmt=hevc ;;
-        vp9) bsf=; fmt=ivf ;;
+        vp9|av1) bsf=; fmt=ivf ;;
     esac
     "$FF" -hide_banner -loglevel error -y -f lavfi -i "$src" -filter_complex "$fg" -map "[v]" \
         -frames:v "$FRAMES" "${enc[@]}" "${rc[@]}" ${tag[@]+"${tag[@]}"} \

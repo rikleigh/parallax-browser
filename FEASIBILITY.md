@@ -68,9 +68,10 @@ What it adds:
   - **GStreamer**, WPE's only media backend, ported like the other
     dependencies. MSE and native HLS (`adaptivedemux2`) come with it.
   - **A decoder element of our own** wrapping Sony's hardware decoder
-    (R16), with FFmpeg (`gst-libav`) as the software fallback.
-    `MediaSource.isTypeSupported` reports HEVC only if the hardware decoder
-    works, so sites send H.264 otherwise.
+    (`libSceVideodec2`; Spike 9 measured H.264, HEVC 8/10-bit up to 8K and
+    VP9 from a title, decoding into GL buffer memory), with FFmpeg/dav1d
+    (`gst-libav`) as the software fallback, for AV1 in particular, which the
+    hardware lacks.
   - **Hole-punch video**, as WPE set-top boxes do: the page leaves a
     transparent hole where the `<video>` is, and the title draws the decoded
     frame under the page bitmap. Decoded frames never touch the CPU, which
@@ -140,6 +141,7 @@ process out of the box, while WebKit needs a patch (§4.8).
 | 3 GL → PS VR2 | **verified:** `psvr2` backend, `hmd2_probe.elf` (3a), `gl_hmd2` title (3b) | **3a (payload): FAIL by design.** Libraries load, 13.60 offset tables match, Hmd2 initialises and reports FOV, but `sceHmd2Open` refuses every user id from a non-application process (0x8a720009). **3b (title): PASS.** Zero-copy: GL 4.6 renders into ps5-opengl textures (SW_64KB_R_X) exported as T#s; 3600 frames at 60.0 fps (120 Hz out), render 1.13 ms + hand-off 0.06 ms, 0 submit errors, 3600/3600 tracked, tracker eye positions valid. Visual check: world-locked, correct stereo depth, no judder noticed; floor grid right in front looked slightly off (likely aliasing of 1-px lines and an assumed floor height, not the pipeline) | **go** |
 | 4 JSC | **verified:** `jsc` links (JSCOnly, JIT off, asm LLInt, bmalloc/libpas, ICU 76 static; 36 MB slim). 6 patches + `memmem` shim; needs libc++ 19 | **PASS** (payload): correctness **30/30** (regex, typed arrays, BigInt, generators, stack-overflow RangeError, ICU Intl, GC churn); bench **3.41 s** vs 1.04–1.10 s on M4 Max (same build): richards 596, deltablue 592, numeric 890, strings 424, alloc 906 ms. Fixes needed on device: `-DLD_PACK_RELATIVE_RELOCS=OFF` (SDK loader ignores DT_RELR), libpas commit/decommit on 16 KiB pages (patch 0006). Open: `Date` reads 1970 (wall clock source) | **go** |
 | 8 title ↔ payload IPC | **verified:** builds as title PPSA99009 with the server payload embedded | **PASS** ([README](spikes/08-title-ipc/README.md)): **the title spawns the payload through the local elfldr** (listening after 1.6–5.2 s); title → payload unix `connect` **EPERM**; **reversed works: the title listens in a 0777 directory the payload made (`/system_tmp/ps5wk`), the payload connects, shm fds pass both ways with SCM_RIGHTS**; named shm both ways; loopback TCP. RTT 131 µs (unix) / 186–249 µs (tcp); in-process baseline 18 µs in the title vs 73 µs in a payload; 112 MB/s (unix), 350 MB/s (tcp). `sceShellCoreUtilExitApp` returns 0 and the title closes **with no debug error** (user-checked) | **go** |
+| 9 hardware video decode | **verified:** `libSceVideodec2` bound through a 13.60 export table (dlsym refuses it); AUs from Annex-B, IVF and fMP4; zero-copy GL path | **PASS (title)** ([README](spikes/09-hw-decode/README.md)): VR clip **8K HEVC 93 fps**, 6K 130, 4K 90; H.264 4K 87; VP9 4K 84, 5.7K 68, Profile 2 88; HEVC Main10 8K 59, 8192x4096 60 (80 Mbit/s noisy clips); 0 errors. Linear NV12 (10-bit: LSB-aligned 16-bit) written into **GL buffer storage**, converted on the GPU in 3.2 ms at 8K with no CPU copy (readback matches). 8K decoder takes 223 MB flexible memory (139 MB at depth 2, 79 fps). **Payload: blocks in the first call.** No AV1 in the decoder; dav1d in software: 4K 92 fps, 8K 34. FFmpeg HEVC in software: 4K 46–51, 8K 20 (8 threads; 16 threads collapse). Headset run plays (0 submit errors) but **visual check open** | **go** |
 | 5 OpenXR runtime | **verified:** `libopenxr_psvr2` covers all ~50 calls WebKit makes (+ the rest of 1.0 core); host smoke test replaying WebKit's sequence **18/18 PASS** via dlopen, static link and the official Khronos loader (1.1.65); PS5 backend cross-compiles (`libopenxr_psvr2.a`) | not run; the study closed without it. Its PS5 backend is Spike 3b's code path, which passed. The first port task | — (not a gate) |
 | 6 MiniBrowser | design ([README](spikes/06-wpe-minibrowser/README.md)); superseded in part by §4.8 (WC mode, CPU-painted WebProcess, no GL in payloads) | — | port work |
 | 7 WebXR e2e | design ([README](spikes/07-webxr-e2e/README.md)); §4.8 picks the single-title option (OpenXR and WebGL in one process) | — | port work |
@@ -147,7 +149,7 @@ process out of the box, while WebKit needs a patch (§4.8).
 Console logs for every run above are in
 [`evidence/2026-10-27/`](evidence/2026-10-27/): `00-sysinfo`, `01-*` (incl.
 the run that panicked), `02b-draw-bench`, `03a-hmd2-probe-payload`,
-`titles-02-03b` (Spikes 2 and 3b over TCP), `04-jsc-*` and `08-title-ipc`.
+`titles-02-03b` (Spikes 2 and 3b over TCP), `04-jsc-*`, `08-title-ipc` and `09-*`.
 
 ### What it took to get Spike 3b running (worth knowing for the port)
 
@@ -323,6 +325,11 @@ then: LLInt, no JIT (Spike 4).
 | Socket RTT within the process | 73 µs | 18 µs |
 | JIT | RWX, RW→RX, `sceKernelJit*` all work | **RW→RX `mprotect` only** |
 
+Flexible memory, two readings: Spike 1 committed 251 MB of anonymous memory in a
+title; Spike 9's title (also ps5-opengl) reports 419 MB from
+`sceKernelAvailableFlexibleMemorySize` at start, and an 8K HEVC decoder maps
+223 MB of it (139 MB at pipeline depth 2).
+
 Consequences: the browser's UI/XR/GPU side must be a title, and its large
 heaps (JS, DOM) have to live in direct memory (a libpas/bmalloc backend over
 `sceKernelAllocateDirectMemory`, as Sony's own port does), or in payload
@@ -442,7 +449,7 @@ are upstream WebKit bugs.
 | R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | **retired** (Spike 3b) | — | Zero-copy via T# export, 3600/3600 frames |
 | R3 | GPU only usable in the title process | **accepted** (ps5-opengl is title-only; payload direct memory ~55 MB) | designed around | All GL in the title (§4.8); pacbrew Mesa in a payload is still untested |
 | R4 | No cross-process GPU memory | **observed** (Spike 1 `dmem-share` EACCES) | designed around | WC mode: the WebProcess sends CPU-painted bitmaps; WebGL, compositing and XR share one process (§4.8) |
-| R16 | Video decoding for VR video (§1a): the owner's sources need HEVC (VR site, 4K–8K) and VP9 or AV1 (YouTube, 4K). 8K is too much for software decoding on the PS5's CPU; it's unknown whether a homebrew title can use Sony's hardware decoder (AvPlayer/Videodec2), and whether it does VP9 | medium | medium: 4K is the owner's minimum, and 4K HEVC/VP9/AV1 in software is plausible on 8 Zen 2 cores; 6K–8K needs the hardware | Spike 9: HEVC 4K–8K (a real VR site clip), VP9 4K, into a GL texture in the headset; software numbers at 4K as the fallback |
+| R16 | Video decoding for VR video (§1a): the owner's sources need HEVC (VR site, 4K–8K) and VP9 or AV1 (YouTube, 4K) | **retired** (Spike 9) | low | A title reaches `libSceVideodec2`: 8K HEVC from a real VR site clip at 93 fps, 4K H.264/VP9 at 84–87, 10-bit too, decoded straight into GL buffers (no CPU copy). Left: AV1 is software only (dav1d 4K 92 fps); an 8K decoder costs 140–220 MB of the title's ~420 MB flexible memory; headset visual check ([Spike 9](spikes/09-hw-decode/README.md)) |
 | R17 | Tube sites' players misbehave in our browser: they need WebGL to play at all, or serve a lesser stream or an "unsupported browser" page to an unknown user agent | medium | medium: per site | Check the owner's sites on a desktop browser with WebGL and WebXR off; send a Safari user agent; WebGL (R14/R15) only if a site the owner needs demands it |
 | R18 | GStreamer port (core, base, good with `adaptivedemux2`, our decoder element, hole-punch sink) is larger than the other dependencies | medium | schedule | It shares glib with WPE; plugins are built static and only the few needed; set-top-box WPE ports have done hole-punch on similar hardware |
 | R14 | GPU process inside the UIProcess (WebXR goal only; not needed for §1a): WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
@@ -495,7 +502,7 @@ things are:
 
 | Phase | Agent work | What sets the pace |
 | --- | --- | --- |
-| Hardware-decode spike: 4K H.264 and 8K HEVC segments into a GL texture in the headset (R16) | small | console runs, headset check |
+| Hardware-decode spike (R16): **done** (Spike 9); only the headset visual check is left | small | headset check |
 | Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) (R9); no ANGLE | large, but parallel and Mac-only | build time |
 | JSC fixes (`Date`, plus Spike 4's patches carried over) | small | one console run |
 | WPE build + PS5 WPE Platform backend (VideoOut, DualSense, IME, fonts), CPU-painted pages | medium | console crash-and-fix loop |
