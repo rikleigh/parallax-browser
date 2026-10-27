@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "libopenxr_psvr2 (mock backend)",
+        "library_path": "./build/host/libopenxr_psvr2.dylib"
+    }
+}

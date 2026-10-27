@@ -1,0 +1,13 @@
+diff --git a/Source/WTF/wtf/Seconds.h b/Source/WTF/wtf/Seconds.h
+index bc7f0c0..7342608 100644
+--- a/Source/WTF/wtf/Seconds.h
++++ b/Source/WTF/wtf/Seconds.h
+@@ -205,7 +205,7 @@ public:
+     WTF_EXPORT_PRIVATE TimeWithDynamicClockType LEGACY_NODELETE operator-(const TimeWithDynamicClockType&) const;
+     
+     // FIXME: Remove this suppression once rdar://190195764 is fixed.
+-    SUPPRESS_MEMORY_UNSAFE_CAST friend constexpr auto operator<=>(Seconds, Seconds) = default;
++    IGNORE_CLANG_STATIC_ANALYZER_WARNINGS_ATTRIBUTE_ON_FUNCTION("alpha.webkit.MemoryUnsafeCastChecker") friend constexpr auto operator<=>(Seconds, Seconds) = default; // clang 18: [[clang::suppress]] not allowed on functions
+     
+     WTF_EXPORT_PRIVATE void dump(PrintStream&) const;
+     

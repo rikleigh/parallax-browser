@@ -1,0 +1,56 @@
+diff --git a/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp b/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
+index 26e825a..ac8762f 100644
+--- a/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
++++ b/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
+@@ -68,7 +68,7 @@ uint32_t computeJSCBytecodeCacheVersion()
+         }
+         cacheVersion.construct(0);
+         dataLogLnIf(JSCBytecodeCacheVersionInternal::verbose, "Failed to get UUID for JavaScriptCore framework");
+-#elif OS(UNIX) && !PLATFORM(PLAYSTATION) && !OS(HAIKU) && !OS(QNX)
++#elif OS(UNIX) && !PLATFORM(PLAYSTATION) && !OS(HAIKU) && !OS(QNX) && !defined(PS5_PAYLOAD_SDK)
+         auto result = ([&] -> std::optional<uint32_t> {
+             Dl_info info { };
+             if (!dladdr(jsFunctionAddr, &info))
+diff --git a/Source/WTF/wtf/unix/MemoryPressureHandlerUnix.cpp b/Source/WTF/wtf/unix/MemoryPressureHandlerUnix.cpp
+index 97b0e3d..9430fa3 100644
+--- a/Source/WTF/wtf/unix/MemoryPressureHandlerUnix.cpp
++++ b/Source/WTF/wtf/unix/MemoryPressureHandlerUnix.cpp
+@@ -28,7 +28,9 @@
+ #include "config.h"
+ #include <wtf/MemoryPressureHandler.h>
+ 
++#if HAVE(MALLOC_TRIM)
+ #include <malloc.h>
++#endif
+ #include <unistd.h>
+ #include <wtf/Logging.h>
+ #include <wtf/MainThread.h>
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_monotonic_time.c b/Source/bmalloc/libpas/src/libpas/pas_monotonic_time.c
+index 147d425..812e86b 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_monotonic_time.c
++++ b/Source/bmalloc/libpas/src/libpas/pas_monotonic_time.c
+@@ -36,7 +36,7 @@
+ #include <windows.h>
+ #endif
+ 
+-#if PAS_OS(LINUX) || PAS_PLATFORM(PLAYSTATION)
++#if PAS_OS(LINUX) || PAS_PLATFORM(PLAYSTATION) || PAS_OS(FREEBSD)
+ #include <time.h>
+ #endif
+ 
+@@ -97,6 +97,15 @@ uint64_t pas_get_current_monotonic_time_nanoseconds(void)
+     return ts.tv_sec * 1000u * 1000u * 1000u + ts.tv_nsec;
+ }
+ 
++#elif PAS_OS(FREEBSD)
++
++uint64_t pas_get_current_monotonic_time_nanoseconds(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC_FAST, &ts);
++    return ts.tv_sec * 1000u * 1000u * 1000u + ts.tv_nsec;
++}
++
+ #elif PAS_OS(WINDOWS)
+ 
+ uint64_t pas_get_current_monotonic_time_nanoseconds(void)

@@ -1,0 +1,16 @@
+# Third-party reference checkouts and local toolchains (never committed)
+/ref/
+/toolchain/
+# Build output
+build/
+*.elf
+*.o
+*.a
+# Sony system files must never enter the repo
+*.sprx
+*.prx
+*.self
+env.local.sh
+logs/
+.DS_Store
+/spikes/04-jsc/results/

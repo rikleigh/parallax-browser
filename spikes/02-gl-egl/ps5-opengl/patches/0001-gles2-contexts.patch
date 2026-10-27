@@ -1,0 +1,351 @@
+diff --git a/src/egl/ps5_egl.c b/src/egl/ps5_egl.c
+index d30f9f4..9d48170 100644
+--- a/src/egl/ps5_egl.c
++++ b/src/egl/ps5_egl.c
+@@ -76,6 +76,7 @@ struct ps5_egl_context {
+    int major;
+    int minor;
+    EGLint profile_mask;
++   EGLenum api; /* EGL_OPENGL_API or EGL_OPENGL_ES_API */
+    bool current;
+    struct ps5_egl_context *next;
+ };
+@@ -108,6 +109,14 @@ static const struct ps5_egl_config_desc ps5_configs[] = {
+    { 2, EGL_PBUFFER_BIT, EGL_OPENGL_BIT, EGL_NONE },
+ };
+ #define PS5_EGL_CONFIG_COUNT ((EGLint)(sizeof(ps5_configs) / sizeof(ps5_configs[0])))
++#ifndef EGL_OPENGL_ES3_BIT
++#define EGL_OPENGL_ES3_BIT 0x00000040
++#endif
++/* GLES variant: every config renders OpenGL and OpenGL ES 2.0/3.x (Mesa
++ * API_OPENGLES2). EGL_CONFORMANT stays OpenGL-only: no OpenGL ES CTS run has
++ * been made against real ES contexts. */
++#define PS5_EGL_RENDERABLE_TYPES \
++   (EGL_OPENGL_BIT | EGL_OPENGL_ES2_BIT | EGL_OPENGL_ES3_BIT)
+ static _Thread_local EGLint ps5_last_error = EGL_SUCCESS;
+ static _Thread_local EGLenum ps5_bound_api = EGL_OPENGL_ES_API;
+ static _Thread_local struct ps5_egl_context *ps5_current_context;
+@@ -378,9 +387,42 @@ ps5_match_config(const struct ps5_egl_config_desc *desc,
+       case EGL_CONFIG_ID:
+          break;
+       case EGL_RENDERABLE_TYPE:
+-         if (value != EGL_DONT_CARE && (value & ~EGL_OPENGL_BIT))
++         if (value != EGL_DONT_CARE && (value & ~PS5_EGL_RENDERABLE_TYPES))
++            return false;
++         break;
++      case EGL_COLOR_BUFFER_TYPE:
++         if (value != EGL_DONT_CARE && value != EGL_RGB_BUFFER)
++            return false;
++         break;
++      case EGL_LUMINANCE_SIZE:
++      case EGL_ALPHA_MASK_SIZE:
++         if (value != EGL_DONT_CARE && value > 0)
++            return false;
++         break;
++      case EGL_BIND_TO_TEXTURE_RGB:
++      case EGL_BIND_TO_TEXTURE_RGBA:
++         if (value != EGL_DONT_CARE && value == EGL_TRUE)
++            return false;
++         break;
++      case EGL_MIN_SWAP_INTERVAL:
++         if (value != EGL_DONT_CARE && value < 0)
++            return false;
++         break;
++      case EGL_MAX_SWAP_INTERVAL:
++         if (value != EGL_DONT_CARE && value > 1)
+             return false;
+          break;
++      /* Valid eglChooseConfig attributes that never exclude a config here
++       * (EGL 1.5 table 3.4: ignored, or only meaningful for other types). */
++      case EGL_NATIVE_VISUAL_TYPE:
++      case EGL_TRANSPARENT_RED_VALUE:
++      case EGL_TRANSPARENT_GREEN_VALUE:
++      case EGL_TRANSPARENT_BLUE_VALUE:
++      case EGL_MAX_PBUFFER_WIDTH:
++      case EGL_MAX_PBUFFER_HEIGHT:
++      case EGL_MAX_PBUFFER_PIXELS:
++      case EGL_MATCH_NATIVE_PIXMAP:
++         break;
+       case EGL_CONFORMANT:
+          if (value != EGL_DONT_CARE && (value & desc->conformant) != value)
+             return false;
+@@ -618,7 +660,7 @@ eglQueryString(EGLDisplay display, EGLint name)
+          "EGL_EXT_create_context_robustness EGL_KHR_no_config_context "
+          "EGL_KHR_surfaceless_context" : "";
+    case EGL_CLIENT_APIS:
+-      return "OpenGL";
++      return "OpenGL OpenGL_ES";
+    default:
+       ps5_set_error(EGL_BAD_PARAMETER);
+       return NULL;
+@@ -732,7 +774,7 @@ eglGetConfigAttrib(EGLDisplay display, EGLConfig config, EGLint attribute,
+    case EGL_CONFIG_ID: *value = desc->id; break;
+    case EGL_CONFIG_CAVEAT: *value = desc->caveat; break;
+    case EGL_NATIVE_RENDERABLE: *value = EGL_FALSE; break;
+-   case EGL_RENDERABLE_TYPE: *value = EGL_OPENGL_BIT; break;
++   case EGL_RENDERABLE_TYPE: *value = PS5_EGL_RENDERABLE_TYPES; break;
+    case EGL_SURFACE_TYPE: *value = desc->surface_type; break;
+    case EGL_TRANSPARENT_TYPE: *value = EGL_NONE; break;
+    case EGL_COLOR_BUFFER_TYPE: *value = EGL_RGB_BUFFER; break;
+@@ -748,7 +790,7 @@ eglGetConfigAttrib(EGLDisplay display, EGLConfig config, EGLint attribute,
+ EGLAPI EGLBoolean EGLAPIENTRY
+ eglBindAPI(EGLenum api)
+ {
+-   if (api != EGL_OPENGL_API) {
++   if (api != EGL_OPENGL_API && api != EGL_OPENGL_ES_API) {
+       ps5_set_error(EGL_BAD_PARAMETER);
+       return EGL_FALSE;
+    }
+@@ -820,6 +862,8 @@ eglCreateWindowSurface(EGLDisplay display, EGLConfig config,
+ struct ps5_egl_context_request {
+    int major, minor;
+    EGLint profile_mask;
++   bool profile_mask_set;     /* OpenGL-only attribute */
++   bool forward_compatible;   /* OpenGL-only flag */
+    unsigned st_flags;   /* ST_CONTEXT_FLAG_* */
+    unsigned pipe_flags; /* PIPE_CONTEXT_* */
+ };
+@@ -844,6 +888,7 @@ ps5_context_attributes(const EGLint *attributes,
+          break;
+       case EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR:
+          request->profile_mask = value;
++         request->profile_mask_set = true;
+          break;
+       case EGL_CONTEXT_FLAGS_KHR:
+          if (value & ~(EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR |
+@@ -852,8 +897,10 @@ ps5_context_attributes(const EGLint *attributes,
+             return EGL_BAD_ATTRIBUTE;
+          if (value & EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR)
+             request->st_flags |= ST_CONTEXT_FLAG_DEBUG;
+-         if (value & EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR)
++         if (value & EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR) {
+             request->st_flags |= ST_CONTEXT_FLAG_FORWARD_COMPATIBLE;
++            request->forward_compatible = true;
++         }
+          if (value & EGL_CONTEXT_OPENGL_ROBUST_ACCESS_BIT_KHR)
+             request->pipe_flags |= PIPE_CONTEXT_ROBUST_BUFFER_ACCESS;
+          break;
+@@ -903,6 +950,8 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+    EGLint profile_mask = 0;
+    unsigned context_flags = 0;
+    unsigned pipe_flags = 0;
++   const EGLenum api = ps5_bound_api;
++   bool gl_only_attribute = false;
+ 
+    PS5_EGL_LOCK();
+ 
+@@ -916,7 +965,7 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+       ps5_set_error(EGL_BAD_CONFIG);
+       return EGL_NO_CONTEXT;
+    }
+-   if (ps5_bound_api != EGL_OPENGL_API) {
++   if (api != EGL_OPENGL_API && api != EGL_OPENGL_ES_API) {
+       ps5_set_error(EGL_BAD_MATCH);
+       return EGL_NO_CONTEXT;
+    }
+@@ -928,7 +977,8 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+       }
+    }
+    if (attributes && attributes[0] != EGL_NONE) {
+-      if (!PS5_ENABLE_CORE_CONTEXT_CANDIDATE) {
++      /* EGL_CONTEXT_CLIENT_VERSION is core EGL 1.3 for OpenGL ES. */
++      if (!PS5_ENABLE_CORE_CONTEXT_CANDIDATE && api != EGL_OPENGL_ES_API) {
+          ps5_set_error(EGL_BAD_ATTRIBUTE);
+          return EGL_NO_CONTEXT;
+       }
+@@ -941,6 +991,8 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+       requested_major = request.major;
+       requested_minor = request.minor;
+       profile_mask = request.profile_mask;
++      gl_only_attribute = request.profile_mask_set ||
++                          request.forward_compatible;
+       context_flags = request.st_flags;
+       pipe_flags = request.pipe_flags;
+    }
+@@ -951,11 +1003,34 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+    st_api_query_versions(&ps5_display.frontend, &options, &core, &compat,
+                          &es1, &es2);
+ #if PS5_ENABLE_CORE_CONTEXT_CANDIDATE
+-   printf("[ps5-egl] versions core=%d compat=%d requested=%d.%d profile=%04x\n",
+-          core, compat, requested_major, requested_minor, profile_mask);
++   printf("[ps5-egl] versions core=%d compat=%d es2=%d api=%s requested=%d.%d profile=%04x\n",
++          core, compat, es2, api == EGL_OPENGL_ES_API ? "es" : "gl",
++          requested_major, requested_minor, profile_mask);
+ #endif
+    (void)es1;
+-   (void)es2;
++   if (api == EGL_OPENGL_ES_API) {
++      /* EGL_KHR_create_context: profile masks and forward-compatible flags
++       * are OpenGL-only. EGL_CONTEXT_CLIENT_VERSION aliases
++       * EGL_CONTEXT_MAJOR_VERSION_KHR and defaults to 1. */
++      if (gl_only_attribute) {
++         ps5_set_error(EGL_BAD_ATTRIBUTE);
++         return EGL_NO_CONTEXT;
++      }
++      if (!requested_major)
++         requested_major = 1;
++      /* No OpenGL ES 1.x (Mesa is built with -Dgles1=disabled); 2.0, 3.x
++       * up to the version Mesa derives from the driver caps. */
++      if (requested_major < 2 || requested_major > 3 || requested_minor < 0 ||
++          (requested_major == 2 && requested_minor != 0) ||
++          es2 <= 0 || requested_major * 10 + requested_minor > es2) {
++         ps5_set_error(EGL_BAD_MATCH);
++         return EGL_NO_CONTEXT;
++      }
++      major = es2 / 10;
++      minor = es2 % 10;
++      profile_mask = 0;
++      goto create;
++   }
+    /* EGL_KHR_create_context: the profile mask is ignored below OpenGL 3.2. */
+    if (requested_major && requested_major * 10 + requested_minor < 32)
+       profile_mask = 0;
+@@ -985,13 +1060,15 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+       ps5_set_error(EGL_BAD_MATCH);
+       return EGL_NO_CONTEXT;
+    }
++create:
+    context = calloc(1, sizeof(*context));
+    if (!context) {
+       ps5_set_error(EGL_BAD_ALLOC);
+       return EGL_NO_CONTEXT;
+    }
+    memset(&attribs, 0, sizeof(attribs));
+-   attribs.profile = profile_mask == EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR ?
++   attribs.profile = api == EGL_OPENGL_ES_API ? API_OPENGLES2 :
++                     profile_mask == EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR ?
+                      API_OPENGL_CORE : API_OPENGL_COMPAT;
+    attribs.major = requested_major ? requested_major : major;
+    attribs.minor = requested_major ? requested_minor : minor;
+@@ -1018,6 +1095,7 @@ eglCreateContext(EGLDisplay display, EGLConfig config, EGLContext share,
+    context->major = major;
+    context->minor = minor;
+    context->profile_mask = profile_mask;
++   context->api = api;
+    context->next = ps5_contexts;
+    ps5_contexts = context;
+    ps5_display.contexts++;
+@@ -1330,7 +1408,7 @@ eglQueryContext(EGLDisplay display, EGLContext context_handle,
+    }
+    switch (attribute) {
+    case EGL_CONFIG_ID: *value = context->config_id; break;
+-   case EGL_CONTEXT_CLIENT_TYPE: *value = EGL_OPENGL_API; break;
++   case EGL_CONTEXT_CLIENT_TYPE: *value = context->api; break;
+    case EGL_CONTEXT_CLIENT_VERSION: *value = context->major; break;
+ #if PS5_ENABLE_CORE_CONTEXT_CANDIDATE
+    case EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR:
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 9631cc4..57bd574 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -17792,9 +17792,11 @@ ps5_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
+    struct ps5_context *context;
+    struct pipe_resource descriptor_template;
+ 
+-   /* Robust buffer access and reset notification need no context state here. */
++   /* Robust buffer access and reset notification need no context state here.
++    * NO_LOD_BIAS is the hint Mesa passes for every OpenGL ES context: the
++    * driver keeps programming the (always zero) sampler LOD bias. */
+    if (flags & ~(PIPE_CONTEXT_PREFER_THREADED | PIPE_CONTEXT_ROBUST_BUFFER_ACCESS |
+-                 PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET))
++                 PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET | PIPE_CONTEXT_NO_LOD_BIAS))
+       return NULL;
+ 
+    context = calloc(1, sizeof(*context));
+@@ -18211,6 +18213,15 @@ ps5_screen_create(void)
+    caps->anisotropic_filter = PS5_ENABLE_GLSL_460_CANDIDATE;
+    caps->max_texture_anisotropy = PS5_ENABLE_GLSL_460_CANDIDATE ? 16.0f : 0.0f;
+    caps->query_so_overflow = PS5_ENABLE_GLSL_460_CANDIDATE;
++   /* OpenGL ES only (st_extensions EXT_CAP): OES_texture_half_float_linear
++    * is the one compute_version_es2() input this driver otherwise lacks for
++    * ES 3.0 (and so 3.1/3.2). FP16 filtering is already required, and CTS
++    * covered, by desktop GL 3.0+. OES_standard_derivatives: GLSL core since
++    * 1.10. texture_float_linear stays unset: Mesa also uses it to force
++    * NEAREST sampling of FP32 textures in every API, so changing it would
++    * change validated GL behaviour. */
++   caps->texture_half_float_linear = true;
++   caps->fragment_shader_derivatives = true;
+    caps->gl_begin_end_buffer_size = 512 * 1024;
+    caps->min_map_buffer_alignment = 64;
+    vs_caps = (struct pipe_shader_caps *)
+diff --git a/toolchain/build-mesa-ps5.sh b/toolchain/build-mesa-ps5.sh
+index 4f4158f..6fef5e0 100644
+--- a/toolchain/build-mesa-ps5.sh
++++ b/toolchain/build-mesa-ps5.sh
+@@ -52,7 +52,7 @@ meson_args="
+ -Degl=disabled
+ -Dgbm=disabled
+ -Dgles1=disabled
+--Dgles2=disabled
++-Dgles2=enabled
+ -Dglx=disabled
+ -Dllvm=disabled
+ -Dzlib=disabled
+diff --git a/toolchain/install-ps5-opengl-core33.sh b/toolchain/install-ps5-opengl-core33.sh
+index 3a4ab49..d7ad519 100644
+--- a/toolchain/install-ps5-opengl-core33.sh
++++ b/toolchain/install-ps5-opengl-core33.sh
+@@ -64,7 +64,7 @@ install -d "$prefix/include" "$prefix/lib/pkgconfig" \
+     "$prefix/lib/cmake/PS5OpenGL" "$prefix/share/ps5-opengl" \
+     "$prefix/lib/cmake/PS5OpenGLCore33" \
+     "$prefix/share/ps5-opengl-core33"
+-for headers in EGL GL KHR; do
++for headers in EGL GL GLES2 GLES3 KHR; do
+     cp -a "$root/third_party/mesa-26.2.0/include/$headers" \
+         "$prefix/include/"
+ done
+diff --git a/toolchain/ps5-opengl-core33.mk b/toolchain/ps5-opengl-core33.mk
+index 762e57b..7d6c9c5 100644
+--- a/toolchain/ps5-opengl-core33.mk
++++ b/toolchain/ps5-opengl-core33.mk
+@@ -150,6 +150,7 @@ $(PS5_OPENGL_BUILD)/ps5_egl.o: $(PS5_OPENGL_ROOT)/src/egl/ps5_egl.c \
+ 		$(PS5_OPENGL_RUNTIME_DEFINES) \
+ 		-DHAVE_STRUCT_TIMESPEC=1 -DPS5_ENABLE_COMPRESSED_FALLBACK_CANDIDATE=1 \
+ 		-DPS5_ENABLE_CORE_CONTEXT_CANDIDATE=1 \
++		-DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=1 \
+ 		-Wno-error=unused-parameter -Wno-unreachable-code-generic-assoc \
+ 		-I$(PS5_OPENGL_MESA_SRC)/src/mesa -c -o $@ $<
+ 
+diff --git a/tools/generate-gl46-entrypoints.py b/tools/generate-gl46-entrypoints.py
+index 79800ef..4d29950 100644
+--- a/tools/generate-gl46-entrypoints.py
++++ b/tools/generate-gl46-entrypoints.py
+@@ -42,14 +42,26 @@ def main() -> None:
+     if len(commands) != 657:
+         raise SystemExit(f"unexpected OpenGL 4.6 command count: {len(commands)}")
+ 
++    # GLES variant: OpenGL ES 3.2 commands absent from OpenGL 4.6 Core
++    # (glBlendBarrier, glPrimitiveBoundingBox) also get static wrappers so
++    # ES applications can link them directly, not only via eglGetProcAddress.
++    gles_commands = set()
++    for feature in root.findall("feature"):
++        if (feature.get("api") != "gles2" or
++                tuple(map(int, feature.get("number").split("."))) > (3, 2)):
++            continue
++        for requirement in feature.findall("require"):
++            gles_commands.update(item.get("name") for item in requirement.findall("command"))
++    gles_only = gles_commands - commands
++
+     exported = symbols(args.bridge, args.glapi)
+-    missing = sorted(commands - exported)
++    missing = sorted((commands | gles_only) - exported)
+     nodes = {node.findtext("proto/name"): node for node in root.findall("commands/command")}
+     stubs = {}
+     for name in missing:
+         exact = "_dispatch_stub_" + name[2:]
+         candidates = ([exact] if exact in exported else
+-                      [exact + suffix for suffix in ("ARB", "EXT", "NV", "KHR")])
++                      [exact + suffix for suffix in ("ARB", "EXT", "NV", "KHR", "OES")])
+         candidates = [candidate for candidate in candidates if candidate in exported]
+         if len(candidates) != 1:
+             raise SystemExit(f"expected one Mesa dispatch stub for {name}, got {candidates}")
+@@ -78,7 +90,8 @@ def main() -> None:
+             "",
+         ])
+     args.output.write_text("\n".join(lines), newline="\n")
+-    print(f"generated {len(missing)} static wrappers for 657 OpenGL 4.6 Core commands")
++    print(f"generated {len(missing)} static wrappers for 657 OpenGL 4.6 Core "
++          f"and {len(gles_only)} OpenGL ES 3.2-only commands")
+ 
+ 
+ if __name__ == "__main__":

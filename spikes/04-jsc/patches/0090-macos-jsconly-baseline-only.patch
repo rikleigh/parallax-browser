@@ -1,0 +1,22 @@
+diff --git a/Source/WTF/wtf/MemoryFootprint.h b/Source/WTF/wtf/MemoryFootprint.h
+index bc7123f..f3b51db 100644
+--- a/Source/WTF/wtf/MemoryFootprint.h
++++ b/Source/WTF/wtf/MemoryFootprint.h
+@@ -28,7 +28,7 @@
+ #include <cstdint>
+ #include <wtf/ExportMacros.h>
+ 
+-#if PLATFORM(COCOA)
++#if OS(DARWIN)
+ #include <mach/port.h>
+ #endif
+ 
+@@ -36,7 +36,7 @@ namespace WTF {
+ 
+ WTF_EXPORT_PRIVATE size_t memoryFootprint();
+ 
+-#if PLATFORM(COCOA)
++#if OS(DARWIN)
+ WTF_EXPORT_PRIVATE size_t memoryFootprint(mach_port_t);
+ #endif
+ 

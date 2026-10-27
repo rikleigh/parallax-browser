@@ -1,0 +1,59 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2d27e64..4d0ce3e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,8 +9,9 @@
+ cmake_minimum_required(VERSION 3.20)
+ set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/Source/cmake")
+ 
+-if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
++if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND NOT CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
+     # Resolve the SDK and pin tools before the call to project().
++    # Skipped when cross-compiling with a toolchain file (e.g. PS5 payload SDK).
+     include(WebKitXcodeSDK)
+ endif ()
+ 
+diff --git a/Source/cmake/OptionsJSCOnly.cmake b/Source/cmake/OptionsJSCOnly.cmake
+index 28fd648..03b997d 100644
+--- a/Source/cmake/OptionsJSCOnly.cmake
++++ b/Source/cmake/OptionsJSCOnly.cmake
+@@ -10,6 +10,11 @@ endif ()
+ 
+ add_definitions(-DBUILDING_JSCONLY__)
+ 
++# PS5 homebrew payload SDK (ps5-payload-sdk): FreeBSD-like userland, not Sony's SDK.
++if (PS5)
++    add_definitions(-DPS5_PAYLOAD_SDK=1)
++endif ()
++
+ set(PROJECT_VERSION_MAJOR 1)
+ set(PROJECT_VERSION_MINOR 0)
+ set(PROJECT_VERSION_MICRO 0)
+@@ -43,9 +48,9 @@ set(ENABLE_WEBINSPECTORUI OFF)
+ set(ENABLE_WEBGL OFF)
+ set(ENABLE_WEBGPU OFF)
+ 
+-if (WIN32)
++if (WIN32 OR CMAKE_CROSSCOMPILING)
+     set(ENABLE_API_TESTS OFF)
+-else ()
++elseif (NOT DEFINED CACHE{ENABLE_API_TESTS})
+     set(ENABLE_API_TESTS ON)
+ endif ()
+ 
+diff --git a/Source/cmake/WebKitCompilerFlags.cmake b/Source/cmake/WebKitCompilerFlags.cmake
+index fb4f616..acc6c3a 100644
+--- a/Source/cmake/WebKitCompilerFlags.cmake
++++ b/Source/cmake/WebKitCompilerFlags.cmake
+@@ -465,7 +465,10 @@ macro(DETERMINE_GCC_SYSTEM_INCLUDE_DIRS _lang _compiler _flags _result)
+     endif ()
+ endmacro()
+ 
+-if (COMPILER_IS_GCC_OR_CLANG)
++# Skipped when cross-compiling: compiler wrappers such as the PS5 payload SDK's
++# prospero-clang append crt objects to every non -c invocation, which makes the
++# -E probe preprocess binary files (hundreds of MB of stderr, minutes of regex).
++if (COMPILER_IS_GCC_OR_CLANG AND NOT CMAKE_CROSSCOMPILING)
+    DETERMINE_GCC_SYSTEM_INCLUDE_DIRS("c" "${CMAKE_C_COMPILER}" "${CMAKE_C_FLAGS}" SYSTEM_INCLUDE_DIRS)
+    set(CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES ${CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES} ${SYSTEM_INCLUDE_DIRS})
+    DETERMINE_GCC_SYSTEM_INCLUDE_DIRS("c++" "${CMAKE_CXX_COMPILER}" "${CMAKE_CXX_FLAGS}" SYSTEM_INCLUDE_DIRS)

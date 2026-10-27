@@ -1,0 +1,125 @@
+// Small CPU benchmark for an interpreter-only jsc (LLInt, no JIT).
+// Self-contained: richards-style task scheduler, deltablue-ish constraint
+// propagation, a numeric kernel, string/regexp/JSON churn and an object
+// allocation (GC) test. Each runs for a fixed iteration count; prints ms per
+// kernel and a total. Compare the same file on macOS and on the PS5.
+var log = (typeof print === "function") ? print : console.log;
+var now = (typeof preciseTime === "function") ? () => preciseTime() * 1000 : () => Date.now();
+
+// ---------------------------------------------------------------- richards-lite
+function richards(iterations) {
+    // Round-robin scheduler with a few task kinds passing packets around.
+    function Packet(link, id, kind) { this.link = link; this.id = id; this.kind = kind; this.a1 = 0; this.a2 = new Array(4).fill(0); }
+    function Task(id, pri, queue, fn) { this.id = id; this.pri = pri; this.queue = queue; this.fn = fn; this.held = false; this.v1 = 0; this.v2 = 0; }
+    var count = 0;
+    for (var it = 0; it < iterations; it++) {
+        var tasks = [];
+        var q = null;
+        for (var i = 0; i < 6; i++) q = new Packet(q, i % 3, i & 1);
+        tasks.push(new Task(0, 1000, null, function (t, p) { t.v1 = (t.v1 * 1103515245 + 12345) & 0x7fffffff; return t.v1 & 3; }));
+        tasks.push(new Task(1, 2000, q, function (t, p) { if (p) { p.a1 = (p.a1 + 1) & 7; p.a2[p.a1 & 3] += t.v2++; } return 1 + (t.v2 & 1); }));
+        tasks.push(new Task(2, 3000, q, function (t, p) { if (p) { for (var j = 0; j < 4; j++) p.a2[j] ^= j + t.v1; t.v1++; } return 0; }));
+        tasks.push(new Task(3, 4000, null, function (t, p) { t.held = !t.held; return t.held ? 2 : 3; }));
+        var cur = 0;
+        for (var step = 0; step < 1000; step++) {
+            var t = tasks[cur];
+            var p = t.queue;
+            if (p) t.queue = p.link;
+            cur = t.fn(t, p);
+            if (p) { p.link = tasks[(cur + 1) & 3].queue; tasks[(cur + 1) & 3].queue = p; }
+            count++;
+        }
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------- deltablue-lite
+function deltablue(iterations) {
+    // Chain of equality constraints; propagate a value change down the chain.
+    function Variable(v) { this.value = v; this.constraints = []; this.stay = false; }
+    function Eq(a, b) { this.a = a; this.b = b; a.constraints.push(this); b.constraints.push(this); }
+    Eq.prototype.execute = function () { this.b.value = this.a.value; };
+    Eq.prototype.output = function () { return this.b; };
+    var total = 0;
+    for (var it = 0; it < iterations; it++) {
+        var n = 100, vars = [];
+        for (var i = 0; i < n; i++) vars.push(new Variable(i));
+        for (var i = 0; i < n - 1; i++) new Eq(vars[i], vars[i + 1]);
+        for (var k = 0; k < 10; k++) {
+            vars[0].value = k * 7 + it;
+            var todo = [vars[0]];
+            while (todo.length) {
+                var v = todo.pop();
+                for (var c of v.constraints) if (c.a === v) { c.execute(); todo.push(c.output()); }
+            }
+            if (vars[n - 1].value !== k * 7 + it) throw new Error("deltablue: propagation failed");
+            total += vars[n - 1].value;
+        }
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------- numeric
+function numeric(iterations) {
+    // Mandelbrot-ish float loop + int sieve.
+    var acc = 0;
+    for (var it = 0; it < iterations; it++) {
+        for (var y = 0; y < 24; y++) for (var x = 0; x < 48; x++) {
+            var cr = x / 24 - 1.5, ci = y / 12 - 1, zr = 0, zi = 0, k = 0;
+            while (k < 50 && zr * zr + zi * zi < 4) { var t = zr * zr - zi * zi + cr; zi = 2 * zr * zi + ci; zr = t; k++; }
+            acc += k;
+        }
+        var sieve = new Uint8Array(8192), primes = 0;
+        for (var i = 2; i < 8192; i++) if (!sieve[i]) { primes++; for (var j = i * 2; j < 8192; j += i) sieve[j] = 1; }
+        acc += primes;
+    }
+    return acc;
+}
+
+// ---------------------------------------------------------------- strings/regexp/json
+function strings(iterations) {
+    var acc = 0;
+    for (var it = 0; it < iterations; it++) {
+        var parts = [];
+        for (var i = 0; i < 200; i++) parts.push("item-" + i + ":" + (i * 31 % 97));
+        var s = parts.join(";");
+        var m = s.match(/item-(\d+):(\d+)/g);
+        acc += m.length;
+        var obj = { list: parts.slice(0, 50), n: it, nested: { a: [1, 2, 3], b: "x".repeat(20) } };
+        acc += JSON.parse(JSON.stringify(obj)).list.length;
+        acc += s.toUpperCase().indexOf("ITEM-199");
+    }
+    return acc;
+}
+
+// ---------------------------------------------------------------- allocation / GC
+function alloc(iterations) {
+    var acc = 0;
+    for (var it = 0; it < iterations; it++) {
+        var tree = null;
+        for (var i = 0; i < 2000; i++) tree = { l: tree, r: { v: i, s: [i, i + 1] }, v: i };
+        while (tree) { acc += tree.v + tree.r.s[1]; tree = tree.l; }
+    }
+    return acc;
+}
+
+var kernels = [
+    ["richards", richards, 4000],
+    ["deltablue", deltablue, 1200],
+    ["numeric", numeric, 400],
+    ["strings", strings, 4000],
+    ["alloc", alloc, 2000],
+];
+
+var scale = (typeof BENCH_SCALE === "number") ? BENCH_SCALE : 1;
+log("bench: scale=" + scale);
+var total = 0;
+for (var [name, fn, iters] of kernels) {
+    fn(1); // warm up (LLInt has no tiers to warm, but caches/ICs exist)
+    var t0 = now();
+    var r = fn(Math.max(1, Math.round(iters * scale)));
+    var dt = now() - t0;
+    total += dt;
+    log("  " + name.padEnd(10) + dt.toFixed(1).padStart(9) + " ms   (checksum " + r + ")");
+}
+log("BENCH TOTAL: " + total.toFixed(1) + " ms");

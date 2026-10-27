@@ -1,0 +1,238 @@
+diff --git a/src/egl/ps5_egl.c b/src/egl/ps5_egl.c
+index 9d48170..6a1a726 100644
+--- a/src/egl/ps5_egl.c
++++ b/src/egl/ps5_egl.c
+@@ -16,6 +16,9 @@
+ #include "glapi/glapi/glapi.h"
+ #include "main/context.h"
+ #include "main/glthread.h"
++#include "main/texobj.h"
++#include "ps5_egl_export.h"
++#include "state_tracker/st_cb_texture.h"
+ #include "pipe/p_screen.h"
+ #include "pipe/p_state.h"
+ #include "ps5_screen.h"
+@@ -658,7 +661,8 @@ eglQueryString(EGLDisplay display, EGLint name)
+       return PS5_ENABLE_CORE_CONTEXT_CANDIDATE ?
+          "EGL_KHR_create_context EGL_KHR_create_context_no_error "
+          "EGL_EXT_create_context_robustness EGL_KHR_no_config_context "
+-         "EGL_KHR_surfaceless_context" : "";
++         "EGL_KHR_surfaceless_context EGL_PS5_texture_descriptor_export" :
++         "EGL_PS5_texture_descriptor_export";
+    case EGL_CLIENT_APIS:
+       return "OpenGL OpenGL_ES";
+    default:
+@@ -1502,11 +1506,83 @@ eglWaitNative(EGLint engine)
+    return EGL_TRUE;
+ }
+ 
++/* Zero-copy hand-off of a GL texture to another AGC consumer (PS VR2
++ * reprojection via libSceHmd2/VideoOut layers): finishes all GL work on the
++ * calling thread's current context, then returns the driver's own GFX10 T#
++ * and addressing for the texture's storage. The texture must be a complete
++ * GL_TEXTURE_2D/RECTANGLE whose storage is the image itself (see
++ * ps5_resource_export_descriptor); immutable storage (glTexStorage2D) keeps
++ * the address stable until the texture is deleted. */
++EGLAPI EGLBoolean EGLAPIENTRY
++eglExportTextureDescriptorPS5(EGLDisplay display, EGLContext context_handle,
++                              GLuint texture, uint32_t tsharp[8],
++                              uint64_t *gpu_address, uint32_t *width,
++                              uint32_t *height, uint32_t *pitch,
++                              uint32_t *swizzle_mode)
++{
++   struct pipe_fence_handle *fence = NULL;
++   struct ps5_egl_context *context;
++   uint32_t descriptor[8];
++   uint64_t address = 0;
++   unsigned row_pitch = 0, sw_mode = 0;
++
++   PS5_EGL_LOCK();
++   context = ps5_context(context_handle);
++   if (!ps5_valid_display(display, true)) {
++      ps5_set_error(EGL_BAD_DISPLAY);
++      return EGL_FALSE;
++   }
++   if (!context) {
++      ps5_set_error(EGL_BAD_CONTEXT);
++      return EGL_FALSE;
++   }
++   /* GL objects and the pipe context belong to the current thread. */
++   if (context != ps5_current_context) {
++      ps5_set_error(EGL_BAD_ACCESS);
++      return EGL_FALSE;
++   }
++   if (!tsharp || !gpu_address || !texture) {
++      ps5_set_error(EGL_BAD_PARAMETER);
++      return EGL_FALSE;
++   }
++   struct gl_context *ctx = context->st->ctx;
++   _mesa_glthread_finish(ctx);
++   struct gl_texture_object *object = _mesa_lookup_texture(ctx, texture);
++   if (!object || (object->Target != GL_TEXTURE_2D &&
++                   object->Target != GL_TEXTURE_RECTANGLE) ||
++       !st_finalize_texture(ctx, context->st->pipe, object, 0) || !object->pt) {
++      ps5_set_error(EGL_BAD_PARAMETER);
++      return EGL_FALSE;
++   }
++   /* Every queued draw that may write the texture has retired on the GPU. */
++   st_context_flush(context->st, ST_FLUSH_WAIT, &fence, NULL, NULL);
++   if (fence)
++      ps5_display.screen->fence_reference(ps5_display.screen, &fence, NULL);
++   if (ps5_resource_export_descriptor(object->pt, descriptor, &address,
++                                      &row_pitch, &sw_mode)) {
++      ps5_set_error(EGL_BAD_MATCH);
++      return EGL_FALSE;
++   }
++   memcpy(tsharp, descriptor, sizeof(descriptor));
++   *gpu_address = address;
++   if (width)
++      *width = object->pt->width0;
++   if (height)
++      *height = object->pt->height0;
++   if (pitch)
++      *pitch = row_pitch;
++   if (swizzle_mode)
++      *swizzle_mode = sw_mode;
++   return EGL_TRUE;
++}
++
+ EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY
+ eglGetProcAddress(const char *name)
+ {
+    if (!name)
+       return NULL;
++   if (!strcmp(name, "eglExportTextureDescriptorPS5"))
++      return (__eglMustCastToProperFunctionPointerType)eglExportTextureDescriptorPS5;
+ #ifdef PS5_DYNAMIC_SCANOUT
+    if (!strcmp(name, "eglSetDisplayModePS5"))
+       return (__eglMustCastToProperFunctionPointerType)eglSetDisplayModePS5;
+diff --git a/src/egl/ps5_egl_export.h b/src/egl/ps5_egl_export.h
+new file mode 100644
+index 0000000..7efe486
+--- /dev/null
++++ b/src/egl/ps5_egl_export.h
+@@ -0,0 +1,38 @@
++/* ps5webkit addition to PS5 OpenGL (GPL-3.0-or-later).
++ * EGL_PS5_texture_descriptor_export: zero-copy export of a GL texture's AGC
++ * (GFX10) image descriptor, e.g. for libSceHmd2 / VideoOut VR layers. */
++#ifndef PS5_EGL_EXPORT_H
++#define PS5_EGL_EXPORT_H
++
++#include <stdint.h>
++#include <EGL/egl.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Values of *swizzle_mode (SQ_IMG_RSRC_WORD3.SW_MODE). */
++#define EGL_PS5_SW_MODE_LINEAR    0u
++#define EGL_PS5_SW_MODE_64KB_R_X 27u
++
++/* ctx must be current on the calling thread. Finishes all GL work (waits for
++ * the GPU), then fills tsharp[8] with the sampled T# the driver uses for the
++ * texture, *gpu_address with its 256-byte aligned GPU VA (== CPU VA), the
++ * level-0 size, the row pitch in texels and the swizzle mode. Returns
++ * EGL_FALSE with EGL_BAD_MATCH when the texture's memory is not the image
++ * itself (MSAA, depth, staged render targets). width/height/pitch/
++ * swizzle_mode may be NULL. */
++EGLAPI EGLBoolean EGLAPIENTRY
++eglExportTextureDescriptorPS5(EGLDisplay dpy, EGLContext ctx, unsigned int texture,
++                              uint32_t tsharp[8], uint64_t *gpu_address,
++                              uint32_t *width, uint32_t *height,
++                              uint32_t *pitch, uint32_t *swizzle_mode);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLEXPORTTEXTUREDESCRIPTORPS5PROC)(
++   EGLDisplay dpy, EGLContext ctx, unsigned int texture, uint32_t tsharp[8],
++   uint64_t *gpu_address, uint32_t *width, uint32_t *height, uint32_t *pitch,
++   uint32_t *swizzle_mode);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 57bd574..af8a4a7 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -5768,6 +5768,43 @@ ps5_resource_sampled_image_descriptor(struct pipe_resource *base, unsigned first
+    return ps5_resource_image_descriptor(base, descriptor, PIPE_BIND_SAMPLER_VIEW, first_level, last_level);
+ }
+ 
++/* PS5 export (eglExportTextureDescriptorPS5): the sampled T# this driver
++ * itself uses for the resource, plus its addressing. Only resources whose
++ * memory holds the authoritative image are exported: no render/depth staging
++ * copy, no MSAA, no depth/stencil and no scanout alias. The GPU address is
++ * the CPU VA of the direct-memory mapping (type 12 WB_ONION, protection 0x33,
++ * the same as PS5VR's eye buffers): this driver programs that VA unchanged
++ * into every descriptor and colour target. */
++int
++ps5_resource_export_descriptor(struct pipe_resource *base, uint32_t descriptor[8],
++                               uint64_t *gpu_address, unsigned *pitch,
++                               unsigned *swizzle_mode)
++{
++   const struct ps5_resource *resource = (const struct ps5_resource *)base;
++
++   if (!base || !descriptor || !gpu_address || !pitch || !swizzle_mode ||
++       (base->target != PIPE_TEXTURE_2D && base->target != PIPE_TEXTURE_RECT) ||
++       base->nr_samples > 1 || base->nr_storage_samples > 1 ||
++       (base->bind & (PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_DISPLAY_TARGET)) ||
++       resource->render_staging_size || resource->depth_staging_size ||
++       !resource->data ||
++       ps5_resource_sampled_image_descriptor(base, 0, base->last_level, descriptor))
++      return -1;
++   *gpu_address = (uint64_t)(uintptr_t)resource->data;
++   /* SQ_IMG_RSRC_WORD3.SW_MODE: 0 = LINEAR, 27 = SW_64KB_R_X (GFX10). */
++   *swizzle_mode = (descriptor[3] >> 20) & 0x1fu;
++   const unsigned texel = util_format_get_blocksize(base->format);
++   if (*swizzle_mode) {
++      /* 64 KiB tile footprint of ps5_tiled_color_surface_size(). */
++      const unsigned tile_width = texel == 1 || texel == 2 ? 256u :
++                                  texel == 16 ? 64u : 128u;
++      *pitch = (base->width0 + tile_width - 1u) & ~(tile_width - 1u);
++   } else {
++      *pitch = texel ? resource->level_stride[0] / texel : 0;
++   }
++   return 0;
++}
++
+ int
+ ps5_resource_sampled_image_descriptor_owned(struct pipe_resource *base,
+                                             const uint32_t descriptor[8])
+diff --git a/src/gallium/ps5/ps5_screen.h b/src/gallium/ps5/ps5_screen.h
+index 7d171c1..03a8005 100644
+--- a/src/gallium/ps5/ps5_screen.h
++++ b/src/gallium/ps5/ps5_screen.h
+@@ -55,5 +55,9 @@ int ps5_resource_stencil_info(struct pipe_resource *resource, void **address,
+                               size_t *allocation_size);
+ struct pipe_resource *ps5_display_target_alias(struct pipe_resource *owner,
+                                                unsigned buffer_index);
++/* PS5 export: driver T#, GPU VA, pitch (texels) and SQ_IMG_RSRC_WORD3.SW_MODE. */
++int ps5_resource_export_descriptor(struct pipe_resource *resource,
++                                   uint32_t descriptor[8], uint64_t *gpu_address,
++                                   unsigned *pitch, unsigned *swizzle_mode);
+ 
+ #endif
+diff --git a/toolchain/install-ps5-opengl-core33.sh b/toolchain/install-ps5-opengl-core33.sh
+index d7ad519..cc2cffb 100644
+--- a/toolchain/install-ps5-opengl-core33.sh
++++ b/toolchain/install-ps5-opengl-core33.sh
+@@ -68,6 +68,7 @@ for headers in EGL GL GLES2 GLES3 KHR; do
+     cp -a "$root/third_party/mesa-26.2.0/include/$headers" \
+         "$prefix/include/"
+ done
++install -m 0644 "$root/src/egl/ps5_egl_export.h" "$prefix/include/ps5_egl_export.h"
+ # This describes the fixed native drawable, not the connected HDMI signal.
+ display_height=${PS5_SCANOUT_HEIGHT:-1080}
+ display_fps=${PS5_SCANOUT_FPS:-60}
+diff --git a/toolchain/ps5-opengl-core33.mk b/toolchain/ps5-opengl-core33.mk
+index 7d6c9c5..ec5671c 100644
+--- a/toolchain/ps5-opengl-core33.mk
++++ b/toolchain/ps5-opengl-core33.mk
+@@ -145,6 +145,7 @@ $(PS5_OPENGL_RUNTIME_OBJECTS): $(PS5_OPENGL_BUILD)/runtime-config.txt $(ps5_open
+ 	$(PS5_OPENGL_PLATFORM)/ps5_scanout.h
+ 
+ $(PS5_OPENGL_BUILD)/ps5_egl.o: $(PS5_OPENGL_ROOT)/src/egl/ps5_egl.c \
++	$(PS5_OPENGL_ROOT)/src/egl/ps5_egl_export.h \
+ 	$(PS5_OPENGL_DRIVER)/ps5_screen.h | $(PS5_OPENGL_BUILD)
+ 	$(CC) $(PS5_OPENGL_COMMON_CFLAGS) -DHAVE_PTHREAD=1 \
+ 		$(PS5_OPENGL_RUNTIME_DEFINES) \

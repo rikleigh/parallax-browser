@@ -1,0 +1,8 @@
+-target
+x86_64-sie-ps5
+-isystem
+toolchain/ps5-payload-sdk/target/include
+-isystem
+toolchain/ps5-payload-sdk/target/include/c++/v1
+-Itoolchain/khronos/include
+-Ispikes
