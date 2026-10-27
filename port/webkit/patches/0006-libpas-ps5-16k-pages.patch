@@ -1,0 +1,40 @@
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c b/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c
+index ee1c884e46..76c12a73ca 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c
++++ b/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c
+@@ -433,6 +433,17 @@ void pas_page_malloc_zero_fill(void* base, size_t size, pas_memory_flavor flavor
+ 
+ static void commit_impl(void* ptr, size_t size, bool do_mprotect, bool is_symmetric, pas_memory_flavor flavor)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    /* PS5: pages are 16 KiB but libpas commits/decommits 4 KiB granules, so
++     * a granule is part of a page. Decommit just zeroes the granule (see
++     * decommit_impl) and memory stays committed: nothing to do here. */
++    PAS_UNUSED_PARAM(ptr);
++    PAS_UNUSED_PARAM(size);
++    PAS_UNUSED_PARAM(do_mprotect);
++    PAS_UNUSED_PARAM(is_symmetric);
++    PAS_UNUSED_PARAM(flavor);
++    return;
++#endif
+     uintptr_t base_as_int;
+     uintptr_t end_as_int;
+ 
+@@ -515,6 +526,17 @@ static void decommit_impl(void* ptr, size_t size,
+                           bool do_mprotect, bool is_symmetric,
+                           pas_memory_flavor flavor)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    /* PS5 (see commit_impl): a 4 KiB granule is part of a 16 KiB page, so it
++     * cannot be madvised or mprotected on its own (libpas asserted on page
++     * alignment here on the console). Zero it, as a fresh commit would be,
++     * and keep it. TODO: 16 KiB granules, as libpas does on Apple arm64. */
++    PAS_UNUSED_PARAM(do_mprotect);
++    PAS_UNUSED_PARAM(is_symmetric);
++    PAS_UNUSED_PARAM(flavor);
++    memset(ptr, 0, size);
++    return;
++#endif
+     static const bool verbose = PAS_SHOULD_LOG(PAS_LOG_OTHER);
+ 
+     uintptr_t base_as_int;

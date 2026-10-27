@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# WPE WebKit for the PS5 (Milestone 1: browse on the TV, pages painted on the
+# CPU). Builds WebKit 15486a0178 with PORT=WPE and the PS5 WPE Platform
+# backend (wpe-ps5/) against ps5-payload-sdk, libc++ 19 and the dependency
+# sysroot from port/deps (toolchain/wpe-sysroot).
+#
+#   port/webkit/build.sh                 # src shim configure build
+#   port/webkit/build.sh src             # (re)create the patched source tree
+#   port/webkit/build.sh configure       # cmake only (shows missing deps)
+#   port/webkit/build.sh build           # ninja (all WebKit targets we need)
+#   port/webkit/build.sh export-patches  # clone commits -> port/webkit/patches
+#   port/webkit/build.sh status          # disk use, deps found
+#
+# Layout:
+#   toolchain/wpe-webkit/src     private clone of ref/WebKit (shared objects,
+#                                sparse checkout), branch "ps5" = 15486a0178 +
+#                                one commit per patches/*.patch
+#   toolchain/wpe-webkit/build   cmake/ninja build (Release, -gline-tables-only)
+#
+# Env: JOBS (default ncpu), FRESH_SRC=1, NINJA_TARGETS="...", NINJA_FLAGS="-k 0",
+#      DEBUG_FLAGS (default -gline-tables-only; -g0 for the smallest build)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+. "$ROOT/env.sh" >/dev/null
+
+JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+WK="$ROOT/toolchain/wpe-webkit"
+SRC="$WK/src"
+BLD="${BLD:-$WK/build}"
+WEBKIT_REF="$ROOT/ref/WebKit"
+WEBKIT_COMMIT=15486a017817cad93f25fdffeb013278866970fc
+SHIM="$HERE/shim"
+LIBCXX="$ROOT/toolchain/libcxx19/install"
+ICU="$ROOT/toolchain/icu/install-ps5"
+SYSROOT="${WPE_SYSROOT:-$ROOT/toolchain/wpe-sysroot}"
+PKGCONFIG="$ROOT/port/deps/pkg-config-ps5"
+
+log() { printf '\n=== %s\n' "$*"; }
+
+# ------------------------------------------------------------------- source
+# A clone that shares ref/WebKit's object store (alternates; ref/WebKit is
+# never written to), sparse: Source/ minus libwebrtc, plus the Tools bits the
+# build reads. Patches are applied as commits on branch "ps5" so they can be
+# edited in place and exported again (export-patches).
+step_src() {
+    if [ ! -d "$SRC/.git" ]; then
+        log "cloning $WEBKIT_REF -> $SRC (shared objects, sparse)"
+        mkdir -p "$WK"
+        git clone -q --no-checkout "$WEBKIT_REF" "$SRC" || true
+        # A clone of a shallow repo copies the pack; use the reference's
+        # objects through alternates instead.
+        echo "$WEBKIT_REF/.git/objects" > "$SRC/.git/objects/info/alternates"
+        rm -f "$SRC"/.git/objects/pack/pack-*
+        git -C "$SRC" sparse-checkout set --no-cone '/CMakeLists.txt' '/Source/' \
+            '!/Source/ThirdParty/libwebrtc/' '/Tools/Scripts/' '/Tools/CMakeLists.txt' \
+            '/Tools/wpe/' '/Tools/MiniBrowser/wpe/' '/Tools/glib/'
+        git -C "$SRC" config user.email ps5wk@local
+        git -C "$SRC" config user.name ps5wk
+    fi
+    if [ -z "${FRESH_SRC:-}" ] && git -C "$SRC" rev-parse -q --verify ps5 >/dev/null; then
+        log "source tree exists (branch ps5); FRESH_SRC=1 re-applies patches/*.patch"
+    else
+        log "applying patches/*.patch on $WEBKIT_COMMIT"
+        git -C "$SRC" checkout -q -f "$WEBKIT_COMMIT"
+        git -C "$SRC" clean -fdq -- Source
+        git -C "$SRC" checkout -q -B ps5
+        for p in "$HERE"/patches/*.patch; do
+            echo "  $(basename "$p")"
+            git -C "$SRC" apply --whitespace=nowarn "$p"
+            git -C "$SRC" add -A Source CMakeLists.txt
+            git -C "$SRC" commit -qm "$(basename "$p" .patch)"
+        done
+    fi
+    # The PS5 backend lives in port/webkit/wpe-ps5; WebKit sees it as wpe/ps5.
+    ln -sfn "$HERE/wpe-ps5" "$SRC/Source/WebKit/WPEPlatform/wpe/ps5"
+    grep -qx 'Source/WebKit/WPEPlatform/wpe/ps5' "$SRC/.git/info/exclude" 2>/dev/null ||
+        echo 'Source/WebKit/WPEPlatform/wpe/ps5' >> "$SRC/.git/info/exclude"
+}
+
+step_export_patches() {
+    log "exporting $WEBKIT_COMMIT..ps5 to patches/"
+    rm -f "$HERE"/patches/*.patch
+    for c in $(git -C "$SRC" rev-list --reverse "$WEBKIT_COMMIT..ps5"); do
+        name="$(git -C "$SRC" log -1 --format=%s "$c")"
+        git -C "$SRC" diff --no-color "$c^" "$c" > "$HERE/patches/$name.patch"
+        echo "  $name.patch ($(git -C "$SRC" diff --shortstat "$c^" "$c"))"
+    done
+}
+
+# --------------------------------------------------------------------- shim
+step_shim() {
+    log "libps5shim.a"
+    ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
+      mkdir -p "$BLD/shim"
+      prospero-clang -O2 -fPIC -ffunction-sections -fdata-sections -I"$SHIM/include" \
+          -c "$SHIM/ps5shim.c" -o "$BLD/shim/ps5shim.o"
+      rm -f "$BLD/shim/libps5shim.a"
+      prospero-ar rcs "$BLD/shim/libps5shim.a" "$BLD/shim/ps5shim.o" )
+}
+
+# ---------------------------------------------------------------- configure
+# Everything optional is off. JIT off (asm LLInt, as Spike 4), no WebGL, no
+# GPU process, no media, Skia on the CPU. WPE Platform API only; headless kept
+# for the payload-side test harness.
+WEBKIT_OPTIONS=(
+    -DPORT=WPE -DCMAKE_BUILD_TYPE=Release -DDEVELOPER_MODE=OFF
+    -DENABLE_WPE_LEGACY_API=OFF -DENABLE_WPE_QT_API=OFF -DENABLE_WPE_1_1_API=OFF
+    -DENABLE_WPE_PLATFORM_DRM=OFF -DENABLE_WPE_PLATFORM_WAYLAND=OFF
+    -DENABLE_WPE_PLATFORM_HEADLESS=ON -DENABLE_WPE_PLATFORM_PS5=ON
+    -DUSE_SKIA=ON -DUSE_GBM=OFF -DUSE_LIBDRM=OFF -DUSE_VULKAN=OFF
+    -DENABLE_JIT=OFF -DENABLE_DFG_JIT=OFF -DENABLE_FTL_JIT=OFF -DENABLE_C_LOOP=OFF
+    -DENABLE_WEBASSEMBLY=OFF -DENABLE_SAMPLING_PROFILER=OFF -DENABLE_REMOTE_INSPECTOR=OFF
+    -DENABLE_RESOURCE_USAGE=OFF -DENABLE_MEMORY_SAMPLER=OFF
+    -DUSE_SYSTEM_MALLOC=OFF
+    -DENABLE_WEBGL=OFF -DENABLE_WEBGPU=OFF -DENABLE_WEBXR=OFF -DENABLE_GPU_PROCESS=OFF
+    -DENABLE_VIDEO=OFF -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
+    -DENABLE_WEB_CODECS=OFF -DENABLE_MEDIA_RECORDER=OFF -DENABLE_MEDIA_SESSION=OFF
+    -DENABLE_ENCRYPTED_MEDIA=OFF -DENABLE_THUNDER=OFF -DUSE_EXTERNAL_HOLEPUNCH=OFF
+    -DENABLE_GAMEPAD=OFF -DENABLE_SPEECH_SYNTHESIS=OFF -DENABLE_SPELLCHECK=OFF
+    -DENABLE_XSLT=OFF -DENABLE_WEBDRIVER=OFF -DENABLE_WEBDRIVER_BIDI=OFF -DENABLE_PDFJS=OFF
+    -DENABLE_GEOLOCATION=OFF -DENABLE_BUBBLEWRAP_SANDBOX=OFF -DENABLE_NOTIFICATIONS=OFF
+    -DENABLE_WK_WEB_EXTENSIONS=OFF
+    -DENABLE_INTROSPECTION=OFF -DENABLE_DOCUMENTATION=OFF -DENABLE_JOURNALD_LOG=OFF
+    -DUSE_LIBBACKTRACE=OFF -DUSE_ATK=OFF -DUSE_AVIF=OFF -DUSE_LCMS=OFF -DUSE_JPEGXL=OFF
+    -DUSE_LIBHYPHEN=OFF -DUSE_FLITE=OFF -DUSE_LIBSECRET=OFF
+    -DUSE_SYSPROF_CAPTURE=OFF -DUSE_SYSTEM_SYSPROF_CAPTURE=OFF
+    -DUSE_OPENSSL=ON -DUSE_WOFF2="${USE_WOFF2:-OFF}"
+    -DENABLE_MINIBROWSER=OFF -DENABLE_API_TESTS=OFF -DENABLE_LAYOUT_TESTS=OFF -DENABLE_TOOLS=OFF
+    -DUSE_SYSTEM_UNIFDEF=ON
+    -DLD_PACK_RELATIVE_RELOCS=OFF
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF -DCLANGD_AUTO_SETUP=OFF -DCMAKE_VERBOSE_MAKEFILE=OFF
+)
+
+step_configure() {
+    log "configure $BLD"
+    mkdir -p "$BLD"
+    local cflags="-isystem $SHIM/include -include ps5shim.h -ffunction-sections -fdata-sections ${DEBUG_FLAGS:--gline-tables-only}"
+    local cxxflags="-nostdinc++ -isystem $LIBCXX/include/c++/v1 $cflags"
+    local libs="$BLD/shim/libps5shim.a $LIBCXX/lib/libc++.a $LIBCXX/lib/libc++abi.a $LIBCXX/lib/libunwind.a"
+    local tc="$PS5_PAYLOAD_SDK/toolchain/prospero.cmake"
+    # The deps toolchain file (port/deps) knows the sysroot; fall back to the
+    # SDK's file plus search paths.
+    local depstc
+    depstc="$(ls "$ROOT"/port/deps/*.cmake 2>/dev/null | head -1 || true)"
+    [ -n "$depstc" ] && tc="$depstc"
+    ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
+      export PKG_CONFIG="$PKGCONFIG"
+      cmake -G Ninja -S "$SRC" -B "$BLD" \
+        -DCMAKE_TOOLCHAIN_FILE="$tc" \
+        -DCMAKE_FIND_ROOT_PATH="$SYSROOT;$ICU" -DCMAKE_PREFIX_PATH="$SYSROOT" \
+        -DPKG_CONFIG_EXECUTABLE="$PKGCONFIG" -DPS5_PORT_DIR="$HERE" -DPS5WK_LOG_HOST="$PS5WK_LOG_HOST" -DPS5WK_LOG_PORT="$PS5WK_LOG_PORT" \
+        "${WEBKIT_OPTIONS[@]}" \
+        -DCMAKE_C_FLAGS="$cflags" -DCMAKE_CXX_FLAGS="$cxxflags" \
+        -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
+        -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ -Wl,--gc-sections" \
+        -DCMAKE_CXX_STANDARD_LIBRARIES="$libs" \
+        -DICU_ROOT="$ICU" -DICU_INCLUDE_DIR="$ICU/include" \
+        -DICU_UC_LIBRARY_RELEASE="$ICU/lib/libicuuc.a" \
+        -DICU_I18N_LIBRARY_RELEASE="$ICU/lib/libicui18n.a" \
+        -DICU_DATA_LIBRARY_RELEASE="$ICU/lib/libicudata.a" \
+        ${EXTRA_CMAKE_ARGS:-} ) 2>&1 | tee "$WK/configure.log" | grep -E "^-- (Enabled|  |Could)|Error|error|Missing|not found|NOT" | head -80
+    [ -f "$BLD/build.ninja" ] && echo "configure: OK" || { echo "configure: FAILED (see $WK/configure.log)"; return 1; }
+}
+
+# -------------------------------------------------------------------- build
+step_build() {
+    local targets="${NINJA_TARGETS:-}"
+    log "ninja -j$JOBS ${targets:-<all>}"
+    local t0=$(date +%s)
+    ninja -C "$BLD" -j"$JOBS" ${NINJA_FLAGS:-} $targets 2>&1 | tee "$WK/ninja.log" | grep -vE '^\[[0-9]+/[0-9]+\] ' | tail -60
+    local rc=${PIPESTATUS[0]}
+    echo "ninja exit $rc after $(( $(date +%s) - t0 )) s" | tee -a "$WK/build-times.log"
+    return "$rc"
+}
+
+step_status() {
+    df -h "$ROOT" | tail -1
+    du -sh "$SRC" "$BLD" 2>/dev/null || true
+    ls "$SYSROOT/lib/pkgconfig" 2>/dev/null | sed 's/\.pc$//' | tr '\n' ' '; echo
+}
+
+STEPS=("$@")
+[ ${#STEPS[@]} -eq 0 ] && STEPS=(src shim configure build)
+for s in "${STEPS[@]}"; do
+    case "$s" in
+        src) step_src ;;
+        export-patches) step_export_patches ;;
+        shim) step_shim ;;
+        configure) step_configure ;;
+        build) step_build ;;
+        status) step_status ;;
+        *) echo "unknown step: $s" >&2; exit 2 ;;
+    esac
+done

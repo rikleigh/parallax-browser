@@ -1,0 +1,200 @@
+diff --git a/Source/JavaScriptCore/jsc.cpp b/Source/JavaScriptCore/jsc.cpp
+index e5f1d7d4d6..71cefb23b3 100644
+--- a/Source/JavaScriptCore/jsc.cpp
++++ b/Source/JavaScriptCore/jsc.cpp
+@@ -3708,7 +3708,13 @@ static void startTimeoutThreadIfNeeded(VM& vm)
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
++#if defined(__PROSPERO__)
++// PS5 payloads get their argv/script via shell/ps5/PS5Main.cpp, which calls this.
++int jscShellMain(int argc, char** argv);
++int jscShellMain(int argc, char** argv)
++#else
+ int main(int argc, char** argv)
++#endif
+ {
+ #if OS(DARWIN)
+ #if __has_include(<libproc.h>)
+diff --git a/Source/JavaScriptCore/shell/CMakeLists.txt b/Source/JavaScriptCore/shell/CMakeLists.txt
+index 53920c730b..a7ac0678e3 100644
+--- a/Source/JavaScriptCore/shell/CMakeLists.txt
++++ b/Source/JavaScriptCore/shell/CMakeLists.txt
+@@ -14,6 +14,11 @@ if (WTF_OS_MACOS)
+     list(APPEND jsc_LIBRARIES edit)
+ endif ()
+ 
++if (PS5)
++    # PS5 payload entry point (argv/stdin handling), see shell/ps5/PS5Main.cpp
++    list(APPEND jsc_SOURCES ps5/PS5Main.cpp)
++endif ()
++
+ if (WIN32)
+     list(APPEND jsc_LIBRARIES Winmm)
+ endif ()
+diff --git a/Source/JavaScriptCore/shell/ps5/PS5Main.cpp b/Source/JavaScriptCore/shell/ps5/PS5Main.cpp
+new file mode 100644
+index 0000000000..26a97d78c2
+--- /dev/null
++++ b/Source/JavaScriptCore/shell/ps5/PS5Main.cpp
+@@ -0,0 +1,160 @@
++/*
++ * PS5 (ps5-payload-sdk) entry point for the jsc shell.
++ *
++ * Payloads started by elfldr usually get no argv (raw ELF upload) and their
++ * stdin/stdout/stderr are the TCP socket the ELF was sent on. So:
++ *
++ *   1. argc > 1 (elfldr "file:///data/jsc/jsc.elf?args=..." URI): pass argv
++ *      through unchanged.
++ *   2. /data/jsc/args.txt exists: split it on whitespace and use it as argv.
++ *   3. Otherwise read JavaScript from stdin until EOF (the socket, i.e.
++ *      `cat jsc.elf script.js | socat -t 999999 - TCP:ps5:9021`) and run it
++ *      as `jsc -e <source>`. If the first line of the source starts with
++ *      "//jsc:" the rest of that line is split into extra jsc options,
++ *      e.g. "//jsc: --useConcurrentGC=0".
++ *
++ * jscShellMain() then runs on a 16 MiB pthread (see runShell) and the stack
++ * bounds seen by pthread_attr_get_np are logged to stderr for diagnosis.
++ */
++
++#include <pthread.h>
++#include <pthread_np.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++int jscShellMain(int argc, char** argv);
++
++// The interpreter runs on a dedicated thread with a known stack size, rather
++// than on the payload's main thread whose stack bounds (as reported by
++// pthread_attr_get_np, which WTF::StackBounds uses) are unverified on PS5.
++static constexpr size_t jscThreadStackSize = 16 * 1024 * 1024;
++
++static constexpr const char* argsFile = "/data/jsc/args.txt";
++
++static void splitInto(char* s, char** argv, int& argc, int max)
++{
++    char* save = nullptr;
++    for (char* tok = strtok_r(s, " \t\r\n", &save); tok && argc < max; tok = strtok_r(nullptr, " \t\r\n", &save))
++        argv[argc++] = tok;
++}
++
++static char* readAll(FILE* f, size_t* outLen)
++{
++    size_t cap = 1 << 16, len = 0;
++    char* buf = static_cast<char*>(malloc(cap));
++    if (!buf)
++        return nullptr;
++    for (;;) {
++        if (len + 4096 + 1 > cap) {
++            cap *= 2;
++            char* n = static_cast<char*>(realloc(buf, cap));
++            if (!n) {
++                free(buf);
++                return nullptr;
++            }
++            buf = n;
++        }
++        size_t n = fread(buf + len, 1, cap - len - 1, f);
++        if (!n)
++            break;
++        len += n;
++    }
++    buf[len] = 0;
++    if (outLen)
++        *outLen = len;
++    return buf;
++}
++
++static void logStackBounds(const char* who)
++{
++    pthread_attr_t attr;
++    void* low = nullptr;
++    size_t size = 0;
++    pthread_attr_init(&attr);
++    int rc1 = pthread_attr_get_np(pthread_self(), &attr);
++    int rc2 = pthread_attr_getstack(&attr, &low, &size);
++    pthread_attr_destroy(&attr);
++    int here = 0;
++    fprintf(stderr, "[jsc-ps5] %s: pagesize=%ld stack low=%p size=%zu (rc %d/%d), &local=%p\n",
++        who, sysconf(_SC_PAGESIZE), low, size, rc1, rc2, static_cast<void*>(&here));
++}
++
++struct ShellArgs {
++    int argc;
++    char** argv;
++    int result;
++};
++
++static void* shellThread(void* p)
++{
++    auto* args = static_cast<ShellArgs*>(p);
++    logStackBounds("jsc thread");
++    args->result = jscShellMain(args->argc, args->argv);
++    return nullptr;
++}
++
++static int runShell(int argc, char** argv)
++{
++    ShellArgs args { argc, argv, 1 };
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, jscThreadStackSize);
++    pthread_t thread;
++    if (pthread_create(&thread, &attr, shellThread, &args)) {
++        fprintf(stderr, "[jsc-ps5] pthread_create failed, running on main thread\n");
++        pthread_attr_destroy(&attr);
++        return jscShellMain(argc, argv);
++    }
++    pthread_attr_destroy(&attr);
++    pthread_join(thread, nullptr);
++    fflush(stdout);
++    return args.result;
++}
++
++int main(int argc, char** argv)
++{
++    // stdout/stderr are usually a socket: make output appear promptly.
++    setvbuf(stdout, nullptr, _IOLBF, 0);
++    setvbuf(stderr, nullptr, _IONBF, 0);
++    logStackBounds("main thread");
++
++    if (argc > 1)
++        return runShell(argc, argv);
++
++    static char* newArgv[256];
++    int newArgc = 0;
++    newArgv[newArgc++] = const_cast<char*>("jsc");
++
++    if (FILE* f = fopen(argsFile, "r")) {
++        char* text = readAll(f, nullptr);
++        fclose(f);
++        if (text) {
++            splitInto(text, newArgv, newArgc, 255);
++            fprintf(stderr, "[jsc-ps5] argv from %s (%d args)\n", argsFile, newArgc - 1);
++            newArgv[newArgc] = nullptr;
++            return runShell(newArgc, newArgv);
++        }
++    }
++
++    fprintf(stderr, "[jsc-ps5] reading script from stdin until EOF\n");
++    size_t len = 0;
++    char* source = readAll(stdin, &len);
++    if (!source || !len) {
++        fprintf(stderr, "[jsc-ps5] no script received; usage: cat jsc.elf script.js | socat -t 999999 - TCP:$PS5_HOST:9021\n");
++        return 2;
++    }
++    fprintf(stderr, "[jsc-ps5] got %zu bytes of JS\n", len);
++
++    if (!strncmp(source, "//jsc:", 6)) {
++        char* eol = strchr(source, '\n');
++        size_t optLen = eol ? static_cast<size_t>(eol - source) - 6 : strlen(source) - 6;
++        char* opts = strndup(source + 6, optLen);
++        splitInto(opts, newArgv, newArgc, 250);
++    }
++    newArgv[newArgc++] = const_cast<char*>("-e");
++    newArgv[newArgc++] = source;
++    newArgv[newArgc] = nullptr;
++    return runShell(newArgc, newArgv);
++}

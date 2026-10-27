@@ -1,0 +1,210 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4d0ce3e022..21cd467d94 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -131,6 +131,12 @@ if (ENABLE_TOOLS)
+     add_subdirectory(Tools)
+ endif ()
+ 
++# PS5: the payload child (WebProcess/NetworkProcess) and the browser title,
++# from port/webkit (passed by port/webkit/build.sh as PS5_PORT_DIR).
++if (PS5 AND PS5_PORT_DIR)
++    add_subdirectory(${PS5_PORT_DIR}/apps ${CMAKE_BINARY_DIR}/ps5-apps)
++endif ()
++
+ if (DEVELOPER_MODE)
+     if (EXISTS "${CMAKE_SOURCE_DIR}/PerformanceTests")
+         add_subdirectory(PerformanceTests)
+diff --git a/Source/WebKit/PlatformWPE.cmake b/Source/WebKit/PlatformWPE.cmake
+index 945fe1d148..8a45974779 100644
+--- a/Source/WebKit/PlatformWPE.cmake
++++ b/Source/WebKit/PlatformWPE.cmake
+@@ -524,6 +524,10 @@ if (ENABLE_WPE_PLATFORM)
+         endif ()
+     endif ()
+ 
++    if (ENABLE_WPE_PLATFORM_PS5)
++        list(APPEND WebKit_PRIVATE_LIBRARIES WPEPlatformPS5)
++    endif ()
++
+     if (ENABLE_WPE_PLATFORM_WAYLAND)
+         list(APPEND WebKit_PRIVATE_LIBRARIES WPEPlatformWayland)
+         if (_old_cmake_swift_needs_explicit_objects)
+diff --git a/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp b/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp
+index 507dd91237..adc41bc34a 100644
+--- a/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp
++++ b/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp
+@@ -48,7 +48,7 @@
+ #include "ProcessProviderLibWPE.h"
+ #endif
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || ENABLE(WPE_PLATFORM_PROCESS_MANAGER)
+ #include <wpe/wpe-platform.h>
+ #endif
+ 
+@@ -112,7 +112,7 @@ void ProcessLauncher::launchProcess()
+     IPC::SocketPair webkitSocketPair = IPC::createPlatformConnection(SOCK_SEQPACKET, connectionOptions());
+     GUniquePtr<gchar> webkitSocket(g_strdup_printf("%d", webkitSocketPair.client.value()));
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || ENABLE(WPE_PLATFORM_PROCESS_MANAGER)
+     if (auto* processManager = wpe_process_manager_get_default()) {
+         WPEProcessType processType;
+         switch (m_launchOptions.processType) {
+@@ -320,7 +320,7 @@ void ProcessLauncher::terminateProcess(const String&)
+     if (!m_processID)
+         return;
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || ENABLE(WPE_PLATFORM_PROCESS_MANAGER)
+     if (auto* processManager = wpe_process_manager_get_default()) {
+         wpe_process_manager_terminate(processManager, m_processID);
+         m_processID = 0;
+diff --git a/Source/WebKit/WPEPlatform/CMakeLists.txt b/Source/WebKit/WPEPlatform/CMakeLists.txt
+index 2f694a8a39..ded0d8b5bd 100644
+--- a/Source/WebKit/WPEPlatform/CMakeLists.txt
++++ b/Source/WebKit/WPEPlatform/CMakeLists.txt
+@@ -127,6 +127,9 @@ endif ()
+ 
+ if (ANDROID)
+     list(APPEND WPEPlatform_LIBRARIES Android::Android)
++endif ()
++
++if (WPE_PLATFORM_PROCESS_MANAGER)
+     list(APPEND WPEPlatform_SOURCES ${WEBKIT_DIR}/WPEPlatform/wpe/WPEProcessManager.cpp)
+     list(APPEND WPEPlatform_INSTALLED_HEADERS ${WEBKIT_DIR}/WPEPlatform/wpe/WPEProcessManager.h)
+ endif ()
+@@ -166,6 +169,11 @@ if (ENABLE_WPE_PLATFORM_HEADLESS)
+     list(APPEND WPEPlatform_LIBRARIES WPEPlatformHeadless)
+ endif ()
+ 
++if (ENABLE_WPE_PLATFORM_PS5)
++    add_subdirectory(${WEBKIT_DIR}/WPEPlatform/wpe/ps5)
++    list(APPEND WPEPlatform_LIBRARIES WPEPlatformPS5)
++endif ()
++
+ if (ENABLE_WPE_PLATFORM_WAYLAND)
+     add_subdirectory(${WEBKIT_DIR}/WPEPlatform/wpe/wayland)
+     list(APPEND WPEPlatform_LIBRARIES WPEPlatformWayland)
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEConfig.h.in b/Source/WebKit/WPEPlatform/wpe/WPEConfig.h.in
+index 4822c740ae..fd8340f7da 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEConfig.h.in
++++ b/Source/WebKit/WPEPlatform/wpe/WPEConfig.h.in
+@@ -32,9 +32,11 @@
+ 
+ #cmakedefine WPE_PLATFORM_BUFFER_ANDROID
+ #cmakedefine WPE_PLATFORM_PROCESS_MANAGER_ANDROID
++#cmakedefine WPE_PLATFORM_PROCESS_MANAGER
+ 
+ #cmakedefine WPE_PLATFORM_DRM
+ #cmakedefine WPE_PLATFORM_HEADLESS
++#cmakedefine WPE_PLATFORM_PS5
+ #cmakedefine WPE_PLATFORM_WAYLAND
+ 
+ #endif /* WPEConig_h */
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+index b93182c8bf..e63987b33a 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+@@ -44,6 +44,10 @@
+ #include "wpe/wayland/WPEDisplayWayland.h"
+ #endif
+ 
++#if ENABLE(WPE_PLATFORM_PS5)
++#include "wpe/ps5/WPEDisplayPS5.h"
++#endif
++
+ void wpeEnsureExtensionPointsRegistered()
+ {
+     static std::once_flag onceFlag;
+@@ -79,6 +83,9 @@ void wpeEnsureExtensionPointsLoaded()
+ #endif
+ #if ENABLE(WPE_PLATFORM_WAYLAND)
+         g_type_ensure(wpe_display_wayland_get_type());
++#endif
++#if ENABLE(WPE_PLATFORM_PS5)
++        g_type_ensure(wpe_display_ps5_get_type());
+ #endif
+     });
+ }
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEProcessManager.cpp b/Source/WebKit/WPEPlatform/wpe/WPEProcessManager.cpp
+index 2880c9bc3a..c5742a125d 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEProcessManager.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEProcessManager.cpp
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include "WPEProcessManager.h"
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || ENABLE(WPE_PLATFORM_PROCESS_MANAGER)
+ 
+ #include <wtf/glib/GRefPtr.h>
+ #include <wtf/glib/WTFGType.h>
+@@ -246,4 +246,4 @@ void wpe_process_manager_set_default(WPEProcessManager* manager)
+     s_defaultProcessManager = manager;
+ }
+ 
+-#endif // OS(ANDROID)
++#endif // OS(ANDROID) || ENABLE(WPE_PLATFORM_PROCESS_MANAGER)
+diff --git a/Source/WebKit/WPEPlatform/wpe/wpe-platform.h b/Source/WebKit/WPEPlatform/wpe/wpe-platform.h
+index 012c653ae2..5bfae483d9 100644
+--- a/Source/WebKit/WPEPlatform/wpe/wpe-platform.h
++++ b/Source/WebKit/WPEPlatform/wpe/wpe-platform.h
+@@ -61,7 +61,7 @@
+ #include <wpe/WPEBufferAndroid.h>
+ #endif
+ 
+-#ifdef WPE_PLATFORM_PROCESS_MANAGER_ANDROID
++#ifdef WPE_PLATFORM_PROCESS_MANAGER
+ #include <wpe/WPEProcessManager.h>
+ #endif
+ 
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 41be24d0a1..86e1831a38 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -112,6 +112,7 @@ WEBKIT_OPTION_DEFINE(ENABLE_JOURNALD_LOG "Whether to enable journald logging" PU
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_DRM "Whether to enable support for DRM platform" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_HEADLESS "Whether to enable support for headless platform" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_WAYLAND "Whether to enable support for Wayland platform" PUBLIC ON)
++WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_PS5 "Whether to enable support for the PS5 platform (ps5-payload-sdk)" PUBLIC OFF)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_LEGACY_API "Whether to enable the WPE legacy API (libwpe)" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_QT_API "Whether to enable support for the Qt/QML plugin" PUBLIC ${ENABLE_DEVELOPER_MODE})
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_1_1_API "Whether to build WPE 1.1 instead of WPE 2.0" PUBLIC OFF)
+@@ -192,6 +193,10 @@ set(bmalloc_LIBRARY_TYPE OBJECT)
+ set(WTF_LIBRARY_TYPE OBJECT)
+ set(JavaScriptCore_LIBRARY_TYPE OBJECT)
+ set(WebCore_LIBRARY_TYPE OBJECT)
++if (PS5)
++    # Payload and title ELFs are static: no shared libraries on the console.
++    set(WebKit_LIBRARY_TYPE STATIC)
++endif ()
+ 
+ # These are shared variables, but we special case their definition so that we can use the
+ # CMAKE_INSTALL_* variables that are populated by the GNUInstallDirs macro.
+@@ -302,6 +307,8 @@ SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM ON)
+ if (ANDROID)
+     set(WPE_PLATFORM_BUFFER_ANDROID ON)
+     set(WPE_PLATFORM_PROCESS_MANAGER_ANDROID ON)
++    set(WPE_PLATFORM_PROCESS_MANAGER ON)
++    SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_PROCESS_MANAGER ON)
+ endif ()
+ 
+ if (ENABLE_WPE_PLATFORM_DRM)
+@@ -316,6 +323,15 @@ if (ENABLE_WPE_PLATFORM_HEADLESS)
+     set(WPE_PLATFORM_HEADLESS ON)
+ endif ()
+ 
++if (ENABLE_WPE_PLATFORM_PS5)
++    SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_PS5 ON)
++    set(WPE_PLATFORM_PS5 ON)
++    # Auxiliary processes are elfldr payloads started by the PS5 platform's
++    # WPEProcessManager, as on Android.
++    set(WPE_PLATFORM_PROCESS_MANAGER ON)
++    SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_PROCESS_MANAGER ON)
++endif ()
++
+ if (ENABLE_WPE_PLATFORM_WAYLAND)
+     find_package(Wayland 1.20 REQUIRED)
+     find_package(WaylandProtocols 1.24 REQUIRED)
