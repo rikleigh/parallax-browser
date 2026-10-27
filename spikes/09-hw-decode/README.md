@@ -17,6 +17,9 @@ supplies, and that memory can be a GL buffer, so the title's GL converts it
 to RGBA8 on the GPU with **no CPU copy**: 3.2 ms at 8K, checked by readback.
 An elfldr payload can't use it: it blocks in the first call.
 
+The owner checked the TV and headset output by eye: correct and smooth
+(details under *Headset and TV* below).
+
 ## What was built
 
 | File | What |
@@ -156,27 +159,41 @@ comparison, a CPU `memcpy` of one decoded frame into a GL buffer costs
 0.96 ms at 4K and 2.9 ms at 8K (5.95 ms for 8K 10-bit), so even the copy
 fallback would be affordable.
 
-## Headset (`vr360` / `vr180`): runs, not yet looked at
+## Headset (`vr360` / `vr180`) and TV: checked by the owner
 
 The RGBA8 frame is drawn on a sphere (360 mono) or a front dome (180
 side-by-side) per eye, sampling along each pixel's view ray with the
-tracker's eye orientation. It goes into 3 × 3072x1536 exported eye buffers
-through `spikes/common/psvr2`, with Hmd2 at 120 Hz and half-rate rendering,
-and is paced to the video's 29.97 fps.
+tracker's eye orientation. It goes into 3 exported eye buffers through
+`spikes/common/psvr2`, with Hmd2 at 120 Hz and half-rate rendering, and is
+paced to the video's frame rate. Job lines can set the eye buffer size, the
+samples per pixel (1, or 4 on a rotated grid) and the frame rate.
 
-| Job | Result (run 2026-10-27 22:40, **nobody wearing the headset**) |
-| --- | --- |
-| `vr360` VR clip 7680x3840, 30 s | 900 video frames → 1798 headset frames, render 1.11 ms, 0 submit errors, 2 late frames, 0 tracked (not worn) |
-| `vr180` synthetic 8K SBS, 20 s | 601 → 1202 headset frames, render 1.09 ms, 0 submit errors |
+**Owner's checks (2026-10-27, evening):**
 
-**Visual check still open.** Run while someone wears the headset:
-`spikes/09-hw-decode/run.sh jobs/vr.txt` (about 60 s: 30 s of 360, then 20 s
-of 180 SBS). Expected:
-- the video surrounds you, right way up, and stays put when you turn;
-- the front is where you first looked;
-- in the 180 SBS part, the burned-in frame number is fused at depth, not
-  doubled or cross-eyed;
-- motion is smooth.
+| Run | Seen | Log |
+| --- | --- | --- |
+| TV, `jobs/gl8k.txt` (VR clip 8K, 8K 10-bit bars, VP9 4K, VR clip 4K) | "looked fine": colours, no blocks, no tearing | 54–60 fps at vsync, 0 errors |
+| Headset, `jobs/vr.txt` (VR clip 8K 360 night street, synthetic 8K 180 SBS) | all correct: surrounds you, upright, world-locked, 3D fused, smooth. The street scene "looked low bitrate" | 1804 / 1202 headset frames, every one tracked, 0 late |
+| Headset, `jobs/vr-sharp.txt` (daylight VR clip 8K 360, 47 Mbit/s): eye 1536 ×1, 2048 ×4, 2560 ×4 | "hard to tell" apart; all three the same. Nearby people jittered in all three | render 0.6 / 1.2 / 1.7 ms; the headset accepts 2560 per eye |
+| Headset, `jobs/vr-60fps.txt` (daylight VR clip 360 at 60 fps, 10-bit): 4320x2160, then 7680x3840 | "much better", both passes OK | 4K: 59.1 fps. 8K: **46.8 fps**, the single-threaded loop can't keep up |
+
+What this settles:
+- **"Low bitrate" is the source.** The night street clip decoded by ffmpeg
+  on the Mac at full resolution shows the same smearing and blotches (a
+  consumer 360 camera at night, 35 Mbit/s). The decoder reproduces it.
+- **Jitter in nearby people is 30 fps footage**, not our pacing: the frame
+  timing in the file is regular, camera motion looked smooth, and nearby
+  people move far between frames with little motion blur. The same kind of
+  footage at 60 fps looked smooth.
+- **Sharpness is limited by the panel and the source**, not the eye buffer
+  above 1536. The browser's player uses 2048 per eye with 4 samples per
+  pixel (1.2 ms), which removes aliasing at little cost.
+- **8K60 needs decoding on its own thread.** The spike decodes, converts and
+  renders on one thread (about 12 + 5 + 1.3 ms per 8K frame), so it reaches
+  47 fps; the decoder alone runs at 80–93 fps at 8K. The player must decode
+  ahead into a queue and pick frames by timestamp against the display clock
+  (which also drops or repeats frames to stay in sync instead of drifting,
+  as the 4K60 pass did).
 
 ## Software fallback (payload, FFmpeg 7.1.1 + dav1d 1.5.1, AVX2)
 

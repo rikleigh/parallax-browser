@@ -1,0 +1,5 @@
+# Headset (needs a person): is the jitter in moving people the source's 30 fps or our player?
+# 15 s of a daylight 60 fps 10-bit VR clip 360 clip (Torun guided tour) at 4320x2160, then at 7680x3840,
+# both paced at 60 fps, 2048 eye buffers with 4 samples per pixel. Local cuts in media/.
+vr360 mp4  vrclip_140612_2160.mp4  hevc 2 4320 2160 15 4 2048 4 60
+vr360 mp4  vrclip_140612_3840.mp4  hevc 2 7680 3840 15 4 2048 4 60

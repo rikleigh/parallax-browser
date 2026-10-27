@@ -449,7 +449,7 @@ are upstream WebKit bugs.
 | R2 | GL memory can't reach the Hmd2 layer (needs tiling, or a process-ownership problem) | **retired** (Spike 3b) | — | Zero-copy via T# export, 3600/3600 frames |
 | R3 | GPU only usable in the title process | **accepted** (ps5-opengl is title-only; payload direct memory ~55 MB) | designed around | All GL in the title (§4.8); pacbrew Mesa in a payload is still untested |
 | R4 | No cross-process GPU memory | **observed** (Spike 1 `dmem-share` EACCES) | designed around | WC mode: the WebProcess sends CPU-painted bitmaps; WebGL, compositing and XR share one process (§4.8) |
-| R16 | Video decoding for VR video (§1a): the owner's sources need HEVC (VR site, 4K–8K) and VP9 or AV1 (YouTube, 4K) | **retired** (Spike 9) | low | A title reaches `libSceVideodec2`: 8K HEVC from a real VR site clip at 93 fps, 4K H.264/VP9 at 84–87, 10-bit too, decoded straight into GL buffers (no CPU copy). Left: AV1 is software only (dav1d 4K 92 fps); an 8K decoder costs 140–220 MB of the title's ~420 MB flexible memory; headset visual check ([Spike 9](spikes/09-hw-decode/README.md)) |
+| R16 | Video decoding for VR video (§1a): the owner's sources need HEVC (VR site, 4K–8K) and VP9 or AV1 (YouTube, 4K) | **retired** (Spike 9) | low | A title reaches `libSceVideodec2`: 8K HEVC from a real VR site clip at 93 fps, 4K H.264/VP9 at 84–87, 10-bit too, decoded straight into GL buffers (no CPU copy). Left: AV1 is software only (dav1d 4K 92 fps); an 8K decoder costs 140–220 MB of the title's ~420 MB flexible memory; 8K60 needs a decoder thread (the single-threaded spike reached 47 fps). The owner checked TV and headset: correct, smooth, 60 fps footage smooth; 30 fps footage shows jitter in nearby people, a property of the source ([Spike 9](spikes/09-hw-decode/README.md)) |
 | R17 | Tube sites' players misbehave in our browser: they need WebGL to play at all, or serve a lesser stream or an "unsupported browser" page to an unknown user agent | medium | medium: per site | Check the owner's sites on a desktop browser with WebGL and WebXR off; send a Safari user agent; WebGL (R14/R15) only if a site the owner needs demands it |
 | R18 | GStreamer port (core, base, good with `adaptivedemux2`, our decoder element, hole-punch sink) is larger than the other dependencies | medium | schedule | It shares glib with WPE; plugins are built static and only the few needed; set-top-box WPE ports have done hole-punch on similar hardware |
 | R14 | GPU process inside the UIProcess (WebXR goal only; not needed for §1a): WebKit has no in-process mode; process-global init (process type, identifier generation, run-loop stop) clashes | certain (it's required) | high: schedule, plus a downstream patch to carry | In-process `GPUProcess` start that skips process-global init (§4.8). Alternative: Sony-style app-local child processes, if reachable (lead, untested) |
@@ -502,7 +502,7 @@ things are:
 
 | Phase | Agent work | What sets the pace |
 | --- | --- | --- |
-| Hardware-decode spike (R16): **done** (Spike 9); only the headset visual check is left | small | headset check |
+| Hardware-decode spike (R16): **done** (Spike 9), TV and headset checked by the owner | — | — |
 | Dependency ports (glib, libsoup, Skia, HarfBuzz, FreeType, fontconfig, ICU, …) (R9); no ANGLE | large, but parallel and Mac-only | build time |
 | JSC fixes (`Date`, plus Spike 4's patches carried over) | small | one console run |
 | WPE build + PS5 WPE Platform backend (VideoOut, DualSense, IME, fonts), CPU-painted pages | medium | console crash-and-fix loop |

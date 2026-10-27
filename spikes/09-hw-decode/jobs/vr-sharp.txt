@@ -1,0 +1,6 @@
+# Headset A/B for sharpness (needs a person): 12 s of a daylight VR clip 8K 360 clip
+# (Gamcheon village, 47 Mbit/s) three times: today's 1536 eye buffer with 1 sample,
+# then 2048 and 2560 with 4 samples per pixel. media/vrclip_140904.mp4 is a local cut.
+vr360 mp4  vrclip_140904.mp4  hevc 1 7680 3840 12 4 1536 1
+vr360 mp4  vrclip_140904.mp4  hevc 1 7680 3840 12 4 2048 4
+vr360 mp4  vrclip_140904.mp4  hevc 1 7680 3840 12 4 2560 4

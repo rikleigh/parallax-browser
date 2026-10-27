@@ -21,6 +21,8 @@
  *
  * Job line: <bench|gl> <h264|hevc|ivf|mp4> <path> <h264|hevc|vp9> <profile>
  *           <width> <height> [seconds] [pipeline depth, default 4]
+ *           [vr eye buffer size, default 1536] [vr samples per pixel, 1 or 4]
+ *           [vr video frame rate, default 29.97]
  */
 #define SPIKE_NAME "09-hw-decode"
 #ifdef PAYLOAD
@@ -61,7 +63,8 @@ static void log_line(const char *s)
 
 typedef struct {
     char mode[8], kind[8], path[192], codec[8];
-    int profile, width, height, seconds, depth;
+    int profile, width, height, seconds, depth, eye, ssaa;
+    double fps;
 } job_t;
 
 static const char *base_name(const char *p)
@@ -400,19 +403,28 @@ static const char *kFsSphere =
     "uniform mat3 rot;\n"
     "uniform int layout_;\n"
     "uniform int eye;\n"
+    "uniform vec2 px;\n" /* one eye-buffer pixel in uv */
+    "uniform int ssaa;\n"
     "out vec4 o;\n"
     "const float PI = 3.14159265;\n"
-    "void main() {\n"
-    "  vec3 dv = normalize(vec3(mix(-tan_lrud.x, tan_lrud.y, uv.x), mix(tan_lrud.z, -tan_lrud.w, uv.y), -1.0));\n"
+    "vec4 ray(vec2 p) {\n"
+    "  vec3 dv = normalize(vec3(mix(-tan_lrud.x, tan_lrud.y, p.x), mix(tan_lrud.z, -tan_lrud.w, p.y), -1.0));\n"
     "  vec3 d = rot * dv;\n"
     "  float lon = atan(d.x, -d.z), lat = asin(clamp(d.y, -1.0, 1.0));\n"
     "  vec2 tc;\n"
     "  if (layout_ == 0) tc = vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);\n"
     "  else {\n"
-    "    if (abs(lon) > 0.5 * PI) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }\n"
+    "    if (abs(lon) > 0.5 * PI) return vec4(0.0, 0.0, 0.0, 1.0);\n"
     "    tc = vec2((lon / PI + 0.5) * 0.5 + 0.5 * float(eye), 0.5 - lat / PI);\n"
     "  }\n"
-    "  o = texture(t, tc);\n"
+    "  return textureLod(t, tc, 0.0);\n"
+    "}\n"
+    "void main() {\n"
+    "  if (ssaa < 4) { o = ray(uv); return; }\n"
+    /* rotated-grid 4x: the video has more pixels per degree than the eye
+     * buffer, so one tap per pixel aliases (shimmer, crawling edges) */
+    "  o = 0.25 * (ray(uv + px * vec2(-0.125, -0.375)) + ray(uv + px * vec2(0.375, -0.125)) +\n"
+    "              ray(uv + px * vec2(0.125, 0.375)) + ray(uv + px * vec2(-0.375, 0.125)));\n"
     "}\n";
 static const char *kFsShow =
     "#version 430 core\n"
@@ -437,9 +449,9 @@ typedef struct {
     unsigned timed;
     int slot_mismatch;
     /* vr */
-    int vr, layout;
+    int vr, layout, eye, ssaa;
     GLuint sphere, eye_tex[PSVR2_MAX_BUFFERS], eye_fbo[PSVR2_MAX_BUFFERS];
-    GLint u_tan, u_rot, u_layout, u_eye;
+    GLint u_tan, u_rot, u_layout, u_eye, u_px, u_ssaa;
     float tan[2][4];
     double video_t0, fps;
     uint64_t hmd_frames, hmd_errors, hmd_tracked, hmd_late;
@@ -474,7 +486,7 @@ static void gl_dump_readback(gl_ctx_t *c)
     free(rgb);
 }
 
-#define EYE 1536
+#define EYE 1536 /* default eye buffer size; job lines can change it */
 #define OVERSCAN 1.15f
 
 /* Show the current RGBA video frame in the headset until the next video
@@ -500,6 +512,8 @@ static void vr_present(gl_ctx_t *c, unsigned index)
         glUseProgram(c->sphere);
         glBindTexture(GL_TEXTURE_2D, c->rgba);
         glUniform1i(c->u_layout, c->layout);
+        glUniform1i(c->u_ssaa, c->ssaa);
+        glUniform2f(c->u_px, 1.0f / (float)c->eye, 1.0f / (float)c->eye);
         const float yq[4] = {0, sinf(-c->yaw0 / 2), 0, cosf(-c->yaw0 / 2)};
         const mat4 yaw = mat4_quat(yq);
         for (int eye = 0; eye < 2; eye++) {
@@ -510,7 +524,7 @@ static void vr_present(gl_ctx_t *c, unsigned index)
             for (int col = 0; col < 3; col++)
                 for (int k = 0; k < 3; k++)
                     m[col * 3 + k] = r.m[col * 4 + k];
-            glViewport(eye * EYE, 0, EYE, EYE);
+            glViewport(eye * c->eye, 0, c->eye, c->eye);
             glUniform4fv(c->u_tan, 1, c->tan[eye]);
             glUniformMatrix3fv(c->u_rot, 1, GL_FALSE, m);
             glUniform1i(c->u_eye, eye);
@@ -664,6 +678,8 @@ static int vr_setup(gl_ctx_t *c)
     c->u_rot = glGetUniformLocation(c->sphere, "rot");
     c->u_layout = glGetUniformLocation(c->sphere, "layout_");
     c->u_eye = glGetUniformLocation(c->sphere, "eye");
+    c->u_px = glGetUniformLocation(c->sphere, "px");
+    c->u_ssaa = glGetUniformLocation(c->sphere, "ssaa");
     glUseProgram(c->sphere);
     glUniform1i(glGetUniformLocation(c->sphere, "flip"), 0);
     psvr2_set_logger(log_line);
@@ -686,7 +702,7 @@ static int vr_setup(gl_ctx_t *c)
     glGenFramebuffers(PSVR2_MAX_BUFFERS, c->eye_fbo);
     for (int b = 0; b < PSVR2_MAX_BUFFERS; b++) {
         glBindTexture(GL_TEXTURE_2D, c->eye_tex[b]);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2 * EYE, EYE);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2 * c->eye, c->eye);
         glBindFramebuffer(GL_FRAMEBUFFER, c->eye_fbo[b]);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->eye_tex[b], 0);
         uint64_t addr = 0;
@@ -697,7 +713,7 @@ static int vr_setup(gl_ctx_t *c)
             return -1;
         }
     }
-    if (psvr2_start(t, PSVR2_MAX_BUFFERS, EYE, EYE) != 0) {
+    if (psvr2_start(t, PSVR2_MAX_BUFFERS, c->eye, c->eye) != 0) {
         SPIKE_FAIL("vr", "VR mode / registration failed");
         psvr2_close();
         return -1;
@@ -705,7 +721,8 @@ static int vr_setup(gl_ctx_t *c)
     psvr2_eye_tangents(0, OVERSCAN, c->tan[0]);
     psvr2_eye_tangents(1, OVERSCAN, c->tan[1]);
     c->fps = c->j->seconds > 0 && c->fps <= 0 ? 29.97 : c->fps;
-    spike_log("headset up: %dx%d eye buffers, zero-copy T#s, video paced at %.2f fps", 2 * EYE, EYE, c->fps);
+    spike_log("headset up: %dx%d eye buffers, %d sample(s) per pixel, zero-copy T#s, video paced at %.2f fps",
+              2 * c->eye, c->eye, c->ssaa, c->fps);
     return 0;
 }
 
@@ -716,8 +733,10 @@ static void run_gl(const job_t *j)
     c.j = j;
     c.ten_bit = j->profile == 2;
     c.vr = !strncmp(j->mode, "vr", 2);
+    c.eye = j->eye >= 512 && j->eye <= 4096 ? j->eye : EYE;
+    c.ssaa = j->ssaa == 4 ? 4 : 1;
     c.layout = !strcmp(j->mode, "vr180");
-    c.fps = 29.97;
+    c.fps = j->fps > 0 ? j->fps : 29.97;
     snprintf(c.name, sizeof c.name, "%s-%s%s", base_name(j->path), j->kind, c.vr ? "-vr" : "");
     spike_log("== %s %s: %s %dx%d", j->mode, c.name, j->codec, j->width, j->height);
 
@@ -882,8 +901,9 @@ static int read_jobs(job_t *jobs, int max)
         memset(j, 0, sizeof *j);
         j->seconds = 40;
         if (line[0] == '#' ||
-            sscanf(line, "%7s %7s %191s %7s %d %d %d %d %d", j->mode, j->kind, j->path, j->codec,
-                   &j->profile, &j->width, &j->height, &j->seconds, &j->depth) < 7)
+            sscanf(line, "%7s %7s %191s %7s %d %d %d %d %d %d %d %lf", j->mode, j->kind, j->path,
+                   j->codec, &j->profile, &j->width, &j->height, &j->seconds, &j->depth, &j->eye,
+                   &j->ssaa, &j->fps) < 7)
             continue;
         count++;
     }
