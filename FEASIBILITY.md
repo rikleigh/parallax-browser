@@ -1,7 +1,7 @@
 # Feasibility: WebKit + WebXR on a jailbroken PS5 with PS VR2
 
-_Status: **study complete (2026-10-27). Verdict: go (§1); estimate ~2–3
-weeks of agent sessions to an end-to-end WebXR demo, bound by console
+_Status: **study complete (2026-10-27). Verdict: go (§1); estimate ~a week of
+agent sessions to an end-to-end WebXR demo, bound by console
 debugging (§7).**_
 
 Everything below marked **verified** was built or checked on the Mac.
@@ -400,8 +400,9 @@ browsing works before any of the XR-specific risks (R14, R15) are taken on.
 
 **The work is done by Claude agents with the owner running the console**, as
 in this study, so the estimate is not in engineer-months. For calibration,
-the provisional plan put Spikes 0–3 at 1–2 weeks, and with agents they took
-about a day. Writing code and porting dependencies are not the limit. Three
+the provisional plan put Spikes 0–3 at 1–2 weeks. With agents they took a
+few hours, dozens of console runs included: the whole study, Spikes 0–8,
+ran from about 16:00 one afternoon. Writing code and porting dependencies are not the limit. Three
 things are:
 
 1. **The console loop.** Each run needs the owner to launch the title
@@ -418,20 +419,20 @@ things are:
 | JSC fixes (`Date`, plus Spike 4's patches carried over) | small | one console run |
 | WPE build + PS5 WPE Platform backend (VideoOut, DualSense, IME, fonts), CPU-painted pages | medium | console crash-and-fix loop |
 | Process launcher: elfldr spawn, reversed rendezvous, prewarming | small (Spike 8 code) | console loop |
-| **Milestone 1: 2D browsing on the TV** | | **~3–7 days of sessions** |
+| **Milestone 1: 2D browsing on the TV** | | **~1–3 days of sessions** |
 | GPU process inside the UIProcess + WC compositing on WPE (R14) | medium; new design, not porting | console loop |
 | Direct-memory heap for the title (R8) | small–medium | console loop |
 | Driver work: in-process texture sharing for ANGLE, state caching (R11, R15) | medium | console loop |
 | OpenXR runtime on device, WebKit XR binding patch, controllers | small–medium (Spike 5 exists) | headset checks |
 | Integration, stability, suspend/resume | open-ended | console loop, headset checks |
-| **Milestone 2: end-to-end WebXR demo** | | **~4–10 more days of sessions** |
+| **Milestone 2: end-to-end WebXR demo** | | **~2–5 more days of sessions** |
 
-So it is roughly **2–3 weeks of calendar time at this study's pace**, with
-wide error bars. The spikes were small programs; the port is a multi-million-
+So it is roughly **a week of sessions at this study's pace**, with wide
+error bars. The spikes were small programs; the port is a multi-million-
 line browser whose bugs will show up mostly as crashes on the console. The
 range assumes no blocker as hard as Spike 3 could have been. R14 and R15 are
 the likeliest to become one. Optional extras (the JIT in the WebProcess, hand
-tracking) are about a day each.
+tracking) are a few hours each.
 
 **Biggest speed-up: let agents launch titles themselves.** A small payload
 that starts a registered title by ID (homebrew launchers use
