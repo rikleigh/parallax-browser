@@ -374,7 +374,7 @@ are upstream WebKit bugs.
 | R6 | Per-firmware fragility (export tables, SCE stubs, Relapse limited to ≤13.60) | high | medium | Anchor-checked tables, one generator script, document the supported firmware |
 | R7 | JIT unavailable, so slow JS | low (reduced) | medium for WebXR (three.js frame budgets) | JS runs in payloads, where RWX, RW→RX and `sceKernelJit*` all work (Spike 1). The LLInt interpreter is ~3× slower than an M4 Max (Spike 4); enabling the JIT is optional port work |
 | R11 | GL draw-call overhead makes busy WebGL/three.js scenes CPU-bound | medium (reduced) | medium for WebXR content | Measured and partly fixed (§4.2c): 72 → 8 µs per draw with patch 0003, profiling off and async preparation. Left: driver state caching (port work), compare pacbrew Mesa/zink. glthread takes the work off the calling thread |
-| R12 | Clean exit/suspend: titles were killed by the system on close (0xa0d0c00f, "debug error") | **fixed** | low (UX) | Cause: ps5-opengl's `catchReturnFromMain` sleeps forever after `main`. `spikes/common/title_exit.c` replaces it with `sceShellCoreUtilExitApp` (as PS5VR): Spike 8 closes with no error (2026-10-27). Still to do: handle suspend/resume events in the browser |
+| R12 | Clean exit/suspend: titles were killed by the system on close (0xa0d0c00f, "debug error") | **worked around** | low (UX) | First cause: ps5-opengl's `catchReturnFromMain` sleeps forever after `main`. Second, watched on the TV: any GPU title that ends itself (`sceShellCoreUtilExitApp`, `exit`, `_exit`) gets a debug error, because ShellUI's suspend-before-kill crashes it (reason 0xc). Only a SIGKILL from another process shows nothing, so `title_exit.c` asks the launcher payload to SIGKILL the title ([tools/launcher](tools/launcher/README.md)). Still to do: handle suspend/resume (rest mode) in the browser |
 | R8 | Memory budget: the title has ~251 MB of flexible memory for the UIProcess + GPU process (ANGLE, Mesa shader compiler, compositor) | high | high | Measured (§4.4b). Heaps on a direct-memory backend (bmalloc/libpas over `sceKernelAllocateDirectMemory`, as Sony's port does); payloads hold the JS/DOM heaps (8 GB) |
 | R9 | Dependency porting (glib, libsoup, ICU, Skia deps) is larger than estimated | high | schedule | pacbrew covers ~60%; budget it explicitly (Spike 6) |
 | R10 | Tethered jailbreak: re-run after every reboot | certain | UX only | Document it; autoload scripts |
@@ -435,12 +435,12 @@ the likeliest to become one. Optional extras (the JIT in the WebProcess, hand
 tracking) are a few hours each.
 
 **Biggest speed-up, now built: agents launch titles themselves.**
-[`tools/launch.sh`](tools/launcher/README.md) starts a registered title
-through a resident payload (`sceLncUtilLaunchApp`), and stops one with
-SIGKILL, because no kill API accepts a payload on 13.60. The
-build → launch → read-log → fix loop no longer needs the owner. Only the TV
-and headset checks, and registering each new title ID once, still need a
-person.
+[`tools/launch.sh`](tools/launcher/README.md) registers a title
+(`sceAppInstUtilAppInstallAll` after writing `/user/app/<ID>`), starts it
+(`sceLncUtilLaunchApp`) and stops it with SIGKILL (no kill API accepts a
+payload on 13.60, and only SIGKILL avoids a debug error). The
+build → upload → register → launch → read-log → fix loop no longer needs the
+owner. Only the TV and headset checks still need a person.
 
 ## 8. Optional console runs before the port
 

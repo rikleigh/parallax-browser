@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Upload a folder title to the console's /data/homebrew/<TITLE_ID> over
-# ftpsrv (port 2121). Register/launch it with PS5Upload (Games -> Game files
-# -> Play). A title that is already registered keeps a copy of its
+# ftpsrv (port 2121). tools/launch.sh --install also registers and launches
+# it. A title that is already registered keeps a copy of its
 # param.json in /user/app/<TITLE_ID>/sce_sys, refreshed here too.
 #   tools/upload-title.sh spikes/08-title-ipc/build/titles/PPSA99009
 set -euo pipefail

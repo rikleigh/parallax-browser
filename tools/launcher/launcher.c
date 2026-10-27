@@ -6,16 +6,16 @@
  *
  *   status                 the running big app, if any: "OK <appid> <TITLEID>"
  *   launch <TITLEID> [arg] start a registered title (fails if one is running)
- *   kill                   stop the running big app and wait until it is gone
+ *   kill                   SIGKILL the running big app, wait until it is gone
+ *   register <TITLEID> [dir] register a title uploaded to /data/homebrew/<ID>
  *   quit                   stop the launcher
  *
  * tools/launch.sh is the client. It sends this payload first if nothing
- * answers on the port. Titles still have to be registered once (PS5Upload).
+ * answers on the port.
  *
  * On 13.60 (checked 2026-10-27) sceLncUtilLaunchApp works with the payload's
- * own authid; the system authids below are only a fallback. No kill API
- * accepts a payload, so kill sends SIGKILL to the title's process, which the
- * system accepts at once and lets the next launch go ahead.
+ * own authid; the system authids below are only a fallback. Stopping is by
+ * signal (see kill_running).
  */
 #include <errno.h>
 #include <netinet/in.h>
@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,9 +46,57 @@ typedef struct {
 int sceUserServiceInitialize(void *);
 int sceUserServiceGetForegroundUser(int32_t *);
 int sceLncUtilLaunchApp(const char *title_id, const char **argv, lnc_app_param_t *param);
-int sceLncUtilKillApp(uint32_t app_id);
 int sceLncUtilGetAppIdOfRunningBigApp(void);
 int sceLncUtilGetAppTitleId(uint32_t app_id, char *title_id);
+int sceKernelLoadStartModule(const char *path, size_t argc, const void *argv, uint32_t flags,
+                             void *opt, int *res);
+
+static void say(int fd, const char *fmt, ...);
+
+/* libSceAppInstUtil isn't loaded in payloads, so elfldr can't bind it at
+ * load time ("Unable to resolve"): load it on first use. */
+static int (*app_inst_init)(void);
+static int (*app_inst_title_dir)(const char *title_id, const char *install_path, void *reserved);
+static int (*app_inst_all)(void *reserved);
+
+static int load_app_inst_util(void)
+{
+    if (app_inst_title_dir || app_inst_all)
+        return 0;
+    /* 13.60's copy has no AppInstallTitleDir (in any process). It has
+     * AppInstallAll, which makes ShellCore rescan /user/app and register every
+     * title directory it finds (its log: "AppInstallTitleDirMain <ID>"), as
+     * happens when PS5Upload starts a title. Look in each copy. sceKernelDlsym refuses these symbols (0x80020003); the
+     * kernel-side lookup reads the export table, as elfldr does. */
+    static const char *paths[] = {
+        "/system/common/lib/libSceAppInstUtil.sprx",
+        "/system/priv/lib/libSceAppInstUtil.sprx",
+    };
+    for (size_t i = 0; i < sizeof paths / sizeof *paths && !app_inst_title_dir && !app_inst_all; i++) {
+        int res = 0;
+        int h = sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, &res);
+        if (h < 0) {
+            say(-1, "  load %s -> 0x%08x", paths[i], (unsigned)h);
+            continue;
+        }
+        void *init = (void *)kernel_dynlib_dlsym(getpid(), (uint32_t)h, "sceAppInstUtilInitialize");
+        void *dir = (void *)kernel_dynlib_dlsym(getpid(), (uint32_t)h, "sceAppInstUtilAppInstallTitleDir");
+        say(-1, "  %s (0x%x): Initialize %p, AppInstallTitleDir %p", paths[i], h, init, dir);
+        if (init && !app_inst_init)
+            app_inst_init = (int (*)(void))init;
+        void *all = (void *)kernel_dynlib_dlsym(getpid(), (uint32_t)h, "sceAppInstUtilAppInstallAll");
+        say(-1, "  AppInstallAll %p", all);
+        if (dir)
+            app_inst_title_dir = (int (*)(const char *, const char *, void *))dir;
+        if (all)
+            app_inst_all = (int (*)(void *))all;
+    }
+    if (!app_inst_init || (!app_inst_title_dir && !app_inst_all))
+        return -1;
+    int r = app_inst_init();
+    say(-1, "  sceAppInstUtilInitialize -> 0x%08x", (unsigned)r);
+    return r;
+}
 
 static FILE *log_file;
 static uint64_t own_authid;
@@ -136,44 +185,124 @@ static pid_t app_pid(int app_id, char title_id[16])
     return -1;
 }
 
+/* The app takes a moment to go; launching before then fails. */
+static int wait_gone(int app_id, int ms)
+{
+    for (int t = 0; t < ms; t += 100) {
+        char now[16];
+        if (running_app(now) != app_id)
+            return t;
+        usleep(100 * 1000);
+    }
+    return -1;
+}
+
 /* On 13.60 every kill API refuses a payload: sceLncUtilKillApp and
  * ForceKillApp return 0x80940004 with any authid, sceSystemServiceKillApp
- * blocks 10 s and fails. So ask once politely, then SIGKILL the process. */
+ * blocks 10 s and fails. SIGKILL works: the system logs an app crash
+ * (0xa0d0c00d) but shows nothing (watched 2026-10-27). SIGTERM and any exit
+ * a GPU title makes itself show a debug error, so SIGKILL is the only way. */
 static int kill_running(int fd)
 {
-    char tid[16];
+    char tid[16], ptid[16];
     int app_id = running_app(tid);
     if (app_id <= 0) {
         say(fd, "OK nothing running");
         return 0;
     }
-    const char *how = "sceLncUtilKillApp";
-    int r = sceLncUtilKillApp((uint32_t)app_id);
-    if (r < 0) {
-        char ptid[16];
-        pid_t pid = app_pid(app_id, ptid);
-        if (pid < 0) {
-            say(fd, "ERR kill %s (appid 0x%x): 0x%08x, and no process found", tid, app_id, (unsigned)r);
-            return -1;
-        }
-        if (kill(pid, SIGKILL) != 0) {
-            say(fd, "ERR kill %s: SIGKILL pid %d: %s", tid, pid, strerror(errno));
-            return -1;
-        }
-        how = "SIGKILL";
-        say(-1, "  sceLncUtilKillApp 0x%08x; SIGKILL pid %d (%s)", (unsigned)r, pid, ptid);
+    pid_t pid = app_pid(app_id, ptid);
+    if (pid < 0) {
+        say(fd, "ERR kill %s (appid 0x%x): no process found", tid, app_id);
+        return -1;
     }
-    /* The app takes a moment to go; launching before then fails. */
-    for (int i = 0; i < 100; i++) {
-        char now[16];
-        if (running_app(now) != app_id) {
-            say(fd, "OK killed %s after %d ms (%s)", tid, i * 100, how);
-            return 0;
-        }
-        usleep(100 * 1000);
+    if (kill(pid, SIGKILL) != 0) {
+        say(fd, "ERR kill %s: SIGKILL pid %d: %s", tid, pid, strerror(errno));
+        return -1;
     }
-    say(fd, "ERR %s still running 10 s after kill", tid);
-    return -1;
+    int t = wait_gone(app_id, 10000);
+    if (t < 0) {
+        say(fd, "ERR %s still running 10 s after SIGKILL", tid);
+        return -1;
+    }
+    say(fd, "OK killed %s after %d ms", tid, t);
+    return 0;
+}
+
+static int copy_file(const char *from, const char *to)
+{
+    FILE *in = fopen(from, "rb");
+    if (!in)
+        return -1;
+    FILE *out = fopen(to, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+    char buf[16384];
+    size_t n;
+    int r = 0;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        if (fwrite(buf, 1, n, out) != n)
+            r = -1;
+    fclose(in);
+    if (fclose(out) != 0)
+        r = -1;
+    return r;
+}
+
+/* Register a title whose files are in src (default /data/homebrew/<ID>) the
+ * way PS5Upload's Play does (read off the console): /user/app/<ID>/ holds
+ * sce_sys/param.json and a mount.lnk naming src, which etaHEN mounts at
+ * launch; then the system's installer adds it to the app list. */
+static void register_title(int fd, const char *tid, const char *src_arg)
+{
+    char src[256], path[320], to[320];
+    if (src_arg)
+        snprintf(src, sizeof src, "%s", src_arg);
+    else
+        snprintf(src, sizeof src, "/data/homebrew/%s", tid);
+
+    struct stat st;
+    snprintf(path, sizeof path, "%s/eboot.bin", src);
+    if (stat(path, &st) != 0) {
+        say(fd, "ERR register %s: no %s", tid, path);
+        return;
+    }
+    snprintf(path, sizeof path, "/user/app/%s", tid);
+    mkdir(path, 0777);
+    snprintf(path, sizeof path, "/user/app/%s/sce_sys", tid);
+    mkdir(path, 0777);
+    static const char *files[] = { "param.json", "icon0.png", "pic0.png", "pic1.png" };
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        snprintf(path, sizeof path, "%s/sce_sys/%s", src, files[i]);
+        snprintf(to, sizeof to, "/user/app/%s/sce_sys/%s", tid, files[i]);
+        if (copy_file(path, to) != 0 && i == 0) {
+            say(fd, "ERR register %s: copy %s: %s", tid, path, strerror(errno));
+            return;
+        }
+    }
+    snprintf(path, sizeof path, "/user/app/%s/mount.lnk", tid);
+    FILE *lnk = fopen(path, "w");
+    if (!lnk || fputs(src, lnk) < 0 || fclose(lnk) != 0) {
+        say(fd, "ERR register %s: write %s: %s", tid, path, strerror(errno));
+        return;
+    }
+    int r = load_app_inst_util();
+    if (r != 0) {
+        say(fd, "ERR register %s: loading libSceAppInstUtil: 0x%08x", tid, (unsigned)r);
+        return;
+    }
+    const char *how = "AppInstallTitleDir";
+    if (app_inst_title_dir) {
+        r = app_inst_title_dir(tid, "/user/app/", NULL);
+    } else {
+        how = "AppInstallAll";
+        r = app_inst_all(NULL);
+    }
+    if (r != 0)
+        say(fd, "ERR register %s: sceAppInstUtil%s 0x%08x (files are in place)", tid, how, (unsigned)r);
+    else
+        say(fd, "OK registered %s from %s (%s)", tid, src, how);
 }
 
 /* Returns 1 to stop the launcher. */
@@ -210,12 +339,17 @@ static int command(int fd, char *line)
             say(fd, "OK launched %s appid 0x%x (authid 0x%016llx%s)", a1, r,
                 (unsigned long long)used, used == own_authid ? ", own" : "");
     } else if (!strcmp(cmd, "kill")) {
-        kill_running(fd);
+        kill_running(fd); /* "kill -9" is accepted: SIGKILL is the only way */
+    } else if (!strcmp(cmd, "register")) {
+        if (!a1 || strlen(a1) != 9)
+            say(fd, "ERR usage: register <TITLEID> [srcdir]");
+        else
+            register_title(fd, a1, a2);
     } else if (!strcmp(cmd, "quit")) {
         say(fd, "OK bye");
         return 1;
     } else {
-        say(fd, "ERR unknown command %s (status, launch, kill, quit)", cmd);
+        say(fd, "ERR unknown command %s (status, launch, kill, register, quit)", cmd);
     }
     return 0;
 }
