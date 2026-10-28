@@ -688,6 +688,132 @@ The plan this followed:
 4. **"View in VR"** samples the same RGBA texture on a sphere or dome
    (Spike 9's `vr360`/`vr180`), so it needs nothing from the page.
 
+## View in VR (Milestone 2 step 3, 2026-10-28)
+
+The `<video>` playing in the page goes into the PS VR2 headset; the page
+keeps playing it and the title draws the same decoded frames (hardware or
+software path) on a sphere, dome or big flat screen. Nothing changes in
+WebKit (no patch): it is all in the title (`wpe-ps5/PS5RendererVR.cpp`,
+`PS5Text.cpp`, `apps/title/viewinvr.c`).
+
+**Pad.** On a page: **touchpad button** = View in VR (a message on the TV
+says so for 4 s when a video of 640 px or more starts, at most every 2
+minutes). In VR the whole pad belongs to it:
+
+| button | in VR |
+| --- | --- |
+| X | play / pause (the page's video element, or YouTube's player API) |
+| D-pad left / right | seek -10 s / +10 s |
+| Triangle | next projection: flat, 180 SBS, 180 TB, 180 mono, 360 mono, 360 TB, 360 SBS, fisheye SBS |
+| Square | recentre (the video's front goes where you look; yaw only) |
+| Options | show the hint again |
+| O or touchpad | back to the TV, playback continues |
+
+The headset shows a hint for a few seconds after entering and after each
+press (projection, playing/paused and time, the controls); the TV shows
+"Playing in the PS VR2 headset", the page title, the projection and the
+controls. Without a headset the TV shows "No PS VR2 headset found..." and
+nothing else happens. Leaving a page, a WebProcess crash and the title's
+wind-down (`tools/launch.sh --stop`) leave VR first; the wind-down waits for
+the headset to be released.
+
+**How it works.**
+- `viewinvr.c` (UIProcess main thread) runs a script in the page: the
+  playing `<video>` (largest first; page and same-origin frames), its
+  address and the page title, plus YouTube's `projectionType`/`stereoLayout`
+  from the player response. The projection guess: YouTube's data if any
+  (`EQUIRECTANGULAR` = 360, `..._THREED_TOP_BOTTOM` = 360 TB, `RECTANGULAR` =
+  flat); else keywords in title, page address, stream address and the
+  element's attributes: `180`/`360` as a number on its own (not `360p`,
+  `640x360`), `sbs`/`3dh`/`side by side` (and `lr` next to an angle),
+  `tb`/`ou`/`3dv`/`top-bottom`/`over-under`, `mono`, `fisheye[NNN]`,
+  `mkx200`/`mkx220`, `vrca220`, `rf52`; 180 without a stereo word is
+  side by side (VR180 nearly always is); SBS/TB without an angle is 180;
+  nothing = flat. With no `<video>` reachable (a cross-origin player frame)
+  it still enters VR on the title's newest video stream, without player
+  controls.
+- The display (`wpe_display_ps5_vr_*`, `wpe_display_ps5_set_button_handler`)
+  hands the request to the render thread and captures the pad.
+- The render thread (`PS5RendererVR.cpp`): `psvr2_open` (Hmd2, VrTracker2,
+  reprojection; Spike 3b's `spikes/common/psvr2`), three 4096x2048 eye
+  buffers (two 2048 eyes side by side) as immutable GL textures exported as
+  T#s, `psvr2_start` (120 Hz out, half-rate rendering). Then it is paced by
+  the headset instead of the TV: per frame (60/s) it takes a pending page
+  buffer (the UI thread waits for those), `psvr2_begin_frame` (pose for the
+  predicted display time), `PS5VideoServer::consume` with that display time
+  (converted from the process clock to CLOCK_MONOTONIC) so the newest due
+  video frame is converted and older ones are dropped with their decoder
+  slots released, the eye pass, `glFinish`, `psvr2_submit`, then
+  `presented()` gives the shown picture's slot back: the same slot flow as
+  on the TV, at the headset's frame rate. The TV is redrawn only when its
+  notice changes (a TV swap is cheap when the previous flip is long done).
+- Eye pass: one fragment pass per eye, 4 samples per pixel on a rotated
+  grid (Spike 9: 2048 x4 removes shimmer, 1.2 ms), each sample along its
+  view ray: equirectangular 360/180, equidistant fisheye (field of view from
+  the name, 180 by default), or a 70-degree-wide flat screen in a dark room;
+  stereo layouts pick the eye's half (left/top = left eye). The hint is
+  head-locked at the same tangents in both eyes. Recentring keeps the yaw
+  of the head at entry (or at Square).
+- Leaving: `psvr2_close` leaves VR mode, unregisters, closes the tracker,
+  reprojection and Hmd2 and now **releases the ~130 MB of direct memory**
+  psvr2 took (Spike 3b/9 leaked it per session); a failed open undoes
+  whatever was set up.
+- `package.sh` writes PS5VR's `attribute`/`attribute3` (0x62000000 /
+  0x04080c40) into PPSA99020's param.json: Hmd2 refuses a title without
+  them (FEASIBILITY §3). Spikes 3b and 9 drew on the TV with the same values.
+- Text (TV notice, hint, messages): FreeType with the browser's Noto fonts
+  (NotoSans-Bold; the pad's ✕ ○ △ □ ◀ ▶ from NotoSansSymbols2).
+
+**Test clips.** `test/media/make-vr-media.sh [--upload]` makes HEVC test
+patterns (FFmpeg `v360` from a labelled equirectangular grid: a cell every
+30 degrees with its yaw/pitch, FRONT/RIGHT/BACK/LEFT/UP/DOWN, a green front
+cell, a clock at the front; stereo clips have a red "LEFT EYE" and a blue
+"RIGHT EYE" grid): `vrtest_360_mono`, `vrtest_360_TB`, `vrtest_360_SBS`,
+`vrtest_180_mono`, `vrtest_180_LR`, `vrtest_180_TB`, `vrtest_MKX200_LR`
+(200-degree fisheye). The start page has a "View in VR tests" row.
+
+**Knobs (log-only tests).** `/data/ps5webkit/vr-sim`: no Hmd2 at all; the eye
+buffers are rendered on a 60 Hz timer with a scripted head direction, and a
+screen capture request reads them back (`[vr] SHOT`). `/data/ps5webkit/vr-selftest`
+(only with `vr-sim`): after the first test URL loads, enters VR through the
+same path as the touchpad, captures the eye buffers looking front, right,
+back, left, up and down, cycles every projection, presses X, right, left, X,
+Square, Options and O, then enters and leaves three more times
+(`RESULT ps5browser vr-selftest`). `/data/ps5webkit/vr-probe`: afterwards
+opens and closes Hmd2 twice without tracker or VR mode (nothing shows in a
+headset): binding, param.json attributes, device status. Logs: `[vr]`
+(every 5 s: headset frames, render time, tracked, video frames shown,
+projection, errors).
+
+**Tested (log-only, 2026-10-28, `vr-sim` + `vr-selftest`; no headset was
+driven).** Run 1: `vrtest_180_LR` decoded by Videodec2 (3840x1920 HEVC):
+guess "180 3D side by side" from the address, simulated headset up in 27 ms,
+eye-buffer captures front/right/back/left/up/down and every projection
+correct (upright, red left eye and blue right eye in the right halves,
+black outside 180 degrees, flat screen where expected; they match a CPU
+port of the eye pass run on the Mac over the same clips), X/seek/recentre
+reached the page's video (`Paused 0:52`, `+10 s`, `-10 s`, `Playing`).
+Run 2: `sync-1080p30-h264` with `no-hwdec` (software frames through shared
+memory): guess "flat", the same sequence, then three more enter/leave
+cycles: `RESULT vr-selftest PASS`. Both runs: eye pass 0.8–1.3 ms per
+frame (2 x 2048 x 2048, 4 samples) when no capture is taken, 60 headset
+frames/s, a 30 fps video shown at 28–30 frames/s, decoder slots flowing
+(0 take-backs), TV notice redrawn 16–17 times in a minute (swap 0.1 ms),
+title flexible memory unchanged (298 MB), direct memory back to its
+pre-VR level after leaving (the eye buffers). `vr-probe`: Hmd2 binds with
+the new param.json, opens the headset (device status 2, not worn) and
+closes, twice. The real Hmd2 VR mode (`psvr2_start`, submits, tracking,
+`psvr2_close` with its memory release) has not run in the browser yet: that
+is the owner's headset check.
+
+Not done: YouTube's own 360/180 formats. Its player data says
+`projectionType` per format (read and logged; `EQUIRECTANGULAR` and
+`EQUIRECTANGULAR_THREED_TOP_BOTTOM` map to 360 / 360 TB), but `MESH`
+(equi-angular cubemap, and VR180's mesh) is not unpacked: it is shown as
+360 equirectangular, which will look wrong. Whether YouTube serves 360
+video at all to this browser (Safari user agent, no WebGL) is not checked.
+the site's JSON feed (exact projection) is not used yet.
+
 ## JSC `Date` (FEASIBILITY §8 item 5)
 
 Not a clock bug. WTF's wall clock on this libc is

@@ -146,4 +146,7 @@ struct PS5NotificationRequest {
 };
 int sceKernelSendNotificationRequest(int, PS5NotificationRequest*, size_t, int) __attribute__((weak));
 
+// libkernel: the clock Hmd2's predicted display times are given in (us).
+uint64_t sceKernelGetProcessTime(void) __attribute__((weak));
+
 } // extern "C"

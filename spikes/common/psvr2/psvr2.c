@@ -55,6 +55,8 @@ int sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t len, size_t
                                   int64_t *offset);
 int sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, int64_t offset,
                              size_t align);
+int sceKernelMunmap(void *addr, size_t len);
+int sceKernelReleaseDirectMemory(int64_t start, size_t len);
 int sceKernelUsleep(unsigned usec);
 uint64_t sceKernelGetProcessTime(void);
 
@@ -217,11 +219,59 @@ void *psvr2_direct_alloc(uint64_t size, uint64_t align)
     return va;
 }
 
+/* Direct memory psvr2_open takes for the tracker and the reprojection: given
+ * back in psvr2_close (a title that enters and leaves VR many times would
+ * otherwise lose ~130 MB each time). */
+#define MAX_OWNED 4
+static struct { void *va; int64_t off; uint64_t size; } s_owned[MAX_OWNED];
+
+static void *owned_alloc(uint64_t size, uint64_t align)
+{
+    int slot = -1;
+    for (int i = 0; i < MAX_OWNED && slot < 0; i++)
+        if (!s_owned[i].va)
+            slot = i;
+    if (slot < 0)
+        return NULL;
+    size = (size + 0xffff) & ~(uint64_t)0xffff;
+    if (align < 0x10000)
+        align = 0x10000;
+    int64_t off = 0;
+    void *va = NULL;
+    if (sceKernelAllocateDirectMemory(0, (int64_t)16 << 30, size, align, 12 /* WB_ONION */, &off) != 0)
+        return NULL;
+    if (sceKernelMapDirectMemory(&va, size, 0x33, 0, off, align) != 0) {
+        sceKernelReleaseDirectMemory(off, size);
+        logf_("psvr2: direct alloc 0x%llx failed", (unsigned long long)size);
+        return NULL;
+    }
+    memset(va, 0, size);
+    s_owned[slot].va = va;
+    s_owned[slot].off = off;
+    s_owned[slot].size = size;
+    return va;
+}
+
+static uint64_t owned_free_all(void)
+{
+    uint64_t bytes = 0;
+    for (int i = 0; i < MAX_OWNED; i++) {
+        if (!s_owned[i].va)
+            continue;
+        sceKernelMunmap(s_owned[i].va, s_owned[i].size);
+        sceKernelReleaseDirectMemory(s_owned[i].off, s_owned[i].size);
+        bytes += s_owned[i].size;
+        s_owned[i].va = NULL;
+    }
+    return bytes;
+}
+
 /* -- state ---------------------------------------------------------------- */
 typedef struct { void *layers; uint32_t count; uint32_t pad; } layer_set_t;
 
 static struct {
     int preloaded, open, active;
+    int hmd_init, tracker_init, tracker_registered, reprojection_init;
     int hmd, vh;
     float fov[4];
     uint32_t eye_w, eye_h;
@@ -247,17 +297,18 @@ int psvr2_preload(void)
     return 0;
 }
 
-int psvr2_open(int user_id)
+static void teardown(void);
+
+/* Every failure after sceHmd2Initialize undoes what was set up (teardown),
+ * so a failed open (no headset) leaves nothing behind. */
+static int open_(int user_id)
 {
-    if (g.open)
-        return 0;
-    if (psvr2_preload() != 0)
-        return -1;
     uint8_t init[16] = {0};
     int rc = sceHmd2Initialize(init);
     logf_("psvr2: sceHmd2Initialize -> 0x%08x", rc);
     if (rc != 0)
         return -1;
+    g.hmd_init = 1;
     float fov[16];
     memset(fov, 0, sizeof fov);
     rc = sceHmd2GetFieldOfViewWithoutHandle(fov);
@@ -288,7 +339,7 @@ int psvr2_open(int user_id)
     if (sceVrTracker2QueryMemory(qparam, qout) != 0)
         return -1;
     logf_("psvr2: tracker wants %u KB direct memory (align 0x%x)", qout[1] >> 10, qout[2]);
-    void *twork = psvr2_direct_alloc(qout[1], qout[2]);
+    void *twork = owned_alloc(qout[1], qout[2]);
     if (!twork)
         return -1;
     uint8_t ip[0x48];
@@ -302,7 +353,9 @@ int psvr2_open(int user_id)
     *(uint32_t *)(ip + 0x28) = qout[1];
     *(uint32_t *)(ip + 0x2c) = qout[2];
     rc = sceVrTracker2Initialize(ip);
+    g.tracker_init = rc == 0;
     int rc2 = rc == 0 ? sceVrTracker2RegisterDevice(0, g.hmd) : -1;
+    g.tracker_registered = rc2 == 0;
     logf_("psvr2: tracker init 0x%08x register 0x%08x", rc, rc2);
     if (rc != 0 || rc2 != 0)
         return -1;
@@ -311,8 +364,8 @@ int psvr2_open(int user_id)
     size_align_t db = sceHmd2ReprojectionQueryDisplayBufferSizeAlign();
     logf_("psvr2: reprojection wants %llu KB work + %llu KB display buffer",
           (unsigned long long)(wb.size >> 10), (unsigned long long)(db.size >> 10));
-    void *work = psvr2_direct_alloc(wb.size, 0x10000);
-    void *disp = psvr2_direct_alloc(db.size, 0x10000);
+    void *work = owned_alloc(wb.size, 0x10000);
+    void *disp = owned_alloc(db.size, 0x10000);
     if (!work || !disp)
         return -1;
     uint8_t rp[72];
@@ -326,8 +379,49 @@ int psvr2_open(int user_id)
     logf_("psvr2: sceHmd2ReprojectionInitialize -> 0x%08x", rc);
     if (rc != 0)
         return -1;
+    g.reprojection_init = 1;
+    return 0;
+}
+
+int psvr2_open(int user_id)
+{
+    if (g.open)
+        return 0;
+    if (psvr2_preload() != 0)
+        return -1;
+    if (open_(user_id) != 0) {
+        teardown();
+        return -1;
+    }
     g.open = 1;
     return 0;
+}
+
+int psvr2_probe(int user_id, uint32_t *status, int *worn)
+{
+    *status = 0;
+    *worn = 0;
+    if (g.open || g.hmd_init)
+        return -1;
+    if (psvr2_preload() != 0)
+        return -2;
+    uint8_t init[16] = {0};
+    int rc = sceHmd2Initialize(init);
+    if (rc != 0) {
+        logf_("psvr2: probe: sceHmd2Initialize -> 0x%08x", rc);
+        return rc;
+    }
+    int h = sceHmd2Open(user_id, 0, 0, NULL);
+    uint8_t info[64];
+    memset(info, 0, sizeof info);
+    int rc2 = sceHmd2GetDeviceInformation(info);
+    *status = *(uint32_t *)info;
+    *worn = info[20];
+    int rc3 = h >= 0 ? sceHmd2Close(h) : 0;
+    int rc4 = sceHmd2Terminate();
+    logf_("psvr2: probe: open 0x%08x, device info 0x%08x (status %u worn %u lens %u mm), close 0x%08x, terminate 0x%08x",
+          h, rc2, *status, info[20], info[21], rc3, rc4);
+    return h >= 0 ? 0 : h;
 }
 
 void psvr2_fov(float tan[4])
@@ -510,20 +604,34 @@ void psvr2_stop(void)
 }
 
 /* Must run before exit: the tracker library's destructor faults on a live
- * tracker (PS5VR). */
+ * tracker (PS5VR). Undoes whatever open_() got to, in reverse order. */
+static void teardown(void)
+{
+    int r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0;
+    if (g.tracker_registered)
+        r1 = sceVrTracker2UnregisterDevice(g.hmd);
+    if (g.tracker_init)
+        r2 = sceVrTracker2Finalize();
+    if (g.reprojection_init)
+        r3 = sceHmd2ReprojectionTerminate();
+    if (g.hmd >= 0)
+        r4 = sceHmd2Close(g.hmd);
+    if (g.hmd_init)
+        r5 = sceHmd2Terminate();
+    const int was = g.hmd_init;
+    g.tracker_registered = g.tracker_init = g.reprojection_init = g.hmd_init = 0;
+    g.hmd = -1;
+    g.open = 0;
+    const uint64_t freed = owned_free_all();
+    if (was)
+        logf_("psvr2: closed (tracker 0x%08x 0x%08x, reprojection 0x%08x, hmd 0x%08x 0x%08x; %llu MB direct memory released)",
+              r1, r2, r3, r4, r5, (unsigned long long)(freed >> 20));
+}
+
 void psvr2_close(void)
 {
     psvr2_stop();
-    if (!g.open)
-        return;
-    const int r1 = sceVrTracker2UnregisterDevice(g.hmd);
-    const int r2 = sceVrTracker2Finalize();
-    const int r3 = sceHmd2ReprojectionTerminate();
-    const int r4 = sceHmd2Close(g.hmd);
-    const int r5 = sceHmd2Terminate();
-    g.open = 0;
-    logf_("psvr2: closed (tracker 0x%08x 0x%08x, reprojection 0x%08x, hmd 0x%08x 0x%08x)", r1, r2,
-          r3, r4, r5);
+    teardown();
 }
 
 /* -- leaving the title -------------------------------------------------------- */

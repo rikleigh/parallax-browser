@@ -45,8 +45,14 @@ void psvr2_set_logger(psvr2_log_fn fn);
 /* Load and bind the libraries. In a title this must run early, while the
  * sandbox's /<random word>/common/lib path is still how they are reached. */
 int psvr2_preload(void);
-/* Hmd2 + tracker + reprojection for the given user. */
+/* Hmd2 + tracker + reprojection for the given user. A failure undoes what
+ * was set up; psvr2_close releases everything, its direct memory included,
+ * and open can be called again afterwards. */
 int psvr2_open(int user_id);
+/* Hmd2 only, opened and closed again (no tracker, no VR mode: nothing shows
+ * in the headset): 0 if the headset could be opened, with its device status
+ * and worn flag; else the error. */
+int psvr2_probe(int user_id, uint32_t *status, int *worn);
 /* FOV tangents of one eye as the headset reports them: out, in, up, down. */
 void psvr2_fov(float tan[4]);
 /* Tangents to render and submit for eye 0/1 (left, right, up, down), with

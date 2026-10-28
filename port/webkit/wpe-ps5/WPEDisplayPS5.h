@@ -63,6 +63,94 @@ WPE_API void        wpe_display_ps5_set_log_sink  (WPEDisplayPS5 *display,
 WPE_API void        wpe_display_ps5_capture_screen (WPEDisplayPS5 *display,
                                                     const char    *path);
 
+/* ---- The pad, for the application ---- */
+
+/* DualSense buttons (bits of the pressed mask below). */
+typedef enum {
+    WPE_DISPLAY_PS5_BUTTON_L3 = 0x00000002,
+    WPE_DISPLAY_PS5_BUTTON_R3 = 0x00000004,
+    WPE_DISPLAY_PS5_BUTTON_OPTIONS = 0x00000008,
+    WPE_DISPLAY_PS5_BUTTON_UP = 0x00000010,
+    WPE_DISPLAY_PS5_BUTTON_RIGHT = 0x00000020,
+    WPE_DISPLAY_PS5_BUTTON_DOWN = 0x00000040,
+    WPE_DISPLAY_PS5_BUTTON_LEFT = 0x00000080,
+    WPE_DISPLAY_PS5_BUTTON_L2 = 0x00000100,
+    WPE_DISPLAY_PS5_BUTTON_R2 = 0x00000200,
+    WPE_DISPLAY_PS5_BUTTON_L1 = 0x00000400,
+    WPE_DISPLAY_PS5_BUTTON_R1 = 0x00000800,
+    WPE_DISPLAY_PS5_BUTTON_TRIANGLE = 0x00001000,
+    WPE_DISPLAY_PS5_BUTTON_CIRCLE = 0x00002000,
+    WPE_DISPLAY_PS5_BUTTON_CROSS = 0x00004000,
+    WPE_DISPLAY_PS5_BUTTON_SQUARE = 0x00008000,
+    WPE_DISPLAY_PS5_BUTTON_TOUCHPAD = 0x00100000,
+} WPEDisplayPS5Button;
+
+/* Called on the main thread with the buttons that went down, before the
+ * page gets them. Return TRUE to take them: the page then sees neither the
+ * press nor the release. */
+typedef gboolean (* WPEDisplayPS5ButtonHandler) (WPEDisplayPS5 *display,
+                                                 guint32        pressed,
+                                                 gpointer       user_data);
+WPE_API void        wpe_display_ps5_set_button_handler (WPEDisplayPS5             *display,
+                                                        WPEDisplayPS5ButtonHandler handler,
+                                                        gpointer                   user_data);
+
+/* A short message over the page on the TV (bottom centre), for @seconds. */
+WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
+                                                  const char    *text,
+                                                  double         seconds);
+
+/* ---- View in VR: the playing video in the PS VR2 headset ---- */
+
+typedef enum {
+    WPE_DISPLAY_PS5_VR_FLAT = 0,     /* a big virtual screen */
+    WPE_DISPLAY_PS5_VR_360,          /* equirectangular 360, mono */
+    WPE_DISPLAY_PS5_VR_360_SBS,      /* 360, left eye left half */
+    WPE_DISPLAY_PS5_VR_360_TB,       /* 360, left eye top half */
+    WPE_DISPLAY_PS5_VR_180,          /* equirectangular 180, mono */
+    WPE_DISPLAY_PS5_VR_180_SBS,
+    WPE_DISPLAY_PS5_VR_180_TB,
+    WPE_DISPLAY_PS5_VR_FISHEYE_SBS,  /* equidistant fisheye per eye (MKX200 etc.) */
+    WPE_DISPLAY_PS5_VR_N_PROJECTIONS
+} WPEDisplayPS5VRProjection;
+
+/* active TRUE: the headset shows the video. FALSE: it could not start, or
+ * VR ended by itself (headset lost); @message says why. Not called after
+ * wpe_display_ps5_vr_stop(). */
+typedef void (* WPEDisplayPS5VRCallback) (WPEDisplayPS5 *display,
+                                          gboolean       active,
+                                          const char    *message,
+                                          gpointer       user_data);
+
+/* Takes the playing video into the headset (asynchronous: @callback says
+ * how it went). While VR is active the pad goes only to the button handler
+ * (no pointer, scrolling or keys for the page). /data/ps5webkit/vr-sim:
+ * simulated, no headset is touched (log-only tests). */
+WPE_API void        wpe_display_ps5_vr_start (WPEDisplayPS5            *display,
+                                              WPEDisplayPS5VRProjection projection,
+                                              double                    fisheye_degrees,
+                                              WPEDisplayPS5VRCallback   callback,
+                                              gpointer                  user_data);
+/* Back to the TV. @wait: block until the headset is released (wind-down). */
+WPE_API void        wpe_display_ps5_vr_stop  (WPEDisplayPS5 *display,
+                                              gboolean       wait);
+WPE_API gboolean    wpe_display_ps5_vr_is_active (WPEDisplayPS5 *display);
+WPE_API void        wpe_display_ps5_vr_set_projection (WPEDisplayPS5            *display,
+                                                       WPEDisplayPS5VRProjection projection,
+                                                       double                    fisheye_degrees);
+/* The video's front goes where the head looks now. */
+WPE_API void        wpe_display_ps5_vr_recenter (WPEDisplayPS5 *display);
+/* @hint: shown in the headset for @seconds ("" or 0 s: none); @tv_text: the
+ * notice on the TV while in VR (NULL: unchanged). '\n' separates lines. */
+WPE_API void        wpe_display_ps5_vr_set_text (WPEDisplayPS5 *display,
+                                                 const char    *hint,
+                                                 double         seconds,
+                                                 const char    *tv_text);
+/* Simulation only: the head direction (degrees, right and up positive). */
+WPE_API void        wpe_display_ps5_vr_sim_look (WPEDisplayPS5 *display,
+                                                 double         yaw,
+                                                 double         pitch);
+
 G_END_DECLS
 
 #endif /* WPEDisplayPS5_h */

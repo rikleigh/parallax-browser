@@ -197,7 +197,7 @@ step_build() {
     ninja -C "$BLD" -j"$JOBS" ${NINJA_FLAGS:-} $targets > "$WK/ninja.log" 2>&1
     local rc=$?
     set -e
-    grep -E "error:|FAILED|undefined symbol" "$WK/ninja.log" | head -40
+    grep -E "error:|FAILED|undefined symbol" "$WK/ninja.log" | head -40 || true
     echo "ninja exit $rc after $(( $(date +%s) - t0 )) s" | tee -a "$WK/build-times.log"
     return "$rc"
 }

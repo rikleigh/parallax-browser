@@ -650,3 +650,13 @@ port.
     loading (280 late frames, mostly then), which the JIT should help.
 - **Next, running in parallel:** "View in VR" (the playing video in the
   headset) and the JSC JIT in the WebProcess (R7).
+- **View in VR** (2026-10-28, port/webkit/README.md, *View in VR*): the
+  touchpad takes the playing video into the headset; the title's render
+  thread drives Hmd2/VrTracker2 (Spike 3b/9's path) and draws the same
+  decoded frames (hardware or software) as 360/180 mono, SBS or TB,
+  fisheye or a flat screen, guessed from the page and stream addresses;
+  the pad plays/pauses, seeks, recentres and cycles the projection through
+  the page's video element; O returns to the TV. Log-only runs with a
+  simulated headset passed (projections checked from eye-buffer captures,
+  repeated enter/leave, slots and memory flat); waiting for the owner's
+  headset check.

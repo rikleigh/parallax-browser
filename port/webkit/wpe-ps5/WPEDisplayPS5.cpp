@@ -56,6 +56,8 @@
  *   Options          Menu (the browser opens its URL prompt)
  *   left stick       moves the drawn pointer
  *   right stick      scrolls under the pointer
+ *   (the application's button handler sees presses first; ps5browser takes
+ *   the touchpad button for "View in VR", and the whole pad while in VR)
  */
 
 static constexpr unsigned padIntervalMS = 8;
@@ -103,6 +105,16 @@ struct _WPEDisplayPS5Private {
 
     std::unique_ptr<PendingText> pendingText;
     PS5ImeFunctions ime { };
+
+    // The application's button handler; the pad is captured (only the
+    // handler gets it) while the video plays in the headset.
+    WPEDisplayPS5ButtonHandler buttonHandler { nullptr };
+    gpointer buttonHandlerData { nullptr };
+    uint32_t swallowedButtons { 0 };
+    bool padCaptured { false };
+    WPEDisplayPS5VRCallback vrCallback { nullptr };
+    gpointer vrCallbackData { nullptr };
+    bool vrStarting { false };
 
     GRefPtr<WPEProcessManager> processManager;
     std::string childELF;
@@ -361,6 +373,26 @@ static void padTick(WPEDisplayPS5* display)
     const double t = nowSeconds();
     if (pressed)
         priv->lastPress = t;
+
+    // The application first (View in VR); what it takes, the page never sees.
+    if (uint32_t swallowedReleases = released & priv->swallowedButtons) {
+        released &= ~swallowedReleases;
+        priv->swallowedButtons &= ~swallowedReleases;
+    }
+    if (pressed && priv->buttonHandler) {
+        bool wasCaptured = priv->padCaptured;
+        bool taken = priv->buttonHandler(display, pressed, priv->buttonHandlerData);
+        if (priv->padCaptured != wasCaptured || priv->activeView != view)
+            return; // the handler changed the pad's owner (held buttons are ignored until released)
+        if (taken) {
+            priv->swallowedButtons |= pressed;
+            pressed = 0;
+        }
+    }
+    if (priv->padCaptured) {
+        priv->repeatingKey = 0;
+        return;
+    }
 
     // Left stick: pointer.
     double sx = stickValue(data.sticks[0]), sy = stickValue(data.sticks[1]);
@@ -634,4 +666,116 @@ void wpe_display_ps5_capture_screen(WPEDisplayPS5* display, const char* path)
     g_return_if_fail(path);
     PS5Renderer::singleton().requestCapture(path);
     wpeDisplayPS5ScheduleRedraw(display);
+}
+
+// ---------------------------------------------------------------- the pad for the application, View in VR
+
+void wpe_display_ps5_set_button_handler(WPEDisplayPS5* display, WPEDisplayPS5ButtonHandler handler, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->buttonHandler = handler;
+    display->priv->buttonHandlerData = userData;
+}
+
+// Buttons held while the owner changes are ignored until released, so
+// neither side sees half a press.
+static void setPadCaptured(WPEDisplayPS5* display, bool captured)
+{
+    auto* priv = display->priv;
+    if (priv->padCaptured == captured)
+        return;
+    priv->padCaptured = captured;
+    priv->ignoredButtons |= priv->buttons;
+    priv->buttons = 0;
+    priv->swallowedButtons = 0;
+    priv->repeatingKey = 0;
+    if (priv->pointerDown && priv->activeView) {
+        priv->pointerDown = false;
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, priv->activeView, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
+        wpe_view_event(priv->activeView, event.get());
+    }
+    if (!captured) {
+        priv->pointerMovedAt = -1000; // pointer hidden until the stick moves again
+        wpeDisplayPS5ScheduleRedraw(display);
+    }
+    PS5_LOG("pad %s", captured ? "captured (View in VR)" : "back to the page");
+}
+
+void wpe_display_ps5_show_message(WPEDisplayPS5* display, const char* text, double seconds)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().showMessage(text, seconds);
+}
+
+void wpe_display_ps5_vr_start(WPEDisplayPS5* display, WPEDisplayPS5VRProjection projection, double fisheyeDegrees,
+    WPEDisplayPS5VRCallback callback, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    auto* priv = display->priv;
+    if (priv->vrStarting)
+        return;
+    priv->vrCallback = callback;
+    priv->vrCallbackData = userData;
+    priv->vrStarting = true;
+    // Capture the pad at once: presses while the headset comes up must not
+    // reach the page.
+    setPadCaptured(display, true);
+    PS5Renderer::singleton().startVR(projection, static_cast<float>(fisheyeDegrees),
+        [](bool ok, const char* message, void* data) {
+            auto* display = WPE_DISPLAY_PS5(data);
+            auto* priv = display->priv;
+            priv->vrStarting = false;
+            if (!ok)
+                setPadCaptured(display, false);
+            PS5_LOG("View in VR: %s%s%s", ok ? "headset up" : "not started", message && *message ? ": " : "", message ? message : "");
+            if (priv->vrCallback)
+                priv->vrCallback(display, ok, message, priv->vrCallbackData);
+        },
+        [](const char* why, void* data) {
+            auto* display = WPE_DISPLAY_PS5(data);
+            auto* priv = display->priv;
+            setPadCaptured(display, false);
+            PS5_LOG("View in VR ended: %s", why ? why : "");
+            if (priv->vrCallback)
+                priv->vrCallback(display, FALSE, why, priv->vrCallbackData);
+        },
+        display);
+}
+
+void wpe_display_ps5_vr_stop(WPEDisplayPS5* display, gboolean wait)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().stopVR(wait);
+    setPadCaptured(display, false);
+}
+
+gboolean wpe_display_ps5_vr_is_active(WPEDisplayPS5* display)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return PS5Renderer::singleton().vrActive();
+}
+
+void wpe_display_ps5_vr_set_projection(WPEDisplayPS5* display, WPEDisplayPS5VRProjection projection, double fisheyeDegrees)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().setVRProjection(projection, static_cast<float>(fisheyeDegrees));
+}
+
+void wpe_display_ps5_vr_recenter(WPEDisplayPS5* display)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().recenterVR();
+}
+
+void wpe_display_ps5_vr_set_text(WPEDisplayPS5* display, const char* hint, double seconds, const char* tvText)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().setVRText(hint, seconds, tvText);
+}
+
+void wpe_display_ps5_vr_sim_look(WPEDisplayPS5* display, double yaw, double pitch)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().setVRSimLook(static_cast<float>(yaw), static_cast<float>(pitch));
 }

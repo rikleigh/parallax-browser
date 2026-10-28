@@ -11,7 +11,9 @@
  *   left stick: pointer, X: click (or Enter when the pointer is hidden),
  *   right stick: scroll, D-pad: move between links (spatial navigation),
  *   O: back, Options: type a URL or search, Square: reload,
- *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard.
+ *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard,
+ *   touchpad: View in VR (the playing video in the PS VR2 headset; its own
+ *   controls while there, see viewinvr.c).
  *
  * Logs go to the Mac's tools/logserver.sh (LOG_HOST:LOG_PORT) and to
  * /data/ps5webkit/ps5browser.log.
@@ -19,6 +21,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "../common/ps5audioserver.h"
 #include "common/title.h"
+#include "viewinvr.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -98,6 +101,8 @@ static gboolean beginWindDown(gpointer data)
     if (windDownStart)
         return G_SOURCE_REMOVE;
     windDownStart = g_get_monotonic_time();
+    /* The headset first: Hmd2/VrTracker2 left open could need a reboot. */
+    ps5wk_vr_stop(TRUE, "wind-down");
     spike_log("wind-down: quit requested; %d audio stream(s) open; loading about:blank", ps5wk_audio_server_active_streams());
     if (webView)
         webkit_web_view_load_uri(webView, "about:blank");
@@ -330,6 +335,7 @@ static void testURLFinished(gboolean ok, const char* uri, const char* detail)
     g_timeout_add(2000, shotAfterLoad, names[slot][0]);
     g_timeout_add(2000, testOnload, NULL);
     g_timeout_add(10000, shotAfterLoad, names[slot][1]);
+    ps5wk_vr_selftest_schedule(8);
     unsigned dwell = testURLIndex - 1 < 256 && testDwell[testURLIndex - 1] ? testDwell[testURLIndex - 1] : 12;
     if (dwell >= 34) { /* long stays (video): one more at +30 s, in steady playback */
         snprintf(names[slot][2], sizeof names[slot][2], "%.*s-30s", (int)(hostLength < 80 ? hostLength : 80), host);
@@ -371,6 +377,8 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
+    if (event == WEBKIT_LOAD_COMMITTED)
+        ps5wk_vr_stop(FALSE, "another page");
     if (event == WEBKIT_LOAD_FINISHED) {
         const char* title = webkit_web_view_get_title(view) ? webkit_web_view_get_title(view) : "";
         SPIKE_PASS("load", "%s \"%s\" (%.1f s after start)", webkit_web_view_get_uri(view), title, (g_get_monotonic_time() - loadStart) / 1e6);
@@ -410,6 +418,7 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     (void)data;
     const char* uri = webkit_web_view_get_uri(view);
     gint64 now = g_get_monotonic_time();
+    ps5wk_vr_stop(FALSE, "the page's process ended");
     gboolean again = uri && lastCrashURI && !strcmp(uri, lastCrashURI) && now - lastCrashTime < 30 * G_USEC_PER_SEC;
     g_free(lastCrashURI);
     lastCrashURI = g_strdup(uri ? uri : "");
@@ -649,6 +658,7 @@ int main(void)
     g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
+    ps5wk_vr_init(display, webView);
 
     memLog("web view created");
     g_timeout_add_seconds(60, memTimer, NULL);
@@ -669,6 +679,7 @@ int main(void)
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     mainLoop = loop;
     g_main_loop_run(loop);
+    ps5wk_vr_stop(TRUE, "main loop ended");
     ps5wk_audio_server_stop();
     return 0;
 }

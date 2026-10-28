@@ -151,7 +151,10 @@ app="$OUT/$TITLE"; rm -rf -- "$app"; mkdir -p "$app/sce_sys" "$app/sce_module"
 "$TOOL" self --sign --in "$W/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F
 cp "$NATIVE/runtime/libc.prx" "$app/sce_module/libc.prx"
 prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
-python3 - "$PSGL/param.json" "$app/sce_sys/param.json" "$TITLE" "$NAME" <<'PY'
+# View in VR: PS VR2 titles declare it in param.json (Hmd2 refuses a title
+# whose attribute words are 0 with 0x8a72001f, FEASIBILITY §3); PS5VR's
+# values, as Spikes 3b and 9 (both also drew on the TV with them).
+python3 - "$PSGL/param.json" "$app/sce_sys/param.json" "$TITLE" "$NAME" "$ROOT/ref/PS5VR/app/sce_sys/param.json" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))
 title, name = sys.argv[3], sys.argv[4]
@@ -159,6 +162,10 @@ p["titleId"] = title
 p["conceptId"] = title[4:]
 p["contentId"] = f"UP9000-{title}_00-PS5WEBKITBRWS01"
 p["localizedParameters"]["en-US"]["titleName"] = name
+vr = json.load(open(sys.argv[5]))
+for k in ("attribute", "attribute2", "attribute3"):
+    p[k] = vr.get(k, 0)
+print("param.json: attribute 0x%x attribute3 0x%x (PS VR2)" % (p["attribute"], p["attribute3"]))
 open(sys.argv[2], "w").write(json.dumps(p, indent=2) + "\n")
 PY
 ls -la "$app" "$app/sce_sys"

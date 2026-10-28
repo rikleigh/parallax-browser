@@ -19,6 +19,7 @@
 #include "config.h"
 #include "PS5Renderer.h"
 
+#include "PS5Text.h"
 #include "PS5VideoDecoder.h"
 #include "PS5VideoServer.h"
 #include <algorithm>
@@ -518,12 +519,22 @@ void PS5Renderer::threadMain()
         return;
 
     for (;;) {
+        // View in VR: the headset paces the thread (PS5RendererVR.cpp).
+        vrHandleRequests();
+        if (m_vr) {
+            vrFrame();
+            continue;
+        }
         char* capturePath = nullptr;
         g_mutex_lock(&m_lock);
         for (;;) {
             if (m_pageJob.pending || m_frameRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
                 break;
+            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged)
+                break;
             int64_t now = nowUS();
+            if (m_messageUntilUS && now >= m_messageUntilUS)
+                break; // take the message down
             if (m_videoActive) {
                 // Video: a frame every vsync (the swap waits for it). Should
                 // a swap ever return early, don't spin.
@@ -534,6 +545,8 @@ void PS5Renderer::threadMain()
             }
             // Idle: sleep until a frame or geometry change is due.
             int64_t deadline = PS5VideoServer::nextDeadline();
+            if (m_messageUntilUS)
+                deadline = std::min(deadline, m_messageUntilUS + 2000);
             if (deadline <= now + 2000)
                 break;
             if (deadline == INT64_MAX)
@@ -555,6 +568,7 @@ void PS5Renderer::threadMain()
 
         serviceBufferRequests();
         int64_t start = nowUS();
+        updateMessage(start);
         bool commitGeometry = m_job.pending;
         if (m_job.pending)
             copyPage();
@@ -568,6 +582,7 @@ void PS5Renderer::threadMain()
         else
             displayUS = start + static_cast<int64_t>(m_periodUS);
         m_videoDrawCount = 0;
+        m_videoSourceCount = 0;
         if (m_convertProgram) {
             m_videoActive = PS5VideoServer::consume(displayUS, static_cast<int64_t>(m_periodUS / 2), commitGeometry,
                 [this](PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data) { handleVideo(stream, frame, data); });
@@ -719,6 +734,7 @@ struct PS5VideoGL {
     GLuint fbo { 0 };
     int width { 0 }, height { 0 };
     bool valid { false };
+    int64_t lastFrameUS { 0 };
 };
 
 void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data)
@@ -789,6 +805,13 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
                 g_message("[wpe-ps5] video stream %d: framebuffer for %dx%d incomplete (0x%x)", stream.id, w, h, status);
                 ok = false;
             } else {
+                // The shortcut, once in a while, when a real video starts
+                // (not while it is in the headset already).
+                static int64_t lastShortcutHintUS;
+                if (!gl->width && w >= 640 && !m_vr && (!lastShortcutHintUS || start - lastShortcutHintUS > 120000000)) {
+                    lastShortcutHintUS = start;
+                    showMessage("Touchpad: watch in the PS VR2 headset", 4);
+                }
                 gl->width = w;
                 gl->height = h;
                 g_message("[wpe-ps5] video stream %d: %dx%d %s", stream.id, w, h,
@@ -825,6 +848,7 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             gl->valid = true;
+            gl->lastFrameUS = start;
         }
         double ms = (nowUS() - start) / 1000.0;
         stats.videoFrames++;
@@ -834,6 +858,8 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
 
     if (gl->valid && stream.geometry.visible && stream.geometry.width > 0 && stream.geometry.height > 0 && m_videoDrawCount < 8)
         m_videoDraws[m_videoDrawCount++] = { gl->texture, stream.geometry.x, stream.geometry.y, stream.geometry.width, stream.geometry.height };
+    if (gl->valid && m_videoSourceCount < 8)
+        m_videoSources[m_videoSourceCount++] = { stream.id, gl->texture, gl->width, gl->height, gl->lastFrameUS };
 }
 
 void PS5Renderer::drawScene()
@@ -907,6 +933,10 @@ void PS5Renderer::drawScene()
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
 
+    // A message over the page (bottom centre), e.g. "No headset".
+    if (m_messageTexture && m_messageUntilUS)
+        drawPanel(m_messageTexture, m_messageWidth, m_messageHeight, m_width / 2.0, m_height - m_messageHeight / 2.0 - 60, 1.0);
+
     if (m_drawPointer) {
         float r[4];
         ndc(m_drawPointerX - pointerSize / 2.0, m_drawPointerY - pointerSize / 2.0, pointerSize, pointerSize, r);
@@ -920,6 +950,82 @@ void PS5Renderer::drawScene()
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
     glDisable(GL_BLEND);
+}
+
+// A premultiplied RGBA panel (PS5Text) centred at (centerX, centerY), TV pixels.
+void PS5Renderer::drawPanel(unsigned texture, int width, int height, double centerX, double centerY, double scale)
+{
+    const double w = width * scale, h = height * scale, x = centerX - w / 2, y = centerY - h / 2;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, m_width, m_height);
+    glBindVertexArray(m_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(m_program);
+    glUniform1i(m_uTexture, 0);
+    glUniform1i(m_uOpaque, 0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform4f(m_uRect, static_cast<float>(x / m_width * 2.0 - 1.0), static_cast<float>(1.0 - (y + h) / m_height * 2.0),
+        static_cast<float>((x + w) / m_width * 2.0 - 1.0), static_cast<float>(1.0 - y / m_height * 2.0));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_BLEND);
+}
+
+// Uploads a PS5Text image into a texture (made on first use).
+static void uploadPanel(unsigned& texture, const PS5TextImage& image)
+{
+    if (!texture) {
+        GLuint name = 0;
+        glGenTextures(1, &name);
+        texture = name;
+    }
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, image.width, image.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image.rgba.data());
+}
+
+void ps5RendererUploadPanel(unsigned& texture, const PS5TextImage& image)
+{
+    uploadPanel(texture, image);
+}
+
+void PS5Renderer::showMessage(const char* text, double seconds)
+{
+    g_mutex_lock(&m_lock);
+    m_messageText = text ? text : "";
+    m_messageSeconds = seconds;
+    m_messageChanged = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+// Render thread: a new message is rasterized; an expired one comes down.
+void PS5Renderer::updateMessage(int64_t now)
+{
+    g_mutex_lock(&m_lock);
+    bool changed = m_messageChanged;
+    std::string text = m_messageText;
+    double seconds = m_messageSeconds;
+    m_messageChanged = false;
+    g_mutex_unlock(&m_lock);
+    if (changed) {
+        PS5TextImage image;
+        if (!text.empty() && seconds > 0 && ps5RenderTextPanel(text.c_str(), 40, image)) {
+            uploadPanel(m_messageTexture, image);
+            m_messageWidth = image.width;
+            m_messageHeight = image.height;
+            m_messageUntilUS = now + static_cast<int64_t>(seconds * 1e6);
+        } else
+            m_messageUntilUS = 0;
+    }
+    if (m_messageUntilUS && now >= m_messageUntilUS)
+        m_messageUntilUS = 0;
 }
 
 void PS5Renderer::writeCapture(char* path)
