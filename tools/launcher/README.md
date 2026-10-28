@@ -10,14 +10,21 @@ tools/launch.sh --install <titledir>   # upload, register if new, launch
 tools/launch.sh PPSA99009              # stop our running title (if any), start this one
 tools/launch.sh -f PPSA99009           # also stop a title that isn't ours
 tools/launch.sh --register PPSA99013   # register what is in /data/homebrew/PPSA99013
+tools/launch.sh --uninstall PPSA99013  # remove a spike title (PPSA99006/07/09–15 only)
 tools/launch.sh --status               # "OK <appid> <TITLEID>" or "OK none"
 tools/launch.sh --kill
 tools/launch.sh --quit                 # stop the launcher
 ```
 
 Only titles listed in `PS5WK_OWN_TITLES` are stopped without `-f`. The
-default list is PPSA99006/07/09–15 and PPSA99020 (the browser), so the owner's own games (such as
-PPSA99008) are never closed by accident.
+default list is just PPSA99020 (the browser), so the owner's own titles are
+never closed by accident. Never touch PPSA99008 (the owner's), PPSA99000
+(ProsperoStore) or PPSA99030 (the YouTube app used for the jailbreak).
+
+The spike titles PPSA99006/07/09–15 were uninstalled on 2026-10-28 with
+`--uninstall`, which calls `sceAppInstUtilAppUnInstall` (found through the
+export table, like the other AppInstUtil calls). The launcher refuses any other
+ID. Their folders in `/data/homebrew` were deleted over FTP.
 
 Titles end through the launcher too: `spikes/common/title_exit.c` asks it to
 SIGKILL the title once `main` returns, because that is the only way to end a
@@ -30,6 +37,7 @@ GPU title without a debug error (below).
 | `sceLncUtilLaunchApp` | works with the payload's own authid (0x480000001000000e) |
 | `sceLncUtilGetAppIdOfRunningBigApp` / `GetAppTitleId` | work |
 | Registration: `/user/app/<ID>/{mount.lnk, sce_sys/param.json}` + `sceAppInstUtilAppInstallAll` | **works**: ShellCore rescans `/user/app` and registers every title folder (`AppInstallTitleDirMain <ID>` in the kernel log), as PS5Upload's Play does. `mount.lnk` names the folder in `/data/homebrew`; etaHEN mounts it at launch |
+| `sceAppInstUtilAppUnInstall(title_id)` | **works**: the title leaves the app list and `/user/app/<ID>`; its `/data/homebrew` folder stays |
 | `sceAppInstUtilAppInstallTitleDir` | not exported on 13.60 (in any process), despite being in the SDK stubs |
 | `libSceAppInstUtil` via `sceKernelDlsym` | refused (0x80020003); `kernel_dynlib_dlsym` (reads the export table) works |
 | `sceLncUtilKillApp`, `sceLncUtilForceKillApp` | 0x80940004 with every authid tried |

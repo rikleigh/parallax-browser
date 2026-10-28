@@ -8,6 +8,7 @@
  *   launch <TITLEID> [arg] start a registered title (fails if one is running)
  *   kill                   SIGKILL the running big app, wait until it is gone
  *   register <TITLEID> [dir] register a title uploaded to /data/homebrew/<ID>
+ *   uninstall <TITLEID>    remove a spike title from the app list (spikes only)
  *   quit                   stop the launcher
  *
  * tools/launch.sh is the client. It sends this payload first if nothing
@@ -58,6 +59,7 @@ static void say(int fd, const char *fmt, ...);
 static int (*app_inst_init)(void);
 static int (*app_inst_title_dir)(const char *title_id, const char *install_path, void *reserved);
 static int (*app_inst_all)(void *reserved);
+static int (*app_inst_uninstall)(const char *title_id);
 
 static int load_app_inst_util(void)
 {
@@ -90,6 +92,10 @@ static int load_app_inst_util(void)
             app_inst_title_dir = (int (*)(const char *, const char *, void *))dir;
         if (all)
             app_inst_all = (int (*)(void *))all;
+        void *un = (void *)kernel_dynlib_dlsym(getpid(), (uint32_t)h, "sceAppInstUtilAppUnInstall");
+        say(-1, "  AppUnInstall %p", un);
+        if (un && !app_inst_uninstall)
+            app_inst_uninstall = (int (*)(const char *))un;
     }
     if (!app_inst_init || (!app_inst_title_dir && !app_inst_all))
         return -1;
@@ -305,6 +311,39 @@ static void register_title(int fd, const char *tid, const char *src_arg)
         say(fd, "OK registered %s from %s (%s)", tid, src, how);
 }
 
+/* Only our spike titles can be uninstalled: never the owner's titles, and
+ * not the browser (PPSA99020) either. */
+static const char *const uninstallable[] = {
+    "PPSA99006", "PPSA99007", "PPSA99009", "PPSA99010", "PPSA99011",
+    "PPSA99012", "PPSA99013", "PPSA99014", "PPSA99015",
+};
+
+static void uninstall_title(int fd, const char *tid)
+{
+    int ok = 0;
+    for (size_t i = 0; i < sizeof uninstallable / sizeof *uninstallable; i++)
+        ok |= !strcmp(tid, uninstallable[i]);
+    if (!ok) {
+        say(fd, "ERR uninstall %s: not a spike title", tid);
+        return;
+    }
+    char running[16];
+    if (running_app(running) > 0 && !strcmp(running, tid)) {
+        say(fd, "ERR uninstall %s: it is running", tid);
+        return;
+    }
+    int r = load_app_inst_util();
+    if (r != 0 || !app_inst_uninstall) {
+        say(fd, "ERR uninstall %s: no sceAppInstUtilAppUnInstall (0x%08x)", tid, (unsigned)r);
+        return;
+    }
+    r = app_inst_uninstall(tid);
+    if (r != 0)
+        say(fd, "ERR uninstall %s: sceAppInstUtilAppUnInstall 0x%08x", tid, (unsigned)r);
+    else
+        say(fd, "OK uninstalled %s", tid);
+}
+
 /* Returns 1 to stop the launcher. */
 static int command(int fd, char *line)
 {
@@ -345,11 +384,16 @@ static int command(int fd, char *line)
             say(fd, "ERR usage: register <TITLEID> [srcdir]");
         else
             register_title(fd, a1, a2);
+    } else if (!strcmp(cmd, "uninstall")) {
+        if (!a1 || strlen(a1) != 9)
+            say(fd, "ERR usage: uninstall <TITLEID>");
+        else
+            uninstall_title(fd, a1);
     } else if (!strcmp(cmd, "quit")) {
         say(fd, "OK bye");
         return 1;
     } else {
-        say(fd, "ERR unknown command %s (status, launch, kill, register, quit)", cmd);
+        say(fd, "ERR unknown command %s (status, launch, kill, register, uninstall, quit)", cmd);
     }
     return 0;
 }

@@ -6,6 +6,7 @@
 #   tools/launch.sh -f PPSA99009         also stop a title that isn't ours
 #   tools/launch.sh --install <titledir> upload, register if new, launch
 #   tools/launch.sh --register <ID> [dir on the console, default /data/homebrew/<ID>]
+#   tools/launch.sh --uninstall <ID>   (spike titles only)
 #   tools/launch.sh --status | --kill [-9] | --quit
 # Only titles in PS5WK_OWN_TITLES are stopped without -f, so the owner's own
 # games are never closed by accident.
@@ -13,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
 PORT=9031
-OWN="${PS5WK_OWN_TITLES:-PPSA99006 PPSA99007 PPSA99009 PPSA99010 PPSA99011 PPSA99012 PPSA99013 PPSA99014 PPSA99015 PPSA99020}"
+OWN="${PS5WK_OWN_TITLES:-PPSA99020}"
 FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
 
 ask() { printf '%s\n' "$@" | socat -t 20 - "TCP:$PS5_HOST:$PORT" 2>/dev/null; }
@@ -41,6 +42,7 @@ case "${1:-}" in
     --status) ensure_launcher; run status; exit ;;
     --kill) ensure_launcher; run kill ${2:-}; exit ;;
     --register) ensure_launcher; run register "${2:?title id}" ${3:-}; exit ;;
+    --uninstall) ensure_launcher; run uninstall "${2:?title id}"; exit ;;
     --quit) run quit; exit ;;
     --install)
         dir="${2:?usage: launch.sh --install <titledir>}"; set -- "$(basename "$dir")"
