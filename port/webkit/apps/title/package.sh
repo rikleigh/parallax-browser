@@ -54,6 +54,8 @@ rm -f "$W/obj/app_heap.o"
 D10="$ROOT/spikes/10-title-dmem"
 prospero-clang -std=gnu11 -O2 "${TF[@]}" -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
+# The system keyboard: libSceImeDialog loaded and bound at run time.
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$HERE" -c "$HERE/titleime.c" -o "$W/obj/titleime.o"
 # libc.a without syscalls.o (raw syscalls: illegal in a title, and they
 # override libkernel's exports); titlesys.c defines what libkernel lacks.
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlesys.c" -o "$W/obj/titlesys.o"
@@ -105,7 +107,7 @@ title_link() {
         --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
         "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
         "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
-        "$SYS/lib/libScePad.so" "$SYS/lib/libSceImeDialog.so" "$SYS/lib/libSceUserService.so" \
+        "$SYS/lib/libScePad.so" "$SYS/lib/libSceUserService.so" \
         --as-needed "${sdk_stubs[@]}" --start-group "$W/libc-title.a" --end-group \
         2> "$W/link.log" || {
             { grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -60; } || true

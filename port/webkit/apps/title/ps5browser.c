@@ -120,9 +120,15 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
         webkit_web_view_set_zoom_level(webView, zoom);
         spike_log("zoom %.2f", zoom);
         return TRUE;
-    case WPE_KEY_Menu:
-        wpe_display_ps5_request_text(WPE_DISPLAY_PS5(display), "Address or search", webkit_web_view_get_uri(webView), TRUE, onURLEntered, NULL);
+    case WPE_KEY_Menu: {
+        /* Start from the current address, except for the built-in pages. */
+        const char* current = webkit_web_view_get_uri(webView);
+        if (!current || !strncmp(current, "data:", 5) || !strncmp(current, "file:", 5) || !strncmp(current, "about:", 6))
+            current = "";
+        if (!wpe_display_ps5_request_text(WPE_DISPLAY_PS5(display), "Address or search", current, TRUE, onURLEntered, NULL))
+            spike_log("URL prompt: no system keyboard");
         return TRUE;
+    }
     default:
         return FALSE;
     }

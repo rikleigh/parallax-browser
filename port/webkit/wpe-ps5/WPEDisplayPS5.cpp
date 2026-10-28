@@ -99,6 +99,7 @@ struct _WPEDisplayPS5Private {
     GRefPtr<GSource> redrawSource;
 
     std::unique_ptr<PendingText> pendingText;
+    PS5ImeFunctions ime { };
 
     GRefPtr<WPEProcessManager> processManager;
     std::string childELF;
@@ -198,16 +199,15 @@ static void finishText(WPEDisplayPS5* display, const char* text)
 static void pollTextDialog(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
-    if (!priv->pendingText || !sceImeDialogGetStatus)
+    if (!priv->pendingText || !priv->ime.getStatus)
         return;
-    int status = sceImeDialogGetStatus();
+    int status = priv->ime.getStatus();
     if (status == PS5_IME_DIALOG_STATUS_RUNNING)
         return;
 
     PS5ImeDialogResult result { };
-    int rc = status == PS5_IME_DIALOG_STATUS_FINISHED && sceImeDialogGetResult ? sceImeDialogGetResult(&result) : -1;
-    if (sceImeDialogTerm)
-        sceImeDialogTerm();
+    int rc = status == PS5_IME_DIALOG_STATUS_FINISHED ? priv->ime.getResult(&result) : -1;
+    priv->ime.term();
     if (rc || result.endStatus) {
         PS5_LOG("IME dialog closed: status %d rc 0x%x end %d", status, rc, result.endStatus);
         finishText(display, nullptr);
@@ -224,8 +224,8 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
 {
     g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
     auto* priv = display->priv;
-    if (priv->pendingText || !sceImeDialogInit) {
-        PS5_LOG("request_text: %s", priv->pendingText ? "a dialog is already open" : "libSceImeDialog not linked");
+    if (priv->pendingText || !priv->ime.init) {
+        PS5_LOG("request_text: %s", priv->pendingText ? "a dialog is already open" : "libSceImeDialog not loaded");
         return FALSE;
     }
 
@@ -249,11 +249,12 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
     param.placeholder = pending->placeholder;
     param.title = pending->title;
 
-    int rc = sceImeDialogInit(&param, nullptr);
+    int rc = priv->ime.init(&param, nullptr);
     if (rc) {
         PS5_LOG("sceImeDialogInit failed: 0x%08x", rc);
         return FALSE;
     }
+    PS5_LOG("IME dialog open (%s, %zu chars)", url ? "URL" : "text", strlen(initialText ? initialText : ""));
     priv->pendingText = WTF::move(pending);
     return TRUE;
 }
@@ -320,8 +321,6 @@ static void openPad(WPEDisplayPS5* display)
     priv->userID = user;
     priv->pad = scePadOpen(user, 0, 0, nullptr);
     PS5_LOG("pad: init 0x%x, user %d, open -> %d", rc, user, priv->pad);
-    PS5_LOG("ime: sceImeDialogInit %p GetStatus %p GetResult %p Term %p", reinterpret_cast<void*>(sceImeDialogInit),
-        reinterpret_cast<void*>(sceImeDialogGetStatus), reinterpret_cast<void*>(sceImeDialogGetResult), reinterpret_cast<void*>(sceImeDialogTerm));
     PS5PadData data { };
     if (priv->pad >= 0 && scePadReadState(priv->pad, &data) == 0)
         priv->ignoredButtons = data.buttons; // held at start: ignore until released
@@ -489,8 +488,14 @@ static gboolean wpeDisplayPS5Connect(WPEDisplay* display, GError** error)
     wpe_display_set_available_input_devices(display, static_cast<WPEAvailableInputDevices>(WPE_AVAILABLE_INPUT_DEVICE_MOUSE | WPE_AVAILABLE_INPUT_DEVICE_KEYBOARD));
 
     openPad(displayPS5);
-    if (sceCommonDialogInitialize)
-        sceCommonDialogInitialize();
+    // The system keyboard: loaded at run time by the title (PS5Sce.h).
+    if (ps5wk_title_load_ime && !ps5wk_title_load_ime(&priv->ime)) {
+        int rc = priv->ime.commonDialogInitialize ? priv->ime.commonDialogInitialize() : -1;
+        PS5_LOG("ime: libSceImeDialog bound; sceCommonDialogInitialize -> 0x%x", rc);
+    } else {
+        priv->ime = { };
+        PS5_LOG("ime: no system keyboard (libSceImeDialog not bound)");
+    }
 
     priv->padSource = adoptGRef(g_timeout_source_new(padIntervalMS));
     g_source_set_priority(priv->padSource.get(), RunLoopSourcePriority::RunLoopTimer);

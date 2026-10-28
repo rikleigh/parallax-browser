@@ -73,13 +73,19 @@ enum : uint32_t {
 };
 
 // libSceImeDialog (PS4-compatible layout, as OpenOrbis documents it; text is
-// UTF-16 because wchar_t is 16-bit on this target).
-int sceImeDialogInit(const void* param, const void* extended) __attribute__((weak));
-int sceImeDialogGetStatus(void) __attribute__((weak));
-int sceImeDialogGetResult(void* result) __attribute__((weak));
-int sceImeDialogTerm(void) __attribute__((weak));
-int sceImeDialogAbort(void) __attribute__((weak));
-int sceCommonDialogInitialize(void) __attribute__((weak));
+// UTF-16 because wchar_t is 16-bit on this target). The system does not load
+// libSceImeDialog.sprx for the title, so its imports would stay NULL: the
+// title loads it at run time and binds these (apps/title/titleime.c, title
+// only; the weak reference is NULL in the payloads).
+struct PS5ImeFunctions {
+    int (*init)(const void* param, const void* extended);
+    int (*getStatus)(void);
+    int (*getResult)(void* result);
+    int (*term)(void);
+    int (*abort)(void);
+    int (*commonDialogInitialize)(void);
+};
+int ps5wk_title_load_ime(PS5ImeFunctions*) __attribute__((weak));
 
 enum PS5ImeType : int32_t {
     PS5_IME_TYPE_DEFAULT = 0,

@@ -94,7 +94,7 @@ later. Console log: `port/webkit/test/date.js`, results below.
 | `PS5Renderer` | the GL side: page texture, round pointer sprite, swap (vsync) |
 | `WPEInputMethodContextPS5` | the system keyboard for focused fields |
 | `WPEProcessManagerPS5` | children as elfldr payloads (below) |
-| `PS5Sce.h` | weak declarations of libScePad, libSceImeDialog, libSceUserService (no SDK headers) |
+| `PS5Sce.h` | weak declarations of libScePad and libSceUserService (no SDK headers); the libSceImeDialog function table that the title fills (`apps/title/titleime.c`) |
 
 Pad map: D-pad = arrow keys (spatial navigation between links in the
 browser); X = click at the pointer when it is shown (it shows for 8 s after
@@ -106,6 +106,26 @@ focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom.
 GL goes through libepoxy; in the title, `--wrap=dlopen/dlsym` and
 `apps/title/dlshim.c` resolve epoxy's lookups to the statically linked
 ps5-opengl (EGL 1.4 from its symbol table, GL from `eglGetProcAddress`).
+
+## System keyboard (libSceImeDialog)
+
+The system loads libScePad and libSceUserService for every title, but not
+libSceImeDialog.sprx: listed as needed in eboot.bin, its imports stayed NULL.
+`apps/title/titleime.c` loads it at start the way Spike 9 loads its decoder:
+`sceSysmoduleLoadModule(0x96)` (the ImeDialog id in 13.60's libSceSysmodule
+table, as on the PS4), `sceKernelLoadStartModule` of
+`/<sandbox word>/common/lib/libSceImeDialog.sprx` for the handle, then
+`sceKernelDlsym` (refused, as for every system library so far) and the
+13.60 export offsets in `apps/title/ime_exports_1360.h` (anchor string
+`checkImeDialogInitParam` checked first). libSceCommonDialog is bound the
+same way and `sceCommonDialogInitialize` returns 0. Log on the console:
+
+    ime: sysmodule 0x96 -> 0x00000000; load /<word>/common/lib/libSceImeDialog.sprx -> 0xe4
+    ime: libSceImeDialog.sprx: 5 of 5 bound (0 by name, base 800e68000)
+    ime: libSceCommonDialog.sprx: 1 of 1 bound (0 by name, base 800e48000)
+
+`sceImeDialogInit` takes the PS4 `SceImeDialogParam` (96 bytes; the
+disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
 
 ## Process launching
 
