@@ -331,6 +331,18 @@ title; Spike 9's title (also ps5-opengl) reports 419 MB from
 `sceKernelAvailableFlexibleMemorySize` at start, and an 8K HEVC decoder maps
 223 MB of it (139 MB at pipeline depth 2).
 
+**Title vs payload libc behaviour (found getting the browser title up, 2026-10-28;
+full table in [port/webkit/README.md](port/webkit/README.md)):** in a title,
+`pipe2(O_CLOEXEC)` fails with EINVAL, `fcntl` F_GETFD/F_SETFD/F_DUPFD fail with EINVAL,
+`dup`/`dup2` are EPERM, sockets can't be made non-blocking (F_SETFL and FIONBIO are
+EACCES), and the SDK libc's raw syscalls crash the title (SYSTEM_ILLEGAL_FUNCTION_CALL).
+All of these are worked around in `port/webkit/shim` and `apps/title` (pipe()+fcntl,
+SCM_RIGHTS to itself for dup, MSG_DONTWAIT per call, libkernel instead of raw syscalls).
+Anonymous mmaps, malloc and thread stacks go to direct memory (Spike 10), so the browser
+title holds steady at 334 MB of flexible memory free while browsing.
+Payloads also cost system-wide CPU page tables (8192 in total, ~4550 used by the
+system, ~300 per WebKit payload), which limits how many WebProcesses can stay alive.
+
 Consequences: the browser's UI/XR/GPU side must be a title, and its large
 heaps (JS, DOM) have to live in direct memory (a libpas/bmalloc backend over
 `sceKernelAllocateDirectMemory`, as Sony's own port does), or in payload
