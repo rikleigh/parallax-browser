@@ -588,7 +588,7 @@ port.
 - **WebKit** (`port/webkit/`): WPE at 15486a0178 with a PS5 WPE Platform
   backend (VideoOut, DualSense, process manager), the WebProcess and
   NetworkProcess as one elfldr payload, and the UIProcess as the title.
-  The JIT is off.
+  The JIT is off (being enabled, see below).
 - **Checked by the owner on the TV:** Wikipedia, BBC News, GitHub, Hacker
   News and DuckDuckGo load and render; pointer, click, back and zoom work on
   the pad. Old WebProcesses exit after cross-site navigation, and the title's
@@ -638,5 +638,15 @@ port.
     frames/s, local HEVC 4K (8- and 10-bit) and 7680x3840 at 30 fps, the
     WebProcess at 0.05–0.07 cores for local clips; 8K HEVC takes 139 MB of
     the title's ~300 MB of flexible memory. Software decoding stays the
-    fallback (AV1, other profiles, no title). Waiting for the owner's TV
-    check.
+    fallback (AV1, other profiles, no title).
+  - **TV check of step 2b** (2026-10-28 evening): the local HEVC 4K, 4K
+    10-bit and 8K clips played smoothly. YouTube 4K60 first stuck after
+    ~5 s: frames dropped as late (by GstVideoDecoder's QoS and by
+    GstBaseSink before `prepare()`) never gave their decoder slots back, so
+    all 12 were held. Fixed (e6afe3e): the proxy drops late pictures itself
+    and releases them, the sink no longer drops hardware frames. On the
+    re-check YouTube VP9 2160p60 played ~100 s at 59–60 frames/s with 0
+    slot take-backs; the owner saw a few stutters only while the page was
+    loading (280 late frames, mostly then), which the JIT should help.
+- **Next, running in parallel:** "View in VR" (the playing video in the
+  headset) and the JSC JIT in the WebProcess (R7).
