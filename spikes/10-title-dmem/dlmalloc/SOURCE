@@ -1,0 +1,5 @@
+dlmalloc 2.8.6 by Doug Lea, re-licensed 2023-09-25 under MIT-0 (was CC0).
+Fetched 2026-10-28 from https://gee.cs.oswego.edu/pub/misc/malloc.c
+sha256 be7be56b40b4b31417e74e77687f9b96127ea6cae534cf236aee40a4c739508d
+Unmodified. ../dheap.c includes it with its configuration (mspaces only,
+segments from the direct-memory page source).
