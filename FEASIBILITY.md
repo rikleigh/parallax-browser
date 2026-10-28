@@ -4,6 +4,9 @@ _Status: **study complete (2026-10-27). Verdict: go. The goal is now a
 browser that plays VR video from tube sites, in the page and in the
 headset, rather than WebXR (§1a); estimate ~4–7 days of agent sessions, bound by console debugging (§7).**_
 
+_Port status (2026-10-28): **Milestone 1 mostly reached.** The browser title
+PPSA99020 browses on the TV: see §9._
+
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
 answers it is named. Sources are community GitHub projects from
@@ -509,8 +512,9 @@ things are:
    the jailbreak (R1a, R10), and rest mode stops payloads until the console
    wakes. A large WebKit binary will crash far more often than the spikes
    did, with only the kernel log and the TCP log to debug it.
-2. **Build time.** A full WPE build probably takes an hour or more on the
-   Mac (not yet timed); incremental builds take minutes.
+2. **Build time.** Measured in the port: a clean WPE build takes 747 s on
+   the Mac (configure 37 s, ninja 710 s), and relinks after a change take
+   8–31 s. Build time turned out not to matter.
 3. **Checks only a person can do:** the TV picture and the headset.
 
 | Phase | Agent work | What sets the pace |
@@ -560,3 +564,29 @@ cheaply.
    `freopen`).
 
 The spike READMEs list the build and run commands for each spike.
+
+## 9. Port progress
+
+**2026-10-28, Milestone 1 (browsing on the TV): mostly reached**, one day
+into the port.
+
+- **Dependencies** (`port/deps/`): a static sysroot with glib, libsoup
+  (HTTP/2), OpenSSL, ICU, HarfBuzz, FreeType, fontconfig, libxml2, SQLite and
+  the rest; plus GStreamer, FFmpeg decoders and dav1d for Milestone 2. The
+  smoke tests pass on the console (Milestone 1: 18/18, Milestone 2: 9/9).
+- **WebKit** (`port/webkit/`): WPE at 15486a0178 with a PS5 WPE Platform
+  backend (VideoOut, DualSense, process manager), the WebProcess and
+  NetworkProcess as one elfldr payload, and the UIProcess as the title.
+  The JIT is off.
+- **Checked by the owner on the TV:** Wikipedia, BBC News, GitHub, Hacker
+  News and DuckDuckGo load and render; pointer, click, back and zoom work on
+  the pad. Old WebProcesses exit after cross-site navigation, and the title's
+  flexible memory stays flat (334 MB free).
+- **What it took** is in §4.4b: titles get a different libc from payloads
+  (pipe2, fcntl, dup2, non-blocking sockets and mmap all behave differently),
+  page tables are limited system-wide, and the title needs Spike 10's
+  direct-memory heap for malloc, thread stacks and anonymous mmaps.
+- **Still open:** the on-screen keyboard (libSceImeDialog isn't loaded in the
+  title), YouTube stops at its loading skeleton, file:// pages show as source
+  (no MIME database), and some fonts are missing. Cinematic Mode in the
+  headset is untested.
