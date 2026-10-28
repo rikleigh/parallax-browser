@@ -20,6 +20,7 @@
  */
 #define SPIKE_NAME "ps5browser"
 #include "../common/ps5audioserver.h"
+#include "../common/webmem.h"
 #include "common/title.h"
 #include "viewinvr.h"
 
@@ -372,11 +373,51 @@ static gboolean readTestURLs(void)
     return testURLCount > 0;
 }
 
+/* The WebProcess memory limit (apps/common/webmem.h): over it, the next
+ * top-level navigation ends the WebProcess and loads the address in a new
+ * one. memRestartURI is set from then until the new WebProcess commits. */
+static char* memRestartURI;
+static gboolean memRestarting;
+
+static gboolean memRestart(gpointer data)
+{
+    (void)data;
+    if (!webView || !memRestartURI)
+        return G_SOURCE_REMOVE;
+    memRestarting = TRUE;
+    ps5wk_vr_stop(FALSE, "WebProcess restart");
+    /* No provisional load left for WebKit to continue in a process of its
+     * own (it launched one that the load below then didn't use). */
+    webkit_web_view_stop_loading(webView);
+    webkit_web_view_terminate_web_process(webView); /* web-process-terminated, then the load below */
+    spike_log("[mem] WebProcess ended; loading %s in a new one", memRestartURI);
+    char* uri = memRestartURI;
+    memRestartURI = NULL;
+    webkit_web_view_load_uri(webView, uri);
+    g_free(uri);
+    return G_SOURCE_REMOVE;
+}
+
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
+    int webPid = 0;
+    double committed = 0, limit = 0;
+    if (event == WEBKIT_LOAD_STARTED && !memRestartURI && !memRestarting && !windDownStart && webkit_web_view_get_uri(view)
+        && ps5wk_webmem_over(&webPid, &committed, &limit)) {
+        spike_log("[mem] WebProcess (pid %d) has %.0f MB of libpas memory committed, limit %.0f MB (PS5WK_MEM_RESTART_MB): restarting it for %s",
+            webPid, committed, limit, webkit_web_view_get_uri(view));
+        ps5wk_webmem_forget();
+        memRestartURI = g_strdup(webkit_web_view_get_uri(view));
+        g_idle_add(memRestart, NULL);
+        return;
+    }
+    if (event == WEBKIT_LOAD_COMMITTED && memRestarting) {
+        memRestarting = FALSE;
+        SPIKE_PASS("mem-restart", "new WebProcess committed %s", webkit_web_view_get_uri(view));
+    }
     if (event == WEBKIT_LOAD_COMMITTED)
         ps5wk_vr_stop(FALSE, "another page");
     if (event == WEBKIT_LOAD_FINISHED) {
@@ -396,6 +437,10 @@ static gboolean onLoadFailed(WebKitWebView* view, WebKitLoadEvent event, const c
     (void)view;
     (void)event;
     (void)data;
+    if (memRestartURI || memRestarting) {
+        spike_log("[mem] load of %s ended by the WebProcess restart (%s)", uri, error->message);
+        return FALSE;
+    }
     SPIKE_FAIL("load", "%s: %s", uri, error->message);
     testURLFinished(FALSE, uri, error->message);
     return FALSE;
@@ -419,6 +464,10 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     const char* uri = webkit_web_view_get_uri(view);
     gint64 now = g_get_monotonic_time();
     ps5wk_vr_stop(FALSE, "the page's process ended");
+    if (memRestarting && reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API) {
+        spike_log("[mem] WebProcess restart: the old one is gone");
+        return;
+    }
     gboolean again = uri && lastCrashURI && !strcmp(uri, lastCrashURI) && now - lastCrashTime < 30 * G_USEC_PER_SEC;
     g_free(lastCrashURI);
     lastCrashURI = g_strdup(uri ? uri : "");

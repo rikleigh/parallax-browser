@@ -77,6 +77,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0019-ps5-gc-suspended-thread-registers | PS5 only: WTF's `registersFromUContext` takes the mcontext at ucontext +0x40 (the PS5 kernel's layout; the SDK header says +0x10). JSC's conservative GC read a suspended thread's stack pointer from the kernel's `mc_addr` instead: 0 (stack not scanned at all) or a stale fault address above the stack (wrapped size: libpas out-of-memory panic in `gatherConservativeRoots`). `captureStack` also scans the whole stack if a stack pointer is ever outside it (counted, logged after the threads resume) |
 | 0020-ps5-hardware-decoded-video-samples | PS5 only: samples from `ps5vdecproxy` (`video/x-raw(memory:PS5Remote)`, a picture decoded in the title) are not painted (canvas `drawImage` gets nothing) and `videoFrameForCurrentTime` returns null, instead of mapping a placeholder buffer |
 | 0030-ps5-jit | the JIT (Baseline, DFG, FTL, YARR) for PS5 payloads: off by default on PS5 (`useJIT=false` in `Options::overrideDefaults`, a title can map RWX memory but faults executing it), turned on by ps5wk-child for WebProcesses and by the jsc shell; a 128 MB executable pool (x86_64's 1 GB would cost ~512 page tables); WebAssembly built (B3 does not compile without it) but off at run time, no fast memory; DFG/FTL compiler threads get 2 MB stacks; WTF's fault handlers use the alternate signal stack and pass faults that are not theirs to the crash guard; `ps5wk_jit_memory()` for the `[mem]` line and the crash guard; jsc shell links the dependency libraries and reads ICU data from /data/ps5webkit/share/icu; `InlineCacheCompiler.h` includes `CCallHelpers.h` (LLIntOffsetsExtractor did not compile with the JIT on) |
+| 0031-ps5-libpas-decommit | PS5 only: libpas gives decommitted memory back (replaces 0006's zero-only decommit): 16 KiB granules (the page size), decommit maps fresh anonymous pages over whole pages (`madvise` and `mprotect` leave them resident on the console, `test/memprobe`), commit is a no-op; executable memory is only zeroed; `PS5WK_PAS_DECOMMIT=0` restores the zero-only behaviour; `pas_page_malloc_ps5_decommitted_bytes` for the `[mem]` line |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -142,12 +143,15 @@ Milestone 1 placeholder media interfaces) is gone.
 | `/data/ps5webkit/audio-null` | title: consume audio silently (no sceAudioOut) |
 | `/data/ps5webkit/audio-silent` | title: real sceAudioOut ports at volume 0 (log-only runs) |
 | `/data/ps5webkit/audio-selftest` | title: open a port at start, 0.1 s of silence, leave it open (`RESULT ps5browser audio-selftest`) |
+| `[ps5audio]` lines | per stream: `sceAudioOutGetPortState` when the port opens and after 2 s (output bits, channels, volume, reroute count), failed `sceAudioOutOpen`/`SetVolume` calls, and at close the samples' peak and RMS and the count of failed `sceAudioOutOutput` calls (is the WebProcess sending silence? is the port refusing data?) |
 | `child.env`: `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_VP9=0`, `PS5WK_MEDIA_AV1=1`, `GST_DEBUG=...` | WebProcess decoding, codec advertising, GStreamer logs |
 | `child.env`: `PS5WK_PROFILE=1` | sampling profiler of the WebProcess main thread (`apps/common/profiler.c`, 2 ms SIGPROF; `test/prof.sh` fetches and symbolizes) |
 | `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
 | `[render]` lines (WebProcess, every 5 s while rendering more than 25 updates) | rendering updates per second, average/max duration, how many were followed by the idle gap |
 | `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child: 7680x4320@60 when the title decodes in hardware (step 2b; the child asks the title's video server at start), else 1920x1080@60 (software: YouTube stays ≤1080p) |
 | `child.env`: `PS5WK_MEM_LOG=<s>` (0 = off), `PS5WK_CPU_LOG=all` | the WebProcess memory watchdog period (default 60 s); `[cpu]` lines every 5 s whatever the load |
+| `child.env`: `PS5WK_MEM_RESTART_MB=<MB>` (default 3072, 0 = off) | WebProcess memory limit: over this much libpas memory committed, the title (and ps5wk-shot's stress mode) ends the WebProcess at the next top-level navigation and loads the page in a new one (see *WebProcess memory*) |
+| `child.env`: `PS5WK_PAS_DECOMMIT=0` | libpas only zeroes decommitted memory (before 0031: memory is a high-water mark), for A/B tests |
 | `child.env`: `PS5WK_JIT=0` / `baseline` / `dfg` / `1` (default) | JavaScriptCore's JIT in WebProcesses (see *JIT* below): off (LLInt only), up to Baseline, up to DFG, all tiers; any `JSC_<option>=...` line is passed to JSC as well |
 
 The children also set `WPE_SHELL_MEDIA_DISK_CACHE_PATH=/data/ps5webkit/home/cache/media`
@@ -970,6 +974,76 @@ Checked on the console (13.60, `spikes/04-jsc/jit-check.sh`: the WPE build's
   that keeps repainting (overlays, controls) is limited by CPU painting
   (`[render]` ~35 ms per update in the owner's session), which the JIT
   doesn't touch.
+
+## WebProcess memory (patch 0031 and the memory limit, 2026-10-28)
+
+Before 0031, libpas memory in the WebProcess was a high-water mark: 0006
+made decommit only zero the memory (pages are 16 KiB and libpas decommitted
+4 KiB granules), and one WebProcess serves every navigation (0018). With the
+JIT, the owner's 2-minute session reached 1.1 GB of libpas pages.
+
+**What the PS5 kernel does** (`test/memprobe/memprobe.c`, a payload: 64 MB
+anonymous mapping, every page touched, the middle 32 MB given back, residency
+by `mincore`): `madvise(MADV_FREE)`, `madvise(MADV_DONTNEED)` and
+`mprotect(PROT_NONE)` return 0 but leave all 32 MB resident with the contents
+kept; `mmap(MAP_FIXED)` of fresh anonymous memory over the range drops them
+(0 MB resident, reads back zero, touchable again); `munmap` works too. Page
+size 16384. `sceKernelAvailableFlexibleMemorySize` stays at 8158 MB whatever
+a payload maps or touches, so it measures nothing for payloads.
+
+**0031:** 16 KiB granules on PS5 (as libpas does on arm64 and Sony's
+PlayStation port), decommit maps fresh anonymous pages over the whole pages
+of the range (partial-page edges zeroed), commit is a no-op. Executable
+memory is only zeroed. `PS5WK_PAS_DECOMMIT=0` (child.env) restores the
+zero-only decommit for A/B tests. The `[mem]` line now says
+`libpas pages X MB (Y given back, Z committed)`; it also prints
+`resident in big mappings` (mincore over every mapping of 1 MB or more), but
+that number drops to ~30-50 MB on light pages in both modes: the console
+swaps payload memory out (`VM Stats ... swap out` in the kernel log grew by
+320-480 MB during each run below), so it is not a measure of what the
+process holds. Committed (mapped minus given back) is.
+
+**Long-session test** (ps5wk-shot stress, `test/stress/long-session.txt`:
+YouTube 4K watch page, BBC News, old.reddit.com, Wikipedia, GitHub, Hacker
+News; 8 rounds = 48 loads, 10 s dwell, JIT on, `[mem]` every 10 s;
+`childenv=PS5WK_MEM_LOG=10;PS5WK_MEM_RESTART_MB=0`, plus
+`PS5WK_PAS_DECOMMIT=0` for "before"; both runs with 16 KiB granules):
+
+| load | before: libpas committed (= pages) | after: libpas pages | after: given back | after: committed |
+|---|---|---|---|---|
+| 2-3 | 861 MB | 802 MB | 115 MB | 686 MB |
+| 9 | 989 | 1029 | 210 | 818 |
+| 16 | 1117 | 1093 | 358 | 735 |
+| 23 | 1184 | 1093 | 377 | 716 |
+| 29-48 | 1184 (flat) | 1125 (flat) | 237-419 | 670-760 on light pages, 830-890 on YouTube; 817 at the end |
+| peak RSS (getrusage) | 1036 MB | | | 925 MB |
+
+Both: 48 loads, 0 failed, 0 WebProcess terminations, no crash; page tables
+peaked at ~7030/8192 in both (about 400 of that is a second WebProcess that
+WebKit starts at each old.reddit.com load and that exits after ~20 s; seen
+in both modes, not from this change). So the heap levels off at ~1.1-1.2 GB
+of address space in this mix either way, and with 0031 300-420 MB of it is
+back with the kernel at any time: committed memory now falls when you leave
+a heavy page, instead of staying at its peak.
+
+**Memory limit (safety net).** `PS5WK_MEM_RESTART_MB` in child.env (default
+3072, 0 = off): ps5wk-child's memory thread compares libpas committed memory
+with it every 5 s and writes `/system_tmp/ps5wk/webmem-<UIProcess pid>`
+(`apps/common/webmem.h`). Over the limit, the title ends the WebProcess at
+the next top-level navigation (load started: stop, terminate, load the same
+address in a new WebProcess; the crash handler and the test-URL bookkeeping
+ignore it) and logs `[mem] WebProcess ... restarting it for <url>` and
+`RESULT ps5browser mem-restart`; ps5wk-shot's stress mode does the same
+before its next load (`memory-limit restarts` in its RESULT line). Still one
+WebProcess at a time (0018): the old one ends before the new one starts, so
+the page-table cost doesn't grow, except that WebKit also starts a spare
+WebProcess when the old one is terminated, which exits unused after ~10 s
+(~300 page tables meanwhile). Checked in the title (log-only,
+`PS5WK_MEM_RESTART_MB=400`): YouTube passed 567 MB, the navigation to
+Wikipedia restarted the WebProcess, Wikipedia loaded in 2.1-2.3 s and Hacker
+News after it in the new process, twice. A navigation that was a POST is
+reloaded as a GET (load-changed gives no method); at 3 GB this should be
+rare: the 48-load mix stayed under 0.9 GB committed.
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

@@ -45,9 +45,11 @@ int sceKernelAvailableFlexibleMemorySize(size_t*) __attribute__((weak));
 // glib-networking's OpenSSL TLS backend, linked statically (GIO module
 // registration that a shared build would do by scanning GIO_MODULE_DIR).
 void g_io_openssl_load(void*);
-// libpas (bmalloc's heap): bytes it has mapped (pas_page_malloc). On PS5 a
-// decommit only zeroes (patch 0006), so this is also what it keeps committed.
+// libpas (bmalloc's heap): bytes it has mapped (pas_page_malloc), and of
+// those, the bytes decommitted and not used again (patch 0031: whole 16 KiB
+// pages given back to the kernel; 0 with PS5WK_PAS_DECOMMIT=0).
 extern size_t pas_page_malloc_num_allocated_bytes __attribute__((weak));
+extern intptr_t pas_page_malloc_ps5_decommitted_bytes __attribute__((weak));
 extern size_t pas_compact_heap_reservation_size __attribute__((weak));
 extern size_t pas_compact_heap_reservation_bump __attribute__((weak));
 // JSC's executable memory pool (WebKit patch 0030; absent without the JIT).
@@ -309,6 +311,54 @@ static std::atomic<uint64_t> mmapCalls, mmapFailures, munmapCalls;
 static std::atomic<int64_t> mmapLiveBytes, mmapLiveCount;
 static std::atomic<uint64_t> mmapPeakBytes, mmapLargest;
 
+// Mappings of 1 MB or more (libpas's, the JIT pool, the structure heap...),
+// for the resident count (mincore) in the [mem] line: lock-free slots.
+#define BIG_MAPPINGS 1024
+static std::atomic<uintptr_t> bigStart[BIG_MAPPINGS];
+static size_t bigLength[BIG_MAPPINGS];
+
+static void rememberBig(void* address, size_t length)
+{
+    for (int i = 0; i < BIG_MAPPINGS; i++) {
+        uintptr_t expected = 0;
+        bigLength[i] = length;
+        if (bigStart[i].compare_exchange_strong(expected, (uintptr_t)address))
+            return;
+    }
+}
+
+static void forgetBig(void* address, size_t length)
+{
+    for (int i = 0; i < BIG_MAPPINGS; i++) {
+        if (bigStart[i].load(std::memory_order_relaxed) == (uintptr_t)address && bigLength[i] == length) {
+            bigStart[i].store(0);
+            return;
+        }
+    }
+}
+
+// Resident bytes in the big mappings, by mincore over 1 MB pieces (pieces
+// that are no longer mapped are skipped).
+static double residentBigMB()
+{
+    static unsigned char vector[(1 << 20) / 4096];
+    size_t page = getpagesize(), resident = 0;
+    for (int i = 0; i < BIG_MAPPINGS; i++) {
+        uintptr_t start = bigStart[i].load(std::memory_order_relaxed);
+        if (!start)
+            continue;
+        size_t length = bigLength[i];
+        for (size_t offset = 0; offset < length; offset += 1 << 20) {
+            size_t piece = length - offset < (1u << 20) ? length - offset : 1u << 20;
+            if (mincore((void*)(start + offset), piece, (char*)vector))
+                continue;
+            for (size_t k = 0; k < (piece + page - 1) / page; k++)
+                resident += vector[k] & 1;
+        }
+    }
+    return resident * (double)page / 1048576.0;
+}
+
 extern "C" void* __wrap_mmap(void* address, size_t length, int prot, int flags, int fd, off_t offset)
 {
     void* result = __real_mmap(address, length, prot, flags, fd, offset);
@@ -327,6 +377,8 @@ extern "C" void* __wrap_mmap(void* address, size_t length, int prot, int flags, 
         return result;
     }
     if (!(flags & MAP_FIXED) || !address) {
+        if (length >= (1u << 20))
+            rememberBig(result, length);
         int64_t live = mmapLiveBytes.fetch_add(length, std::memory_order_relaxed) + length;
         mmapLiveCount.fetch_add(1, std::memory_order_relaxed);
         uint64_t peak = mmapPeakBytes.load(std::memory_order_relaxed);
@@ -341,6 +393,8 @@ extern "C" int __wrap_munmap(void* address, size_t length)
 {
     int result = __real_munmap(address, length);
     munmapCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!result && length >= (1u << 20))
+        forgetBig(address, length);
     if (!result) {
         mmapLiveBytes.fetch_sub(length, std::memory_order_relaxed);
         mmapLiveCount.fetch_sub(1, std::memory_order_relaxed);
@@ -368,12 +422,42 @@ static void* memLogger(void* data)
     const char* tag = static_cast<const char*>(data);
     const char* period = getenv("PS5WK_MEM_LOG");
     int seconds = period ? atoi(period) : 60;
-    if (seconds <= 0)
-        return nullptr;
     double start = nowMS();
-    for (;;) {
-        struct timespec ts { seconds, 0 };
+    // The memory limit (WebProcess): every 5 s, libpas's committed memory
+    // (mapped minus given back) against PS5WK_MEM_RESTART_MB (default 3072, 0
+    // = off), written to PS5WK_MEM_STATUS for the UIProcess, which restarts
+    // this WebProcess at the next top-level navigation when it says "over 1".
+    const char* statusPath = getenv("PS5WK_MEM_STATUS");
+    const char* limitText = getenv("PS5WK_MEM_RESTART_MB");
+    double limitMB = limitText ? atof(limitText) : 3072;
+    bool over = false;
+    for (unsigned tick = 1;; tick++) {
+        struct timespec ts { 5, 0 };
         nanosleep(&ts, nullptr);
+        double mapped = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : 0;
+        double givenBack = &pas_page_malloc_ps5_decommitted_bytes && pas_page_malloc_ps5_decommitted_bytes > 0
+            ? pas_page_malloc_ps5_decommitted_bytes / 1048576.0 : 0;
+        double committed = mapped > givenBack ? mapped - givenBack : 0;
+        if (statusPath) {
+            bool nowOver = limitMB > 0 && committed >= limitMB;
+            if (nowOver && !over)
+                LOG("[mem] %s: libpas committed %.0f MB, at or above the limit of %.0f MB (PS5WK_MEM_RESTART_MB): the browser restarts this WebProcess at the next navigation",
+                    tag, committed, limitMB);
+            over = nowOver;
+            char line[160];
+            int length = snprintf(line, sizeof line, "pid %d committed %.0f limit %.0f over %d\n", (int)getpid(), committed, limitMB, over ? 1 : 0);
+            char temporary[200];
+            snprintf(temporary, sizeof temporary, "%s.tmp", statusPath);
+            int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd >= 0) {
+                write(fd, line, length);
+                fchmod(fd, 0666);
+                close(fd);
+                rename(temporary, statusPath);
+            }
+        }
+        if (seconds <= 0 || (tick * 5) % (unsigned)seconds >= 5)
+            continue;
         size_t flexible = 0;
         if (sceKernelAvailableFlexibleMemorySize)
             sceKernelAvailableFlexibleMemorySize(&flexible);
@@ -381,6 +465,7 @@ static void* memLogger(void* data)
         getrusage(RUSAGE_SELF, &usage);
         long rss = residentKB();
         double pas = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : -1;
+        double resident = residentBigMB();
         double compact = &pas_compact_heap_reservation_bump ? pas_compact_heap_reservation_bump / 1048576.0 : -1;
         double compactSize = &pas_compact_heap_reservation_size ? pas_compact_heap_reservation_size / 1048576.0 : -1;
         char jitText[96] = "";
@@ -399,9 +484,9 @@ static void* memLogger(void* data)
             snprintf(rssText, sizeof rssText, "rss %.1f MB, peak", rss / 1024.0);
         else
             snprintf(rssText, sizeof rssText, "peak rss");
-        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed%s",
+        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB (%.1f given back, %.1f committed), resident in big mappings %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed%s",
             tag, (nowMS() - start) / 1e3, rssText, usage.ru_maxrss / 1024.0,
-            flexible / 1048576.0, ((double)flexible - (double)startFlexible) / 1048576.0, pas, compact, compactSize,
+            flexible / 1048576.0, ((double)flexible - (double)startFlexible) / 1048576.0, pas, givenBack, committed, resident, compact, compactSize,
             (long long)mmapLiveCount.load(), mmapLiveBytes.load() / 1048576.0, mmapPeakBytes.load() / 1048576.0, mmapLargest.load() / 1048576.0,
             (unsigned long long)mmapCalls.load(), (unsigned long long)munmapCalls.load(), (unsigned long long)mmapFailures.load(), jitText);
     }
@@ -467,6 +552,9 @@ int main(int, char**)
                 setenv("PS5WK_AUDIO_SOCKET", audioPath, 0);
                 snprintf(slash + 1, sizeof(audioPath) - (slash + 1 - audioPath), "video-%d.sock", uiPid);
                 setenv("PS5WK_VIDEO_SOCKET", audioPath, 0);
+                // The memory limit's status for the UIProcess (memLogger).
+                snprintf(slash + 1, sizeof(audioPath) - (slash + 1 - audioPath), "webmem-%d", uiPid);
+                setenv("PS5WK_MEM_STATUS", audioPath, 1);
             }
         }
     }

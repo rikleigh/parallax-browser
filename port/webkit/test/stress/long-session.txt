@@ -1,0 +1,8 @@
+# ps5wk-shot cycle= list for the long-session memory test (README, WebProcess memory):
+# six heavy and light sites in turn, one WebProcess (patch 0018).
+https://www.youtube.com/watch?v=aqz-KE-bpKQ
+https://www.bbc.co.uk/news
+https://old.reddit.com/r/PS5/
+https://en.wikipedia.org/wiki/PlayStation_5
+https://github.com/WebKit/WebKit
+https://news.ycombinator.com/

@@ -43,6 +43,7 @@
 #include <WPEProcessManagerPS5.h>
 #include "../common/crashguard.h"
 #include "../common/ps5audioserver.h"
+#include "../common/webmem.h"
 #include <PS5VideoServer.h>
 
 void g_io_openssl_load(void*);
@@ -62,7 +63,8 @@ static char childEnvFile[64]; /* childenv=: this run's children's env file, remo
 static char cycleFile[256];
 static int cycleRounds = 3, cycleDwell = 4;
 static char** cycleURLs;
-static unsigned cycleCount, cycleIndex, cycleLoads, cycleFailures, cycleTerminations;
+static unsigned cycleCount, cycleIndex, cycleLoads, cycleFailures, cycleTerminations, cycleMemRestarts;
+static gboolean cycleMemRestarting;
 static guint cycleTimer;
 static char dataDir[256] = "/data/ps5webkit/shot/data";
 static char cacheDir[256] = "/data/ps5webkit/shot/cache";
@@ -321,14 +323,24 @@ static gboolean cycleNext(gpointer data)
     (void)data;
     cycleTimer = 0;
     if (cycleIndex >= cycleCount * (unsigned)cycleRounds) {
-        RESULT("stress", !cycleFailures && !cycleTerminations, "%u loads of %u URLs x %d rounds: %u failed, %u WebProcess terminations, %.1f s",
-            cycleLoads, cycleCount, cycleRounds, cycleFailures, cycleTerminations, secondsSinceStart());
+        RESULT("stress", !cycleFailures && !cycleTerminations, "%u loads of %u URLs x %d rounds: %u failed, %u WebProcess terminations, %u memory-limit restarts, %.1f s",
+            cycleLoads, cycleCount, cycleRounds, cycleFailures, cycleTerminations, cycleMemRestarts, secondsSinceStart());
         g_main_loop_quit(loop);
         return G_SOURCE_REMOVE;
     }
     const char* next = cycleURLs[cycleIndex++ % cycleCount];
     printf("STRESS load %u: %s at %.1f s\n", cycleIndex, next, secondsSinceStart());
     cycleLoads++;
+    /* The WebProcess memory limit, as the browser title applies it. */
+    int webPid = 0;
+    double committed = 0, limit = 0;
+    if (ps5wk_webmem_over(&webPid, &committed, &limit)) {
+        printf("STRESS memory limit: WebProcess %d has %.0f MB of libpas memory committed (limit %.0f MB); restarting it\n", webPid, committed, limit);
+        ps5wk_webmem_forget();
+        cycleMemRestarts++;
+        cycleMemRestarting = TRUE;
+        webkit_web_view_terminate_web_process(webView); /* not counted as a termination below */
+    }
     webkit_web_view_load_uri(webView, next);
     /* dwell < 0: move on |dwell| s after starting, finished or not (loads
      * get cancelled mid-way, as when someone clicks on quickly). */
@@ -390,6 +402,11 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
 {
     (void)view;
     (void)data;
+    if (cycleURLs && cycleMemRestarting) {
+        cycleMemRestarting = FALSE;
+        printf("STRESS WebProcess ended for the memory limit at %.1f s\n", secondsSinceStart());
+        return;
+    }
     if (cycleURLs) {
         cycleTerminations++;
         printf("STRESS WebProcess terminated (reason %d) at %.1f s\n", reason, secondsSinceStart());

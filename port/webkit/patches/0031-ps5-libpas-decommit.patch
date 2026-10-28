@@ -1,0 +1,120 @@
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_internal_config.h b/Source/bmalloc/libpas/src/libpas/pas_internal_config.h
+index 7b0d4cfc91..d9ce815c92 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_internal_config.h
++++ b/Source/bmalloc/libpas/src/libpas/pas_internal_config.h
+@@ -50,7 +50,8 @@
+ #define PAS_MARGE_PAGE_DEFAULT_SHIFT     22
+ #define PAS_MARGE_PAGE_DEFAULT_SIZE      ((size_t)1 << PAS_MARGE_PAGE_DEFAULT_SHIFT)
+ 
+-#if PAS_ARM64 || PAS_PLATFORM(PLAYSTATION)
++/* PS5 payloads: 16 KiB pages, so 16 KiB granules (decommit works on whole pages). */
++#if PAS_ARM64 || PAS_PLATFORM(PLAYSTATION) || defined(PS5_PAYLOAD_SDK)
+ #define PAS_GRANULE_DEFAULT_SHIFT        14
+ #else
+ #define PAS_GRANULE_DEFAULT_SHIFT        12
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c b/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c
+index 76c12a73ca..36355b3005 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c
++++ b/Source/bmalloc/libpas/src/libpas/pas_page_malloc.c
+@@ -31,6 +31,7 @@
+ 
+ #include <errno.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #if !PAS_OS(WINDOWS)
+ #include <sys/mman.h>
+@@ -431,17 +432,37 @@ void pas_page_malloc_zero_fill(void* base, size_t size, pas_memory_flavor flavor
+ #endif /* PAS_OS(WINDOWS) */
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++/* Bytes decommitted and not committed again (whole pages given back to the
++ * kernel), for the WebProcess's [mem] line and its memory limit. */
++intptr_t pas_page_malloc_ps5_decommitted_bytes;
++
++static bool ps5_decommit_by_remap(void)
++{
++    static int state; /* 0 unknown, 1 remap, -1 zero only */
++    if (!state) {
++        const char* value = getenv("PS5WK_PAS_DECOMMIT");
++        state = value && value[0] == '0' ? -1 : 1;
++    }
++    return state > 0;
++}
++#endif
++
+ static void commit_impl(void* ptr, size_t size, bool do_mprotect, bool is_symmetric, pas_memory_flavor flavor)
+ {
+ #if defined(PS5_PAYLOAD_SDK)
+-    /* PS5: pages are 16 KiB but libpas commits/decommits 4 KiB granules, so
+-     * a granule is part of a page. Decommit just zeroes the granule (see
+-     * decommit_impl) and memory stays committed: nothing to do here. */
+-    PAS_UNUSED_PARAM(ptr);
+-    PAS_UNUSED_PARAM(size);
++    /* PS5: decommit maps fresh anonymous pages over the range (see
++     * decommit_impl), which fault in zeroed on first touch: nothing to do
++     * but the accounting. */
+     PAS_UNUSED_PARAM(do_mprotect);
+     PAS_UNUSED_PARAM(is_symmetric);
+-    PAS_UNUSED_PARAM(flavor);
++    if (ps5_decommit_by_remap() && !pas_memory_flavor_is_executable(flavor) && !pas_memory_flavor_client_owns_permissions(flavor)) {
++        uintptr_t page = pas_page_malloc_alignment();
++        uintptr_t begin = pas_round_up_to_power_of_2((uintptr_t)ptr, page);
++        uintptr_t end = pas_round_down_to_power_of_2((uintptr_t)ptr + size, page);
++        if (end > begin)
++            __atomic_fetch_sub(&pas_page_malloc_ps5_decommitted_bytes, (intptr_t)(end - begin), __ATOMIC_RELAXED);
++    }
+     return;
+ #endif
+     uintptr_t base_as_int;
+@@ -527,13 +548,30 @@ static void decommit_impl(void* ptr, size_t size,
+                           pas_memory_flavor flavor)
+ {
+ #if defined(PS5_PAYLOAD_SDK)
+-    /* PS5 (see commit_impl): a 4 KiB granule is part of a 16 KiB page, so it
+-     * cannot be madvised or mprotected on its own (libpas asserted on page
+-     * alignment here on the console). Zero it, as a fresh commit would be,
+-     * and keep it. TODO: 16 KiB granules, as libpas does on Apple arm64. */
++    /* PS5: pages are 16 KiB (granules are too, pas_internal_config.h). On
++     * the console madvise(MADV_FREE or MADV_DONTNEED) leaves the pages
++     * resident (mincore) and mprotect too; mapping fresh anonymous memory
++     * over the range drops them (port/webkit/test/memprobe). So: zero the
++     * parts that aren't whole pages, map over the rest. Executable memory
++     * and memory whose permissions the client owns are only zeroed, and so
++     * is everything with PS5WK_PAS_DECOMMIT=0 (the 0006 behaviour: libpas
++     * memory as a high-water mark). */
+     PAS_UNUSED_PARAM(do_mprotect);
+     PAS_UNUSED_PARAM(is_symmetric);
+-    PAS_UNUSED_PARAM(flavor);
++    if (ps5_decommit_by_remap() && !pas_memory_flavor_is_executable(flavor) && !pas_memory_flavor_client_owns_permissions(flavor)) {
++        uintptr_t page = pas_page_malloc_alignment();
++        uintptr_t begin = pas_round_up_to_power_of_2((uintptr_t)ptr, page);
++        uintptr_t end = pas_round_down_to_power_of_2((uintptr_t)ptr + size, page);
++        if (end > begin
++            && mmap((void*)begin, end - begin, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED | PAS_NORESERVE, PAS_VM_TAG, 0) == (void*)begin) {
++            if (begin > (uintptr_t)ptr)
++                memset(ptr, 0, begin - (uintptr_t)ptr);
++            if ((uintptr_t)ptr + size > end)
++                memset((void*)end, 0, (uintptr_t)ptr + size - end);
++            __atomic_fetch_add(&pas_page_malloc_ps5_decommitted_bytes, (intptr_t)(end - begin), __ATOMIC_RELAXED);
++            return;
++        }
++    }
+     memset(ptr, 0, size);
+     return;
+ #endif
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_page_malloc.h b/Source/bmalloc/libpas/src/libpas/pas_page_malloc.h
+index 185a9a3495..0daf458d01 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_page_malloc.h
++++ b/Source/bmalloc/libpas/src/libpas/pas_page_malloc.h
+@@ -34,6 +34,9 @@
+ PAS_BEGIN_EXTERN_C;
+ 
+ PAS_API extern size_t pas_page_malloc_num_allocated_bytes;
++#if defined(PS5_PAYLOAD_SDK)
++PAS_API extern intptr_t pas_page_malloc_ps5_decommitted_bytes;
++#endif
+ PAS_API extern size_t pas_page_malloc_cached_alignment;
+ PAS_API extern size_t pas_page_malloc_cached_alignment_shift;
+ #if PAS_OS(DARWIN)
