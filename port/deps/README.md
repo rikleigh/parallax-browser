@@ -5,7 +5,7 @@ with ps5-payload-sdk into **`toolchain/wpe-sysroot`**. Package list, versions
 and state: [STATUS.md](STATUS.md).
 
 ```sh
-port/deps/build.sh               # every step, in order (~10 min on the M4 Max)
+port/deps/build.sh               # every step, in order (4.5 min from scratch on the M4 Max)
 port/deps/build.sh --list        # step names
 port/deps/build.sh glib libsoup  # single steps
 KEEP=1 port/deps/build.sh glib   # keep toolchain/wpe-deps/{src,build}/glib for debugging
@@ -152,9 +152,14 @@ Things a consumer must know:
   from it.
 - **libps5compat** (our shim, `compat/`): memmem, getline/getdelim, resolver
   stubs (`res_query` etc. fail with HOST_NOT_FOUND; only GResolver SRV/MX
-  lookups use them), empty fstab, and a **readlink fix** linked with
-  `-Wl,--wrap=readlink`. `glib-2.0.pc`, `gio-2.0.pc` and `fontconfig.pc`
-  carry `-lps5compat -Wl,--wrap=readlink` in `Libs.private`. Each function is
+  lookups use them), empty fstab, and fixes for libkernel calls that return
+  errno values (below), linked with
+  `-Wl,--wrap=readlink,--wrap=eaccess,--wrap=faccessat,--wrap=link,--wrap=symlink,--wrap=ppoll`.
+  `ps5compat.pc`, and `Libs.private` of `glib-2.0.pc`, `gio-2.0.pc`,
+  `fontconfig.pc` and `xkbcommon.pc`, carry `-lps5compat` plus those flags.
+  **WebKit should link with them too** (`pkg-config-ps5 --libs ps5compat`):
+  WTF/libc++ `std::filesystem` call readlink, and the wrap only fixes
+  objects linked with the flag. Each function is
   its own object, so a second memmem (WebKit's shim) does not clash.
   Empty `libm.a`/`librt.a` exist so `-lm`/`-lrt` resolve (libm lives in
   libSceLibcInternal).
@@ -167,16 +172,25 @@ Things a consumer must know:
 
 ## PS5 libc findings (13.60, from the smoke test)
 
-- **`readlink`, `symlink` and `ppoll` from libkernel return the errno value
-  as a positive result** instead of -1 with errno set: `readlink(regular
-  file)` = 22, `readlink(missing)` = 2, `symlink()` = 45 (EOPNOTSUPP),
-  `ppoll(readable pipe)` = 3 with no revents. `poll` works. Other libkernel
-  wrappers may share the bug; check return values when something odd happens.
+- **Some libkernel calls return the errno value as a positive result**
+  instead of -1 with errno set (`smoke/libcprobe.c` checks 28 calls):
+  `readlink` (regular file → 22, missing → 2), `eaccess` and `faccessat`
+  (→ 78 ENOSYS, even for existing paths), `link` and `symlink` (→ 45
+  EOPNOTSUPP), `ppoll` (→ 3, no revents). `access`, `stat`, `lstat`, `open`,
+  `mkdir`, `rmdir`, `unlink`, `rename`, `chmod`, `utimes`, `truncate`,
+  `chdir`, `close`, `dup2`, `fcntl`, `fsync`, `statfs` and `poll` behave
+  normally. The pattern looks like syscalls the payload sandbox doesn't
+  allow; expect more of them and check return values when something odd
+  happens.
   - glib: `ppoll` is disabled at configure time on PS5 (patch). With it,
     GMainContext sources on sockets never fired in worker threads, so every
     glib-networking TLS handshake timed out.
   - readlink: wrapped in libps5compat (lstat first). fontconfig failed to
     load its config without it.
+  - eaccess/faccessat: wrapped, falling back to `access()`. libxkbcommon
+    rejected its XKB directory without it.
+  - link/symlink: wrapped to return -1/errno. Hard and symbolic links fail
+    on /data (EOPNOTSUPP).
 - `<malloc.h>` is a hard `#error` in the SDK headers (as on FreeBSD).
 - No `F_KINFO`, no procfs: `g_unix_fd_query_path()` returns
   `G_FILE_ERROR_NOSYS`.

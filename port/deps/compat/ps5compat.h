@@ -6,8 +6,14 @@
  *   memmem             missing from the SDK libc
  *   getline, getdelim  missing from the SDK libc
  *   setfsent/getfsent/endfsent  empty fstab (GIO unix mounts)
- *   __wrap_readlink    readlink fix (libkernel returns errno values); link
- *                      with -Wl,--wrap=readlink (ps5compat.pc does)
+ *   __wrap_readlink, __wrap_eaccess, __wrap_faccessat, __wrap_link,
+ *   __wrap_symlink, __wrap_ppoll
+ *                      fixes for libkernel wrappers that return errno values
+ *                      as positive results (13.60); link with
+ *                      -Wl,--wrap=readlink,--wrap=eaccess,--wrap=faccessat,
+ *                      --wrap=link,--wrap=symlink,--wrap=ppoll
+ *                      (ps5compat.pc and the glib/fontconfig/xkbcommon .pc
+ *                      files carry these)
  *   res_* / dn_*       resolver stubs (declared by resolv.h, exported by
  *                      nothing); they fail with HOST_NOT_FOUND
  */

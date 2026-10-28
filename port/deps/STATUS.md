@@ -3,8 +3,9 @@
 Sysroot: `toolchain/wpe-sysroot` (static `.a` only, relocatable `.pc` files).
 Built by `port/deps/build.sh`; how to consume it: `port/deps/README.md`.
 Status: **built** = cross-compiles and installs; **smoke-tested** = linked
-into `port/deps/smoke` and exercised on the console (13.60), all 17 checks PASS
-(`smoke/results/20261028-000641-all-pass.log`).
+into `port/deps/smoke` and exercised on the console (13.60), all 18 checks PASS
+(`smoke/results/20261028-002207-all-pass.log`). A clean rebuild of the whole
+sysroot takes 4m22s.
 
 Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 -DENABLE_WPE_LEGACY_API=OFF -DUSE_GBM=OFF -DUSE_LIBDRM=OFF
@@ -16,7 +17,7 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 
 | package | version | status | notes |
 | --- | --- | --- | --- |
-| ps5compat | 1.0 | smoke-tested | ours: memmem, getline, resolver/fstab stubs, readlink fix (`-Wl,--wrap=readlink`); empty libm.a/librt.a |
+| ps5compat | 1.0 | smoke-tested | ours: memmem, getline, resolver/fstab stubs, fixes for libkernel calls returning errno as a positive value (readlink, eaccess, faccessat, link, symlink, ppoll; `-Wl,--wrap=...` from the .pc files); empty libm.a/librt.a |
 | zlib | 1.3.1 | smoke-tested | |
 | brotli | 1.1.0 | smoke-tested | (libsoup, freetype) |
 | libpng | 1.6.47 | smoke-tested | linked via freetype |
@@ -41,8 +42,8 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 | libsoup | 3.8.1 | smoke-tested | HTTP/2, brotli, psl, sqlite |
 | glib-networking | 2.90.1 | smoke-tested | OpenSSL backend, static: link `gioopenssl`, call `g_io_openssl_load(NULL)` |
 | libepoxy | 1.5.10 | built | EGL only (required by OptionsWPE; unused by CPU painting) |
-| libxkbcommon | 1.7.0 | built | XKB root /data/ps5webkit/share/xkb; smoke check pending (console asleep) |
-| xkeyboard-config | 2.43 | built | data in runtime tree share/xkb |
+| libxkbcommon | 1.7.0 | smoke-tested | XKB root /data/ps5webkit/share/xkb; evdev/pc105/us keymap compiles in 7 ms |
+| xkeyboard-config | 2.43 | smoke-tested | data in runtime tree share/xkb (/data/ps5webkit/share/xkb) |
 | lcms2 | 2.17 | built | MIT core only |
 | CA bundle | 2026-10-20 | smoke-tested | /data/ps5webkit/etc/ssl/cert.pem |
 | Noto fonts + fonts.conf | notofonts @781896b | smoke-tested | /data/ps5webkit/fonts |

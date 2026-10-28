@@ -34,6 +34,9 @@ PS5_RUNTIME="/data/ps5webkit"
 
 export PATH="$W/venv/bin:/opt/homebrew/opt/bison/bin:$SDK/bin:$PATH"
 
+# libps5compat plus the --wrap flags for its libkernel fixes (compat/*.c).
+PS5COMPAT_LIBS="-lps5compat -Wl,--wrap=readlink,--wrap=eaccess,--wrap=faccessat,--wrap=link,--wrap=symlink,--wrap=ppoll"
+
 CFLAGS_COMMON="-O2 -g0 -fPIC -ffunction-sections -fdata-sections"
 CXXFLAGS_COMMON="$CFLAGS_COMMON -nostdinc++ -isystem $LIBCXX/include/c++/v1"
 
@@ -190,7 +193,7 @@ includedir=\${prefix}/include
 Name: ps5compat
 Description: libc additions for PS5 payloads (memmem, getline, resolver stubs)
 Version: 1.0
-Libs: -L\${libdir} -lps5compat -Wl,--wrap=readlink
+Libs: -L\${libdir} $PS5COMPAT_LIBS
 Cflags: -I\${includedir}
 EOF
     rm -rf "$b"
@@ -404,7 +407,7 @@ step_fontconfig() {
     rm -rf "$stage"
     fix_sysroot
     # PS5 readlink() returns errno values (see compat/readlink.c).
-    pc_add_private fontconfig "-lps5compat -Wl,--wrap=readlink"
+    pc_add_private fontconfig "$PS5COMPAT_LIBS"
     cleanup fontconfig
 }
 
@@ -460,8 +463,8 @@ step_glib() {
     rm -f "$SYSROOT"/bin/{gio,gio-querymodules,glib-compile-schemas,glib-compile-resources,gresource,gsettings,gdbus,gapplication,gobject-query,gi-*}
     fix_sysroot
     # res_query/dn_expand (GResolver), getline: from libps5compat.
-    pc_add_private glib-2.0 "-lps5compat -Wl,--wrap=readlink"
-    pc_add_private gio-2.0 "-lps5compat -Wl,--wrap=readlink"
+    pc_add_private glib-2.0 "$PS5COMPAT_LIBS"
+    pc_add_private gio-2.0 "$PS5COMPAT_LIBS"
     # gmodule's .pc adds -Wl,--export-dynamic; payloads load no modules.
     sed -i '' 's/ *-Wl,--export-dynamic//' "$SYSROOT"/lib/pkgconfig/gmodule-*.pc
     cleanup glib
@@ -548,7 +551,10 @@ step_libxkbcommon() {
     meson_pkg libxkbcommon -Denable-x11=false -Denable-wayland=false -Denable-docs=false \
         -Denable-tools=false -Denable-xkbregistry=false -Denable-bash-completion=false \
         -Dxkb-config-root="$PS5_RUNTIME/share/xkb" -Dx-locale-root="$PS5_RUNTIME/share/X11/locale"
-    fix_sysroot; cleanup libxkbcommon
+    fix_sysroot
+    # eaccess() returns ENOSYS as a positive value on PS5 (compat/eaccess.c).
+    pc_add_private xkbcommon "$PS5COMPAT_LIBS"
+    cleanup libxkbcommon
 }
 
 # WPEPlatform's default keymap (wpe_keymap_xkb_new: evdev/pc105/us) is
@@ -624,7 +630,9 @@ step_fonts() {
 }
 
 STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv proxy_libintl
-          libxml2 libxslt sqlite libpsl freetype harfbuzz fontconfig icu pcre2 libffi glib openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2 cacert fonts xkeyboard_config)
+          libxml2 libxslt sqlite libpsl icu freetype harfbuzz fontconfig pcre2 libffi glib
+          openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
+          cacert fonts xkeyboard_config)
 
 if [ "${1:-}" = "--list" ]; then printf '%s\n' "${STEPS_M1[@]}" | tr _ -; exit 0; fi
 STEPS=("$@")
