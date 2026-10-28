@@ -118,12 +118,12 @@ static void report(void)
             const guint8* px = row + x * 4;
             for (int c = 0; c < 4; c++)
                 hash = (hash ^ px[c]) * 1099511628211ull;
-            if (px[0] < 240 || px[1] < 240 || px[2] < 240)
-                nonWhite++;
+            if (px[0] != p[0] || px[1] != p[1] || px[2] != p[2])
+                nonWhite++; // differs from the top-left pixel (the background)
         }
     }
-    gboolean painted = nonWhite > 0 && nonWhite < total;
-    RESULT("paint", painted, "%dx%d, %u frames, first at %.1f s, fnv64 %016llx, %.2f%% non-white pixels", lastWidth, lastHeight,
+    gboolean painted = nonWhite * 1000 > total && nonWhite < total; // > 0.1% not background
+    RESULT("paint", painted, "%dx%d, %u frames, first at %.1f s, fnv64 %016llx, %.2f%% of pixels differ from the background", lastWidth, lastHeight,
         framesRendered, (firstFrameTime - startTime) / 1e6, (unsigned long long)hash, total ? 100.0 * nonWhite / total : 0.0);
 
     // Thumbnail: box-filtered to 320 px wide, binary PPM, base64 in lines.

@@ -78,10 +78,10 @@ for so in $(LC_ALL=C ls "$SYS"/lib/*.so); do
 done
 "$LLD" -T "$NATIVE/ps5-pie.ld" --eh-frame-hdr \
     --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=posix_memalign \
-    --wrap=malloc_usable_size --wrap=dlopen --wrap=dlsym \
+    --wrap=malloc_usable_size --wrap=dlopen --wrap=dlsym --wrap=fcntl \
     --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
     --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" \
-    "$W"/obj/*.o "${inputs[@]}" -u ps5_agc_gate2_run \
+    "$W"/obj/*.o "${inputs[@]}" "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
     --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
     "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
     "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \

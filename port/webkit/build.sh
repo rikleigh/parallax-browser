@@ -174,7 +174,7 @@ step_configure() {
         "${WEBKIT_OPTIONS[@]}" \
         -DCMAKE_C_FLAGS="$cflags" -DCMAKE_CXX_FLAGS="$cxxflags" \
         -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
-        -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ -Wl,--gc-sections -L$SYSROOT/lib" \
+        -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ -Wl,--gc-sections -L$SYSROOT/lib -Wl,--wrap=fcntl" \
         -DCMAKE_CXX_STANDARD_LIBRARIES="$libs" \
         -DICU_ROOT="$ICU" -DICU_INCLUDE_DIR="$ICU/include" \
         -DICU_UC_LIBRARY_RELEASE="$ICU/lib/libicuuc.a" \

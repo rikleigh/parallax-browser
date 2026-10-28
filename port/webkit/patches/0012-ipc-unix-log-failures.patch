@@ -1,63 +1,118 @@
-diff --git a/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp b/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp
-index 0031d7feeb..cd660044a9 100644
---- a/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp
-+++ b/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp
-@@ -135,7 +135,7 @@ bool Connection::processMessage()
-     memcpySpan(asMutableByteSpan(messageInfo), consumeSpan(messageData, sizeof(messageInfo)));
+diff --git a/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp b/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp
+index 3bb2f67fb2..7bcedc0e9a 100644
+--- a/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp
++++ b/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp
+@@ -24,6 +24,7 @@
+  */
  
-     if (messageInfo.attachmentCount() > attachmentMaxAmount || (!messageInfo.isBodyOutOfLine() && messageInfo.bodySize() > messageMaxSize)) {
--        ASSERT_NOT_REACHED();
-+        SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
-         return false;
+ #include "config.h"
++#include <sys/stat.h>
+ #include "Connection.h"
+ 
+ #if USE(GLIB)
+@@ -49,6 +50,13 @@
+ namespace IPC {
+ 
+ static constexpr size_t s_messageMaxSize = 4096;
++
++// Every path that closes a connection logs why (PS5 bring-up diagnostics).
++#define PS5_IPC_LOG(...) do { \
++    IGNORE_WARNINGS_BEGIN("format-nonliteral") \
++    fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); \
++    IGNORE_WARNINGS_END \
++} while (0)
+ static constexpr size_t s_attachmentMaxAmount = 254;
+ 
+ class AttachmentInfo {
+@@ -225,18 +233,24 @@ std::unique_ptr<Decoder> Connection::createMessageDecoder()
+     ASSERT(messageInfo.bodySize());
+     auto& attachmentInfo = reinterpretCastSpanStartTo<AttachmentInfo>(messageData);
+     if (attachmentInfo.isNull()) {
++        PS5_IPC_LOG("IPC: out-of-line body attachment is null in process %d", getpid());
+         ASSERT_NOT_REACHED();
+         return nullptr;
      }
  
-@@ -171,20 +171,20 @@ bool Connection::processMessage()
-         ASSERT(messageInfo.bodySize());
- 
-         if (attachmentInfo[attachmentCount].isNull()) {
--            ASSERT_NOT_REACHED();
-+            SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
-             return false;
-         }
- 
-         auto fd = UnixFileDescriptor { m_fileDescriptors[attachmentFileDescriptorCount - 1], UnixFileDescriptor::Adopt };
-         if (!fd) {
--            ASSERT_NOT_REACHED();
-+            SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
-             return false;
-         }
- 
-         auto handle = WebCore::SharedMemory::Handle { WTF::move(fd), messageInfo.bodySize() };
-         oolMessageBody = WebCore::SharedMemory::map(WTF::move(handle), WebCore::SharedMemory::Protection::ReadOnly);
-         if (!oolMessageBody) {
--            ASSERT_NOT_REACHED();
-+            SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
-             return false;
-         }
+     if (fdIndex >= m_fileDescriptors.size()) {
++        PS5_IPC_LOG("IPC: no fd for the out-of-line body in process %d (fdIndex %zu, %zu fds)", getpid(), static_cast<size_t>(fdIndex), m_fileDescriptors.size());
+         RELEASE_LOG_FAULT(IPC, "createMessageDecoder: missing shared-memory file descriptor for out-of-line body");
+         ASSERT_NOT_REACHED();
+         return nullptr;
      }
-@@ -253,6 +253,8 @@ static ssize_t readBytesFromSocket(int socketDescriptor, Vector<uint8_t>& buffer
-         }
++    int oolFD = m_fileDescriptors[fdIndex].value();
++    struct stat oolStat { };
++    int oolStatResult = fstat(oolFD, &oolStat);
+     auto handle = WebCore::SharedMemory::Handle { WTF::move(m_fileDescriptors[fdIndex]), messageInfo.bodySize() };
+     auto messageBody = WebCore::SharedMemory::map(WTF::move(handle), WebCore::SharedMemory::Protection::ReadOnly);
+     if (!messageBody) {
++        PS5_IPC_LOG("IPC: mapping the out-of-line body failed in process %d: fd %d, body %zu bytes, fstat %d size %lld mode 0%o, errno %d", getpid(), oolFD, static_cast<size_t>(messageInfo.bodySize()), oolStatResult, static_cast<long long>(oolStat.st_size), static_cast<unsigned>(oolStat.st_mode), errno);
+         ASSERT_NOT_REACHED();
+         return nullptr;
+     }
+@@ -255,8 +269,9 @@ static ssize_t readBytesFromSocket(GSocket* socket, Vector<uint8_t>& buffer, Vec
+     if (bytesRead <= 0)
+         return bytesRead;
  
-         if (message.msg_flags & MSG_CTRUNC) {
-+            SAFE_WTFLOGALWAYS("IPC: control data truncated (MSG_CTRUNC) on socket %d in process %d", socketDescriptor, getpid());
-+            errno = EBADMSG;
-             // Control data has been discarded, which is expected by processMessage(), so consider this a read failure.
-             buffer.shrink(previousBufferSize);
-             return -1;
-@@ -298,6 +300,7 @@ void Connection::readyReadHandler()
+-    if (flags & MSG_CTRUNC) {
++    if (flags & (MSG_CTRUNC | MSG_TRUNC)) {
+         // Control data has been discarded, so consider this a read failure.
++        PS5_IPC_LOG("IPC: message %s on socket %d in process %d (read %zd of a %zu byte buffer)", (flags & MSG_TRUNC) ? "truncated (MSG_TRUNC)" : "lost its control data (MSG_CTRUNC)", g_socket_get_fd(socket), getpid(), bytesRead, buffer.size());
+         return -1;
+     }
+ 
+@@ -308,11 +323,13 @@ void Connection::readyReadHandler()
                  return;
  
-             if (errno == ECONNRESET) {
-+                SAFE_WTFLOGALWAYS("IPC: connection reset on socket %d in process %d", socketDescriptor(), getpid());
+             if (g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED) || g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
++                PS5_IPC_LOG("IPC: receive on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error ? error->message : "?");
                  connectionDidClose();
                  return;
              }
-@@ -310,6 +313,8 @@ void Connection::readyReadHandler()
+ 
+             if (m_isConnected) {
++                PS5_IPC_LOG("IPC: error receiving on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error ? error->message : "(no GError)");
+                 RELEASE_LOG_ERROR(IPC, "Error receiving IPC message on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error->message);
+                 connectionDidClose();
+             }
+@@ -320,6 +337,7 @@ void Connection::readyReadHandler()
          }
  
          if (!bytesRead) {
-+            if (m_readBuffer.size() >= m_readBuffer.capacity())
-+                SAFE_WTFLOGALWAYS("IPC: read buffer full (%zu bytes of unprocessed messages) on socket %d in process %d; closing", m_readBuffer.size(), socketDescriptor(), getpid());
++            PS5_IPC_LOG("IPC: end of stream on socket %d in process %d", g_socket_get_fd(m_socket.get()), getpid());
              connectionDidClose();
              return;
          }
+@@ -338,8 +356,10 @@ void Connection::readyReadHandler()
+ 
+         if (auto decoder = createMessageDecoder())
+             processIncomingMessage(makeUniqueRefFromNonNullUniquePtr(WTF::move(decoder)));
+-        else
++        else {
++            PS5_IPC_LOG("IPC: undecodable message (%zu bytes, %zu fds) on socket %d in process %d", m_readBuffer.size(), m_fileDescriptors.size(), g_socket_get_fd(m_socket.get()), getpid());
+             connectionDidClose();
++        }
+     }
+ }
+ 
+@@ -355,6 +375,7 @@ void Connection::platformOpen()
+ 
+     m_readSocketMonitor.start(m_socket.get(), G_IO_IN, m_connectionQueue->runLoop(), m_cancellable.get(), [protectedThis] (GIOCondition condition) -> gboolean {
+         if (condition & G_IO_HUP || condition & G_IO_ERR || condition & G_IO_NVAL) {
++            PS5_IPC_LOG("IPC: socket %d in process %d reported condition 0x%x (HUP/ERR/NVAL)", g_socket_get_fd(protectedThis->m_socket.get()), getpid(), static_cast<unsigned>(condition));
+             protectedThis->connectionDidClose();
+             return G_SOURCE_REMOVE;
+         }
+@@ -501,10 +522,13 @@ bool Connection::sendOutputMessage(UnixMessage&& outputMessage)
+     }
+ 
+     if (g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED) || g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
++        PS5_IPC_LOG("IPC: send on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error ? error->message : "?");
+         connectionDidClose();
+         return false;
+     }
+ 
++    if (m_isConnected)
++        PS5_IPC_LOG("IPC: error sending on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error ? error->message : "?");
+     if (m_isConnected)
+         RELEASE_LOG_ERROR(IPC, "Error sending IPC message on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error->message);
+     return false;
