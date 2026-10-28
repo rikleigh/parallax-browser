@@ -47,9 +47,16 @@ public:
 
     bool hasPage() const { return m_pageWidth > 0; }
 
+    // Debug screen readback: the next present() reads the composed frame
+    // back (glReadPixels), halves it (1920x1080 -> 960x540, box filter),
+    // flips it top-down and writes it to path as a binary PPM (P6, RGB).
+    void requestCapture(const char* path);
+    bool capturePending() const { return m_capturePath; }
+
 private:
     PS5Renderer() = default;
     bool createPrograms(char* error, unsigned errorSize);
+    void writeCapture();
 
     bool m_initialized { false };
     void* m_eglDisplay { nullptr };
@@ -67,4 +74,5 @@ private:
     int m_pageWidth { 0 };
     int m_pageHeight { 0 };
     unsigned m_pointerTexture { 0 };
+    char* m_capturePath { nullptr };
 };

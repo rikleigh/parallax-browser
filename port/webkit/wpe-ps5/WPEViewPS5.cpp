@@ -22,6 +22,7 @@
 #include "PS5Renderer.h"
 #include "WPEPS5Private.h"
 #include <wtf/glib/GRefPtr.h>
+#include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/RunLoopSourcePriority.h>
 #include <wtf/glib/WTFGType.h>
 
@@ -128,6 +129,12 @@ static gboolean wpeViewPS5RenderBuffer(WPEView* view, WPEBuffer* buffer, const W
         priv->firstFrameTime = g_get_monotonic_time();
         PS5_LOG("first page frame: %dx%d stride %u, %u damage rects", wpe_buffer_get_width(buffer),
             wpe_buffer_get_height(buffer), wpe_buffer_shm_get_stride(shm), damageCount);
+        // Debug readback of the first frame on the TV (the title sets this
+        // when /data/ps5webkit/debug-screenshot exists).
+        if (const char* dir = g_getenv("PS5WK_SCREENSHOT_DIR")) {
+            GUniquePtr<char> path(g_build_filename(dir, "first-frame.ppm", nullptr));
+            wpe_display_ps5_capture_screen(display, path.get());
+        }
     } else if (!(priv->frames % 600)) {
         double seconds = (g_get_monotonic_time() - priv->firstFrameTime) / 1e6;
         PS5_LOG("%u page frames in %.1f s", priv->frames, seconds);

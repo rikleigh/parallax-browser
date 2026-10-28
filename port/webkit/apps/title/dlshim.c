@@ -63,3 +63,37 @@ void* __wrap_dlsym(void* handle, const char* symbol)
         return (void*)lookupProc(symbol); /* extensions, or NULL */
     return (void*)lookupProc(symbol);
 }
+
+/* Strong references to the SCE functions the PS5 platform declares weak
+ * (PS5Sce.h, weak so the payload links without these stubs). With only weak
+ * references the title's imports came out NULL at run time ("pad:
+ * libScePad/libSceUserService not linked" at the first launch). */
+extern int sceUserServiceInitialize(const void*);
+extern int sceUserServiceGetInitialUser(int*);
+extern int scePadInit(void);
+extern int scePadOpen(int, int, int, const void*);
+extern int scePadClose(int);
+extern int scePadReadState(int, void*);
+extern int sceImeDialogInit(const void*, const void*);
+extern int sceImeDialogGetStatus(void);
+extern int sceImeDialogGetResult(void*);
+extern int sceImeDialogTerm(void);
+extern int sceImeDialogAbort(void);
+__attribute__((used)) void* const ps5wk_title_sce_imports[] = {
+    (void*)sceUserServiceInitialize, (void*)sceUserServiceGetInitialUser,
+    (void*)scePadInit, (void*)scePadOpen, (void*)scePadClose, (void*)scePadReadState,
+    (void*)sceImeDialogInit, (void*)sceImeDialogGetStatus, (void*)sceImeDialogGetResult,
+    (void*)sceImeDialogTerm, (void*)sceImeDialogAbort,
+};
+
+/* The title's flexible memory is small (~250-420 MB), and ps5-opengl's libc
+ * heap takes 256 MB of it. libpas's own mappings then failed
+ * (pas_bootstrap_free_heap_allocate_with_alignment -> SIGILL in
+ * webkit_settings_new, 2026-10-28). The UIProcess is light: send bmalloc to
+ * the system heap (bmalloc's "Malloc" environment switch), before any static
+ * initializer allocates. The payloads keep libpas. */
+#include <stdlib.h>
+__attribute__((constructor(101))) static void ps5wkUseSystemMalloc(void)
+{
+    setenv("Malloc", "1", 1);
+}

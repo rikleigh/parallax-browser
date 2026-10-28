@@ -268,5 +268,67 @@ void PS5Renderer::present(bool pointerVisible, double pointerX, double pointerY)
         glDisable(GL_BLEND);
     }
 
+    if (m_capturePath)
+        writeCapture();
+
     eglSwapBuffers(m_eglDisplay, m_eglSurface);
+}
+
+void PS5Renderer::requestCapture(const char* path)
+{
+    g_free(m_capturePath);
+    m_capturePath = g_strdup(path);
+}
+
+void PS5Renderer::writeCapture()
+{
+    char* path = m_capturePath;
+    m_capturePath = nullptr;
+    const int w = m_width, h = m_height;
+    const int ow = w / 2, oh = h / 2;
+    gint64 start = g_get_monotonic_time();
+    auto* rgba = static_cast<uint8_t*>(g_try_malloc(static_cast<size_t>(w) * h * 4));
+    auto* rgb = static_cast<uint8_t*>(g_try_malloc(static_cast<size_t>(ow) * oh * 3));
+    if (!rgba || !rgb) {
+        g_message("[wpe-ps5] capture %s: out of memory", path);
+        g_free(rgba);
+        g_free(rgb);
+        g_free(path);
+        return;
+    }
+    glFinish();
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    GLenum glError = glGetError();
+    // GL rows are bottom-up: output row y comes from GL rows h-2y-1 and h-2y-2.
+    uint64_t sum = 0;
+    unsigned nonBlack = 0;
+    for (int y = 0; y < oh; y++) {
+        const uint8_t* r0 = rgba + static_cast<size_t>(h - 2 * y - 1) * w * 4;
+        const uint8_t* r1 = rgba + static_cast<size_t>(h - 2 * y - 2) * w * 4;
+        uint8_t* out = rgb + static_cast<size_t>(y) * ow * 3;
+        for (int x = 0; x < ow; x++) {
+            for (int c = 0; c < 3; c++) {
+                unsigned v = r0[8 * x + c] + r0[8 * x + 4 + c] + r1[8 * x + c] + r1[8 * x + 4 + c];
+                out[3 * x + c] = static_cast<uint8_t>((v + 2) / 4);
+                sum += out[3 * x + c];
+            }
+            if (out[3 * x] | out[3 * x + 1] | out[3 * x + 2])
+                nonBlack++;
+        }
+    }
+    FILE* file = fopen(path, "wb");
+    bool ok = false;
+    if (file) {
+        fprintf(file, "P6\n%d %d\n255\n", ow, oh);
+        ok = fwrite(rgb, 1, static_cast<size_t>(ow) * oh * 3, file) == static_cast<size_t>(ow) * oh * 3;
+        ok = !fclose(file) && ok;
+    }
+    g_message("[wpe-ps5] SHOT %s %dx%d %s (gl error 0x%x, mean %.1f, %.1f%% non-black, %.0f ms)", path, ow, oh,
+        ok ? "written" : "FAILED", glError, static_cast<double>(sum) / (static_cast<double>(ow) * oh * 3),
+        100.0 * nonBlack / (static_cast<double>(ow) * oh), (g_get_monotonic_time() - start) / 1000.0);
+    g_free(rgba);
+    g_free(rgb);
+    g_free(path);
 }

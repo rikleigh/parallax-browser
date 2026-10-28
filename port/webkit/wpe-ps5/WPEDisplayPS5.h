@@ -58,6 +58,11 @@ WPE_API void        wpe_display_ps5_set_log_sink  (WPEDisplayPS5 *display,
                                                    const char    *host,
                                                    int            port);
 
+/* Debug: the next frame on the TV is read back, halved (960x540 for
+ * 1080p), and written to @path as a binary PPM; logs "[wpe-ps5] SHOT ...". */
+WPE_API void        wpe_display_ps5_capture_screen (WPEDisplayPS5 *display,
+                                                    const char    *path);
+
 G_END_DECLS
 
 #endif /* WPEDisplayPS5_h */

@@ -579,3 +579,11 @@ void wpe_display_ps5_set_log_sink(WPEDisplayPS5* display, const char* host, int 
     display->priv->logHost = host ? host : "";
     display->priv->logPort = port;
 }
+
+void wpe_display_ps5_capture_screen(WPEDisplayPS5* display, const char* path)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    g_return_if_fail(path);
+    PS5Renderer::singleton().requestCapture(path);
+    wpeDisplayPS5ScheduleRedraw(display);
+}

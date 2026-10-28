@@ -19,7 +19,11 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/title.h"
 
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/filio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <wpe/ps5/wpe-ps5.h>
@@ -36,6 +40,21 @@
 #endif
 
 void g_io_openssl_load(void*);
+
+/* titlemem.c, linked into the title only (the payload-style build of this
+ * file has no direct-memory heap): weak, NULL there. */
+void ps5wk_title_mem_log(const char* milestone) __attribute__((weak));
+size_t ps5wk_title_flexible_free(void) __attribute__((weak));
+unsigned ps5wk_title_check_imports(char* out, size_t size, unsigned* total) __attribute__((weak));
+static double flexibleMB(void)
+{
+    return ps5wk_title_flexible_free ? ps5wk_title_flexible_free() / 1048576.0 : -1.0;
+}
+static void memLog(const char* milestone)
+{
+    if (ps5wk_title_mem_log)
+        ps5wk_title_mem_log(milestone);
+}
 
 static WebKitWebView* webView;
 static WPEDisplay* display;
@@ -109,13 +128,124 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
     }
 }
 
+/* Debug screen readback: /data/ps5webkit/debug-screenshot (a file, any
+ * content) or PS5WK_SCREENSHOT=1. Frames go to /data/ps5webkit/shots as PPM
+ * (port/webkit/test/fetch-shots.sh fetches and converts them). */
+#define SHOT_DIR "/data/ps5webkit/shots"
+static gboolean screenshots;
+static unsigned shotCount;
+
+static void captureScreen(const char* name)
+{
+    if (!screenshots)
+        return;
+    char path[256];
+    snprintf(path, sizeof path, SHOT_DIR "/%02u-%s.ppm", ++shotCount, name);
+    wpe_display_ps5_capture_screen(WPE_DISPLAY_PS5(display), path);
+}
+
+/* Test URL list: /data/ps5webkit/test-urls.txt, one URL per line (# comments).
+ * Each is loaded in turn; after it finishes: a screenshot at +2 s and +10 s,
+ * load time and memory in the log, then the next one at +12 s. */
+static char** testURLs;
+static unsigned testURLCount, testURLIndex, testURLsLoaded;
+static gint64 loadStart;
+static guint testTimer;
+static gboolean testWaitingForLoad;
+
+static void loadNextTestURL(void);
+
+static gboolean testTimeout(gpointer data)
+{
+    (void)data;
+    testTimer = 0;
+    if (testWaitingForLoad) {
+        SPIKE_FAIL("url", "%u/%u %s: not finished after 60 s", testURLIndex, testURLCount, testURLs[testURLIndex - 1]);
+        captureScreen("timeout");
+        memLog("url timeout");
+        testWaitingForLoad = FALSE;
+    }
+    loadNextTestURL();
+    return G_SOURCE_REMOVE;
+}
+
+static void loadNextTestURL(void)
+{
+    if (testURLIndex >= testURLCount) {
+        SPIKE_RESULT("urls", testURLsLoaded == testURLCount ? "PASS" : "FAIL", "%u of %u test URLs loaded", testURLsLoaded, testURLCount);
+        memLog("test URLs done");
+        return;
+    }
+    const char* uri = testURLs[testURLIndex++];
+    spike_log("test URL %u/%u: %s", testURLIndex, testURLCount, uri);
+    testWaitingForLoad = TRUE;
+    loadStart = g_get_monotonic_time();
+    webkit_web_view_load_uri(webView, uri);
+    testTimer = g_timeout_add_seconds(60, testTimeout, NULL);
+}
+
+static gboolean shotAfterLoad(gpointer data)
+{
+    captureScreen((const char*)data);
+    return G_SOURCE_REMOVE;
+}
+
+static void testURLFinished(gboolean ok, const char* uri, const char* detail)
+{
+    if (!testWaitingForLoad)
+        return;
+    testWaitingForLoad = FALSE;
+    if (testTimer)
+        g_source_remove(testTimer);
+    double seconds = (g_get_monotonic_time() - loadStart) / 1e6;
+    if (ok)
+        testURLsLoaded++;
+    SPIKE_RESULT("url", ok ? "PASS" : "FAIL", "%u/%u %s %s in %.1f s: %s; flexible %.1f MB", testURLIndex, testURLCount,
+        uri, ok ? "loaded" : "failed", seconds, detail, flexibleMB());
+    char milestone[64];
+    snprintf(milestone, sizeof milestone, "after test URL %u", testURLIndex);
+    memLog(milestone);
+    g_timeout_add(2000, shotAfterLoad, (gpointer) "loaded");
+    g_timeout_add(10000, shotAfterLoad, (gpointer) "loaded-10s");
+    testTimer = g_timeout_add(12000, testTimeout, NULL);
+}
+
+static gboolean readTestURLs(void)
+{
+    gchar* contents = NULL;
+    if (!g_file_get_contents("/data/ps5webkit/test-urls.txt", &contents, NULL, NULL))
+        return FALSE;
+    GPtrArray* list = g_ptr_array_new();
+    char** lines = g_strsplit(contents, "\n", -1);
+    for (char** line = lines; *line; line++) {
+        g_strstrip(*line);
+        if (**line && **line != '#')
+            g_ptr_array_add(list, g_strdup(*line));
+    }
+    g_strfreev(lines);
+    g_free(contents);
+    testURLCount = list->len;
+    g_ptr_array_add(list, NULL);
+    testURLs = (char**)g_ptr_array_free(list, FALSE);
+    spike_log("test URL list: %u URLs", testURLCount);
+    return testURLCount > 0;
+}
+
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
-    if (event == WEBKIT_LOAD_FINISHED)
-        SPIKE_PASS("load", "%s \"%s\"", webkit_web_view_get_uri(view), webkit_web_view_get_title(view) ? webkit_web_view_get_title(view) : "");
+    if (event == WEBKIT_LOAD_FINISHED) {
+        const char* title = webkit_web_view_get_title(view) ? webkit_web_view_get_title(view) : "";
+        SPIKE_PASS("load", "%s \"%s\" (%.1f s after start)", webkit_web_view_get_uri(view), title, (g_get_monotonic_time() - loadStart) / 1e6);
+        memLog("load finished");
+        if (!testURLs)
+            g_timeout_add(2000, shotAfterLoad, (gpointer) "loaded");
+        char detail[300];
+        snprintf(detail, sizeof detail, "title \"%s\"", title);
+        testURLFinished(TRUE, webkit_web_view_get_uri(view), detail);
+    }
 }
 
 static gboolean onLoadFailed(WebKitWebView* view, WebKitLoadEvent event, const char* uri, GError* error, gpointer data)
@@ -124,7 +254,15 @@ static gboolean onLoadFailed(WebKitWebView* view, WebKitLoadEvent event, const c
     (void)event;
     (void)data;
     SPIKE_FAIL("load", "%s: %s", uri, error->message);
+    testURLFinished(FALSE, uri, error->message);
     return FALSE;
+}
+
+static gboolean memTimer(gpointer data)
+{
+    (void)data;
+    memLog("every 60 s");
+    return G_SOURCE_CONTINUE;
 }
 
 static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminationReason reason, gpointer data)
@@ -146,9 +284,81 @@ static char* homeURL(void)
     return g_strdup(PS5WK_HOME_URL);
 }
 
+/* Titles differ from payloads in which socket calls work (Spike 8): log
+ * what WebKit's IPC needs (socketpair types, close-on-exec, pipe2). */
+int __real_fcntl(int, int, ...) __attribute__((weak));
+static void probeSockets(void)
+{
+    if (!__real_fcntl)
+        return;
+    static const struct { int type; const char* name; } types[] = {
+        { SOCK_STREAM, "stream" }, { SOCK_SEQPACKET, "seqpacket" }, { SOCK_DGRAM, "dgram" },
+    };
+    char line[1024];
+    int n = 0;
+    for (unsigned i = 0; i < sizeof types / sizeof types[0]; i++) {
+        int fds[2] = { -1, -1 };
+        errno = 0;
+        int rc = socketpair(AF_UNIX, types[i].type, 0, fds);
+        int err = errno;
+        int cloexec = -2;
+        if (!rc) {
+            int fl = __real_fcntl(fds[0], F_GETFL);
+            int fle = errno;
+            int sfl = __real_fcntl(fds[0], F_SETFL, O_NONBLOCK | (fl > 0 ? fl : 0));
+            int sfle = errno;
+            int one = 1;
+            int nb = ioctl(fds[1], FIONBIO, &one);
+            char byte;
+            errno = 0;
+            int dw = (int)recv(fds[1], &byte, 1, MSG_DONTWAIT);
+            n += snprintf(line + n, sizeof line - n, "[recv MSG_DONTWAIT on empty: %d/%d] ", dw, errno);
+            n += snprintf(line + n, sizeof line - n, "[%s: F_GETFL %d/%d F_SETFL %d/%d FIONBIO %d] ", types[i].name, fl, fle, sfl, sfle, nb);
+            cloexec = fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+            close(fds[0]);
+            close(fds[1]);
+        }
+        n += snprintf(line + n, sizeof line - n, "socketpair %s rc %d errno %d (F_SETFD %d); ", types[i].name, rc, err, cloexec);
+    }
+    int p[2];
+    errno = 0;
+    int rc = pipe(p);
+    n += snprintf(line + n, sizeof line - n, "pipe rc %d errno %d", rc, errno);
+    spike_log("probe: %s", line);
+    if (!rc) {
+        n = 0;
+#define PROBE(expr) do { errno = 0; int r_ = (expr); n += snprintf(line + n, sizeof line - n, "%s = %d (errno %d); ", #expr, r_, errno); } while (0)
+        PROBE(fcntl(p[0], F_GETFD));
+        PROBE(fcntl(p[0], F_SETFD, FD_CLOEXEC));
+        PROBE(fcntl(p[0], F_GETFL));
+        PROBE(fcntl(p[0], F_SETFL, O_NONBLOCK));
+        PROBE(fcntl(p[0], F_GETFL));
+        int one = 1;
+        PROBE(ioctl(p[1], FIONBIO, &one));
+        int d = fcntl(p[0], F_DUPFD, 3);
+        n += snprintf(line + n, sizeof line - n, "F_DUPFD -> %d; ", d);
+        if (d >= 0)
+            close(d);
+        close(p[0]);
+        close(p[1]);
+        int q[2];
+        PROBE(d = dup(q[0] = 0));
+        if (d > 0)
+            close(d);
+        PROBE(pipe2(q, O_CLOEXEC));
+        if (!pipe2(q, O_NONBLOCK)) {
+            close(q[0]);
+            close(q[1]);
+        }
+#undef PROBE
+        spike_log("probe: %s", line);
+    }
+}
+
 int main(void)
 {
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
+    loadStart = g_get_monotonic_time();
     signal(SIGPIPE, SIG_IGN);
     // WebKit, GLib and the child payloads (relayed) log to stderr.
     if (spike_log_fd >= 0)
@@ -158,6 +368,14 @@ int main(void)
     spike_log("ps5browser: WPE WebKit %u.%u.%u, pid %d", webkit_get_major_version(), webkit_get_minor_version(),
         webkit_get_micro_version(), (int)getpid());
     spike_notify("ps5webkit browser starting");
+    memLog("main");
+    if (ps5wk_title_check_imports) {
+        static char names[1024];
+        unsigned total = 0;
+        unsigned missing = ps5wk_title_check_imports(names, sizeof names, &total);
+        spike_log("imports: %u of %u NULL%s%s", missing, total, missing ? ": " : "", names);
+    }
+    probeSockets();
 
     mkdir("/data/ps5webkit", 0777);
     mkdir("/data/ps5webkit/home", 0777);
@@ -168,6 +386,25 @@ int main(void)
     setenv("GSETTINGS_BACKEND", "memory", 0);
     g_io_openssl_load(NULL);
 
+    /* open(), not access(): access() said no for an existing file here. */
+    int flag = open("/data/ps5webkit/debug-screenshot", O_RDONLY);
+    if (flag >= 0)
+        close(flag);
+    screenshots = flag >= 0 || g_getenv("PS5WK_SCREENSHOT");
+    if (screenshots) {
+        mkdir(SHOT_DIR, 0777);
+        GDir* dir = g_dir_open(SHOT_DIR, 0, NULL);
+        for (const char* name; dir && (name = g_dir_read_name(dir));) {
+            char* path = g_build_filename(SHOT_DIR, name, NULL);
+            unlink(path);
+            g_free(path);
+        }
+        if (dir)
+            g_dir_close(dir);
+        setenv("PS5WK_SCREENSHOT_DIR", SHOT_DIR, 1);
+        spike_log("debug screenshots on: %s", SHOT_DIR);
+    }
+
     GError* error = NULL;
     display = wpe_display_ps5_new();
     wpe_display_ps5_set_child_elf(WPE_DISPLAY_PS5(display), "/app0/ps5wk-child.elf");
@@ -177,6 +414,7 @@ int main(void)
     }
     wpe_display_set_primary(display);
     SPIKE_PASS("display", "PS5 display connected");
+    memLog("display connected");
 
     WebKitSettings* settings = webkit_settings_new_with_settings(
         "enable-spatial-navigation", TRUE,
@@ -194,10 +432,18 @@ int main(void)
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
 
-    char* home = homeURL();
-    spike_log("loading %s", home);
-    webkit_web_view_load_uri(webView, home);
-    g_free(home);
+    memLog("web view created");
+    g_timeout_add_seconds(60, memTimer, NULL);
+
+    if (readTestURLs()) {
+        loadNextTestURL();
+    } else {
+        char* home = homeURL();
+        spike_log("loading %s", home);
+        loadStart = g_get_monotonic_time();
+        webkit_web_view_load_uri(webView, home);
+        g_free(home);
+    }
 
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);

@@ -47,7 +47,18 @@ TF=(-fno-plt -fno-stack-protector -ffunction-sections -fdata-sections)
 prospero-clang++ -std=c++20 -O2 -fno-exceptions -fno-rtti "${TF[@]}" -c "$NATIVE/app_crt.cpp" -o "$W/obj/app_crt.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchReturnFromMain -Dmkstemps=ps5_opengl_mkstemps \
     -c "$PSGL/runtime_shims.c" -o "$W/obj/runtime_shims.o"
-prospero-clang -std=c11 -O2 "${TF[@]}" -c "$PSGL/app_heap.c" -o "$W/obj/app_heap.o"
+# The heap: Spike 10's dheap.c (dlmalloc over direct memory) instead of
+# ps5-opengl's app_heap.c, plus titlemem.c (anonymous mmaps and thread stacks
+# in direct memory, memory report).
+rm -f "$W/obj/app_heap.o"
+D10="$ROOT/spikes/10-title-dmem"
+prospero-clang -std=gnu11 -O2 "${TF[@]}" -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
+# libc.a without syscalls.o (raw syscalls: illegal in a title, and they
+# override libkernel's exports); titlesys.c defines what libkernel lacks.
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlesys.c" -o "$W/obj/titlesys.o"
+cp "$SYS/lib/libc.a" "$W/libc-title.a"
+/opt/homebrew/opt/llvm@18/bin/llvm-ar d "$W/libc-title.a" syscalls.o
 /opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |
     awk '$2 == "T" && $3 ~ /^egl[A-Z]/ { print "EGL_SYMBOL(" $3 ")" }' | sort -u > "$W/obj/egl_symbols.inc"
 prospero-clang -std=c11 -O2 "${TF[@]}" -I"$W/obj" -c "$HERE/dlshim.c" -o "$W/obj/dlshim.o"
@@ -73,21 +84,29 @@ sdk_stubs=("$SYS/lib/libkernel.so")
 for so in $(LC_ALL=C ls "$SYS"/lib/*.so); do
     case $(basename "$so") in
         libSceAgc.so|libSceAgcDriver.so|libkernel.so|libkernel_sys.so) continue ;;
+        # Sony's WebKit support library: its stub exports __wrap_readlink,
+        # __wrap_link, __wrap_symlink and __wrap_mmap, which won over
+        # libps5compat's (left NULL at run time: SIGSEGV at address 0).
+        libScePosixForWebKit.so) continue ;;
     esac
     sdk_stubs+=("$so")
 done
 title_link() {
     "$LLD" -T "$HERE/ps5-pie-webkit.ld" --eh-frame-hdr -z nodynamic-undefined-weak \
         --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=posix_memalign \
-        --wrap=malloc_usable_size --wrap=dlopen --wrap=dlsym --wrap=fcntl \
+        --wrap=aligned_alloc --wrap=memalign --wrap=malloc_usable_size \
+        --wrap=mmap --wrap=munmap --wrap=madvise \
+        --wrap=pthread_create --wrap=pthread_join --wrap=pthread_exit \
+        --wrap=dlopen --wrap=dlsym --wrap=fcntl --wrap=pipe2 --wrap=dup \
+        --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close \
         --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
-        --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" "$@" \
+        --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" ${TITLE_LDFLAGS:-} "$@" \
         "$W"/obj/*.o "${inputs[@]}" "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
         --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
         "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
         "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
         "$SYS/lib/libScePad.so" "$SYS/lib/libSceImeDialog.so" "$SYS/lib/libSceUserService.so" \
-        --as-needed "${sdk_stubs[@]}" --start-group "$SYS/lib/libc.a" --end-group \
+        --as-needed "${sdk_stubs[@]}" --start-group "$W/libc-title.a" --end-group \
         2> "$W/link.log" || {
             { grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -60; } || true
             grep -E "duplicate symbol" -A3 "$W/link.log" | head -30 || true
@@ -103,12 +122,21 @@ for so in "${sdk_stubs[@]}" "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDri
 done | sort -u > "$W/stub-symbols.txt"
 defsyms=()
 for sym in $(/opt/homebrew/opt/llvm@18/bin/llvm-readelf --dyn-syms "$W/llvm-pie.elf" | awk '$7 == "UND" && $5 == "WEAK" { print $8 }'); do
+    [[ $sym == ps5wk_title_check_imports ]] && continue # importcheck.o, second link
     grep -qx "$sym" "$W/stub-symbols.txt" || defsyms+=("--defsym=$sym=0")
 done
-if (( ${#defsyms[@]} )); then
-    echo "weak symbols set to null: ${defsyms[*]#--defsym=}"
-    title_link "${defsyms[@]}"
-fi
+(( ${#defsyms[@]} )) && echo "weak symbols set to null: ${defsyms[*]#--defsym=}"
+# Every imported function, for the NULL-import check at start (importcheck.c).
+/opt/homebrew/opt/llvm@18/bin/llvm-readelf --dyn-syms "$W/llvm-pie.elf" |
+    awk '$7 == "UND" && $4 == "FUNC" && $5 == "GLOBAL" { sub(/@.*/, "", $8); print $8 }' |
+    grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u | sed 's/.*/IMPORT(&)/' > "$W/imports.inc"
+echo "imports: $(wc -l < "$W/imports.inc") functions"
+prospero-clang -std=c11 -O2 "${TF[@]}" -fno-builtin -Wno-incompatible-library-redeclaration -I"$W" \
+    -c "$HERE/importcheck.c" -o "$W/importcheck.o"
+title_link "${defsyms[@]}" "$W/importcheck.o"
+
+# Symbols for crash triage (kernel-log rips minus the 0x400000 load base).
+cp "$W/llvm-pie.elf" "$OUT/ps5browser-symbols.elf"
 
 # 4. Convert, fake-sign, assemble the folder title.
 "$TOOL" link --in "$W/llvm-pie.elf" --out "$W/eboot.elf" --stub-dir "$SYS/lib" \
