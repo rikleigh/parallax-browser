@@ -1,16 +1,20 @@
 # WPE WebKit dependencies for PS5 payloads
 
-Static libraries for WPE WebKit (Milestone 1: browsing, no media), cross-built
-with ps5-payload-sdk into **`toolchain/wpe-sysroot`**. Package list, versions
+Static libraries for WPE WebKit, cross-built with ps5-payload-sdk into
+**`toolchain/wpe-sysroot`**: Milestone 1 (browsing, no media) and
+Milestone 2 (GStreamer, [below](#milestone-2-gstreamer)). Package list, versions
 and state: [STATUS.md](STATUS.md).
 
 ```sh
 port/deps/build.sh               # every step, in order (4.5 min from scratch on the M4 Max)
 port/deps/build.sh --list        # step names
 port/deps/build.sh glib libsoup  # single steps
+port/deps/build.sh m2            # Milestone 2: dav1d, FFmpeg, GStreamer (~4 min)
+port/deps/build.sh all           # both
 KEEP=1 port/deps/build.sh glib   # keep toolchain/wpe-deps/{src,build}/glib for debugging
 port/deps/smoke/build.sh         # console smoke test payload
 port/deps/smoke/upload-runtime.sh && port/deps/smoke/run.sh
+port/deps/smoke/build.sh gst && port/deps/smoke/run.sh toolchain/wpe-deps/build/smoke/gstsmoke.elf
 ```
 
 Each step downloads a pinned tarball into `toolchain/wpe-deps/dl` (sha256
@@ -199,6 +203,72 @@ Things a consumer must know:
 - `getaddrinfo`, TCP sockets, `poll`, pthreads, `realpath` and OpenSSL's
   default entropy source (`RAND_bytes`) work in payloads.
 
+## Milestone 2: GStreamer
+
+`build.sh m2` adds dav1d 1.5.1, FFmpeg 7.1.1 (decoders only) and GStreamer
+1.28.8 (core, -base, -good, -bad, gst-libav), all static.
+
+**Use it from WebKit with `-DUSE_GSTREAMER_FULL=ON -DUSE_GSTREAMER_GL=OFF`.**
+
+- `lib/libgstreamer-full-1.0.a` is one archive with every GStreamer library,
+  the plugins below, FFmpeg + dav1d, and `gst_init_static_plugins()`
+  ([gst/gststaticplugins.c](gst/gststaticplugins.c)). It is what upstream's
+  gstreamer-full produces, and what `USE_GSTREAMER_FULL` links
+  (`GSTREAMER_FULL_LIBRARIES`) without needing any WebKit change.
+- libgstreamer is built with `gstreamer-static-full`, so **`gst_init()`
+  itself calls `gst_init_static_plugins()`**: no registration code in WebKit,
+  no plugin directories, no registry file (`registry=false`). A consequence:
+  `libgstreamer-1.0.a` alone does not link without the full archive (the
+  symbol lives there).
+- Remaining link dependencies (`pkg-config-ps5 --libs gstreamer-full-1.0`):
+  glib/gio/gobject/gmodule, libsoup-3.0, libxml2, OpenSSL, zlib, which WebKit
+  links anyway.
+- `USE_GSTREAMER_GL` must be OFF: gst-plugins-base is built without GL (no
+  `gstreamer-gl-1.0`; payloads have no GL). Without `USE_GSTREAMER_FULL`,
+  `GStreamerChecks.cmake` would also demand `gstreamer-gl-1.0` and
+  `gstreamer-mpegts-1.0` as find_package components.
+- `ENABLE_MEDIA_RECORDER`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`: OFF (no
+  encoders are built).
+
+Plugins registered (`gst-inspect` names in brackets):
+
+| module | plugins |
+| --- | --- |
+| core | coreelements [queue, queue2, multiqueue, typefind, tee, identity, fakesink, capsfilter, ...] |
+| -base | app [appsrc, appsink], playback [playbin3, decodebin3, parsebin, uridecodebin3, urisourcebin], typefindfunctions, audioconvert, audioresample, videoconvertscale, volume, pbtypes, rawparse, subparse, gio |
+| -good | isomp4 [qtdemux], matroska [matroskademux], audioparsers [aacparse, mpegaudioparse, ...], adaptivedemux2 [hlsdemux2, dashdemux2, mssdemux2], id3demux, apetag, icydemux, wavparse |
+| -bad | videoparsersbad [h264parse, h265parse, vp9parse, av1parse, ...], mpegtsdemux [tsdemux], mpegpsdemux, id3tag |
+| gst-libav | avdec_h264, avdec_h265, avdec_vp8, avdec_vp9, avdec_libdav1d (AV1), avdec_aac, avdec_opus, avdec_mp3, avdec_flac, ... |
+
+Not registered: `soup` (souphttpsrc; it is built because adaptivedemux2
+needs it, but WebKit fetches media through its own webkitwebsrc). Not built:
+GL, mse (WebKit has its own MSE), encoders, ALSA/pulse sinks (audio output is
+the PS5 backend's job), orc. adaptivedemux2 links libsoup and uses OpenSSL
+for HLS AES-128.
+
+FFmpeg configuration: `--disable-everything` plus decoders aac, aac_fixed,
+aac_latm, mp3, mp3float, opus, vorbis, flac, pcm_s16le/f32le, h264, hevc,
+vp8, vp9, libdav1d; matching parsers; avfilter (buffer/format/yadif/scale)
+and swresample. No demuxers, protocols, encoders or network.
+
+Notes for the WebKit side:
+
+- Frame-threaded decoding works when each stream has its own streaming
+  thread (a queue/multiqueue after the demuxer, as WebKit's pipelines have).
+  Spike 9 found throughput collapses above 8 decoder threads on the PS5; set
+  `max-threads=8` on avdec_* (auto picks 16 there).
+- The hardware decoder element (libSceVideodec2) and the hole-punch sink
+  are not here; they are port work.
+- gst-libav normally refuses `lib*` decoders. Our patch keeps
+  `avdec_libdav1d` (FFmpeg's native AV1 decoder needs a hwaccel, and
+  GStreamer's dav1ddec is in gst-plugins-rs) and fixes non-direct-rendering
+  output so its frames are not dropped.
+
+Smoke test (`smoke/gstsmoke.c`, `smoke/results/*-gst-all-pass.log`):
+`gst_init`, 40 element factories, MP4 (H.264 + AAC) and WebM (VP9 + Opus)
+demuxed from memory through appsrc, then each stream decoded (H.264, AAC,
+VP9, Opus, AV1). 9/9 PASS on the console.
+
 ## Console runtime tree
 
 `share/ps5webkit-runtime` is copied to **`/data/ps5webkit/`** by
@@ -221,6 +291,7 @@ About 49 MB. Fonts are fetched by the `fonts` step (not committed).
 | `libffi/0001-ps5-no-ms_abi.patch` | clang rejects `__attribute__((ms_abi))` for x86_64-sie-ps5; the Win64 ABIs are rejected at `ffi_prep_cif` instead |
 | `glib/0001-ps5-configure-memalign-ppoll.patch` | don't use `memalign` (needs the `#error` `<malloc.h>`); don't use `ppoll` on PS5 (broken in libkernel, see above) |
 | `glib/0002-unix-fd-query-path-no-F_KINFO.patch` | SDK headers lack `F_KINFO`; fall back to "not supported" |
+| `gst-libav/0001-keep-avdec_libdav1d.patch` | register avdec_libdav1d (only AV1 decoder here), and don't drop frames from decoders without direct rendering (they stayed DECODE_ONLY) |
 
 ## Licenses
 
@@ -256,6 +327,9 @@ About 49 MB. Fonts are fetched by the `fonts` step (not committed).
 | lcms2 | MIT (the GPL-3 fastfloat/threaded plugins are not built) |
 | Mozilla CA bundle | MPL-2.0 |
 | Noto fonts | OFL-1.1 |
+| dav1d | BSD-2-Clause |
+| FFmpeg (as configured: no GPL/nonfree parts) | LGPL-2.1-or-later |
+| GStreamer core, -base, -good, -bad, gst-libav | LGPL-2.1-or-later (-bad built with `gpl=disabled`) |
 
 The LGPL libraries are linked statically into GPL-3 payloads (the SDK is
 GPL-3), which LGPL allows; publishing the full source, as FEASIBILITY.md §6
@@ -272,3 +346,4 @@ plans, covers the relinking requirement.
 - **Noto Color Emoji**: the file's path in googlefonts/noto-emoji moved;
   add it to `FONTS` in build.sh when needed (~10 MB, CBDT).
 - zstd for libsoup (optional content coding), gssapi/NTLM, libproxy.
+- GStreamer: GL, encoders, audio sinks, the mse plugin, gst-plugins-rs.

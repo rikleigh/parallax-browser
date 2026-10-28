@@ -586,6 +586,167 @@ step_lcms2() {
     fix_sysroot; cleanup lcms2
 }
 
+# ======================================================= Milestone 2: media
+# GStreamer, static, plugins registered at gst_init() (gst-full style), with
+# gst-libav on our own FFmpeg (audio + video decoders) and dav1d.
+
+step_dav1d() {
+    log "dav1d 1.5.1 (AV1, x86-64 asm)"
+    fetch https://downloads.videolan.org/pub/videolan/dav1d/1.5.1/dav1d-1.5.1.tar.xz \
+        401813f1f89fa8fd4295805aa5284d9aed9bc7fc1fdbe554af4292f64cbabe21
+    unpack dav1d "$FETCHED"
+    meson_pkg dav1d -Denable_tools=false -Denable_tests=false -Denable_asm=true -Denable_examples=false
+    fix_sysroot; cleanup dav1d
+}
+
+step_ffmpeg() {
+    log "FFmpeg 7.1.1 (decoders for gst-libav: AAC, MP3, Opus, Vorbis, FLAC, H.264, HEVC, VP8, VP9, AV1 via dav1d)"
+    fetch https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz \
+        733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+    unpack ffmpeg "$FETCHED"
+    ( cd "$BLD"
+      "$SRC/configure" --prefix="$SYSROOT" --enable-cross-compile --cross-prefix="$SDK/bin/prospero-" \
+        --cc="$SDK/bin/prospero-clang" --cxx="$SDK/bin/prospero-clang++" \
+        --ar="$SDK/bin/prospero-ar" --ranlib="$SDK/bin/prospero-ranlib" --nm="$SDK/bin/prospero-nm" \
+        --strip="$SDK/bin/prospero-strip" --pkg-config="$PKGCONF" --pkg-config-flags=--static \
+        --arch=x86_64 --target-os=freebsd --enable-static --disable-shared --enable-pic \
+        --disable-everything --disable-programs --disable-doc --disable-debug --disable-network \
+        --disable-avdevice --disable-swscale --disable-autodetect --enable-pthreads \
+        --enable-avfilter --enable-swresample --enable-libdav1d \
+        --enable-decoder=aac,aac_fixed,aac_latm,mp3,mp3float,opus,vorbis,flac,pcm_s16le,pcm_f32le,h264,hevc,vp8,vp9,libdav1d \
+        --enable-parser=aac,aac_latm,mpegaudio,opus,vorbis,flac,h264,hevc,vp8,vp9,av1 \
+        --enable-filter=buffer,buffersink,abuffer,abuffersink,format,aformat,yadif,scale \
+        --extra-cflags="$CFLAGS_COMMON -I$SYSROOT/include" --extra-ldflags="-L$SYSROOT/lib" \
+        >"$W/build/ffmpeg.configure.log" 2>&1 || { tail -20 "$W/build/ffmpeg.configure.log"; exit 1; }
+      make -j"$JOBS" >"$W/build/ffmpeg.build.log" 2>&1 || { grep -E 'error' "$W/build/ffmpeg.build.log" | head -30; exit 1; }
+      make install >/dev/null ) || die "ffmpeg failed"
+    rm -rf "$SYSROOT/share/ffmpeg"
+    fix_sysroot; cleanup ffmpeg
+}
+
+GST_VER=1.28.8
+GST_COMMON=(-Dauto_features=disabled -Dtests=disabled -Ddoc=disabled -Dglib_debug=disabled)
+
+step_gstreamer() {
+    log "GStreamer $GST_VER core (static, gstreamer-static-full: gst_init() calls gst_init_static_plugins())"
+    fetch https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-$GST_VER.tar.xz \
+        baa8e86985ad6417cc0ad6e7b79ff2884c6779c8b1c7a6240e7121822c86e524
+    unpack gstreamer "$FETCHED"
+    meson_pkg gstreamer "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dintrospection=disabled -Dgstreamer-static-full=true -Dtools=disabled \
+        -Dbenchmarks=disabled -Dcheck=disabled -Dlibunwind=disabled -Dlibdw=disabled \
+        -Ddbghelp=disabled -Dbash-completion=disabled -Dptp-helper=disabled -Dcoretracers=disabled \
+        -Dgst_debug=true -Dregistry=false -Doption-parsing=true
+    fix_sysroot; cleanup gstreamer
+}
+
+step_gst_plugins_base() {
+    log "gst-plugins-base $GST_VER (app, audio, video, pbutils, tag, fft; playback, typefind, converters; GL off)"
+    fetch https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-$GST_VER.tar.xz \
+        ade70e3381fcbb024f1f20aa9ede9b5654aeed39d5bd70b1a98f53015e501117
+    unpack gst-plugins-base "$FETCHED"
+    meson_pkg gst-plugins-base "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dintrospection=disabled -Dtools=disabled -Dorc=disabled -Dgl=disabled \
+        -Dapp=enabled -Daudioconvert=enabled -Daudioresample=enabled -Dtypefind=enabled \
+        -Dplayback=enabled -Dvideoconvertscale=enabled -Dvolume=enabled -Dpbtypes=enabled \
+        -Drawparse=enabled -Dsubparse=enabled -Dgio=enabled -Dgio-typefinder=enabled
+    fix_sysroot; cleanup gst-plugins-base
+}
+
+step_gst_plugins_good() {
+    log "gst-plugins-good $GST_VER (isomp4, matroska, audioparsers, id3demux, adaptivedemux2 HLS/DASH)"
+    fetch https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-$GST_VER.tar.xz \
+        a7670ed900d3d03be744d25c1873b239896e9a82ce6d17f8febc6fffbaee9521
+    unpack gst-plugins-good "$FETCHED"
+    meson_pkg gst-plugins-good "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dorc=disabled -Dasm=disabled \
+        -Disomp4=enabled -Dmatroska=enabled -Daudioparsers=enabled -Did3demux=enabled \
+        -Dapetag=enabled -Dicydemux=enabled -Dwavparse=enabled \
+        -Dadaptivedemux2=enabled -Dsoup=enabled -Dsoup-version=3 -Dhls-crypto=openssl
+    fix_sysroot; cleanup gst-plugins-good
+}
+
+step_gst_plugins_bad() {
+    log "gst-plugins-bad $GST_VER (videoparsers, mpegtsdemux + libgstmpegts, codecparsers)"
+    fetch https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-$GST_VER.tar.xz \
+        670d888bde8242579b0d8e91f60cf337aa7be20ca7c315ebfbdd6e5a9218d104
+    unpack gst-plugins-bad "$FETCHED"
+    meson_pkg gst-plugins-bad "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dintrospection=disabled -Dtools=disabled -Dorc=disabled -Dgpl=disabled \
+        -Dvideoparsers=enabled -Dmpegtsdemux=enabled -Did3tag=enabled -Dmpegdemux=enabled
+    fix_sysroot; cleanup gst-plugins-bad
+}
+
+step_gst_libav() {
+    log "gst-libav $GST_VER (avdec_* on FFmpeg 7.1.1)"
+    fetch https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-$GST_VER.tar.xz \
+        98ad3d7f8932c495e268708903f1c3388d5f26a0db34727a9f861ee23b724177
+    unpack gst-libav "$FETCHED"
+    meson_pkg gst-libav -Ddoc=disabled -Dtests=disabled
+    fix_sysroot; cleanup gst-libav
+}
+
+# Plugins registered by port/deps/gst/gststaticplugins.c (keep in sync).
+GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions playback
+                  videoconvertscale volume pbtypes rawparse subparse gio isomp4 matroska
+                  audioparsers id3demux apetag icydemux wavparse adaptivedemux2
+                  videoparsersbad mpegtsdemux mpegpsdemux id3tag libav)
+
+# libgstreamer-full-1.0.a: every libgst*-1.0.a, the plugins above, the
+# registration object and FFmpeg/dav1d merged into one archive (what
+# upstream's gst-full produces and WebKit's USE_GSTREAMER_FULL links), plus
+# gstreamer-full-1.0.pc whose Requires.private lists the remaining
+# dependencies (glib/gio, libsoup, libxml2, OpenSSL, zlib), which WebKit
+# links anyway.
+step_gst_full() {
+    log "gstreamer-full-1.0 (one archive + gst_init_static_plugins())"
+    local b="$W/build/gst-full" lib="$SYSROOT/lib" p mri reqs
+    rm -rf "$b"; mkdir -p "$b"
+    prospero-clang $CFLAGS_COMMON $("$PKGCONF" --cflags gstreamer-1.0) \
+        -c "$HERE/gst/gststaticplugins.c" -o "$b/gststaticplugins.o"
+    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o"
+    mri="$b/full.mri"
+    { echo "CREATE $lib/libgstreamer-full-1.0.a"
+      echo "ADDLIB $b/libgststaticplugins.a"
+      for p in "${GST_FULL_PLUGINS[@]}"; do
+          [ -f "$lib/gstreamer-1.0/libgst$p.a" ] || die "missing plugin archive libgst$p.a"
+          echo "ADDLIB $lib/gstreamer-1.0/libgst$p.a"
+      done
+      for p in "$lib"/libgst*-1.0.a; do
+          case "$p" in */libgstreamer-full-1.0.a) continue ;; esac
+          echo "ADDLIB $p"
+      done
+      # gst-libav's FFmpeg and dav1d too, so WebKit's USE_GSTREAMER_FULL
+      # (which links only this archive) needs nothing media-specific.
+      for p in avfilter avformat avcodec swresample avutil dav1d; do
+          echo "ADDLIB $lib/lib$p.a"
+      done
+      echo "SAVE"; echo "END"; } > "$mri"
+    rm -f "$lib/libgstreamer-full-1.0.a"
+    prospero-ar -M < "$mri"
+    prospero-ranlib "$lib/libgstreamer-full-1.0.a"
+    # External (non-GStreamer) dependencies of everything merged above.
+    local mods=() pc
+    for p in "${GST_FULL_PLUGINS[@]}"; do mods+=("gst$p"); done
+    for pc in "$lib"/pkgconfig/gstreamer-*-1.0.pc; do
+        pc=$(basename "$pc" .pc)
+        [ "$pc" = gstreamer-full-1.0 ] || mods+=("$pc")
+    done
+    reqs=$(PKG_CONFIG_LIBDIR="$lib/pkgconfig:$lib/gstreamer-1.0/pkgconfig:$SYSROOT/share/pkgconfig" \
+        pkg-config --print-requires --print-requires-private "${mods[@]}" 2>/dev/null |
+        awk '{print $1}' | grep -v -E '^(gst|libav|libswresample|dav1d)' | sort -u | tr '\n' ' ')
+    cat > "$lib/pkgconfig/gstreamer-full-1.0.pc" <<PC
+prefix=\${pcfiledir}/../..
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: gstreamer-full
+Description: Static GStreamer $GST_VER for PS5 payloads: core, libraries and plugins (${GST_FULL_PLUGINS[*]}), registered by gst_init()
+Version: $GST_VER
+Requires.private: $reqs
+Libs: -L\${libdir} -lgstreamer-full-1.0
+Cflags: -I\${includedir}/gstreamer-1.0
+PC
+    echo "Requires.private: $reqs"
+    rm -rf "$b"
+}
+
 # ------------------------------------------------------------ runtime files
 # The console-side tree, staged in $RUNTIME (mirrors $PS5_RUNTIME on the
 # console): etc/ssl/cert.pem, etc/fonts/fonts.conf, fonts/, cache/fontconfig/.
@@ -633,10 +794,17 @@ STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv p
           libxml2 libxslt sqlite libpsl icu freetype harfbuzz fontconfig pcre2 libffi glib
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
           cacert fonts xkeyboard_config)
+STEPS_M2=(dav1d ffmpeg gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
 
-if [ "${1:-}" = "--list" ]; then printf '%s\n' "${STEPS_M1[@]}" | tr _ -; exit 0; fi
+if [ "${1:-}" = "--list" ]; then
+    echo "# Milestone 1 (default)"; printf '%s\n' "${STEPS_M1[@]}" | tr _ -
+    echo "# Milestone 2 (media): build.sh m2"; printf '%s\n' "${STEPS_M2[@]}" | tr _ -
+    exit 0
+fi
 STEPS=("$@")
 [ ${#STEPS[@]} -eq 0 ] && STEPS=("${STEPS_M1[@]}")
+[ "${STEPS[*]}" = m2 ] && STEPS=("${STEPS_M2[@]}")
+[ "${STEPS[*]}" = all ] && STEPS=("${STEPS_M1[@]}" "${STEPS_M2[@]}")
 for s in "${STEPS[@]}"; do
     fn="step_${s//-/_}"
     declare -F "$fn" >/dev/null || die "unknown step: $s (try --list)"

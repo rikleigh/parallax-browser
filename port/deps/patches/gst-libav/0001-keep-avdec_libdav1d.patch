@@ -1,0 +1,27 @@
+--- a/ext/libav/gstavviddec.c
++++ b/ext/libav/gstavviddec.c
+@@ -2122,6 +2122,11 @@
+   pool = gst_video_decoder_get_buffer_pool (GST_VIDEO_DECODER (ffmpegdec));
+   if (G_UNLIKELY (output_frame->output_buffer == NULL)) {
+     *ret = get_output_buffer (ffmpegdec, output_frame);
++    /* Decoders without direct rendering (libdav1d) never call get_buffer2,
++     * so the input frame is still flagged DECODE_ONLY and finish_frame
++     * would drop it although a picture was produced and copied. */
++    GST_VIDEO_CODEC_FRAME_FLAG_UNSET (output_frame,
++        GST_VIDEO_CODEC_FRAME_FLAG_DECODE_ONLY);
+   } else if (G_UNLIKELY (output_frame->output_buffer->pool != pool)) {
+     GstBuffer *tmp = output_frame->output_buffer;
+     output_frame->output_buffer = NULL;
+@@ -3023,7 +3028,11 @@
+     /* No decoders depending on external libraries (we don't build them, but
+      * people who build against an external ffmpeg might have them.
+      * We have native gstreamer plugins for all of those libraries anyway. */
+-    if (!strncmp (in_plugin->name, "lib", 3)) {
++    /* PS5: dav1d is the only AV1 decoder (FFmpeg's native one needs a
++     * hwaccel, and GStreamer's dav1ddec lives in gst-plugins-rs), so keep
++     * avdec_libdav1d. */
++    if (!strncmp (in_plugin->name, "lib", 3)
++        && strcmp (in_plugin->name, "libdav1d") != 0) {
+       GST_DEBUG
+           ("Not using external library decoder %s. Use the gstreamer-native ones instead.",
+           in_plugin->name);

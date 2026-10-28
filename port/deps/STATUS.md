@@ -49,4 +49,12 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 | Noto fonts + fonts.conf | notofonts @781896b | smoke-tested | /data/ps5webkit/fonts |
 | libgcrypt/libtasn1 | – | skipped | use -DUSE_OPENSSL=ON |
 | libavif, libjxl, woff2, libwpe | – | skipped | see README |
-| GStreamer (M2) | – | not started | |
+| **Milestone 2** | | | `build.sh m2` (2m34s clean); gst smoke 9/9 PASS (`smoke/results/*-gst-all-pass.log`) |
+| dav1d | 1.5.1 | smoke-tested | AV1 via avdec_libdav1d |
+| FFmpeg | 7.1.1 | smoke-tested | decoders only: aac, mp3, opus, vorbis, flac, h264, hevc, vp8, vp9, libdav1d; avfilter, swresample; LGPL |
+| GStreamer core | 1.28.8 | smoke-tested | static, `gstreamer-static-full` (gst_init registers static plugins), registry off |
+| gst-plugins-base | 1.28.8 | smoke-tested | app, playback (decodebin3/parsebin/playbin3), typefind, converters; **no GL** |
+| gst-plugins-good | 1.28.8 | smoke-tested | isomp4, matroska, audioparsers, adaptivedemux2 (hlsdemux2/dashdemux2), id3demux |
+| gst-plugins-bad | 1.28.8 | smoke-tested | videoparsersbad, mpegtsdemux (+libgstmpegts), codecparsers |
+| gst-libav | 1.28.8 | smoke-tested | patch: keep avdec_libdav1d, fix dropped frames without DR |
+| gstreamer-full | 1.28.8 | smoke-tested | `lib/libgstreamer-full-1.0.a` = all gst libs + 25 plugins + FFmpeg/dav1d + `gst_init_static_plugins()`; WebKit: `-DUSE_GSTREAMER_FULL=ON -DUSE_GSTREAMER_GL=OFF` |
