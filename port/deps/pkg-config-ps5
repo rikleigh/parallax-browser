@@ -1,0 +1,17 @@
+#!/bin/sh
+# pkg-config for the PS5 WPE sysroot (toolchain/wpe-sysroot).
+#
+# The .pc files in the sysroot use `prefix=${pcfiledir}/../..`, so they are
+# relocatable and PKG_CONFIG_SYSROOT_DIR must stay empty. Everything in the
+# sysroot is a static archive, so --static is always passed: Libs.private and
+# Requires.private are what a final payload link needs.
+#
+# WPE_SYSROOT overrides the sysroot location.
+here="$(cd "$(dirname "$0")" && pwd)"
+: "${WPE_SYSROOT:=$(cd "$here/../.." && pwd)/toolchain/wpe-sysroot}"
+PKG_CONFIG_LIBDIR="$WPE_SYSROOT/lib/pkgconfig:$WPE_SYSROOT/share/pkgconfig"
+PKG_CONFIG_PATH=
+PKG_CONFIG_SYSROOT_DIR=
+export PKG_CONFIG_LIBDIR PKG_CONFIG_PATH PKG_CONFIG_SYSROOT_DIR
+unset DESTDIR
+exec pkg-config --static "$@"

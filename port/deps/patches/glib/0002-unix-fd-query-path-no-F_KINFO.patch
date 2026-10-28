@@ -1,0 +1,23 @@
+--- a/glib/glib-unix.c
++++ b/glib/glib-unix.c
+@@ -967,7 +967,9 @@
+   g_free (proc_path);
+ 
+   return g_steal_pointer (&path);
+-#elif defined (__FreeBSD__) || defined(__DragonFly__)
++#elif (defined (__FreeBSD__) || defined(__DragonFly__)) && defined (F_KINFO)
++  /* F_KINFO is FreeBSD 13+; the PS5 SDK headers are older (falls through
++   * to the unsupported case below). */
+   struct kinfo_file kf = {0};
+ 
+   kf.kf_structsize = sizeof (kf);
+@@ -996,7 +998,8 @@
+     }
+ 
+   return g_strdup (file_path);
+-#elif defined (__GNU__)
++#elif defined (__GNU__) || defined (__PROSPERO__)
++  /* PS5: no F_KINFO, no procfs. */
+   /*
+    * Hurd allows to open("/dev/fd/%u") to open the very same fd, but it's not
+    * possible to get the file name from it, see:

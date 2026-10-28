@@ -1,0 +1,37 @@
+--- a/meson.build
++++ b/meson.build
+@@ -747,7 +747,6 @@
+   'localtime_r',
+   'lstat',
+   'mbrtowc',
+-  'memalign',
+   'memmem',
+   'mmap',
+   'newlocale',
+@@ -856,7 +855,9 @@
+   glib_conf.set('HAVE_STPCPY', 1)
+ endif
+ 
+-if cc.has_function('memalign', prefix: '#include <stdlib.h>\n#include <malloc.h>')
++# PS5 (and FreeBSD): <malloc.h> is a hard #error, so only use memalign()
++# where the header is usable (gmem.c includes it for memalign).
++if glib_conf.has('HAVE_MALLOC_H') and cc.has_function('memalign', prefix: '#include <stdlib.h>\n#include <malloc.h>')
+   glib_conf.set('HAVE_MEMALIGN', 1)
+ endif
+ 
+@@ -1073,9 +1074,14 @@
+                }''', name : 'eventfd(2) system call')
+   glib_conf.set('HAVE_EVENTFD', 1)
+ endif
++
++# PS5 payloads (ps5-payload-sdk): libkernel exports ppoll(), but GMainContext
++# sources never became ready through it in worker threads (glib-networking's
++# TLS handshake timed out); poll() works. Use poll() there.
++is_ps5 = cc.get_define('__PROSPERO__') != ''
+ 
+ # Check for ppoll(2)
+-if cc.links('''#define _GNU_SOURCE
++if not is_ps5 and cc.links('''#define _GNU_SOURCE
+                #include <poll.h>
+                #include <stddef.h>
+                int main (int argc, char ** argv) {

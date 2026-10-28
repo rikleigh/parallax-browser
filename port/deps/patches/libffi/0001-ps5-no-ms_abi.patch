@@ -1,0 +1,30 @@
+diff -ru a/src/x86/ffi64.c b/src/x86/ffi64.c
+--- a/src/x86/ffi64.c	2025-03-27 00:35:35
++++ b/src/x86/ffi64.c	2026-10-27 23:37:23
+@@ -406,7 +406,7 @@
+   size_t bytes, n, rtype_size;
+   ffi_type *rtype;
+ 
+-#ifndef __ILP32__
++#if !defined(__ILP32__) && !defined(__PROSPERO__)
+   if (cif->abi == FFI_EFI64 || cif->abi == FFI_GNUW64)
+     return ffi_prep_cif_machdep_efi64(cif);
+ #endif
+diff -ru a/src/x86/ffiw64.c b/src/x86/ffiw64.c
+--- a/src/x86/ffiw64.c	2024-06-01 18:42:02
++++ b/src/x86/ffiw64.c	2026-10-27 23:37:23
+@@ -307,7 +307,14 @@
+    this is a nop.  When compiling on unix, this simplifies the assembly,
+    and places the burden of saving the extra call-saved registers on
+    the compiler.  */
++/* PS5 (x86_64-sie-ps5): clang does not support ms_abi for this target. The
++   Win64 ABIs are rejected in ffi_prep_cif_machdep (ffi64.c) there, so this
++   function is never reached.  */
++#ifdef __PROSPERO__
++int FFI_HIDDEN
++#else
+ int FFI_HIDDEN __attribute__((ms_abi))
++#endif
+ ffi_closure_win64_inner(ffi_cif *cif,
+ 			void (*fun)(ffi_cif*, void*, void**, void*),
+ 			void *user_data,
