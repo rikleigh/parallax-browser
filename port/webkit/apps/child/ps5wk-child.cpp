@@ -215,6 +215,12 @@ static void configureJIT()
         setenv("JSC_useDFGJIT", "false", 0);
     if (!strcmp(mode, "baseline") || !strcmp(mode, "dfg"))
         setenv("JSC_useFTLJIT", "false", 0);
+    // One compiler thread per tier (JSC's default is up to 4 on 16 CPUs):
+    // YouTube's heap at 20 s was 772 MB instead of 885 MB (libpas never
+    // returns pages on PS5), no measurable slowdown.
+    setenv("JSC_numberOfBaselineCompilerThreads", "1", 0);
+    setenv("JSC_numberOfDFGCompilerThreads", "1", 0);
+    setenv("JSC_numberOfFTLCompilerThreads", "1", 0);
     const char* dfg = getenv("JSC_useDFGJIT");
     const char* ftl = getenv("JSC_useFTLJIT");
     LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s)", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),

@@ -920,7 +920,8 @@ Checked on the console (13.60, `spikes/04-jsc/jit-check.sh`: the WPE build's
   back down: 43 -> 20 MB in the stress cycle). The WebProcess heap is larger
   with the JIT: libpas pages on YouTube at 20 s were 589 MB (LLInt),
   770 MB (Baseline only), 780 MB (up to DFG) and 885 MB (all tiers; 772 MB with
-  one compiler thread per tier, `JSC_numberOf{Baseline,DFG,FTL}CompilerThreads=1`).
+  one compiler thread per tier, `JSC_numberOf{Baseline,DFG,FTL}CompilerThreads=1`,
+  which ps5wk-child now sets by default; child.env lines override it).
   After the 12-load cycle they were 625 MB against 1104 MB. The payload has 8 GB of
   flexible memory, but on PS5 libpas never returns pages (0006), and
   touched memory costs page tables: the kernel's `page table CPU` count with
