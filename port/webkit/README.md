@@ -398,7 +398,8 @@ test URL's page 2 s after it loads; `test/media/yt-consent.js` answers
 YouTube's cookie dialog in log-only runs). Test page:
 `video.html?src=...&test=geometry` (rounded clipping box, a label over the
 video, the page scrolls by 160 px every 3 s). Harness scripts:
-`test/media/pause-resume.js`, `test/media/yt-1080.js`.
+`test/media/pause-resume.js`, `test/media/seek.js` (forward, back, paused
+seek: frames resume after each flush), `test/media/yt-1080.js`.
 
 ### Step 2b: Videodec2 in the title (plan, not built)
 
