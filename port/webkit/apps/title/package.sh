@@ -45,7 +45,7 @@ fi
 # 2. Title runtime objects + our shims.
 TF=(-fno-plt -fno-stack-protector -ffunction-sections -fdata-sections)
 prospero-clang++ -std=c++20 -O2 -fno-exceptions -fno-rtti "${TF[@]}" -c "$NATIVE/app_crt.cpp" -o "$W/obj/app_crt.o"
-prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchReturnFromMain \
+prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchReturnFromMain -Dmkstemps=ps5_opengl_mkstemps \
     -c "$PSGL/runtime_shims.c" -o "$W/obj/runtime_shims.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -c "$PSGL/app_heap.c" -o "$W/obj/app_heap.o"
 /opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |
@@ -76,20 +76,39 @@ for so in $(LC_ALL=C ls "$SYS"/lib/*.so); do
     esac
     sdk_stubs+=("$so")
 done
-"$LLD" -T "$NATIVE/ps5-pie.ld" --eh-frame-hdr \
-    --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=posix_memalign \
-    --wrap=malloc_usable_size --wrap=dlopen --wrap=dlsym --wrap=fcntl \
-    --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
-    --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" \
-    "$W"/obj/*.o "${inputs[@]}" "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
-    --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
-    "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
-    "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
-    --as-needed "${sdk_stubs[@]}" --start-group "$SYS/lib/libc.a" --end-group \
-    2> "$W/link.log" || {
-        { grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -60; } || true
-        grep -E "duplicate symbol" -A3 "$W/link.log" | head -30 || true
-        tail -5 "$W/link.log"; exit 1; }
+title_link() {
+    "$LLD" -T "$HERE/ps5-pie-webkit.ld" --eh-frame-hdr -z nodynamic-undefined-weak \
+        --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=posix_memalign \
+        --wrap=malloc_usable_size --wrap=dlopen --wrap=dlsym --wrap=fcntl \
+        --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
+        --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" "$@" \
+        "$W"/obj/*.o "${inputs[@]}" "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
+        --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
+        "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
+        "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
+        "$SYS/lib/libScePad.so" "$SYS/lib/libSceImeDialog.so" "$SYS/lib/libSceUserService.so" \
+        --as-needed "${sdk_stubs[@]}" --start-group "$SYS/lib/libc.a" --end-group \
+        2> "$W/link.log" || {
+            { grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -60; } || true
+            grep -E "duplicate symbol" -A3 "$W/link.log" | head -30 || true
+            tail -5 "$W/link.log"; exit 1; }
+}
+title_link
+# Weak references nothing provides (C++ thread_local init hooks, LSan hooks,
+# __cxa_thread_atexit_impl, optional SCE calls) stay undefined dynamic
+# symbols, which the converter rejects: define them as 0 (null) and relink.
+NM=/opt/homebrew/opt/llvm@18/bin/llvm-nm
+for so in "${sdk_stubs[@]}" "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so"; do
+    "$NM" -D --defined-only "$so" 2>/dev/null | awk '{print $NF}'
+done | sort -u > "$W/stub-symbols.txt"
+defsyms=()
+for sym in $(/opt/homebrew/opt/llvm@18/bin/llvm-readelf --dyn-syms "$W/llvm-pie.elf" | awk '$7 == "UND" && $5 == "WEAK" { print $8 }'); do
+    grep -qx "$sym" "$W/stub-symbols.txt" || defsyms+=("--defsym=$sym=0")
+done
+if (( ${#defsyms[@]} )); then
+    echo "weak symbols set to null: ${defsyms[*]#--defsym=}"
+    title_link "${defsyms[@]}"
+fi
 
 # 4. Convert, fake-sign, assemble the folder title.
 "$TOOL" link --in "$W/llvm-pie.elf" --out "$W/eboot.elf" --stub-dir "$SYS/lib" \

@@ -60,7 +60,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0010-wpe-platform-ps5-backend-and-process-manager | `ENABLE_WPE_PLATFORM_PS5`: builds `wpe/ps5` (a symlink to `port/webkit/wpe-ps5`) into WPEPlatform and WebKit; enables `WPEProcessManager` (Android-only upstream) for PS5 in WPEPlatform and ProcessLauncherGLib; WebKit as a static library; `apps/` added when `PS5_PORT_DIR` is set |
 | 0011-wpe-on-freebsd-portability | WPE on a FreeBSD userland: WTF picks the generic memory footprint and no Linux-only sources (as PlatformGTK does), plus later fixes found while building |
 
-| 0012-ipc-unix-log-failures | diagnostics: log every failure path in `Platform/IPC/unix/ConnectionUnix.cpp` |
+| 0012-ipc-unix-log-failures | diagnostics: log why each IPC connection closes, in `Platform/IPC/glib/ConnectionGLib.cpp` (the file GLib ports use) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -147,7 +147,7 @@ ps5-opengl (EGL 1.4 from its symbol table, GL from `eglGetProcAddress`).
   child at 93 MB instead of 125 MB.
 - The payload wall clock is right (see JSC `Date` above).
 
-## Status and timings (checkpoint 2026-10-28 ~02:00)
+## Status and timings (2026-10-28)
 
 ### Builds (Mac, 14 cores, Release, -O2 -gline-tables-only)
 
@@ -164,65 +164,76 @@ relinks it as the title, not yet run).
 
 ### Console (payload-only, `test/run-shot.sh`)
 
-Latest run (example.com):
+First light 2026-10-28: the WebProcess payload paints pages with Skia on the
+CPU and hands them over as SHM buffers (thumbnail of the first one:
+`test/first-light-example.com.png`).
 
     RESULT ps5wk-shot setup PASS UIProcess up at 0.0 s, loading https://example.com/
-    RESULT ps5wk-shot load FAIL https://example.com/: WebKit encountered an internal error (domain WebKitErrorDomain code 300)
-    RESULT ps5wk-shot network PASS first response committed at 1.7 s
-    RESULT ps5wk-shot paint FAIL no frame painted within 40 s (load finished)
+    RESULT ps5wk-shot network PASS first response committed at 1.4 s
+    RESULT ps5wk-shot load PASS https://example.com/ finished at 1.4 s, title "Example Domain"
+    RESULT ps5wk-shot paint FAIL 1280x720, 77 frames, first at 1.4 s, fnv64 b8e5138fc7b8a468, 100.00% non-white pixels
+      (the page rendered correctly; the check counted the light-grey background as "non-white" and was fixed afterwards)
 
-Working: elfldr launch of both children from a payload UIProcess (upload
-~0.3 s, connected 0.7–1.3 s after launch), the reversed rendezvous with
-SCM_RIGHTS, WebProcess and NetworkProcess initialisation, NetworkProcess TLS +
-HTTP/2: with `SHOT_DEBUG=Network,Loading,Process` it logs `GET / HTTP/2` to
-example.com and `didReceiveResponse: (httpStatusCode=200, MIMEType=text/html`.
+    RESULT ps5wk-shot setup PASS UIProcess up at 0.0 s, loading https://en.wikipedia.org/wiki/PlayStation_5
+    RESULT ps5wk-shot network PASS first response committed at 1.5 s
+    RESULT ps5wk-shot load PASS https://en.wikipedia.org/wiki/PlayStation_5 finished at 3.5 s, title "PlayStation 5 - Wikipedia"
+    RESULT ps5wk-shot paint PASS 1280x720, 346 frames, first at 1.4 s, fnv64 4bdf213cb91b1482, 99.97% of pixels differ from the background
 
-**Blocker:** right after the NetworkProcess sends
-`WebResourceLoader::DidReceiveResponse` to the WebProcess, the
-WebProcess<->NetworkProcess IPC connection closes: the WebProcess logs
-`WebProcess::networkProcessConnectionClosed: NetworkProcess closed its
-connection (Crashed)` and the NetworkProcess logs
-`NetworkConnectionToWebProcess::didClose: WebProcess closed its connection`.
-Then `WebLoaderStrategy::networkProcessCrashed` fails the load (internal error
-code 300, `WebLoaderStrategy.cpp(693)`), so nothing is painted. Neither
-process crashes (klog: both exit 0 when the UIProcess quits).
-The injected-bundle warning (`Error loading the injected bundle
-.../libWPEInjectedBundle.so`) is harmless (no dlopen; only the
-WebProcessExtension API needs it).
+Both children launch through elfldr from a payload UIProcess (upload ~0.3 s,
+connected 0.7–1.3 s after launch). The NetworkProcess runs TLS (OpenSSL) and
+HTTP/2, and fontconfig/Noto (CJK included), images, CSS and JS all work.
 
-Ruled out / done:
-- not page tables, not elfldr (fixed, see Findings);
-- SCM_RIGHTS over SOCK_SEQPACKET socketpairs works on the console
-  (`test/seqpacket`: stream/seqpacket/dgram all PASS, passed twice);
-- patch 0012 logs every failure path in `Platform/IPC/unix/ConnectionUnix.cpp`
-  (malformed message, out-of-line body map failure, MSG_CTRUNC, ECONNRESET,
-  full read buffer). **None fired** in the last run, so the close does not
-  come from those paths.
+What blocked it last, for the record: WebProcess<->NetworkProcess IPC
+closed at the first out-of-line message. The cause was
+**`fcntl(fd, F_DUPFD_CLOEXEC, 0)` returning 0 (fd 0, the payload's stdin
+socket) in libkernel**, so `WTF::dupCloseOnExec` sent a socket in place of
+shared memory (`test/seqpacket/dupfd.c`). Fixed with `__wrap_fcntl` in
+`shim/ps5shim.c` (`-Wl,--wrap=fcntl`); requested in port/deps/REQUESTS.md
+for ps5compat, since glib uses it too. Patch 0012 makes every
+IPC-connection close path in `Platform/IPC/glib/ConnectionGLib.cpp` log why.
 
-Hypothesis: the close comes from the GLib read monitor
-(`Connection::m_readSocketMonitor`, a `GSocketMonitor` on the IPC socket,
-`Connection.h` USE(GLIB)) reporting G_IO_HUP/G_IO_ERR, or from the sender
-side. deps notes that glib's ppoll is broken on PS5 and disabled; a GSource
-condition on a SOCK_SEQPACKET socket may report HUP/ERR wrongly on this
-kernel. DidReceiveResponse is probably the first large message on that
-connection: it carries a CertificateInfo, so its body goes out of line as a
-SharedMemory fd.
+Other probes in `test/` (payloads, RESULT lines on stdout):
+`jitpool` (2048 MB of JIT shm in one payload, no limit hit),
+`seqpacket/seqpacket` (SCM_RIGHTS over stream/seqpacket/dgram PASS),
+`seqpacket/shmfd` (SHM_ANON and named shm fds pass and map), `seqpacket/dupfd`
+(the F_DUPFD_CLOEXEC bug), `seqpacket/reserve` (RW or PROT_NONE
+reservations do not reduce `sceKernelAvailableFlexibleMemorySize`).
 
-Next steps:
-1. Find where `m_readSocketMonitor` is started (grep `m_readSocketMonitor`
-   in Platform/IPC, probably `Connection.cpp`/`ConnectionUnix.cpp` under
-   USE(GLIB)) and log the GIOCondition that leads to `connectionDidClose()`;
-   also log in `sendOutputMessage` failures (EPIPE is not treated as close
-   on non-Linux).
-2. Test on the console: a 2-process (or 2-thread) GSocket/GSource watch on a
-   SOCK_SEQPACKET socketpair, sending a message with an fd attachment, and
-   print the conditions seen (extend `test/seqpacket`).
-3. If it is the monitor: patch it on PS5 (ignore HUP when data is readable,
-   or poll with a plain fd watch), or make IPC use SOCK_STREAM on PS5
-   (`SOCKET_TYPE` in ConnectionUnix.cpp; the message framing would need
-   checking).
-4. Then rerun `test/run-shot.sh` for paint, then package and hand over the
-   title (`apps/title/package.sh`).
+### Title PPSA99020 (built, not launched)
+
+`apps/title/package.sh` -> `toolchain/wpe-webkit/titles/PPSA99020` (200 MB:
+`eboot.bin` 109 MB + `ps5wk-child.elf` 90 MB + param.json + libc.prx);
+symbols for crash triage: `toolchain/wpe-webkit/titles/ps5browser-symbols.elf`
+(title rips relative to the eboot load base).
+Title link specifics: `ps5-pie-webkit.ld` (WTF/JSC's page-aligned writable
+sections moved into the data segment, or the converter fails with "LLVM
+layout leaves no room for PS5 process parameters"), weak references that no
+stub provides are defined as 0 (`_ZTH...` thread_local hooks, LSan hooks,
+`__cxa_thread_atexit_impl`, `sceCommonDialogInitialize`), the SCE libraries
+the backend uses are linked without --as-needed, ps5-opengl's `mkstemps`
+shim renamed (clashes with libc.a), and `--wrap=dlopen/dlsym/fcntl`.
+
+Runtime needs on the console (already there): `/data/ps5webkit` runtime tree
+from port/deps (certs, fonts, fonts.conf, xkb) and
+`/data/ps5webkit/share/icu/icudt76l.dat` (uploaded by `test/run-shot.sh`).
+Optional: `/data/ps5webkit/home-url.txt` (start page),
+`/data/ps5webkit/child.env` (`WEBKIT_DEBUG=...` for the children; remove it
+for normal use, it is very verbose).
+
+Not yet tried on the console (expect the first issues here): the title's
+memory budget (~250–420 MB flexible) with WebKit's UIProcess in it; libepoxy
+through `dlshim.c`; the ImeDialog struct layout (PS4/OpenOrbis layout,
+unverified on PS5); the ScePadData layout (PS5VR's); GL 4.6 core context
+creation from the backend; spatial navigation with the D-pad.
+
+### Next steps
+
+1. Owner: first TV launch of PPSA99020 (see the report / below), read the
+   log on the Mac.
+2. Fix what the title run shows (memory, epoxy, IME, pad).
+3. Process prewarming (spawns are ~1 s now), TZ from the system settings,
+   the exit-time crash in `Font::~Font` (a WebProcess being torn down when the
+   UIProcess quits; harmless so far).
 
 Debug knobs: `/data/ps5webkit/child.env` (KEY=VALUE lines read by the
 child, e.g. `WEBKIT_DEBUG=Network,Loading,Process`); `SHOT_DEBUG=...` for

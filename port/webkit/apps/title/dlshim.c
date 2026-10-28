@@ -21,7 +21,13 @@ void* __real_dlsym(void* handle, const char* symbol);
 #undef EGL_SYMBOL
 
 typedef void (*proc_t)(void);
-extern proc_t eglGetProcAddress(const char* name);
+/* eglGetProcAddress is declared as void(void) by the table above; call it
+ * through a correctly typed pointer. */
+static proc_t lookupProc(const char* name)
+{
+    proc_t (*getProcAddress)(const char*) = (proc_t (*)(const char*))(void*)eglGetProcAddress;
+    return getProcAddress(name);
+}
 
 static const struct {
     const char* name;
@@ -54,6 +60,6 @@ void* __wrap_dlsym(void* handle, const char* symbol)
             return (void*)eglSymbols[i].address;
     }
     if (!strncmp(symbol, "egl", 3) && symbol[3] >= 'A' && symbol[3] <= 'Z')
-        return (void*)eglGetProcAddress(symbol); /* extensions, or NULL */
-    return (void*)eglGetProcAddress(symbol);
+        return (void*)lookupProc(symbol); /* extensions, or NULL */
+    return (void*)lookupProc(symbol);
 }
