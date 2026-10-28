@@ -34,6 +34,9 @@ extern char __ehdr_start;
 extern char __init_array_start;
 static uintptr_t textStart, textEnd;
 
+// JSC's executable memory (WebKit patch 0030), so a pc in JIT code is named.
+void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
+
 #define ALT_STACK_SIZE (128 * 1024)
 #define SCAN_WORDS 4096
 #define MAX_CANDIDATES 24
@@ -180,6 +183,14 @@ static void handler(int sig, siginfo_t* info, void* context)
         put(&line, " (elf +");
         putHex(&line, pc - base);
         put(&line, ")");
+    } else if (ps5wk_jit_memory) {
+        void *jitStart = 0, *jitEnd = 0;
+        ps5wk_jit_memory(&jitStart, &jitEnd, 0, 0);
+        if (pc >= (uintptr_t)jitStart && pc < (uintptr_t)jitEnd) {
+            put(&line, " (JIT code +");
+            putHex(&line, pc - (uintptr_t)jitStart);
+            put(&line, ")");
+        }
     }
     put(&line, " sp ");
     putHex(&line, sp);

@@ -16,8 +16,10 @@
 #                                sparse checkout), branch "ps5" = 15486a0178 +
 #                                one commit per patches/*.patch
 #   toolchain/wpe-webkit/build   cmake/ninja build (Release, -gline-tables-only)
+#   SRC=, BLD=, LOGDIR= override these (a second worktree and build dir:
+#   git -C toolchain/wpe-webkit/src worktree add ../src-x -b x ps5)
 #
-# Env: JOBS (default ncpu), FRESH_SRC=1, NINJA_TARGETS="...", NINJA_FLAGS="-k 0",
+# Env: JOBS (default ncpu), FRESH_SRC=1, JIT=0 (configure without the JIT), NINJA_TARGETS="...", NINJA_FLAGS="-k 0",
 #      DEBUG_FLAGS (default -gline-tables-only; -g0 for the smallest build)
 set -euo pipefail
 
@@ -27,7 +29,8 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 WK="$ROOT/toolchain/wpe-webkit"
-SRC="$WK/src"
+SRC="${SRC:-$WK/src}"
+LOGDIR="${LOGDIR:-$WK}"
 BLD="${BLD:-$WK/build}"
 WEBKIT_REF="$ROOT/ref/WebKit"
 WEBKIT_COMMIT=15486a017817cad93f25fdffeb013278866970fc
@@ -45,7 +48,7 @@ log() { printf '\n=== %s\n' "$*"; }
 # build reads. Patches are applied as commits on branch "ps5" so they can be
 # edited in place and exported again (export-patches).
 step_src() {
-    if [ ! -d "$SRC/.git" ]; then
+    if [ ! -e "$SRC/.git" ]; then
         log "cloning $WEBKIT_REF -> $SRC (shared objects, sparse)"
         mkdir -p "$WK"
         git clone -q --no-checkout "$WEBKIT_REF" "$SRC" || true
@@ -75,14 +78,16 @@ step_src() {
     fi
     # The PS5 backend lives in port/webkit/wpe-ps5; WebKit sees it as wpe/ps5.
     ln -sfn "$HERE/wpe-ps5" "$SRC/Source/WebKit/WPEPlatform/wpe/ps5"
-    grep -qx 'Source/WebKit/WPEPlatform/wpe/ps5' "$SRC/.git/info/exclude" 2>/dev/null ||
-        echo 'Source/WebKit/WPEPlatform/wpe/ps5' >> "$SRC/.git/info/exclude"
+    local exclude
+    exclude="$(cd "$SRC" && cd "$(git rev-parse --git-common-dir)" && pwd)/info/exclude"
+    grep -qx 'Source/WebKit/WPEPlatform/wpe/ps5' "$exclude" 2>/dev/null ||
+        echo 'Source/WebKit/WPEPlatform/wpe/ps5' >> "$exclude"
 }
 
 step_export_patches() {
-    log "exporting $WEBKIT_COMMIT..ps5 to patches/"
+    log "exporting $WEBKIT_COMMIT..HEAD ($(git -C "$SRC" branch --show-current)) to patches/"
     rm -f "$HERE"/patches/*.patch
-    for c in $(git -C "$SRC" rev-list --reverse "$WEBKIT_COMMIT..ps5"); do
+    for c in $(git -C "$SRC" rev-list --reverse "$WEBKIT_COMMIT..HEAD"); do
         name="$(git -C "$SRC" log -1 --format=%s "$c")"
         git -C "$SRC" diff --no-color "$c^" "$c" > "$HERE/patches/$name.patch"
         echo "  $name.patch ($(git -C "$SRC" diff --shortstat "$c^" "$c"))"
@@ -109,19 +114,23 @@ step_shim() {
 }
 
 # ---------------------------------------------------------------- configure
-# Everything optional is off. JIT off (asm LLInt, as Spike 4), no WebGL, no
+# Everything optional is off. JIT on (Baseline, DFG, FTL, YARR; patches 0030+;
+# JIT=0 builds the asm LLInt only, as Spike 4). WebAssembly is compiled with
+# the JIT because B3 (FTL) does not build without it upstream, but it is off
+# at run time on PS5 (patch 0030: JSC_useWasm=true turns it on). No WebGL, no
 # GPU process, Skia on the CPU. Media (Milestone 2): <video>/<audio> and MSE on
 # the static GStreamer from port/deps (gstreamer-full, GL off), software
 # decoders in the WebProcess, audio through ps5audiosink (sceAudioOut). WPE Platform API only; headless kept
 # for the payload-side test harness.
+JIT_ON=ON; [ "${JIT:-1}" = 0 ] && JIT_ON=OFF
 WEBKIT_OPTIONS=(
     -DPORT=WPE -DCMAKE_BUILD_TYPE=Release -DDEVELOPER_MODE=OFF
     -DENABLE_WPE_LEGACY_API=OFF -DENABLE_WPE_QT_API=OFF -DENABLE_WPE_1_1_API=OFF
     -DENABLE_WPE_PLATFORM_DRM=OFF -DENABLE_WPE_PLATFORM_WAYLAND=OFF
     -DENABLE_WPE_PLATFORM_HEADLESS=ON -DENABLE_WPE_PLATFORM_PS5=ON
     -DUSE_SKIA=ON -DUSE_GBM=OFF -DUSE_LIBDRM=OFF -DUSE_VULKAN=OFF
-    -DENABLE_JIT=OFF -DENABLE_DFG_JIT=OFF -DENABLE_FTL_JIT=OFF -DENABLE_C_LOOP=OFF
-    -DENABLE_WEBASSEMBLY=OFF -DENABLE_SAMPLING_PROFILER=OFF -DENABLE_REMOTE_INSPECTOR=OFF
+    -DENABLE_JIT="${JIT_ON}" -DENABLE_DFG_JIT="${JIT_ON}" -DENABLE_FTL_JIT="${JIT_ON}" -DENABLE_C_LOOP=OFF
+    -DENABLE_WEBASSEMBLY="${JIT_ON}" -DENABLE_WEBASSEMBLY_BBQJIT="${JIT_ON}" -DENABLE_WEBASSEMBLY_OMGJIT="${JIT_ON}" -DENABLE_SAMPLING_PROFILER=OFF -DENABLE_REMOTE_INSPECTOR=OFF
     -DENABLE_RESOURCE_USAGE=OFF -DENABLE_MEMORY_SAMPLER=OFF -DENABLE_RELEASE_LOG=ON
     -DUSE_SYSTEM_MALLOC=OFF
     -DENABLE_WEBGL=OFF -DENABLE_WEBGPU=OFF -DENABLE_WEBXR=OFF -DENABLE_GPU_PROCESS=OFF
@@ -184,8 +193,8 @@ step_configure() {
         -DICU_UC_LIBRARY_RELEASE="$ICU/lib/libicuuc.a" \
         -DICU_I18N_LIBRARY_RELEASE="$ICU/lib/libicui18n.a" \
         -DICU_DATA_LIBRARY_RELEASE="$BLD/shim/libicudata-stub.a" \
-        ${EXTRA_CMAKE_ARGS:-} ) 2>&1 | tee "$WK/configure.log" | grep -E "^-- (Enabled|  |Could)|Error|error|Missing|not found|NOT" | head -80
-    [ -f "$BLD/build.ninja" ] && echo "configure: OK" || { echo "configure: FAILED (see $WK/configure.log)"; return 1; }
+        ${EXTRA_CMAKE_ARGS:-} ) 2>&1 | tee "$LOGDIR/configure.log" | grep -E "^-- (Enabled|  |Could)|Error|error|Missing|not found|NOT" | head -80
+    [ -f "$BLD/build.ninja" ] && echo "configure: OK" || { echo "configure: FAILED (see $LOGDIR/configure.log)"; return 1; }
 }
 
 # -------------------------------------------------------------------- build
@@ -194,11 +203,11 @@ step_build() {
     log "ninja -j$JOBS ${targets:-<all>}"
     local t0=$(date +%s)
     set +e
-    ninja -C "$BLD" -j"$JOBS" ${NINJA_FLAGS:-} $targets > "$WK/ninja.log" 2>&1
+    ninja -C "$BLD" -j"$JOBS" ${NINJA_FLAGS:-} $targets > "$LOGDIR/ninja.log" 2>&1
     local rc=$?
     set -e
-    grep -E "error:|FAILED|undefined symbol" "$WK/ninja.log" | head -40 || true
-    echo "ninja exit $rc after $(( $(date +%s) - t0 )) s" | tee -a "$WK/build-times.log"
+    grep -E "error:|FAILED|undefined symbol" "$LOGDIR/ninja.log" | head -40 || true
+    echo "ninja exit $rc after $(( $(date +%s) - t0 )) s" | tee -a "$LOGDIR/build-times.log"
     return "$rc"
 }
 

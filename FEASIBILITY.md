@@ -483,7 +483,7 @@ are upstream WebKit bugs.
 | R15 | (WebXR goal only) WebGL (ANGLE) can't use the OpenXR runtime's native ps5-opengl textures in the same process; ANGLE port to the PS5 target | medium | high for WebXR | Add EGLImage or a T# import to ps5-opengl (we carry its patches); ANGLE GL backend on Mesa GL 4.6 / GLES 3.2 |
 | R5 | pacbrew Mesa / ps5-opengl immature or abandoned (upstreams already deleted) | high | medium | Keep both routes; vendor sources and patches; pin hashes |
 | R6 | Per-firmware fragility (export tables, SCE stubs, Relapse limited to ≤13.60) | high | medium | Anchor-checked tables, one generator script, document the supported firmware |
-| R7 | JIT unavailable, so slow JS | low (reduced) | medium for WebXR (three.js frame budgets) | JS runs in payloads, where RWX, RW→RX and `sceKernelJit*` all work (Spike 1). The LLInt interpreter is ~3× slower than an M4 Max (Spike 4); enabling the JIT is optional port work |
+| R7 | JIT unavailable, so slow JS | **retired** (2026-10-28) | medium for WebXR (three.js frame budgets) | JS runs in payloads, where RWX, RW→RX and `sceKernelJit*` all work (Spike 1). The JIT now runs in the WebProcess (WebKit patch 0030: Baseline, DFG, FTL and the regexp JIT on an RWX pool; the title stays on the LLInt): Spike 4's bench 3.06 s -> 0.44 s on the console, 7.6x as a page. Costs ~15 MB of image per executable and 200–500 MB more WebProcess heap ([port/webkit/README.md](port/webkit/README.md), *JIT*) |
 | R11 | GL draw-call overhead makes busy WebGL/three.js scenes CPU-bound | medium (reduced) | medium for WebXR content | Measured and partly fixed (§4.2c): 72 → 8 µs per draw with patch 0003, profiling off and async preparation. Left: driver state caching (port work), compare pacbrew Mesa/zink. glthread takes the work off the calling thread |
 | R12 | Clean exit/suspend: titles were killed by the system on close (0xa0d0c00f, "debug error") | **worked around** | low (UX) | First cause: ps5-opengl's `catchReturnFromMain` sleeps forever after `main`. Second, watched on the TV: any GPU title that ends itself (`sceShellCoreUtilExitApp`, `exit`, `_exit`) gets a debug error, because ShellUI's suspend-before-kill crashes it (reason 0xc). Only a SIGKILL from another process shows nothing, so `title_exit.c` asks the launcher payload to SIGKILL the title ([tools/launcher](tools/launcher/README.md)). Still to do: handle suspend/resume (rest mode) in the browser |
 | R8 | Memory budget: the title has ~440 MB of flexible memory (13.60), and the UIProcess, Sony's video decoder (223 MB for 8K at depth 4, 139 MB at depth 2) and the title image itself (1:1, ~112 MB for today's browser ELF) all draw on it | medium | high | **Mostly retired by Spike 10:** malloc, libpas/bmalloc pages and thread stacks go to direct memory (11.7 GB, flexible untouched, measured). What's left: keep the image small; budget the decoder at depth 2 for 8K if the image stays ~110 MB (~190 MB headroom) |
@@ -588,7 +588,7 @@ port.
 - **WebKit** (`port/webkit/`): WPE at 15486a0178 with a PS5 WPE Platform
   backend (VideoOut, DualSense, process manager), the WebProcess and
   NetworkProcess as one elfldr payload, and the UIProcess as the title.
-  The JIT is off (being enabled, see below).
+  The JIT was off at first; the WebProcess now runs JavaScriptCore's JIT (patch 0030, R7).
 - **Checked by the owner on the TV:** Wikipedia, BBC News, GitHub, Hacker
   News and DuckDuckGo load and render; pointer, click, back and zoom work on
   the pad. Old WebProcesses exit after cross-site navigation, and the title's

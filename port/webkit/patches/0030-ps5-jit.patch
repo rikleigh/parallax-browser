@@ -1,0 +1,147 @@
+diff --git a/Source/JavaScriptCore/bytecode/InlineCacheCompiler.h b/Source/JavaScriptCore/bytecode/InlineCacheCompiler.h
+index ead363b5b3..c0783335e5 100644
+--- a/Source/JavaScriptCore/bytecode/InlineCacheCompiler.h
++++ b/Source/JavaScriptCore/bytecode/InlineCacheCompiler.h
+@@ -28,6 +28,7 @@
+ #if ENABLE(JIT)
+ 
+ #include "AccessCase.h"
++#include "CCallHelpers.h"
+ #include "InlineCacheHandler.h"
+ #include "JITStubRoutine.h"
+ #include "JSFunctionInlines.h"
+diff --git a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+index 1e7555eaa4..44011106fe 100644
+--- a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
++++ b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+@@ -92,6 +92,11 @@ static constexpr size_t minimumPoolSizeForSegregatedHeap = 256 * MB;
+ 
+ #if defined(FIXED_EXECUTABLE_MEMORY_POOL_SIZE_IN_MB) && FIXED_EXECUTABLE_MEMORY_POOL_SIZE_IN_MB > 0
+ static constexpr size_t fixedExecutableMemoryPoolSize = FIXED_EXECUTABLE_MEMORY_POOL_SIZE_IN_MB * MB;
++#elif defined(PS5_PAYLOAD_SDK)
++// PS5: address-space reservations cost CPU page tables, a system-wide pool,
++// even when untouched (port/webkit/README.md); 1 GB would be ~512 of them.
++// JSC_jitMemoryReservationSize overrides it.
++static constexpr size_t fixedExecutableMemoryPoolSize = 128 * MB;
+ #elif CPU(ARM64)
+ #if ENABLE(JUMP_ISLANDS)
+ static constexpr size_t fixedExecutableMemoryPoolSize = 512 * MB;
+@@ -1228,6 +1233,24 @@ Lock& ExecutableAllocator::getLock() const
+     return allocator->getLock();
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// For the PS5 payloads (apps/child: the [mem] line; the crash guard tells
++// JIT code from the image). Any pointer may be null.
++extern "C" void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed)
++{
++    FixedVMPoolExecutableAllocator* allocator = g_jscConfig.fixedVMPoolExecutableAllocator;
++    bool valid = allocator && allocator->isValid();
++    if (start)
++        *start = valid ? g_jscConfig.startExecutableMemory : nullptr;
++    if (end)
++        *end = valid ? g_jscConfig.endExecutableMemory : nullptr;
++    if (allocated)
++        *allocated = valid ? allocator->bytesAllocated() : 0;
++    if (committed)
++        *committed = valid ? allocator->bytesCommitted() : 0;
++}
++#endif
++
+ size_t ExecutableAllocator::committedByteCount()
+ {
+ #if ENABLE(LIBPAS_JIT_HEAP)
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index c1be8f9de3..69b5ca3863 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -654,6 +654,19 @@ static void overrideDefaults()
+     Options::usePollingTraps() = true;
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: the JIT is opt-in (JSC_useJIT=true). elfldr payloads (the
++    // WebProcess, the jsc shell) can execute RWX memory; a title (the
++    // UIProcess) can map it but faults executing it (Spike 1), so a title
++    // must never JIT. ps5wk-child turns it on for WebProcesses.
++    Options::useJIT() = false;
++    // WebAssembly is built because B3 needs it, but not exposed to pages
++    // (JSC_useWasm=true does). Fast memory would reserve 4 GB+ of address
++    // space per wasm memory: bounds checks instead.
++    Options::useWasm() = false;
++    Options::useWasmFastMemory() = false;
++#endif
++
+ #if !ENABLE(WEBASSEMBLY)
+     Options::useWasmFastMemory() = false;
+     Options::useWasmFaultSignalHandler() = false;
+diff --git a/Source/JavaScriptCore/shell/CMakeLists.txt b/Source/JavaScriptCore/shell/CMakeLists.txt
+index a7ac0678e3..4a59a88d4a 100644
+--- a/Source/JavaScriptCore/shell/CMakeLists.txt
++++ b/Source/JavaScriptCore/shell/CMakeLists.txt
+@@ -17,6 +17,13 @@ endif ()
+ if (PS5)
+     # PS5 payload entry point (argv/stdin handling), see shell/ps5/PS5Main.cpp
+     list(APPEND jsc_SOURCES ps5/PS5Main.cpp)
++    # WPE builds: JavaScriptCore carries its GLib API, so the static
++    # dependency libraries (port/webkit/build.sh) and the shim (memmem) go
++    # after it.
++    if (PS5_DEPS_LIBS)
++        separate_arguments(jsc_PS5_DEPS UNIX_COMMAND "${PS5_DEPS_LIBS}")
++        list(APPEND jsc_LIBRARIES ${jsc_PS5_DEPS} ${CMAKE_BINARY_DIR}/shim/libps5shim.a)
++    endif ()
+ endif ()
+ 
+ if (WIN32)
+diff --git a/Source/JavaScriptCore/shell/ps5/PS5Main.cpp b/Source/JavaScriptCore/shell/ps5/PS5Main.cpp
+index 26a97d78c2..004571f573 100644
+--- a/Source/JavaScriptCore/shell/ps5/PS5Main.cpp
++++ b/Source/JavaScriptCore/shell/ps5/PS5Main.cpp
+@@ -115,6 +115,12 @@ static int runShell(int argc, char** argv)
+ 
+ int main(int argc, char** argv)
+ {
++    // The JIT is opt-in on PS5 (Options.cpp): on in this payload unless
++    // JSC_useJIT or --useJIT=... says otherwise. ICU data is not linked into
++    // the WPE build's jsc (stub data library): use the browser's copy.
++    setenv("JSC_useJIT", "true", 0);
++    setenv("ICU_DATA", "/data/ps5webkit/share/icu", 0);
++
+     // stdout/stderr are usually a socket: make output appear promptly.
+     setvbuf(stdout, nullptr, _IOLBF, 0);
+     setvbuf(stderr, nullptr, _IONBF, 0);
+diff --git a/Source/WTF/wtf/Threading.cpp b/Source/WTF/wtf/Threading.cpp
+index a7da0fd90b..fe11c92cca 100644
+--- a/Source/WTF/wtf/Threading.cpp
++++ b/Source/WTF/wtf/Threading.cpp
+@@ -102,6 +102,12 @@ static std::optional<size_t> LEGACY_NODELETE stackSize(ThreadType threadType)
+ #if PLATFORM(PLAYSTATION)
+     if (threadType == ThreadType::JavaScript)
+         return 512 * KB;
++#elif defined(PS5_PAYLOAD_SDK)
++    // PS5 payloads: the libc default stack is 64 KiB (ps5wk-child's crash
++    // guard widens it to 2 MiB, the jsc shell has no such wrapper). DFG/FTL
++    // compiler threads need more.
++    if (threadType == ThreadType::Compiler)
++        return 2 * MB;
+ #elif OS(DARWIN) && (ASAN_ENABLED || ASSERT_ENABLED)
+     if (threadType == ThreadType::Compiler)
+         return 1 * MB; // ASan / Debug build needs more stack space.
+diff --git a/Source/WTF/wtf/threads/Signals.cpp b/Source/WTF/wtf/threads/Signals.cpp
+index 7d91e27bce..547c4f545d 100644
+--- a/Source/WTF/wtf/threads/Signals.cpp
++++ b/Source/WTF/wtf/threads/Signals.cpp
+@@ -588,6 +588,13 @@ void SignalHandlers::finalize()
+             result = sigdelset(&action.sa_mask, g_wtfConfig.sigThreadSuspendResume);
+             RELEASE_ASSERT(!result);
+             action.sa_flags = SA_SIGINFO;
++#if defined(PS5_PAYLOAD_SDK)
++            // The payloads' crash guard gives every thread an alternate
++            // signal stack; use it, so a fault that is not ours (passed on
++            // to the guard as the old action) is still reported on a stack
++            // overflow.
++            action.sa_flags |= SA_ONSTACK;
++#endif
+             auto systemSignals = toSystemSignal(signal);
+             result = sigaction(std::get<0>(systemSignals), &action, &handlers.oldActions[offsetForSystemSignal(std::get<0>(systemSignals))]);
+             if (std::get<1>(systemSignals))

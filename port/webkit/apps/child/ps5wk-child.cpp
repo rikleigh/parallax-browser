@@ -50,6 +50,8 @@ void g_io_openssl_load(void*);
 extern size_t pas_page_malloc_num_allocated_bytes __attribute__((weak));
 extern size_t pas_compact_heap_reservation_size __attribute__((weak));
 extern size_t pas_compact_heap_reservation_bump __attribute__((weak));
+// JSC's executable memory pool (WebKit patch 0030; absent without the JIT).
+void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
 }
 
 static double nowMS()
@@ -193,6 +195,30 @@ static void setupEnvironment(const char* launchPath)
         snprintf(file, sizeof(file), "/data/ps5webkit/child-%d.env", uiPid);
         readEnvFile(file);
     }
+}
+
+// JavaScriptCore's JIT, opt-in on PS5 (WebKit patch 0030: a title can't
+// execute what it maps RWX; payloads can). On for WebProcesses unless
+// PS5WK_JIT says otherwise (child.env, or ps5wk-shot childenv=):
+//   PS5WK_JIT=0         LLInt only (the interpreter, as before the JIT)
+//   PS5WK_JIT=baseline  LLInt + Baseline JIT (+ the regexp JIT)
+//   PS5WK_JIT=dfg       + DFG
+//   PS5WK_JIT=1 / ftl   + FTL (all tiers, the default)
+// JSC_* variables (JSC options, e.g. JSC_useFTLJIT=false) in child.env win.
+static void configureJIT()
+{
+    const char* knob = getenv("PS5WK_JIT");
+    const char* mode = knob && *knob ? knob : "1";
+    bool off = !strcmp(mode, "0") || !strcmp(mode, "off");
+    setenv("JSC_useJIT", off ? "false" : "true", 0);
+    if (!strcmp(mode, "baseline"))
+        setenv("JSC_useDFGJIT", "false", 0);
+    if (!strcmp(mode, "baseline") || !strcmp(mode, "dfg"))
+        setenv("JSC_useFTLJIT", "false", 0);
+    const char* dfg = getenv("JSC_useDFGJIT");
+    const char* ftl = getenv("JSC_useFTLJIT");
+    LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s)", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),
+        dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "", ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "");
 }
 
 // Asks the title's video server what it decodes in hardware (HELLO with
@@ -351,16 +377,27 @@ static void* memLogger(void* data)
         double pas = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : -1;
         double compact = &pas_compact_heap_reservation_bump ? pas_compact_heap_reservation_bump / 1048576.0 : -1;
         double compactSize = &pas_compact_heap_reservation_size ? pas_compact_heap_reservation_size / 1048576.0 : -1;
+        char jitText[96] = "";
+        if (ps5wk_jit_memory) {
+            void *jitStart = nullptr, *jitEnd = nullptr;
+            size_t jitAllocated = 0, jitCommitted = 0;
+            ps5wk_jit_memory(&jitStart, &jitEnd, &jitAllocated, &jitCommitted);
+            if (jitStart)
+                snprintf(jitText, sizeof jitText, "; JIT code %.1f MB (committed %.1f of %.0f MB)", jitAllocated / 1048576.0,
+                    jitCommitted / 1048576.0, ((char*)jitEnd - (char*)jitStart) / 1048576.0);
+            else
+                snprintf(jitText, sizeof jitText, "; JIT off");
+        }
         char rssText[48];
         if (rss >= 0)
             snprintf(rssText, sizeof rssText, "rss %.1f MB, peak", rss / 1024.0);
         else
             snprintf(rssText, sizeof rssText, "peak rss");
-        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed",
+        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed%s",
             tag, (nowMS() - start) / 1e3, rssText, usage.ru_maxrss / 1024.0,
             flexible / 1048576.0, ((double)flexible - (double)startFlexible) / 1048576.0, pas, compact, compactSize,
             (long long)mmapLiveCount.load(), mmapLiveBytes.load() / 1048576.0, mmapPeakBytes.load() / 1048576.0, mmapLargest.load() / 1048576.0,
-            (unsigned long long)mmapCalls.load(), (unsigned long long)munmapCalls.load(), (unsigned long long)mmapFailures.load());
+            (unsigned long long)mmapCalls.load(), (unsigned long long)munmapCalls.load(), (unsigned long long)mmapFailures.load(), jitText);
     }
     return nullptr;
 }
@@ -409,6 +446,8 @@ int main(int, char**)
         return 1;
 
     setupEnvironment(path);
+    if (!network)
+        configureJIT();
     // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):
     // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock; hole-punch video frames
     // to its video server (wpe-ps5/PS5VideoServer.cpp): <dir>/video-<pid>.sock.

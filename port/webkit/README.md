@@ -10,7 +10,7 @@ pages painted on the CPU.
 - **Payload `ps5wk-child.elf` = WebProcess and NetworkProcess** (one
   multi-call ELF, `apps/child/ps5wk-child.cpp`), started by the title through
   the local elfldr with Spike 8's reversed rendezvous (`wpe-ps5/PS5LaunchProtocol.h`).
-  8 GB of flexible memory, JIT off (asm LLInt), Skia on the CPU, frames sent
+  8 GB of flexible memory, JavaScriptCore with the JIT (patch 0030, *JIT* below), Skia on the CPU, frames sent
   to the UIProcess as shared memory (WebKit's `RenderTargetSHMImage` path
   with `hardware-acceleration-policy = never`, no GL in payloads).
 - **Payload `ps5wk-shot.elf`**: a UIProcess on WPE's headless display, for
@@ -76,6 +76,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0018-ps5-single-web-process-and-no-decoder-drains | PS5 only: one WebProcess for all navigations (no process swaps, WebProcess cache or prewarming; `PS5WK_PROCESS_SWAPS=1` restores them): each payload costs ~300 of 8192 system page tables and swaps exhausted them; still-frame events are dropped before avdec too (`PS5WK_STILL_FRAME=1` keeps them): avdec's drain flushed libav's reference frames, so video stayed broken until the next keyframe |
 | 0019-ps5-gc-suspended-thread-registers | PS5 only: WTF's `registersFromUContext` takes the mcontext at ucontext +0x40 (the PS5 kernel's layout; the SDK header says +0x10). JSC's conservative GC read a suspended thread's stack pointer from the kernel's `mc_addr` instead: 0 (stack not scanned at all) or a stale fault address above the stack (wrapped size: libpas out-of-memory panic in `gatherConservativeRoots`). `captureStack` also scans the whole stack if a stack pointer is ever outside it (counted, logged after the threads resume) |
 | 0020-ps5-hardware-decoded-video-samples | PS5 only: samples from `ps5vdecproxy` (`video/x-raw(memory:PS5Remote)`, a picture decoded in the title) are not painted (canvas `drawImage` gets nothing) and `videoFrameForCurrentTime` returns null, instead of mapping a placeholder buffer |
+| 0030-ps5-jit | the JIT (Baseline, DFG, FTL, YARR) for PS5 payloads: off by default on PS5 (`useJIT=false` in `Options::overrideDefaults`, a title can map RWX memory but faults executing it), turned on by ps5wk-child for WebProcesses and by the jsc shell; a 128 MB executable pool (x86_64's 1 GB would cost ~512 page tables); WebAssembly built (B3 does not compile without it) but off at run time, no fast memory; DFG/FTL compiler threads get 2 MB stacks; WTF's fault handlers use the alternate signal stack and pass faults that are not theirs to the crash guard; `ps5wk_jit_memory()` for the `[mem]` line and the crash guard; jsc shell links the dependency libraries and reads ICU data from /data/ps5webkit/share/icu; `InlineCacheCompiler.h` includes `CCallHelpers.h` (LLIntOffsetsExtractor did not compile with the JIT on) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -147,6 +148,7 @@ Milestone 1 placeholder media interfaces) is gone.
 | `[render]` lines (WebProcess, every 5 s while rendering more than 25 updates) | rendering updates per second, average/max duration, how many were followed by the idle gap |
 | `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child: 7680x4320@60 when the title decodes in hardware (step 2b; the child asks the title's video server at start), else 1920x1080@60 (software: YouTube stays ≤1080p) |
 | `child.env`: `PS5WK_MEM_LOG=<s>` (0 = off), `PS5WK_CPU_LOG=all` | the WebProcess memory watchdog period (default 60 s); `[cpu]` lines every 5 s whatever the load |
+| `child.env`: `PS5WK_JIT=0` / `baseline` / `dfg` / `1` (default) | JavaScriptCore's JIT in WebProcesses (see *JIT* below): off (LLInt only), up to Baseline, up to DFG, all tiers; any `JSC_<option>=...` line is passed to JSC as well |
 
 The children also set `WPE_SHELL_MEDIA_DISK_CACHE_PATH=/data/ps5webkit/home/cache/media`
 (progressive downloads buffer on disk; WebKit's default `/var/tmp` doesn't
@@ -854,6 +856,76 @@ Not done: YouTube's own 360/180 formats. Its player data says
 360 equirectangular, which will look wrong. Whether YouTube serves 360
 video at all to this browser (Safari user agent, no WebGL) is not checked.
 the site's JSON feed (exact projection) is not used yet.
+
+## JIT (patch 0030, 2026-10-28)
+
+JavaScriptCore's JIT runs in the WebProcess payload: Baseline, DFG, FTL
+and the regexp JIT (YARR). The executable memory is plain RWX anonymous memory,
+upstream's Linux/FreeBSD x86_64 model (`ExecutableAllocator`'s fixed pool,
+no W^X): payloads may execute it (Spike 1), and the dual-mapping
+`sceKernelJit*` route isn't needed. **The JIT is opt-in on PS5**
+(`useJIT=false` in JSC's defaults). A title can map RWX memory but faults
+when it executes it (Spike 1 title run: `jit-rwx ... executing faulted`).
+So the UIProcess title, ps5wk-shot and the NetworkProcess stay on the LLInt
+without any change of their own. `ps5wk-child` turns the JIT on for
+WebProcesses (`PS5WK_JIT`, see *Knobs*; the log says `JIT: on (...)`).
+
+- **Pool:** 128 MB reserved per WebProcess (upstream x86_64: 1 GB, about 512
+  page tables). `JSC_jitMemoryReservationSize=<bytes>` in child.env changes it.
+- **WebAssembly** is compiled in, because B3 (the FTL backend) doesn't build
+  without it upstream (`B3WasmStruct*`), and `ENABLE_WEBASSEMBLY_BBQJIT` alone
+  didn't compile either. It is off at run time (`useWasm=false`, no fast
+  memory: 4 GB+ reservations); `JSC_useWasm=true` turns it on, untested.
+- **Signal contexts:** everything in JSC that reads registers from a signal
+  goes through WTF's `registersFromUContext` (VM traps, thread suspension for
+  GC and the sampling profiler, the wasm fault handler). 0019 already moved it
+  to the PS5 kernel's layout, and nothing reads `uc_mcontext` directly. VM traps in
+  JIT code were checked on the console with both signal-based traps (the
+  default) and polling traps. With the JIT on, JSC installs SIGSEGV/SIGBUS
+  handlers (signal-based VM traps). 0030 runs them on the crash guard's alternate
+  stack (SA_ONSTACK), and faults that aren't JSC's go to the crash guard as
+  before. Its report names a pc in JIT code as `(JIT code +0x...)`.
+- **Build:** `build.sh` configures `JIT=1` by default (`JIT=0`: the LLInt-only
+  build as before). The executables grow by ~15 MB stripped (ps5wk-child 114 ->
+  129 MB, elfldr loads it in ~0.2 s as before; ps5browser 114 -> 129 MB, which
+  costs the title ~15 MB of flexible memory, since the image counts 1:1).
+
+Checked on the console (13.60, `spikes/04-jsc/jit-check.sh`: the WPE build's
+`jsc` as a payload, and `test/jit-ab.sh`: ps5wk-shot A/B):
+
+| | LLInt (`--useJIT=0`) | Baseline | DFG | FTL (default) |
+| --- | --- | --- | --- | --- |
+| Spike 4 bench, jsc payload: total | 3062 ms | 1505 ms | 511 ms | **440 ms** (7.0x) |
+| richards / deltablue / numeric / strings / alloc | 583 / 521 / 800 / 393 / 766 | 358 / 181 / 461 / 192 / 313 | 79 / 53 / 95 / 154 / 131 | 65 / 41 / 56 / 154 / 124 |
+| same bench as a page in the WebProcess (`test/jit-bench.html`) | 3014 ms | | | **398 ms** (7.6x) |
+
+- Correctness: `correctness.js` 30/30 with and without the JIT;
+  `jit-stress.js` (tier-up to DFG/FTL, OSR exits, exceptions through JIT
+  frames, GC from inside hot loops, watchpoint invalidation, regexp JIT,
+  stack overflow in JIT code) 16/16 in four modes (all tiers, no FTL,
+  eager tier-up without concurrent JIT, LLInt), and the checksums are the same
+  in every mode and on macOS's system jsc. `jit-watchdog.js`: an endless
+  DFG/FTL loop is terminated by the watchdog with signal and with polling traps.
+- Pages (ps5wk-shot, 2-3 runs per mode, `jit-ab.sh`): YouTube watch page,
+  BBC News, Reddit and Wikipedia load and paint with the JIT, with no crash and 0 failed
+  mmaps. A 12-load stress cycle over six pages in one WebProcess had no
+  termination (one Reddit `js_challenge` redirect is cancelled with and
+  without the JIT). Load events are mostly network-bound here: YouTube's `load`
+  event came 2.5–3.4 s after the start with the JIT against 3.1–6.5 s without.
+  The busy main thread (~1 core) after it is shorter: two 5 s windows of
+  1.11/0.74 cores against 1.00/1.00. BBC, Reddit and Wikipedia are within run-to-run
+  noise. Video in the harness (fake title decoder) dropped 2–3 frames during
+  load either way.
+- Memory: YouTube makes ~40 MB of JIT code (of 128 MB; code GC brings it
+  back down: 43 -> 20 MB in the stress cycle). The WebProcess heap is larger
+  with the JIT: libpas pages on YouTube at 20 s were 589 MB (LLInt),
+  770 MB (Baseline only), 780 MB (up to DFG) and 885 MB (all tiers; 772 MB with
+  one compiler thread per tier, `JSC_numberOf{Baseline,DFG,FTL}CompilerThreads=1`).
+  After the 12-load cycle they were 625 MB against 1104 MB. The payload has 8 GB of
+  flexible memory, but on PS5 libpas never returns pages (0006), and
+  touched memory costs page tables: the kernel's `page table CPU` count with
+  ps5wk-shot + NetworkProcess + WebProcess peaked at ~6575/8192 with the JIT
+  against ~6290 without (idle 5023).
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

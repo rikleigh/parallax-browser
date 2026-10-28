@@ -8,6 +8,9 @@
 #
 # Output: toolchain/wpe-webkit/shots/<time>.log and .ppm/.png (sips).
 # The ELFs are stripped copies of the build (debug info stays on the Mac).
+# BLD=<build dir>; CHILD_REMOTE=<path on the console> uploads the child there
+# and passes child=<path> (a second build next to the shared one, e.g.
+# CHILD_REMOTE=/data/ps5webkit/jit/ps5wk-child.elf); SHOT_OUT=<dir> for logs.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -18,7 +21,8 @@ BLD="${BLD:-$WK/build}"
 URL="${1:-https://example.com/}"
 TIMEOUT="${2:-150}"
 FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
-OUTD="$WK/shots"; mkdir -p "$OUTD"
+OUTD="${SHOT_OUT:-$WK/shots}"; mkdir -p "$OUTD"
+CHILD_REMOTE="${CHILD_REMOTE:-/data/ps5webkit/ps5wk-child.elf}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG="$OUTD/$STAMP.log"
 
@@ -36,12 +40,12 @@ if ! curl -s --max-time 5 "$FTP/data/ps5webkit/share/icu/" | grep -q icudt76l.da
     curl -s --ftp-create-dirs -T "$ICUDAT" "$FTP/data/ps5webkit/share/icu/icudt76l.dat"
 fi
 if [[ -z ${SKIP_UPLOAD:-} ]]; then
-    echo "==> uploading ps5wk-child.elf to /data/ps5webkit/ (FTP)"
-    curl -s --ftp-create-dirs -T "$OUTD/stripped/ps5wk-child.elf" "$FTP/data/ps5webkit/ps5wk-child.elf"
+    echo "==> uploading ps5wk-child.elf to $CHILD_REMOTE (FTP)"
+    curl -s --ftp-create-dirs -T "$OUTD/stripped/ps5wk-child.elf" "$FTP$CHILD_REMOTE"
 fi
 
 echo "==> ps5wk-shot $URL (timeout $TIMEOUT s)" | tee "$LOG"
-{ cat "$OUTD/stripped/ps5wk-shot.elf"; printf 'url=%s timeout=%s %s %s\n' "$URL" "$TIMEOUT" "${SHOT_ARGS:-}" "${SHOT_DEBUG:+debug=$SHOT_DEBUG}"; } |
+{ cat "$OUTD/stripped/ps5wk-shot.elf"; printf 'url=%s timeout=%s child=%s %s %s\n' "$URL" "$TIMEOUT" "$CHILD_REMOTE" "${SHOT_ARGS:-}" "${SHOT_DEBUG:+debug=$SHOT_DEBUG}"; } |
     socat -t $((TIMEOUT + 60)) -T $((TIMEOUT + 60)) - "TCP:$PS5_HOST:$PS5_PORT" 2>&1 | tee -a "$LOG" | grep -v '^THUMB ' || true
 
 grep '^THUMB ' "$LOG" | cut -c7- | tr -d '\n' | base64 -D > "$OUTD/$STAMP.ppm" 2>/dev/null || true
