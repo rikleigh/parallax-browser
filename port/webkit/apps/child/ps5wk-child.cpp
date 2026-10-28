@@ -250,7 +250,8 @@ int main(int, char**)
 
     setupEnvironment();
     // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):
-    // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock.
+    // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock; hole-punch video frames
+    // to its video server (wpe-ps5/PS5VideoServer.cpp): <dir>/video-<pid>.sock.
     if (!network) {
         char audioPath[256];
         snprintf(audioPath, sizeof(audioPath), "%s", path);
@@ -259,6 +260,8 @@ int main(int, char**)
             if (sscanf(slash + 1, "ui-%d.sock", &uiPid) == 1) {
                 snprintf(slash + 1, sizeof(audioPath) - (slash + 1 - audioPath), "audio-%d.sock", uiPid);
                 setenv("PS5WK_AUDIO_SOCKET", audioPath, 0);
+                snprintf(slash + 1, sizeof(audioPath) - (slash + 1 - audioPath), "video-%d.sock", uiPid);
+                setenv("PS5WK_VIDEO_SOCKET", audioPath, 0);
             }
         }
     }

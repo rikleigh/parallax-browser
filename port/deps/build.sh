@@ -693,8 +693,9 @@ GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions 
 # flags; a missing deinterlace/videobalance is a missing-plugin message, which
 # WebKit turns into MEDIA_ERR_SRC_NOT_SUPPORTED. audiofx = scaletempo for
 # playbackRate with preserved pitch.)
-# Plus our own static plugin "ps5audio" (gst/gstps5audiosink.c, sceAudioOut),
-# compiled into the registration archive below.
+# Plus our own static plugins "ps5audio" (gst/gstps5audiosink.c, audio to the
+# title) and "ps5video" (gst/gstps5videosink.c, hole-punch video frames to the
+# title), compiled into the registration archive below.
 
 # libgstreamer-full-1.0.a: every libgst*-1.0.a, the plugins above, the
 # registration object and FFmpeg/dav1d merged into one archive (what
@@ -710,7 +711,9 @@ step_gst_full() {
         -c "$HERE/gst/gststaticplugins.c" -o "$b/gststaticplugins.o"
     prospero-clang $CFLAGS_COMMON -DGST_PLUGIN_BUILD_STATIC $("$PKGCONF" --cflags gstreamer-audio-1.0) \
         -c "$HERE/gst/gstps5audiosink.c" -o "$b/gstps5audiosink.o"
-    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o" "$b/gstps5audiosink.o"
+    prospero-clang $CFLAGS_COMMON -DGST_PLUGIN_BUILD_STATIC $("$PKGCONF" --cflags gstreamer-video-1.0) \
+        -c "$HERE/gst/gstps5videosink.c" -o "$b/gstps5videosink.o"
+    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o" "$b/gstps5audiosink.o" "$b/gstps5videosink.o"
     mri="$b/full.mri"
     { echo "CREATE $lib/libgstreamer-full-1.0.a"
       echo "ADDLIB $b/libgststaticplugins.a"

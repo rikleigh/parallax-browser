@@ -36,6 +36,7 @@
 #include <WPEProcessManagerPS5.h>
 #include "../common/crashguard.h"
 #include "../common/ps5audioserver.h"
+#include <PS5VideoServer.h>
 
 void g_io_openssl_load(void*);
 
@@ -139,7 +140,8 @@ static void report(void)
     gsize size = 0;
     const guint8* p = g_bytes_get_data(lastPixels, &size);
     guint64 hash = 1469598103934665603ull;
-    guint64 nonWhite = 0, total = (guint64)lastWidth * lastHeight;
+    guint64 nonWhite = 0, transparent = 0, total = (guint64)lastWidth * lastHeight;
+    int hx0 = lastWidth, hy0 = lastHeight, hx1 = -1, hy1 = -1;
     for (int y = 0; y < lastHeight; y++) {
         const guint8* row = p + (size_t)y * lastStride;
         for (int x = 0; x < lastWidth; x++) {
@@ -148,8 +150,18 @@ static void report(void)
                 hash = (hash ^ px[c]) * 1099511628211ull;
             if (px[0] != p[0] || px[1] != p[1] || px[2] != p[2])
                 nonWhite++; // differs from the top-left pixel (the background)
+            if (!px[3]) { // transparent: a hole punched for a <video>
+                transparent++;
+                if (x < hx0) hx0 = x;
+                if (y < hy0) hy0 = y;
+                if (x > hx1) hx1 = x;
+                if (y > hy1) hy1 = y;
+            }
         }
     }
+    if (transparent)
+        printf("RESULT ps5wk-shot holes INFO %.2f%% of pixels transparent, bounding box %dx%d+%d+%d\n", 100.0 * transparent / total,
+            hx1 - hx0 + 1, hy1 - hy0 + 1, hx0, hy0);
     gboolean painted = nonWhite * 1000 > total && nonWhite < total; // > 0.1% not background
     RESULT("paint", painted, "%dx%d, %u frames, first at %.1f s, fnv64 %016llx, %.2f%% of pixels differ from the background", lastWidth, lastHeight,
         framesRendered, (firstFrameTime - startTime) / 1e6, (unsigned long long)hash, total ? 100.0 * nonWhite / total : 0.0);
@@ -333,6 +345,8 @@ int main(void)
     /* WebProcess audio: consumed at the real-time rate without sceAudioOut
      * (a payload's sceAudioOut use is never released: ps5audioserver.c). */
     ps5wk_audio_server_start(PS5WK_AUDIO_NULL);
+    /* Hole-punch video frames: consumed at 60 Hz, logged ([video] lines). */
+    ps5wk_video_server_start_null();
     WPEProcessManager* manager = wpe_process_manager_ps5_new(child);
     wpe_process_manager_set_default(manager);
 

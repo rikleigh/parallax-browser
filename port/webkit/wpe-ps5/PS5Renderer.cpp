@@ -19,13 +19,15 @@
 #include "config.h"
 #include "PS5Renderer.h"
 
+#include "PS5VideoServer.h"
 #include <algorithm>
 #include <cmath>
 #include <epoxy/egl.h>
 #include <epoxy/gl.h>
-#include <glib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 // GL is reached through libepoxy. In the title its dlopen()/dlsym() resolve
 // to the statically linked ps5-opengl (port/webkit/apps/title/dlshim.c).
@@ -36,7 +38,13 @@ PS5Renderer& PS5Renderer::singleton()
     return renderer;
 }
 
-static const char* kVertexShader = R"(#version 330 core
+static int64_t nowUS()
+{
+    return g_get_monotonic_time();
+}
+
+// A quad at rect (NDC); uv (0,0) is the top-left of the texture.
+static const char* kVertexShader = R"(#version 430 core
 uniform vec4 rect; // x0 y0 x1 y1 in NDC
 out vec2 uv;
 void main()
@@ -47,7 +55,7 @@ void main()
 }
 )";
 
-static const char* kFragmentShader = R"(#version 330 core
+static const char* kFragmentShader = R"(#version 430 core
 uniform sampler2D tex;
 uniform int opaque_;
 in vec2 uv;
@@ -56,6 +64,73 @@ void main()
 {
     vec4 c = texture(tex, uv);
     color = opaque_ != 0 ? vec4(c.rgb, 1.0) : c;
+}
+)";
+
+// The page straight from its persistent GL buffer (premultiplied BGRA rows,
+// as the WebProcess painted them). pageRect: where the page sits on the
+// screen in pixels, top-down.
+static const char* kPageFragmentShader = R"(#version 430 core
+layout(std430, binding = 1) readonly buffer Page { uint px[]; };
+uniform vec4 pageRect;
+uniform ivec2 pageSize;
+uniform int pageStride; // in pixels
+uniform int screenHeight;
+out vec4 color;
+void main()
+{
+    vec2 s = vec2(gl_FragCoord.x, float(screenHeight) - gl_FragCoord.y);
+    ivec2 p = clamp(ivec2((s - pageRect.xy) * vec2(pageSize) / pageRect.zw), ivec2(0), pageSize - 1);
+    color = unpackUnorm4x8(px[p.y * pageStride + p.x]).zyxw;
+}
+)";
+
+// A whole-target triangle (for the YUV -> RGBA pass).
+static const char* kFullscreenVertexShader = R"(#version 430 core
+void main()
+{
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+// I420 or NV12 from the frame's GL buffer (a copy of the WebProcess's
+// shared-memory slot) to RGBA, one fragment per pixel; texture row 0 is the
+// picture's top row (as with Spike 9's decoder frames).
+static const char* kConvertFragmentShader = R"(#version 430 core
+layout(std430, binding = 0) readonly buffer Frame { uint d[]; };
+uniform int format_;   // 1 = I420, 2 = NV12
+uniform ivec3 strides;
+uniform ivec3 offsets;
+uniform int color_;    // bit 0: BT.709 (else BT.601), bit 1: full range
+out vec4 o;
+float b8(int a) { return float((d[a >> 2] >> ((a & 3) * 8)) & 0xffu) / 255.0; }
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float y = b8(offsets.x + p.y * strides.x + p.x);
+    int cy = p.y >> 1, cx = p.x >> 1;
+    float u, v;
+    if (format_ == 2) {
+        int c = offsets.y + cy * strides.y + cx * 2;
+        u = b8(c);
+        v = b8(c + 1);
+    } else {
+        u = b8(offsets.y + cy * strides.y + cx);
+        v = b8(offsets.z + cy * strides.z + cx);
+    }
+    if ((color_ & 2) == 0) {
+        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+        u = (u - 0.5) * (255.0 / 224.0);
+        v = (v - 0.5) * (255.0 / 224.0);
+    } else {
+        u -= 0.5;
+        v -= 0.5;
+    }
+    vec3 rgb = (color_ & 1) != 0
+        ? vec3(y + 1.5748 * v, y - 0.1873 * u - 0.4681 * v, y + 1.8556 * u)
+        : vec3(y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u);
+    o = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }
 )";
 
@@ -74,27 +149,63 @@ static GLuint compile(GLenum type, const char* source, char* error, unsigned err
     return shader;
 }
 
-bool PS5Renderer::createPrograms(char* error, unsigned errorSize)
+static GLuint link(const char* vertex, const char* fragment, char* error, unsigned errorSize)
 {
-    GLuint vs = compile(GL_VERTEX_SHADER, kVertexShader, error, errorSize);
-    GLuint fs = vs ? compile(GL_FRAGMENT_SHADER, kFragmentShader, error, errorSize) : 0;
-    if (!vs || !fs)
-        return false;
-    m_program = glCreateProgram();
-    glAttachShader(m_program, vs);
-    glAttachShader(m_program, fs);
-    glLinkProgram(m_program);
+    GLuint vs = compile(GL_VERTEX_SHADER, vertex, error, errorSize);
+    GLuint fs = vs ? compile(GL_FRAGMENT_SHADER, fragment, error, errorSize) : 0;
+    if (!vs || !fs) {
+        if (vs)
+            glDeleteShader(vs);
+        return 0;
+    }
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
     glDeleteShader(vs);
     glDeleteShader(fs);
     GLint ok = 0;
-    glGetProgramiv(m_program, GL_LINK_STATUS, &ok);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
     if (!ok) {
-        glGetProgramInfoLog(m_program, errorSize, nullptr, error);
-        return false;
+        glGetProgramInfoLog(program, errorSize, nullptr, error);
+        glDeleteProgram(program);
+        return 0;
     }
+    return program;
+}
+
+bool PS5Renderer::createPrograms(char* error, unsigned errorSize)
+{
+    m_program = link(kVertexShader, kFragmentShader, error, errorSize);
+    if (!m_program)
+        return false;
     m_uRect = glGetUniformLocation(m_program, "rect");
     m_uTexture = glGetUniformLocation(m_program, "tex");
     m_uOpaque = glGetUniformLocation(m_program, "opaque_");
+
+    char pageError[512] = { };
+    m_pageProgram = link(kVertexShader, kPageFragmentShader, pageError, sizeof(pageError));
+    if (m_pageProgram) {
+        m_uPageNDC = glGetUniformLocation(m_pageProgram, "rect");
+        m_uPageRect = glGetUniformLocation(m_pageProgram, "pageRect");
+        m_uPageSize = glGetUniformLocation(m_pageProgram, "pageSize");
+        m_uPageStride = glGetUniformLocation(m_pageProgram, "pageStride");
+        m_uScreenHeight = glGetUniformLocation(m_pageProgram, "screenHeight");
+    } else {
+        g_message("[wpe-ps5] page buffer shader failed (%s): page as a texture", pageError);
+        m_pageAsTexture = true;
+    }
+
+    char convertError[512] = { };
+    m_convertProgram = link(kFullscreenVertexShader, kConvertFragmentShader, convertError, sizeof(convertError));
+    if (m_convertProgram) {
+        m_uFormat = glGetUniformLocation(m_convertProgram, "format_");
+        m_uStrides = glGetUniformLocation(m_convertProgram, "strides");
+        m_uOffsets = glGetUniformLocation(m_convertProgram, "offsets");
+        m_uColor = glGetUniformLocation(m_convertProgram, "color_");
+    } else
+        g_message("[wpe-ps5] YUV shader failed (%s): no hole-punch video", convertError);
+
     glGenVertexArrays(1, &m_vao);
     return true;
 }
@@ -121,11 +232,54 @@ static void makePointer(uint8_t* rgba, int size)
 
 static constexpr int pointerSize = 40;
 
+static double threadCPUSeconds(pthread_t thread)
+{
+    clockid_t clock;
+    struct timespec ts;
+    if (pthread_getcpuclockid(thread, &clock) || clock_gettime(clock, &ts))
+        return -1;
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+double PS5Renderer::renderThreadCPUSeconds() const
+{
+    return m_initialized ? threadCPUSeconds(m_thread) : -1;
+}
+
 bool PS5Renderer::initialize(char* error, unsigned errorSize)
 {
     if (m_initialized)
         return true;
+    g_mutex_init(&m_lock);
+    g_cond_init(&m_cond);
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 1 << 20);
+    if (pthread_create(&m_thread, &attributes, threadEntry, this)) {
+        snprintf(error, errorSize, "render thread: pthread_create failed");
+        return false;
+    }
+    g_mutex_lock(&m_lock);
+    while (!m_initDone)
+        g_cond_wait(&m_cond, &m_lock);
+    g_mutex_unlock(&m_lock);
+    if (!m_initOK) {
+        snprintf(error, errorSize, "%s", m_initError);
+        return false;
+    }
+    m_initialized = true;
+    PS5VideoServer::start([] { PS5Renderer::singleton().wake(); });
+    return true;
+}
 
+void* PS5Renderer::threadEntry(void* data)
+{
+    static_cast<PS5Renderer*>(data)->threadMain();
+    return nullptr;
+}
+
+bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
+{
     EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (display == EGL_NO_DISPLAY || !eglInitialize(display, nullptr, nullptr)) {
         snprintf(error, errorSize, "eglInitialize failed (0x%04x)", eglGetError());
@@ -163,6 +317,9 @@ bool PS5Renderer::initialize(char* error, unsigned errorSize)
     }
     eglSwapInterval(display, 1);
 
+    struct stat st;
+    if (!stat("/data/ps5webkit/page-texture", &st))
+        m_pageAsTexture = true;
     if (!createPrograms(error, errorSize))
         return false;
 
@@ -184,151 +341,497 @@ bool PS5Renderer::initialize(char* error, unsigned errorSize)
     m_eglDisplay = display;
     m_eglSurface = surface;
     m_eglContext = context;
-    m_initialized = true;
 
     // First frame: black, so the TV shows the title is alive.
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     eglSwapBuffers(display, surface);
-    g_message("PS5Renderer: EGL %s, GL %s, %dx%d", eglQueryString(display, EGL_VERSION),
-        reinterpret_cast<const char*>(glGetString(GL_VERSION)), m_width, m_height);
+    g_message("[wpe-ps5] PS5Renderer: EGL %s, GL %s, %dx%d, render thread; page %s", eglQueryString(display, EGL_VERSION),
+        reinterpret_cast<const char*>(glGetString(GL_VERSION)), m_width, m_height,
+        m_pageAsTexture ? "as a texture (glTexSubImage2D)" : "in a persistent GL buffer");
     return true;
 }
 
-// Timing of the page path (Milestone 2: video frames pass through here),
-// logged every 5 s while more than 25 frames went through:
-// "[present] N uploads (x/s), upload avg/max ms (MB/frame), N swaps, swap avg/max ms".
-static struct {
-    gint64 windowStart;
-    unsigned uploads, swaps;
-    double uploadMS, uploadMaxMS, swapMS, swapMaxMS, uploadBytes;
-} stats;
-
-static void maybeLogStats(gint64 now)
+void PS5Renderer::submitPage(const uint8_t* data, int width, int height, unsigned stride, const Rect* damage, unsigned damageCount,
+    void (*done)(void*), void* userData)
 {
-    if (!stats.windowStart)
-        stats.windowStart = now;
-    double seconds = (now - stats.windowStart) / 1e6;
-    if (seconds < 5)
+    if (!m_initialized || !data || width <= 0 || height <= 0) {
+        if (done)
+            done(userData);
         return;
-    if (stats.uploads > 25)
-        g_message("[wpe-ps5] [present] %u uploads (%.1f/s), upload %.1f ms avg %.1f max (%.2f MB/frame), %u swaps (%.1f/s), swap %.1f ms avg %.1f max",
-            stats.uploads, stats.uploads / seconds, stats.uploadMS / stats.uploads, stats.uploadMaxMS, stats.uploadBytes / stats.uploads / 1048576.0,
-            stats.swaps, stats.swaps / seconds, stats.swaps ? stats.swapMS / stats.swaps : 0.0, stats.swapMaxMS);
-    stats = { };
-    stats.windowStart = now;
-}
-
-void PS5Renderer::uploadPage(const uint8_t* data, int width, int height, unsigned stride, const Rect* damage, unsigned damageCount)
-{
-    if (!m_initialized || !data || width <= 0 || height <= 0)
-        return;
-    gint64 uploadStart = g_get_monotonic_time();
-    double bytes = 0;
-
-    glBindTexture(GL_TEXTURE_2D, m_pageTexture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(stride / 4));
-    if (width != m_pageWidth || height != m_pageHeight) {
-        // New size: allocate and upload everything.
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, data);
-        bytes = 4.0 * width * height;
-        m_pageWidth = width;
-        m_pageHeight = height;
-    } else if (!damageCount) {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, data);
-        bytes = 4.0 * width * height;
-    } else {
-        for (unsigned i = 0; i < damageCount; i++) {
-            int x0 = std::max(0, damage[i].x), y0 = std::max(0, damage[i].y);
-            int x1 = std::min(width, damage[i].x + damage[i].width);
-            int y1 = std::min(height, damage[i].y + damage[i].height);
-            if (x1 <= x0 || y1 <= y0)
-                continue;
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x1 - x0, y1 - y0, GL_BGRA, GL_UNSIGNED_BYTE,
-                data + static_cast<size_t>(y0) * stride + static_cast<size_t>(x0) * 4);
-            bytes += 4.0 * (x1 - x0) * (y1 - y0);
-        }
     }
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    gint64 now = g_get_monotonic_time();
-    double ms = (now - uploadStart) / 1000.0;
-    stats.uploads++;
-    stats.uploadMS += ms;
-    stats.uploadMaxMS = std::max(stats.uploadMaxMS, ms);
-    stats.uploadBytes += bytes;
-    maybeLogStats(now);
+    Rect* copy = damageCount ? static_cast<Rect*>(g_memdup2(damage, sizeof(Rect) * damageCount)) : nullptr;
+    g_mutex_lock(&m_lock);
+    // WebKit waits for each frame before it sends the next; if one were
+    // still queued, wait for the render thread to take it.
+    while (m_pageJob.pending)
+        g_cond_wait(&m_cond, &m_lock);
+    m_pageJob = { true, data, width, height, stride, copy, damageCount, done, userData };
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
 }
 
 void PS5Renderer::present(bool pointerVisible, double pointerX, double pointerY)
 {
     if (!m_initialized)
         return;
+    g_mutex_lock(&m_lock);
+    m_pointerVisible = pointerVisible;
+    m_pointerX = pointerX;
+    m_pointerY = pointerY;
+    m_frameRequested = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
 
+void PS5Renderer::wake()
+{
+    g_mutex_lock(&m_lock);
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+void PS5Renderer::requestCapture(const char* path)
+{
+    g_mutex_lock(&m_lock);
+    g_free(m_capturePath);
+    m_capturePath = g_strdup(path);
+    m_frameRequested = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+// Timing, logged every 5 s while more than 25 frames went out:
+// "[present] N frames (x/s), render a/b ms (avg/max, CPU time on the render
+// thread before the swap), swap c/d ms, vsync interval e ms; N page uploads,
+// f/g ms, MB per upload; video: N frames converted, h ms".
+static struct {
+    int64_t windowStart;
+    unsigned frames, uploads, videoFrames, intervals;
+    double renderMS, renderMaxMS, swapMS, swapMaxMS, uploadMS, uploadMaxMS, uploadBytes, videoMS, videoMaxMS, intervalMS;
+} stats;
+
+static void maybeLogStats(int64_t now)
+{
+    if (!stats.windowStart)
+        stats.windowStart = now;
+    double seconds = (now - stats.windowStart) / 1e6;
+    if (seconds < 5)
+        return;
+    if (stats.frames > 25) {
+        g_message("[wpe-ps5] [present] %u frames (%.1f/s), render %.2f ms avg %.1f max, swap %.1f ms avg %.1f max, vsync interval %.2f ms; "
+                  "%u page uploads, %.1f ms avg %.1f max (%.2f MB each); %u video frames, copy+convert %.2f ms avg %.1f max",
+            stats.frames, stats.frames / seconds, stats.renderMS / stats.frames, stats.renderMaxMS, stats.swapMS / stats.frames, stats.swapMaxMS,
+            stats.intervals ? stats.intervalMS / stats.intervals : 0.0, stats.uploads, stats.uploads ? stats.uploadMS / stats.uploads : 0.0,
+            stats.uploadMaxMS, stats.uploads ? stats.uploadBytes / stats.uploads / 1048576.0 : 0.0, stats.videoFrames,
+            stats.videoFrames ? stats.videoMS / stats.videoFrames : 0.0, stats.videoMaxMS);
+    }
+    stats = { };
+    stats.windowStart = now;
+}
+
+void PS5Renderer::threadMain()
+{
+    char error[512] = { };
+    bool ok = initializeGL(error, sizeof(error));
+    g_mutex_lock(&m_lock);
+    m_initOK = ok;
+    snprintf(m_initError, sizeof(m_initError), "%s", error);
+    m_initDone = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+    if (!ok)
+        return;
+
+    for (;;) {
+        char* capturePath = nullptr;
+        g_mutex_lock(&m_lock);
+        for (;;) {
+            if (m_pageJob.pending || m_frameRequested || m_capturePath)
+                break;
+            int64_t now = nowUS();
+            if (m_videoActive) {
+                // Video: a frame every vsync (the swap waits for it). Should
+                // a swap ever return early, don't spin.
+                if (!m_lastSwapEnd || now - m_lastSwapEnd >= 10000)
+                    break;
+                g_cond_wait_until(&m_cond, &m_lock, m_lastSwapEnd + 12000);
+                continue;
+            }
+            // Idle: sleep until a frame or geometry change is due.
+            int64_t deadline = PS5VideoServer::nextDeadline();
+            if (deadline <= now + 2000)
+                break;
+            if (deadline == INT64_MAX)
+                g_cond_wait(&m_cond, &m_lock);
+            else
+                g_cond_wait_until(&m_cond, &m_lock, deadline - 2000);
+        }
+        m_job = m_pageJob;
+        m_pageJob.pending = false;
+        if (m_job.pending)
+            g_cond_broadcast(&m_cond); // a waiting submitPage
+        m_frameRequested = false;
+        m_drawPointer = m_pointerVisible;
+        m_drawPointerX = m_pointerX;
+        m_drawPointerY = m_pointerY;
+        capturePath = m_capturePath;
+        m_capturePath = nullptr;
+        g_mutex_unlock(&m_lock);
+
+        int64_t start = nowUS();
+        bool commitGeometry = m_job.pending;
+        if (m_job.pending)
+            copyPage();
+
+        // The frame drawn now goes on screen at the next vsync after the
+        // last swap returned. Keep a vsync grid (smoothed swap-return times)
+        // so frames keep a steady phase against it.
+        int64_t displayUS;
+        if (m_vsyncGrid && start - m_vsyncGrid < 3 * static_cast<int64_t>(m_periodUS))
+            displayUS = m_vsyncGrid + static_cast<int64_t>(m_periodUS);
+        else
+            displayUS = start + static_cast<int64_t>(m_periodUS);
+        m_videoDrawCount = 0;
+        if (m_convertProgram) {
+            m_videoActive = PS5VideoServer::consume(displayUS, static_cast<int64_t>(m_periodUS / 2), commitGeometry,
+                [this](PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data) { handleVideo(stream, frame, data); });
+        }
+
+        drawScene();
+        if (capturePath)
+            writeCapture(capturePath);
+        int64_t swapStart = nowUS();
+        eglSwapBuffers(m_eglDisplay, m_eglSurface);
+        int64_t swapEnd = nowUS();
+
+        // vsync grid: follow swap returns within a quarter period, else reset.
+        if (m_lastSwapEnd) {
+            double interval = swapEnd - m_lastSwapEnd;
+            if (interval > 12000 && interval < 22000) {
+                stats.intervals++;
+                stats.intervalMS += interval / 1000.0;
+                m_periodUS += (interval - m_periodUS) / 64;
+                m_periodUS = std::clamp(m_periodUS, 15500.0, 17500.0);
+            }
+        }
+        m_lastSwapEnd = swapEnd;
+        if (m_vsyncGrid) {
+            int64_t predicted = m_vsyncGrid;
+            while (predicted + m_periodUS / 2 < swapEnd)
+                predicted += static_cast<int64_t>(m_periodUS);
+            int64_t error = swapEnd - predicted;
+            m_vsyncGrid = std::abs(error) < m_periodUS / 4 ? predicted + error / 8 : swapEnd;
+        } else
+            m_vsyncGrid = swapEnd;
+
+        if (m_job.pending) {
+            g_free(m_job.damage);
+            if (m_job.done)
+                m_job.done(m_job.userData);
+            m_job = { };
+        }
+
+        double renderMS = (swapStart - start) / 1000.0, swapMS = (swapEnd - swapStart) / 1000.0;
+        stats.frames++;
+        stats.renderMS += renderMS;
+        stats.renderMaxMS = std::max(stats.renderMaxMS, renderMS);
+        stats.swapMS += swapMS;
+        stats.swapMaxMS = std::max(stats.swapMaxMS, swapMS);
+        maybeLogStats(swapEnd);
+    }
+}
+
+void PS5Renderer::copyPage()
+{
+    int64_t start = nowUS();
+    const PageJob& job = m_job;
+    double bytes = 0;
+    const int width = job.width, height = job.height;
+    const bool resized = width != m_pageWidth || height != m_pageHeight;
+
+    if (!m_pageAsTexture) {
+        size_t needed = static_cast<size_t>(width) * height * 4;
+        if (needed > m_pageBufferBytes) {
+            if (m_pageBuffer)
+                glDeleteBuffers(1, &m_pageBuffer);
+            const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+            glGenBuffers(1, &m_pageBuffer);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_pageBuffer);
+            glBufferStorage(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(needed), nullptr, flags);
+            m_pageMap = static_cast<uint8_t*>(glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(needed), flags));
+            if (!m_pageMap) {
+                g_message("[wpe-ps5] page buffer: map failed (GL error 0x%x): page as a texture", glGetError());
+                glDeleteBuffers(1, &m_pageBuffer);
+                m_pageBuffer = 0;
+                m_pageBufferBytes = 0;
+                m_pageAsTexture = true;
+            } else
+                m_pageBufferBytes = needed;
+        }
+    }
+
+    if (!m_pageAsTexture) {
+        // The previous frame's GPU work is done (the swap waits for it), so
+        // the rows can be overwritten in place.
+        const size_t dstStride = static_cast<size_t>(width) * 4;
+        auto copyRect = [&](int x0, int y0, int x1, int y1) {
+            const size_t rowBytes = static_cast<size_t>(x1 - x0) * 4;
+            for (int y = y0; y < y1; y++)
+                memcpy(m_pageMap + y * dstStride + x0 * 4, job.data + static_cast<size_t>(y) * job.stride + x0 * 4, rowBytes);
+            bytes += static_cast<double>(rowBytes) * (y1 - y0);
+        };
+        if (resized || !job.damageCount) {
+            if (job.stride == dstStride) {
+                memcpy(m_pageMap, job.data, dstStride * height);
+                bytes = static_cast<double>(dstStride) * height;
+            } else
+                copyRect(0, 0, width, height);
+        } else {
+            for (unsigned i = 0; i < job.damageCount; i++) {
+                int x0 = std::max(0, job.damage[i].x), y0 = std::max(0, job.damage[i].y);
+                int x1 = std::min(width, job.damage[i].x + job.damage[i].width);
+                int y1 = std::min(height, job.damage[i].y + job.damage[i].height);
+                if (x1 > x0 && y1 > y0)
+                    copyRect(x0, y0, x1, y1);
+            }
+        }
+    } else {
+        glBindTexture(GL_TEXTURE_2D, m_pageTexture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(job.stride / 4));
+        if (resized) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, job.data);
+            bytes = 4.0 * width * height;
+        } else if (!job.damageCount) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, job.data);
+            bytes = 4.0 * width * height;
+        } else {
+            for (unsigned i = 0; i < job.damageCount; i++) {
+                int x0 = std::max(0, job.damage[i].x), y0 = std::max(0, job.damage[i].y);
+                int x1 = std::min(width, job.damage[i].x + job.damage[i].width);
+                int y1 = std::min(height, job.damage[i].y + job.damage[i].height);
+                if (x1 <= x0 || y1 <= y0)
+                    continue;
+                glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x1 - x0, y1 - y0, GL_BGRA, GL_UNSIGNED_BYTE,
+                    job.data + static_cast<size_t>(y0) * job.stride + static_cast<size_t>(x0) * 4);
+                bytes += 4.0 * (x1 - x0) * (y1 - y0);
+            }
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
+    m_pageWidth = width;
+    m_pageHeight = height;
+
+    double ms = (nowUS() - start) / 1000.0;
+    stats.uploads++;
+    stats.uploadMS += ms;
+    stats.uploadMaxMS = std::max(stats.uploadMaxMS, ms);
+    stats.uploadBytes += bytes;
+}
+
+// The renderer's GL objects for one video stream: the frame's YUV bytes in
+// a persistent GL buffer (read by the conversion shader as an SSBO) and the
+// RGBA texture it is converted into. Step 2b: Videodec2 decodes straight
+// into such buffers (Spike 9), and the memcpy below goes away.
+struct PS5VideoGL {
+    GLuint buffer { 0 };
+    uint8_t* map { nullptr };
+    size_t bytes { 0 };
+    GLuint texture { 0 };
+    GLuint fbo { 0 };
+    int width { 0 }, height { 0 };
+    bool valid { false };
+};
+
+void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data)
+{
+    auto* gl = static_cast<PS5VideoGL*>(stream.consumerData);
+    if (stream.closed) {
+        if (gl) {
+            if (gl->buffer)
+                glDeleteBuffers(1, &gl->buffer);
+            if (gl->fbo)
+                glDeleteFramebuffers(1, &gl->fbo);
+            if (gl->texture)
+                glDeleteTextures(1, &gl->texture);
+            delete gl;
+            stream.consumerData = nullptr;
+        }
+        return;
+    }
+    if (!gl) {
+        gl = new PS5VideoGL;
+        stream.consumerData = gl;
+    }
+
+    if (frame && frame->width && frame->height && frame->width <= 8192 && frame->height <= 8192) {
+        int64_t start = nowUS();
+        const int w = static_cast<int>(frame->width), h = static_cast<int>(frame->height), ch = (h + 1) / 2;
+        size_t needed = frame->format == PS5WK_VFMT_NV12
+            ? frame->offset[1] + static_cast<size_t>(frame->stride[1]) * ch
+            : frame->offset[2] + static_cast<size_t>(frame->stride[2]) * ch;
+        needed = std::min<size_t>(needed, stream.slotBytes);
+        bool ok = true;
+        if (needed > gl->bytes) {
+            if (gl->buffer)
+                glDeleteBuffers(1, &gl->buffer);
+            size_t bytes = (needed + 0xffff) & ~static_cast<size_t>(0xffff);
+            const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+            glGenBuffers(1, &gl->buffer);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, gl->buffer);
+            glBufferStorage(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, flags);
+            gl->map = static_cast<uint8_t*>(glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), flags));
+            gl->bytes = gl->map ? bytes : 0;
+            if (!gl->map) {
+                g_message("[wpe-ps5] video stream %d: GL buffer of %zu bytes: map failed (0x%x)", stream.id, bytes, glGetError());
+                glDeleteBuffers(1, &gl->buffer);
+                gl->buffer = 0;
+                ok = false;
+            }
+        }
+        if (ok && (gl->width != w || gl->height != h)) {
+            if (!gl->texture)
+                glGenTextures(1, &gl->texture);
+            glBindTexture(GL_TEXTURE_2D, gl->texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            if (!gl->fbo)
+                glGenFramebuffers(1, &gl->fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, gl->fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl->texture, 0);
+            GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (status != GL_FRAMEBUFFER_COMPLETE) {
+                g_message("[wpe-ps5] video stream %d: framebuffer for %dx%d incomplete (0x%x)", stream.id, w, h, status);
+                ok = false;
+            } else {
+                gl->width = w;
+                gl->height = h;
+                g_message("[wpe-ps5] video stream %d: %dx%d %s", stream.id, w, h, frame->format == PS5WK_VFMT_NV12 ? "NV12" : "I420");
+            }
+        }
+        if (ok) {
+            memcpy(gl->map, data, needed);
+            glBindFramebuffer(GL_FRAMEBUFFER, gl->fbo);
+            glViewport(0, 0, w, h);
+            glDisable(GL_BLEND);
+            glDisable(GL_SCISSOR_TEST);
+            glUseProgram(m_convertProgram);
+            glBindVertexArray(m_vao);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gl->buffer);
+            glUniform1i(m_uFormat, static_cast<GLint>(frame->format));
+            glUniform3i(m_uStrides, static_cast<GLint>(frame->stride[0]), static_cast<GLint>(frame->stride[1]), static_cast<GLint>(frame->stride[2]));
+            glUniform3i(m_uOffsets, static_cast<GLint>(frame->offset[0]), static_cast<GLint>(frame->offset[1]), static_cast<GLint>(frame->offset[2]));
+            glUniform1i(m_uColor, static_cast<GLint>(frame->colorimetry));
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            gl->valid = true;
+        }
+        double ms = (nowUS() - start) / 1000.0;
+        stats.videoFrames++;
+        stats.videoMS += ms;
+        stats.videoMaxMS = std::max(stats.videoMaxMS, ms);
+    }
+
+    if (gl->valid && stream.geometry.visible && stream.geometry.width > 0 && stream.geometry.height > 0 && m_videoDrawCount < 8)
+        m_videoDraws[m_videoDrawCount++] = { gl->texture, stream.geometry.x, stream.geometry.y, stream.geometry.width, stream.geometry.height };
+}
+
+void PS5Renderer::drawScene()
+{
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, m_width, m_height);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(m_program);
     glBindVertexArray(m_vao);
     glActiveTexture(GL_TEXTURE0);
-    glUniform1i(m_uTexture, 0);
 
-    auto toNDC = [&](double x, double y, double w, double h) {
-        float x0 = static_cast<float>(x / m_width * 2.0 - 1.0);
-        float x1 = static_cast<float>((x + w) / m_width * 2.0 - 1.0);
-        float y0 = static_cast<float>(1.0 - (y + h) / m_height * 2.0);
-        float y1 = static_cast<float>(1.0 - y / m_height * 2.0);
-        glUniform4f(m_uRect, x0, y0, x1, y1);
+    auto ndc = [&](double x, double y, double w, double h, float out[4]) {
+        out[0] = static_cast<float>(x / m_width * 2.0 - 1.0);
+        out[1] = static_cast<float>(1.0 - (y + h) / m_height * 2.0);
+        out[2] = static_cast<float>((x + w) / m_width * 2.0 - 1.0);
+        out[3] = static_cast<float>(1.0 - y / m_height * 2.0);
     };
 
+    // Where the page goes: scaled to fit, centred (normally 1:1).
+    double scale = 1, pageX = 0, pageY = 0, pageW = 0, pageH = 0;
     if (m_pageWidth > 0) {
-        // Scale to fit, centred (the view is normally the surface size).
-        double scale = std::min(static_cast<double>(m_width) / m_pageWidth, static_cast<double>(m_height) / m_pageHeight);
-        double w = m_pageWidth * scale, h = m_pageHeight * scale;
-        glDisable(GL_BLEND);
-        glBindTexture(GL_TEXTURE_2D, m_pageTexture);
-        glUniform1i(m_uOpaque, 1);
-        toNDC((m_width - w) / 2, (m_height - h) / 2, w, h);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        scale = std::min(static_cast<double>(m_width) / m_pageWidth, static_cast<double>(m_height) / m_pageHeight);
+        pageW = m_pageWidth * scale;
+        pageH = m_pageHeight * scale;
+        pageX = (m_width - pageW) / 2;
+        pageY = (m_height - pageH) / 2;
     }
 
-    if (pointerVisible) {
+    // Videos under the page, clipped to it.
+    if (m_videoDrawCount && m_pageWidth > 0) {
+        glUseProgram(m_program);
+        glUniform1i(m_uTexture, 0);
+        glUniform1i(m_uOpaque, 1);
+        glDisable(GL_BLEND);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(static_cast<GLint>(pageX), static_cast<GLint>(m_height - pageY - pageH), static_cast<GLsizei>(pageW), static_cast<GLsizei>(pageH));
+        for (unsigned i = 0; i < m_videoDrawCount; i++) {
+            const auto& v = m_videoDraws[i];
+            float r[4];
+            ndc(pageX + v.x * scale, pageY + v.y * scale, v.width * scale, v.height * scale, r);
+            glBindTexture(GL_TEXTURE_2D, v.texture);
+            glUniform4f(m_uRect, r[0], r[1], r[2], r[3]);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+        glDisable(GL_SCISSOR_TEST);
+    }
+
+    // The page, premultiplied, over the videos (holes are transparent).
+    if (m_pageWidth > 0) {
+        float r[4];
+        ndc(pageX, pageY, pageW, pageH, r);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        glBindTexture(GL_TEXTURE_2D, m_pointerTexture);
-        glUniform1i(m_uOpaque, 0);
-        toNDC(pointerX - pointerSize / 2.0, pointerY - pointerSize / 2.0, pointerSize, pointerSize);
+        if (!m_pageAsTexture) {
+            glUseProgram(m_pageProgram);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_pageBuffer);
+            glUniform4f(m_uPageNDC, r[0], r[1], r[2], r[3]);
+            glUniform4f(m_uPageRect, static_cast<float>(pageX), static_cast<float>(pageY), static_cast<float>(pageW), static_cast<float>(pageH));
+            glUniform2i(m_uPageSize, m_pageWidth, m_pageHeight);
+            glUniform1i(m_uPageStride, m_pageWidth);
+            glUniform1i(m_uScreenHeight, m_height);
+        } else {
+            glUseProgram(m_program);
+            glUniform1i(m_uTexture, 0);
+            glUniform1i(m_uOpaque, 0);
+            glBindTexture(GL_TEXTURE_2D, m_pageTexture);
+            glUniform4f(m_uRect, r[0], r[1], r[2], r[3]);
+        }
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisable(GL_BLEND);
     }
 
-    if (m_capturePath)
-        writeCapture();
-
-    gint64 swapStart = g_get_monotonic_time();
-    eglSwapBuffers(m_eglDisplay, m_eglSurface);
-    double ms = (g_get_monotonic_time() - swapStart) / 1000.0;
-    stats.swaps++;
-    stats.swapMS += ms;
-    stats.swapMaxMS = std::max(stats.swapMaxMS, ms);
+    if (m_drawPointer) {
+        float r[4];
+        ndc(m_drawPointerX - pointerSize / 2.0, m_drawPointerY - pointerSize / 2.0, pointerSize, pointerSize, r);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(m_program);
+        glUniform1i(m_uTexture, 0);
+        glUniform1i(m_uOpaque, 0);
+        glBindTexture(GL_TEXTURE_2D, m_pointerTexture);
+        glUniform4f(m_uRect, r[0], r[1], r[2], r[3]);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    glDisable(GL_BLEND);
 }
 
-void PS5Renderer::requestCapture(const char* path)
+void PS5Renderer::writeCapture(char* path)
 {
-    g_free(m_capturePath);
-    m_capturePath = g_strdup(path);
-}
-
-void PS5Renderer::writeCapture()
-{
-    char* path = m_capturePath;
-    m_capturePath = nullptr;
     const int w = m_width, h = m_height;
     const int ow = w / 2, oh = h / 2;
-    gint64 start = g_get_monotonic_time();
+    int64_t start = nowUS();
     auto* rgba = static_cast<uint8_t*>(g_try_malloc(static_cast<size_t>(w) * h * 4));
     auto* rgb = static_cast<uint8_t*>(g_try_malloc(static_cast<size_t>(ow) * oh * 3));
     if (!rgba || !rgb) {
@@ -369,7 +872,7 @@ void PS5Renderer::writeCapture()
     }
     g_message("[wpe-ps5] SHOT %s %dx%d %s (gl error 0x%x, mean %.1f, %.1f%% non-black, %.0f ms)", path, ow, oh,
         ok ? "written" : "FAILED", glError, static_cast<double>(sum) / (static_cast<double>(ow) * oh * 3),
-        100.0 * nonBlack / (static_cast<double>(ow) * oh), (g_get_monotonic_time() - start) / 1000.0);
+        100.0 * nonBlack / (static_cast<double>(ow) * oh), (nowUS() - start) / 1000.0);
     g_free(rgba);
     g_free(rgb);
     g_free(path);

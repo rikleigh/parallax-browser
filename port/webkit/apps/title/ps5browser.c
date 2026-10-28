@@ -287,6 +287,22 @@ static gboolean shotAfterLoad(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* /data/ps5webkit/test-onload.js: evaluated in each test URL's page 2 s
+ * after it loaded (log-only runs: e.g. port/webkit/test/media/yt-consent.js
+ * answers YouTube's cookie dialog, which pauses the video). */
+static gboolean testOnload(gpointer data)
+{
+    (void)data;
+    gchar* script = NULL;
+    gsize length = 0;
+    if (g_file_get_contents("/data/ps5webkit/test-onload.js", &script, &length, NULL)) {
+        webkit_web_view_evaluate_javascript(webView, script, (gssize)length, NULL, "test-onload.js", NULL, NULL, NULL);
+        spike_log("test-onload.js evaluated (%zu bytes)", (size_t)length);
+        g_free(script);
+    }
+    return G_SOURCE_REMOVE;
+}
+
 static void testURLFinished(gboolean ok, const char* uri, const char* detail)
 {
     if (!testWaitingForLoad)
@@ -310,6 +326,7 @@ static void testURLFinished(gboolean ok, const char* uri, const char* detail)
     snprintf(names[slot][0], sizeof names[slot][0], "%.*s-2s", (int)(hostLength < 80 ? hostLength : 80), host);
     snprintf(names[slot][1], sizeof names[slot][1], "%.*s-10s", (int)(hostLength < 80 ? hostLength : 80), host);
     g_timeout_add(2000, shotAfterLoad, names[slot][0]);
+    g_timeout_add(2000, testOnload, NULL);
     g_timeout_add(10000, shotAfterLoad, names[slot][1]);
     testTimer = g_timeout_add(12000, testTimeout, NULL);
 }

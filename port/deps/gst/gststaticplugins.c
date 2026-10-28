@@ -26,7 +26,7 @@
     /* -bad */           X(videoparsersbad) X(mpegtsdemux) X(mpegpsdemux)    \
                          X(id3tag)                                           \
     /* gst-libav */      X(libav)                                            \
-    /* ours: sceAudioOut sink (gstps5audiosink.c) */ X(ps5audio)
+    /* ours: audio and hole-punch video to the title */ X(ps5audio) X(ps5video)
 
 #define DECLARE(name) GST_PLUGIN_STATIC_DECLARE(name);
 GST_PS5_PLUGINS(DECLARE)

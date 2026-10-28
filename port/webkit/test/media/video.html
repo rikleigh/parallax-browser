@@ -12,6 +12,14 @@ a{display:block;padding:16px 18px;border-radius:12px;background:#1f2633;color:#9
 a:focus,a:hover{background:#2d3a52;outline:3px solid #9cc7ff}
 video{width:1280px;height:720px;background:#000;display:block}
 #stats{font:20px monospace;color:#c8f0c8;margin:10px 0;white-space:pre}
+/* ?test=geometry: the video in a rounded clipping box with a label on top,
+   and the page scrolls by itself (hole-punch checks: position, clipping,
+   z-order, scrolling). */
+body.geometry{min-height:2400px}
+body.geometry #clip{position:relative;width:900px;height:420px;overflow:hidden;border-radius:40px;margin:40px 0 0 200px;outline:6px solid #ffb040}
+body.geometry video{width:1280px;height:720px;margin:-150px 0 0 -190px}
+#label{display:none}
+body.geometry #label{display:block;position:absolute;left:40px;top:40px;padding:14px 20px;background:rgba(0,0,0,.55);color:#fff;font:28px sans-serif;border-radius:10px}
 </style></head><body>
 <h1>Video test</h1>
 <ul>
@@ -22,13 +30,20 @@ video{width:1280px;height:720px;background:#000;display:block}
 <li><a href="?src=https://download.blender.org/durian/trailer/sintel_trailer-720p.mp4">Sintel trailer (web, MP4 720p)</a></li>
 <li><a href="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube: Big Buck Bunny 60 fps</a></li>
 <li><a href="https://www.youtube.com/watch?v=jNQXAC9IVRw">YouTube: Me at the zoo</a></li>
+<li><a href="?src=media/sync-1080p30-h264.mp4&amp;test=geometry">Clipped, overlaid, scrolling (1080p30)</a></li>
+<li><a href="https://www.youtube.com/watch?v=eRsGyueVLvQ">YouTube: Sintel (1080p24)</a></li>
 <li><a href="start.html">Start page</a></li>
 </ul>
-<video id="v" controls playsinline></video>
+<div id="clip"><video id="v" controls playsinline></video><div id="label">over the video</div></div>
 <div id="stats">pick a clip</div>
 <script>
 var v = document.getElementById('v'), stats = document.getElementById('stats');
-var src = new URLSearchParams(location.search).get('src');
+var params = new URLSearchParams(location.search), src = params.get('src');
+if (params.get('test') === 'geometry') {
+  document.body.className = 'geometry';
+  var down = false;
+  setInterval(function () { down = !down; window.scrollTo(0, down ? 160 : 0); console.log('GEOMETRY scrolled to ' + window.scrollY); }, 3000);
+}
 var last = null, fps = 0, log = [];
 if (src) {
   v.src = src;

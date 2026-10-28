@@ -22,6 +22,9 @@
 #include "GRefPtrWPE.h"
 
 #include "PS5Renderer.h"
+#include <pthread.h>
+#include <sys/resource.h>
+#include <time.h>
 #include "PS5Sce.h"
 #include "WPEExtensions.h"
 #include "WPEPS5Private.h"
@@ -109,6 +112,8 @@ struct _WPEDisplayPS5Private {
 WEBKIT_DEFINE_FINAL_TYPE_WITH_CODE(WPEDisplayPS5, wpe_display_ps5, WPE_TYPE_DISPLAY, WPEDisplay,
     wpeEnsureExtensionPointsRegistered();
     g_io_extension_point_implement(WPE_DISPLAY_EXTENSION_POINT_NAME, g_define_type_id, "ps5", 100))
+
+static gint64 s_mainPollUS; // time the main loop spent waiting in poll (main thread)
 
 static double nowSeconds()
 {
@@ -505,6 +510,40 @@ static gboolean wpeDisplayPS5Connect(WPEDisplay* display, GError** error)
         return G_SOURCE_CONTINUE;
     }, display, nullptr);
     g_source_attach(priv->padSource.get(), g_main_context_get_thread_default());
+
+    // Title load for the TV-test logs, every 5 s while it is above 2 %:
+    // main (UI) thread busy = wall time outside the main loop's poll (a
+    // poll function that times itself); process CPU from getrusage; thread
+    // CPU clocks where the system has them (-1 otherwise).
+    g_main_context_set_poll_func(g_main_context_default(), [](GPollFD* fds, guint n, gint timeout) -> gint {
+        gint64 start = g_get_monotonic_time();
+        gint result = g_poll(fds, n, timeout);
+        s_mainPollUS += g_get_monotonic_time() - start;
+        return result;
+    });
+    g_timeout_add_seconds(5, [](gpointer) -> gboolean {
+        static gint64 lastTime, lastPoll;
+        static double lastProcess = -1, lastRender = -1;
+        struct rusage usage;
+        double process = !getrusage(RUSAGE_SELF, &usage)
+            ? usage.ru_utime.tv_sec + usage.ru_stime.tv_sec + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6 : -1;
+        double render = PS5Renderer::singleton().renderThreadCPUSeconds();
+        gint64 now = g_get_monotonic_time(), poll = s_mainPollUS;
+        if (lastTime) {
+            double seconds = (now - lastTime) / 1e6;
+            double mainBusy = 1.0 - (poll - lastPoll) / 1e6 / seconds;
+            double processShare = process >= 0 && lastProcess >= 0 ? (process - lastProcess) / seconds : -1;
+            double renderShare = render >= 0 && lastRender >= 0 ? (render - lastRender) / seconds : -1;
+            if (mainBusy > 0.02 || processShare > 0.05)
+                PS5_LOG("[cpu] title: main thread busy %.0f %% (outside poll), process CPU %.2f cores, render thread CPU %.0f %%",
+                    100 * mainBusy, processShare, 100 * renderShare);
+        }
+        lastTime = now;
+        lastPoll = poll;
+        lastProcess = process;
+        lastRender = render;
+        return G_SOURCE_CONTINUE;
+    }, nullptr);
 
     // WebProcess and NetworkProcess are elfldr payloads (FEASIBILITY §4.8).
     priv->processManager = adoptGRef(wpe_process_manager_ps5_new(priv->childELF.c_str()));

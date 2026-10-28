@@ -18,7 +18,8 @@ pages painted on the CPU.
 
 Milestone 2 step 1 (2026-10-28): `<video>`/`<audio>` and MSE on GStreamer,
 software decoders in the WebProcess, audio played by the title (see
-*Media* below).
+*Media* below). Step 2a (same day): hole-punch video, the title draws the
+decoded frames under the page (see *Hole-punch video* below).
 
 No WebGL, WebXR, GPU process, Web Audio, WebRTC, speech, geolocation,
 sandbox, introspection, docs, journald or libbacktrace.
@@ -70,6 +71,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 
 | 0015-media-build-fixes-video-without-web-audio | ENABLE_VIDEO with Web Audio off: `platform/audio/gstreamer` on the include path (AudioDecoder.cpp includes it under USE(GSTREAMER)); no WEBCORE_EXPORT on a member of the exported `MediaSourcePrivate` (dllexport inside dllexport is an error with this toolchain); libpas uses libc's `backtrace()` on FreeBSD (its own stub clashed with libc.a's once GStreamer pulled `backtrace.o` in) |
 | 0016-ps5-software-video-paint-and-media-policy | PS5 only (`PS5_PAYLOAD_SDK`): AV1 not advertised (no hardware AV1; `PS5WK_MEDIA_AV1=1` advertises it), `PS5WK_MEDIA_VP9=0` hides VP9; avdec `max-threads` 4 (`PS5WK_DECODER_THREADS`), `max-errors` -1 (a reference-less frame after a flush doesn't end playback); playsink's `videoconvert` on 4 threads; video painting: the frame is scaled to the device-pixel size with GstVideoConverter (4 threads, linear) and wrapped zero-copy in an SkImage cached for the repaints of the same frame (Skia's raster bilinear scaling of 1080p cost ~30 ms per frame, ImageGStreamer copied the frame on every paint, and `convertSampleToImage` ran a conversion pipeline even when the format already matched); non-composited rendering updates longer than 6 ms are followed by an equal idle gap (NonCompositedFrameRenderer), so JavaScript timers and MSE appends still run while video plays |
+| 0017-ps5-hole-punch-video | PS5 only: `MediaPlayerPrivateGStreamer` makes `ps5videosink` (port/deps/gst) as the video sink (`PS5WK_HOLEPUNCH=0`: the step-1 path), `paint()` clears the video's rectangle to transparent and reports it to the sink (`ps5_video_sink_set_geometry`), canvas `drawImage` still gets the frame (`paintCurrentFrameInContext`), new samples no longer repaint the page (only the first one, for the hole), the streaming thread no longer waits for a paint; MSE `TrackQueue` water levels 1000/500 ms (were 200/100 ms: the busy main thread let the video run dry on YouTube) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -282,11 +284,149 @@ presents with a vsync-paced `eglSwapBuffers`. Frame completion goes back to
 the WebProcess after that, and the WebProcess's idle gap follows any update
 longer than 6 ms. The `[present]` and `[render]` lines measure each part.
 
-Still open: the TV test (picture and sound judged by the owner), title
-fps, YouTube 60 fps under its overlays (every video frame repaints the
-player's gradient/blur layers on the CPU; hole punching removes that), Opus
-in WebM for MSE, the 24 s without video frames once on YouTube after the
-consent dialog (audio and clock ran on).
+Still open after step 1 (the first three are addressed by step 2a, below):
+title fps, YouTube 60 fps under its overlays (every video frame repainted
+the player's gradient/blur layers on the CPU), the 24 s without video
+frames on YouTube after the consent dialog (audio and clock ran on); and
+Opus in WebM for MSE.
+
+## Hole-punch video (Milestone 2 step 2a, 2026-10-28)
+
+Step 1 painted every decoded frame into the page on the CPU: on YouTube
+each frame also repainted the player's overlays (about 7 page updates/s
+at 69 ms each in the TV test), and the title uploaded every page update as
+a texture (17.8 ms for 3.8 MB). Now the page gets a transparent hole and the
+title draws the frame under it.
+
+**WebProcess** (patch 0017, `port/deps/gst/gstps5videosink.c`):
+- `ps5videosink` (rank NONE; WebKit makes it by name) takes I420 or NV12
+  from avdec_* (playsink converts anything else), copies each frame into a
+  ring of 6 slots of anonymous shared memory (3 MB each, enough for 1080p
+  without reallocating; the fd goes to the title over SCM_RIGHTS) and sends a
+  128-byte FRAME message with the CLOCK_MONOTONIC time the frame is due.
+  The due time comes from the pipeline clock, which is the audio sink's when
+  there is audio (it counts what the title's sceAudioOut has played), with
+  the clock-to-monotonic offset smoothed (the audio clock steps in 5.3 ms
+  grains). The sink syncs 40 ms early (its `get_times` moves the start
+  time; playsink owns `ts-offset`), so frames reach the title ~37 ms ahead.
+  The title releases a slot as soon as it has copied it; no free slot for
+  100 ms drops the frame.
+- `paint()` clears the video's rectangle (`clearRect`, device-pixel snapped)
+  and calls `ps5_video_sink_set_geometry()`; the sink sends GEOMETRY when it
+  changes. Whatever the page paints after the video (controls, captions,
+  YouTube's gradients) stays on top of it; whatever clips the video
+  (overflow, rounded corners) covers it with opaque page pixels, so the
+  title needs no clip of its own. Rotated or mirrored videos fall back to
+  painting the frame into the page.
+- New samples still reach WebKit (`repaint-requested`: video size,
+  current-time tasks, canvas `drawImage`), but only the first one repaints
+  the page; the streaming thread no longer waits for the main thread.
+- `getVideoPlaybackQuality()` (YouTube's stats for nerds, `VIDEOSTATS`)
+  counts frames the title showed, and drops by the sink's QoS, by the title
+  and for lack of a slot (`stats` property).
+
+**Title** (`wpe-ps5/PS5VideoServer.cpp`, `PS5Renderer.cpp`):
+- One receiver thread per sink connection
+  (`/system_tmp/ps5wk/video-<UIProcess pid>.sock`, `PS5WK_VIDEO_SOCKET` in the
+  children) queues FRAME messages and maps the shared memory.
+- The render thread owns EGL/GL (the UI main thread no longer touches GL).
+  It sleeps until a page buffer, a pointer move or a due frame arrives, and
+  presents every vsync while a video is playing. For each video it shows the
+  newest frame due by the next vsync (plus half a frame), drops older ones,
+  memcpys the slot into a persistent GL buffer, releases the slot, and
+  converts I420/NV12 to an RGBA texture in one fragment pass (BT.601/709,
+  limited/full range from the caps). Then: videos at their rectangles, the
+  page blended over them (premultiplied; transparent only in the holes),
+  the pointer.
+- Geometry is applied together with the next page buffer (the hole and the
+  video move in the same frame), or after 100 ms without one.
+- The page itself now lives in a persistent, coherent GL buffer that the
+  fragment shader reads (`unpackUnorm4x8`), so a page update is a memcpy of
+  the damaged rows: 1.0 ms for a full 7.2 MB YouTube page, 0.0–0.1 ms for
+  the usual small updates (was `glTexSubImage2D`: 14.5–36 ms, ps5-opengl
+  tiles on the CPU at ~210 MB/s). The swap waits for the GPU (`ST_FLUSH_WAIT`),
+  so the next frame's copies never race the GPU.
+- `ps5wk-shot` runs the same server with a 60 Hz null consumer (`[video]`
+  lines) and reports the hole (`RESULT ps5wk-shot holes`).
+
+**Measured** (2026-10-28; harness = `ps5wk-shot` at 1920x1080 with the null
+consumer; title = log-only PPSA99020 runs, audio-silent):
+
+| | shown | dropped | WebProcess CPU | WebProcess `[render]` |
+|---|---|---|---|---|
+| harness, local 1080p30 H.264 (step 1: 0.91–1.05 cores) | 30.0/s | 1 at the start | 0.31 cores | 9/s, 1.2 ms |
+| harness, local 1080p60 H.264 (step 1: 1.59–1.95 cores) | 60.0/s | 2–3 at the start | 0.54 cores | 9/s, 1.2 ms |
+| harness, YouTube Big Buck Bunny, VP9 720p60 (inline player) | 60/s | 3 in 40 s, through the cookie dialog's pause | 1.2–1.3 cores while the page loads, then 0.43–0.65 | ~5/s |
+| harness, same at 1080p60 (`yt-1080.js`: `setPlaybackQualityRange`) | 60/s | 1 in 34 s | 1.5 cores while loading, then 0.68–0.92 | |
+| title, local 1080p60 H.264 | 59.5–59.9/s | ~1 per 5 s | 0.43 cores | 9/s, 0.9 ms |
+| title, local 1080p30 H.264 | 30.0/s | 0 after the start | | |
+| title, clipped/overlaid/scrolling test (`?test=geometry`) | 30.0/s | 0 after the start | 0.38 cores | 32/s, 0.7 ms |
+| title, YouTube Big Buck Bunny 720p60 | 44–55/s for the first 20 s (page still loading), then 59–60/s | 32 in 27 s, nearly all in the first 20 s | ~1.0 cores while loading, then 0.35–0.43 | 5/s, 14 ms |
+
+Title side, all runs: 59.9 frames/s presented while a video plays (vsync
+interval 16.68 ms: the TV runs at 59.94 Hz, so 60 fps content loses about
+one frame every 17 s), video copy+convert 0.47 ms per 1080p frame (0.27 ms
+at 720p), frames shown 0–5 ms after due on average, page updates 0.0–1.4 ms.
+Title process CPU (getrusage) 0.05–0.10 cores, and its main thread is busy
+under 1 % of the time (wall time outside the main loop's poll). Thread CPU
+clocks read 0 in a title, so the render thread is not broken out; its frame
+takes ~5 ms of wall time, nearly all of it waiting for the previous flip.
+Screenshots (title readback) confirmed position, rounded clipping, a
+translucent overlay over the video and scrolling.
+
+**Found on the way:**
+- **YouTube video stalled for 20–35 s after a pause** (step 1 saw "24 s
+  without video frames" too). WebKit's MSE `TrackQueue` keeps only 100–200 ms
+  of samples ahead, refilled from the main thread, which YouTube's
+  JavaScript (no JIT) blocks for longer. The video ran dry, WebKitMediaSrc
+  drained the decoder (still-frame events), QoS then had the decoder skip
+  ahead, and the sink waited for a frame 35 s in the future. With 1000/500 ms
+  water levels (0017) it played through the cookie dialog's pause without a
+  stall (harness, three runs).
+- playsink overwrites `ts-offset` on its sinks (its `av-offset`); hence
+  `get_times`.
+- A swapped-out WebProcess aborted once while exiting (the IPC thread's
+  `_exit` racing a thread whose `ThreadGlobalData` destructor reached
+  `Font::~Font` off the main thread: `MainThreadSharedTimer` RELEASE_ASSERT);
+  the crash guard caught it. Same family as the earlier `Font::~Font`
+  teardown abort; not in the video path.
+
+**Knobs:** `child.env`: `PS5WK_HOLEPUNCH=0` (frames painted into the page
+again, step 1). Title: `/data/ps5webkit/page-texture` (page as a texture,
+the old upload path); `/data/ps5webkit/test-onload.js` (evaluated in each
+test URL's page 2 s after it loads; `test/media/yt-consent.js` answers
+YouTube's cookie dialog in log-only runs). Test page:
+`video.html?src=...&test=geometry` (rounded clipping box, a label over the
+video, the page scrolls by 160 px every 3 s). Harness scripts:
+`test/media/pause-resume.js`, `test/media/yt-1080.js`.
+
+### Step 2b: Videodec2 in the title (plan, not built)
+
+The compositing path stays; only where frames come from changes.
+1. **WebProcess:** a proxy decoder element, `ps5vdecproxy` (klass
+   Codec/Decoder/Video, rank above avdec_* for H.264, HEVC 8/10-bit and VP9
+   from the parsers, AU-aligned byte-stream), sends each access unit to the
+   title over the same connection (AUs in the shared-memory ring, an AU
+   message with PTS/DTS/keyframe/codec data), and outputs a placeholder
+   buffer per frame (`video/x-raw(memory:PS5Remote)`, PTS-ordered through a
+   small reorder queue sized from the SPS) that `ps5videosink` accepts. So
+   playbin, QoS, A/V sync, MSE and the FRAME/GEOMETRY messages work as now;
+   FRAME names a PTS instead of a slot. AV1 (no hardware) and anything
+   Videodec2 refuses stay on dav1d/avdec with frames as now.
+2. **Title:** a decoder thread per stream (Spike 9's `vdec2`: one decoder
+   per codec, pipeline depth 2–4) decodes the AUs ahead of time, straight
+   into output slots that are persistent GL buffers from the renderer
+   (direct memory type 12, GPU VA = CPU VA), and queues each picture with
+   its PTS (`sceVideodec2GetPictureInfo`; VP9 alt-ref pictures dropped by
+   PTS, as Spike 9 found). `PS5VideoServer::consume` pairs FRAME messages
+   with decoded pictures by PTS and hands the GL buffer to `handleVideo`:
+   no memcpy, and the conversion pass gains the 10-bit LSB-aligned variant
+   (Spike 9's shader). Flush/seek resets the decoder.
+3. **Budget:** flexible memory 24 MB for 1080p H.264 up to ~140 MB for 8K
+   HEVC at depth 2 (Spike 9), against 299 MB free in the title today; an
+   output slot pool of about depth + 4 frames per stream.
+4. **"View in VR"** samples the same RGBA texture on a sphere or dome
+   (Spike 9's `vr360`/`vr180`), so it needs nothing from the page.
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 
@@ -306,8 +446,9 @@ later. Console log: `port/webkit/test/date.js`, results below.
 | --- | --- |
 | `WPEDisplayPS5` | connects EGL (ps5-opengl, one window surface, GL 4.6 core), one 1080p `WPEScreen`, the pad (8 ms poll on the main loop), the IME dialog, and installs `WPEProcessManagerPS5` as the default process manager |
 | `WPEToplevelPS5` | always fullscreen, the surface size |
-| `WPEViewPS5` | `render_buffer`: copies the damaged rectangles of the WebProcess's SHM buffer into a BGRA texture, presents, then reports the buffer rendered and released |
-| `PS5Renderer` | the GL side: page texture, round pointer sprite, swap (vsync) |
+| `WPEViewPS5` | `render_buffer`: hands the WebProcess's SHM buffer and its damage to the render thread, which copies and presents it; the buffer is reported rendered and released on the main thread afterwards |
+| `PS5Renderer` | the GL side, on its own render thread: the page in a persistent GL buffer read by the shader (memcpy of damaged rows; `/data/ps5webkit/page-texture` = the old `glTexSubImage2D` path), hole-punch video under it (YUV -> RGBA on the GPU), round pointer sprite, swap (vsync), screen readback |
+| `PS5VideoServer`, `PS5VideoProtocol.h` | hole-punch video: the WebProcesses' `ps5videosink` connections, frame queues, geometry, frame selection by due time (see *Hole-punch video*) |
 | `WPEInputMethodContextPS5` | the system keyboard for focused fields |
 | `WPEProcessManagerPS5` | children as elfldr payloads (below) |
 | `PS5Sce.h` | weak declarations of libScePad and libSceUserService (no SDK headers); the libSceImeDialog function table that the title fills (`apps/title/titleime.c`) |

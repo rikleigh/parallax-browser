@@ -609,3 +609,20 @@ port.
   them; the console then survived about ten crashes in a row. Payload
   threads also default to a 64 KiB stack, now raised to 2 MiB.
 - **Milestone 2 has started:** video and audio in pages through GStreamer.
+  - **Step 1** (2026-10-28): software decoding in the WebProcess, frames
+    painted into the page, audio played by the title. YouTube played with
+    sound on the TV, but at ~7 fps under its overlays.
+  - **Step 2a, hole-punch video** (2026-10-28; port/webkit/README.md,
+    *Hole-punch video*): the page punches a transparent hole, the WebProcess's
+    `ps5videosink` hands each software-decoded frame to the title through
+    shared memory with the time it is due (from the audio clock), and the
+    title's new render thread converts it on the GPU and draws it under the
+    page at the next vsync. The page itself now goes to the GPU as a memcpy
+    into a persistent GL buffer (1 ms for a full page instead of 14–36 ms).
+    Measured: local 1080p30/60 and YouTube 720p60/1080p60 at full frame
+    rate, WebProcess CPU down by half to two thirds, title under 0.1 cores.
+    WebKit's MSE queue was deepened to 1 s, which removed YouTube's 20–35 s
+    video stalls after a pause. Waiting for the owner's TV check.
+  - **Step 2b** (planned, same README): Videodec2 in the title decodes
+    access units sent by a proxy decoder in the WebProcess, straight into the
+    GL buffers the compositor already reads.
