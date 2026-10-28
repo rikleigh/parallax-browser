@@ -152,16 +152,21 @@ step_configure() {
         roots="$roots;$WK/fake"; pc="$WK/fake/pkg-config"
         EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS:-} -DEpoxy_INCLUDE_DIR=$WK/fake/include -DEpoxy_LIBRARY=$WK/fake/lib/libepoxy.a"
     fi
+    # Static link flags of every dependency (Libs.private included): WebKit's
+    # find modules only name the top-level archives.
+    local depslibs=""
+    [ -z "${FAKE_DEPS:-}" ] && depslibs="$("$PKGCONFIG" --libs gio-unix-2.0 gioopenssl libsoup-3.0 fontconfig freetype2 \
+        harfbuzz-icu libxml-2.0 sqlite3 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl)"
     ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
       export PKG_CONFIG="$pc"
       cmake -G Ninja -S "$SRC" -B "$BLD" \
         -DCMAKE_TOOLCHAIN_FILE="$tc" \
         -DCMAKE_FIND_ROOT_PATH="$roots" -DCMAKE_PREFIX_PATH="$SYSROOT" \
-        -DPKG_CONFIG_EXECUTABLE="$pc" -DPS5_PORT_DIR="$HERE" -DPS5WK_LOG_HOST="$PS5WK_LOG_HOST" -DPS5WK_LOG_PORT="$PS5WK_LOG_PORT" \
+        -DPKG_CONFIG_EXECUTABLE="$pc" -DPS5_PORT_DIR="$HERE" -DPS5WK_LOG_HOST="$PS5WK_LOG_HOST" -DPS5WK_LOG_PORT="$PS5WK_LOG_PORT" -DPS5_DEPS_LIBS="$depslibs" \
         "${WEBKIT_OPTIONS[@]}" \
         -DCMAKE_C_FLAGS="$cflags" -DCMAKE_CXX_FLAGS="$cxxflags" \
         -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
-        -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ -Wl,--gc-sections" \
+        -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ -Wl,--gc-sections -L$SYSROOT/lib" \
         -DCMAKE_CXX_STANDARD_LIBRARIES="$libs" \
         -DICU_ROOT="$ICU" -DICU_INCLUDE_DIR="$ICU/include" \
         -DICU_UC_LIBRARY_RELEASE="$ICU/lib/libicuuc.a" \

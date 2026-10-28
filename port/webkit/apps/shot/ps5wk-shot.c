@@ -28,7 +28,7 @@
 #include <wpe/wpe-platform.h>
 #include <WPEProcessManagerPS5.h>
 
-void g_io_openssl_load(void*) __attribute__((weak));
+void g_io_openssl_load(void*);
 
 static char url[1024] = "https://example.com/";
 static char child[256] = "/data/ps5webkit/ps5wk-child.elf";
@@ -237,8 +237,7 @@ int main(void)
     setenv("XDG_RUNTIME_DIR", "/system_tmp/ps5wk", 0);
     setenv("GIO_USE_VFS", "local", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
-    if (g_io_openssl_load)
-        g_io_openssl_load(NULL);
+    g_io_openssl_load(NULL);
 
     WPEProcessManager* manager = wpe_process_manager_ps5_new(child);
     wpe_process_manager_set_default(manager);
@@ -251,7 +250,6 @@ int main(void)
     }
 
     WebKitSettings* settings = webkit_settings_new_with_settings(
-        "hardware-acceleration-policy", WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER,
         "enable-developer-extras", FALSE,
         NULL);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/shot/data", "/data/ps5webkit/shot/cache");

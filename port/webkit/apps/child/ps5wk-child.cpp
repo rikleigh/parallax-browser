@@ -36,7 +36,7 @@ extern "C" {
 int sceKernelAvailableFlexibleMemorySize(size_t*) __attribute__((weak));
 // glib-networking's OpenSSL TLS backend, linked statically (GIO module
 // registration that a shared build would do by scanning GIO_MODULE_DIR).
-void g_io_openssl_load(void*) __attribute__((weak));
+void g_io_openssl_load(void*);
 }
 
 static double nowMS()
@@ -186,8 +186,7 @@ int main(int, char**)
         return 1;
 
     setupEnvironment();
-    if (g_io_openssl_load)
-        g_io_openssl_load(nullptr);
+    g_io_openssl_load(nullptr);
 
     static char idArg[32], fdArg[16];
     snprintf(idArg, sizeof(idArg), "%llu", processIdentifier);

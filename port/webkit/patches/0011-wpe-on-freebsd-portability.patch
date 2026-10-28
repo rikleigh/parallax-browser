@@ -11,6 +11,20 @@ index 6b2f079bd7..12e8f7de19 100644
  #elif defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_UNIX)
  #include <malloc.h>
  #elif defined(SK_BUILD_FOR_WIN)
+diff --git a/Source/ThirdParty/xdgmime/CMakeLists.txt b/Source/ThirdParty/xdgmime/CMakeLists.txt
+index 43374cae68..7f473f6f88 100644
+--- a/Source/ThirdParty/xdgmime/CMakeLists.txt
++++ b/Source/ThirdParty/xdgmime/CMakeLists.txt
+@@ -18,6 +18,9 @@ set(XDGMIME_SOURCES
+ 
+ include_directories("${XDGMIME_INCLUDE_DIRECTORIES}")
+ add_definitions(-DXDG_PREFIX=_wk_xdg)
++# Two globals escape XDG_PREFIX; GIO carries its own xdgmime copy, which
++# clashes with them in a static link (PS5).
++add_definitions(-D_caches=_wk_xdg_caches -D_xdg_binary_or_text_fallback=_wk_xdg_binary_or_text_fallback)
+ add_library(xdgmime STATIC ${XDGMIME_SOURCES})
+ 
+ if (CMAKE_CXX_BYTE_ORDER STREQUAL "LITTLE_ENDIAN")
 diff --git a/Source/WTF/wtf/PlatformWPE.cmake b/Source/WTF/wtf/PlatformWPE.cmake
 index ebc66aa1f9..7e7f44dfdd 100644
 --- a/Source/WTF/wtf/PlatformWPE.cmake
@@ -87,6 +101,23 @@ index 1a8a443a00..cdc5199f0e 100644
  
      if (CheckedPtr box = dynamicDowncast<RenderBox>(node.renderer()); box && box->canBeScrolledAndHasScrollableArea()) {
          if (CheckedPtr layer = box->layer()) {
+diff --git a/Source/WebCore/platform/AudioEncoder.h b/Source/WebCore/platform/AudioEncoder.h
+index d047b07c65..72de214d1f 100644
+--- a/Source/WebCore/platform/AudioEncoder.h
++++ b/Source/WebCore/platform/AudioEncoder.h
+@@ -26,10 +26,10 @@
+ 
+ #pragma once
+ 
+-#include <WebCore/PlatformRawAudioData.h>
+-
+ #if ENABLE(WEB_CODECS)
+ 
++#include <WebCore/PlatformRawAudioData.h>
++
+ #include <WebCore/AudioEncoderActiveConfiguration.h>
+ #include "BitrateMode.h"
+ #include <WebCore/WebCodecsAudioInternalData.h>
 diff --git a/Source/WebCore/platform/MediaSamplesDecoder.cpp b/Source/WebCore/platform/MediaSamplesDecoder.cpp
 index dc6aec8548..03e948a71a 100644
 --- a/Source/WebCore/platform/MediaSamplesDecoder.cpp
@@ -144,6 +175,41 @@ index 08a4f6c814..82196f33c3 100644
  } // namespace WebCore
 +
 +#endif // ENABLE(VIDEO)
+diff --git a/Source/WebCore/platform/audio/PlatformRawAudioData.h b/Source/WebCore/platform/audio/PlatformRawAudioData.h
+index 4d32f302a1..615ce74068 100644
+--- a/Source/WebCore/platform/audio/PlatformRawAudioData.h
++++ b/Source/WebCore/platform/audio/PlatformRawAudioData.h
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#if ENABLE(VIDEO)
++
+ #include <WebCore/MediaPlayer.h>
+ #include <span>
+ #include <wtf/ThreadSafeRefCounted.h>
+@@ -55,3 +57,5 @@ private:
+ };
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(VIDEO)
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+index f7ad5f605d..e341fa3152 100644
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+@@ -39,9 +39,9 @@ std::unique_ptr<PlatformDisplaySurfaceless> PlatformDisplaySurfaceless::create()
+ 
+     RefPtr<GLDisplay> glDisplay;
+     if (GLContext::isExtensionSupported(extensions, "EGL_EXT_platform_base"))
+-        glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
++        glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, nullptr /* EGL_DEFAULT_DISPLAY; an int on PS5 */, nullptr));
+     else if (GLContext::isExtensionSupported(extensions, "EGL_KHR_platform_base"))
+-        glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
++        glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, nullptr /* EGL_DEFAULT_DISPLAY; an int on PS5 */, nullptr));
+ 
+     if (!glDisplay) {
+         WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
 diff --git a/Source/WebCore/platform/network/DNS.cpp b/Source/WebCore/platform/network/DNS.cpp
 index bc8629a354..46a73830eb 100644
 --- a/Source/WebCore/platform/network/DNS.cpp
@@ -160,3 +226,86 @@ index bc8629a354..46a73830eb 100644
  #if PLATFORM(IOS_FAMILY)
  #include <wtf/cocoa/RuntimeApplicationChecksCocoa.h>
  #endif
+diff --git a/Source/WebKit/UIProcess/API/C/WKAPICast.h b/Source/WebKit/UIProcess/API/C/WKAPICast.h
+index f49fc985a2..8dc860a368 100644
+--- a/Source/WebKit/UIProcess/API/C/WKAPICast.h
++++ b/Source/WebKit/UIProcess/API/C/WKAPICast.h
+@@ -444,7 +444,7 @@ inline WKStorageBlockingPolicy toAPI(WebCore::StorageBlockingPolicy policy)
+ #include "WKAPICastWin.h"
+ #endif
+ 
+-#if defined(__SCE__)
++#if defined(__SCE__) && !defined(BUILDING_WPE__) // PS5 payload SDK builds of WPE also define __SCE__
+ #include "WKAPICastPlayStation.h"
+ #endif
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+index fd9ca6e5b7..337e227b4c 100644
+--- a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
++++ b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+@@ -219,8 +219,12 @@ static std::expected<SkImageInfo, String> getImageInfoFromBuffer(const  GRefPtr<
+     if (WPE_IS_BUFFER_DMA_BUF(buffer.get())) {
+         auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer.get());
+         SkAlphaType alphaType = kPremul_SkAlphaType;
++#if OS(ANDROID) || USE(LIBDRM)
+         if (wpe_buffer_dma_buf_get_format(dmaBuffer) == DRM_FORMAT_XRGB8888)
+             alphaType = kOpaque_SkAlphaType;
++#else
++        UNUSED_PARAM(dmaBuffer);
++#endif
+         return SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, alphaType, SkColorSpace::MakeSRGB());
+     }
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+index 9b688ad328..b83d6a8a98 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+@@ -30,9 +30,19 @@ namespace WebKit {
+ 
+ void WebPreferences::platformInitializeStore()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 Milestone 1: no GL in the WebProcess (an elfldr payload). Pages are
++    // painted with Skia on the CPU and sent as shared memory
++    // (NonCompositedFrameRenderer + RenderTargetSHMImage).
++    setHardwareAccelerationEnabled(false);
++    setAcceleratedCompositingEnabled(false);
++    setForceCompositingMode(false);
++    setThreadedScrollingEnabled(false);
++#else
+     setAcceleratedCompositingEnabled(true);
+     setForceCompositingMode(true);
+     setThreadedScrollingEnabled(true);
++#endif
+ }
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WPEPlatform/wpe/headless/WPEDisplayHeadless.cpp b/Source/WebKit/WPEPlatform/wpe/headless/WPEDisplayHeadless.cpp
+index aefc200ef5..8b4e8ac648 100644
+--- a/Source/WebKit/WPEPlatform/wpe/headless/WPEDisplayHeadless.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/headless/WPEDisplayHeadless.cpp
+@@ -150,9 +150,9 @@ static gpointer wpeDisplayHeadlessGetEGLDisplay(WPEDisplay* display, GError** er
+ 
+     EGLDisplay eglDisplay = EGL_NO_DISPLAY;
+     if (epoxy_has_egl_extension(nullptr, "EGL_EXT_platform_base"))
+-        eglDisplay = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
++        eglDisplay = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, nullptr /* EGL_DEFAULT_DISPLAY; an int on PS5 */, nullptr);
+     else if (epoxy_has_egl_extension(nullptr, "EGL_KHR_platform_base"))
+-        eglDisplay = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
++        eglDisplay = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, nullptr /* EGL_DEFAULT_DISPLAY; an int on PS5 */, nullptr);
+     if (eglDisplay != EGL_NO_DISPLAY)
+         return eglDisplay;
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/WebPage.cpp b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+index 120061650e..770c3d1296 100644
+--- a/Source/WebKit/WebProcess/WebPage/WebPage.cpp
++++ b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+@@ -7755,7 +7755,7 @@ void WebPage::processDidResume()
+         manager->processDidResume();
+ }
+ 
+-bool WebPage::didReceiveRemoteCommand(PlatformMediaSession::RemoteControlCommandType type, const PlatformMediaSession::RemoteCommandArgument& argument, std::optional<WebCore::MediaSessionIdentifier> targetSession)
++bool WebPage::didReceiveRemoteCommand(WebCore::PlatformMediaSessionRemoteControlCommandType type, const WebCore::PlatformMediaSessionRemoteCommandArgument& argument, std::optional<WebCore::MediaSessionIdentifier> targetSession)
+ {
+     RefPtr manager = mediaSessionManagerIfExists();
+     return manager && manager->processDidReceiveRemoteControlCommand(type, argument, targetSession);

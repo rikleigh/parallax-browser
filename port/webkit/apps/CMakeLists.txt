@@ -13,6 +13,7 @@ set(PS5_WPE_DIR ${PS5_PORT_DIR}/wpe-ps5)
 set(PS5_API_INCLUDE_DIRECTORIES
     ${CMAKE_BINARY_DIR}
     ${DERIVED_SOURCES_WPE_API_DIR}
+    ${DERIVED_SOURCES_WEBKIT_DIR}
     ${FORWARDING_HEADERS_WPE_DIR}
     ${FORWARDING_HEADERS_DIR}
     ${JavaScriptCoreGLib_DERIVED_SOURCES_DIR}
@@ -22,13 +23,57 @@ set(PS5_API_INCLUDE_DIRECTORIES
     ${PS5_WPE_DIR}
 )
 
+# WebKit is a static library here, but WTF, bmalloc, JavaScriptCore, PAL and
+# WebCore (and their subtargets) are OBJECT libraries linked privately into
+# it, and CMake does not carry their objects into a static archive or its
+# consumers. Collect every OBJECT library's objects into one thin archive
+# that the executables link after WebKit (archive members are only pulled in
+# when needed, so objects already on the link line are not duplicated).
+function(_ps5_collect_targets _dir _out)
+    get_property(_targets DIRECTORY ${_dir} PROPERTY BUILDSYSTEM_TARGETS)
+    get_property(_subdirs DIRECTORY ${_dir} PROPERTY SUBDIRECTORIES)
+    foreach (_sub IN LISTS _subdirs)
+        _ps5_collect_targets(${_sub} _subtargets)
+        list(APPEND _targets ${_subtargets})
+    endforeach ()
+    set(${_out} ${_targets} PARENT_SCOPE)
+endfunction()
+_ps5_collect_targets(${CMAKE_SOURCE_DIR}/Source _ps5_all_targets)
+set(PS5_OBJECT_LIBRARIES "")
+foreach (_t IN LISTS _ps5_all_targets)
+    get_target_property(_type ${_t} TYPE)
+    if (_type STREQUAL "OBJECT_LIBRARY")
+        list(APPEND PS5_OBJECT_LIBRARIES ${_t})
+    endif ()
+endforeach ()
+set(_ps5_objects "")
+foreach (_t IN LISTS PS5_OBJECT_LIBRARIES)
+    list(APPEND _ps5_objects "$<FILTER:$<TARGET_OBJECTS:${_t}>,EXCLUDE,\\.(g|p)ch$>")
+endforeach ()
+file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/ps5-apps/objects.rsp CONTENT "$<JOIN:${_ps5_objects},\n>\n")
+set(PS5_OBJECTS_ARCHIVE ${CMAKE_BINARY_DIR}/lib/libps5wk-objects.a)
+add_custom_command(
+    OUTPUT ${PS5_OBJECTS_ARCHIVE}
+    COMMAND ${CMAKE_COMMAND} -E rm -f ${PS5_OBJECTS_ARCHIVE}
+    COMMAND ${CMAKE_AR} qcsT ${PS5_OBJECTS_ARCHIVE} @${CMAKE_BINARY_DIR}/ps5-apps/objects.rsp
+    DEPENDS ${PS5_OBJECT_LIBRARIES} ${_ps5_objects} ${CMAKE_BINARY_DIR}/ps5-apps/objects.rsp
+    COMMENT "Archiving WebKit's object libraries for the PS5 executables"
+    VERBATIM
+)
+add_custom_target(ps5wk-objects DEPENDS ${PS5_OBJECTS_ARCHIVE})
+message(STATUS "PS5: ${CMAKE_BINARY_DIR}/lib/libps5wk-objects.a from: ${PS5_OBJECT_LIBRARIES}")
+
+separate_arguments(PS5_DEPS_LINK UNIX_COMMAND "${PS5_DEPS_LIBS}")
+
 add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp)
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
-target_link_libraries(ps5wk-child PRIVATE WebKit)
+target_link_libraries(ps5wk-child PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK})
+add_dependencies(ps5wk-child ps5wk-objects)
 
 add_executable(ps5wk-shot ${PS5_APPS_DIR}/shot/ps5wk-shot.c)
 target_include_directories(ps5wk-shot PRIVATE ${PS5_API_INCLUDE_DIRECTORIES})
-target_link_libraries(ps5wk-shot PRIVATE WebKit GLib::Gio)
+target_link_libraries(ps5wk-shot PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)
+add_dependencies(ps5wk-shot ps5wk-objects)
 add_dependencies(ps5wk-shot WebKit)
 
 set(PS5WK_LOG_HOST "192.168.1.20" CACHE STRING "Mac address for the title's TCP log (tools/logserver.sh)")
@@ -36,5 +81,6 @@ set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
 add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c)
 target_include_directories(ps5browser PRIVATE ${PS5_API_INCLUDE_DIRECTORIES} ${PS5_PORT_DIR}/../../spikes)
 target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_PORT=${PS5WK_LOG_PORT})
-target_link_libraries(ps5browser PRIVATE WebKit GLib::Gio)
+target_link_libraries(ps5browser PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)
+add_dependencies(ps5browser ps5wk-objects)
 add_dependencies(ps5browser WebKit)

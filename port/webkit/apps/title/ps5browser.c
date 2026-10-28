@@ -35,7 +35,7 @@
 #define PS5WK_HOME_URL "https://example.com/"
 #endif
 
-void g_io_openssl_load(void*) __attribute__((weak));
+void g_io_openssl_load(void*);
 
 static WebKitWebView* webView;
 static WPEDisplay* display;
@@ -165,8 +165,7 @@ int main(void)
     setenv("XDG_RUNTIME_DIR", "/data/ps5webkit/home", 0);
     setenv("GIO_USE_VFS", "local", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
-    if (g_io_openssl_load)
-        g_io_openssl_load(NULL);
+    g_io_openssl_load(NULL);
 
     GError* error = NULL;
     display = wpe_display_ps5_new();
@@ -179,7 +178,6 @@ int main(void)
     SPIKE_PASS("display", "PS5 display connected");
 
     WebKitSettings* settings = webkit_settings_new_with_settings(
-        "hardware-acceleration-policy", WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER,
         "enable-spatial-navigation", TRUE,
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);
