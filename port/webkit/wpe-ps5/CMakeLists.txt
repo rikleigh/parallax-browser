@@ -2,6 +2,7 @@
 # Source/WebKit/WPEPlatform/wpe/ps5 by port/webkit/build.sh).
 set(WPEPlatformPS5_SOURCES
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5Renderer.cpp
+    ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5VideoDecoder.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5VideoServer.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEDisplayPS5.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEInputMethodContextPS5.cpp

@@ -19,7 +19,8 @@ pages painted on the CPU.
 Milestone 2 step 1 (2026-10-28): `<video>`/`<audio>` and MSE on GStreamer,
 software decoders in the WebProcess, audio played by the title (see
 *Media* below). Step 2a (same day): hole-punch video, the title draws the
-decoded frames under the page (see *Hole-punch video* below).
+decoded frames under the page (see *Hole-punch video* below). Step 2b
+(same day): H.264/HEVC/VP9 decoded in the title by Videodec2 (see *Step 2b*).
 
 No WebGL, WebXR, GPU process, Web Audio, WebRTC, speech, geolocation,
 sandbox, introspection, docs, journald or libbacktrace.
@@ -73,6 +74,8 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0016-ps5-software-video-paint-and-media-policy | PS5 only (`PS5_PAYLOAD_SDK`): AV1 not advertised (no hardware AV1; `PS5WK_MEDIA_AV1=1` advertises it), `PS5WK_MEDIA_VP9=0` hides VP9; avdec `max-threads` 4 (`PS5WK_DECODER_THREADS`), `max-errors` -1 (a reference-less frame after a flush doesn't end playback); playsink's `videoconvert` on 4 threads; video painting: the frame is scaled to the device-pixel size with GstVideoConverter (4 threads, linear) and wrapped zero-copy in an SkImage cached for the repaints of the same frame (Skia's raster bilinear scaling of 1080p cost ~30 ms per frame, ImageGStreamer copied the frame on every paint, and `convertSampleToImage` ran a conversion pipeline even when the format already matched); non-composited rendering updates longer than 6 ms are followed by an equal idle gap (NonCompositedFrameRenderer), so JavaScript timers and MSE appends still run while video plays |
 | 0017-ps5-hole-punch-video | PS5 only: `MediaPlayerPrivateGStreamer` makes `ps5videosink` (port/deps/gst) as the video sink (`PS5WK_HOLEPUNCH=0`: the step-1 path), `paint()` clears the video's rectangle to transparent and reports it to the sink (`ps5_video_sink_set_geometry`), canvas `drawImage` still gets the frame (`paintCurrentFrameInContext`), new samples no longer repaint the page (only the first one, for the hole), the streaming thread no longer waits for a paint; MSE `TrackQueue` water levels 1000/500 ms (were 200/100 ms: the busy main thread let the video run dry on YouTube) |
 | 0018-ps5-single-web-process-and-no-decoder-drains | PS5 only: one WebProcess for all navigations (no process swaps, WebProcess cache or prewarming; `PS5WK_PROCESS_SWAPS=1` restores them): each payload costs ~300 of 8192 system page tables and swaps exhausted them; still-frame events are dropped before avdec too (`PS5WK_STILL_FRAME=1` keeps them): avdec's drain flushed libav's reference frames, so video stayed broken until the next keyframe |
+| 0019-ps5-gc-suspended-thread-registers | PS5 only: WTF's `registersFromUContext` takes the mcontext at ucontext +0x40 (the PS5 kernel's layout; the SDK header says +0x10). JSC's conservative GC read a suspended thread's stack pointer from the kernel's `mc_addr` instead: 0 (stack not scanned at all) or a stale fault address above the stack (wrapped size: libpas out-of-memory panic in `gatherConservativeRoots`). `captureStack` also scans the whole stack if a stack pointer is ever outside it (counted, logged after the threads resume) |
+| 0020-ps5-hardware-decoded-video-samples | PS5 only: samples from `ps5vdecproxy` (`video/x-raw(memory:PS5Remote)`, a picture decoded in the title) are not painted (canvas `drawImage` gets nothing) and `videoFrameForCurrentTime` returns null, instead of mapping a placeholder buffer |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -142,7 +145,8 @@ Milestone 1 placeholder media interfaces) is gone.
 | `child.env`: `PS5WK_PROFILE=1` | sampling profiler of the WebProcess main thread (`apps/common/profiler.c`, 2 ms SIGPROF; `test/prof.sh` fetches and symbolizes) |
 | `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
 | `[render]` lines (WebProcess, every 5 s while rendering more than 25 updates) | rendering updates per second, average/max duration, how many were followed by the idle gap |
-| `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child to 1920x1080@60: MSE/canPlayType refuse more, so YouTube stays ≤1080p |
+| `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child: 7680x4320@60 when the title decodes in hardware (step 2b; the child asks the title's video server at start), else 1920x1080@60 (software: YouTube stays ≤1080p) |
+| `child.env`: `PS5WK_MEM_LOG=<s>` (0 = off), `PS5WK_CPU_LOG=all` | the WebProcess memory watchdog period (default 60 s); `[cpu]` lines every 5 s whatever the load |
 
 The children also set `WPE_SHELL_MEDIA_DISK_CACHE_PATH=/data/ps5webkit/home/cache/media`
 (progressive downloads buffer on disk; WebKit's default `/var/tmp` doesn't
@@ -481,9 +485,154 @@ went from ~1 drop per 5 s to 0 in steady state. YouTube Big Buck Bunny
 WebProcess at 1.2 cores drops late frames), then 58.7–59.7/s with 0–2
 drops per 5 s at 0.34–0.41 cores.
 
-### Step 2b: Videodec2 in the title (plan, not built)
+### WebProcess out-of-memory crash in GC: found and fixed (0019)
 
-The compositing path stays; only where frames come from changes.
+TV test 2026-10-28 (evening): web5, YouTube's service-worker WebProcess,
+died after 150 s with SIGILL in `pas_panic_on_out_of_memory_error` <-
+`bmalloc_allocate` <- `JSC::MachineThreads::gatherConservativeRoots` on the
+GC collector thread; the stress runs had the same stack after 122 s. The
+payload had 8 GB of flexible memory and nothing else was short: the
+allocation itself was absurd. `gatherConservativeRoots` copies every other
+VM thread's stack, from the thread's stack pointer at suspension to its
+stack origin, into one buffer. WTF suspends threads with SIGUSR1 and reads
+the stack pointer from `&ucontext->uc_mcontext` (+0x10 in the SDK header),
+`mc_rsp` = ucontext +0xc8. The PS5 kernel puts the mcontext at +0x40
+(found for the crash guard, `test/sigctx/sigctx.c`), so +0xc8 is the
+kernel's `mc_addr`. Probe `test/sigctx/suspend.c` (a worker faulting in
+fresh heap pages, suspended 200 times the way WTF does): +0xc8 was **0 in
+197 samples** (JSC then skips the thread: its stack was never scanned,
+so objects only it referenced could be freed under it) and **a heap
+address above the stack in 3** (size = origin - "sp" wraps: the
+out-of-memory panic); the real rsp (+0xf8) was inside the stack 200/200.
+Not an mmap size, alignment, address-space or page-table limit: no mmap
+failed. Fix (0019): the mcontext at +0x40 on PS5, and a whole-stack scan if
+a stack pointer is ever outside its stack. After it: a 300 s YouTube
+harness session, no crash, no out-of-stack stack pointer reported, 0
+failed mmaps, memory flat after 3 minutes (libpas 632 MB, 96 mappings
+holding 855 MB). The title links the same WTF and gets the fix too.
+
+The libc-heap failure of the stress runs ("could not grow by 8 MB",
+`SceLibcInternalHeap`, SIGABRT on a thread start) happened while elfldr
+was already failing to spawn payloads: the system page tables were
+exhausted (fixed by 0018).
+
+**Memory watchdog:** every WebProcess/NetworkProcess logs a line per
+minute (`PS5WK_MEM_LOG=<s>`, 0 = off):
+
+    [mem] web4 at 300 s: peak rss 553.0 MB; flexible free 8158.0 MB (+0.0 since start); libpas pages 632.4 MB, compact 0.3 of 128 MB; mmaps 96 live, 854.7 MB (peak 854.7, largest 128.0), 3912 calls, 3814 munmaps, 0 failed
+
+All mmaps of the child go through `--wrap=mmap,munmap`
+(`apps/child/ps5wk-child.cpp`): live count and bytes, the largest, and a
+`[mem] mmap FAILED: <bytes> at <addr>, align 2^n, prot, flags, fd: errno
+(caller)` line for each failure (written with `write(2)`, no stdio in
+mmap). Payloads can't read their own RSS (`kern.proc.pid` is refused), so
+it's getrusage's peak; flexible memory doesn't move with anonymous memory
+in payloads (only `sceKernel*Flexible*` maps count). libpas pages are what
+it keeps committed (0006: decommit only zeroes on PS5).
+
+### Step 2b: Videodec2 in the title (built 2026-10-28)
+
+The compositing path stays; only where frames come from changes. Built as
+planned below, with these details:
+
+- **WebProcess, `ps5vdecproxy`** (`port/deps/gst/gstps5vdecproxy.c`, in the
+  `ps5video` plugin, rank PRIMARY+100): a GstVideoDecoder for H.264 (8-bit
+  4:2:0 up to 4096x2304), HEVC Main/Main10 and VP9 profiles 0/2 (up to
+  8192x4352), progressive. It takes avc/avc3/hvc1/hev1 as well as
+  byte-stream (decodebin3 offers the parser's packetized caps; packetized
+  input is converted to Annex-B here, codec_data's parameter sets before
+  keyframes). It connects to the title's video server at READY (HELLO, role
+  DECODER) and fails READY *without* an error message when the title has no
+  decoder; anything outside the list is refused in the accept-caps query.
+  decodebin3 then takes avdec_*/dav1d: software stays the fallback (and
+  the only path in `ps5wk-shot`). Each AU goes to the title inline on the
+  socket with the frame number; PICTURE replies (display order) finish
+  frames with a 16-byte placeholder buffer (`struct ps5wk_remote_picture`:
+  decoder, token, epoch) in `video/x-raw(memory:PS5Remote)` caps; VP9
+  hidden frames, frames before the first keyframe and errors are released.
+  At most 16 frames pending. Seek = DFLUSH with a new epoch; EOS = DDRAIN.
+  Pictures outside the segment (decoding restarts at the keyframe before a
+  seek target) are released at once (PRELEASE): the base class would clip
+  them and the title would never get the slot back.
+- **`ps5videosink`** accepts the remote caps and sends a REMOTE FRAME
+  (decoder + token, due time as before); `prepare()` reports placeholders it
+  dropped as late without rendering (RDROP). playbin's native-video flag is
+  already set with this sink, so nothing converts in between.
+- **Title, `PS5VideoDecoder`** (`wpe-ps5/PS5VideoDecoder.cpp`): per decoder
+  connection a receiver (AU queue) and a decoder thread. Output buffers are
+  persistent GL buffers made on the render thread (`allocateVideoBuffer`);
+  12 slots up to 16 MB frames, 9 up to 50 MB, 8 above. The decoder picks a
+  free slot per `Decode` call (`vdec2_decode_into`, new in Spike 9's vdec2)
+  and gets each picture's own pts back with **`sceVideodec2GetPictureInfo`**,
+  read from the 13.60 disassembly: the decoder keeps 1 KiB of metadata per
+  picture at the end of the output buffer; the picture info's `thisSize`
+  must be the codec's (AVC 0x68/0x78, HEVC 0x88/0x98/0xa8/0xb8, VP9 exactly
+  0x58), `ptsData` is at +0x10 (the PS4 layout). The pts given is the frame
+  number, plus bit 62 for VP9 hidden frames (superframes split here), so
+  alt-ref pictures are dropped by pts, not by call order (Spike 9's
+  off-by-one). H.264/HEVC parameter sets are cached and put back in front
+  of the first keyframe after a reset. Flush = `vdec2_renew`. Slots come
+  back when the consumer has presented the picture (pinned while drawn,
+  released after the swap), when a later picture of the same decoder is
+  consumed (the sink dropped this one), on PRELEASE/RDROP/flush, or, as a
+  safety net, the oldest unpinned one after 1.5 s without a free slot (a
+  frame skipped after a long pause at worst, never a stall).
+  Decoders are opened at 3840x2160 for VP9 (13 MB of flexible memory) and
+  at least 1920x1088 for H.264, so YouTube's resolution switches within
+  that keep the decoder; pipeline depth 4 up to 4K, 2 above (8K: 139 MB of
+  flexible memory instead of 223).
+- **Renderer**: a REMOTE frame converts straight from the decoder's GL
+  buffer (no memcpy), NV12 or the 10-bit LSB-aligned variant (`format_ 4`).
+- **Backend**: the decoding itself is a function table the executable
+  installs: Videodec2 in the title (`apps/title/titlevdec.c`; `vdec2_load`
+  runs first thing in `main`, before the unjail), a fake in ps5wk-shot
+  (`fakevdec=1`: empty pictures in display order by PTS, so the whole
+  WebProcess side and the slot bookkeeping run in payload-only tests).
+- The WebProcess asks the title at start (QUERY role) and raises
+  `WEBKIT_GST_VIDEO_DECODING_LIMIT` to 7680x4320@60 when it decodes in
+  hardware: YouTube offers VP9 up to 2160p60, and `hvc1`/`hev1` are
+  advertised (h265parse and a decoder exist).
+
+**Measured** (title, log-only runs 2026-10-28, audio through sceAudioOut at
+volume 0, video in a 1280x720 element; clips from `test/media/make-media.sh`):
+
+| clip | shown | decode call | WebProcess | title flexible memory free | direct memory |
+|---|---|---|---|---|---|
+| H.264 1080p30 (software before: 0.31 cores) | 30.0/s, 1 drop at the start | 1.0–1.2 ms | **0.05–0.06 cores** | 299 -> 274 MB | decoder 70 MB + 12 x 3.2 MB |
+| HEVC 3840x2160p30, x265 with B-frames, 20 Mbit/s | 30.0/s, 1 drop | 1.8–2.3 ms | 0.06 cores | 298 -> 221 MB | 337 MB + 12 x 12 MB |
+| HEVC Main10 3840x2160p30 | 30.0/s, 2 drops | 0.6–1.4 ms | 0.05 cores | 297 -> 221 MB | 512 MB + 9 x 23.9 MB |
+| HEVC 7680x3840p30, 68 Mbit/s (software: 20 fps at most) | 30.0/s, 1 drop | 12.6 ms (≈79 fps of capacity at depth 2) | 0.07 cores | 297 -> 157 MB | 941 MB + 9 x 42 MB; 1856 MB in use in all |
+| VP9 1080p30 (WebM) | 30.0/s | 1.0 ms | 0.05–0.06 cores | 297 -> 284 MB | 535 MB + 12 x 12 MB |
+| YouTube Big Buck Bunny VP9 **3840x2160p60** (MSE) | 59.3–59.7/s, 0–2 drops per 5 s after the start | 1.4–3.2 ms avg | 0.22–0.45 cores (YouTube's JavaScript) | 297 -> 284 MB | as above |
+
+0 decode errors and 0 pictures without a pts in every run (3931 pictures,
+305 VP9 hidden frames dropped, in 66 s of YouTube 4K60). The title's
+conversion pass: 0.3 ms per 1080p frame, 0.7 ms 4K, 1.5 ms 4K 10-bit,
+3.1 ms 8K; the title presents 59.9 frames/s throughout. Decoder bring-up
+3–95 ms (VP9 3 ms); the proxy's first DOPEN round trip 150–250 ms.
+Direct memory in use goes back to ~595 MB (the browser's baseline) when a
+decoder closes. Seeking (local 8K: forward, back, paused; YouTube
+`seekTo`), YouTube's 720p -> 1440p -> 2160p switches and switching videos
+all resumed; screen readbacks showed the decoded frames correctly under the
+page (8K clip, YouTube 4K). Harness (fake decoder): local H.264 with seeks,
+YouTube with the cookie dialog's pause, 87 VP9 hidden frames; without a
+decoder (normal harness) avdec plays as before.
+
+**Knobs:** `/data/ps5webkit/no-hwdec` (title: no hardware decoding,
+software in the WebProcess as before), `child.env`: `PS5WK_HWDEC=0` (the
+WebProcess doesn't ask), `ps5wk-shot fakevdec=1`. Logs: `[vdec]` (title:
+backend, each decoder's memory, every 5 s AUs/pictures/decode time/slots),
+`[ps5vdecproxy]` (WebProcess, every 5 s). Title test lists take a dwell per
+URL (`<url> 40`), screenshots also at +30 s for dwells of 34 s or more;
+`test/media/title-seek-and-2160.js` (title `test-onload.js`: seeks on
+video.html, 2160p and a seek on YouTube), `test/media/yt-2160.js`.
+
+Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
+matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
+draws nothing; two 8K decoders at once won't fit the title's flexible
+memory (the second waits up to 3 s, then the proxy fails that stream).
+
+The plan this followed:
 1. **WebProcess:** a proxy decoder element, `ps5vdecproxy` (klass
    Codec/Decoder/Video, rank above avdec_* for H.264, HEVC 8/10-bit and VP9
    from the parsers, AU-aligned byte-stream), sends each access unit to the
@@ -530,6 +679,7 @@ later. Console log: `port/webkit/test/date.js`, results below.
 | `WPEViewPS5` | `render_buffer`: hands the WebProcess's SHM buffer and its damage to the render thread, which copies and presents it; the buffer is reported rendered and released on the main thread afterwards |
 | `PS5Renderer` | the GL side, on its own render thread: the page in a persistent GL buffer read by the shader (memcpy of damaged rows; `/data/ps5webkit/page-texture` = the old `glTexSubImage2D` path), hole-punch video under it (YUV -> RGBA on the GPU), round pointer sprite, swap (vsync), screen readback |
 | `PS5VideoServer`, `PS5VideoProtocol.h` | hole-punch video: the WebProcesses' `ps5videosink` connections, frame queues, geometry, frame selection by due time (see *Hole-punch video*) |
+| `PS5VideoDecoder` | hardware decoding (step 2b): `ps5vdecproxy` connections, decoder threads over an installed backend (Videodec2 in the title, a fake in ps5wk-shot), output slots in GL buffers |
 | `WPEInputMethodContextPS5` | the system keyboard for focused fields |
 | `WPEProcessManagerPS5` | children as elfldr payloads (below) |
 | `PS5Sce.h` | weak declarations of libScePad and libSceUserService (no SDK headers); the libSceImeDialog function table that the title fills (`apps/title/titleime.c`) |

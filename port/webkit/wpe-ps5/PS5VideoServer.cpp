@@ -91,6 +91,10 @@ static bool readMessage(int fd, ps5wk_video_msg& msg, int* passedFD)
     return true;
 }
 
+// Pinned REMOTE pictures waiting for presented().
+static GMutex pinnedLock;
+static std::vector<std::pair<uint32_t, uint32_t>> pinnedPictures; // decoder, token
+
 static void sendRelease(PS5VideoStream& stream, uint32_t slot, uint32_t generation)
 {
     ps5wk_video_msg msg;
@@ -102,6 +106,16 @@ static void sendRelease(PS5VideoStream& stream, uint32_t slot, uint32_t generati
     msg.dropped = stream.dropped;
     if (stream.fd >= 0)
         send(stream.fd, &msg, sizeof msg, MSG_DONTWAIT);
+}
+
+// A frame leaves the queue without being drawn (dropped, flushed, closed).
+static void discardFrame(PS5VideoStream& stream, const PS5VideoFrame& frame)
+{
+    if (frame.remote) {
+        PS5VideoDecoder::release(frame.decoder, frame.token, false);
+        sendRelease(stream, frame.token, 0xffffffffu); // counts only: no shared-memory slot
+    } else
+        sendRelease(stream, frame.slot, frame.generation);
 }
 
 static void* receiverThread(void* data)
@@ -120,6 +134,38 @@ static void* receiverThread(void* data)
             }
             hello = true;
             stream->pid = msg.pid;
+            // Version 2: what the title can decode (ps5vdecproxy asks;
+            // sinks ignore it).
+            ps5wk_video_msg ack;
+            memset(&ack, 0, sizeof ack);
+            ack.type = PS5WK_VMSG_HELLO_ACK;
+            ack.magic = PS5WK_VIDEO_MAGIC;
+            ack.version = PS5WK_VIDEO_VERSION;
+            ack.role = PS5VideoDecoder::codecs();
+            int maxWidth, maxHeight;
+            PS5VideoDecoder::maxSize(maxWidth, maxHeight);
+            ack.width = static_cast<uint32_t>(maxWidth);
+            ack.height = static_cast<uint32_t>(maxHeight);
+            send(fd, &ack, sizeof ack, 0);
+            if (msg.role == PS5WK_VROLE_QUERY) {
+                g_mutex_lock(&streamsLock);
+                streams.erase(std::remove(streams.begin(), streams.end(), stream), streams.end());
+                g_mutex_unlock(&streamsLock);
+                close(fd);
+                stream->fd = -1;
+                return nullptr;
+            }
+            if (msg.role == PS5WK_VROLE_DECODER) {
+                // Not a video on screen: the decoder service takes the connection.
+                g_mutex_lock(&streamsLock);
+                streams.erase(std::remove(streams.begin(), streams.end(), stream), streams.end());
+                g_mutex_unlock(&streamsLock);
+                VLOG("stream %d from pid %d is a decoder connection", stream->id, msg.pid);
+                PS5VideoDecoder::serve(fd, msg.pid, stream->id);
+                close(fd);
+                stream->fd = -1;
+                return nullptr;
+            }
             VLOG("stream %d from pid %d connected", stream->id, msg.pid);
             continue;
         }
@@ -158,18 +204,26 @@ static void* receiverThread(void* data)
             memcpy(frame.offset, msg.offset, sizeof frame.offset);
             frame.targetUS = msg.target_us;
             frame.ptsNS = msg.pts_ns;
+            if (frame.format == PS5WK_VFMT_REMOTE) {
+                frame.remote = true;
+                frame.decoder = msg.ps5wk_decoder;
+                frame.token = msg.ps5wk_token;
+            }
             bool ok;
             g_mutex_lock(&stream->lock);
-            ok = stream->shm && frame.generation == stream->generation && frame.slot < stream->slots;
+            ok = frame.remote || (stream->shm && frame.generation == stream->generation && frame.slot < stream->slots);
             if (ok)
                 stream->queue.push_back(frame);
             g_mutex_unlock(&stream->lock);
             if (!ok)
-                sendRelease(*stream, frame.slot, frame.generation);
+                discardFrame(*stream, frame);
             else
                 wake();
             break;
         }
+        case PS5WK_VMSG_RDROP:
+            PS5VideoDecoder::release(msg.ps5wk_decoder, msg.ps5wk_token, false);
+            break;
         case PS5WK_VMSG_GEOMETRY:
             g_mutex_lock(&stream->lock);
             stream->pending.visible = msg.visible;
@@ -189,7 +243,7 @@ static void* receiverThread(void* data)
             dropped.swap(stream->queue);
             g_mutex_unlock(&stream->lock);
             for (auto& frame : dropped)
-                sendRelease(*stream, frame.slot, frame.generation);
+                discardFrame(*stream, frame);
             break;
         }
         default:
@@ -345,6 +399,11 @@ bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Cons
             streams.erase(std::remove(streams.begin(), streams.end(), stream), streams.end());
             g_mutex_unlock(&streamsLock);
             g_mutex_lock(&stream->lock);
+            for (auto& frame : stream->queue) {
+                if (frame.remote)
+                    PS5VideoDecoder::release(frame.decoder, frame.token, false);
+            }
+            stream->queue.clear();
             if (stream->shm)
                 munmap(stream->shm, stream->shmBytes);
             stream->shm = nullptr;
@@ -395,9 +454,22 @@ bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Cons
         }
         if (!stream->queue.empty())
             active = true;
-        if (haveChosen && chosen.generation == stream->generation && stream->shm) {
-            const uint8_t* data = stream->shm + static_cast<size_t>(chosen.slot) * stream->slotBytes;
-            consumer(*stream, &chosen, data); // copies while the mapping is held
+        bool pinned = false;
+        if (haveChosen && chosen.remote) {
+            pinned = PS5VideoDecoder::pin(chosen.decoder, chosen.token, chosen.picture);
+            if (!pinned) {
+                skipped.push_back(chosen); // the decoder no longer has it (flushed)
+                haveChosen = false;
+            }
+        }
+        if (haveChosen && (chosen.remote || (chosen.generation == stream->generation && stream->shm))) {
+            const uint8_t* data = chosen.remote ? nullptr : stream->shm + static_cast<size_t>(chosen.slot) * stream->slotBytes;
+            consumer(*stream, &chosen, data); // copies while the mapping is held (shared memory) or draws from the decoder's buffer
+            if (pinned) {
+                g_mutex_lock(&pinnedLock);
+                pinnedPictures.emplace_back(chosen.decoder, chosen.token);
+                g_mutex_unlock(&pinnedLock);
+            }
             if (stream->hasFrame && stream->holdVsyncs) {
                 unsigned hold = stream->holdVsyncs;
                 stream->holdHistogram[std::min(hold, 4u) - 1]++;
@@ -422,14 +494,24 @@ bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Cons
         g_mutex_unlock(&stream->lock);
 
         for (auto& frame : skipped)
-            sendRelease(*stream, frame.slot, frame.generation);
+            discardFrame(*stream, frame);
         if (haveChosen)
-            sendRelease(*stream, chosen.slot, chosen.generation);
+            sendRelease(*stream, chosen.remote ? chosen.token : chosen.slot, chosen.remote ? 0xffffffffu : chosen.generation);
         if (now - stream->lastFrameUS < activeAfterFrameUS)
             active = true;
         logStream(*stream, now);
     }
     return active;
+}
+
+void presented()
+{
+    std::vector<std::pair<uint32_t, uint32_t>> done;
+    g_mutex_lock(&pinnedLock);
+    done.swap(pinnedPictures);
+    g_mutex_unlock(&pinnedLock);
+    for (auto& [decoder, token] : done)
+        PS5VideoDecoder::release(decoder, token, true);
 }
 
 } // namespace PS5VideoServer
@@ -448,12 +530,17 @@ static void* nullConsumerThread(void*)
         } else if (wait < -100000)
             next = g_get_monotonic_time();
         PS5VideoServer::consume(next, period / 2, true, [](PS5VideoStream&, const PS5VideoFrame*, const uint8_t*) { });
+        PS5VideoServer::presented();
     }
     return nullptr;
 }
 
 void ps5wk_video_server_start_null(void)
 {
+    // PS5WK_FAKE_VDEC=1: the fake hardware decoder (empty pictures in
+    // display order), so payload-only runs exercise ps5vdecproxy.
+    if (!g_strcmp0(g_getenv("PS5WK_FAKE_VDEC"), "1"))
+        ps5wk_video_set_decoder_backend(ps5wk_video_fake_decoder_backend());
     PS5VideoServer::start(nullptr);
     pthread_t thread;
     if (!pthread_create(&thread, nullptr, nullConsumerThread, nullptr))

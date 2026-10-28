@@ -695,7 +695,8 @@ GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions 
 # playbackRate with preserved pitch.)
 # Plus our own static plugins "ps5audio" (gst/gstps5audiosink.c, audio to the
 # title) and "ps5video" (gst/gstps5videosink.c, hole-punch video frames to the
-# title), compiled into the registration archive below.
+# title, and gst/gstps5vdecproxy.c, access units to the title's hardware
+# decoder), compiled into the registration archive below.
 
 # libgstreamer-full-1.0.a: every libgst*-1.0.a, the plugins above, the
 # registration object and FFmpeg/dav1d merged into one archive (what
@@ -712,8 +713,11 @@ step_gst_full() {
     prospero-clang $CFLAGS_COMMON -DGST_PLUGIN_BUILD_STATIC $("$PKGCONF" --cflags gstreamer-audio-1.0) \
         -c "$HERE/gst/gstps5audiosink.c" -o "$b/gstps5audiosink.o"
     prospero-clang $CFLAGS_COMMON -DGST_PLUGIN_BUILD_STATIC $("$PKGCONF" --cflags gstreamer-video-1.0) \
-        -c "$HERE/gst/gstps5videosink.c" -o "$b/gstps5videosink.o"
-    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o" "$b/gstps5audiosink.o" "$b/gstps5videosink.o"
+        -I"$HERE/../webkit/wpe-ps5" -c "$HERE/gst/gstps5videosink.c" -o "$b/gstps5videosink.o"
+    prospero-clang $CFLAGS_COMMON -DGST_PLUGIN_BUILD_STATIC $("$PKGCONF" --cflags gstreamer-video-1.0) \
+        -I"$HERE/../webkit/wpe-ps5" -c "$HERE/gst/gstps5vdecproxy.c" -o "$b/gstps5vdecproxy.o"
+    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o" "$b/gstps5audiosink.o" "$b/gstps5videosink.o" \
+        "$b/gstps5vdecproxy.o"
     mri="$b/full.mri"
     { echo "CREATE $lib/libgstreamer-full-1.0.a"
       echo "ADDLIB $b/libgststaticplugins.a"

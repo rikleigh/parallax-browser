@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "PS5VideoDecoder.h"
 #include "PS5VideoProtocol.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -33,10 +34,11 @@
 // a null consumer in ps5wk-shot) picks the frame due at each vsync and
 // releases the slots.
 //
-// Step 2b (Videodec2 in the title) adds a second kind of frame source: a
-// decoder thread here that gets compressed access units over the same
-// connection and decodes them straight into the renderer's GPU buffers. The
-// consumer side (frame selection by time, geometry, compositing) stays.
+// Step 2b (Videodec2 in the title) adds a second kind of frame source:
+// PS5VideoDecoder decodes access units from the WebProcess's ps5vdecproxy
+// straight into the renderer's GL buffers; the sink then sends REMOTE frames
+// that name a decoded picture instead of a shared-memory slot. The consumer
+// side (frame selection by time, geometry, compositing) stays.
 
 struct PS5VideoFrame {
     uint32_t slot { 0 };
@@ -49,6 +51,12 @@ struct PS5VideoFrame {
     uint32_t offset[3] { };
     int64_t targetUS { 0 }; // CLOCK_MONOTONIC, 0 = at once
     int64_t ptsNS { -1 };
+    // REMOTE frames (format PS5WK_VFMT_REMOTE): a title decoder's picture,
+    // pinned while the consumer draws it.
+    bool remote { false };
+    uint32_t decoder { 0 };
+    uint32_t token { 0 };
+    PS5VideoPicture picture;
 };
 
 struct PS5VideoGeometry {
@@ -115,6 +123,10 @@ void start(void (*wake)());
 // last 500 ms (keep presenting every vsync).
 using Consumer = std::function<void(PS5VideoStream&, const PS5VideoFrame*, const uint8_t*)>;
 bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Consumer&);
+
+// After the frame drawn in consume() is on screen (the swap returned, so the
+// GPU is done with it): REMOTE pictures drawn go back to their decoders.
+void presented();
 
 // Earliest time (CLOCK_MONOTONIC us) something is due: a queued frame or a
 // pending geometry's 100 ms commit; INT64_MAX if nothing.

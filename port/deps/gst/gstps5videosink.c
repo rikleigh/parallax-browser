@@ -11,9 +11,12 @@
  *   (set by ps5wk-child: /system_tmp/ps5wk/video-<UIProcess pid>.sock), a
  *   ring of PS5_SLOTS frame slots in anonymous shared memory whose fd goes
  *   over the connection (SCM_RIGHTS), 128-byte messages
- *   (port/webkit/wpe-ps5/PS5VideoProtocol.h; the definitions are copied
- *   below: change both). The title copies a slot into GPU memory when it
- *   shows the frame and releases it.
+ *   (port/webkit/wpe-ps5/PS5VideoProtocol.h). The title copies a slot into
+ *   GPU memory when it shows the frame and releases it.
+ * - Hardware decoding (step 2b): buffers from ps5vdecproxy
+ *   (video/x-raw(memory:PS5Remote)) name a picture the title decoded
+ *   itself; they go out as REMOTE frames (decoder id + token), with no
+ *   shared memory at all.
  * - Formats: I420 and NV12 (what avdec_* produce for 8-bit 4:2:0; playsink
  *   converts anything else). Planes are copied into the slot with 64-byte
  *   aligned strides; the title converts YUV to RGB on the GPU.
@@ -48,23 +51,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-/* ---- wire format: copy of port/webkit/wpe-ps5/PS5VideoProtocol.h ---- */
-#define PS5WK_VIDEO_MAGIC 0x56355350u
-#define PS5WK_VIDEO_VERSION 1
-enum { PS5WK_VMSG_HELLO = 1, PS5WK_VMSG_SHM = 2, PS5WK_VMSG_FRAME = 3, PS5WK_VMSG_GEOMETRY = 4, PS5WK_VMSG_FLUSH = 5, PS5WK_VMSG_RELEASE = 16 };
-enum { PS5WK_VFMT_I420 = 1, PS5WK_VFMT_NV12 = 2 };
-#define PS5WK_VCOLOR_BT709 1u
-#define PS5WK_VCOLOR_FULL_RANGE 2u
-struct ps5wk_video_msg {
-    uint32_t type, magic, version;
-    int32_t pid;
-    uint32_t slot, slots, slot_bytes, generation, format, width, height, visible;
-    int32_t rect[4];
-    uint32_t colorimetry, stride[3], offset[3], displayed, dropped, reserved[3];
-    int64_t target_us, pts_ns;
-};
-_Static_assert(sizeof(struct ps5wk_video_msg) == 128, "ps5wk_video_msg is 128 bytes");
-/* ---- */
+/* Wire format: port/webkit/wpe-ps5/PS5VideoProtocol.h (build.sh puts it on the include path). */
+#include "PS5VideoProtocol.h"
 
 #define PS5_SLOTS 6
 #define PS5_LEAD (40 * GST_MSECOND)  /* frames reach the title this much early */
@@ -97,6 +85,10 @@ struct _GstPs5VideoSink {
     GstVideoInfo info;
     gboolean have_info;
     guint format, colorimetry;
+    gboolean remote; /* ps5vdecproxy's placeholders */
+    guint64 remote_sent, remote_dropped;
+    struct ps5wk_remote_picture prepared; /* the last placeholder prepare() saw */
+    gboolean prepared_pending;            /* ... and not rendered yet */
     guint stride[3], offset[3];
     gsize frame_bytes;
 
@@ -124,7 +116,8 @@ static guint signals[LAST_SIGNAL];
 G_DEFINE_TYPE(GstPs5VideoSink, gst_ps5_video_sink, GST_TYPE_VIDEO_SINK)
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ I420, NV12 }")));
+    GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ I420, NV12 }") "; "
+        GST_VIDEO_CAPS_MAKE_WITH_FEATURES("memory:PS5Remote", "{ NV12, P010_10LE }")));
 
 /* ------------------------------------------------------------ connection */
 
@@ -372,7 +365,8 @@ static gboolean ps5_stop(GstBaseSink *bsink)
     g_mutex_lock(&self->lock);
     if (self->sent)
         g_printerr("[ps5videosink] %p: stop after %" G_GUINT64_FORMAT " frames sent (title: %u shown, %u dropped; %" G_GUINT64_FORMAT
-                   " without a free slot)\n", (void *)self, self->sent, self->title_displayed, self->title_dropped, self->no_slot);
+                   " without a free slot; %" G_GUINT64_FORMAT " hardware-decoded, %" G_GUINT64_FORMAT " of them dropped here as late)\n",
+            (void *)self, self->sent, self->title_displayed, self->title_dropped, self->no_slot, self->remote_sent, self->remote_dropped);
     disconnect_locked(self);
     g_mutex_unlock(&self->lock);
     return TRUE;
@@ -386,9 +380,18 @@ static gboolean ps5_set_caps(GstBaseSink *bsink, GstCaps *caps)
         return FALSE;
     guint w = GST_VIDEO_INFO_WIDTH(&info), h = GST_VIDEO_INFO_HEIGHT(&info);
     guint ch = (h + 1) / 2, cw = (w + 1) / 2;
+    GstCapsFeatures *features = gst_caps_get_features(caps, 0);
+    gboolean remote = features && gst_caps_features_contains(features, "memory:PS5Remote");
     g_mutex_lock(&self->lock);
     self->info = info;
     self->have_info = TRUE;
+    self->remote = remote;
+    if (remote) {
+        self->format = PS5WK_VFMT_REMOTE;
+        memset(self->stride, 0, sizeof self->stride);
+        memset(self->offset, 0, sizeof self->offset);
+        self->frame_bytes = 0;
+    } else
     switch (GST_VIDEO_INFO_FORMAT(&info)) {
     case GST_VIDEO_FORMAT_I420:
         self->format = PS5WK_VFMT_I420;
@@ -415,8 +418,8 @@ static gboolean ps5_set_caps(GstBaseSink *bsink, GstCaps *caps)
     GstVideoColorimetry *c = &GST_VIDEO_INFO_COLORIMETRY(&info);
     gboolean bt709 = c->matrix == GST_VIDEO_COLOR_MATRIX_BT709 || (c->matrix == GST_VIDEO_COLOR_MATRIX_UNKNOWN && h >= 720);
     self->colorimetry = (bt709 ? PS5WK_VCOLOR_BT709 : 0) | (c->range == GST_VIDEO_COLOR_RANGE_0_255 ? PS5WK_VCOLOR_FULL_RANGE : 0);
-    g_printerr("[ps5videosink] %p: %ux%u %s, %s %s range\n", (void *)self, w, h, gst_video_format_to_string(GST_VIDEO_INFO_FORMAT(&info)),
-        bt709 ? "BT.709" : "BT.601", c->range == GST_VIDEO_COLOR_RANGE_0_255 ? "full" : "limited");
+    g_printerr("[ps5videosink] %p: %ux%u %s%s, %s %s range\n", (void *)self, w, h, gst_video_format_to_string(GST_VIDEO_INFO_FORMAT(&info)),
+        remote ? " decoded in the title" : "", bt709 ? "BT.709" : "BT.601", c->range == GST_VIDEO_COLOR_RANGE_0_255 ? "full" : "limited");
     g_mutex_unlock(&self->lock);
     return TRUE;
 }
@@ -514,7 +517,38 @@ static GstFlowReturn show(GstPs5VideoSink *self, GstBuffer *buffer, gboolean pre
         return GST_FLOW_NOT_NEGOTIATED;
     }
     connect_locked(self);
-    if (self->fd >= 0 && ensure_shm_locked(self, self->frame_bytes)) {
+    if (self->remote) {
+        read_releases_locked(self, 0);
+        struct ps5wk_remote_picture remote;
+        if (self->fd >= 0 && gst_buffer_extract(buffer, 0, &remote, sizeof remote) == sizeof remote && remote.magic == PS5WK_REMOTE_MAGIC) {
+            struct ps5wk_video_msg msg;
+            memset(&msg, 0, sizeof msg);
+            msg.type = PS5WK_VMSG_FRAME;
+            msg.format = PS5WK_VFMT_REMOTE;
+            msg.ps5wk_decoder = remote.decoder;
+            msg.ps5wk_token = remote.token;
+            msg.generation = remote.epoch;
+            msg.width = GST_VIDEO_INFO_WIDTH(&self->info);
+            msg.height = GST_VIDEO_INFO_HEIGHT(&self->info);
+            msg.colorimetry = self->colorimetry;
+            msg.target_us = target;
+            msg.pts_ns = GST_BUFFER_PTS_IS_VALID(buffer) ? (int64_t)GST_BUFFER_PTS(buffer) : -1;
+            if (target) {
+                gint64 lead = target - g_get_monotonic_time();
+                self->lead_sum_us += lead;
+                if (!self->lead_count || lead < self->lead_min_us)
+                    self->lead_min_us = lead;
+                self->lead_count++;
+            }
+            if (self->prepared_pending && self->prepared.token == remote.token)
+                self->prepared_pending = FALSE;
+            if (!send_msg(self, &msg, -1)) {
+                self->sent++;
+                self->remote_sent++;
+            }
+        }
+        maybe_log(self);
+    } else if (self->fd >= 0 && ensure_shm_locked(self, self->frame_bytes)) {
         read_releases_locked(self, 0);
         int slot = free_slot_locked(self);
         if (slot < 0 && !self->flushing) {
@@ -572,6 +606,33 @@ static GstFlowReturn ps5_preroll(GstBaseSink *bsink, GstBuffer *buffer)
     return show(GST_PS5_VIDEO_SINK(bsink), buffer, TRUE);
 }
 
+/* Every buffer that reaches the sink passes here before it is synced
+ * (and maybe dropped as late, without render()): a placeholder the sink saw
+ * but never rendered goes back to the title's decoder. */
+static GstFlowReturn ps5_prepare(GstBaseSink *bsink, GstBuffer *buffer)
+{
+    GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
+    if (!self->remote)
+        return GST_FLOW_OK;
+    struct ps5wk_remote_picture remote;
+    if (gst_buffer_extract(buffer, 0, &remote, sizeof remote) != sizeof remote || remote.magic != PS5WK_REMOTE_MAGIC)
+        return GST_FLOW_OK;
+    g_mutex_lock(&self->lock);
+    if (self->prepared_pending && self->prepared.token != remote.token) {
+        struct ps5wk_video_msg msg;
+        memset(&msg, 0, sizeof msg);
+        msg.type = PS5WK_VMSG_RDROP;
+        msg.ps5wk_decoder = self->prepared.decoder;
+        msg.ps5wk_token = self->prepared.token;
+        send_msg(self, &msg, -1);
+        self->remote_dropped++;
+    }
+    self->prepared = remote;
+    self->prepared_pending = TRUE;
+    g_mutex_unlock(&self->lock);
+    return GST_FLOW_OK;
+}
+
 static gboolean ps5_unlock(GstBaseSink *bsink)
 {
     GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
@@ -590,6 +651,7 @@ static gboolean ps5_event(GstBaseSink *bsink, GstEvent *event)
     GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
     if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
         g_mutex_lock(&self->lock);
+        self->prepared_pending = FALSE; /* the title's flush took them back */
         struct ps5wk_video_msg msg;
         memset(&msg, 0, sizeof msg);
         msg.type = PS5WK_VMSG_FLUSH;
@@ -682,14 +744,18 @@ static void gst_ps5_video_sink_class_init(GstPs5VideoSinkClass *klass)
     bsink_class->event = ps5_event;
     bsink_class->propose_allocation = ps5_propose_allocation;
     bsink_class->get_times = ps5_get_times;
+    bsink_class->prepare = ps5_prepare;
 }
 
 static gboolean plugin_init(GstPlugin *plugin)
 {
     GST_DEBUG_CATEGORY_INIT(ps5_video_sink_debug, "ps5videosink", 0, "PS5 hole-punch video sink");
-    /* Rank NONE: only WebKit makes it, by name. */
-    return gst_element_register(plugin, "ps5videosink", GST_RANK_NONE, GST_TYPE_PS5_VIDEO_SINK);
+    /* Rank NONE: only WebKit makes it, by name. The hardware decoder proxy
+     * (gstps5vdecproxy.c) is part of the same plugin. */
+    extern gboolean ps5_vdec_proxy_register(GstPlugin *plugin);
+    return gst_element_register(plugin, "ps5videosink", GST_RANK_NONE, GST_TYPE_PS5_VIDEO_SINK)
+        && ps5_vdec_proxy_register(plugin);
 }
 
-GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, ps5video, "PS5 hole-punch video sink", plugin_init, "1.0", "LGPL",
+GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, ps5video, "PS5 hole-punch video sink and hardware decoder proxy", plugin_init, "1.0", "LGPL",
     "ps5webkit", "https://github.com/")

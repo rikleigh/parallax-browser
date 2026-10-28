@@ -19,6 +19,7 @@
 #include "config.h"
 #include "PS5Renderer.h"
 
+#include "PS5VideoDecoder.h"
 #include "PS5VideoServer.h"
 #include <algorithm>
 #include <cmath>
@@ -99,23 +100,30 @@ void main()
 // picture's top row (as with Spike 9's decoder frames).
 static const char* kConvertFragmentShader = R"(#version 430 core
 layout(std430, binding = 0) readonly buffer Frame { uint d[]; };
-uniform int format_;   // 1 = I420, 2 = NV12
+uniform int format_;   // 1 = I420, 2 = NV12, 4 = NV12 layout with 16-bit samples, 10 bits LSB-aligned (Videodec2)
 uniform ivec3 strides;
 uniform ivec3 offsets;
 uniform int color_;    // bit 0: BT.709 (else BT.601), bit 1: full range
 out vec4 o;
 float b8(int a) { return float((d[a >> 2] >> ((a & 3) * 8)) & 0xffu) / 255.0; }
+float b16(int a) { return float((d[a >> 2] >> ((a & 2) * 8)) & 0xffffu) / 1023.0; }
 void main()
 {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    float y = b8(offsets.x + p.y * strides.x + p.x);
     int cy = p.y >> 1, cx = p.x >> 1;
-    float u, v;
-    if (format_ == 2) {
+    float y, u, v;
+    if (format_ == 4) {
+        y = b16(offsets.x + p.y * strides.x + p.x * 2);
+        int c = offsets.y + cy * strides.y + cx * 4;
+        u = b16(c);
+        v = b16(c + 2);
+    } else if (format_ == 2) {
+        y = b8(offsets.x + p.y * strides.x + p.x);
         int c = offsets.y + cy * strides.y + cx * 2;
         u = b8(c);
         v = b8(c + 1);
     } else {
+        y = b8(offsets.x + p.y * strides.x + p.x);
         u = b8(offsets.y + cy * strides.y + cx);
         v = b8(offsets.z + cy * strides.z + cx);
     }
@@ -268,8 +276,74 @@ bool PS5Renderer::initialize(char* error, unsigned errorSize)
         return false;
     }
     m_initialized = true;
+    // Hardware decoding: output buffers are GL buffers (persistent, coherent;
+    // ps5-opengl backs them with GPU-visible direct memory, which Videodec2
+    // writes into), made on the render thread.
+    PS5VideoDecoder::setBufferProvider({
+        [](size_t bytes, unsigned* name, uint8_t** map) { return PS5Renderer::singleton().allocateVideoBuffer(bytes, name, map); },
+        [](unsigned name, uint8_t*, size_t) { PS5Renderer::singleton().freeVideoBuffer(name); },
+    });
     PS5VideoServer::start([] { PS5Renderer::singleton().wake(); });
     return true;
+}
+
+bool PS5Renderer::allocateVideoBuffer(size_t bytes, unsigned* name, uint8_t** map)
+{
+    BufferRequest request;
+    request.bytes = bytes;
+    g_mutex_lock(&m_lock);
+    m_bufferRequests.push_back(&request);
+    g_cond_broadcast(&m_cond);
+    while (!request.done)
+        g_cond_wait(&m_cond, &m_lock);
+    g_mutex_unlock(&m_lock);
+    *name = request.name;
+    *map = request.map;
+    return request.map;
+}
+
+void PS5Renderer::freeVideoBuffer(unsigned name)
+{
+    g_mutex_lock(&m_lock);
+    m_bufferFrees.push_back(name);
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+// Render thread, at the top of a frame (the previous swap waited for the GPU,
+// so buffers freed here are no longer read).
+void PS5Renderer::serviceBufferRequests()
+{
+    g_mutex_lock(&m_lock);
+    auto requests = std::move(m_bufferRequests);
+    m_bufferRequests.clear();
+    auto frees = std::move(m_bufferFrees);
+    m_bufferFrees.clear();
+    g_mutex_unlock(&m_lock);
+    for (unsigned name : frees) {
+        GLuint buffer = name;
+        glDeleteBuffers(1, &buffer);
+    }
+    for (auto* request : requests) {
+        const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        GLuint buffer = 0;
+        glGenBuffers(1, &buffer);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glBufferStorage(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(request->bytes), nullptr, flags);
+        auto* map = static_cast<uint8_t*>(glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(request->bytes), flags));
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        if (!map) {
+            g_message("[wpe-ps5] decoder output buffer of %.1f MB: map failed (0x%x)", request->bytes / 1048576.0, glGetError());
+            glDeleteBuffers(1, &buffer);
+            buffer = 0;
+        }
+        g_mutex_lock(&m_lock);
+        request->name = buffer;
+        request->map = map;
+        request->done = true;
+        g_cond_broadcast(&m_cond);
+        g_mutex_unlock(&m_lock);
+    }
 }
 
 void* PS5Renderer::threadEntry(void* data)
@@ -407,7 +481,7 @@ void PS5Renderer::requestCapture(const char* path)
 // f/g ms, MB per upload; video: N frames converted, h ms".
 static struct {
     int64_t windowStart;
-    unsigned frames, uploads, videoFrames, intervals;
+    unsigned frames, uploads, videoFrames, remoteFrames, intervals;
     double renderMS, renderMaxMS, swapMS, swapMaxMS, uploadMS, uploadMaxMS, uploadBytes, videoMS, videoMaxMS, intervalMS;
 } stats;
 
@@ -420,10 +494,10 @@ static void maybeLogStats(int64_t now)
         return;
     if (stats.frames > 25) {
         g_message("[wpe-ps5] [present] %u frames (%.1f/s), render %.2f ms avg %.1f max, swap %.1f ms avg %.1f max, vsync interval %.2f ms; "
-                  "%u page uploads, %.1f ms avg %.1f max (%.2f MB each); %u video frames, copy+convert %.2f ms avg %.1f max",
+                  "%u page uploads, %.1f ms avg %.1f max (%.2f MB each); %u video frames (%u hardware-decoded), copy+convert %.2f ms avg %.1f max",
             stats.frames, stats.frames / seconds, stats.renderMS / stats.frames, stats.renderMaxMS, stats.swapMS / stats.frames, stats.swapMaxMS,
             stats.intervals ? stats.intervalMS / stats.intervals : 0.0, stats.uploads, stats.uploads ? stats.uploadMS / stats.uploads : 0.0,
-            stats.uploadMaxMS, stats.uploads ? stats.uploadBytes / stats.uploads / 1048576.0 : 0.0, stats.videoFrames,
+            stats.uploadMaxMS, stats.uploads ? stats.uploadBytes / stats.uploads / 1048576.0 : 0.0, stats.videoFrames, stats.remoteFrames,
             stats.videoFrames ? stats.videoMS / stats.videoFrames : 0.0, stats.videoMaxMS);
     }
     stats = { };
@@ -447,7 +521,7 @@ void PS5Renderer::threadMain()
         char* capturePath = nullptr;
         g_mutex_lock(&m_lock);
         for (;;) {
-            if (m_pageJob.pending || m_frameRequested || m_capturePath)
+            if (m_pageJob.pending || m_frameRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
                 break;
             int64_t now = nowUS();
             if (m_videoActive) {
@@ -479,6 +553,7 @@ void PS5Renderer::threadMain()
         m_capturePath = nullptr;
         g_mutex_unlock(&m_lock);
 
+        serviceBufferRequests();
         int64_t start = nowUS();
         bool commitGeometry = m_job.pending;
         if (m_job.pending)
@@ -504,6 +579,8 @@ void PS5Renderer::threadMain()
         int64_t swapStart = nowUS();
         eglSwapBuffers(m_eglDisplay, m_eglSurface);
         int64_t swapEnd = nowUS();
+        // The swap waited for the GPU: decoded pictures drawn this frame go back to their decoders.
+        PS5VideoServer::presented();
 
         // vsync grid: follow swap returns within a quarter period, else reset.
         if (m_lastSwapEnd) {
@@ -665,15 +742,18 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
         stream.consumerData = gl;
     }
 
+    if (frame && frame->remote && !frame->picture.glBuffer)
+        frame = nullptr; // not GPU memory (fake decoder): nothing to draw
     if (frame && frame->width && frame->height && frame->width <= 8192 && frame->height <= 8192) {
         int64_t start = nowUS();
         const int w = static_cast<int>(frame->width), h = static_cast<int>(frame->height), ch = (h + 1) / 2;
-        size_t needed = frame->format == PS5WK_VFMT_NV12
+        const bool remote = frame->remote;
+        size_t needed = remote ? 0 : frame->format == PS5WK_VFMT_NV12
             ? frame->offset[1] + static_cast<size_t>(frame->stride[1]) * ch
             : frame->offset[2] + static_cast<size_t>(frame->stride[2]) * ch;
         needed = std::min<size_t>(needed, stream.slotBytes);
         bool ok = true;
-        if (needed > gl->bytes) {
+        if (!remote && needed > gl->bytes) {
             if (gl->buffer)
                 glDeleteBuffers(1, &gl->buffer);
             size_t bytes = (needed + 0xffff) & ~static_cast<size_t>(0xffff);
@@ -711,21 +791,36 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
             } else {
                 gl->width = w;
                 gl->height = h;
-                g_message("[wpe-ps5] video stream %d: %dx%d %s", stream.id, w, h, frame->format == PS5WK_VFMT_NV12 ? "NV12" : "I420");
+                g_message("[wpe-ps5] video stream %d: %dx%d %s", stream.id, w, h,
+                    remote ? (frame->picture.bitDepth > 8 ? "hardware-decoded, 10-bit" : "hardware-decoded NV12")
+                           : frame->format == PS5WK_VFMT_NV12 ? "NV12" : "I420");
             }
         }
         if (ok) {
-            memcpy(gl->map, data, needed);
+            if (!remote)
+                memcpy(gl->map, data, needed);
             glBindFramebuffer(GL_FRAMEBUFFER, gl->fbo);
             glViewport(0, 0, w, h);
             glDisable(GL_BLEND);
             glDisable(GL_SCISSOR_TEST);
             glUseProgram(m_convertProgram);
             glBindVertexArray(m_vao);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gl->buffer);
-            glUniform1i(m_uFormat, static_cast<GLint>(frame->format));
-            glUniform3i(m_uStrides, static_cast<GLint>(frame->stride[0]), static_cast<GLint>(frame->stride[1]), static_cast<GLint>(frame->stride[2]));
-            glUniform3i(m_uOffsets, static_cast<GLint>(frame->offset[0]), static_cast<GLint>(frame->offset[1]), static_cast<GLint>(frame->offset[2]));
+            if (remote) {
+                // Zero copy: straight from the decoder's output buffer (Spike 9).
+                const PS5VideoPicture& pic = frame->picture;
+                GLint pitch = static_cast<GLint>(pic.pitch), y = static_cast<GLint>(pic.offset);
+                GLint uv = y + pitch * static_cast<GLint>(pic.codedHeight);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, pic.glBuffer);
+                glUniform1i(m_uFormat, pic.bitDepth > 8 ? PS5WK_VFMT_P010LSB : PS5WK_VFMT_NV12);
+                glUniform3i(m_uStrides, pitch, pitch, 0);
+                glUniform3i(m_uOffsets, y, uv, 0);
+                stats.remoteFrames++;
+            } else {
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gl->buffer);
+                glUniform1i(m_uFormat, static_cast<GLint>(frame->format));
+                glUniform3i(m_uStrides, static_cast<GLint>(frame->stride[0]), static_cast<GLint>(frame->stride[1]), static_cast<GLint>(frame->stride[2]));
+                glUniform3i(m_uOffsets, static_cast<GLint>(frame->offset[0]), static_cast<GLint>(frame->offset[1]), static_cast<GLint>(frame->offset[2]));
+            }
             glUniform1i(m_uColor, static_cast<GLint>(frame->colorimetry));
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);

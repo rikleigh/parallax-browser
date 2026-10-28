@@ -50,6 +50,10 @@ typedef struct {
     /* Optional: caller-owned output slots (e.g. a GL buffer's mapping), each
      * at least the decoder's max_frame_size. NULL = allocate direct memory. */
     void *const *external_slots;
+    /* Non-zero: no output slots at all; every vdec2_decode_into/
+     * vdec2_flush_into names the buffer the picture goes into (the
+     * browser's decoder picks a free GL buffer per call). */
+    int caller_frames;
 } vdec2_config_t;
 
 typedef struct {
@@ -69,6 +73,8 @@ typedef struct {
     void *buffer;               /* Y plane; UV follows at pitch_bytes * height */
     uint64_t buffer_size;
     int slot;                   /* which output slot holds it */
+    int has_pts;                /* pts below came from sceVideodec2GetPictureInfo */
+    uint64_t pts;               /* the pts passed with the access unit of this picture */
 } vdec2_picture_t;
 
 typedef struct vdec2 vdec2_t;
@@ -79,11 +85,20 @@ vdec2_t *vdec2_open(const vdec2_config_t *cfg, vdec2_info_t *info, const char **
 /* Decode one access unit (copied into the decoder's input ring first).
  * Returns the call's rc; *pic says whether a picture came out. */
 int vdec2_decode(vdec2_t *v, const void *au, size_t size, uint64_t pts, vdec2_picture_t *pic);
+/* Same, into a buffer of the caller's (caller_frames decoders): any
+ * GPU-visible direct memory of at least vdec2_frame_size bytes, such as a GL
+ * buffer's persistent mapping. pic->pts is the picture's own pts (pictures
+ * come out in display order, a pipeline depth behind the access units). */
+int vdec2_decode_into(vdec2_t *v, const void *au, size_t size, uint64_t pts, void *frame, vdec2_picture_t *pic);
+int vdec2_flush_into(vdec2_t *v, void *frame, vdec2_picture_t *pic);
 /* Drain one buffered picture (end of stream). rc 0 and pic->valid 0: empty. */
 int vdec2_flush(vdec2_t *v, vdec2_picture_t *pic);
 /* A fresh decoder object on the same memory (what a seek needs, per PS5VR). */
 int vdec2_renew(vdec2_t *v);
 void vdec2_close(vdec2_t *v);
+/* Bytes per output slot (max_frame_size, 16 KiB aligned); the alignment
+ * the decoder wants for output buffers. */
+uint32_t vdec2_frame_alignment(const vdec2_t *v);
 /* Bytes per output slot (max_frame_size, 16 KiB aligned). */
 size_t vdec2_frame_size(const vdec2_t *v);
 /* The input ring slot the next vdec2_decode uses: build the AU there and

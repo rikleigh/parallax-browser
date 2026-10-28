@@ -241,10 +241,12 @@ static void captureScreen(const char* name)
     wpe_display_ps5_capture_screen(WPE_DISPLAY_PS5(display), path);
 }
 
-/* Test URL list: /data/ps5webkit/test-urls.txt, one URL per line (# comments).
+/* Test URL list: /data/ps5webkit/test-urls.txt, one URL per line (# comments),
+ * optionally followed by how long to stay on it ("<url> 40"; default 12 s).
  * Each is loaded in turn; after it finishes: a screenshot at +2 s and +10 s,
- * load time and memory in the log, then the next one at +12 s. */
+ * load time and memory in the log, then the next one after the dwell. */
 static char** testURLs;
+static unsigned testDwell[256];
 static unsigned testURLCount, testURLIndex, testURLsLoaded;
 static gint64 loadStart;
 static guint testTimer;
@@ -319,7 +321,7 @@ static void testURLFinished(gboolean ok, const char* uri, const char* detail)
     snprintf(milestone, sizeof milestone, "after test URL %u", testURLIndex);
     memLog(milestone);
     /* Screenshot names: the page's host, e.g. "03-en.wikipedia.org-2s". */
-    static char names[16][2][96];
+    static char names[16][3][96];
     const char* host = strstr(uri, "://") ? strstr(uri, "://") + 3 : uri;
     size_t hostLength = strcspn(host, "/?#:");
     unsigned slot = testURLIndex % 16;
@@ -328,7 +330,12 @@ static void testURLFinished(gboolean ok, const char* uri, const char* detail)
     g_timeout_add(2000, shotAfterLoad, names[slot][0]);
     g_timeout_add(2000, testOnload, NULL);
     g_timeout_add(10000, shotAfterLoad, names[slot][1]);
-    testTimer = g_timeout_add(12000, testTimeout, NULL);
+    unsigned dwell = testURLIndex - 1 < 256 && testDwell[testURLIndex - 1] ? testDwell[testURLIndex - 1] : 12;
+    if (dwell >= 34) { /* long stays (video): one more at +30 s, in steady playback */
+        snprintf(names[slot][2], sizeof names[slot][2], "%.*s-30s", (int)(hostLength < 80 ? hostLength : 80), host);
+        g_timeout_add(30000, shotAfterLoad, names[slot][2]);
+    }
+    testTimer = g_timeout_add_seconds(dwell, testTimeout, NULL);
 }
 
 static gboolean readTestURLs(void)
@@ -340,8 +347,15 @@ static gboolean readTestURLs(void)
     char** lines = g_strsplit(contents, "\n", -1);
     for (char** line = lines; *line; line++) {
         g_strstrip(*line);
-        if (**line && **line != '#')
+        if (**line && **line != '#') {
+            char* space = strpbrk(*line, " \t");
+            if (space) {
+                *space = 0;
+                if (list->len < 256)
+                    testDwell[list->len] = (unsigned)atoi(space + 1);
+            }
             g_ptr_array_add(list, g_strdup(*line));
+        }
     }
     g_strfreev(lines);
     g_free(contents);
@@ -514,8 +528,16 @@ static int fileExists(const char* path)
     return 1;
 }
 
+/* titlevdec.c: hardware video decoding (Videodec2) for the WebProcesses. */
+void ps5wk_title_vdec_preload(void) __attribute__((weak));
+void ps5wk_title_vdec_install(void) __attribute__((weak));
+
 int main(void)
 {
+    /* Before the unjail in spike_title_init (PS5VR: libSceVideodec2 does
+     * not load after it). */
+    if (ps5wk_title_vdec_preload)
+        ps5wk_title_vdec_preload();
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
     loadStart = g_get_monotonic_time();
     signal(SIGPIPE, SIG_IGN);
@@ -542,6 +564,8 @@ int main(void)
         spike_log("imports: %u of %u NULL%s%s", missing, total, missing ? ": " : "", names);
     }
     probeSockets();
+    if (ps5wk_title_vdec_install)
+        ps5wk_title_vdec_install();
 
     mkdir("/data/ps5webkit", 0777);
     mkdir("/data/ps5webkit/home", 0777);

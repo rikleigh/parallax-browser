@@ -85,7 +85,8 @@ typedef struct {
     X(int32_t, sceVideodec2DeleteDecoder, (void *))                                          \
     X(int32_t, sceVideodec2Reset, (void *))                                                  \
     X(int32_t, sceVideodec2Decode, (void *, input_t *, frame_t *, output_t *))               \
-    X(int32_t, sceVideodec2Flush, (void *, frame_t *, output_t *))
+    X(int32_t, sceVideodec2Flush, (void *, frame_t *, output_t *))                         \
+    X(int32_t, sceVideodec2GetPictureInfo, (const output_t *, void *, void *))
 #define DECLARE_PTR(ret, name, args) static ret(*name) args;
 VDEC2_FUNCS(DECLARE_PTR)
 
@@ -288,6 +289,25 @@ static uint32_t level_for(uint32_t codec, int w, int h)
     return px <= 2228224 ? 41 : px <= 8912896 ? 51 : 61;
 }
 
+/* sceVideodec2GetPictureInfo (13.60, read from the disassembly): the
+ * decoder keeps 1 KiB of metadata per picture at the end of the output
+ * buffer and this copies it out. The first picture info's thisSize must be
+ * the codec's own: AVC 0x68 or 0x78, HEVC 0x88/0x98/0xa8/0xb8, VP9 exactly
+ * 0x58; isValid is the byte at +8, ptsData at +0x10, dtsData at +0x18,
+ * attachedData at +0x20 (the PS4 SceVideodec2*PictureInfo layout). */
+static int picture_pts(const output_t *o, uint64_t *pts)
+{
+    if (!sceVideodec2GetPictureInfo)
+        return 0;
+    uint64_t info[0xc0 / 8];
+    memset(info, 0, sizeof info);
+    info[0] = o->codec == VDEC2_CODEC_VP9 ? 0x58 : o->codec == VDEC2_CODEC_HEVC ? 0x88 : 0x68;
+    if (sceVideodec2GetPictureInfo(o, info, NULL) != 0 || !(info[1] & 0xff))
+        return 0;
+    *pts = info[2];
+    return 1;
+}
+
 static void picture_from(const output_t *o, vdec2_picture_t *p, int slot)
 {
     memset(p, 0, sizeof *p);
@@ -301,6 +321,8 @@ static void picture_from(const output_t *o, vdec2_picture_t *p, int slot)
     p->buffer = o->buffer;
     p->buffer_size = o->buffer_size;
     p->slot = slot;
+    if (p->valid)
+        p->has_pts = picture_pts(o, &p->pts);
 }
 
 vdec2_t *vdec2_open(const vdec2_config_t *c, vdec2_info_t *info, const char **stage, int *rc_out)
@@ -377,7 +399,9 @@ vdec2_t *vdec2_open(const vdec2_config_t *c, vdec2_info_t *info, const char **st
     v->nslots = c->frame_slots > 0 ? c->frame_slots : 8;
     if (v->nslots > MAX_SLOTS)
         v->nslots = MAX_SLOTS;
-    if (c->external_slots) {
+    if (c->caller_frames) {
+        v->nslots = 0;
+    } else if (c->external_slots) {
         for (int i = 0; i < v->nslots; i++)
             v->slot[i] = c->external_slots[i];
     } else {
@@ -403,6 +427,36 @@ fail:
 size_t vdec2_frame_size(const vdec2_t *v)
 {
     return v->frame_size;
+}
+
+uint32_t vdec2_frame_alignment(const vdec2_t *v)
+{
+    return v->mem.frame_alignment;
+}
+
+int vdec2_decode_into(vdec2_t *v, const void *au, size_t size, uint64_t pts, void *frame, vdec2_picture_t *pic)
+{
+    memset(pic, 0, sizeof *pic);
+    if (size > VDEC2_INPUT_SLOT_BYTES)
+        return -1;
+    uint8_t *in_mem = (uint8_t *)v->input.addr + (size_t)(v->in_ring++ % INPUT_SLOTS) * VDEC2_INPUT_SLOT_BYTES;
+    if (au != in_mem)
+        memcpy(in_mem, au, size);
+    input_t in = {.size = sizeof in, .au = in_mem, .au_size = size, .pts = pts, .dts = UINT64_MAX};
+    frame_t fb = {.size = sizeof fb, .buffer = frame, .buffer_size = v->frame_size};
+    output_t out = {.size = sizeof out};
+    const int rc = sceVideodec2Decode(v->decoder, &in, &fb, &out);
+    picture_from(&out, pic, -1);
+    return rc;
+}
+
+int vdec2_flush_into(vdec2_t *v, void *frame, vdec2_picture_t *pic)
+{
+    frame_t fb = {.size = sizeof fb, .buffer = frame, .buffer_size = v->frame_size};
+    output_t out = {.size = sizeof out};
+    const int rc = sceVideodec2Flush(v->decoder, &fb, &out);
+    picture_from(&out, pic, -1);
+    return rc;
 }
 
 int vdec2_decode(vdec2_t *v, const void *au, size_t size, uint64_t pts, vdec2_picture_t *pic)

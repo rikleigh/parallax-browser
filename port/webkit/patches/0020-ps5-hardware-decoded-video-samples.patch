@@ -1,0 +1,43 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index a5291baa71..a6c0f3bfc7 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -4568,6 +4568,16 @@ static RefPtr<NativeImage> ps5NativeImageForSample(const GRefPtr<GstSample>& sam
+     return NativeImage::create(WTF::move(image));
+ }
+ 
++// Hardware decoding (Milestone 2 step 2b): ps5vdecproxy's samples carry a
++// placeholder that names a picture decoded in the browser title
++// (video/x-raw(memory:PS5Remote)); the pixels never reach this process.
++static bool ps5IsRemoteSample(GstSample* sample)
++{
++    GstCaps* caps = sample ? gst_sample_get_caps(sample) : nullptr;
++    GstCapsFeatures* features = caps && gst_caps_get_size(caps) ? gst_caps_get_features(caps, 0) : nullptr;
++    return features && gst_caps_features_contains(features, "memory:PS5Remote");
++}
++
+ static bool ps5PaintVideoSample(GraphicsContext& context, const FloatRect& rect, const GRefPtr<GstSample>& sample, const FloatSize& presentationSize)
+ {
+     static GRefPtr<GstSample> cachedSource;
+@@ -4685,6 +4695,10 @@ void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRec
+         return;
+ 
+ #if defined(PS5_PAYLOAD_SDK)
++    // A frame decoded in the title can't be painted here (canvas drawImage,
++    // a rotated video): nothing is drawn.
++    if (ps5IsRemoteSample(sample.get()))
++        return;
+     if (ps5PaintVideoSample(context, rect, sample, *presentationSize))
+         return;
+ #endif
+@@ -4703,6 +4717,10 @@ RefPtr<VideoFrame> MediaPlayerPrivateGStreamer::videoFrameForCurrentTime()
+ 
+     if (!GST_IS_SAMPLE(m_sample.get()))
+         return nullptr;
++#if defined(PS5_PAYLOAD_SDK)
++    if (ps5IsRemoteSample(m_sample.get()))
++        return nullptr;
++#endif
+ 
+     auto frame = VideoFrameGStreamer::createWrappedSample(m_sample);
+     auto contentHint = frame->contentHint();

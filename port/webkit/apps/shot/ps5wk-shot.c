@@ -13,7 +13,7 @@
  * Stdin carries the arguments (elfldr passes none for raw uploads): one line
  * "url=<url> child=<path> timeout=<s> width=<w> height=<h> settle=<s>
  * ua=safari|default js=<file> onload=<file> data=<dir> cache=<dir>
- * cycle=<file> rounds=<n> dwell=<s>" (dwell < 0: that long after starting
+ * cycle=<file> rounds=<n> dwell=<s> fakevdec=1" (dwell < 0: that long after starting
  * each load), any order, all optional. settle: seconds to
  * keep running after the load finished (default 3); ua=safari uses the
  * browser title's user agent; js: a script file on the console evaluated in
@@ -21,6 +21,9 @@
  * the network session's directories (default /data/ps5webkit/shot/...; the
  * title's are /data/ps5webkit/browser/...). Page console
  * messages are printed by the WebProcess ([webN] CONSOLE lines).
+ * fakevdec=1: the video server advertises a fake hardware decoder (empty
+ * pictures in display order), so ps5vdecproxy and REMOTE frames run in
+ * payload-only tests (Videodec2 itself only works in the title).
  * Output goes back on the elfldr connection.
  */
 #include <errno.h>
@@ -118,6 +121,8 @@ static void readArguments(void)
             g_strlcpy(onloadFile, token + 7, sizeof(onloadFile));
         else if (!strncmp(token, "js=", 3))
             g_strlcpy(jsFile, token + 3, sizeof(jsFile));
+        else if (!strncmp(token, "fakevdec=", 9))
+            setenv("PS5WK_FAKE_VDEC", token + 9, 1); /* 1: the fake title decoder (ps5vdecproxy plumbing without Videodec2) */
         else if (!strncmp(token, "debug=", 6))
             setenv("WEBKIT_DEBUG", token + 6, 1); // also reaches the NetworkProcess (creation parameters)
     }

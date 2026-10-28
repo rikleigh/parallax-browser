@@ -623,6 +623,20 @@ port.
     rate, WebProcess CPU down by half to two thirds, title under 0.1 cores.
     WebKit's MSE queue was deepened to 1 s, which removed YouTube's 20–35 s
     video stalls after a pause. Waiting for the owner's TV check.
-  - **Step 2b** (planned, same README): Videodec2 in the title decodes
-    access units sent by a proxy decoder in the WebProcess, straight into the
-    GL buffers the compositor already reads.
+  - **TV check of step 2a** (2026-10-28 evening): YouTube and local video
+    smooth, fullscreen, seeking and switching videos fine. One WebProcess
+    crash after 150 s: JSC's GC read suspended threads' stack pointers at the
+    SDK's ucontext offset, not the PS5 kernel's (+0x40), so it mostly
+    skipped their stacks and sometimes copied a wrapped "stack" size
+    (out-of-memory panic). Fixed (WebKit patch 0019); WebProcesses now log
+    a memory line per minute.
+  - **Step 2b, hardware decoding** (2026-10-28, port/webkit/README.md,
+    *Step 2b*): a proxy decoder element in the WebProcess sends access
+    units to the title, Videodec2 decodes them straight into the GL buffers
+    the compositor reads, and the sink names the decoded picture instead of
+    sending pixels. Measured in the title: YouTube VP9 2160p60 at 59.5
+    frames/s, local HEVC 4K (8- and 10-bit) and 7680x3840 at 30 fps, the
+    WebProcess at 0.05–0.07 cores for local clips; 8K HEVC takes 139 MB of
+    the title's ~300 MB of flexible memory. Software decoding stays the
+    fallback (AV1, other profiles, no title). Waiting for the owner's TV
+    check.

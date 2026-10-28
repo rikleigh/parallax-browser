@@ -21,6 +21,8 @@
 #include <glib.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <vector>
 
 struct PS5VideoStream;
 struct PS5VideoFrame;
@@ -75,6 +77,12 @@ public:
     // CPU time of the render thread so far (seconds), or -1.
     double renderThreadCPUSeconds() const;
 
+    // Hardware decoding (PS5VideoDecoder's output buffers): a persistent,
+    // coherent GL buffer made on the render thread (blocks until it is);
+    // freed there at the start of the next frame.
+    bool allocateVideoBuffer(size_t bytes, unsigned* name, uint8_t** map);
+    void freeVideoBuffer(unsigned name);
+
 private:
     PS5Renderer() = default;
     static void* threadEntry(void*);
@@ -84,6 +92,7 @@ private:
     void renderFrame();
     void copyPage();
     void handleVideo(PS5VideoStream&, const PS5VideoFrame*, const uint8_t*);
+    void serviceBufferRequests();
     void drawScene();
     void writeCapture(char* path);
 
@@ -112,6 +121,14 @@ private:
         void (*done)(void*) { nullptr };
         void* userData { nullptr };
     } m_pageJob;
+    struct BufferRequest {
+        size_t bytes { 0 };
+        unsigned name { 0 };
+        uint8_t* map { nullptr };
+        bool done { false };
+    };
+    std::vector<BufferRequest*> m_bufferRequests;
+    std::vector<unsigned> m_bufferFrees;
     bool m_frameRequested { false };
     bool m_pointerVisible { false };
     double m_pointerX { 0 }, m_pointerY { 0 };

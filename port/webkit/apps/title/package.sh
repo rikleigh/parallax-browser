@@ -56,6 +56,9 @@ prospero-clang -std=gnu11 -O2 "${TF[@]}" -I"$D10" -c "$D10/dheap.c" -o "$W/obj/d
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
 # The system keyboard: libSceImeDialog loaded and bound at run time.
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$HERE" -c "$HERE/titleime.c" -o "$W/obj/titleime.o"
+# Hardware video decoding (step 2b): Spike 9's vdec2 + the backend for wpe-ps5's PS5VideoDecoder.
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes/09-hw-decode" -c "$ROOT/spikes/09-hw-decode/vdec2.c" -o "$W/obj/vdec2.o"
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$PORT/wpe-ps5" -c "$HERE/titlevdec.c" -o "$W/obj/titlevdec.o"
 # libc.a without syscalls.o (raw syscalls: illegal in a title, and they
 # override libkernel's exports); titlesys.c defines what libkernel lacks.
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlesys.c" -o "$W/obj/titlesys.o"

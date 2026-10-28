@@ -431,6 +431,30 @@ size_t ps5wk_title_flexible_free(void)
     return dmem_flexible_free();
 }
 
+/* Direct memory this process holds, all of it (the heap and mmaps above,
+ * ps5-opengl's buffers and textures, the video decoder's memory). */
+typedef struct {
+    long start, end;
+    int memory_type;
+} dmq_info_t;
+int sceKernelDirectMemoryQuery(long offset, int flags, dmq_info_t* info, size_t info_size);
+
+double ps5wk_title_direct_mb(void);
+double ps5wk_title_direct_mb(void)
+{
+    long offset = 0;
+    double total = 0;
+    for (int i = 0; i < 65536; i++) {
+        dmq_info_t info;
+        memset(&info, 0, sizeof info);
+        if (sceKernelDirectMemoryQuery(offset, 1 /* the next allocation at or after offset */, &info, sizeof info) != 0 || info.end <= offset)
+            break;
+        total += (double)(info.end - info.start);
+        offset = info.end;
+    }
+    return total / 1048576.0;
+}
+
 void ps5wk_title_mem_log(const char* milestone)
 {
     dheap_stats_t h;
@@ -443,10 +467,10 @@ void ps5wk_title_mem_log(const char* milestone)
     unsigned live = stacks_live, created = threads_created;
     size_t sb = stack_bytes;
     pthread_mutex_unlock(&stack_lock);
-    spike_log("[mem] %s: flexible %.1f MB free; direct heap %.1f MB mapped (peak %.1f, %llu libc fallbacks, init %s); "
+    spike_log("[mem] %s: flexible %.1f MB free; direct memory %.1f MB in use; direct heap %.1f MB mapped (peak %.1f, %llu libc fallbacks, init %s); "
               "anon mmaps %.1f MB in %u (peak %.1f MB, %llu made, %llu failed, %llu zero fills, %llu passed through); "
               "thread stacks %u live, %.1f MB (%u created, %u libc)",
-        milestone, dmem_flexible_free() / 1048576.0, h.mapped / 1048576.0, h.peak / 1048576.0, h.libc_fallbacks,
+        milestone, dmem_flexible_free() / 1048576.0, ps5wk_title_direct_mb(), h.mapped / 1048576.0, h.peak / 1048576.0, h.libc_fallbacks,
         h.init_step, (mapped - sb) / 1048576.0, n, peak / 1048576.0, dmap_count, dmap_failures, dmap_zero_fills,
         dmap_passthrough, live, sb / 1048576.0, created, threads_libc);
 }
