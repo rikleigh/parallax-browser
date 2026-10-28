@@ -644,6 +644,10 @@ int main(void)
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
+    /* Without this WPE keeps cookies in memory only: every site logged out
+     * and YouTube's consent dialog back after each restart. */
+    webkit_cookie_manager_set_persistent_storage(webkit_network_session_get_cookie_manager(session),
+        "/data/ps5webkit/browser/data/cookies.sqlite", WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
     /* A TV browser: media may start without a gesture (YouTube, players
      * that autoplay; the pad's X is not always on the video). */
     WebKitWebsitePolicies* policies = webkit_website_policies_new_with_policies("autoplay", WEBKIT_AUTOPLAY_ALLOW, NULL);
