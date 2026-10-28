@@ -19,6 +19,8 @@
 #include "config.h"
 #include "WPEDisplayPS5.h"
 
+#include "GRefPtrWPE.h"
+
 #include "PS5Renderer.h"
 #include "PS5Sce.h"
 #include "WPEExtensions.h"
@@ -318,6 +320,8 @@ static void openPad(WPEDisplayPS5* display)
     priv->userID = user;
     priv->pad = scePadOpen(user, 0, 0, nullptr);
     PS5_LOG("pad: init 0x%x, user %d, open -> %d", rc, user, priv->pad);
+    PS5_LOG("ime: sceImeDialogInit %p GetStatus %p GetResult %p Term %p", reinterpret_cast<void*>(sceImeDialogInit),
+        reinterpret_cast<void*>(sceImeDialogGetStatus), reinterpret_cast<void*>(sceImeDialogGetResult), reinterpret_cast<void*>(sceImeDialogTerm));
     PS5PadData data { };
     if (priv->pad >= 0 && scePadReadState(priv->pad, &data) == 0)
         priv->ignoredButtons = data.buttons; // held at start: ignore until released
@@ -404,7 +408,7 @@ static void padTick(WPEDisplayPS5* display)
         if (priv->pointerDown) {
             priv->pointerDown = false;
             GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
-                eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 1));
+                eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
             wpe_view_event(view, event.get());
         } else
             sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
