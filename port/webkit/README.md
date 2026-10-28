@@ -927,6 +927,24 @@ Checked on the console (13.60, `spikes/04-jsc/jit-check.sh`: the WPE build's
   touched memory costs page tables: the kernel's `page table CPU` count with
   ps5wk-shot + NetworkProcess + WebProcess peaked at ~6575/8192 with the JIT
   against ~6290 without (idle 5023).
+- **Title PPSA99020 with the JIT build** (log-only runs, 2026-10-28 evening):
+  the WebProcess logs `JIT: on`, the NetworkProcess `JIT off`, and the
+  title maps no RWX memory (flexible memory 284 MB at start, ~15 MB less
+  than before, as the bigger image predicts). Start page, YouTube (4K60 VP9 in
+  Videodec2, 60 s), Wikipedia and BBC News load, with no crash. Page tables
+  peaked at 6965/8192 (title + NetworkProcess + two WebProcesses). YouTube's
+  first ~20 s on the real decoder: 12 and 8 frames dropped with the JIT
+  (two runs) against 22 without; late access units 118/61 against 79.
+  Rendering updates take 45–90 ms each at ~6/s during load either way.
+- **Where the WebProcess main thread goes** (`PS5WK_PROFILE=1`; the profiler
+  now writes JIT pcs as `jit`, and `test/prof.sh` adds a by-area summary):
+  while YouTube loads, the main thread is 65–91% busy for ~15 s. Roughly
+  40–65% of that is JavaScript (JIT code plus the JSC runtime, allocator
+  included), 10–30% paint and ~15% style and layout. Once playing without
+  interaction it is 3–11% busy. So the JIT shortens the load phase, but a page
+  that keeps repainting (overlays, controls) is limited by CPU painting
+  (`[render]` ~35 ms per update in the owner's session), which the JIT
+  doesn't touch.
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

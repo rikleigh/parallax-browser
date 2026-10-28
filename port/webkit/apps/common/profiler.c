@@ -87,18 +87,28 @@ static void onProf(int sig, siginfo_t* info, void* context)
     __atomic_store_n(&head, h + 1, __ATOMIC_RELEASE);
 }
 
+// JSC's executable memory (WebKit patch 0030): a pc there is written as
+// "jit" (prof.sh counts it as JIT-compiled JavaScript).
+void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
+
 static void flushSamples(void)
 {
     FILE* f = fopen(path, "a");
     if (!f)
         return;
     uintptr_t base = (uintptr_t)&__ehdr_start;
+    void *jitStart = 0, *jitEnd = 0;
+    if (ps5wk_jit_memory)
+        ps5wk_jit_memory(&jitStart, &jitEnd, 0, 0);
     unsigned h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
     while (tail != h) {
         sample_t* s = &ring[tail % RING];
         for (int i = 0; i <= DEPTH && s->pc[i]; i++) {
             uintptr_t pc = s->pc[i];
-            fprintf(f, i ? " %lx" : "%lx", (unsigned long)(pc >= textStart && pc < textEnd ? pc - base : 0));
+            if (!i && pc >= (uintptr_t)jitStart && pc < (uintptr_t)jitEnd)
+                fputs("jit", f);
+            else
+                fprintf(f, i ? " %lx" : "%lx", (unsigned long)(pc >= textStart && pc < textEnd ? pc - base : 0));
         }
         fputc('\n', f);
         tail++;

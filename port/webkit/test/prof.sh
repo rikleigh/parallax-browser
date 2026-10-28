@@ -18,8 +18,8 @@ echo "== $name: $(wc -l < "$OUT/$name") samples (2 ms each)"
 python3 - "$OUT/$name" "$ELF" <<'PY'
 import sys, subprocess, collections
 samples = [l.split() for l in open(sys.argv[1]) if l.strip()]
-addrs = sorted({a for s in samples for a in s if a != '0'})
-sym = {}
+addrs = sorted({a for s in samples for a in s if a not in ('0', 'jit')})
+sym = {'jit': '(JIT-compiled JavaScript)'}
 if addrs:
     out = subprocess.run(['/opt/homebrew/opt/llvm@18/bin/llvm-addr2line', '-f', '-C', '-e', sys.argv[2]] + ['0x' + a for a in addrs],
                          capture_output=True, text=True).stdout.split('\n')
@@ -36,5 +36,26 @@ print('-- self')
 for f, c in selfc.most_common(25): print('%5.1f%%  %s' % (100.0 * c / n, f))
 print('-- total (function anywhere in the scanned stack)')
 for f, c in total.most_common(40): print('%5.1f%%  %s' % (100.0 * c / n, f))
+# Where the thread's time goes: each sample by its innermost frame that
+# names a known area (JavaScript, style, layout, paint, ...).
+import re
+areas = [('JavaScript (JIT code)', r'^\(JIT'), ('JavaScript (JSC, LLInt, GC)', r'JSC::|llint_|op_|Yarr|Inspector|pas_|bmalloc'),
+         ('DOM bindings', r'WebCore::JS[A-Z]|IDL|WebCore::Bindings'),
+         ('style', r'WebCore::Style::|CSS|Selector'), ('layout', r'WebCore::(Layout|Render|Legacy|Inline|LineLayout)|LayoutIntegration|BoxGeometry'),
+         ('paint', r'Sk[A-Z]|skia|GraphicsContext|paint|Paint|Skia|ImageBuffer|DisplayList'),
+         ('text/fonts', r'harfbuzz|hb_|FT_|Font|Glyph|ComplexText'),
+         ('media', r'gst|Media|SourceBuffer'), ('IPC/run loop', r'IPC::|RunLoop|g_main|WTF::'),]
+cat = collections.Counter()
+for smp in samples:
+    names = [sym.get(a, '') for a in smp if a != '0']
+    hit = 'other'
+    for f in names:
+        found = next((a for a, rx in areas if re.search(rx, f)), None)
+        if found:
+            hit = found
+            break
+    cat[hit] += 1
+print('-- by area (innermost frame that names one)')
+for a, c in cat.most_common(): print('%5.1f%%  %s' % (100.0 * c / n, a))
 PY
 if [ "${2:-}" = --clear ] || [ "${1:-}" = --clear ]; then curl -s "$FTP/" -Q "DELE /data/ps5webkit/prof/$name" >/dev/null || true; fi; exit 0
