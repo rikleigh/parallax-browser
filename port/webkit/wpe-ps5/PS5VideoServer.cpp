@@ -314,10 +314,12 @@ static void logStream(PS5VideoStream& stream, int64_t now)
     uint32_t dropped = stream.dropped - stream.windowDropped;
     if (received || displayed)
         VLOG("stream %d (pid %d): %.1f frames/s received, %.1f/s shown, %u dropped (%u in all), shown %.1f ms after due on average; "
-             "%s %dx%d+%d+%d",
+             "held 1/2/3/4+ vsyncs: %u/%u/%u/%u, last holds %s; %s %dx%d+%d+%d",
             stream.id, stream.pid, received / seconds, displayed / seconds, dropped, stream.dropped,
-            displayed ? stream.windowLateMS / displayed : 0.0, stream.geometry.visible ? "at" : "hidden", stream.geometry.width,
+            displayed ? stream.windowLateMS / displayed : 0.0, stream.holdHistogram[0], stream.holdHistogram[1], stream.holdHistogram[2],
+            stream.holdHistogram[3], stream.holdPattern, stream.geometry.visible ? "at" : "hidden", stream.geometry.width,
             stream.geometry.height, stream.geometry.x, stream.geometry.y);
+    memset(stream.holdHistogram, 0, sizeof stream.holdHistogram);
     stream.windowStartUS = now;
     stream.windowReceived = stream.received;
     stream.windowDisplayed = stream.displayed;
@@ -389,6 +391,17 @@ bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Cons
         if (haveChosen && chosen.generation == stream->generation && stream->shm) {
             const uint8_t* data = stream->shm + static_cast<size_t>(chosen.slot) * stream->slotBytes;
             consumer(*stream, &chosen, data); // copies while the mapping is held
+            if (stream->hasFrame && stream->holdVsyncs) {
+                unsigned hold = stream->holdVsyncs;
+                stream->holdHistogram[std::min(hold, 4u) - 1]++;
+                if (stream->holdPatternLength == 16) {
+                    memmove(stream->holdPattern, stream->holdPattern + 1, 15);
+                    stream->holdPatternLength = 15;
+                }
+                stream->holdPattern[stream->holdPatternLength++] = hold < 10 ? static_cast<char>('0' + hold) : '+';
+                stream->holdPattern[stream->holdPatternLength] = 0;
+            }
+            stream->holdVsyncs = 0;
             stream->displayed++;
             stream->hasFrame = true;
             stream->lastFrameUS = now;
@@ -396,6 +409,8 @@ bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Cons
                 stream->windowLateMS += std::max<int64_t>(0, displayUS - chosen.targetUS) / 1000.0;
         } else
             consumer(*stream, nullptr, nullptr);
+        if (stream->hasFrame)
+            stream->holdVsyncs++;
         stream->dropped += skipped.size();
         g_mutex_unlock(&stream->lock);
 

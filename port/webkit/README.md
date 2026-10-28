@@ -401,6 +401,69 @@ video, the page scrolls by 160 px every 3 s). Harness scripts:
 `test/media/pause-resume.js`, `test/media/seek.js` (forward, back, paused
 seek: frames resume after each flush), `test/media/yt-1080.js`.
 
+### TV test of step 2a and what it found (2026-10-28, afternoon)
+
+The owner's TV test: the local clips played well with few drops. On YouTube,
+main-document loads failed (`tlsv1 alert protocol version` three times,
+`Bad file descriptor`, `Connection reset by peer`, within 15 s around process
+swaps), then the browser froze; video stayed black for ~10 s at the start
+of one Sintel load while audio played; and YouTube "still stutters a bit".
+
+**TLS/EBADF errors: found and fixed.** Reproduced with the harness's new
+stress mode (`ps5wk-shot cycle=<URL list> rounds=<n> dwell=<s>`;
+`test/stress/youtube-swaps.txt` alternates file:// and YouTube watch pages,
+so every load is a process swap): 1–2 failed loads per 20, the same errors.
+An fd trace in the payloads (`PS5WK_FD_TRACE=1` in `child.env`: every close of
+a socket and every inet `socket()` with its stack, plus every close that
+fails with EBADF, from the shim's `close`/`socket` wraps) showed GSocket's
+own `g_socket_close` of fd 20 failing with EBADF, and just before it a close
+of fd 20 from **libc++'s `std::filesystem::remove_all`**, called by
+`NetworkStorageManager` (`deleteEmptyOriginDirectory`) whenever a WebProcess
+disconnects. Cause (probe `test/openat/openat.c`): **libkernel's `openat`
+returns the errno as a positive value** in payloads: `openat(file,
+O_DIRECTORY)` = 20 (ENOTDIR), `openat(missing)` = 2; `fstatat` and `unlinkat`
+too (`open` is right). remove_all opens every entry with O_DIRECTORY, takes
+20 for a directory fd, `fdopendir` fails, and it closes fd 20, whichever TLS
+socket holds it. Fixed in ps5compat (`port/deps/compat/atfuncs.c`,
+`--wrap=openat,fstatat,unlinkat,utimensat`): positive results become -1/errno;
+for openat a positive result is kept only if it is open on the named file
+(same device and inode). After the fix: 20 stress loads, 0 failed, 0 EBADF
+(before: 13 double closes of fd 20 per run).
+
+**Payload count / page tables** (open; probably the TV freeze): during the
+stress runs elfldr began failing to spawn WebProcesses ("Error spawning
+payload", up to 6 retries), and two WebProcesses hit memory failures (libc
+heap could not grow by 8 MB, SIGABRT; a libpas out-of-memory panic in GC).
+Several WebProcesses stay alive across swaps (the YouTube process lived
+413 s while file:// pages got their own, plus the prewarmed one), and each
+costs ~300 of the system's 8192 CPU page tables (*Findings*: three exhausted
+it). After the last run elfldr could not start any payload at all (not even
+klogsrv). On the TV, ten WebProcesses were launched in 154 s and the
+NetworkProcess ended just before the freeze. Next: keep at most one
+WebProcess besides the active one (no process prewarming, no swap for
+same-tab file:// <-> https where WebKit allows it, end swapped-out processes
+at once), and watch `page table CPU` in the kernel log while stressing.
+
+**Video black at the start (open):** on the TV the sink sent 14.6 frames/s,
+then 3.4/s for ~5 s, then 24/s; audio ran throughout and the WebProcess
+main thread was busy (render updates 29 ms average, 180 ms max). Not
+reproduced in the harness yet (BBB started at 55 frames/s). Leading
+hypothesis: YouTube's quality switch appends a new representation over the
+range WebKit already enqueued (1 s ahead since 0017), WebKit flushes the
+video track and re-enqueues from the keyframe before the current time, and
+the software decoder has to get through up to a GOP before a frame is due
+again. To check with `GST_DEBUG=webkitmsesrc:7` (per-track pushes) and the
+SourceBuffer release logs (`reenqueuing at time`).
+
+**"Stutter" on YouTube (analysis):** Sintel on YouTube is 24 fps; the title
+showed it at a steady 23.4–24.0 frames/s, 0 dropped, 2–3 ms after due. On a
+59.94 Hz output, 24 fps can only alternate 2 and 3 vsyncs per frame (3:2
+cadence), which judders on pans; the local clips are 30/60 fps (even
+cadence). The `[video]` lines now include how many vsyncs each frame stayed
+on screen (`held 1/2/3/4+ vsyncs` and the last 16 holds), to tell 3:2
+cadence from pacing jitter on the next run. Big Buck Bunny (60 fps) never
+loaded in that TV run, so 60 fps YouTube on the TV is still unjudged.
+
 ### Step 2b: Videodec2 in the title (plan, not built)
 
 The compositing path stays; only where frames come from changes.

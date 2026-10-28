@@ -12,7 +12,9 @@
  *
  * Stdin carries the arguments (elfldr passes none for raw uploads): one line
  * "url=<url> child=<path> timeout=<s> width=<w> height=<h> settle=<s>
- * ua=safari|default js=<file> onload=<file> data=<dir> cache=<dir>", any order, all optional. settle: seconds to
+ * ua=safari|default js=<file> onload=<file> data=<dir> cache=<dir>
+ * cycle=<file> rounds=<n> dwell=<s>" (dwell < 0: that long after starting
+ * each load), any order, all optional. settle: seconds to
  * keep running after the load finished (default 3); ua=safari uses the
  * browser title's user agent; js: a script file on the console evaluated in
  * the page just before the report (its result is printed); data/cache:
@@ -48,6 +50,14 @@ static int settleSeconds = 3;
 static char userAgent[16] = "safari";
 static char jsFile[256];
 static char onloadFile[256];
+/* Stress mode: cycle=<file of URLs> rounds=<n> dwell=<s>: load each URL in
+ * turn (dwell seconds after it finished or failed), rounds times, counting
+ * load failures and WebProcess terminations (RESULT ps5wk-shot stress). */
+static char cycleFile[256];
+static int cycleRounds = 3, cycleDwell = 4;
+static char** cycleURLs;
+static unsigned cycleCount, cycleIndex, cycleLoads, cycleFailures, cycleTerminations;
+static guint cycleTimer;
 static char dataDir[256] = "/data/ps5webkit/shot/data";
 static char cacheDir[256] = "/data/ps5webkit/shot/cache";
 #define SAFARI_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -98,6 +108,12 @@ static void readArguments(void)
             g_strlcpy(dataDir, token + 5, sizeof(dataDir));
         else if (!strncmp(token, "cache=", 6))
             g_strlcpy(cacheDir, token + 6, sizeof(cacheDir));
+        else if (!strncmp(token, "cycle=", 6))
+            g_strlcpy(cycleFile, token + 6, sizeof(cycleFile));
+        else if (!strncmp(token, "rounds=", 7))
+            cycleRounds = atoi(token + 7);
+        else if (!strncmp(token, "dwell=", 6))
+            cycleDwell = atoi(token + 6);
         else if (!strncmp(token, "onload=", 7))
             g_strlcpy(onloadFile, token + 7, sizeof(onloadFile));
         else if (!strncmp(token, "js=", 3))
@@ -279,8 +295,45 @@ static gboolean onOnload(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static gboolean cycleNext(gpointer data)
+{
+    (void)data;
+    cycleTimer = 0;
+    if (cycleIndex >= cycleCount * (unsigned)cycleRounds) {
+        RESULT("stress", !cycleFailures && !cycleTerminations, "%u loads of %u URLs x %d rounds: %u failed, %u WebProcess terminations, %.1f s",
+            cycleLoads, cycleCount, cycleRounds, cycleFailures, cycleTerminations, secondsSinceStart());
+        g_main_loop_quit(loop);
+        return G_SOURCE_REMOVE;
+    }
+    const char* next = cycleURLs[cycleIndex++ % cycleCount];
+    printf("STRESS load %u: %s at %.1f s\n", cycleIndex, next, secondsSinceStart());
+    cycleLoads++;
+    webkit_web_view_load_uri(webView, next);
+    /* dwell < 0: move on |dwell| s after starting, finished or not (loads
+     * get cancelled mid-way, as when someone clicks on quickly). */
+    if (cycleDwell < 0)
+        cycleTimer = g_timeout_add((guint)(-cycleDwell) * 1000u, cycleNext, NULL);
+    else
+        cycleTimer = g_timeout_add_seconds(60, cycleNext, NULL); /* stuck: go on */
+    return G_SOURCE_REMOVE;
+}
+
+static void cycleLoadDone(void)
+{
+    if (cycleDwell < 0)
+        return;
+    if (cycleTimer)
+        g_source_remove(cycleTimer);
+    cycleTimer = g_timeout_add_seconds(cycleDwell, cycleNext, NULL);
+}
+
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
+    if (cycleURLs) {
+        if (event == WEBKIT_LOAD_FINISHED)
+            cycleLoadDone();
+        return;
+    }
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
     printf("load %s at %.1f s: %s\n", names[event], secondsSinceStart(), webkit_web_view_get_uri(view));
@@ -302,6 +355,12 @@ static gboolean onLoadFailed(WebKitWebView* view, WebKitLoadEvent event, const c
     (void)event;
     (void)data;
     loadFailed = TRUE;
+    if (cycleURLs) {
+        cycleFailures++;
+        printf("STRESS FAIL %s: %s (domain %s code %d) at %.1f s\n", failingURI, error->message, g_quark_to_string(error->domain), error->code,
+            secondsSinceStart());
+        return FALSE; /* load-changed FINISHED follows */
+    }
     RESULT("load", FALSE, "%s: %s (domain %s code %d)", failingURI, error->message, g_quark_to_string(error->domain), error->code);
     return FALSE;
 }
@@ -310,6 +369,12 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
 {
     (void)view;
     (void)data;
+    if (cycleURLs) {
+        cycleTerminations++;
+        printf("STRESS WebProcess terminated (reason %d) at %.1f s\n", reason, secondsSinceStart());
+        cycleLoadDone();
+        return;
+    }
     RESULT("webprocess", FALSE, "terminated (reason %d) at %.1f s", reason, secondsSinceStart());
     report();
     g_main_loop_quit(loop);
@@ -357,7 +422,10 @@ int main(void)
         return 1;
     }
 
+    /* As in the browser title: no page cache, one process per page. */
+    webkit_web_context_set_cache_model(webkit_web_context_get_default(), WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
     WebKitSettings* settings = webkit_settings_new_with_settings(
+        "enable-page-cache", FALSE,
         "enable-developer-extras", FALSE,
         "enable-write-console-messages-to-stdout", TRUE,
         NULL);
@@ -384,11 +452,25 @@ int main(void)
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
 
-    RESULT("setup", TRUE, "UIProcess up at %.1f s, loading %s", secondsSinceStart(), url);
-    webkit_web_view_load_uri(webView, url);
-
     loop = g_main_loop_new(NULL, FALSE);
-    g_timeout_add_seconds(timeoutSeconds, onTimeout, NULL);
+    gchar* cycleText = NULL;
+    if (*cycleFile && g_file_get_contents(cycleFile, &cycleText, NULL, NULL)) {
+        cycleURLs = g_strsplit_set(g_strstrip(cycleText), "\r\n", -1);
+        unsigned kept = 0;
+        for (unsigned i = 0; cycleURLs[i]; i++)
+            if (*cycleURLs[i] && *cycleURLs[i] != '#')
+                cycleURLs[kept++] = cycleURLs[i];
+        cycleURLs[kept] = NULL;
+        cycleCount = kept;
+        RESULT("setup", kept > 0, "UIProcess up at %.1f s, stress: %u URLs x %d rounds, %d s each", secondsSinceStart(), kept, cycleRounds, cycleDwell);
+        if (!kept)
+            return 1;
+        cycleNext(NULL);
+    } else {
+        RESULT("setup", TRUE, "UIProcess up at %.1f s, loading %s", secondsSinceStart(), url);
+        webkit_web_view_load_uri(webView, url);
+        g_timeout_add_seconds(timeoutSeconds, onTimeout, NULL);
+    }
     g_main_loop_run(loop);
     printf("ps5wk-shot done (%d) after %.1f s\n", exitCode, secondsSinceStart());
     fflush(stdout);

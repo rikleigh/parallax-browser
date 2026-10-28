@@ -2,6 +2,7 @@
  * ps5-payload-sdk libc / libkernel stubs do not provide. Keep this tiny;
  * each entry is listed in NOTES.md. */
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* (filled in as link errors show up) */
@@ -179,11 +180,75 @@ ssize_t __wrap_sendto(int fd, const void* buffer, size_t length, int flags, cons
 {
     return __real_sendto(fd, buffer, length, NB_FLAGS(fd, flags), to, toLength);
 }
+/* fd tracing (PS5WK_FD_TRACE=1 in the environment; child.env for the
+ * payloads): every close() of a socket and every socket() of an inet socket
+ * is logged with its caller's stack ("elf +0x..." offsets for
+ * llvm-addr2line), so a close of a descriptor that someone else now owns
+ * shows who did it. A close() that fails with EBADF (closed twice, before
+ * the number was reused) is logged always (at most 50 times). Payloads link
+ * with --wrap=close,socket; the title wraps close too. */
+#include <netinet/in.h>
+size_t backtrace(void**, size_t) __attribute__((weak));
+extern char __ehdr_start __attribute__((weak));
+static int fdTraceMode = -1;
+static atomic_int fdTraceBadCloses;
+static int fdTraceEnabled(void)
+{
+    /* Checked until it is on: the children read child.env after their
+     * first closes. */
+    if (fdTraceMode <= 0) {
+        const char* e = getenv("PS5WK_FD_TRACE");
+        fdTraceMode = e && *e == '1';
+    }
+    return fdTraceMode;
+}
+static void fdTraceReport(const char* what, int fd, int extra)
+{
+    char line[512];
+    int n = snprintf(line, sizeof line, "[fdtrace %d] %s fd %d (%d) thread %p:", (int)getpid(), what, fd, extra, (void*)pthread_self());
+    void* frames[14];
+    size_t count = backtrace ? backtrace(frames, 14) : 0;
+    uintptr_t base = (uintptr_t)&__ehdr_start;
+    for (size_t i = 1; i < count && n < (int)sizeof line - 24; i++)
+        n += snprintf(line + n, sizeof line - n, " +0x%lx", (unsigned long)((uintptr_t)frames[i] - base));
+    if (n < (int)sizeof line - 1) {
+        line[n++] = '\n';
+        line[n] = 0;
+    }
+    write(2, line, strlen(line));
+}
+
 int __wrap_close(int fd)
 {
+    int family = -1;
+    if (fd >= 0 && fdTraceEnabled()) {
+        struct sockaddr_storage address;
+        socklen_t length = sizeof address;
+        if (!getsockname(fd, (struct sockaddr*)&address, &length))
+            family = address.ss_family;
+    }
     if (fd >= 0 && fd < NB_FDS)
         atomic_store_explicit(&nonBlocking[fd], 0, memory_order_relaxed);
-    return __real_close(fd);
+    int r = __real_close(fd);
+    int saved = errno;
+    if (r < 0 && saved == EBADF && fd >= 0 && atomic_fetch_add(&fdTraceBadCloses, 1) < 50)
+        fdTraceReport("close EBADF (already closed)", fd, -1);
+    else if (family >= 0)
+        fdTraceReport(family == AF_INET || family == AF_INET6 ? "close inet socket" : family == AF_UNIX ? "close unix socket" : "close socket", fd, family);
+    errno = saved;
+    return r;
+}
+
+int __real_socket(int, int, int) __attribute__((weak));
+int __wrap_socket(int domain, int type, int protocol)
+{
+    int fd = __real_socket(domain, type, protocol);
+    if (fd >= 0 && (domain == AF_INET || domain == AF_INET6) && fdTraceEnabled()) {
+        int saved = errno;
+        fdTraceReport("socket inet", fd, domain);
+        errno = saved;
+    }
+    return fd;
 }
 
 int __real_fcntl(int fd, int cmd, ...);

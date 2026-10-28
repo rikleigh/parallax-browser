@@ -84,6 +84,12 @@ struct PS5VideoStream {
     int64_t windowStartUS { 0 };
     uint32_t windowReceived { 0 }, windowDisplayed { 0 }, windowDropped { 0 };
     double windowLateMS { 0 };
+    // Cadence: vsyncs each frame stayed on screen (consume() runs once per
+    // presented frame), as a histogram (1, 2, 3, 4+) and the last 16 holds.
+    unsigned holdVsyncs { 0 };
+    unsigned holdHistogram[4] { };
+    char holdPattern[17] { };
+    unsigned holdPatternLength { 0 };
     int64_t lastGeometryLogUS { 0 };
 
     PS5VideoStream() { g_mutex_init(&lock); }

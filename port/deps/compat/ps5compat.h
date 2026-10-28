@@ -7,11 +7,15 @@
  *   getline, getdelim  missing from the SDK libc
  *   setfsent/getfsent/endfsent  empty fstab (GIO unix mounts)
  *   __wrap_readlink, __wrap_eaccess, __wrap_faccessat, __wrap_link,
- *   __wrap_symlink, __wrap_ppoll
+ *   __wrap_symlink, __wrap_ppoll, __wrap_openat, __wrap_fstatat,
+ *   __wrap_unlinkat, __wrap_utimensat
  *                      fixes for libkernel wrappers that return errno values
  *                      as positive results (13.60); link with
  *                      -Wl,--wrap=readlink,--wrap=eaccess,--wrap=faccessat,
- *                      --wrap=link,--wrap=symlink,--wrap=ppoll
+ *                      --wrap=link,--wrap=symlink,--wrap=ppoll,--wrap=openat,
+ *                      --wrap=fstatat,--wrap=unlinkat,--wrap=utimensat
+ *                      (openat's errno-as-fd made libc++'s remove_all close
+ *                      fd 20 under a TLS socket: compat/atfuncs.c)
  *                      (ps5compat.pc and the glib/fontconfig/xkbcommon .pc
  *                      files carry these)
  *   res_* / dn_*       resolver stubs (declared by resolv.h, exported by

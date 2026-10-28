@@ -1,0 +1,6 @@
+# ps5wk-shot cycle= list: file:// and YouTube watch pages in turn (a process swap at every load)
+file:///data/ps5webkit/video.html
+https://www.youtube.com/watch?v=aqz-KE-bpKQ
+file:///data/ps5webkit/video.html?src=media/sync-720p30-h264.mp4
+https://www.youtube.com/watch?v=jNQXAC9IVRw
+https://www.youtube.com/watch?v=eRsGyueVLvQ

@@ -35,7 +35,7 @@ PS5_RUNTIME="/data/ps5webkit"
 export PATH="$W/venv/bin:/opt/homebrew/opt/bison/bin:$SDK/bin:$PATH"
 
 # libps5compat plus the --wrap flags for its libkernel fixes (compat/*.c).
-PS5COMPAT_LIBS="-lps5compat -Wl,--wrap=readlink,--wrap=eaccess,--wrap=faccessat,--wrap=link,--wrap=symlink,--wrap=ppoll"
+PS5COMPAT_LIBS="-lps5compat -Wl,--wrap=readlink,--wrap=eaccess,--wrap=faccessat,--wrap=link,--wrap=symlink,--wrap=ppoll,--wrap=openat,--wrap=fstatat,--wrap=unlinkat,--wrap=utimensat"
 
 CFLAGS_COMMON="-O2 -g0 -fPIC -ffunction-sections -fdata-sections"
 CXXFLAGS_COMMON="$CFLAGS_COMMON -nostdinc++ -isystem $LIBCXX/include/c++/v1"
