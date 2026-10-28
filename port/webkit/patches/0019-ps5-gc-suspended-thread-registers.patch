@@ -1,0 +1,65 @@
+diff --git a/Source/JavaScriptCore/heap/MachineStackMarker.cpp b/Source/JavaScriptCore/heap/MachineStackMarker.cpp
+index 2425fed89d..47592466e1 100644
+--- a/Source/JavaScriptCore/heap/MachineStackMarker.cpp
++++ b/Source/JavaScriptCore/heap/MachineStackMarker.cpp
+@@ -73,10 +73,27 @@ static inline int LEGACY_NODELETE osRedZoneAdjustment()
+     return redZoneAdjustment;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++static std::atomic<unsigned> ps5StackPointerOutsideStack;
++static std::atomic<void*> ps5LastBadStackPointer;
++#endif
++
+ static std::pair<void*, size_t> LEGACY_NODELETE captureStack(Thread& thread, void* stackTop)
+ {
+     char* begin = reinterpret_cast_ptr<char*>(thread.stack().origin());
+     char* end = std::bit_cast<char*>(WTF::roundUpToMultipleOf<sizeof(void*)>(reinterpret_cast<uintptr_t>(stackTop)));
++#if defined(PS5_PAYLOAD_SDK)
++    // A stack pointer outside the thread's stack would make a wrapped size
++    // below (an out-of-memory panic in growBuffer, or a copy of unmapped
++    // memory); scan the whole stack instead, which is conservative.
++    // Threads are suspended here (no locks, no logging): count, and
++    // gatherConservativeRoots reports after resuming them.
++    if (end > begin || end < reinterpret_cast_ptr<char*>(thread.stack().end())) {
++        ps5StackPointerOutsideStack.fetch_add(1, std::memory_order_relaxed);
++        ps5LastBadStackPointer.store(stackTop, std::memory_order_relaxed);
++        end = reinterpret_cast_ptr<char*>(thread.stack().end());
++    }
++#endif
+     ASSERT(begin >= end);
+ 
+     char* endWithRedZone = end + osRedZoneAdjustment();
+@@ -222,6 +239,14 @@ void MachineThreads::gatherConservativeRoots(ConservativeRoots& conservativeRoot
+     while (!tryCopyOtherThreadStacks(locker, buffer, capacity, &size, *conductorThread))
+         growBuffer(size, &buffer, &capacity);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    static unsigned ps5Reported;
++    if (unsigned bad = ps5StackPointerOutsideStack.load(std::memory_order_relaxed); bad != ps5Reported && ps5Reported < 8) {
++        ps5Reported = bad;
++        WTFLogAlways("PS5: GC: %u suspended-thread stack pointers outside their stacks so far (last %p); scanned whole stacks", bad, ps5LastBadStackPointer.load(std::memory_order_relaxed));
++    }
++#endif
++
+     if (!buffer)
+         return;
+ 
+diff --git a/Source/WTF/wtf/PlatformRegisters.h b/Source/WTF/wtf/PlatformRegisters.h
+index 37efb86df1..53b7ce3ea2 100644
+--- a/Source/WTF/wtf/PlatformRegisters.h
++++ b/Source/WTF/wtf/PlatformRegisters.h
+@@ -82,6 +82,13 @@ inline PlatformRegisters& registersFromUContext(ucontext_t* ucontext)
+ {
+ #if OS(OPENBSD)
+     return *std::bit_cast<PlatformRegisters*>(ucontext);
++#elif defined(PS5_PAYLOAD_SDK)
++    // The PS5 kernel's ucontext is not the SDK header's FreeBSD one: the
++    // mcontext sits at +0x40, not +0x10 (port/webkit/test/sigctx). With the
++    // header's layout mc_rsp read the kernel's mc_addr (0 or a stale fault
++    // address): the GC skipped suspended threads' stacks, or copied a wrapped
++    // "stack" size and died in an out-of-memory panic.
++    return *std::bit_cast<PlatformRegisters*>(reinterpret_cast<char*>(ucontext) + 0x40);
+ #elif CPU(PPC)
+     return *std::bit_cast<PlatformRegisters*>(ucontext->uc_mcontext.uc_regs);
+ #else

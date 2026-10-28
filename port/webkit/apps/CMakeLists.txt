@@ -72,7 +72,7 @@ set(PS5_CRASHGUARD ${PS5_APPS_DIR}/common/crashguard.c)
 
 add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUARD} ${PS5_APPS_DIR}/common/profiler.c)
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
-target_link_options(ps5wk-child PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=close -Wl,--wrap=socket)
+target_link_options(ps5wk-child PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=close -Wl,--wrap=socket -Wl,--wrap=mmap -Wl,--wrap=munmap)
 target_link_libraries(ps5wk-child PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK})
 add_dependencies(ps5wk-child ps5wk-objects)
 

@@ -11,6 +11,7 @@
  * launched us (the title relays them to its TCP log).
  */
 #include "PS5LaunchProtocol.h"
+#include "PS5VideoProtocol.h"
 #include "../common/crashguard.h"
 #include "../common/profiler.h"
 
@@ -22,8 +23,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
@@ -40,6 +45,11 @@ int sceKernelAvailableFlexibleMemorySize(size_t*) __attribute__((weak));
 // glib-networking's OpenSSL TLS backend, linked statically (GIO module
 // registration that a shared build would do by scanning GIO_MODULE_DIR).
 void g_io_openssl_load(void*);
+// libpas (bmalloc's heap): bytes it has mapped (pas_page_malloc). On PS5 a
+// decommit only zeroes (patch 0006), so this is also what it keeps committed.
+extern size_t pas_page_malloc_num_allocated_bytes __attribute__((weak));
+extern size_t pas_compact_heap_reservation_size __attribute__((weak));
+extern size_t pas_compact_heap_reservation_bump __attribute__((weak));
 }
 
 static double nowMS()
@@ -147,10 +157,9 @@ static void setupEnvironment()
     // MIME types by file extension (share/mime/globs2; no shared-mime-info on
     // the console): file:// pages, MIMETypeRegistry, GIO content types.
     setenv("XDG_DATA_DIRS", "/data/ps5webkit/share", 0);
-    // Media (Milestone 2, software decoding in this process): advertise at
-    // most 1080p60 to MSE/canPlayType (YouTube then stays at or below 1080p).
+    // Media: WEBKIT_GST_VIDEO_DECODING_LIMIT (what MSE/canPlayType accept)
+    // is set in main() once the title says whether it decodes in hardware.
     // GST_DEBUG etc. can be added through child.env.
-    setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", "1920x1080@60", 0);
     // Progressive media is buffered on disk (GStreamer downloadbuffer); the
     // default /var/tmp does not exist for payloads.
     mkdir("/data/ps5webkit/home/cache", 0777);
@@ -173,6 +182,41 @@ static void setupEnvironment()
     }
 }
 
+// Asks the title's video server what it decodes in hardware (HELLO with
+// the QUERY role; wpe-ps5/PS5VideoProtocol.h).
+static void queryTitleDecoder(unsigned& codecs, int& maxWidth, int& maxHeight)
+{
+    codecs = 0;
+    maxWidth = maxHeight = 0;
+    const char* path = getenv("PS5WK_VIDEO_SOCKET");
+    const char* knob = getenv("PS5WK_HWDEC");
+    if (!path || (knob && !strcmp(knob, "0")))
+        return;
+    struct sockaddr_un address { };
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0)
+        return;
+    if (!connect(s, reinterpret_cast<struct sockaddr*>(&address), sizeof(address))) {
+        ps5wk_video_msg msg { };
+        msg.type = PS5WK_VMSG_HELLO;
+        msg.magic = PS5WK_VIDEO_MAGIC;
+        msg.version = PS5WK_VIDEO_VERSION;
+        msg.pid = getpid();
+        msg.role = PS5WK_VROLE_QUERY;
+        if (send(s, &msg, sizeof(msg), 0) == sizeof(msg)) {
+            struct pollfd p { s, POLLIN, 0 };
+            if (poll(&p, 1, 2000) == 1 && recv(s, &msg, sizeof(msg), MSG_WAITALL) == sizeof(msg) && msg.type == PS5WK_VMSG_HELLO_ACK) {
+                codecs = msg.role;
+                maxWidth = static_cast<int>(msg.width);
+                maxHeight = static_cast<int>(msg.height);
+            }
+        }
+    }
+    close(s);
+}
+
 struct MainArgs {
     bool network;
     int argc;
@@ -182,7 +226,8 @@ struct MainArgs {
 
 // CPU use of this process (user + system time per wall second, i.e. cores
 // busy), logged every 5 s while it is above 0.3 cores: shows what software
-// video decoding and painting cost (Milestone 2). PS5WK_CPU_LOG=0 turns it off.
+// video decoding and painting cost (Milestone 2). PS5WK_CPU_LOG=0 turns it
+// off, PS5WK_CPU_LOG=all logs every 5 s whatever the load.
 static void* cpuLogger(void* data)
 {
     const char* tag = static_cast<const char*>(data);
@@ -198,10 +243,111 @@ static void* cpuLogger(void* data)
         auto ms = [](const struct timeval& tv) { return tv.tv_sec * 1e3 + tv.tv_usec / 1e3; };
         double user = ms(now.ru_utime) - ms(last.ru_utime), sys = ms(now.ru_stime) - ms(last.ru_stime);
         double cores = (user + sys) / (wall - lastWall);
-        if (cores > 0.3)
+        static const bool always = getenv("PS5WK_CPU_LOG") && !strcmp(getenv("PS5WK_CPU_LOG"), "all");
+        if (cores > 0.3 || always)
             LOG("[cpu] %s: %.2f cores (user %.2f, sys %.2f) over %.1f s", tag, cores, user / (wall - lastWall), sys / (wall - lastWall), (wall - lastWall) / 1e3);
         last = now;
         lastWall = wall;
+    }
+    return nullptr;
+}
+
+
+// Every mmap/munmap of the payload goes through these (--wrap=mmap,munmap in
+// apps/CMakeLists.txt): live mappings for the [mem] line, and one log line
+// per failed mmap with its size, alignment, protection, flags, errno and
+// caller (libpas, the JSC structure heap and glib all map here). The log is
+// write(2) of a stack buffer: no stdio or malloc inside mmap.
+extern "C" void* __real_mmap(void*, size_t, int, int, int, off_t);
+extern "C" int __real_munmap(void*, size_t);
+static std::atomic<uint64_t> mmapCalls, mmapFailures, munmapCalls;
+static std::atomic<int64_t> mmapLiveBytes, mmapLiveCount;
+static std::atomic<uint64_t> mmapPeakBytes, mmapLargest;
+
+extern "C" void* __wrap_mmap(void* address, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    void* result = __real_mmap(address, length, prot, flags, fd, offset);
+    mmapCalls.fetch_add(1, std::memory_order_relaxed);
+    if (result == MAP_FAILED) {
+        int savedErrno = errno;
+        uint64_t n = mmapFailures.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32) {
+            char line[256];
+            int len = snprintf(line, sizeof(line), "[ps5wk-child %d] [mem] mmap FAILED: %zu bytes (%.1f MB) at %p, align 2^%d, prot %#x, flags %#x, fd %d: errno %d (caller %p)\n",
+                (int)getpid(), length, length / 1048576.0, address, (flags >> 24) & 0xff, prot, flags & 0xffffff, fd, savedErrno, __builtin_return_address(0));
+            if (len > 0)
+                write(2, line, len < (int)sizeof(line) ? len : (int)sizeof(line) - 1);
+        }
+        errno = savedErrno;
+        return result;
+    }
+    if (!(flags & MAP_FIXED) || !address) {
+        int64_t live = mmapLiveBytes.fetch_add(length, std::memory_order_relaxed) + length;
+        mmapLiveCount.fetch_add(1, std::memory_order_relaxed);
+        uint64_t peak = mmapPeakBytes.load(std::memory_order_relaxed);
+        while (live > 0 && (uint64_t)live > peak && !mmapPeakBytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) { }
+        uint64_t largest = mmapLargest.load(std::memory_order_relaxed);
+        while (length > largest && !mmapLargest.compare_exchange_weak(largest, length, std::memory_order_relaxed)) { }
+    }
+    return result;
+}
+
+extern "C" int __wrap_munmap(void* address, size_t length)
+{
+    int result = __real_munmap(address, length);
+    munmapCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!result) {
+        mmapLiveBytes.fetch_sub(length, std::memory_order_relaxed);
+        mmapLiveCount.fetch_sub(1, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+// Resident set size of this process (kern.proc.pid), or -1 (payloads get
+// EPERM/ENOENT for it on 13.60; then only getrusage's peak is printed).
+static long residentKB()
+{
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid() };
+    if (sysctl(mib, 4, &info, &size, nullptr, 0) || size < sizeof(info))
+        return -1;
+    return info.ki_rssize * (long)(getpagesize() / 1024);
+}
+
+// The memory watchdog: one [mem] line per minute (PS5WK_MEM_LOG=<seconds>
+// changes the period, 0 turns it off), for watching long sessions.
+static size_t startFlexible;
+static void* memLogger(void* data)
+{
+    const char* tag = static_cast<const char*>(data);
+    const char* period = getenv("PS5WK_MEM_LOG");
+    int seconds = period ? atoi(period) : 60;
+    if (seconds <= 0)
+        return nullptr;
+    double start = nowMS();
+    for (;;) {
+        struct timespec ts { seconds, 0 };
+        nanosleep(&ts, nullptr);
+        size_t flexible = 0;
+        if (sceKernelAvailableFlexibleMemorySize)
+            sceKernelAvailableFlexibleMemorySize(&flexible);
+        struct rusage usage;
+        getrusage(RUSAGE_SELF, &usage);
+        long rss = residentKB();
+        double pas = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : -1;
+        double compact = &pas_compact_heap_reservation_bump ? pas_compact_heap_reservation_bump / 1048576.0 : -1;
+        double compactSize = &pas_compact_heap_reservation_size ? pas_compact_heap_reservation_size / 1048576.0 : -1;
+        char rssText[48];
+        if (rss >= 0)
+            snprintf(rssText, sizeof rssText, "rss %.1f MB, peak", rss / 1024.0);
+        else
+            snprintf(rssText, sizeof rssText, "peak rss");
+        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed",
+            tag, (nowMS() - start) / 1e3, rssText, usage.ru_maxrss / 1024.0,
+            flexible / 1048576.0, ((double)flexible - (double)startFlexible) / 1048576.0, pas, compact, compactSize,
+            (long long)mmapLiveCount.load(), mmapLiveBytes.load() / 1048576.0, mmapPeakBytes.load() / 1048576.0, mmapLargest.load() / 1048576.0,
+            (unsigned long long)mmapCalls.load(), (unsigned long long)munmapCalls.load(), (unsigned long long)mmapFailures.load());
     }
     return nullptr;
 }
@@ -242,6 +388,7 @@ int main(int, char**)
     size_t flexible = 0;
     if (sceKernelAvailableFlexibleMemorySize)
         sceKernelAvailableFlexibleMemorySize(&flexible);
+    startFlexible = flexible;
     LOG("%s process %llu starting (parent %d, flexible memory %zu MB)", type, processIdentifier, (int)getppid(), flexible >> 20);
 
     int fd = rendezvous(path, processIdentifier);
@@ -266,6 +413,21 @@ int main(int, char**)
         }
     }
     g_io_openssl_load(nullptr);
+    if (!network) {
+        // Hardware decoding in the title (Milestone 2 step 2b): advertise up
+        // to 8K (the hardware does HEVC/VP9 that large; H.264 above 4K falls
+        // back to software); otherwise 1080p60, the software decoders' limit
+        // (YouTube then stays at or below 1080p). child.env can override.
+        unsigned codecs = 0;
+        int maxWidth = 0, maxHeight = 0;
+        queryTitleDecoder(codecs, maxWidth, maxHeight);
+        if (codecs && maxWidth >= 3840)
+            setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", maxWidth >= 7680 && maxHeight >= 4320 ? "7680x4320@60" : "3840x2160@60", 0);
+        else
+            setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", "1920x1080@60", 0);
+        LOG("video decoding: %s (codecs 0x%x, up to %dx%d); MSE/canPlayType limit %s", codecs ? "hardware in the title" : "software",
+            codecs, maxWidth, maxHeight, getenv("WEBKIT_GST_VIDEO_DECODING_LIMIT"));
+    }
 
     static char idArg[32], fdArg[16];
     snprintf(idArg, sizeof(idArg), "%llu", processIdentifier);
@@ -281,6 +443,11 @@ int main(int, char**)
         pthread_t cpuThread;
         if (!pthread_create(&cpuThread, nullptr, cpuLogger, cpuTag))
             pthread_detach(cpuThread);
+    }
+    {
+        pthread_t memThread;
+        if (!pthread_create(&memThread, nullptr, memLogger, cpuTag))
+            pthread_detach(memThread);
     }
 
     pthread_attr_t attributes;
