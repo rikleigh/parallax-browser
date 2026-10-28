@@ -273,7 +273,7 @@ index 2b0d029f07..d8159dc56b 100644
      GRefPtr caps = adoptGRef(gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, format.characters(), "framerate", GST_TYPE_FRACTION, GST_VIDEO_INFO_FPS_N(&videoInfo), GST_VIDEO_INFO_FPS_D(&videoInfo), "width", G_TYPE_INT, GST_VIDEO_INFO_WIDTH(&videoInfo), "height", G_TYPE_INT, GST_VIDEO_INFO_HEIGHT(&videoInfo), nullptr));
      auto convertedSample = GStreamerVideoFrameConverter::singleton().convert(sample, caps);
 diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
-index 9d0b9b2808..d3abffb579 100644
+index 9d0b9b2808..5fef711b5b 100644
 --- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
 +++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
 @@ -38,6 +38,7 @@
@@ -294,14 +294,14 @@ index 9d0b9b2808..d3abffb579 100644
  {
  #if ENABLE(DAMAGE_TRACKING)
      resetFrameDamage();
-@@ -169,9 +173,33 @@ void NonCompositedFrameRenderer::scheduleRenderingUpdate()
+@@ -169,8 +173,32 @@ void NonCompositedFrameRenderer::scheduleRenderingUpdate()
          return;
      }
  
 +#if defined(PS5_PAYLOAD_SDK)
 +    ps5ScheduleRenderingUpdate();
 +#else
-     scheduleRenderingUpdateRunLoopObserver();
++    scheduleRenderingUpdateRunLoopObserver();
 +#endif
 +}
 +
@@ -315,20 +315,19 @@ index 9d0b9b2808..d3abffb579 100644
 +    }
 +    if (!m_ps5ThrottleTimer.isActive())
 +        m_ps5ThrottleTimer.startOneShot(m_ps5NextUpdate - now);
- }
- 
++}
++
 +void NonCompositedFrameRenderer::ps5ThrottleTimerFired()
 +{
 +    if (m_layerTreeStateIsFrozen || m_isSuspended || !canUpdateRendering())
 +        return;
-+    scheduleRenderingUpdateRunLoopObserver();
-+}
+     scheduleRenderingUpdateRunLoopObserver();
+ }
 +#endif
-+
+ 
  bool NonCompositedFrameRenderer::canUpdateRendering() const
  {
-     return !m_pendingNotifyFrame;
-@@ -187,6 +215,14 @@ void NonCompositedFrameRenderer::updateRendering()
+@@ -187,6 +215,31 @@ void NonCompositedFrameRenderer::updateRendering()
      SetForScope<bool> reentrancyProtector(m_isUpdatingRendering, true);
  
      WTFBeginSignpost(this, NonCompositedRenderingUpdate);
@@ -338,12 +337,29 @@ index 9d0b9b2808..d3abffb579 100644
 +        auto end = MonotonicTime::now();
 +        auto took = end - ps5UpdateStart;
 +        m_ps5NextUpdate = took > 6_ms ? end + took : end;
++        // Every 5 s while it renders: how long updates take (TV-test logs).
++        static unsigned count, throttled;
++        static double totalMS, maxMS;
++        static MonotonicTime windowStart = end;
++        count++;
++        totalMS += took.milliseconds();
++        maxMS = std::max(maxMS, took.milliseconds());
++        if (took > 6_ms)
++            throttled++;
++        if (end - windowStart >= 5_s) {
++            if (count > 25)
++                WTFLogAlways("[render] %u updates in %.1f s (%.1f/s), %.1f ms average, %.1f ms max, %u followed by an idle gap",
++                    count, (end - windowStart).seconds(), count / (end - windowStart).seconds(), totalMS / count, maxMS, throttled);
++            count = throttled = 0;
++            totalMS = maxMS = 0;
++            windowStart = end;
++        }
 +    });
 +#endif
  
      Ref webPage = m_webPage;
      webPage->updateRendering();
-@@ -306,8 +342,13 @@ void NonCompositedFrameRenderer::frameComplete()
+@@ -306,8 +359,13 @@ void NonCompositedFrameRenderer::frameComplete()
          finishRenderingUpdate();
  
      bool shouldRenderFollowupFrame = std::exchange(m_shouldRenderFollowupFrame, false);

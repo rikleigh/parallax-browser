@@ -138,6 +138,7 @@ Milestone 1 placeholder media interfaces) is gone.
 | `child.env`: `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_VP9=0`, `PS5WK_MEDIA_AV1=1`, `GST_DEBUG=...` | WebProcess decoding, codec advertising, GStreamer logs |
 | `child.env`: `PS5WK_PROFILE=1` | sampling profiler of the WebProcess main thread (`apps/common/profiler.c`, 2 ms SIGPROF; `test/prof.sh` fetches and symbolizes) |
 | `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
+| `[render]` lines (WebProcess, every 5 s while rendering more than 25 updates) | rendering updates per second, average/max duration, how many were followed by the idle gap |
 | `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child to 1920x1080@60: MSE/canPlayType refuse more, so YouTube stays ≤1080p |
 
 The children also set `WPE_SHELL_MEDIA_DISK_CACHE_PATH=/data/ps5webkit/home/cache/media`
