@@ -29,6 +29,7 @@
 #include <wpe/ps5/wpe-ps5.h>
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
+#include "../common/media-stubs.h"
 
 #ifndef LOG_HOST
 #define LOG_HOST "192.168.1.20"
@@ -444,6 +445,9 @@ int main(void)
     WebKitSettings* settings = webkit_settings_new_with_settings(
         "enable-page-cache", FALSE,
         "enable-spatial-navigation", TRUE,
+        /* Page console messages and uncaught exceptions go to the WebProcess
+         * stdout, which the title relays to its log ([webN] lines). */
+        "enable-write-console-messages-to-stdout", TRUE,
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
@@ -452,6 +456,12 @@ int main(void)
         "settings", settings,
         "network-session", session,
         NULL));
+    /* No video in Milestone 1: placeholder media interfaces so pages that
+     * name them (YouTube) don't throw at load (apps/common/media-stubs.h). */
+    WebKitUserScript* mediaStubs = webkit_user_script_new(ps5wkMediaStubsScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(webView), mediaStubs);
+    webkit_user_script_unref(mediaStubs);
     WPEView* view = webkit_web_view_get_wpe_view(webView);
     g_signal_connect(view, "event", G_CALLBACK(onViewEvent), NULL);
     g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);

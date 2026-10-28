@@ -11,8 +11,13 @@
  *   THUMB <base64 of a binary PPM thumbnail>     (decode: tools in port/webkit/test)
  *
  * Stdin carries the arguments (elfldr passes none for raw uploads): one line
- * "url=<url> child=<path> timeout=<s> width=<w> height=<h>", any order, all
- * optional. Output goes back on the elfldr connection.
+ * "url=<url> child=<path> timeout=<s> width=<w> height=<h> settle=<s>
+ * ua=safari|default js=<file>", any order, all optional. settle: seconds to
+ * keep running after the load finished (default 3); ua=safari uses the
+ * browser title's user agent; js: a script file on the console evaluated in
+ * the page just before the report (its result is printed). Page console
+ * messages are printed by the WebProcess ([webN] CONSOLE lines).
+ * Output goes back on the elfldr connection.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +32,7 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 #include <WPEProcessManagerPS5.h>
+#include "../common/media-stubs.h"
 
 void g_io_openssl_load(void*);
 
@@ -34,6 +40,10 @@ static char url[1024] = "https://example.com/";
 static char child[256] = "/data/ps5webkit/ps5wk-child.elf";
 static int timeoutSeconds = 120;
 static int width = 1280, height = 720;
+static int settleSeconds = 3;
+static char userAgent[16] = "safari";
+static char jsFile[256];
+#define SAFARI_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
 static GMainLoop* loop;
 static WebKitWebView* webView;
@@ -73,6 +83,12 @@ static void readArguments(void)
             width = atoi(token + 6);
         else if (!strncmp(token, "height=", 7))
             height = atoi(token + 7);
+        else if (!strncmp(token, "settle=", 7))
+            settleSeconds = atoi(token + 7);
+        else if (!strncmp(token, "ua=", 3))
+            g_strlcpy(userAgent, token + 3, sizeof(userAgent));
+        else if (!strncmp(token, "js=", 3))
+            g_strlcpy(jsFile, token + 3, sizeof(jsFile));
         else if (!strncmp(token, "debug=", 6))
             setenv("WEBKIT_DEBUG", token + 6, 1); // also reaches the NetworkProcess (creation parameters)
     }
@@ -175,11 +191,40 @@ static gboolean onTimeout(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static void finish(void)
+{
+    report();
+    g_main_loop_quit(loop);
+}
+
+static void onScriptDone(GObject* object, GAsyncResult* result, gpointer data)
+{
+    (void)data;
+    GError* error = NULL;
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    if (value) {
+        char* text = jsc_value_to_string(value);
+        printf("JS %s\n", text ? text : "(null)");
+        g_free(text);
+        g_object_unref(value);
+    } else {
+        printf("JS error: %s\n", error ? error->message : "?");
+        g_clear_error(&error);
+    }
+    finish();
+}
+
 static gboolean onSettled(gpointer data)
 {
     (void)data;
-    report();
-    g_main_loop_quit(loop);
+    gchar* script = NULL;
+    gsize length = 0;
+    if (*jsFile && g_file_get_contents(jsFile, &script, &length, NULL)) {
+        webkit_web_view_evaluate_javascript(webView, script, (gssize)length, NULL, NULL, NULL, onScriptDone, NULL);
+        g_free(script);
+        return G_SOURCE_REMOVE;
+    }
+    finish();
     return G_SOURCE_REMOVE;
 }
 
@@ -194,7 +239,7 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
         loadFinishedTime = g_get_monotonic_time();
         if (!loadFailed)
             RESULT("load", TRUE, "%s finished at %.1f s, title \"%s\"", url, secondsSinceStart(), webkit_web_view_get_title(view) ?: "");
-        g_timeout_add_seconds(3, onSettled, NULL); // let it paint
+        g_timeout_add_seconds(settleSeconds, onSettled, NULL); // let it paint
     }
 }
 
@@ -254,7 +299,10 @@ int main(void)
 
     WebKitSettings* settings = webkit_settings_new_with_settings(
         "enable-developer-extras", FALSE,
+        "enable-write-console-messages-to-stdout", TRUE,
         NULL);
+    if (!strcmp(userAgent, "safari"))
+        webkit_settings_set_user_agent(settings, SAFARI_UA);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/shot/data", "/data/ps5webkit/shot/cache");
     webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "display", display,
@@ -268,6 +316,12 @@ int main(void)
         wpe_toplevel_resize(toplevel, width, height);
     else
         printf("note: the headless view has no toplevel\n");
+    if (!g_getenv("PS5WK_NO_MEDIA_STUBS")) {
+        WebKitUserScript* stubs = webkit_user_script_new(ps5wkMediaStubsScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+        webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(webView), stubs);
+        webkit_user_script_unref(stubs);
+    }
     g_signal_connect(view, "buffer-rendered", G_CALLBACK(onBufferRendered), NULL);
     g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);

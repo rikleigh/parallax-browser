@@ -167,6 +167,22 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   child at 93 MB instead of 125 MB.
 - The payload wall clock is right (see JSC `Date` above).
 
+- **YouTube stayed on its loading skeleton because of `ENABLE_VIDEO=OFF`.**
+  With page console messages on (`enable-write-console-messages-to-stdout`,
+  `[webN] CONSOLE ...` lines in the title log and the shot output), the
+  main bundle (kevlar_base) threw `ReferenceError: Can't find variable:
+  HTMLVideoElement`: TypeScript decorator metadata names the class while
+  components are defined, so the whole module aborted. A document-start user
+  script (`apps/common/media-stubs.h`) defines placeholder
+  `HTMLMediaElement`/`HTMLVideoElement`/`HTMLAudioElement` interfaces; with
+  it the home page renders its app (cookie-consent dialog, guide, masthead)
+  in `ps5wk-shot`. `<video>` stays `HTMLUnknownElement`, so playback is
+  still Milestone 2. A watch page (`/watch?v=...`) loaded (title "Me at the
+  zoo - YouTube") but its WebProcess died 1.7 s later (termination reason 0,
+  no output); the console powered off shortly afterwards.
+  `run-shot.sh` takes `SHOT_ARGS="settle=<s> js=<file on the console>"` to
+  watch a page longer and dump page state.
+
 ## Status and timings (2026-10-28)
 
 ### Builds (Mac, 14 cores, Release, -O2 -gline-tables-only)
