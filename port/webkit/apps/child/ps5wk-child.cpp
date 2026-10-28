@@ -11,6 +11,7 @@
  * launched us (the title relays them to its TCP log).
  */
 #include "PS5LaunchProtocol.h"
+#include "../common/crashguard.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -178,6 +179,7 @@ static void* runWebKit(void* data)
 int main(int, char**)
 {
     signal(SIGPIPE, SIG_IGN);
+    ps5wk_crash_guard_install("child");
     setvbuf(stdout, nullptr, _IOLBF, 0);
     setvbuf(stderr, nullptr, _IOLBF, 0);
 
@@ -195,6 +197,9 @@ int main(int, char**)
         return 1;
     }
     bool network = !strcmp(type, "network");
+    char tag[32];
+    snprintf(tag, sizeof(tag), "%s%llu", network ? "network" : "web", processIdentifier);
+    ps5wk_crash_guard_install(tag);
     size_t flexible = 0;
     if (sceKernelAvailableFlexibleMemorySize)
         sceKernelAvailableFlexibleMemorySize(&flexible);

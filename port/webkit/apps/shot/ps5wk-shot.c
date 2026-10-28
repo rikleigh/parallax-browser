@@ -33,6 +33,7 @@
 #include <wpe/wpe-platform.h>
 #include <WPEProcessManagerPS5.h>
 #include "../common/media-stubs.h"
+#include "../common/crashguard.h"
 
 void g_io_openssl_load(void*);
 
@@ -265,6 +266,7 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+    ps5wk_crash_guard_install("shot");
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
     startTime = g_get_monotonic_time();

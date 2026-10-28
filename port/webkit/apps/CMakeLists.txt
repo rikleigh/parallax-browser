@@ -65,13 +65,20 @@ message(STATUS "PS5: ${CMAKE_BINARY_DIR}/lib/libps5wk-objects.a from: ${PS5_OBJE
 
 separate_arguments(PS5_DEPS_LINK UNIX_COMMAND "${PS5_DEPS_LIBS}")
 
-add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp)
+# crashguard: fatal signals are reported and end in _exit(70), so a crashing
+# payload never reaches the system crash reporter; --wrap=pthread_create
+# gives every thread an alternate signal stack.
+set(PS5_CRASHGUARD ${PS5_APPS_DIR}/common/crashguard.c)
+
+add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUARD})
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
+target_link_options(ps5wk-child PRIVATE -Wl,--wrap=pthread_create)
 target_link_libraries(ps5wk-child PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK})
 add_dependencies(ps5wk-child ps5wk-objects)
 
-add_executable(ps5wk-shot ${PS5_APPS_DIR}/shot/ps5wk-shot.c)
+add_executable(ps5wk-shot ${PS5_APPS_DIR}/shot/ps5wk-shot.c ${PS5_CRASHGUARD})
 target_include_directories(ps5wk-shot PRIVATE ${PS5_API_INCLUDE_DIRECTORIES})
+target_link_options(ps5wk-shot PRIVATE -Wl,--wrap=pthread_create)
 target_link_libraries(ps5wk-shot PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)
 add_dependencies(ps5wk-shot ps5wk-objects)
 add_dependencies(ps5wk-shot WebKit)

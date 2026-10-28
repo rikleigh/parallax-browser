@@ -191,6 +191,22 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   The title's home page is that file again (`PS5WK_HOME_URL`; the console's
   `home-url.txt` now names it too).
 
+- **Crash guard in the payloads** (`apps/common/crashguard.c`, ps5wk-child
+  and ps5wk-shot): SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT/SIGTRAP/SIGSYS
+  handlers on an alternate signal stack (every thread gets one through
+  `--wrap=pthread_create`) print one report and `_exit(70)`, so a crashing
+  payload no longer reaches the system crash reporter (suspected in two
+  console power-offs after WebProcess crashes):
+
+      [crash web5 pid 145] signal 11 (SIGSEGV) code 1 addr 0x... pc 0x... (elf +0x...) sp 0x... thread 0x...
+      [crash web5 pid 145] stack: +0x... +0x...   (stack words after a call instruction, innermost first)
+
+  `llvm-addr2line -f -C -e toolchain/wpe-webkit/build/bin/ps5wk-child 0x<elf offset>`.
+  Do not read the payload's own ELF header: elfldr maps the first PT_LOAD
+  (file offset 0x4000) at the image base, so `__ehdr_start` is the base but
+  no header is there (the first build did, and faulted before its handlers
+  were installed). Not yet triggered on purpose.
+
 ## Status and timings (2026-10-28)
 
 ### Builds (Mac, 14 cores, Release, -O2 -gline-tables-only)
