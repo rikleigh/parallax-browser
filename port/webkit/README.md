@@ -206,6 +206,15 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   (file offset 0x4000) at the image base, so `__ehdr_start` is the base but
   no header is there (the first build did, and faulted before its handlers
   were installed). Not yet triggered on purpose.
+- **Payload threads had 64 KiB stacks.** The payload libc's default thread
+  stack is 64 KiB (`test/stack/stack.c`: default attr 64 KiB, 16 KiB guard),
+  and WTF leaves most thread types to the platform default, Web Workers'
+  JavaScript threads included (JSC alone reserves 192 KiB of stack zones;
+  only PLATFORM(PLAYSTATION) asks for 512 KiB). The crash guard's
+  `pthread_create` wrapper now gives every thread without its own stack at
+  least 2 MiB (FreeBSD's amd64 default). Prime suspect for the silent
+  WebProcess death on YouTube watch pages (not re-tested yet). The title's
+  own wrapper (`titlemem.c`) still uses the requested size.
 
 ## Status and timings (2026-10-28)
 

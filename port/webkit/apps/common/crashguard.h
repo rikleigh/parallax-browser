@@ -20,7 +20,9 @@ void ps5wk_crash_guard_install(const char* tag);
 /* An alternate signal stack for the calling thread (sigaltstack is
  * per-thread), so a stack overflow can still be reported. Every thread made
  * through pthread_create gets one when the executable links with
- * -Wl,--wrap=pthread_create (CMakeLists.txt). */
+ * -Wl,--wrap=pthread_create (CMakeLists.txt). That wrapper also raises
+ * threads below 2 MiB of stack (the payload libc's default is 64 KiB) to
+ * 2 MiB. */
 void ps5wk_crash_guard_thread(void);
 
 #ifdef __cplusplus

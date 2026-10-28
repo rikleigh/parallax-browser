@@ -17,6 +17,7 @@
 #include "crashguard.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -277,15 +278,67 @@ static void* threadTrampoline(void* data)
     return result;
 }
 
+// The payload libc's default thread stack is 64 KiB (test/stack/stack.c on
+// 13.60), and WTF leaves the size to the platform for most thread types
+// (Workers' JavaScript threads included; JSC alone reserves 192 KiB of
+// stack zones). Threads that would get less than MIN_THREAD_STACK and did
+// not bring their own stack get MIN_THREAD_STACK, FreeBSD's amd64 default.
+#define MIN_THREAD_STACK (2u << 20)
+
+static int widenedAttributes(const pthread_attr_t* attributes, pthread_attr_t* out)
+{
+    size_t size = 0;
+    if (attributes) {
+        void* own = NULL;
+        size_t ownSize = 0;
+        if (pthread_attr_getstack(attributes, &own, &ownSize) == 0 && own)
+            return 0;
+        if (pthread_attr_getstacksize(attributes, &size) != 0 || size >= MIN_THREAD_STACK)
+            return 0;
+    }
+    if (pthread_attr_init(out) != 0)
+        return 0;
+    if (attributes) {
+        int v;
+        size_t guard;
+        struct sched_param sp;
+        if (pthread_attr_getdetachstate(attributes, &v) == 0)
+            pthread_attr_setdetachstate(out, v);
+        if (pthread_attr_getguardsize(attributes, &guard) == 0)
+            pthread_attr_setguardsize(out, guard);
+        if (pthread_attr_getinheritsched(attributes, &v) == 0)
+            pthread_attr_setinheritsched(out, v);
+        if (pthread_attr_getschedpolicy(attributes, &v) == 0)
+            pthread_attr_setschedpolicy(out, v);
+        if (pthread_attr_getschedparam(attributes, &sp) == 0)
+            pthread_attr_setschedparam(out, &sp);
+        if (pthread_attr_getscope(attributes, &v) == 0)
+            pthread_attr_setscope(out, v);
+    }
+    if (pthread_attr_setstacksize(out, MIN_THREAD_STACK) != 0) {
+        pthread_attr_destroy(out);
+        return 0;
+    }
+    return 1;
+}
+
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attributes, void* (*start)(void*), void* argument)
 {
+    pthread_attr_t widened;
+    int useWidened = widenedAttributes(attributes, &widened);
+    const pthread_attr_t* effective = useWidened ? &widened : attributes;
     thread_start_t* data = (thread_start_t*)malloc(sizeof *data);
+    int rc;
     if (!data)
-        return __real_pthread_create(thread, attributes, start, argument);
-    data->start = start;
-    data->argument = argument;
-    int rc = __real_pthread_create(thread, attributes, threadTrampoline, data);
-    if (rc)
-        free(data);
+        rc = __real_pthread_create(thread, effective, start, argument);
+    else {
+        data->start = start;
+        data->argument = argument;
+        rc = __real_pthread_create(thread, effective, threadTrampoline, data);
+        if (rc)
+            free(data);
+    }
+    if (useWidened)
+        pthread_attr_destroy(&widened);
     return rc;
 }
