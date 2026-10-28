@@ -24,6 +24,8 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <pthread.h>
 #include <sys/filio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -58,6 +60,94 @@ static void memLog(const char* milestone)
 }
 
 static WebKitWebView* webView;
+static GMainLoop* mainLoop;
+
+/* ---- Clean wind-down (asked by the launcher before it SIGKILLs us) ----
+ * tools/launcher "stop" connects to PS5WK_CONTROL_SOCKET and sends "quit".
+ * The title then: loads about:blank (the WebProcess stops playback and its
+ * GStreamer pipeline, so its audio stream closes), waits for the audio
+ * streams to end (2 s at most), ends the WebProcess, stops the audio server
+ * (wakes and waits for its threads, closes every sceAudioOut port), and
+ * leaves the main loop; main returns and title_exit.c asks the launcher for
+ * the SIGKILL, now with nothing playing. The launcher kills it anyway if it
+ * is still there after a timeout. (2026-10-28: a SIGKILL request during a
+ * media test run left the console wedged.) */
+#define PS5WK_CONTROL_SOCKET "/system_tmp/ps5wk/ps5browser-control.sock"
+static gint64 windDownStart;
+
+static gboolean windDownStep(gpointer data)
+{
+    (void)data;
+    double ms = (g_get_monotonic_time() - windDownStart) / 1000.0;
+    int streams = ps5wk_audio_server_active_streams();
+    if (streams && ms < 2000)
+        return G_SOURCE_CONTINUE;
+    spike_log("wind-down: %d audio stream(s) left after %.0f ms; ending the WebProcess and the audio server", streams, ms);
+    if (webView)
+        webkit_web_view_terminate_web_process(webView);
+    ps5wk_audio_server_stop();
+    spike_log("wind-down: done after %.0f ms; leaving the main loop", (g_get_monotonic_time() - windDownStart) / 1000.0);
+    if (mainLoop)
+        g_main_loop_quit(mainLoop);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean beginWindDown(gpointer data)
+{
+    (void)data;
+    if (windDownStart)
+        return G_SOURCE_REMOVE;
+    windDownStart = g_get_monotonic_time();
+    spike_log("wind-down: quit requested; %d audio stream(s) open; loading about:blank", ps5wk_audio_server_active_streams());
+    if (webView)
+        webkit_web_view_load_uri(webView, "about:blank");
+    g_timeout_add(50, windDownStep, NULL);
+    return G_SOURCE_REMOVE;
+}
+
+static void* controlThread(void* unused)
+{
+    (void)unused;
+    int fd = -1;
+    /* PS5WK_LAUNCH_DIR exists once the first payload made it; a title can
+     * only bind in a directory a payload created. */
+    while (fd < 0) {
+        struct sockaddr_un address;
+        memset(&address, 0, sizeof address);
+        address.sun_family = AF_UNIX;
+        strncpy(address.sun_path, PS5WK_CONTROL_SOCKET, sizeof address.sun_path - 1);
+        unlink(address.sun_path);
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0 && !bind(fd, (struct sockaddr*)&address, sizeof address) && !listen(fd, 4))
+            break;
+        if (fd >= 0)
+            close(fd);
+        fd = -1;
+        usleep(500 * 1000);
+    }
+    chmod(PS5WK_CONTROL_SOCKET, 0777);
+    spike_log("control: listening on %s", PS5WK_CONTROL_SOCKET);
+    for (;;) {
+        int client = accept(fd, NULL, NULL);
+        if (client < 0) {
+            usleep(100 * 1000);
+            continue;
+        }
+        char line[64] = "";
+        ssize_t n = recv(client, line, sizeof line - 1, 0);
+        line[n > 0 ? n : 0] = 0;
+        if (!strncmp(line, "quit", 4)) {
+            static const char reply[] = "OK winding down\n";
+            send(client, reply, sizeof reply - 1, 0);
+            g_main_context_invoke(NULL, beginWindDown, NULL);
+        } else {
+            static const char reply[] = "ERR unknown command (quit)\n";
+            send(client, reply, sizeof reply - 1, 0);
+        }
+        close(client);
+    }
+    return NULL;
+}
 static WPEDisplay* display;
 static double zoom = 1.0;
 
@@ -532,7 +622,11 @@ int main(void)
         g_free(home);
     }
 
+    pthread_t control;
+    if (!pthread_create(&control, NULL, controlThread, NULL))
+        pthread_detach(control);
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
+    mainLoop = loop;
     g_main_loop_run(loop);
     ps5wk_audio_server_stop();
     return 0;

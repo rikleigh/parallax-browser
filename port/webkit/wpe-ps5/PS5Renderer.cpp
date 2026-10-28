@@ -19,6 +19,7 @@
 #include "config.h"
 #include "PS5Renderer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <epoxy/egl.h>
 #include <epoxy/gl.h>
@@ -194,10 +195,36 @@ bool PS5Renderer::initialize(char* error, unsigned errorSize)
     return true;
 }
 
+// Timing of the page path (Milestone 2: video frames pass through here),
+// logged every 5 s while more than 25 frames went through:
+// "[present] N uploads (x/s), upload avg/max ms (MB/frame), N swaps, swap avg/max ms".
+static struct {
+    gint64 windowStart;
+    unsigned uploads, swaps;
+    double uploadMS, uploadMaxMS, swapMS, swapMaxMS, uploadBytes;
+} stats;
+
+static void maybeLogStats(gint64 now)
+{
+    if (!stats.windowStart)
+        stats.windowStart = now;
+    double seconds = (now - stats.windowStart) / 1e6;
+    if (seconds < 5)
+        return;
+    if (stats.uploads > 25)
+        g_message("[wpe-ps5] [present] %u uploads (%.1f/s), upload %.1f ms avg %.1f max (%.2f MB/frame), %u swaps (%.1f/s), swap %.1f ms avg %.1f max",
+            stats.uploads, stats.uploads / seconds, stats.uploadMS / stats.uploads, stats.uploadMaxMS, stats.uploadBytes / stats.uploads / 1048576.0,
+            stats.swaps, stats.swaps / seconds, stats.swaps ? stats.swapMS / stats.swaps : 0.0, stats.swapMaxMS);
+    stats = { };
+    stats.windowStart = now;
+}
+
 void PS5Renderer::uploadPage(const uint8_t* data, int width, int height, unsigned stride, const Rect* damage, unsigned damageCount)
 {
     if (!m_initialized || !data || width <= 0 || height <= 0)
         return;
+    gint64 uploadStart = g_get_monotonic_time();
+    double bytes = 0;
 
     glBindTexture(GL_TEXTURE_2D, m_pageTexture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -205,10 +232,12 @@ void PS5Renderer::uploadPage(const uint8_t* data, int width, int height, unsigne
     if (width != m_pageWidth || height != m_pageHeight) {
         // New size: allocate and upload everything.
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, data);
+        bytes = 4.0 * width * height;
         m_pageWidth = width;
         m_pageHeight = height;
     } else if (!damageCount) {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, data);
+        bytes = 4.0 * width * height;
     } else {
         for (unsigned i = 0; i < damageCount; i++) {
             int x0 = std::max(0, damage[i].x), y0 = std::max(0, damage[i].y);
@@ -218,9 +247,17 @@ void PS5Renderer::uploadPage(const uint8_t* data, int width, int height, unsigne
                 continue;
             glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x1 - x0, y1 - y0, GL_BGRA, GL_UNSIGNED_BYTE,
                 data + static_cast<size_t>(y0) * stride + static_cast<size_t>(x0) * 4);
+            bytes += 4.0 * (x1 - x0) * (y1 - y0);
         }
     }
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    gint64 now = g_get_monotonic_time();
+    double ms = (now - uploadStart) / 1000.0;
+    stats.uploads++;
+    stats.uploadMS += ms;
+    stats.uploadMaxMS = std::max(stats.uploadMaxMS, ms);
+    stats.uploadBytes += bytes;
+    maybeLogStats(now);
 }
 
 void PS5Renderer::present(bool pointerVisible, double pointerX, double pointerY)
@@ -271,7 +308,12 @@ void PS5Renderer::present(bool pointerVisible, double pointerX, double pointerY)
     if (m_capturePath)
         writeCapture();
 
+    gint64 swapStart = g_get_monotonic_time();
     eglSwapBuffers(m_eglDisplay, m_eglSurface);
+    double ms = (g_get_monotonic_time() - swapStart) / 1000.0;
+    stats.swaps++;
+    stats.swapMS += ms;
+    stats.swapMaxMS = std::max(stats.swapMaxMS, ms);
 }
 
 void PS5Renderer::requestCapture(const char* path)

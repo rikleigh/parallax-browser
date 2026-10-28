@@ -187,6 +187,77 @@ the title's flexible memory was 299 MB free (eboot 129 MB with GStreamer,
 was 109 MB). The YouTube URL after it did not report "load finished" within
 60 s, and the launcher's kill then got no reply: open.
 
+### Console wedge at 12:00 and the clean wind-down (2026-10-28)
+
+After the log-only run above, `tools/launch.sh --kill` got no reply, and
+the console froze: the title stayed on screen, the PS button did nothing,
+FTP and the launcher stopped answering, ping still worked, and the owner
+power-cycled. What the logs say:
+- **Nothing was playing when the kill was asked for.** The MP4's audio
+  stream had closed when the page left for YouTube (`stream from pid 150
+  closed: 32.8 s`). The YouTube WebProcess (web6) never started media: no
+  `ps5audiosink` line, never above 0.3 cores.
+- **The title was still alive afterwards.** Its 60-second `[mem]` lines went
+  on until 12:04:17 (6 after the URL timeout, the log file's mtime). So
+  the SIGKILL never reached it. The launcher was stuck *before* the kill, in
+  its system-service calls (`sceLncUtilGetAppIdOfRunningBigApp` / the
+  `sceKernelGetAppInfo` scan), or in writing its log on /data, as it was in
+  `sceLncUtilLaunchApp` (`IpmWEf0`) at 11:43. With the PS button and FTP
+  dead too, a system service or /data was hung. The cause is unknown.
+- **Already slow before the kill:** the elfldr uploads of web5 and web6
+  took 4.5 s each (683–837 ms earlier in the same run), while web4 was still
+  decoding the 1080p clip and GStreamer's downloadbuffer was copying that
+  local file to /data (`Enabling on-disk buffering`). Local files no longer
+  get an on-disk copy (0016).
+
+**What could hold up a title's teardown** (from the code): a thread inside
+`sceAudioOutOutput` (at most one 5.3 ms grain, then it returns), the audio
+server's stream threads blocked in `recv` on the WebProcess socket, the GL
+thread in `eglSwapBuffers`/VideoOut flips (main thread, at most one vsync), the
+control/listen threads in `accept`, the payload sockets. All of these are
+interruptible waits for a SIGKILL. The 12 kill cycles had GL running and a
+port open. The one kind of wait that a kill can't interrupt is a system IPC
+call (`Ipm*`), as the hung audio probes showed. The title makes those only
+for sceAudioOut, the pad and the IME.
+
+**Wind-down (built, not yet run on the console):**
+- `tools/launch.sh --stop`, and every time launch.sh is about to stop
+  PPSA99020, now sends the launcher's new `stop` command. The launcher
+  connects to the title's unix socket
+  `/system_tmp/ps5wk/ps5browser-control.sock` and sends `quit`. This makes no
+  system calls, so it works while services are slow.
+- The title answers `OK winding down` and then:
+  1. Loads about:blank. The WebProcess stops playback, its GStreamer
+     pipeline goes to NULL, and its audio sink disconnects.
+  2. Waits up to 2 s for the audio streams to end.
+  3. Ends the WebProcess (`webkit_web_view_terminate_web_process`).
+  4. Stops the audio server: no new streams, `shutdown()` on every stream
+     socket, waits up to 2 s for the stream threads. Each thread closes its
+     own port after its last grain, so a port is never closed under a writer.
+     The server then closes any port left over.
+  5. Quits the main loop. `title_exit.c` then asks the launcher for
+     `kill -9`, with nothing playing.
+- launch.sh polls `status` and kills only if the title is still running
+  after `STOP_WAIT` seconds (default 10).
+- The launcher now runs each command on a worker thread. A command that
+  hasn't answered in 15 s gets `ERR <cmd> blocked for 15 s in <stage>`, the
+  name of the call it is stuck in, and the launcher keeps serving other
+  connections. It also answers the client before writing its log on /data.
+- Diagnostics for the next runs: `[present]` lines from the title (upload
+  and swap times per 5 s) and `[render]` lines from the WebProcess.
+
+**Why YouTube didn't finish in 60 s:** two process swaps, file:// → youtube
+(web5) and then YouTube's Cross-Origin-Opener-Policy (web6), each a fresh
+114 MB payload through elfldr that took about 10 s to connect (4.5 s upload)
+while the old WebProcess was still decoding. In the shot harness, YouTube
+finishes loading in 5–6 s with one WebProcess.
+
+**Why the title showed 20–23 fps against 29.9 in the harness:** not known
+yet. The title uploads every damaged rectangle into a GL texture and
+presents with a vsync-paced `eglSwapBuffers`. Frame completion goes back to
+the WebProcess after that, and the WebProcess's idle gap follows any update
+longer than 6 ms. The `[present]` and `[render]` lines measure each part.
+
 Still open: the TV test (picture and sound judged by the owner), title
 fps, YouTube 60 fps under its overlays (every video frame repaints the
 player's gradient/blur layers on the CPU; hole punching removes that), Opus

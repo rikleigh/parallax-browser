@@ -7,6 +7,9 @@
  *   status                 the running big app, if any: "OK <appid> <TITLEID>"
  *   launch <TITLEID> [arg] start a registered title (fails if one is running)
  *   kill                   SIGKILL the running big app, wait until it is gone
+ *   stop                   ask the browser title to wind down by itself (control
+ *                          socket, no system calls); launch.sh then polls status
+ *                          and only kills it if it is still there
  *   register <TITLEID> [dir] register a title uploaded to /data/homebrew/<ID>
  *   uninstall <TITLEID>    remove a spike title from the app list (spikes only)
  *   quit                   stop the launcher
@@ -14,11 +17,19 @@
  * tools/launch.sh is the client. It sends this payload first if nothing
  * answers on the port.
  *
+ * Each command runs on a worker thread. If it hasn't answered after 15 s
+ * the client gets "ERR <cmd> blocked for 15 s in <stage>" (the system call
+ * it is stuck in) and the launcher keeps serving other connections
+ * (2026-10-28: the launcher hung inside a kill request and only accepted
+ * connections from then on).
+ *
  * On 13.60 (checked 2026-10-27) sceLncUtilLaunchApp works with the payload's
  * own authid; the system authids below are only a fallback. Stopping is by
  * signal (see kill_running).
  */
 #include <errno.h>
+#include <pthread.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -115,23 +126,30 @@ static void say(int fd, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
+    size_t n = strlen(line);
+    if (fd >= 0) { /* the client first: the log is on /data */
+        line[n] = '\n';
+        (void)!write(fd, line, n + 1);
+        line[n] = 0;
+    }
     if (log_file) {
         fprintf(log_file, "%ld %s\n", (long)time(NULL), line);
         fflush(log_file);
     }
-    if (fd >= 0) {
-        size_t n = strlen(line);
-        line[n] = '\n';
-        (void)!write(fd, line, n + 1);
-    }
 }
+
+/* What the current command is doing, for "blocked in" replies. */
+static const char *volatile stage = "idle";
 
 static int running_app(char title_id[16])
 {
+    stage = "sceLncUtilGetAppIdOfRunningBigApp";
     int app_id = sceLncUtilGetAppIdOfRunningBigApp();
     title_id[0] = 0;
+    stage = "sceLncUtilGetAppTitleId";
     if (app_id > 0 && app_id != -1 && sceLncUtilGetAppTitleId((uint32_t)app_id, title_id) != 0)
         strcpy(title_id, "?");
+    stage = "after running_app";
     return app_id;
 }
 
@@ -179,6 +197,7 @@ int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
  * kinfo_proc layout matching the SDK's. */
 static pid_t app_pid(int app_id, char title_id[16])
 {
+    stage = "sceKernelGetAppInfo scan";
     for (pid_t pid = 1; pid < 8192; pid++) {
         app_info_t info;
         memset(&info, 0, sizeof info);
@@ -221,10 +240,12 @@ static int kill_running(int fd)
         say(fd, "ERR kill %s (appid 0x%x): no process found", tid, app_id);
         return -1;
     }
+    stage = "kill(SIGKILL)";
     if (kill(pid, SIGKILL) != 0) {
         say(fd, "ERR kill %s: SIGKILL pid %d: %s", tid, pid, strerror(errno));
         return -1;
     }
+    stage = "waiting for the killed app to go";
     int t = wait_gone(app_id, 10000);
     if (t < 0) {
         say(fd, "ERR %s still running 10 s after SIGKILL", tid);
@@ -344,6 +365,41 @@ static void uninstall_title(int fd, const char *tid)
         say(fd, "OK uninstalled %s", tid);
 }
 
+/* Ask the browser title (port/webkit/apps/title/ps5browser.c) to wind down
+ * by itself: stop media, close its audio ports and sockets, then ask us for
+ * the SIGKILL. Only a unix socket in /system_tmp, no system service calls,
+ * so it works even when those are slow. */
+#define BROWSER_CONTROL_SOCKET "/system_tmp/ps5wk/ps5browser-control.sock"
+static void stop_title(int fd)
+{
+    stage = "connect to the title's control socket";
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, BROWSER_CONTROL_SOCKET, sizeof a.sun_path - 1);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof a) != 0) {
+        say(fd, "ERR stop: %s: %s", BROWSER_CONTROL_SOCKET, strerror(errno));
+        if (s >= 0)
+            close(s);
+        return;
+    }
+    struct timeval tv = { 3, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    char reply[128] = "";
+    stage = "waiting for the title's answer";
+    ssize_t n = -1;
+    if (write(s, "quit\n", 5) == 5)
+        n = read(s, reply, sizeof reply - 1);
+    close(s);
+    reply[n > 0 ? n : 0] = 0;
+    reply[strcspn(reply, "\r\n")] = 0;
+    if (n > 0 && !strncmp(reply, "OK", 2))
+        say(fd, "OK stop: %s", reply);
+    else
+        say(fd, "ERR stop: no answer from the title (%s)", n < 0 ? strerror(errno) : reply);
+}
+
 /* Returns 1 to stop the launcher. */
 static int command(int fd, char *line)
 {
@@ -371,12 +427,15 @@ static int command(int fd, char *line)
             return 0;
         }
         uint64_t used;
+        stage = "sceLncUtilLaunchApp";
         int r = launch(a1, a2, &used);
         if (r < 0)
             say(fd, "ERR launch %s: 0x%08x", a1, (unsigned)r);
         else
             say(fd, "OK launched %s appid 0x%x (authid 0x%016llx%s)", a1, r,
                 (unsigned long long)used, used == own_authid ? ", own" : "");
+    } else if (!strcmp(cmd, "stop")) {
+        stop_title(fd);
     } else if (!strcmp(cmd, "kill")) {
         kill_running(fd); /* "kill -9" is accepted: SIGKILL is the only way */
     } else if (!strcmp(cmd, "register")) {
@@ -393,9 +452,31 @@ static int command(int fd, char *line)
         say(fd, "OK bye");
         return 1;
     } else {
-        say(fd, "ERR unknown command %s (status, launch, kill, register, uninstall, quit)", cmd);
+        say(fd, "ERR unknown command %s (status, launch, stop, kill, register, uninstall, quit)", cmd);
     }
     return 0;
+}
+
+typedef struct {
+    int fd;
+    char line[256];
+    int done, stop, abandoned;
+} job_t;
+
+static void *run_job(void *data)
+{
+    job_t *job = data;
+    int stop = command(job->fd, job->line);
+    stage = "idle";
+    if (__atomic_load_n(&job->abandoned, __ATOMIC_ACQUIRE)) {
+        say(-1, "a command that blocked for more than 15 s returned");
+        close(job->fd);
+        free(job);
+        return NULL;
+    }
+    job->stop = stop;
+    __atomic_store_n(&job->done, 1, __ATOMIC_RELEASE);
+    return NULL;
 }
 
 int main(void)
@@ -427,10 +508,41 @@ int main(void)
             continue;
         FILE *in = fdopen(c, "r");
         char line[256];
-        while (!stop && in && fgets(line, sizeof line, in)) {
+        int abandoned = 0;
+        while (!stop && !abandoned && in && fgets(line, sizeof line, in)) {
             say(-1, "> %.*s", (int)strcspn(line, "\r\n"), line);
-            stop = command(c, line);
+            job_t *job = calloc(1, sizeof *job);
+            pthread_t t;
+            if (job) {
+                job->fd = c;
+                memcpy(job->line, line, sizeof job->line);
+            }
+            if (!job || pthread_create(&t, NULL, run_job, job) != 0) {
+                stop = command(c, line); /* no thread: run it here */
+                free(job);
+                continue;
+            }
+            pthread_detach(t);
+            for (int ms = 0; ms < 15000 && !__atomic_load_n(&job->done, __ATOMIC_ACQUIRE); ms += 20)
+                usleep(20 * 1000);
+            if (__atomic_load_n(&job->done, __ATOMIC_ACQUIRE)) {
+                stop = job->stop;
+                free(job);
+            } else {
+                /* Leave the connection to the worker (it closes it if it
+                 * ever returns) and serve the next client. */
+                char msg[200];
+                int n = snprintf(msg, sizeof msg, "ERR %.20s blocked for 15 s in %s\n", line, stage);
+                for (int i = 0; i < n; i++)
+                    if (msg[i] == '\n' && i < n - 1)
+                        msg[i] = ' ';
+                (void)!write(c, msg, (size_t)n);
+                __atomic_store_n(&job->abandoned, 1, __ATOMIC_RELEASE);
+                abandoned = 1;
+            }
         }
+        if (abandoned)
+            continue; /* the worker owns c now (and `in` leaks with it) */
         if (in)
             fclose(in);
         else

@@ -7,7 +7,12 @@
 #   tools/launch.sh --install <titledir> upload, register if new, launch
 #   tools/launch.sh --register <ID> [dir on the console, default /data/homebrew/<ID>]
 #   tools/launch.sh --uninstall <ID>   (spike titles only)
-#   tools/launch.sh --status | --kill [-9] | --quit
+#   tools/launch.sh --status | --stop | --kill [-9] | --quit
+# --stop (and stopping our browser title before a launch) first asks the
+# title to wind down by itself (launcher "stop": media stopped, audio ports
+# and sockets closed, then the title asks for its SIGKILL) and kills it only
+# if it is still running after STOP_WAIT seconds (default 10).
+# Any "ERR ... blocked ..." or missing reply: stop and look, don't retry.
 # Only titles in PS5WK_OWN_TITLES are stopped without -f, so the owner's own
 # games are never closed by accident.
 set -euo pipefail
@@ -36,11 +41,31 @@ ensure_launcher() {
 # Print the reply; succeed only on "OK ...".
 run() { local r; r="$(ask "$*")"; echo "${r:-ERR no reply}"; [[ "$r" == OK* ]]; }
 
+# Wind the browser title down, then make sure it is gone.
+stop_title() {
+    local r
+    r="$(ask stop)"; echo "${r:-ERR no reply}"
+    case "$r" in
+        OK*) ;;
+        ERR*blocked*|"") return 1 ;;              # the launcher is stuck: don't go on
+        *) echo "(no wind-down; killing)"; run kill; return ;;
+    esac
+    for _ in $(seq $(( ${STOP_WAIT:-10} * 2 ))); do
+        sleep 0.5
+        read -r ok app _ <<<"$(ask status)"
+        [[ "$ok" == OK && "$app" == none ]] && { echo "OK stopped (wound down)"; return 0; }
+        [[ "$ok" != OK ]] && { echo "ERR status: $ok $app"; return 1; }
+    done
+    echo "still running after ${STOP_WAIT:-10} s: killing"
+    run kill
+}
+
 force=0
 case "${1:-}" in
     -f) force=1; shift ;;
     --status) ensure_launcher; run status; exit ;;
     --kill) ensure_launcher; run kill ${2:-}; exit ;;
+    --stop) ensure_launcher; stop_title; exit ;;
     --register) ensure_launcher; run register "${2:?title id}" ${3:-}; exit ;;
     --uninstall) ensure_launcher; run uninstall "${2:?title id}"; exit ;;
     --quit) run quit; exit ;;
@@ -63,6 +88,6 @@ if [[ "$ok" == OK && "$app" != none ]]; then
         echo "$running is running and isn't one of ours; use -f to close it" >&2
         exit 1
     fi
-    run kill || exit 1
+    if [[ "$running" == PPSA99020 ]]; then stop_title || exit 1; else run kill || exit 1; fi
 fi
 run launch "$title" ${1:-}

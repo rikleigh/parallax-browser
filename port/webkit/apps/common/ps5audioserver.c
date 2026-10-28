@@ -50,6 +50,17 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_PORTS 16
 static int openPorts[MAX_PORTS]; // sceAudioOut handles + 1 (0 = free slot)
 static int stopping;
+static int clientFds[MAX_PORTS]; // connections being served, + 1 (0 = free)
+static int threadsRunning;       // stream threads, counted from accept()
+
+static void forgetClient(int fd)
+{
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < MAX_PORTS; i++)
+        if (clientFds[i] == fd + 1)
+            clientFds[i] = 0;
+    pthread_mutex_unlock(&lock);
+}
 
 static void registerPort(int handle)
 {
@@ -122,7 +133,11 @@ static void* streamThread(void* data)
     if (readFull(fd, &hello, sizeof hello) || hello.magic != PS5WK_AUDIO_MAGIC || hello.version != PS5WK_AUDIO_VERSION
         || hello.rate != RATE || (hello.channels != 1 && hello.channels != 2)) {
         LOGA("bad hello (magic 0x%x version %u rate %u channels %u)", hello.magic, hello.version, hello.rate, hello.channels);
+        forgetClient(fd);
         close(fd);
+        pthread_mutex_lock(&lock);
+        threadsRunning--;
+        pthread_mutex_unlock(&lock);
         return NULL;
     }
     pthread_mutex_lock(&lock);
@@ -166,9 +181,11 @@ static void* streamThread(void* data)
         sceAudioOutClose(handle);
     }
     free(grain);
+    forgetClient(fd);
     close(fd);
     pthread_mutex_lock(&lock);
     streamsOpen--;
+    threadsRunning--;
     pthread_mutex_unlock(&lock);
     LOGA("stream from pid %d closed: %.1f s of audio in %.1f s", hello.pid, played / (double)RATE, (nowMS() - start) / 1e3);
     return NULL;
@@ -213,13 +230,32 @@ static void* listenThread(void* unused)
         // consumption (about 4 grains, 21 ms, in the socket buffer).
         int size = 4 * GRAIN * 4;
         setsockopt(client, SOL_SOCKET, SO_RCVBUF, &size, sizeof size);
+        pthread_mutex_lock(&lock);
+        int slot = -1;
+        if (!stopping)
+            for (int i = 0; i < MAX_PORTS && slot < 0; i++)
+                if (!clientFds[i])
+                    slot = i;
+        if (slot >= 0) {
+            clientFds[slot] = client + 1;
+            threadsRunning++;
+        }
+        pthread_mutex_unlock(&lock);
+        if (slot < 0) { // winding down, or too many streams
+            close(client);
+            continue;
+        }
         pthread_t thread;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 256 * 1024);
-        if (pthread_create(&thread, &attr, streamThread, (void*)(intptr_t)client))
+        if (pthread_create(&thread, &attr, streamThread, (void*)(intptr_t)client)) {
+            forgetClient(client);
             close(client);
-        else
+            pthread_mutex_lock(&lock);
+            threadsRunning--;
+            pthread_mutex_unlock(&lock);
+        } else
             pthread_detach(thread);
     }
     return NULL;
@@ -242,8 +278,34 @@ void ps5wk_audio_server_start(int outputMode)
 // over repeated launch/kill cycles).
 void ps5wk_audio_server_stop(void)
 {
+    // 1. No new streams; wake every stream thread out of recv(). A thread in
+    //    sceAudioOutOutput returns within one grain (5.3 ms), sees `stopping`
+    //    and closes its own port (a port is never closed under a thread that
+    //    is writing to it).
     pthread_mutex_lock(&lock);
     stopping = 1;
+    int woken = 0;
+    for (int i = 0; i < MAX_PORTS; i++)
+        if (clientFds[i]) {
+            shutdown(clientFds[i] - 1, SHUT_RDWR);
+            woken++;
+        }
+    pthread_mutex_unlock(&lock);
+    // 2. Wait (up to 2 s) for the stream threads to finish.
+    double t0 = nowMS();
+    int left;
+    for (;;) {
+        pthread_mutex_lock(&lock);
+        left = threadsRunning;
+        pthread_mutex_unlock(&lock);
+        if (!left || nowMS() - t0 > 2000)
+            break;
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    // 3. Ports no thread owns any more (the self-test's), or of threads that
+    //    did not finish in time.
+    pthread_mutex_lock(&lock);
     int handles[MAX_PORTS], n = 0;
     for (int i = 0; i < MAX_PORTS; i++)
         if (openPorts[i]) {
@@ -253,7 +315,15 @@ void ps5wk_audio_server_stop(void)
     pthread_mutex_unlock(&lock);
     for (int i = 0; i < n; i++)
         sceAudioOutClose(handles[i]);
-    LOGA("stopped: closed %d port(s)", n);
+    LOGA("stopped: %d stream(s) woken, %d thread(s) still running after %.0f ms, %d port(s) closed here", woken, left, nowMS() - t0, n);
+}
+
+int ps5wk_audio_server_active_streams(void)
+{
+    pthread_mutex_lock(&lock);
+    int n = threadsRunning;
+    pthread_mutex_unlock(&lock);
+    return n;
 }
 
 // /data/ps5webkit/audio-selftest: open a port at start, play 0.1 s of

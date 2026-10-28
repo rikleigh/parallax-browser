@@ -23,6 +23,7 @@ extern "C" {
 #endif
 void ps5wk_audio_server_start(int mode);
 void ps5wk_audio_server_stop(void);
+int ps5wk_audio_server_active_streams(void);
 void ps5wk_audio_server_selftest(void);
 #ifdef __cplusplus
 }

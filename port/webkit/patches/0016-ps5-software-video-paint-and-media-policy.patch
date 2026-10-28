@@ -29,7 +29,7 @@ index b7e542b220..636535d034 100644
          m_decoderCodecMap.add("av01*"_s, av1DecoderAvailable);
          m_decoderCodecMap.add("av1"_s, av1DecoderAvailable);
 diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
-index 3545f9d9bd..9ae92aa006 100644
+index 3545f9d9bd..394c5a0e75 100644
 --- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
 +++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
 @@ -133,6 +133,14 @@
@@ -47,7 +47,22 @@ index 3545f9d9bd..9ae92aa006 100644
  GST_DEBUG_CATEGORY(webkit_media_player_debug);
  #define GST_CAT_DEFAULT webkit_media_player_debug
  
-@@ -2889,6 +2897,15 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
+@@ -2850,7 +2858,13 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
+         m_urisourceBin = element;
+         if (isBlob || isDataUri)
+             g_object_set(element, "ring-buffer-max-size", static_cast<guint64>(2 * MB), nullptr);
+-        else if (!isMediaSource() && !isMediaStreamPlayer())
++        else if (!isMediaSource() && !isMediaStreamPlayer()
++#if defined(PS5_PAYLOAD_SDK)
++            // PS5: a local file needs no on-disk copy (it doubled the /data
++            // traffic of local test clips).
++            && !m_url.protocolIsFile()
++#endif
++            )
+             g_object_set(element, "download", TRUE, nullptr);
+ 
+         // Disable download buffering for WebM because often the needed duration is stored at the
+@@ -2889,6 +2903,15 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
      if (isMediaStreamPlayer())
          return;
  
@@ -63,7 +78,22 @@ index 3545f9d9bd..9ae92aa006 100644
      if (startsWith(name.span(), "downloadbuffer"_s)) {
          configureDownloadBuffer(element);
          return;
-@@ -3838,7 +3855,17 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
+@@ -3559,6 +3582,14 @@ void MediaPlayerPrivateGStreamer::updateDownloadBufferingFlag()
+         return;
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_url.protocolIsFile()) {
++        GST_DEBUG_OBJECT(pipeline(), "Local file. Disabling on-disk buffering");
++        disableDownloading();
++        return;
++    }
++#endif
++
+     if (m_url.protocolIsBlob()) {
+         GST_DEBUG_OBJECT(pipeline(), "Blob URI detected. Disabling on-disk buffering");
+         disableDownloading();
+@@ -3838,7 +3869,17 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
          // Set the decoder maximum number of threads to a low, fixed value, not depending on the
          // platform. This also helps with processing metrics gathering. When using the default value
          // the decoder introduces artificial processing latency reflecting the maximum number of threads.
@@ -81,7 +111,7 @@ index 3545f9d9bd..9ae92aa006 100644
      } else {
          // WebKitMediaSrc is emitting still-frame events to work around stalls caused by avdec_* decoders.
          // It does so regardless of the decoder we are actually using (see details in the comment there).
-@@ -3851,8 +3878,16 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
+@@ -3851,8 +3892,16 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
          }, nullptr, nullptr);
      }
  
@@ -99,7 +129,7 @@ index 3545f9d9bd..9ae92aa006 100644
  
      setupCodecProbe(decoder);
  
-@@ -4380,6 +4415,134 @@ void MediaPlayerPrivateGStreamer::setPresentationSize(const IntSize& size)
+@@ -4380,6 +4429,134 @@ void MediaPlayerPrivateGStreamer::setPresentationSize(const IntSize& size)
      m_size = size;
  }
  
@@ -234,7 +264,7 @@ index 3545f9d9bd..9ae92aa006 100644
  void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRect& rect)
  {
      if (context.paintingDisabled())
-@@ -4410,6 +4573,10 @@ void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRec
+@@ -4410,6 +4587,10 @@ void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRec
      if (!presentationSize)
          return;
  
