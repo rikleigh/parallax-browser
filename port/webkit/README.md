@@ -220,7 +220,7 @@ port open. The one kind of wait that a kill can't interrupt is a system IPC
 call (`Ipm*`), as the hung audio probes showed. The title makes those only
 for sceAudioOut, the pad and the IME.
 
-**Wind-down (built, not yet run on the console):**
+**Wind-down (checked on the console, below):**
 - `tools/launch.sh --stop`, and every time launch.sh is about to stop
   PPSA99020, now sends the launcher's new `stop` command. The launcher
   connects to the title's unix socket
@@ -246,14 +246,38 @@ for sceAudioOut, the pad and the IME.
 - Diagnostics for the next runs: `[present]` lines from the title (upload
   and swap times per 5 s) and `[render]` lines from the WebProcess.
 
+**Checked on the console (12:12–12:14, owner nearby):**
+- **Wind-down at the start page:** `launch.sh --stop` gave "OK stop: OK winding
+  down", then "OK stopped (wound down)". The title took 56 ms from "quit"
+  to leaving its main loop, then asked for its own SIGKILL.
+- **Wind-down during playback:** local 1080p30 clip, real sceAudioOut port
+  at volume 0, 13 s in. The audio stream closed 51 ms after "quit", 0
+  threads were left, the title was gone, and `status` said "OK none".
+- **Relaunch with the same clip:** the port opened again (0x20000000),
+  then the same clean wind-down.
+- **fps breakdown in the title** (1080p30 clip in a 1280x720 element,
+  25 s, no debug-screenshot):
+
+  | What | Measured |
+  |---|---|
+  | Video | **30 fps, 0 dropped**, WebProcess 0.77–0.85 cores |
+  | WebProcess `[render]` | 35–37 updates/s (video plus the stats line), 10–10.7 ms average; 150 of ~180 updates per 5 s followed by the idle gap |
+  | Title `[present]` | 34–35 uploads/s, **14.5 ms average per ~3 MB texture upload** (`glTexSubImage2D` through ps5-opengl, about 210 MB/s); `eglSwapBuffers` 0.1 ms |
+
+  The 20–23 fps of the 11:58 run is gone. That run had debug-screenshot
+  on and an on-disk copy of the clip. The title's texture upload is the
+  next limit: 14.5 ms × 60 frames/s is 87 % of its main thread. Hole punching
+  (step 2) removes it for video. Until then, 1080p60 in the title will
+  probably drop frames.
+
 **Why YouTube didn't finish in 60 s:** two process swaps, file:// → youtube
 (web5) and then YouTube's Cross-Origin-Opener-Policy (web6), each a fresh
 114 MB payload through elfldr that took about 10 s to connect (4.5 s upload)
 while the old WebProcess was still decoding. In the shot harness, YouTube
 finishes loading in 5–6 s with one WebProcess.
 
-**Why the title showed 20–23 fps against 29.9 in the harness:** not known
-yet. The title uploads every damaged rectangle into a GL texture and
+**Why the title showed 20–23 fps (11:58 run):** not reproduced; see the
+breakdown above (30 fps). The title uploads every damaged rectangle into a GL texture and
 presents with a vsync-paced `eglSwapBuffers`. Frame completion goes back to
 the WebProcess after that, and the WebProcess's idle gap follows any update
 longer than 6 ms. The `[present]` and `[render]` lines measure each part.
