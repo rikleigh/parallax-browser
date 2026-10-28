@@ -660,3 +660,12 @@ port.
   simulated headset passed (projections checked from eye-buffer captures,
   repeated enter/leave, slots and memory flat); waiting for the owner's
   headset check.
+- **Evening fixes (2026-10-28):** the TV "no sound" was the TV being off
+  (the sound test played with and without the PS VR2 param.json attributes;
+  Hmd2 itself only checks attribute3 bit 0x400). BBC News's H.264 video
+  failed in Videodec2 after a mid-stream resolution switch: the decoder is
+  now drained and reset at a new SPS. WebProcess memory no longer only grows:
+  libpas gives decommitted pages back (patch 0031: 300-420 MB of a ~1.1 GB
+  heap returned at any time in a 48-load session), and a memory limit
+  (`PS5WK_MEM_RESTART_MB`, default 3 GB) restarts the WebProcess at the next
+  navigation. Details in port/webkit/README.md.
