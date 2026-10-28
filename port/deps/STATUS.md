@@ -51,12 +51,13 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 | MIME globs2 | ours | console-tested | /data/ps5webkit/share/mime/globs2 (hand-written; no shared-mime-info); children set XDG_DATA_DIRS=/data/ps5webkit/share |
 | libgcrypt/libtasn1 | – | skipped | use -DUSE_OPENSSL=ON |
 | libavif, libjxl, woff2, libwpe | – | skipped | see README |
-| **Milestone 2** | | | `build.sh m2` (2m34s clean); gst smoke 9/9 PASS (`smoke/results/*-gst-all-pass.log`) |
+| **Milestone 2** | | | `build.sh m2` (2m34s clean); gst smoke 10/10 PASS incl. the audio sink (`smoke/results/20261028-095119.log`) |
 | dav1d | 1.5.1 | smoke-tested | AV1 via avdec_libdav1d |
 | FFmpeg | 7.1.1 | smoke-tested | decoders only: aac, mp3, opus, vorbis, flac, h264, hevc, vp8, vp9, libdav1d; avfilter, swresample; LGPL |
 | GStreamer core | 1.28.8 | smoke-tested | static, `gstreamer-static-full` (gst_init registers static plugins), registry off |
 | gst-plugins-base | 1.28.8 | smoke-tested | app, playback (decodebin3/parsebin/playbin3), typefind, converters; **no GL** |
-| gst-plugins-good | 1.28.8 | smoke-tested | isomp4, matroska, audioparsers, adaptivedemux2 (hlsdemux2/dashdemux2), id3demux |
+| gst-plugins-good | 1.28.8 | smoke-tested | isomp4, matroska, audioparsers, adaptivedemux2 (hlsdemux2/dashdemux2), id3demux, autodetect (autoaudiosink), deinterlace + videofilter (WebKit's software video path plugs them; missing = MEDIA_ERR_SRC_NOT_SUPPORTED), audiofx (scaletempo) |
 | gst-plugins-bad | 1.28.8 | smoke-tested | videoparsersbad, mpegtsdemux (+libgstmpegts), codecparsers |
 | gst-libav | 1.28.8 | smoke-tested | patch: keep avdec_libdav1d, fix dropped frames without DR |
+| ps5audiosink | ours | smoke-tested | `gst/gstps5audiosink.c`, static plugin "ps5audio", rank PRIMARY: PCM to the browser title's audio server when `PS5WK_AUDIO_SOCKET` is set, else direct sceAudioOut (smoke test only: a payload's sceAudioOut use is never released by the system, see port/webkit/README.md); `-lSceAudioOut` in gstreamer-full-1.0.pc |
 | gstreamer-full | 1.28.8 | smoke-tested | `lib/libgstreamer-full-1.0.a` = all gst libs + 25 plugins + FFmpeg/dav1d + `gst_init_static_plugins()`; WebKit: `-DUSE_GSTREAMER_FULL=ON -DUSE_GSTREAMER_GL=OFF` |

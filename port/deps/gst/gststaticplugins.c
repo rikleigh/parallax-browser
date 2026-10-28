@@ -22,9 +22,11 @@
                          X(volume) X(pbtypes) X(rawparse) X(subparse) X(gio)   \
     /* -good */          X(isomp4) X(matroska) X(audioparsers) X(id3demux)   \
                          X(apetag) X(icydemux) X(wavparse) X(adaptivedemux2) \
+                         X(autodetect) X(deinterlace) X(videofilter) X(audiofx) \
     /* -bad */           X(videoparsersbad) X(mpegtsdemux) X(mpegpsdemux)    \
                          X(id3tag)                                           \
-    /* gst-libav */      X(libav)
+    /* gst-libav */      X(libav)                                            \
+    /* ours: sceAudioOut sink (gstps5audiosink.c) */ X(ps5audio)
 
 #define DECLARE(name) GST_PLUGIN_STATIC_DECLARE(name);
 GST_PS5_PLUGINS(DECLARE)

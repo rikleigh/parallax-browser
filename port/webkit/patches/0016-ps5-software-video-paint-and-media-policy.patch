@@ -1,0 +1,390 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+index b7e542b220..636535d034 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+@@ -544,6 +544,11 @@ void GStreamerRegistryScanner::initializeDecoders(const GStreamerRegistryScanner
+     if (matroskaSupported) {
+         auto vp8DecoderAvailable = factories.hasElementForMediaType(ElementFactories::Type::VideoDecoder, "video/x-vp8"_s, ElementFactories::CheckHardwareClassifier::Yes, { { "vp8alphadecodebin"_s, "vavp8alphadecodebin"_s } });
+         auto vp9DecoderAvailable = factories.hasElementForMediaType(ElementFactories::Type::VideoDecoder, "video/x-vp9"_s, ElementFactories::CheckHardwareClassifier::Yes, { { "vp9alphadecodebin"_s, "vavp9alphadecodebin"_s } });
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5WK_MEDIA_VP9=0 hides VP9 (YouTube then sends H.264).
++        if (!g_strcmp0(g_getenv("PS5WK_MEDIA_VP9"), "0"))
++            vp9DecoderAvailable = { };
++#endif
+ 
+         if (vp8DecoderAvailable || vp9DecoderAvailable)
+             m_decoderMimeTypeSet.add("video/webm"_s);
+@@ -599,6 +604,13 @@ void GStreamerRegistryScanner::initializeDecoders(const GStreamerRegistryScanner
+     }
+ 
+     auto av1DecoderAvailable = factories.hasElementForMediaType(ElementFactories::Type::VideoDecoder, "video/x-av1"_s, ElementFactories::CheckHardwareClassifier::Yes);
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: AV1 can only be decoded in software (dav1d; the hardware decoder has
++    // H.264, HEVC and VP9), so it is not advertised and sites such as YouTube
++    // pick VP9 or H.264. PS5WK_MEDIA_AV1=1 advertises it.
++    if (g_strcmp0(g_getenv("PS5WK_MEDIA_AV1"), "1"))
++        av1DecoderAvailable = { };
++#endif
+     if ((matroskaSupported || isContainerTypeSupported(Configuration::Decoding, "video/mp4"_s)) && av1DecoderAvailable) {
+         m_decoderCodecMap.add("av01*"_s, av1DecoderAvailable);
+         m_decoderCodecMap.add("av1"_s, av1DecoderAvailable);
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index 3545f9d9bd..9ae92aa006 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -133,6 +133,14 @@
+ #include "MediaPlayerPrivateHolePunch.h"
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include "NativeImage.h"
++#include <skia/core/SkImage.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkPixmap.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#endif
++
+ GST_DEBUG_CATEGORY(webkit_media_player_debug);
+ #define GST_CAT_DEFAULT webkit_media_player_debug
+ 
+@@ -2889,6 +2897,15 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
+     if (isMediaStreamPlayer())
+         return;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: playsink's colour conversion (I420 -> BGRx for the software video
++    // sink) runs without ORC; spread it over a few threads.
++    if (gstElementMatchesFactoryAndHasProperty(element, "videoconvert*"_s, "n-threads"_s)) {
++        g_object_set(element, "n-threads", 4, nullptr);
++        return;
++    }
++#endif
++
+     if (startsWith(name.span(), "downloadbuffer"_s)) {
+         configureDownloadBuffer(element);
+         return;
+@@ -3838,7 +3855,17 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
+         // Set the decoder maximum number of threads to a low, fixed value, not depending on the
+         // platform. This also helps with processing metrics gathering. When using the default value
+         // the decoder introduces artificial processing latency reflecting the maximum number of threads.
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: software decoding is the only decoding for now (Milestone 2
++        // step 1); 4 threads keep 1080p60 H.264/VP9 ahead (Spike 9: more than 8
++        // collapse on the console). PS5WK_DECODER_THREADS overrides.
++        int threads = 4;
++        if (const char* value = g_getenv("PS5WK_DECODER_THREADS"))
++            threads = std::clamp(atoi(value), 1, 8);
++        g_object_set(decoder, "max-threads", threads, nullptr);
++#else
+         g_object_set(decoder, "max-threads", 2, nullptr);
++#endif
+     } else {
+         // WebKitMediaSrc is emitting still-frame events to work around stalls caused by avdec_* decoders.
+         // It does so regardless of the decoder we are actually using (see details in the comment there).
+@@ -3851,8 +3878,16 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
+         }, nullptr, nullptr);
+     }
+ 
+-    if (gstObjectHasProperty(decoder, "max-errors"_s))
++    if (gstObjectHasProperty(decoder, "max-errors"_s)) {
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5 (software decoders): a damaged or reference-less frame after a
++        // flush ("Not all references are available" from avdec_vp9 on YouTube)
++        // must not end playback; the decoder recovers at the next keyframe.
++        g_object_set(decoder, "max-errors", -1, nullptr);
++#else
+         g_object_set(decoder, "max-errors", 0, nullptr);
++#endif
++    }
+ 
+     setupCodecProbe(decoder);
+ 
+@@ -4380,6 +4415,134 @@ void MediaPlayerPrivateGStreamer::setPresentationSize(const IntSize& size)
+     m_size = size;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5 (Milestone 2 step 1: software decoding, pages painted on the CPU):
++// Skia's raster bilinear path for a scaled image costs ~30 ms per 1080p frame
++// drawn at 1280x720, which kept the WebProcess main thread busy and starved
++// JavaScript. Scale (and keep BGRx/BGRA) with GstVideoConverter on 4 threads
++// to the device-pixel size first, so Skia only blits.
++static GRefPtr<GstSample> ps5ScaleVideoSample(GstSample* sample, int width, int height, GstVideoInfo& outInfo)
++{
++    static GstVideoConverter* converter;
++    static GstVideoInfo converterIn, converterOut;
++    static GstSample* lastSource;
++    static GRefPtr<GstSample> lastScaled;
++
++    GstVideoInfo in;
++    if (!gst_video_info_from_caps(&in, gst_sample_get_caps(sample))) {
++        GST_WARNING("PS5: no video info in %" GST_PTR_FORMAT, gst_sample_get_caps(sample));
++        return nullptr;
++    }
++    auto format = GST_VIDEO_INFO_FORMAT(&in);
++    if (format != GST_VIDEO_FORMAT_BGRx && format != GST_VIDEO_FORMAT_BGRA) {
++        GST_WARNING("PS5: video format %s not scaled", gst_video_format_to_string(format));
++        return nullptr;
++    }
++    gst_video_info_set_format(&outInfo, format, width, height);
++    // GstVideoConverter refuses frame rate and interlace changes.
++    GST_VIDEO_INFO_FPS_N(&outInfo) = GST_VIDEO_INFO_FPS_N(&in);
++    GST_VIDEO_INFO_FPS_D(&outInfo) = GST_VIDEO_INFO_FPS_D(&in);
++    GST_VIDEO_INFO_INTERLACE_MODE(&outInfo) = GST_VIDEO_INFO_INTERLACE_MODE(&in);
++    outInfo.colorimetry = in.colorimetry;
++    if (lastScaled && lastSource == sample && GST_VIDEO_INFO_WIDTH(&converterOut) == width && GST_VIDEO_INFO_HEIGHT(&converterOut) == height)
++        return lastScaled;
++    if (!converter || !gst_video_info_is_equal(&in, &converterIn) || !gst_video_info_is_equal(&outInfo, &converterOut)) {
++        if (converter)
++            gst_video_converter_free(converter);
++        converter = gst_video_converter_new(&in, &outInfo, gst_structure_new("options",
++            GST_VIDEO_CONVERTER_OPT_RESAMPLER_METHOD, GST_TYPE_VIDEO_RESAMPLER_METHOD, GST_VIDEO_RESAMPLER_METHOD_LINEAR,
++            GST_VIDEO_CONVERTER_OPT_DITHER_METHOD, GST_TYPE_VIDEO_DITHER_METHOD, GST_VIDEO_DITHER_NONE,
++            GST_VIDEO_CONVERTER_OPT_THREADS, G_TYPE_UINT, 4u, nullptr));
++        converterIn = in;
++        converterOut = outInfo;
++        if (!converter) {
++            GST_WARNING("PS5: gst_video_converter_new failed for %dx%d -> %dx%d", GST_VIDEO_INFO_WIDTH(&in), GST_VIDEO_INFO_HEIGHT(&in), width, height);
++            return nullptr;
++        }
++    }
++    GRefPtr<GstBuffer> output = adoptGRef(gst_buffer_new_allocate(nullptr, GST_VIDEO_INFO_SIZE(&outInfo), nullptr));
++    GstVideoFrame inFrame, outFrame;
++    if (!gst_video_frame_map(&inFrame, &in, gst_sample_get_buffer(sample), GST_MAP_READ)) {
++        GST_WARNING("PS5: cannot map the video frame (buffer %" GST_PTR_FORMAT ")", gst_sample_get_buffer(sample));
++        return nullptr;
++    }
++    if (!gst_video_frame_map(&outFrame, &outInfo, output.get(), GST_MAP_WRITE)) {
++        GST_WARNING("PS5: cannot map the scaled frame");
++        gst_video_frame_unmap(&inFrame);
++        return nullptr;
++    }
++    gst_video_converter_frame(converter, &inFrame, &outFrame);
++    gst_video_frame_unmap(&outFrame);
++    gst_video_frame_unmap(&inFrame);
++    GRefPtr<GstCaps> caps = adoptGRef(gst_video_info_to_caps(&outInfo));
++    lastScaled = adoptGRef(gst_sample_new(output.get(), caps.get(), nullptr, nullptr));
++    lastSource = sample;
++    return lastScaled;
++}
++
++// One SkImage per decoded (and scaled) frame, wrapping the GstBuffer's
++// memory (no copy), kept for the repaints of the same frame: the non-
++// composited renderer paints the video several times per frame (one per
++// damaged rectangle), and ImageGStreamer copied the frame each time.
++static RefPtr<NativeImage> ps5NativeImageForSample(const GRefPtr<GstSample>& sample)
++{
++    GstVideoInfo info;
++    GstBuffer* buffer = gst_sample_get_buffer(sample.get());
++    if (!buffer || !gst_video_info_from_caps(&info, gst_sample_get_caps(sample.get())))
++        return nullptr;
++    auto format = GST_VIDEO_INFO_FORMAT(&info);
++    if (format != GST_VIDEO_FORMAT_BGRx && format != GST_VIDEO_FORMAT_BGRA)
++        return nullptr;
++    GstVideoFrame frame;
++    if (!gst_video_frame_map(&frame, &info, buffer, GST_MAP_READ))
++        return nullptr;
++    auto imageInfo = SkImageInfo::Make(GST_VIDEO_INFO_WIDTH(&info), GST_VIDEO_INFO_HEIGHT(&info), kBGRA_8888_SkColorType,
++        format == GST_VIDEO_FORMAT_BGRx ? kOpaque_SkAlphaType : kUnpremul_SkAlphaType);
++    SkPixmap pixmap(imageInfo, GST_VIDEO_FRAME_PLANE_DATA(&frame, 0), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0));
++    // The frame stays mapped (system memory) until Skia releases the image.
++    auto* mapped = new GstVideoFrame(frame);
++    auto image = SkImages::RasterFromPixmap(pixmap, [](const void*, void* context) {
++        auto* mapped = static_cast<GstVideoFrame*>(context);
++        gst_video_frame_unmap(mapped);
++        delete mapped;
++    }, mapped);
++    if (!image)
++        return nullptr;
++    return NativeImage::create(WTF::move(image));
++}
++
++static bool ps5PaintVideoSample(GraphicsContext& context, const FloatRect& rect, const GRefPtr<GstSample>& sample, const FloatSize& presentationSize)
++{
++    static GRefPtr<GstSample> cachedSource;
++    static IntSize cachedSize;
++    static RefPtr<NativeImage> cachedImage;
++
++    auto ctm = context.getCTM();
++    if (!ctm.preservesAxisAlignment() || ctm.b() || ctm.c() || ctm.a() <= 0 || ctm.d() <= 0)
++        return false;
++    IntRect snapped = enclosingIntRect(ctm.mapRect(rect));
++    IntSize size(std::clamp(snapped.width(), 1, 3840), std::clamp(snapped.height(), 1, 2160));
++    if (cachedSource != sample || cachedSize != size) {
++        GRefPtr<GstSample> source = sample;
++        if (size != IntSize(presentationSize)) {
++            GstVideoInfo scaledInfo;
++            source = ps5ScaleVideoSample(sample.get(), size.width(), size.height(), scaledInfo);
++            if (!source)
++                return false;
++        }
++        auto image = ps5NativeImageForSample(source);
++        if (!image)
++            return false;
++        cachedSource = sample;
++        cachedSize = size;
++        cachedImage = WTF::move(image);
++    }
++    FloatRect userRect = ctm.inverse().value_or(AffineTransform()).mapRect(FloatRect(snapped.location(), FloatSize(size)));
++    context.drawNativeImage(*cachedImage, userRect, FloatRect({ }, FloatSize(size)), { CompositeOperator::Copy });
++    return true;
++}
++#endif
++
+ void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRect& rect)
+ {
+     if (context.paintingDisabled())
+@@ -4410,6 +4573,10 @@ void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRec
+     if (!presentationSize)
+         return;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (ps5PaintVideoSample(context, rect, sample, *presentationSize))
++        return;
++#endif
+     Ref frame = VideoFrameGStreamer::create(WTF::move(sample), { IntSize(*presentationSize), { *m_videoInfo } });
+     context.drawVideoFrame(frame, rect, ShouldDiscardAlpha::No, { m_videoSourceOrientation });
+ }
+diff --git a/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp
+index 2b0d029f07..d8159dc56b 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp
+@@ -158,6 +158,22 @@ static RefPtr<ImageGStreamer> convertSampleToImage(const GRefPtr<GstSample>& sam
+     auto format = GST_VIDEO_INFO_HAS_ALPHA(&videoInfo) ? "BGRA"_s : "BGRx"_s;
+ #else
+     auto format = GST_VIDEO_INFO_HAS_ALPHA(&videoInfo) ? "ARGB"_s : "xRGB"_s;
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 (software video, pages painted on the CPU): the video sink already
++    // delivers BGRx/BGRA at the stream size, but its caps carry more fields
++    // (colorimetry, chroma-site, pixel-aspect-ratio...) than the ones built
++    // below, so gst_caps_is_equal() failed and every painted frame went
++    // through a synchronous conversion pipeline on the main thread. Use the
++    // sample as it is when format and size already match.
++    {
++        GstVideoInfo sampleInfo;
++        auto* sampleCaps = gst_sample_get_caps(sample.get());
++        auto wanted = gst_video_format_from_string(format.characters());
++        if (sampleCaps && gst_video_info_from_caps(&sampleInfo, sampleCaps) && GST_VIDEO_INFO_FORMAT(&sampleInfo) == wanted
++            && GST_VIDEO_INFO_WIDTH(&sampleInfo) == GST_VIDEO_INFO_WIDTH(&videoInfo) && GST_VIDEO_INFO_HEIGHT(&sampleInfo) == GST_VIDEO_INFO_HEIGHT(&videoInfo))
++            return ImageGStreamer::create(GRefPtr<GstSample>(sample));
++    }
+ #endif
+     GRefPtr caps = adoptGRef(gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, format.characters(), "framerate", GST_TYPE_FRACTION, GST_VIDEO_INFO_FPS_N(&videoInfo), GST_VIDEO_INFO_FPS_D(&videoInfo), "width", G_TYPE_INT, GST_VIDEO_INFO_WIDTH(&videoInfo), "height", G_TYPE_INT, GST_VIDEO_INFO_HEIGHT(&videoInfo), nullptr));
+     auto convertedSample = GStreamerVideoFrameConverter::singleton().convert(sample, caps);
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+index 9d0b9b2808..d3abffb579 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+@@ -38,6 +38,7 @@
+ #include <WebCore/Settings.h>
+ #include <epoxy/egl.h>
+ #include <epoxy/gl.h>
++#include <wtf/Scope.h>
+ #include <wtf/SetForScope.h>
+ #include <wtf/SystemTracing.h>
+ 
+@@ -57,6 +58,9 @@ NonCompositedFrameRenderer::NonCompositedFrameRenderer(WebPage& webPage)
+     , m_surface(AcceleratedSurface::create(m_webPage, [this] {
+         frameComplete();
+     }, AcceleratedSurface::RenderingPurpose::NonComposited))
++#if defined(PS5_PAYLOAD_SDK)
++    , m_ps5ThrottleTimer(RunLoop::mainSingleton(), "NonCompositedFrameRenderer::PS5ThrottleTimer"_s, [this] { ps5ThrottleTimerFired(); }) // a member: never outlives this
++#endif
+ {
+ #if ENABLE(DAMAGE_TRACKING)
+     resetFrameDamage();
+@@ -169,9 +173,33 @@ void NonCompositedFrameRenderer::scheduleRenderingUpdate()
+         return;
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    ps5ScheduleRenderingUpdate();
++#else
+     scheduleRenderingUpdateRunLoopObserver();
++#endif
++}
++
++#if defined(PS5_PAYLOAD_SDK)
++void NonCompositedFrameRenderer::ps5ScheduleRenderingUpdate()
++{
++    auto now = MonotonicTime::now();
++    if (now >= m_ps5NextUpdate) {
++        scheduleRenderingUpdateRunLoopObserver();
++        return;
++    }
++    if (!m_ps5ThrottleTimer.isActive())
++        m_ps5ThrottleTimer.startOneShot(m_ps5NextUpdate - now);
+ }
+ 
++void NonCompositedFrameRenderer::ps5ThrottleTimerFired()
++{
++    if (m_layerTreeStateIsFrozen || m_isSuspended || !canUpdateRendering())
++        return;
++    scheduleRenderingUpdateRunLoopObserver();
++}
++#endif
++
+ bool NonCompositedFrameRenderer::canUpdateRendering() const
+ {
+     return !m_pendingNotifyFrame;
+@@ -187,6 +215,14 @@ void NonCompositedFrameRenderer::updateRendering()
+     SetForScope<bool> reentrancyProtector(m_isUpdatingRendering, true);
+ 
+     WTFBeginSignpost(this, NonCompositedRenderingUpdate);
++#if defined(PS5_PAYLOAD_SDK)
++    auto ps5UpdateStart = MonotonicTime::now();
++    auto ps5SetNextUpdate = makeScopeExit([&] {
++        auto end = MonotonicTime::now();
++        auto took = end - ps5UpdateStart;
++        m_ps5NextUpdate = took > 6_ms ? end + took : end;
++    });
++#endif
+ 
+     Ref webPage = m_webPage;
+     webPage->updateRendering();
+@@ -306,8 +342,13 @@ void NonCompositedFrameRenderer::frameComplete()
+         finishRenderingUpdate();
+ 
+     bool shouldRenderFollowupFrame = std::exchange(m_shouldRenderFollowupFrame, false);
+-    if (!m_isSuspended && !m_layerTreeStateIsFrozen && shouldRenderFollowupFrame)
++    if (!m_isSuspended && !m_layerTreeStateIsFrozen && shouldRenderFollowupFrame) {
++#if defined(PS5_PAYLOAD_SDK)
++        ps5ScheduleRenderingUpdate();
++#else
+         scheduleRenderingUpdateRunLoopObserver();
++#endif
++    }
+ }
+ 
+ void NonCompositedFrameRenderer::updateRenderingWithForcedRepaint()
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+index eb5f426f39..507ff029fa 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+@@ -28,6 +28,8 @@
+ #if USE(COORDINATED_GRAPHICS)
+ #include "AcceleratedSurface.h"
+ #include "FrameRenderer.h"
++#include <wtf/MonotonicTime.h>
++#include <wtf/RunLoop.h>
+ 
+ namespace WebCore {
+ class GLContext;
+@@ -86,6 +88,16 @@ private:
+     bool m_pendingNotifyFrame { false };
+     bool m_isWaitingForFrameComplete { false };
+     bool m_shouldRenderFollowupFrame { false };
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 (pages painted on the CPU): a rendering update that takes longer
++    // than a few ms (video under YouTube's overlays: blurs, transparency
++    // layers) is followed by an equal idle gap, so timers, media events and
++    // MSE appends still run on the main thread.
++    void ps5ScheduleRenderingUpdate();
++    void ps5ThrottleTimerFired();
++    RunLoop::Timer m_ps5ThrottleTimer;
++    MonotonicTime m_ps5NextUpdate;
++#endif
+ #if ENABLE(DAMAGE_TRACKING)
+     std::optional<WebCore::Damage> m_frameDamage;
+     std::optional<Vector<WebCore::Region>> m_frameDamageHistoryForTesting;

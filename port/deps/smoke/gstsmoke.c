@@ -66,6 +66,8 @@ static void test_factories(void)
         /* software decoders (gst-libav) */
         "avdec_h264", "avdec_h265", "avdec_vp9", "avdec_vp8", "avdec_libdav1d", "avdec_aac",
         "avdec_opus", "avdec_mp3", "avdec_flac",
+        /* audio output (ours: sceAudioOut) */
+        "autoaudiosink", "ps5audiosink",
     };
     GString *missing = g_string_new(NULL);
     guint n = G_N_ELEMENTS(need), found = 0;
@@ -234,6 +236,65 @@ static void run_demux(const Clip *clip, gboolean decode, int threads, const char
     gst_object_unref(d.pipeline);
 }
 
+/* --------------------------------------------------------- audio sink */
+/* The mp4 clip's 2 s of AAC through autoaudiosink, which must pick our
+ * ps5audiosink (sceAudioOut). Silent by default (volume 0; SMOKE_VOLUME=0.1
+ * to hear it); a synced sink takes about the clip's length in wall time. */
+static void test_audio_sink(const Clip *clip)
+{
+    const char *vol = g_getenv("SMOKE_VOLUME") ? g_getenv("SMOKE_VOLUME") : "0";
+    gchar *desc = g_strdup_printf("appsrc name=src caps=video/quicktime format=bytes ! qtdemux name=d "
+                                  "d.audio_0 ! queue ! aacparse ! avdec_aac ! audioconvert ! audioresample ! "
+                                  "volume volume=%s ! autoaudiosink name=out", vol);
+    GError *err = NULL;
+    GstElement *pipeline = gst_parse_launch(desc, &err);
+    g_free(desc);
+    if (!pipeline) {
+        result("audio-sink", FALSE, "parse: %s", err ? err->message : "?");
+        g_clear_error(&err);
+        return;
+    }
+    GstElement *src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+    GstElement *out = gst_bin_get_by_name(GST_BIN(pipeline), "out");
+    GstBuffer *buf = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY, (gpointer)clip->data, clip->len, 0,
+                                                 clip->len, NULL, NULL);
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    gint64 t0 = g_get_monotonic_time();
+    gst_app_src_push_buffer(GST_APP_SRC(src), buf);
+    gst_app_src_end_of_stream(GST_APP_SRC(src));
+    GstBus *bus = gst_element_get_bus(pipeline);
+    GstMessage *msg = gst_bus_timed_pop_filtered(bus, 20 * GST_SECOND, GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+    double ms = (g_get_monotonic_time() - t0) / 1000.0;
+    char error[256] = "";
+    gboolean eos = msg && GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS;
+    if (msg && !eos) {
+        GError *e = NULL;
+        gst_message_parse_error(msg, &e, NULL);
+        g_snprintf(error, sizeof error, ", error: %s: %s", GST_OBJECT_NAME(msg->src), e->message);
+        g_clear_error(&e);
+    } else if (!msg) {
+        g_strlcpy(error, ", timeout (20 s)", sizeof error);
+    }
+    if (msg)
+        gst_message_unref(msg);
+    char child[64] = "none";
+    GstIterator *it = gst_bin_iterate_sinks(GST_BIN(out));
+    GValue v = G_VALUE_INIT;
+    if (gst_iterator_next(it, &v) == GST_ITERATOR_OK) {
+        GstElement *c = g_value_get_object(&v);
+        g_strlcpy(child, GST_OBJECT_NAME(gst_element_get_factory(c)), sizeof child);
+        g_value_unset(&v);
+    }
+    gst_iterator_free(it);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(bus);
+    gst_object_unref(src);
+    gst_object_unref(out);
+    gst_object_unref(pipeline);
+    result("audio-sink", eos && !strcmp(child, "ps5audiosink") && ms > 1500 && ms < 4000,
+           "autoaudiosink -> %s, 2 s of AAC played in %.0f ms (volume %s)%s", child, ms, vol, error);
+}
+
 static gpointer watchdog(gpointer data)
 {
     g_usleep(120 * G_USEC_PER_SEC);
@@ -276,6 +337,7 @@ int main(int argc, char **argv)
     run_demux(&c[1], FALSE, 0, NULL);
     for (int i = 0; i < 3; i++)
         run_demux(&c[i], TRUE, 0, NULL);
+    test_audio_sink(&c[0]);
 
     printf("RESULT summary %s %d passed, %d failed\n", n_fail ? "FAIL" : "PASS", n_pass, n_fail);
     fflush(stdout);

@@ -19,6 +19,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -173,4 +174,28 @@ int symlink(const char* from, const char* to)
     (void)to;
     errno = EOPNOTSUPP;
     return -1;
+}
+
+// GStreamer's system clock (Milestone 2) waits with clock_nanosleep, a raw
+// syscall in the SDK's libc: nanosleep for the remaining time instead
+// (relative or TIMER_ABSTIME on the given clock). Returns an errno value,
+// as clock_nanosleep does.
+int clock_nanosleep(clockid_t clock, int flags, const struct timespec* request, struct timespec* remain)
+{
+    struct timespec rel = *request;
+    if (flags & TIMER_ABSTIME) {
+        struct timespec now;
+        if (clock_gettime(clock, &now))
+            return errno;
+        rel.tv_sec = request->tv_sec - now.tv_sec;
+        rel.tv_nsec = request->tv_nsec - now.tv_nsec;
+        if (rel.tv_nsec < 0) {
+            rel.tv_nsec += 1000000000L;
+            rel.tv_sec--;
+        }
+        if (rel.tv_sec < 0)
+            return 0;
+        remain = NULL;
+    }
+    return nanosleep(&rel, remain) ? errno : 0;
 }

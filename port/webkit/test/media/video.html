@@ -1,0 +1,61 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Video test</title>
+<!-- Milestone 2 test page (file:///data/ps5webkit/video.html, uploaded by
+     test/media/make-media.sh --upload). ?src=<url> plays that URL; the stats
+     line (and window.ps5wkVideoStats() for ps5wk-shot js= dumps) shows decoded
+     and dropped frames and the measured frame rate. -->
+<style>
+body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:32px 48px}
+h1{font-weight:600;font-size:32px;margin:0 0 16px}
+ul{list-style:none;padding:0;display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:0 0 16px}
+a{display:block;padding:16px 18px;border-radius:12px;background:#1f2633;color:#9cc7ff;font-size:22px;text-decoration:none}
+a:focus,a:hover{background:#2d3a52;outline:3px solid #9cc7ff}
+video{width:1280px;height:720px;background:#000;display:block}
+#stats{font:20px monospace;color:#c8f0c8;margin:10px 0;white-space:pre}
+</style></head><body>
+<h1>Video test</h1>
+<ul>
+<li><a href="?src=media/sync-720p30-h264.mp4">720p30 H.264 + AAC</a></li>
+<li><a href="?src=media/sync-1080p30-h264.mp4">1080p30 H.264 + AAC</a></li>
+<li><a href="?src=media/sync-1080p60-h264.mp4">1080p60 H.264 + AAC</a></li>
+<li><a href="?src=media/sync-1080p30-vp9.webm">1080p30 VP9 + Opus</a></li>
+<li><a href="?src=https://download.blender.org/durian/trailer/sintel_trailer-720p.mp4">Sintel trailer (web, MP4 720p)</a></li>
+<li><a href="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube: Big Buck Bunny 60 fps</a></li>
+<li><a href="https://www.youtube.com/watch?v=jNQXAC9IVRw">YouTube: Me at the zoo</a></li>
+<li><a href="start.html">Start page</a></li>
+</ul>
+<video id="v" controls playsinline></video>
+<div id="stats">pick a clip</div>
+<script>
+var v = document.getElementById('v'), stats = document.getElementById('stats');
+var src = new URLSearchParams(location.search).get('src');
+var last = null, fps = 0, log = [];
+if (src) {
+  v.src = src;
+  v.play().catch(function (e) { stats.textContent = 'play(): ' + e.name + ' ' + e.message + ' (press X on the video)'; });
+}
+['loadedmetadata', 'canplay', 'playing', 'waiting', 'stalled', 'ended', 'error', 'pause'].forEach(function (n) {
+  v.addEventListener(n, function () {
+    log.push(n + '@' + v.currentTime.toFixed(2));
+    if (n === 'error') log.push('MediaError ' + (v.error && v.error.code) + ' ' + (v.error && v.error.message));
+  });
+});
+window.ps5wkVideoStats = function () {
+  var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+  return { src: src, t: +v.currentTime.toFixed(2), dur: +(v.duration || 0).toFixed(1), size: v.videoWidth + 'x' + v.videoHeight,
+    total: q.totalVideoFrames, dropped: q.droppedVideoFrames, fps: +fps.toFixed(1), paused: v.paused, muted: v.muted,
+    volume: v.volume, ready: v.readyState, events: log.slice(-12).join(' ') };
+};
+setInterval(function () {
+  if (!src) return;
+  var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : { totalVideoFrames: 0, droppedVideoFrames: 0 };
+  var now = performance.now(), shown = q.totalVideoFrames - q.droppedVideoFrames;
+  if (last) fps = (shown - last.shown) * 1000 / (now - last.now);
+  last = { now: now, shown: shown };
+  var s = window.ps5wkVideoStats();
+  stats.textContent = s.size + '  t=' + s.t + '/' + s.dur + '  frames ' + s.total + ' dropped ' + s.dropped +
+    '  ' + s.fps + ' fps  ' + (s.paused ? 'paused' : 'playing') + '\n' + s.events;
+  console.log('VIDEOSTATS ' + JSON.stringify(s));
+}, 1000);
+</script>
+</body></html>

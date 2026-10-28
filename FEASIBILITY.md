@@ -328,6 +328,7 @@ then: LLInt, no JIT (Spike 4).
 | Launch a payload | via elfldr | **via the local elfldr** (127.0.0.1:9021), 1.6–5.2 s |
 | Socket RTT within the process | 73 µs | 18 µs |
 | JIT | RWX, RW→RX, `sceKernelJit*` all work | **RW→RX `mprotect` only** |
+| sceAudioOut | opens and plays, but **never released**: ~8 processes exhaust the audio daemon (Init 0x80260002, then blocks system-wide) | **yes**, freed when the title is killed |
 
 Flexible memory, two readings: Spike 1 committed 251 MB of anonymous memory in a
 title; Spike 9's title (also ps5-opengl) reports 419 MB from
@@ -345,6 +346,16 @@ Anonymous mmaps, malloc and thread stacks go to direct memory (Spike 10), so the
 title holds steady at 334 MB of flexible memory free while browsing.
 Payloads also cost system-wide CPU page tables (8192 in total, ~4550 used by the
 system, ~300 per WebKit payload), which limits how many WebProcesses can stay alive.
+
+**Audio from payloads (found 2026-10-28, Milestone 2): don't.** A payload can
+open sceAudioOut (main port, system user 255) and it plays in real time, but
+the system audio daemon never releases what a payload process took: after
+about eight payload processes had used it, `sceAudioOutInit` returned
+0x80260002 and then blocked (IPC wait) in every new process, system-wide.
+A title launch later hung in the launcher and the console rebooted. Titles
+are cleaned up: 12 launch/SIGKILL cycles of the browser title, each leaving
+a port open, all reopened one. So audio is played by the title, fed by the
+payloads over a unix socket (port/webkit/README.md, *Media*).
 
 Consequences: the browser's UI/XR/GPU side must be a title, and its large
 heaps (JS, DOM) have to live in direct memory (a libpas/bmalloc backend over

@@ -17,6 +17,7 @@
  * /data/ps5webkit/ps5browser.log.
  */
 #define SPIKE_NAME "ps5browser"
+#include "../common/ps5audioserver.h"
 #include "common/title.h"
 
 #include <fcntl.h>
@@ -29,7 +30,6 @@
 #include <wpe/ps5/wpe-ps5.h>
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
-#include "../common/media-stubs.h"
 
 #ifndef LOG_HOST
 #define LOG_HOST "192.168.1.20"
@@ -397,6 +397,16 @@ static void probeSockets(void)
     }
 }
 
+/* open(), not access(): access() reports existing files as missing in a title. */
+static int fileExists(const char* path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    return 1;
+}
+
 int main(void)
 {
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
@@ -465,6 +475,20 @@ int main(void)
     wpe_display_set_primary(display);
     SPIKE_PASS("display", "PS5 display connected");
     memLog("display connected");
+    /* The WebProcesses' audio (ps5audiosink) is played here with sceAudioOut
+     * (apps/common/ps5audioserver.c). /data/ps5webkit/audio-null (a file):
+     * consume it silently instead, for log-only runs. */
+    /* Log-only runs: /data/ps5webkit/audio-null (no sceAudioOut) or
+     * /data/ps5webkit/audio-silent (sceAudioOut at volume 0). */
+    int audioMode = fileExists("/data/ps5webkit/audio-null") ? PS5WK_AUDIO_NULL
+        : fileExists("/data/ps5webkit/audio-silent") ? PS5WK_AUDIO_SILENT : PS5WK_AUDIO_SCE;
+    ps5wk_audio_server_start(audioMode);
+    int selftest = fileExists("/data/ps5webkit/audio-selftest");
+    spike_log("audio: server started (%s); self-test file: %s",
+        audioMode == PS5WK_AUDIO_NULL ? "null output" : audioMode == PS5WK_AUDIO_SILENT ? "sceAudioOut, volume 0" : "sceAudioOut",
+        selftest ? "present" : "absent");
+    if (selftest)
+        ps5wk_audio_server_selftest();
 
     /* Every WebProcess is a payload that costs ~300 of the system's 8192 CPU
      * page tables (README: findings). WebKit kept each page's process alive
@@ -480,17 +504,15 @@ int main(void)
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
+    /* A TV browser: media may start without a gesture (YouTube, players
+     * that autoplay; the pad's X is not always on the video). */
+    WebKitWebsitePolicies* policies = webkit_website_policies_new_with_policies("autoplay", WEBKIT_AUTOPLAY_ALLOW, NULL);
     webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "display", display,
         "settings", settings,
         "network-session", session,
+        "website-policies", policies,
         NULL));
-    /* No video in Milestone 1: placeholder media interfaces so pages that
-     * name them (YouTube) don't throw at load (apps/common/media-stubs.h). */
-    WebKitUserScript* mediaStubs = webkit_user_script_new(ps5wkMediaStubsScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
-    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(webView), mediaStubs);
-    webkit_user_script_unref(mediaStubs);
     WPEView* view = webkit_web_view_get_wpe_view(webView);
     g_signal_connect(view, "event", G_CALLBACK(onViewEvent), NULL);
     g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);
@@ -512,5 +534,6 @@ int main(void)
 
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);
+    ps5wk_audio_server_stop();
     return 0;
 }

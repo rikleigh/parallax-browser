@@ -1,0 +1,39 @@
+diff --git a/Source/WebCore/platform/GStreamer.cmake b/Source/WebCore/platform/GStreamer.cmake
+index ce1c66972c..299f3ea648 100644
+--- a/Source/WebCore/platform/GStreamer.cmake
++++ b/Source/WebCore/platform/GStreamer.cmake
+@@ -121,7 +121,7 @@ if (ENABLE_VIDEO)
+     endif ()
+ endif ()
+ 
+-if (ENABLE_MEDIA_STREAM OR ENABLE_WEB_AUDIO OR ENABLE_WEB_CODECS)
++if (ENABLE_VIDEO OR ENABLE_MEDIA_STREAM OR ENABLE_WEB_AUDIO OR ENABLE_WEB_CODECS)
+     list(APPEND WebCore_PRIVATE_INCLUDE_DIRECTORIES
+         "${WEBCORE_DIR}/platform/audio/gstreamer"
+     )
+diff --git a/Source/WebCore/platform/graphics/MediaSourcePrivate.h b/Source/WebCore/platform/graphics/MediaSourcePrivate.h
+index 95a186c2bb..5a4b5281ee 100644
+--- a/Source/WebCore/platform/graphics/MediaSourcePrivate.h
++++ b/Source/WebCore/platform/graphics/MediaSourcePrivate.h
+@@ -108,7 +108,7 @@ public:
+     // MediaSource readyState is "ended". Used by both MediaSource (main) on
+     // readyState/dirty triggers and MediaSourcePrivate (dispatcher) when track
+     // ranges change so a single algorithm produces the value.
+-    WEBCORE_EXPORT static PlatformTimeRanges computeBufferedRanges(const Vector<PlatformTimeRanges>& activeRanges, bool ended);
++    static PlatformTimeRanges computeBufferedRanges(const Vector<PlatformTimeRanges>& activeRanges, bool ended);
+ 
+     MediaPlayer::ReadyState LEGACY_NODELETE mediaPlayerReadyState() const;
+     void setMediaPlayerReadyState(MediaPlayer::ReadyState);
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_probabilistic_guard_malloc_allocator.c b/Source/bmalloc/libpas/src/libpas/pas_probabilistic_guard_malloc_allocator.c
+index 150ee54985..b5e24fdee9 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_probabilistic_guard_malloc_allocator.c
++++ b/Source/bmalloc/libpas/src/libpas/pas_probabilistic_guard_malloc_allocator.c
+@@ -43,7 +43,7 @@
+ #endif
+ 
+ /* PlayStation does not currently support the backtrace API. Android API versions < 33 don't, either. Windows does not either. Linux only with GLibc and not uCLibc/Musl. */
+-#if (PAS_OS(ANDROID) && __ANDROID_API__ >= 33) || PAS_OS(DARWIN) || (PAS_OS(LINUX) && defined(__GLIBC__) && !defined(__UCLIBC__))
++#if (PAS_OS(ANDROID) && __ANDROID_API__ >= 33) || PAS_OS(DARWIN) || PAS_OS(FREEBSD) || (PAS_OS(LINUX) && defined(__GLIBC__) && !defined(__UCLIBC__))
+ #include <execinfo.h>
+ #else
+ size_t backtrace(void** buffer, size_t size)

@@ -1,4 +1,4 @@
-# WPE WebKit for the PS5 (Milestone 1)
+# WPE WebKit for the PS5 (Milestones 1 and 2)
 
 WebKit 15486a0178, `PORT=WPE`, built with ps5-payload-sdk for a jailbroken PS5
 on 13.60. Goal of Milestone 1 (FEASIBILITY §1a, §4.8): browse on the TV with
@@ -16,7 +16,11 @@ pages painted on the CPU.
 - **Payload `ps5wk-shot.elf`**: a UIProcess on WPE's headless display, for
   payload-only first light (loads a URL, reports a checksum and a thumbnail).
 
-No WebGL, WebXR, GPU process, GStreamer/media, WebRTC, speech, geolocation,
+Milestone 2 step 1 (2026-10-28): `<video>`/`<audio>` and MSE on GStreamer,
+software decoders in the WebProcess, audio played by the title (see
+*Media* below).
+
+No WebGL, WebXR, GPU process, Web Audio, WebRTC, speech, geolocation,
 sandbox, introspection, docs, journald or libbacktrace.
 
 ## Build
@@ -64,6 +68,9 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0013-ps5-payload-exit-and-cache-without-hard-links | `AuxiliaryProcess::didClose` exits at once (`_exit`) in PS5 payloads: the GLib teardown after the run loop stopped aborted (SIGABRT) in every swapped-out WebProcess. The network cache copies a blob when `link()` fails (EOPNOTSUPP on `/data`) instead of leaving the record without its body (`Failed to create hard link`) |
 | 0014-ps5-exit-on-ui-close-and-no-forced-compositing | payloads `_exit(0)` on the IPC thread as soon as the connection to the UI process closes (end of stream or HUP; 0013 only covered `didClose` on the main thread, and swapped-out processes still aborted); `RenderLayerCompositor::enableCompositingMode` is a no-op when accelerated compositing is off: `document.startViewTransition()` (YouTube watch pages) forced compositing on and `NonCompositedFrameRenderer::graphicsLayerFactory()` RELEASE_ASSERTed (SIGABRT, every watch page) |
 
+| 0015-media-build-fixes-video-without-web-audio | ENABLE_VIDEO with Web Audio off: `platform/audio/gstreamer` on the include path (AudioDecoder.cpp includes it under USE(GSTREAMER)); no WEBCORE_EXPORT on a member of the exported `MediaSourcePrivate` (dllexport inside dllexport is an error with this toolchain); libpas uses libc's `backtrace()` on FreeBSD (its own stub clashed with libc.a's once GStreamer pulled `backtrace.o` in) |
+| 0016-ps5-software-video-paint-and-media-policy | PS5 only (`PS5_PAYLOAD_SDK`): AV1 not advertised (no hardware AV1; `PS5WK_MEDIA_AV1=1` advertises it), `PS5WK_MEDIA_VP9=0` hides VP9; avdec `max-threads` 4 (`PS5WK_DECODER_THREADS`), `max-errors` -1 (a reference-less frame after a flush doesn't end playback); playsink's `videoconvert` on 4 threads; video painting: the frame is scaled to the device-pixel size with GstVideoConverter (4 threads, linear) and wrapped zero-copy in an SkImage cached for the repaints of the same frame (Skia's raster bilinear scaling of 1080p cost ~30 ms per frame, ImageGStreamer copied the frame on every paint, and `convertSampleToImage` ran a conversion pipeline even when the format already matched); non-composited rendering updates longer than 6 ms are followed by an equal idle gap (NonCompositedFrameRenderer), so JavaScript timers and MSE appends still run while video plays |
+
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
 includes, WKAPICast PlayStation guard, `EGL_DEFAULT_DISPLAY` as an int on PS5,
@@ -73,6 +80,117 @@ WPE preferences on PS5 (no hardware acceleration, no compositing), and the
 
 The memmem shim and `<sys/sysinfo.h>` from Spike 4 are in `shim/`
 (force-included `ps5shim.h`, `libps5shim.a`).
+
+## Media (Milestone 2, step 1)
+
+`<video>`, `<audio>` and MSE play on the static GStreamer from port/deps
+(`USE_GSTREAMER_FULL=ON`, `USE_GSTREAMER_GL=OFF`, `ENABLE_VIDEO=ON`,
+`ENABLE_MEDIA_SOURCE=ON`, Web Audio off). `apps/common/media-stubs.h` (the
+Milestone 1 placeholder media interfaces) is gone.
+
+### Decision: decode in the WebProcess, play audio in the title
+
+- **Video: software decoding in the WebProcess payload** (avdec_h264,
+  avdec_vp9, avdec_h265 from FFmpeg 7.1.1; dav1d for AV1, not advertised),
+  painted through WebKit's normal non-composited video path into the page
+  bitmap. The hardware decoder only works in a title (Spike 9) and its frames
+  would have to reach the page by hole punching, which needs compositing in
+  the title; that is step 2. Software decoding was hours of work, not days,
+  and covers ≤1080p (measured below).
+- **Audio: through the title.** An elfldr payload *can* open sceAudioOut
+  (`test/audio/audioprobe.c`: main port of the system user 255, S16 48 kHz,
+  2000 ms of audio consumed in 2013 ms; other user ids 0x80260011), and the
+  first build played from the WebProcess (`ps5audiosink`, direct mode). But
+  **the audio daemon never releases what payload processes took**: after
+  eight payload processes had used sceAudioOut (2026-10-28: the probe, the
+  gst smoke test and six WebProcesses, some closing their port, some not),
+  `sceAudioOutInit` returned 0x80260002 in the ninth, and then blocked
+  forever (IPC wait `IpmWSv0`) in every new process. A title launch an hour
+  later hung in the launcher (`IpmWEf0`) and the console rebooted (11:44).
+  **Never use sceAudioOut from a payload.**
+  A title is an application the system cleans up after: 12 launch/SIGKILL
+  cycles of PPSA99020 in a row, each opening a port and leaving it open when
+  killed (`/data/ps5webkit/audio-selftest`), all reopened it (handle
+  0x20000000, Init 0).
+- So the WebProcess's `ps5audiosink` (port/deps/gst/gstps5audiosink.c,
+  autoaudiosink picks it at rank PRIMARY) ships S16 48 kHz PCM over a unix
+  socket, `/system_tmp/ps5wk/audio-<UIProcess pid>.sock`
+  (`PS5WK_AUDIO_SOCKET`, set by ps5wk-child from its launch path), to the
+  audio server in the UIProcess (`apps/common/ps5audioserver.c`): one
+  connection and one sceAudioOut port per stream, 256-frame grains, a
+  "frames played" count sent back per grain for the sink's `delay()` (A/V
+  sync), a flush/seek closes the connection (queued audio dropped). Blocking
+  in sceAudioOutOutput paces the WebProcess's pipeline clock through the
+  socket (about 4 grains, 21 ms, buffered on each side). The title closes
+  its ports when main returns (`ps5wk_audio_server_stop`); a SIGKILL leaves
+  that to the system (checked above). ps5wk-shot runs the same server with a
+  paced null output, so harness runs never touch sceAudioOut.
+- Long-term (FEASIBILITY §1a) the hardware decoder element lives in the
+  title with hole-punch video; audio already lives there.
+
+### Knobs
+
+| | |
+| --- | --- |
+| `/data/ps5webkit/audio-null` | title: consume audio silently (no sceAudioOut) |
+| `/data/ps5webkit/audio-silent` | title: real sceAudioOut ports at volume 0 (log-only runs) |
+| `/data/ps5webkit/audio-selftest` | title: open a port at start, 0.1 s of silence, leave it open (`RESULT ps5browser audio-selftest`) |
+| `child.env`: `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_VP9=0`, `PS5WK_MEDIA_AV1=1`, `GST_DEBUG=...` | WebProcess decoding, codec advertising, GStreamer logs |
+| `child.env`: `PS5WK_PROFILE=1` | sampling profiler of the WebProcess main thread (`apps/common/profiler.c`, 2 ms SIGPROF; `test/prof.sh` fetches and symbolizes) |
+| `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
+| `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child to 1920x1080@60: MSE/canPlayType refuse more, so YouTube stays ≤1080p |
+
+The children also set `WPE_SHELL_MEDIA_DISK_CACHE_PATH=/data/ps5webkit/home/cache/media`
+(progressive downloads buffer on disk; WebKit's default `/var/tmp` doesn't
+exist for payloads: "Could not create temp file").
+
+### Test media and pages
+
+`test/media/make-media.sh [--upload]` makes the clips with FFmpeg on the Mac
+(test patterns with a running clock, a white flash and a 1760 Hz beep at the
+start of every second: A/V sync by eye and ear; nothing third-party is
+committed) and uploads them with `video.html` (file:///data/ps5webkit/video.html,
+tile "Video test" on the start page; `?src=<url>` plays a URL, the stats line
+and `VIDEOSTATS` console lines give frames, drops and fps).
+`test/media/yt-stats.js` (ps5wk-shot `js=`) dumps the first `<video>`,
+YouTube's stats for nerds and `MediaSource.isTypeSupported` answers;
+`test/media/yt-consent.js` (ps5wk-shot `onload=`, new) answers YouTube's
+cookie dialog, which pauses the video in a fresh session, and logs
+`YTSTATS` every 3 s.
+
+### Measured (ps5wk-shot, 1920x1080 viewport, video element 1280x720, 2026-10-28)
+
+| clip | fps shown | dropped | WebProcess CPU |
+| --- | --- | --- | --- |
+| local 720p30 H.264 + AAC (1:1, before the paint fixes) | 28.5 | 0 | 1.44 cores |
+| local 1080p30 H.264 + AAC | 29.9 | 0 | 0.91–1.05 cores |
+| local 1080p60 H.264 + AAC | 59.9 | 0 | 1.59–1.95 cores |
+| local 1080p30 VP9 + Opus | 29.9 | 0 | 1.03 cores |
+| Sintel trailer 720p24 H.264 + AAC over HTTPS (moov at the end, range requests) | 24 | 0 | 0.55 cores |
+| YouTube "Never Gonna Give You Up": MSE VP9 720p25 (itag 247) + AAC (140) | 25 | 0 | 0.87 cores |
+| YouTube Big Buck Bunny 60 fps: VP9 720p60 (302) chosen | plays, JS starved before the throttle | | 1.2–1.7 cores |
+
+Before the paint fixes 1080p30 managed ~19 fps and starved the page's
+JavaScript completely (events and timers ran only after the video ended):
+the profile showed 81 % of the main thread in Skia's `bilerp_clamp_8888`.
+YouTube asks `isTypeSupported` and gets: avc1 yes, vp9/vp09 yes, av01 no,
+VP9 at 3840x2160 no, at 1920x1080@60 yes; mp4a yes; `audio/webm; opus` no
+(not needed so far: YouTube sent AAC).
+
+**In the title (log-only run, 2026-10-28 11:58, audio-silent):** the local
+1080p30 MP4 played with its audio going through the title's sceAudioOut
+(32.8 s of audio in 34.3 s, handle 0x20000000 at volume 0) at **20–23 fps**
+(0 dropped, WebProcess 0.46 cores; the title's vsync-paced frame
+completion plus the rendering throttle is the suspect for the gap to 30), and
+the title's flexible memory was 299 MB free (eboot 129 MB with GStreamer,
+was 109 MB). The YouTube URL after it did not report "load finished" within
+60 s, and the launcher's kill then got no reply: open.
+
+Still open: the TV test (picture and sound judged by the owner), title
+fps, YouTube 60 fps under its overlays (every video frame repaints the
+player's gradient/blur layers on the CPU; hole punching removes that), Opus
+in WebM for MSE, the 24 s without video frames once on YouTube after the
+consent dialog (audio and clock ran on).
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

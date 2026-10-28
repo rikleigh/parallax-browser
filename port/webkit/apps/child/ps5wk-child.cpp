@@ -12,6 +12,7 @@
  */
 #include "PS5LaunchProtocol.h"
 #include "../common/crashguard.h"
+#include "../common/profiler.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -21,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -145,6 +147,15 @@ static void setupEnvironment()
     // MIME types by file extension (share/mime/globs2; no shared-mime-info on
     // the console): file:// pages, MIMETypeRegistry, GIO content types.
     setenv("XDG_DATA_DIRS", "/data/ps5webkit/share", 0);
+    // Media (Milestone 2, software decoding in this process): advertise at
+    // most 1080p60 to MSE/canPlayType (YouTube then stays at or below 1080p).
+    // GST_DEBUG etc. can be added through child.env.
+    setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", "1920x1080@60", 0);
+    // Progressive media is buffered on disk (GStreamer downloadbuffer); the
+    // default /var/tmp does not exist for payloads.
+    mkdir("/data/ps5webkit/home/cache", 0777);
+    mkdir("/data/ps5webkit/home/cache/media", 0777);
+    setenv("WPE_SHELL_MEDIA_DISK_CACHE_PATH", "/data/ps5webkit/home/cache/media", 0);
     // Optional overrides for debugging, one KEY=VALUE per line (e.g.
     // WEBKIT_DEBUG=Network,Loading,IPC). Read last, so they win.
     if (FILE* f = fopen("/data/ps5webkit/child.env", "r")) {
@@ -169,9 +180,37 @@ struct MainArgs {
     int result;
 };
 
+// CPU use of this process (user + system time per wall second, i.e. cores
+// busy), logged every 5 s while it is above 0.3 cores: shows what software
+// video decoding and painting cost (Milestone 2). PS5WK_CPU_LOG=0 turns it off.
+static void* cpuLogger(void* data)
+{
+    const char* tag = static_cast<const char*>(data);
+    struct rusage last;
+    getrusage(RUSAGE_SELF, &last);
+    double lastWall = nowMS();
+    for (;;) {
+        struct timespec ts { 5, 0 };
+        nanosleep(&ts, nullptr);
+        struct rusage now;
+        getrusage(RUSAGE_SELF, &now);
+        double wall = nowMS();
+        auto ms = [](const struct timeval& tv) { return tv.tv_sec * 1e3 + tv.tv_usec / 1e3; };
+        double user = ms(now.ru_utime) - ms(last.ru_utime), sys = ms(now.ru_stime) - ms(last.ru_stime);
+        double cores = (user + sys) / (wall - lastWall);
+        if (cores > 0.3)
+            LOG("[cpu] %s: %.2f cores (user %.2f, sys %.2f) over %.1f s", tag, cores, user / (wall - lastWall), sys / (wall - lastWall), (wall - lastWall) / 1e3);
+        last = now;
+        lastWall = wall;
+    }
+    return nullptr;
+}
+
 static void* runWebKit(void* data)
 {
     auto* args = static_cast<MainArgs*>(data);
+    if (!args->network)
+        ps5wk_profiler_start("web");
     args->result = args->network ? WebKit::NetworkProcessMain(args->argc, args->argv) : WebKit::WebProcessMain(args->argc, args->argv);
     return nullptr;
 }
@@ -210,6 +249,19 @@ int main(int, char**)
         return 1;
 
     setupEnvironment();
+    // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):
+    // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock.
+    if (!network) {
+        char audioPath[256];
+        snprintf(audioPath, sizeof(audioPath), "%s", path);
+        if (char* slash = strrchr(audioPath, '/')) {
+            int uiPid = 0;
+            if (sscanf(slash + 1, "ui-%d.sock", &uiPid) == 1) {
+                snprintf(slash + 1, sizeof(audioPath) - (slash + 1 - audioPath), "audio-%d.sock", uiPid);
+                setenv("PS5WK_AUDIO_SOCKET", audioPath, 0);
+            }
+        }
+    }
     g_io_openssl_load(nullptr);
 
     static char idArg[32], fdArg[16];
@@ -219,6 +271,15 @@ int main(int, char**)
 
     // WebKit's main thread is whichever thread initializes it (WTF generic
     // MainThread); run it on a thread with a known, large stack for JSC.
+    static char cpuTag[32];
+    snprintf(cpuTag, sizeof(cpuTag), "%s", tag);
+    const char* cpuLog = getenv("PS5WK_CPU_LOG");
+    if (!network && !(cpuLog && !strcmp(cpuLog, "0"))) {
+        pthread_t cpuThread;
+        if (!pthread_create(&cpuThread, nullptr, cpuLogger, cpuTag))
+            pthread_detach(cpuThread);
+    }
+
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
     pthread_attr_setstacksize(&attributes, 64 << 20);

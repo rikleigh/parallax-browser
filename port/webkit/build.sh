@@ -110,7 +110,9 @@ step_shim() {
 
 # ---------------------------------------------------------------- configure
 # Everything optional is off. JIT off (asm LLInt, as Spike 4), no WebGL, no
-# GPU process, no media, Skia on the CPU. WPE Platform API only; headless kept
+# GPU process, Skia on the CPU. Media (Milestone 2): <video>/<audio> and MSE on
+# the static GStreamer from port/deps (gstreamer-full, GL off), software
+# decoders in the WebProcess, audio through ps5audiosink (sceAudioOut). WPE Platform API only; headless kept
 # for the payload-side test harness.
 WEBKIT_OPTIONS=(
     -DPORT=WPE -DCMAKE_BUILD_TYPE=Release -DDEVELOPER_MODE=OFF
@@ -123,7 +125,9 @@ WEBKIT_OPTIONS=(
     -DENABLE_RESOURCE_USAGE=OFF -DENABLE_MEMORY_SAMPLER=OFF -DENABLE_RELEASE_LOG=ON
     -DUSE_SYSTEM_MALLOC=OFF
     -DENABLE_WEBGL=OFF -DENABLE_WEBGPU=OFF -DENABLE_WEBXR=OFF -DENABLE_GPU_PROCESS=OFF
-    -DUSE_GSTREAMER=OFF -DENABLE_VIDEO=OFF -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
+    -DUSE_GSTREAMER=ON -DUSE_GSTREAMER_FULL=ON -DUSE_GSTREAMER_GL=OFF -DUSE_GSTREAMER_MPEGTS=OFF
+    -DENABLE_VIDEO=ON -DENABLE_MEDIA_SOURCE=ON -DENABLE_MEDIA_TELEMETRY=OFF
+    -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
     -DENABLE_WEB_CODECS=OFF -DENABLE_MEDIA_RECORDER=OFF -DENABLE_MEDIA_SESSION=OFF
     -DENABLE_ENCRYPTED_MEDIA=OFF -DENABLE_THUNDER=OFF -DUSE_EXTERNAL_HOLEPUNCH=OFF
     -DENABLE_GAMEPAD=OFF -DENABLE_SPEECH_SYNTHESIS=OFF -DENABLE_SPELLCHECK=OFF
@@ -164,7 +168,7 @@ step_configure() {
     # find modules only name the top-level archives.
     local depslibs=""
     [ -z "${FAKE_DEPS:-}" ] && depslibs="$("$PKGCONFIG" --libs gio-unix-2.0 gioopenssl libsoup-3.0 fontconfig freetype2 \
-        harfbuzz-icu libxml-2.0 sqlite3 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl | sed 's/ -licudata//g')"
+        harfbuzz-icu libxml-2.0 sqlite3 gstreamer-full-1.0 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl | sed 's/ -licudata//g')"
     ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
       export PKG_CONFIG="$pc"
       cmake -G Ninja -S "$SRC" -B "$BLD" \

@@ -652,13 +652,14 @@ step_gst_plugins_base() {
 }
 
 step_gst_plugins_good() {
-    log "gst-plugins-good $GST_VER (isomp4, matroska, audioparsers, id3demux, adaptivedemux2 HLS/DASH)"
+    log "gst-plugins-good $GST_VER (isomp4, matroska, audioparsers, id3demux, autodetect, deinterlace, videofilter, audiofx, adaptivedemux2 HLS/DASH)"
     fetch https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-$GST_VER.tar.xz \
         a7670ed900d3d03be744d25c1873b239896e9a82ce6d17f8febc6fffbaee9521
     unpack gst-plugins-good "$FETCHED"
     meson_pkg gst-plugins-good "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dorc=disabled -Dasm=disabled \
         -Disomp4=enabled -Dmatroska=enabled -Daudioparsers=enabled -Did3demux=enabled \
-        -Dapetag=enabled -Dicydemux=enabled -Dwavparse=enabled \
+        -Dapetag=enabled -Dicydemux=enabled -Dwavparse=enabled -Dautodetect=enabled \
+        -Ddeinterlace=enabled -Dvideofilter=enabled -Daudiofx=enabled \
         -Dadaptivedemux2=enabled -Dsoup=enabled -Dsoup-version=3 -Dhls-crypto=openssl
     fix_sysroot; cleanup gst-plugins-good
 }
@@ -686,7 +687,14 @@ step_gst_libav() {
 GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions playback
                   videoconvertscale volume pbtypes rawparse subparse gio isomp4 matroska
                   audioparsers id3demux apetag icydemux wavparse adaptivedemux2
-                  videoparsersbad mpegtsdemux mpegpsdemux id3tag libav)
+                  videoparsersbad mpegtsdemux mpegpsdemux id3tag libav autodetect
+                  deinterlace videofilter audiofx)
+# (WebKit's software video path sets playbin's deinterlace and soft-colorbalance
+# flags; a missing deinterlace/videobalance is a missing-plugin message, which
+# WebKit turns into MEDIA_ERR_SRC_NOT_SUPPORTED. audiofx = scaletempo for
+# playbackRate with preserved pitch.)
+# Plus our own static plugin "ps5audio" (gst/gstps5audiosink.c, sceAudioOut),
+# compiled into the registration archive below.
 
 # libgstreamer-full-1.0.a: every libgst*-1.0.a, the plugins above, the
 # registration object and FFmpeg/dav1d merged into one archive (what
@@ -700,7 +708,9 @@ step_gst_full() {
     rm -rf "$b"; mkdir -p "$b"
     prospero-clang $CFLAGS_COMMON $("$PKGCONF" --cflags gstreamer-1.0) \
         -c "$HERE/gst/gststaticplugins.c" -o "$b/gststaticplugins.o"
-    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o"
+    prospero-clang $CFLAGS_COMMON -DGST_PLUGIN_BUILD_STATIC $("$PKGCONF" --cflags gstreamer-audio-1.0) \
+        -c "$HERE/gst/gstps5audiosink.c" -o "$b/gstps5audiosink.o"
+    prospero-ar rcs "$b/libgststaticplugins.a" "$b/gststaticplugins.o" "$b/gstps5audiosink.o"
     mri="$b/full.mri"
     { echo "CREATE $lib/libgstreamer-full-1.0.a"
       echo "ADDLIB $b/libgststaticplugins.a"
@@ -740,7 +750,7 @@ Name: gstreamer-full
 Description: Static GStreamer $GST_VER for PS5 payloads: core, libraries and plugins (${GST_FULL_PLUGINS[*]}), registered by gst_init()
 Version: $GST_VER
 Requires.private: $reqs
-Libs: -L\${libdir} -lgstreamer-full-1.0
+Libs: -L\${libdir} -lgstreamer-full-1.0 -lSceAudioOut
 Cflags: -I\${includedir}/gstreamer-1.0
 PC
     echo "Requires.private: $reqs"

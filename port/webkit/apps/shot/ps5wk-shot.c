@@ -12,7 +12,7 @@
  *
  * Stdin carries the arguments (elfldr passes none for raw uploads): one line
  * "url=<url> child=<path> timeout=<s> width=<w> height=<h> settle=<s>
- * ua=safari|default js=<file> data=<dir> cache=<dir>", any order, all optional. settle: seconds to
+ * ua=safari|default js=<file> onload=<file> data=<dir> cache=<dir>", any order, all optional. settle: seconds to
  * keep running after the load finished (default 3); ua=safari uses the
  * browser title's user agent; js: a script file on the console evaluated in
  * the page just before the report (its result is printed); data/cache:
@@ -34,8 +34,8 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 #include <WPEProcessManagerPS5.h>
-#include "../common/media-stubs.h"
 #include "../common/crashguard.h"
+#include "../common/ps5audioserver.h"
 
 void g_io_openssl_load(void*);
 
@@ -46,6 +46,7 @@ static int width = 1280, height = 720;
 static int settleSeconds = 3;
 static char userAgent[16] = "safari";
 static char jsFile[256];
+static char onloadFile[256];
 static char dataDir[256] = "/data/ps5webkit/shot/data";
 static char cacheDir[256] = "/data/ps5webkit/shot/cache";
 #define SAFARI_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -96,6 +97,8 @@ static void readArguments(void)
             g_strlcpy(dataDir, token + 5, sizeof(dataDir));
         else if (!strncmp(token, "cache=", 6))
             g_strlcpy(cacheDir, token + 6, sizeof(cacheDir));
+        else if (!strncmp(token, "onload=", 7))
+            g_strlcpy(onloadFile, token + 7, sizeof(onloadFile));
         else if (!strncmp(token, "js=", 3))
             g_strlcpy(jsFile, token + 3, sizeof(jsFile));
         else if (!strncmp(token, "debug=", 6))
@@ -237,6 +240,33 @@ static gboolean onSettled(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static void onOnloadScriptDone(GObject* object, GAsyncResult* result, gpointer data)
+{
+    (void)data;
+    GError* error = NULL;
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    char* text = value ? jsc_value_to_string(value) : NULL;
+    printf("ONLOAD-JS %s\n", text ? text : (error ? error->message : "?"));
+    g_free(text);
+    g_clear_error(&error);
+    if (value)
+        g_object_unref(value);
+}
+
+// onload=<file>: evaluated 2 s after the load finished (e.g. dismiss a
+// consent dialog that would pause the video).
+static gboolean onOnload(gpointer data)
+{
+    (void)data;
+    gchar* script = NULL;
+    gsize length = 0;
+    if (g_file_get_contents(onloadFile, &script, &length, NULL)) {
+        webkit_web_view_evaluate_javascript(webView, script, (gssize)length, NULL, NULL, NULL, onOnloadScriptDone, NULL);
+        g_free(script);
+    }
+    return G_SOURCE_REMOVE;
+}
+
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
     (void)data;
@@ -249,6 +279,8 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
         if (!loadFailed)
             RESULT("load", TRUE, "%s finished at %.1f s, title \"%s\"", url, secondsSinceStart(), webkit_web_view_get_title(view) ?: "");
         g_timeout_add_seconds(settleSeconds, onSettled, NULL); // let it paint
+        if (*onloadFile)
+            g_timeout_add_seconds(2, onOnload, NULL);
     }
 }
 
@@ -298,6 +330,9 @@ int main(void)
     setenv("GSETTINGS_BACKEND", "memory", 0);
     g_io_openssl_load(NULL);
 
+    /* WebProcess audio: consumed at the real-time rate without sceAudioOut
+     * (a payload's sceAudioOut use is never released: ps5audioserver.c). */
+    ps5wk_audio_server_start(PS5WK_AUDIO_NULL);
     WPEProcessManager* manager = wpe_process_manager_ps5_new(child);
     wpe_process_manager_set_default(manager);
 
@@ -315,10 +350,13 @@ int main(void)
     if (!strcmp(userAgent, "safari"))
         webkit_settings_set_user_agent(settings, SAFARI_UA);
     WebKitNetworkSession* session = webkit_network_session_new(dataDir, cacheDir);
+    /* Autoplay as in the browser title (media starts without a gesture). */
+    WebKitWebsitePolicies* policies = webkit_website_policies_new_with_policies("autoplay", WEBKIT_AUTOPLAY_ALLOW, NULL);
     webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "display", display,
         "settings", settings,
         "network-session", session,
+        "website-policies", policies,
         NULL));
 
     WPEView* view = webkit_web_view_get_wpe_view(webView);
@@ -327,12 +365,6 @@ int main(void)
         wpe_toplevel_resize(toplevel, width, height);
     else
         printf("note: the headless view has no toplevel\n");
-    if (!g_getenv("PS5WK_NO_MEDIA_STUBS")) {
-        WebKitUserScript* stubs = webkit_user_script_new(ps5wkMediaStubsScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
-        webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(webView), stubs);
-        webkit_user_script_unref(stubs);
-    }
     g_signal_connect(view, "buffer-rendered", G_CALLBACK(onBufferRendered), NULL);
     g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
