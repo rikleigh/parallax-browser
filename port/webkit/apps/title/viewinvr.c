@@ -557,6 +557,8 @@ void ps5wk_vr_init(WPEDisplay* display, WebKitWebView* webView)
 /* Each step runs 1.5 s after the previous one; captures are the headset's
  * eye buffers (both eyes, quarter size) in /data/ps5webkit/shots. */
 int psvr2_probe(int user_id, uint32_t* status, int* worn) __attribute__((weak));
+int psvr2_open(int user_id) __attribute__((weak));
+void psvr2_close(void) __attribute__((weak));
 void psvr2_set_logger(void (*fn)(const char*)) __attribute__((weak));
 int sceUserServiceGetInitialUser(int32_t* user) __attribute__((weak));
 
@@ -573,6 +575,49 @@ static void selftestShot(const char* name)
 static void logLine(const char* line)
 {
     spike_log("%s", line);
+}
+
+/* Hmd2 itself, without VR mode (nothing shows in a headset): binding, the
+ * param.json attributes, open/close. Only with /data/ps5webkit/vr-probe: after
+ * the self-test, or on its own (no vr-sim needed) after the first test URL. */
+static gboolean vrProbe(gpointer data)
+{
+    (void)data;
+    int fd = open("/data/ps5webkit/vr-probe", O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        if (psvr2_probe) {
+            psvr2_set_logger(logLine);
+            int32_t user = -1;
+            if (sceUserServiceGetInitialUser)
+                sceUserServiceGetInitialUser(&user);
+            for (int i = 0; i < 2; i++) {
+                uint32_t status = 0;
+                int worn = 0;
+                int rc = psvr2_probe(user, &status, &worn);
+                SPIKE_RESULT("vr-probe", rc == 0 ? "PASS" : "INFO", "Hmd2 open %s (rc 0x%08x, device status %u, worn %d)",
+                    rc == 0 ? "ok" : "refused", (unsigned)rc, status, worn);
+            }
+        } else
+            SPIKE_SKIP("vr-probe", "no psvr2 in this build");
+        /* "full" in the file: also what View in VR opens before VR mode
+         * (Hmd2, VrTracker2 registration, reprojection), then closes it:
+         * which param.json attribute bits each part needs. */
+        char word[8] = { 0 };
+        if ((fd = open("/data/ps5webkit/vr-probe", O_RDONLY)) >= 0) {
+            read(fd, word, sizeof word - 1);
+            close(fd);
+        }
+        if (!strncmp(word, "full", 4) && psvr2_open && psvr2_close) {
+            int32_t user = -1;
+            if (sceUserServiceGetInitialUser)
+                sceUserServiceGetInitialUser(&user);
+            int rc = psvr2_open(user);
+            psvr2_close();
+            SPIKE_RESULT("vr-probe-full", rc == 0 ? "PASS" : "INFO", "psvr2_open %s (rc %d), closed", rc == 0 ? "ok" : "failed", rc);
+        }
+    }
+    return G_SOURCE_REMOVE;
 }
 
 static gboolean selftestTick(gpointer data)
@@ -656,26 +701,7 @@ static gboolean selftestTick(gpointer data)
     }
     SPIKE_PASS("vr-selftest", "%u eye-buffer captures, %u projections, controls, 4 entries in %.0f s; VR %s now",
         selftestShots, nProj, (g_get_monotonic_time() - selftestEnterStart) / 1e6, vrOn ? "STILL ON" : "off");
-    /* Hmd2 itself, without VR mode (nothing shows in a headset): binding, the
-     * param.json attributes, open/close. Only with /data/ps5webkit/vr-probe. */
-    int fd = open("/data/ps5webkit/vr-probe", O_RDONLY);
-    if (fd >= 0) {
-        close(fd);
-        if (psvr2_probe) {
-            psvr2_set_logger(logLine);
-            int32_t user = -1;
-            if (sceUserServiceGetInitialUser)
-                sceUserServiceGetInitialUser(&user);
-            for (int i = 0; i < 2; i++) {
-                uint32_t status = 0;
-                int worn = 0;
-                int rc = psvr2_probe(user, &status, &worn);
-                SPIKE_RESULT("vr-probe", rc == 0 ? "PASS" : "INFO", "Hmd2 open %s (rc 0x%08x, device status %u, worn %d)",
-                    rc == 0 ? "ok" : "refused", (unsigned)rc, status, worn);
-            }
-        } else
-            SPIKE_SKIP("vr-probe", "no psvr2 in this build");
-    }
+    vrProbe(NULL);
     return G_SOURCE_REMOVE;
 }
 
@@ -694,6 +720,11 @@ void ps5wk_vr_selftest_schedule(unsigned delaySeconds)
     if (fd < 0 || scheduled) {
         if (fd >= 0)
             close(fd);
+        else if (!scheduled && (fd = open("/data/ps5webkit/vr-probe", O_RDONLY)) >= 0) {
+            close(fd);
+            g_timeout_add_seconds(delaySeconds, vrProbe, NULL);
+        }
+        scheduled = TRUE;
         return;
     }
     close(fd);

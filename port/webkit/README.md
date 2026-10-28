@@ -160,6 +160,9 @@ exist for payloads: "Could not create temp file").
 
 ### Test media and pages
 
+Start page tile "Sound test (beeps)": `media/sound-test.m4a`, audio only (a
+440 Hz tone with a 1760 Hz beep at the start of every second, 60 s), for "is
+there sound at all" checks without any video decoder involved.
 `test/media/make-media.sh [--upload]` makes the clips with FFmpeg on the Mac
 (test patterns with a running clock, a white flash and a 1760 Hz beep at the
 start of every second: A/V sync by eye and ear; nothing third-party is
@@ -795,6 +798,18 @@ the headset to be released.
 - `package.sh` writes PS5VR's `attribute`/`attribute3` (0x62000000 /
   0x04080c40) into PPSA99020's param.json: Hmd2 refuses a title without
   them (FEASIBILITY §3). Spikes 3b and 9 drew on the TV with the same values.
+  Bisected on the console (2026-10-28, `vr-probe`, no headset connected):
+  only attribute3 bit 0x400 is checked by `sceHmd2Initialize` (0x8a72001f
+  without it); with attribute 0 / attribute3 0x400 the whole open path
+  (Hmd2 open, VrTracker2 registration, reprojection) succeeds as with the full
+  values; VR mode itself (`EnableVrMode`) needs a headset to check, so the
+  full values stay. `VR_ATTRS=0` or `VR_ATTRS=<attribute>:<attribute3>` (hex)
+  makes package.sh write other values. The attributes don't change audio:
+  the sound test played on the TV with the full values, with 0/0x400 and with
+  none (owner, 2026-10-28; an earlier "no sound" was the TV being off).
+  `/data/ps5webkit/vr-probe` now also runs on its own (no `vr-sim`) after the
+  first test URL, and with `full` in the file it opens and closes the whole
+  psvr2 path (`RESULT ps5browser vr-probe-full`).
 - Text (TV notice, hint, messages): FreeType with the browser's Noto fonts
   (NotoSans-Bold; the pad's ✕ ○ △ □ ◀ ▶ from NotoSansSymbols2).
 

@@ -23,6 +23,7 @@
 #include "ps5audioserver.h"
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,11 +38,40 @@
 #define GRAIN 256
 #define RATE 48000
 
+#define LOGA(...) do { fprintf(stderr, "[ps5audio] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+
 int sceAudioOutInit(void) __attribute__((weak));
 int sceAudioOutOpen(int userId, int type, int index, unsigned len, unsigned freq, unsigned param) __attribute__((weak));
 int sceAudioOutOutput(int handle, const void* ptr) __attribute__((weak));
 int sceAudioOutClose(int handle) __attribute__((weak));
 int sceAudioOutSetVolume(int handle, int flag, int* vol) __attribute__((weak));
+// Not weak: the title's loader leaves weak imports NULL (the others are
+// bound because gstps5audiosink.c references them too).
+int sceAudioOutGetPortState(int handle, void* state);
+
+// SceAudioOutPortState (the PS4 layout; 32 bytes). output: 0 unknown, bit 0
+// primary (HDMI/TV), 1 secondary, 2 tertiary, 3 headphones, 4 external.
+struct portState {
+    uint16_t output;
+    uint8_t channel;
+    uint8_t reserved8;
+    int16_t volume;
+    uint16_t rerouteCounter;
+    uint64_t flag;
+    uint64_t reserved64[2];
+};
+
+static void logPortState(int handle, const char* when, int pid)
+{
+    if (handle < 0)
+        return;
+    struct portState state;
+    memset(&state, 0, sizeof state);
+    int rc = sceAudioOutGetPortState(handle, &state);
+    LOGA("port 0x%x (pid %d) %s: GetPortState 0x%08x: output 0x%x, %u ch, volume %d, reroutes %u, flag 0x%llx",
+        (unsigned)handle, pid, when, (unsigned)rc, state.output, state.channel, state.volume, state.rerouteCounter,
+        (unsigned long long)state.flag);
+}
 
 static int mode;
 static char socketPath[108];
@@ -87,8 +117,6 @@ static int unregisterPort(int handle)
     pthread_mutex_unlock(&lock);
     return found;
 }
-
-#define LOGA(...) do { fprintf(stderr, "[ps5audio] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
 static double nowMS(void)
 {
@@ -150,9 +178,12 @@ static void* streamThread(void* data)
             // PS5WK_AUDIO_SILENT: real ports at volume 0 (log-only test runs).
             int level = mode == PS5WK_AUDIO_SILENT ? 0 : 32768;
             int vol[2] = { level, level };
-            sceAudioOutSetVolume(handle, 3, vol);
+            int rc = sceAudioOutSetVolume(handle, 3, vol);
+            if (rc < 0)
+                LOGA("port 0x%x: sceAudioOutSetVolume(%d) -> 0x%08x", (unsigned)handle, level, (unsigned)rc);
             registerPort(handle);
-        }
+        } else
+            LOGA("sceAudioOutOpen -> 0x%08x", (unsigned)handle);
     }
     LOGA("stream from pid %d: %u ch, %s (handle 0x%x), %d open", hello.pid, hello.channels,
         mode == PS5WK_AUDIO_SCE ? "sceAudioOut" : mode == PS5WK_AUDIO_SILENT ? "sceAudioOut at volume 0" : "null output", (unsigned)handle, streamNumber);
@@ -160,10 +191,25 @@ static void* streamThread(void* data)
     int16_t* grain = malloc(grainBytes);
     uint64_t played = 0;
     double start = nowMS(), next = start;
+    logPortState(handle, "opened", hello.pid);
+    // What reached the port: peak and RMS of the samples, output errors, and
+    // the port state once the stream has played 2 s.
+    int peak = 0, outputErrors = 0, firstError = 0;
+    double sumSquares = 0;
     while (grain && !stopping && !readFull(fd, grain, grainBytes)) {
-        if (handle >= 0)
-            sceAudioOutOutput(handle, grain);
-        else {
+        for (size_t i = 0; i < grainBytes / 2; i++) {
+            int v = grain[i] < 0 ? -grain[i] : grain[i];
+            if (v > peak)
+                peak = v;
+            sumSquares += (double)grain[i] * grain[i];
+        }
+        if (handle >= 0) {
+            int rc = sceAudioOutOutput(handle, grain);
+            if (rc < 0 && !outputErrors++)
+                firstError = rc;
+            if (played == RATE * 2 - (RATE * 2) % GRAIN)
+                logPortState(handle, "after 2 s", hello.pid);
+        } else {
             // Null output (or no port): consume at the real-time rate.
             next += GRAIN * 1000.0 / RATE;
             double wait = next - nowMS();
@@ -176,6 +222,8 @@ static void* streamThread(void* data)
         played += GRAIN;
         send(fd, &played, sizeof played, MSG_DONTWAIT);
     }
+    if (handle >= 0 && played)
+        logPortState(handle, "closing", hello.pid);
     if (handle >= 0 && unregisterPort(handle)) {
         sceAudioOutOutput(handle, NULL);
         sceAudioOutClose(handle);
@@ -187,7 +235,9 @@ static void* streamThread(void* data)
     streamsOpen--;
     threadsRunning--;
     pthread_mutex_unlock(&lock);
-    LOGA("stream from pid %d closed: %.1f s of audio in %.1f s", hello.pid, played / (double)RATE, (nowMS() - start) / 1e3);
+    double rms = played ? sqrt(sumSquares / ((double)played * hello.channels)) : 0;
+    LOGA("stream from pid %d closed: %.1f s of audio in %.1f s (peak %d, rms %.0f of 32767; %d output errors, first 0x%08x)",
+        hello.pid, played / (double)RATE, (nowMS() - start) / 1e3, peak, rms, outputErrors, (unsigned)firstError);
     return NULL;
 }
 

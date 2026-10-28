@@ -154,7 +154,9 @@ prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
 # View in VR: PS VR2 titles declare it in param.json (Hmd2 refuses a title
 # whose attribute words are 0 with 0x8a72001f, FEASIBILITY §3); PS5VR's
 # values, as Spikes 3b and 9 (both also drew on the TV with them).
-python3 - "$PSGL/param.json" "$app/sce_sys/param.json" "$TITLE" "$NAME" "$ROOT/ref/PS5VR/app/sce_sys/param.json" <<'PY'
+# VR_ATTRS=0 packages without them (no View in VR), VR_ATTRS=<attribute>:<attribute3>
+# (hex) with other values, for tests.
+python3 - "$PSGL/param.json" "$app/sce_sys/param.json" "$TITLE" "$NAME" "$ROOT/ref/PS5VR/app/sce_sys/param.json" "${VR_ATTRS:-}" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))
 title, name = sys.argv[3], sys.argv[4]
@@ -165,6 +167,9 @@ p["localizedParameters"]["en-US"]["titleName"] = name
 vr = json.load(open(sys.argv[5]))
 for k in ("attribute", "attribute2", "attribute3"):
     p[k] = vr.get(k, 0)
+if sys.argv[6]:
+    a = sys.argv[6].split(":") if sys.argv[6] != "0" else ["0", "0"]
+    p["attribute"], p["attribute2"], p["attribute3"] = int(a[0], 16), 0, int(a[1], 16)
 print("param.json: attribute 0x%x attribute3 0x%x (PS VR2)" % (p["attribute"], p["attribute3"]))
 open(sys.argv[2], "w").write(json.dumps(p, indent=2) + "\n")
 PY
