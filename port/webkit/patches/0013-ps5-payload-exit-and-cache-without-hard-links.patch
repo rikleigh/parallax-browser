@@ -1,0 +1,37 @@
+diff --git a/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp b/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp
+index 40c68f3934..7c0e72bf37 100644
+--- a/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp
++++ b/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp
+@@ -161,7 +161,7 @@ BlobStorage::Blob BlobStorage::add(const String& path, const Data& data, bool ad
+         if (FileSystem::makeSafeToUseMemoryMapForPath(blobPath)) {
+             auto existingData = mapFile(blobPath);
+             if (bytesEqual(existingData, data)) {
+-                if (!FileSystem::hardLink(blobPath, path))
++                if (!FileSystem::hardLinkOrCopyFile(blobPath, path))
+                     SAFE_WTFLOGALWAYS("Failed to create hard link from %s to %s", blobPath.utf8(), path.utf8());
+                 BlobStorage::Blob result { existingData, hash };
+ #if ENABLE(NETWORK_CACHE_BLOB_STORAGE_MEMORY_CACHE)
+@@ -178,7 +178,7 @@ BlobStorage::Blob BlobStorage::add(const String& path, const Data& data, bool ad
+     if (mappedData.isNull())
+         return { };
+ 
+-    if (!FileSystem::hardLink(blobPath, path))
++    if (!FileSystem::hardLinkOrCopyFile(blobPath, path))
+         SAFE_WTFLOGALWAYS("Failed to create hard link from %s to %s", blobPath.utf8(), path.utf8());
+ 
+     m_approximateSize += mappedData.size();
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.cpp b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+index 3dd33d679e..208672c552 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.cpp
++++ b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+@@ -70,7 +70,9 @@ void AuxiliaryProcess::didClose(IPC::Connection&)
+ {
+ // Stop the run loop for GTK and WPE to ensure a normal exit, since stopRunLoop()
+ // releases resources like EGL displays before the process exits.
+-#if PLATFORM(GTK) || PLATFORM(WPE)
++// PS5 payloads have no EGL, and their teardown after the run loop stops
++// aborted (SIGABRT on every process swap): exit at once, as other ports do.
++#if (PLATFORM(GTK) || PLATFORM(WPE)) && !defined(PS5_PAYLOAD_SDK)
+     stopRunLoop();
+ #else
+     terminateProcess(EXIT_SUCCESS);

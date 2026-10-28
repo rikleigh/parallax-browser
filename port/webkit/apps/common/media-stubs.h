@@ -38,4 +38,18 @@ static const char ps5wkMediaStubsScript[] =
     "  if (typeof HTMLTrackElement === 'undefined') stub('HTMLTrackElement', HTMLElement);\n"
     "  if (typeof MediaError === 'undefined') stub('MediaError', Object);\n"
     "  if (typeof TimeRanges === 'undefined') stub('TimeRanges', Object);\n"
+    // new Audio(): YouTube's voice-search feedback preloads sounds with it.
+    // An <audio> element (HTMLUnknownElement) whose load/pause do nothing and
+    // whose play() rejects, as a browser without media support would.
+    "  if (typeof Audio === 'undefined') {\n"
+    "    var audio = function Audio(src) {\n"
+    "      var e = document.createElement('audio');\n"
+    "      e.load = function () {}; e.pause = function () {};\n"
+    "      e.play = function () { return Promise.reject(new DOMException('Media playback is not supported', 'NotSupportedError')); };\n"
+    "      e.canPlayType = function () { return ''; };\n"
+    "      if (src !== undefined) e.src = src;\n"
+    "      return e;\n"
+    "    };\n"
+    "    Object.defineProperty(window, 'Audio', { value: audio, writable: true, configurable: true });\n"
+    "  }\n"
     "})();\n";

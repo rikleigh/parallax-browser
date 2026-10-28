@@ -12,10 +12,12 @@
  *
  * Stdin carries the arguments (elfldr passes none for raw uploads): one line
  * "url=<url> child=<path> timeout=<s> width=<w> height=<h> settle=<s>
- * ua=safari|default js=<file>", any order, all optional. settle: seconds to
+ * ua=safari|default js=<file> data=<dir> cache=<dir>", any order, all optional. settle: seconds to
  * keep running after the load finished (default 3); ua=safari uses the
  * browser title's user agent; js: a script file on the console evaluated in
- * the page just before the report (its result is printed). Page console
+ * the page just before the report (its result is printed); data/cache:
+ * the network session's directories (default /data/ps5webkit/shot/...; the
+ * title's are /data/ps5webkit/browser/...). Page console
  * messages are printed by the WebProcess ([webN] CONSOLE lines).
  * Output goes back on the elfldr connection.
  */
@@ -44,6 +46,8 @@ static int width = 1280, height = 720;
 static int settleSeconds = 3;
 static char userAgent[16] = "safari";
 static char jsFile[256];
+static char dataDir[256] = "/data/ps5webkit/shot/data";
+static char cacheDir[256] = "/data/ps5webkit/shot/cache";
 #define SAFARI_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
 static GMainLoop* loop;
@@ -88,6 +92,10 @@ static void readArguments(void)
             settleSeconds = atoi(token + 7);
         else if (!strncmp(token, "ua=", 3))
             g_strlcpy(userAgent, token + 3, sizeof(userAgent));
+        else if (!strncmp(token, "data=", 5))
+            g_strlcpy(dataDir, token + 5, sizeof(dataDir));
+        else if (!strncmp(token, "cache=", 6))
+            g_strlcpy(cacheDir, token + 6, sizeof(cacheDir));
         else if (!strncmp(token, "js=", 3))
             g_strlcpy(jsFile, token + 3, sizeof(jsFile));
         else if (!strncmp(token, "debug=", 6))
@@ -306,7 +314,7 @@ int main(void)
         NULL);
     if (!strcmp(userAgent, "safari"))
         webkit_settings_set_user_agent(settings, SAFARI_UA);
-    WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/shot/data", "/data/ps5webkit/shot/cache");
+    WebKitNetworkSession* session = webkit_network_session_new(dataDir, cacheDir);
     webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "display", display,
         "settings", settings,

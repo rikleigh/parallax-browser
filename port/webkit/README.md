@@ -61,6 +61,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0011-wpe-on-freebsd-portability | WPE on a FreeBSD userland: WTF picks the generic memory footprint and no Linux-only sources (as PlatformGTK does), plus later fixes found while building |
 
 | 0012-ipc-unix-log-failures | diagnostics: log why each IPC connection closes, in `Platform/IPC/glib/ConnectionGLib.cpp` (the file GLib ports use) |
+| 0013-ps5-payload-exit-and-cache-without-hard-links | `AuxiliaryProcess::didClose` exits at once (`_exit`) in PS5 payloads: the GLib teardown after the run loop stopped aborted (SIGABRT) in every swapped-out WebProcess. The network cache copies a blob when `link()` fails (EOPNOTSUPP on `/data`) instead of leaving the record without its body (`Failed to create hard link`) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -215,6 +216,20 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   least 2 MiB (FreeBSD's amd64 default). Prime suspect for the silent
   WebProcess death on YouTube watch pages (not re-tested yet). The title's
   own wrapper (`titlemem.c`) still uses the requested size.
+
+- **YouTube in the title, TV test 2026-10-28**: the page failed with
+  `Error receiving data: Connection reset by peer` three times, while the
+  swapped-out start-page WebProcess aborted (SIGABRT, caught by the crash
+  guard) and the NetworkProcess logged `Failed to create hard link` for
+  every cache write. `ps5wk-shot` with the title's own session directories
+  (`SHOT_ARGS="data=/data/ps5webkit/browser/data cache=/data/ps5webkit/browser/cache"`)
+  loaded YouTube fine, so the cache contents and cookies (in memory only) were
+  not the cause on their own. With patch 0013 (clean exit, cache copies)
+  a log-only title run of start.html -> YouTube -> example.com -> YouTube
+  loaded all four with no reset, no abort and no hard-link errors. The reset
+  was not reproduced, so its cause stays open (most likely the aborting
+  process or the record without a body). `new Audio()` is stubbed as well
+  (`ReferenceError: Can't find variable: Audio` from voice search).
 
 ## Status and timings (2026-10-28)
 
