@@ -4,8 +4,8 @@ _Status: **study complete (2026-10-27). Verdict: go. The goal is now a
 browser that plays VR video from tube sites, in the page and in the
 headset, rather than WebXR (§1a); estimate ~4–7 days of agent sessions, bound by console debugging (§7).**_
 
-_Port status (2026-10-28): **Milestone 1 mostly reached.** The browser title
-PPSA99020 browses on the TV: see §9._
+_Port status (2026-10-28): **Milestone 1 reached.** The browser title
+PPSA99020 browses on the TV; Milestone 2 (video) has started: see §9._
 
 Everything below marked **verified** was built or checked on the Mac.
 Everything marked **pending** needs a run on the console, and the spike that
@@ -567,8 +567,8 @@ The spike READMEs list the build and run commands for each spike.
 
 ## 9. Port progress
 
-**2026-10-28, Milestone 1 (browsing on the TV): mostly reached**, one day
-into the port.
+**2026-10-28, Milestone 1 (browsing on the TV): reached**, one day into the
+port.
 
 - **Dependencies** (`port/deps/`): a static sysroot with glib, libsoup
   (HTTP/2), OpenSSL, ICU, HarfBuzz, FreeType, fontconfig, libxml2, SQLite and
@@ -586,7 +586,15 @@ into the port.
   (pipe2, fcntl, dup2, non-blocking sockets and mmap all behave differently),
   page tables are limited system-wide, and the title needs Spike 10's
   direct-memory heap for malloc, thread stacks and anonymous mmaps.
-- **Still open:** the on-screen keyboard (libSceImeDialog isn't loaded in the
-  title), YouTube stops at its loading skeleton, file:// pages show as source
-  (no MIME database), and some fonts are missing. Cinematic Mode in the
-  headset is untested.
+- **Finished the same day, checked on the TV:** the on-screen keyboard
+  (libSceImeDialog loaded at run time by 13.60 export offset) for the
+  address bar, search and text fields; YouTube's pages (search, results,
+  watch page without playback) after placeholder media interfaces and a fix
+  for forced compositing; file:// pages; Noto fonts for more scripts and
+  colour emoji.
+- **Crashes no longer take the console down.** Two console hangs this morning
+  followed WebProcess crashes. The payloads now catch fatal signals, log a
+  symbolizable stack and `_exit`, so the system crash reporter never sees
+  them; the console then survived about ten crashes in a row. Payload
+  threads also default to a 64 KiB stack, now raised to 2 MiB.
+- **Milestone 2 has started:** video and audio in pages through GStreamer.
