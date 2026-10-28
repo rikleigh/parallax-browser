@@ -86,12 +86,14 @@ __attribute__((used)) void* const ps5wk_title_sce_imports[] = {
     (void*)sceImeDialogTerm, (void*)sceImeDialogAbort,
 };
 
-/* The title's flexible memory is small (~250-420 MB), and ps5-opengl's libc
- * heap takes 256 MB of it. libpas's own mappings then failed
- * (pas_bootstrap_free_heap_allocate_with_alignment -> SIGILL in
- * webkit_settings_new, 2026-10-28). The UIProcess is light: send bmalloc to
- * the system heap (bmalloc's "Malloc" environment switch), before any static
- * initializer allocates. The payloads keep libpas. */
+/* bmalloc through the system heap (its "Malloc" environment switch), set
+ * before any static initializer allocates: FastMalloc then lands in the
+ * direct-memory dheap (titlemem.c), which gives memory back, instead of
+ * libpas, which never decommits on PS5 (patch 0006). libpas still starts
+ * (its 128 MB compact reservation goes to direct memory through the mmap
+ * wrapper). The first title run died in libpas's bootstrap when its
+ * mappings still came from flexible memory (2026-10-28). The payloads keep
+ * libpas. */
 #include <stdlib.h>
 __attribute__((constructor(101))) static void ps5wkUseSystemMalloc(void)
 {

@@ -205,8 +205,15 @@ static void testURLFinished(gboolean ok, const char* uri, const char* detail)
     char milestone[64];
     snprintf(milestone, sizeof milestone, "after test URL %u", testURLIndex);
     memLog(milestone);
-    g_timeout_add(2000, shotAfterLoad, (gpointer) "loaded");
-    g_timeout_add(10000, shotAfterLoad, (gpointer) "loaded-10s");
+    /* Screenshot names: the page's host, e.g. "03-en.wikipedia.org-2s". */
+    static char names[16][2][96];
+    const char* host = strstr(uri, "://") ? strstr(uri, "://") + 3 : uri;
+    size_t hostLength = strcspn(host, "/?#:");
+    unsigned slot = testURLIndex % 16;
+    snprintf(names[slot][0], sizeof names[slot][0], "%.*s-2s", (int)(hostLength < 80 ? hostLength : 80), host);
+    snprintf(names[slot][1], sizeof names[slot][1], "%.*s-10s", (int)(hostLength < 80 ? hostLength : 80), host);
+    g_timeout_add(2000, shotAfterLoad, names[slot][0]);
+    g_timeout_add(10000, shotAfterLoad, names[slot][1]);
     testTimer = g_timeout_add(12000, testTimeout, NULL);
 }
 
@@ -361,8 +368,15 @@ int main(void)
     loadStart = g_get_monotonic_time();
     signal(SIGPIPE, SIG_IGN);
     // WebKit, GLib and the child payloads (relayed) log to stderr.
-    if (spike_log_fd >= 0)
-        dup2(spike_log_fd, 2);
+    if (spike_log_fd >= 0 && dup2(spike_log_fd, 2) != 2) {
+        /* A title can't dup2 (EPERM; fd 2 can't be reused either): point
+         * libc's stderr stream at the log socket instead. */
+        int err = errno;
+        FILE* log = fdopen(spike_log_fd, "w");
+        if (log)
+            stderr = log;
+        spike_log("dup2(log, stderr) failed (errno %d): stderr is %s", err, log ? "an fdopen() stream on the log socket" : "lost");
+    }
     setvbuf(stderr, NULL, _IOLBF, 0);
     g_log_set_default_handler(logHandler, NULL);
     spike_log("ps5browser: WPE WebKit %u.%u.%u, pid %d", webkit_get_major_version(), webkit_get_minor_version(),
@@ -416,7 +430,13 @@ int main(void)
     SPIKE_PASS("display", "PS5 display connected");
     memLog("display connected");
 
+    /* Every WebProcess is a payload that costs ~300 of the system's 8192 CPU
+     * page tables (README: findings). WebKit kept each page's process alive
+     * (back/forward cache, process cache): 6 payloads after 3 sites. Without
+     * them only the current page's process and one prewarmed one live. */
+    webkit_web_context_set_cache_model(webkit_web_context_get_default(), WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
     WebKitSettings* settings = webkit_settings_new_with_settings(
+        "enable-page-cache", FALSE,
         "enable-spatial-navigation", TRUE,
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);

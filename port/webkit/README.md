@@ -199,41 +199,151 @@ Other probes in `test/` (payloads, RESULT lines on stdout):
 (the F_DUPFD_CLOEXEC bug), `seqpacket/reserve` (RW or PROT_NONE
 reservations do not reduce `sceKernelAvailableFlexibleMemorySize`).
 
-### Title PPSA99020 (built, not launched)
+### Title PPSA99020 on the TV (2026-10-28, night run)
+
+**The title loads and shows pages on the TV.** Verified from the log and a
+screen readback (nobody watching the TV): example.com, Wikipedia and
+DuckDuckGo Lite, the right way up and in the right colours.
+
+    RESULT ps5browser display PASS PS5 display connected
+    RESULT ps5browser load PASS https://example.com/ "Example Domain" (2.5 s after start)
+    RESULT ps5browser url PASS 1/3 https://example.com/ loaded in 2.5 s: title "Example Domain"; flexible 334.0 MB
+    RESULT ps5browser load PASS https://en.wikipedia.org/wiki/PlayStation_5 "PlayStation 5 - Wikipedia" (2.5 s after start)
+    RESULT ps5browser url PASS 2/3 https://en.wikipedia.org/wiki/PlayStation_5 loaded in 2.5 s: title "PlayStation 5 - Wikipedia"; flexible 334.0 MB
+    RESULT ps5browser load PASS https://lite.duckduckgo.com/lite?q=ps5 "ps5 at DuckDuckGo" (0.9 s after start)
+    RESULT ps5browser url PASS 3/3 https://lite.duckduckgo.com/lite?q=ps5 loaded in 1.0 s: title "ps5 at DuckDuckGo"; flexible 334.0 MB
+    RESULT ps5browser urls PASS 3 of 3 test URLs loaded
+    [wpe-ps5] pad: init 0x0, user 285379873, open -> 53085952
+
+Screen readbacks (960x540, halved from the 1080p frame on the TV):
+`test/title-01-example.com-2s.png`, `test/title-03-en.wikipedia.org-2s.png`,
+`test/title-05-lite.duckduckgo.com-2s.png` (+ the `-10s` ones, and
+`title-first-frame.png`, the blank first frame). Load times count from
+`webkit_web_view_load_uri`; a new WebProcess payload for the first page adds
+~2 s before that (upload ~0.35 s, connected 1–2.3 s after launch).
+
+Flexible memory (`sceKernelAvailableFlexibleMemorySize`, `[mem]` lines):
+
+| milestone | flexible free | direct memory in use |
+| --- | --- | --- |
+| main (image already charged: 440 -> 335 MB) | 335.0 MB | heap 2 MB |
+| display connected (EGL/GL up) | 334.0 MB | heap 12.8 MB |
+| web view created | 334.0 MB | heap 22.8 MB, anon mmaps 256 MB (libpas 128 MB compact reservation, JSC 128 MB structure heap), 3 thread stacks |
+| after example.com / Wikipedia / DDG | 334.0 / 334.0 / 334.0 MB | heap 26.8 MB (peak 34.7), anon mmaps 264–272 MB, 9–15 thread stacks (1.1–1.9 MB) |
+
+Everything the UIProcess allocates is in direct memory; flexible memory
+stays at 334 MB through three page loads (~190 MB more than Spike 10's
+budget needs for the 8K decoder at depth 2).
+
+#### Title vs payload: what broke, and the fixes
+
+| symptom | cause | fix |
+| --- | --- | --- |
+| `[GLib ERROR] Creating pipes for GWakeup: Invalid argument` | `pipe2(O_CLOEXEC)` EINVAL in a title | `__wrap_pipe2` (`shim/ps5shim.c`): pipe() + flags by hand |
+| `pad: libScePad/libSceUserService not linked` | only weak references to the SCE functions: imports came out NULL | strong references in `apps/title/dlshim.c`; the pad opens for the logged-in user |
+| SIGILL in libpas (`pas_bootstrap_free_heap...`, `pas_immortal_heap...`) at `webkit_settings_new` | anonymous mmaps (libpas's 128 MB compact heap reservation) failed: flexible memory | `apps/title/titlemem.c`: anonymous RW mmaps -> direct memory (MAP_ALIGNED honoured, partial munmap, MAP_FIXED re-zeroing); Spike 10's `dheap.c` for malloc instead of ps5-opengl's 128 MB `app_heap.c`; thread stacks in direct memory (`--wrap=pthread_create/join/exit`); bmalloc through the system heap (`Malloc=1`) |
+| `JSC::StructureMemoryManager` RELEASE_ASSERT | the structure heap wants 128 MB alignment (`MAP_ALIGNED(27)`) | honoured by the mmap wrapper |
+| `IPC::createPlatformConnection` RELEASE_ASSERT | **`fcntl(F_GETFD/F_SETFD/F_DUPFD)` return EINVAL in a title** | `__wrap_fcntl`: FD flags report success (no exec in a title), F_DUPFD falls back to dup |
+| SYSTEM_ILLEGAL_FUNCTION_CALL in `dup` | **libc.a's `syscalls.o` makes raw syscalls, which a title may not**, and once linked it overrides libkernel's exports (dup) | the title links `libc-title.a` (libc.a without syscalls.o); `apps/title/titlesys.c` provides what libkernel lacks (openat/fstatat/unlinkat on AT_FDCWD or absolute paths, eaccess, utimensat, chown family, closefrom, statfs/getfsstat ENOSYS, readlink/link/symlink) |
+| `dup(ipc fd) errno 1` | **`dup()` is EPERM in a title** (dup2 too) | dup through SCM_RIGHTS to ourselves (`scmDup`, `--wrap=dup,dup2`) |
+| SIGSEGV at address 0 in `currentExecutablePath` | `libScePosixForWebKit.so`'s stub exports `__wrap_readlink`, `__wrap_link`, `__wrap_symlink` (and `__wrap_mmap`); lld bound them instead of libps5compat's and they were NULL at run time | that stub is no longer linked |
+| first page never finished loading (UI main loop blocked) | **`F_SETFL O_NONBLOCK` and FIONBIO on sockets are EACCES in a title**: GSocket's fds stayed blocking | emulated O_NONBLOCK: `__wrap_fcntl` remembers it, `--wrap=recvmsg,sendmsg,recv,send,recvfrom,sendto` add MSG_DONTWAIT, `--wrap=close` forgets it |
+| nothing on stderr | `dup2(log, 2)` refused | `stderr = fdopen(log socket)` in `ps5browser.c` |
+
+Probes in the title log at every start: `imports: N of M NULL` (every
+function the title imports, from `apps/title/importcheck.c`, generated by
+`package.sh`), and `probe:` lines (socketpair types, fcntl, FIONBIO,
+MSG_DONTWAIT, dup, pipe2). Pipes behave (F_SETFL works on them); sockets
+don't.
+
+#### Process count and page tables
+
+Each WebProcess payload costs ~300 of the system-wide 8192 CPU page tables
+(`VM Stats ... page table CPU` in the kernel log: 4650 with nothing running,
+5256 with the title + NetworkProcess + one WebProcess, 6155 after three
+sites). WebKit kept every visited site's process (back/forward cache and
+process cache) plus a prewarmed one, so 6 payloads were alive after three
+navigations. `ps5browser.c` now sets `enable-page-cache` FALSE and the
+DOCUMENT_BROWSER cache model, which should leave the current page's process
+and one prewarmed process. **Built, not yet verified on the console** (the
+console went offline during that run, below).
+
+Children ended by aborting: when the UIProcess closed their IPC socket,
+`exit()` ran static destructors and crashed in `WebCore::Font::~Font`
+(ThreadGlobalData, WTFCrash), so every ended page process produced a crash
+report for a ~600 MB payload. `apps/child/ps5wk-child.cpp` now `_exit`s
+after WebKit returns. **Built, not yet verified.**
+
+#### Packaging
 
 `apps/title/package.sh` -> `toolchain/wpe-webkit/titles/PPSA99020` (200 MB:
-`eboot.bin` 109 MB + `ps5wk-child.elf` 90 MB + param.json + libc.prx);
-symbols for crash triage: `toolchain/wpe-webkit/titles/ps5browser-symbols.elf`
-(title rips relative to the eboot load base).
+`eboot.bin` 109 MB + `ps5wk-child.elf` 90 MB + param.json + libc.prx).
 Title link specifics: `ps5-pie-webkit.ld` (WTF/JSC's page-aligned writable
 sections moved into the data segment, or the converter fails with "LLVM
-layout leaves no room for PS5 process parameters"), weak references that no
+layout leaves no room for PS5 process parameters"); weak references that no
 stub provides are defined as 0 (`_ZTH...` thread_local hooks, LSan hooks,
-`__cxa_thread_atexit_impl`, `sceCommonDialogInitialize`), the SCE libraries
-the backend uses are linked without --as-needed, ps5-opengl's `mkstemps`
-shim renamed (clashes with libc.a), and `--wrap=dlopen/dlsym/fcntl`.
+`__cxa_thread_atexit_impl`, `sceCommonDialogInitialize`, `__syscall`); the
+SCE libraries the backend uses are linked without --as-needed;
+ps5-opengl's `mkstemps` shim renamed (clashes with libc.a); libc.a without
+`syscalls.o`, no `libScePosixForWebKit.so`; and the wraps:
+malloc family + `aligned_alloc`/`memalign` (dheap), `mmap/munmap/madvise`,
+`pthread_create/join/exit` (titlemem), `dlopen/dlsym` (dlshim, epoxy),
+`fcntl/pipe2/dup/dup2`, `recvmsg/sendmsg/recv/send/recvfrom/sendto/close`
+(ps5shim). Then a second link with `importcheck.o`.
 
 Runtime needs on the console (already there): `/data/ps5webkit` runtime tree
 from port/deps (certs, fonts, fonts.conf, xkb) and
 `/data/ps5webkit/share/icu/icudt76l.dat` (uploaded by `test/run-shot.sh`).
 Optional: `/data/ps5webkit/home-url.txt` (start page),
-`/data/ps5webkit/child.env` (`WEBKIT_DEBUG=...` for the children; remove it
-for normal use, it is very verbose).
+`/data/ps5webkit/child.env` (`WEBKIT_DEBUG=...` for the children; very
+verbose).
 
-Not yet tried on the console (expect the first issues here): the title's
-memory budget (~250–420 MB flexible) with WebKit's UIProcess in it; libepoxy
-through `dlshim.c`; the ImeDialog struct layout (PS4/OpenOrbis layout,
-unverified on PS5); the ScePadData layout (PS5VR's); GL 4.6 core context
-creation from the backend; spatial navigation with the D-pad.
+#### Debug knobs (title)
+
+- `/data/ps5webkit/debug-screenshot` (a file, any content) or
+  `PS5WK_SCREENSHOT=1`: the first page frame, and 2 s and 10 s after each
+  test URL finishes, are read back (`glReadPixels` of the composed back
+  buffer before the swap, ~100 ms), halved and flipped to top-down, and
+  written to `/data/ps5webkit/shots/NN-<host>-2s.ppm`; the log says
+  `[wpe-ps5] SHOT <path> ... mean, % non-black`. `test/fetch-shots.sh`
+  fetches them over FTP and writes `test/title-*.png`.
+  `wpe_display_ps5_capture_screen()` is the API.
+- `/data/ps5webkit/test-urls.txt`: one URL per line; loaded in turn instead
+  of the home page, each with RESULT lines (load time, flexible memory) and
+  screenshots, 12 s apart; 60 s timeout per URL.
+- `[mem]` lines at main, display, web view, every load and every 60 s.
+- Crash triage: `toolchain/wpe-webkit/titles/ps5browser-symbols.elf`
+  (refreshed by `package.sh`), `llvm-addr2line -f -C -i -e ... <rip - 0x400000>`.
+  `TITLE_LDFLAGS="--trace-symbol=x" package.sh` traces the title link.
+
+Not yet checked: the ImeDialog struct layout (keyboard), the pad map in
+use (only the pad opening is verified), spatial navigation with the D-pad,
+fonts for Arabic/Hebrew/Devanagari (example.com's second paragraph shows
+boxes: no Noto font for that script in `/data/ps5webkit/fonts`).
+
+#### Console state at the end of the night run (03:01 GMT)
+
+The console dropped off the network (no ping, no ports) a few seconds into
+the run that tested the page-cache/cache-model change, ~3 h 50 min after the
+owner's last pad input, so most likely rest mode. The kernel log's last
+lines were a system app starting (NPXS40112) and
+`mDBG: Waiting for debug subsystem`. Earlier in the night a system app
+(NPXS40112, SceSpZeroConf) had crashed once while several aborted child
+payloads were being crash-reported; whether that is related is unknown.
 
 ### Next steps
 
-1. Owner: first TV launch of PPSA99020 (see the report / below), read the
-   log on the Mac.
-2. Fix what the title run shows (memory, epoxy, IME, pad).
-3. Process prewarming (spawns are ~1 s now), TZ from the system settings,
-   the exit-time crash in `Font::~Font` (a WebProcess being torn down when the
-   UIProcess quits; harmless so far).
+1. Verify the two unverified fixes above on the console (page-table count
+   staying flat while browsing; children exiting without crash reports):
+   `tools/launch.sh PPSA99020` with `test-urls.txt` and watch
+   `page table CPU` in the kernel log and `(output closed after ...)` lines.
+2. Owner on the TV: pad map, Options -> keyboard -> URL, X on links,
+   scrolling, zoom (see the morning checklist in the session report).
+3. Move the ps5shim fcntl/pipe2/dup wrappers into libps5compat (port/deps)
+   if glib-only programs need them too; today every WebKit executable links
+   ps5shim with `--wrap=fcntl,pipe2` and the title adds the rest.
+4. Fonts for more scripts; process prewarming at start; TZ from the system
+   settings.
 
 Debug knobs: `/data/ps5webkit/child.env` (KEY=VALUE lines read by the
 child, e.g. `WEBKIT_DEBUG=Network,Loading,Process`); `SHOT_DEBUG=...` for

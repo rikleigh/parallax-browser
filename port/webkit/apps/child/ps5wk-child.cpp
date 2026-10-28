@@ -221,5 +221,10 @@ int main(int, char**)
     } else
         pthread_join(thread, nullptr);
     LOG("%s process %llu exited with %d", type, processIdentifier, args.result);
-    return args.result;
+    // _exit, not exit: static destructors crashed (WebCore::Font::~Font ->
+    // ThreadGlobalData, WTFCrash) every time a page's process ended, and each
+    // crash made the system write a crash report for a ~600 MB payload.
+    fflush(stdout);
+    fflush(stderr);
+    _exit(args.result);
 }

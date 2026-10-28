@@ -93,6 +93,38 @@ int __wrap_dup(int fd)
     return r;
 }
 
+/* dup2(): the lowest free descriptor is newfd once it is closed, and the
+ * descriptors below it are held open meanwhile. Linked with --wrap=dup2 in
+ * the title. */
+int __real_dup2(int fd, int newfd) __attribute__((weak));
+int __wrap_dup2(int fd, int newfd)
+{
+    int r = __real_dup2 ? __real_dup2(fd, newfd) : -1;
+    if (r >= 0 || errno != EPERM || fd < 0 || newfd < 0 || newfd >= 64)
+        return r;
+    if (fd == newfd)
+        return newfd;
+    close(newfd);
+    int held[64], n = 0;
+    for (;;) {
+        int d = scmDup(fd);
+        if (d < 0 || d == newfd) {
+            r = d;
+            break;
+        }
+        if (d > newfd || n == 64) { /* newfd is taken by someone else */
+            close(d);
+            errno = EBUSY;
+            r = -1;
+            break;
+        }
+        held[n++] = d;
+    }
+    for (int i = 0; i < n; i++)
+        close(held[i]);
+    return r;
+}
+
 static int dupAny(int fd)
 {
     int r = dup(fd);

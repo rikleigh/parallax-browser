@@ -97,7 +97,7 @@ title_link() {
         --wrap=aligned_alloc --wrap=memalign --wrap=malloc_usable_size \
         --wrap=mmap --wrap=munmap --wrap=madvise \
         --wrap=pthread_create --wrap=pthread_join --wrap=pthread_exit \
-        --wrap=dlopen --wrap=dlsym --wrap=fcntl --wrap=pipe2 --wrap=dup \
+        --wrap=dlopen --wrap=dlsym --wrap=fcntl --wrap=pipe2 --wrap=dup --wrap=dup2 \
         --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close \
         --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
         --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" ${TITLE_LDFLAGS:-} "$@" \
