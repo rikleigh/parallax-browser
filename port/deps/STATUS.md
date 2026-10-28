@@ -46,7 +46,9 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 | xkeyboard-config | 2.43 | smoke-tested | data in runtime tree share/xkb (/data/ps5webkit/share/xkb) |
 | lcms2 | 2.17 | built | MIT core only |
 | CA bundle | 2026-10-20 | smoke-tested | /data/ps5webkit/etc/ssl/cert.pem |
-| Noto fonts + fonts.conf | notofonts @781896b | smoke-tested | /data/ps5webkit/fonts |
+| Noto fonts + fonts.conf | notofonts @781896b | smoke-tested | /data/ps5webkit/fonts; + Arabic, Hebrew, Devanagari, Thai, Bengali, Tamil, Armenian, Georgian, Ethiopic, Symbols, Symbols 2, Math; OFL texts beside them |
+| Noto Color Emoji | noto-emoji v2026-09-24-unicode18_0 | built | CBDT (FreeType + libpng), 10.7 MB, OFL-1.1 |
+| MIME globs2 | ours | console-tested | /data/ps5webkit/share/mime/globs2 (hand-written; no shared-mime-info); children set XDG_DATA_DIRS=/data/ps5webkit/share |
 | libgcrypt/libtasn1 | – | skipped | use -DUSE_OPENSSL=ON |
 | libavif, libjxl, woff2, libwpe | – | skipped | see README |
 | **Milestone 2** | | | `build.sh m2` (2m34s clean); gst smoke 9/9 PASS (`smoke/results/*-gst-all-pass.log`) |

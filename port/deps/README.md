@@ -277,12 +277,15 @@ VP9, Opus, AV1). 9/9 PASS on the console.
 ```
 /data/ps5webkit/etc/ssl/cert.pem            Mozilla CA bundle
 /data/ps5webkit/etc/fonts/fonts.conf        from runtime/etc/fonts/fonts.conf
-/data/ps5webkit/fonts/                      Noto Sans/Serif (4 styles), Sans Mono (2), Sans CJK (Regular, Bold TTC)
+/data/ps5webkit/fonts/                      Noto Sans/Serif (4 styles), Sans Mono (2), Sans CJK (Regular, Bold TTC),
+                                            Arabic/Hebrew/Devanagari/Thai (2), Bengali, Tamil, Armenian, Georgian,
+                                            Ethiopic, Symbols, Symbols 2, Math, Color Emoji; OFL-*.txt
+/data/ps5webkit/share/mime/globs2           file extension -> MIME type (runtime/share/mime/globs2)
 /data/ps5webkit/cache/fontconfig/           fontconfig cache (written on first FcInit)
 /data/ps5webkit/share/xkb/                  xkeyboard-config data
 ```
 
-About 49 MB. Fonts are fetched by the `fonts` step (not committed).
+About 63 MB. Fonts are fetched by the `fonts` step (not committed).
 
 ## Patches
 

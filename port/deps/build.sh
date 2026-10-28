@@ -763,6 +763,7 @@ step_cacert() {
 
 NOTO=https://raw.githubusercontent.com/notofonts/notofonts.github.io/781896b8653bf9e09129c103643a3cc5e31a2cb7/fonts
 NOTO_CJK=https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTC
+NOTO_EMOJI=https://raw.githubusercontent.com/googlefonts/noto-emoji/v2026-09-24-unicode18_0
 FONTS=(
     "$NOTO/NotoSans/hinted/ttf/NotoSans-Regular.ttf 478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823"
     "$NOTO/NotoSans/hinted/ttf/NotoSans-Bold.ttf 1df075a380fc7cb898acf64c1f7b3b4dd780de3caa860178bf929de35817a913"
@@ -776,6 +777,30 @@ FONTS=(
     "$NOTO/NotoSansMono/hinted/ttf/NotoSansMono-Bold.ttf a21ea0ba6ea49fda7b34ca39a504b487f1130885d36e1a4f9f4255b3ba6994bc"
     "$NOTO_CJK/NotoSansCJK-Regular.ttc b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
     "$NOTO_CJK/NotoSansCJK-Bold.ttc faa5f3656a78b2e2d450d27fe8382c778bc2b6bb5ea29c986664a6a435056ceb"
+    # Other scripts (example.com's Arabic paragraph was tofu), symbols, math.
+    "$NOTO/NotoSansArabic/hinted/ttf/NotoSansArabic-Regular.ttf bdff3e5659d67e67def05b33f749683b9376ae819d65d3dd62ac4640b3aaef48"
+    "$NOTO/NotoSansArabic/hinted/ttf/NotoSansArabic-Bold.ttf 4e5462d2e8be880317b9f49b5b2da109ddb6a3563d91cc604b67f3535832a555"
+    "$NOTO/NotoSansHebrew/hinted/ttf/NotoSansHebrew-Regular.ttf cdefaf8efd47045f6820928eba84db5bed7557539328952b5f828315485e02ee"
+    "$NOTO/NotoSansHebrew/hinted/ttf/NotoSansHebrew-Bold.ttf da9226e886c245a7e11673c24dec82bded64d8574c1e1f03983bf89297d2aaa8"
+    "$NOTO/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Regular.ttf 4e3c66638958c3e2ab5d37f47a8deb89fffeb7be9985c665a519bbc7ba762313"
+    "$NOTO/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Bold.ttf 6a09c8d797cfc803d32cdc731e809424d74cbaff59f503de34ade421a08e5bc2"
+    "$NOTO/NotoSansThai/hinted/ttf/NotoSansThai-Regular.ttf 61cf814eec46b294d6ea4401ac295d0cecd5207bd2331dcc5a15e7301d30ee44"
+    "$NOTO/NotoSansThai/hinted/ttf/NotoSansThai-Bold.ttf 2ac6c6e8a478e23b15f76e4894af1fa2210f8f350e4e6e54aad530bec03efbfb"
+    "$NOTO/NotoSansBengali/hinted/ttf/NotoSansBengali-Regular.ttf b55c62ee531e3214da6c0701daecea89a52ba42db7d8206b92e6b51f397a3193"
+    "$NOTO/NotoSansTamil/hinted/ttf/NotoSansTamil-Regular.ttf 3c0a186feb3c63c7f6d63e1511dcdc144e745ae09b98e217c83f3e317974f6f9"
+    "$NOTO/NotoSansArmenian/hinted/ttf/NotoSansArmenian-Regular.ttf 720df88c332417a235b4d6209d14ec2e2bf4bfe2a954b7453d869ea593bfce1e"
+    "$NOTO/NotoSansGeorgian/hinted/ttf/NotoSansGeorgian-Regular.ttf d3e33254b09e7bb2c5cf0f17e554b80462056c5a107097f258d495168c3a9346"
+    "$NOTO/NotoSansEthiopic/hinted/ttf/NotoSansEthiopic-Regular.ttf f6f7fc379db9438959a2b0527e7a2cf36ea9c84626d56ec444fff37fc24c3c10"
+    "$NOTO/NotoSansSymbols/hinted/ttf/NotoSansSymbols-Regular.ttf d0e98e9a2c046594c5021437273943be7e79e0fd980fde125279e22302212595"
+    "$NOTO/NotoSansSymbols2/hinted/ttf/NotoSansSymbols2-Regular.ttf c4a0a80f0041ce4be81e2478faad22776d23edb98ae3f0d19bd37044820ecf9d"
+    "$NOTO/NotoSansMath/hinted/ttf/NotoSansMath-Regular.ttf d51afd5739c7ba6c44fcab35a88160e25dfb69a2d4ad0bd99533f8d894af1f96"
+    # Emoji: CBDT colour bitmaps (FreeType has libpng), Unicode 18 release.
+    "$NOTO_EMOJI/2D/fonts/NotoColorEmoji.ttf 15671215ab769fdc7162a045d56fd7d7e477c51b04e6b3c761d914d8fdd6cc44"
+)
+# OFL-1.1 texts, installed next to the fonts.
+FONT_LICENSES=(
+    "$NOTO/LICENSE f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8 OFL-Noto.txt"
+    "$NOTO_EMOJI/LICENSE 500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b OFL-NotoColorEmoji.txt"
 )
 
 step_fonts() {
@@ -787,13 +812,27 @@ step_fonts() {
         fetch "$url" "$sum" "fonts/$(basename "$url")"
         install -m644 "$FETCHED" "$RUNTIME/fonts/"
     done
+    for e in "${FONT_LICENSES[@]}"; do
+        read -r url sum name <<< "$e"
+        fetch "$url" "$sum" "fonts/$name"
+        install -m644 "$FETCHED" "$RUNTIME/fonts/$name"
+    done
     install -m644 "$HERE/runtime/etc/fonts/fonts.conf" "$RUNTIME/etc/fonts/fonts.conf"
+}
+
+# MIME types by file extension (no shared-mime-info on the console): a
+# hand-written globs2 for xdgmime (WebKit's and GIO's copies); the children
+# set XDG_DATA_DIRS=/data/ps5webkit/share.
+step_mime() {
+    log "share/mime/globs2 (file extension -> MIME type)"
+    mkdir -p "$RUNTIME/share/mime"
+    install -m644 "$HERE/runtime/share/mime/globs2" "$RUNTIME/share/mime/globs2"
 }
 
 STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv proxy_libintl
           libxml2 libxslt sqlite libpsl icu freetype harfbuzz fontconfig pcre2 libffi glib
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
-          cacert fonts xkeyboard_config)
+          cacert fonts mime xkeyboard_config)
 STEPS_M2=(dav1d ffmpeg gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
 
 if [ "${1:-}" = "--list" ]; then

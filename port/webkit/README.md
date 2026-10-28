@@ -183,6 +183,14 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   `run-shot.sh` takes `SHOT_ARGS="settle=<s> js=<file on the console>"` to
   watch a page longer and dump page state.
 
+- **file:// pages showed as source**: no shared-mime-info on the console,
+  so GIO and WebKit's xdgmime had no extension map. A hand-written
+  `share/mime/globs2` (port/deps `mime` step) plus `XDG_DATA_DIRS=/data/ps5webkit/share`
+  in the children, the title and the shot fixes it:
+  `file:///data/ps5webkit/start.html` loads as `text/html` in `ps5wk-shot`.
+  The title's home page is that file again (`PS5WK_HOME_URL`; the console's
+  `home-url.txt` now names it too).
+
 ## Status and timings (2026-10-28)
 
 ### Builds (Mac, 14 cores, Release, -O2 -gline-tables-only)

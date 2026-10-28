@@ -1,0 +1,42 @@
+# File name -> MIME type for WebKit and GIO on the console (xdgmime reads
+# <XDG_DATA_DIRS>/mime/globs2 when there is no mime.cache). The console has
+# no shared-mime-info; without this file, file:// pages came back as
+# application/octet-stream / text/plain and showed as source.
+# Format: weight:type:glob (shared-mime-info's globs2). Hand-written subset.
+50:text/html:*.html
+50:text/html:*.htm
+50:application/xhtml+xml:*.xhtml
+50:text/css:*.css
+50:text/javascript:*.js
+50:text/javascript:*.mjs
+50:application/json:*.json
+50:application/xml:*.xml
+50:application/wasm:*.wasm
+50:application/pdf:*.pdf
+50:text/plain:*.txt
+50:text/plain:*.log
+50:text/csv:*.csv
+50:text/markdown:*.md
+50:image/svg+xml:*.svg
+50:image/png:*.png
+50:image/jpeg:*.jpg
+50:image/jpeg:*.jpeg
+50:image/gif:*.gif
+50:image/webp:*.webp
+50:image/avif:*.avif
+50:image/bmp:*.bmp
+50:image/vnd.microsoft.icon:*.ico
+50:font/woff:*.woff
+50:font/woff2:*.woff2
+50:font/ttf:*.ttf
+50:font/otf:*.otf
+50:video/mp4:*.mp4
+50:video/mp4:*.m4v
+50:video/webm:*.webm
+50:audio/webm:*.weba
+50:audio/mp4:*.m4a
+50:audio/mpeg:*.mp3
+50:audio/ogg:*.ogg
+50:audio/ogg:*.opus
+50:audio/flac:*.flac
+50:audio/wav:*.wav

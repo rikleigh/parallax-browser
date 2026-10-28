@@ -141,6 +141,9 @@ static void setupEnvironment()
     setenv("GSETTINGS_BACKEND", "memory", 0);
     setenv("TZ", "UTC", 0);
     setenv("ICU_DATA", "/data/ps5webkit/share/icu", 0); // icudt76l.dat (ICU stub data linked)
+    // MIME types by file extension (share/mime/globs2; no shared-mime-info on
+    // the console): file:// pages, MIMETypeRegistry, GIO content types.
+    setenv("XDG_DATA_DIRS", "/data/ps5webkit/share", 0);
     // Optional overrides for debugging, one KEY=VALUE per line (e.g.
     // WEBKIT_DEBUG=Network,Loading,IPC). Read last, so they win.
     if (FILE* f = fopen("/data/ps5webkit/child.env", "r")) {
