@@ -21,6 +21,9 @@
 #include "PS5LaunchProtocol.h"
 #include "WPEPS5Private.h"
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <climits>
+#include <cstring>
 #include <errno.h>
 #include <fcntl.h>
 #include <glib-unix.h>
@@ -294,8 +297,49 @@ static void handleConnection(WPEProcessManagerPS5* manager, int client)
     close(client);
 }
 
+// The title is ended with SIGKILL (and payload harnesses often are), so the
+// sockets and status files named after a pid in PS5WK_LAUNCH_DIR stay
+// behind; the directory is a small tmpfs and binding failed with ENOSPC
+// after a few hundred. Remove those whose process is gone.
+static void removeStaleRuntimeFiles()
+{
+    DIR* dir = opendir(PS5WK_LAUNCH_DIR);
+    if (!dir)
+        return;
+    unsigned removed = 0;
+    while (struct dirent* entry = readdir(dir)) {
+        const char* name = entry->d_name;
+        int pid = 0;
+        const char* dash = strrchr(name, '-');
+        if (!dash)
+            continue;
+        size_t prefix = dash - name;
+        bool known = (prefix == 2 && !strncmp(name, "ui", 2)) || (prefix == 5 && !strncmp(name, "audio", 5))
+            || (prefix == 5 && !strncmp(name, "video", 5)) || (prefix == 6 && !strncmp(name, "webmem", 6));
+        if (!known)
+            continue;
+        char* end = nullptr;
+        long value = strtol(dash + 1, &end, 10);
+        if (end == dash + 1 || value <= 0 || value > INT_MAX)
+            continue;
+        if (strcmp(end, prefix == 6 ? "" : ".sock"))
+            continue;
+        pid = static_cast<int>(value);
+        // Only a process that is known to be gone (EPERM: alive, another uid).
+        if (pid == getpid() || !kill(pid, 0) || errno != ESRCH)
+            continue;
+        std::string path = std::string(PS5WK_LAUNCH_DIR "/") + name;
+        if (!unlink(path.c_str()))
+            removed++;
+    }
+    closedir(dir);
+    if (removed)
+        PS5_LOG("[ps5-launch] removed %u stale files from %s", removed, PS5WK_LAUNCH_DIR);
+}
+
 static bool bindListener(WPEProcessManagerPS5* manager)
 {
+    removeStaleRuntimeFiles();
     auto* priv = manager->priv;
     struct sockaddr_un address { };
     address.sun_family = AF_UNIX;
