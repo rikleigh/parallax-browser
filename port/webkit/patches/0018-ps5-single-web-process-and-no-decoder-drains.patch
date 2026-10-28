@@ -1,0 +1,62 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index 5e977de09e..a5291baa71 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -3885,6 +3885,23 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
+         if (const char* value = g_getenv("PS5WK_DECODER_THREADS"))
+             threads = std::clamp(atoi(value), 1, 8);
+         g_object_set(decoder, "max-threads", threads, nullptr);
++        // PS5: no still-frame drains either. avdec drains by flushing libav
++        // (avcodec_flush_buffers), which drops the reference frames: every
++        // inter frame after a drain failed to decode (max-errors -1 hid it)
++        // until the next keyframe, up to ~10 s of black or frozen video with
++        // audio playing (YouTube start and after its cookie dialog's pause:
++        // WebKitMediaSrc sends one whenever 100 ms pass without samples, as
++        // the busy main thread appends in bursts). The decoder then keeps its
++        // last few frames until more data or EOS. PS5WK_STILL_FRAME=1 lets
++        // them through again.
++        if (g_strcmp0(g_getenv("PS5WK_STILL_FRAME"), "1")) {
++            GRefPtr sinkPad = adoptGRef(gst_element_get_static_pad(decoder, "sink"));
++            gst_pad_add_probe(sinkPad.get(), GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, [](GstPad*, GstPadProbeInfo* info, gpointer) -> GstPadProbeReturn {
++                if (gst_video_event_parse_still_frame(gst_pad_probe_info_get_event(info), nullptr))
++                    return GST_PAD_PROBE_DROP;
++                return GST_PAD_PROBE_OK;
++            }, nullptr, nullptr);
++        }
+ #else
+         g_object_set(decoder, "max-threads", 2, nullptr);
+ #endif
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
+index 6a6bb7e57d..ef908b329c 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
+@@ -439,11 +439,29 @@ static void webkitWebContextConstructed(GObject* object)
+ 
+     Ref configuration = API::ProcessPoolConfiguration::create();
+     configuration->setInjectedBundlePath(FileSystem::stringFromFileSystemRepresentation(bundleFilename.utf8()));
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: every WebProcess is an elfldr payload (a 114 MB upload) costing
++    // ~300 of the system's 8192 CPU page tables. With process swaps, the
++    // WebProcess cache and prewarming, YouTube browsing kept several alive
++    // until elfldr could not spawn any more and allocations failed
++    // (2026-10-28). One WebProcess serves every navigation;
++    // PS5WK_PROCESS_SWAPS=1 restores upstream behaviour.
++    if (!g_strcmp0(g_getenv("PS5WK_PROCESS_SWAPS"), "1")) {
++        configuration->setUsesWebProcessCache(true);
++        configuration->setProcessSwapsOnNavigation(true);
++    } else {
++        configuration->setUsesSingleWebProcess(true);
++        configuration->setUsesWebProcessCache(false);
++        configuration->setProcessSwapsOnNavigation(false);
++        configuration->setIsAutomaticProcessWarmingEnabled(false);
++    }
++#else
+     configuration->setUsesWebProcessCache(true);
+ #if PLATFORM(GTK) && !USE(GTK4)
+     configuration->setProcessSwapsOnNavigation(priv->psonEnabled);
+ #else
+     configuration->setProcessSwapsOnNavigation(true);
++#endif
+ #endif
+     if (priv->memoryPressureSettings) {
+         configuration->setMemoryPressureHandlerConfiguration(webkitMemoryPressureSettingsGetMemoryPressureHandlerConfiguration(priv->memoryPressureSettings));

@@ -72,6 +72,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0015-media-build-fixes-video-without-web-audio | ENABLE_VIDEO with Web Audio off: `platform/audio/gstreamer` on the include path (AudioDecoder.cpp includes it under USE(GSTREAMER)); no WEBCORE_EXPORT on a member of the exported `MediaSourcePrivate` (dllexport inside dllexport is an error with this toolchain); libpas uses libc's `backtrace()` on FreeBSD (its own stub clashed with libc.a's once GStreamer pulled `backtrace.o` in) |
 | 0016-ps5-software-video-paint-and-media-policy | PS5 only (`PS5_PAYLOAD_SDK`): AV1 not advertised (no hardware AV1; `PS5WK_MEDIA_AV1=1` advertises it), `PS5WK_MEDIA_VP9=0` hides VP9; avdec `max-threads` 4 (`PS5WK_DECODER_THREADS`), `max-errors` -1 (a reference-less frame after a flush doesn't end playback); playsink's `videoconvert` on 4 threads; video painting: the frame is scaled to the device-pixel size with GstVideoConverter (4 threads, linear) and wrapped zero-copy in an SkImage cached for the repaints of the same frame (Skia's raster bilinear scaling of 1080p cost ~30 ms per frame, ImageGStreamer copied the frame on every paint, and `convertSampleToImage` ran a conversion pipeline even when the format already matched); non-composited rendering updates longer than 6 ms are followed by an equal idle gap (NonCompositedFrameRenderer), so JavaScript timers and MSE appends still run while video plays |
 | 0017-ps5-hole-punch-video | PS5 only: `MediaPlayerPrivateGStreamer` makes `ps5videosink` (port/deps/gst) as the video sink (`PS5WK_HOLEPUNCH=0`: the step-1 path), `paint()` clears the video's rectangle to transparent and reports it to the sink (`ps5_video_sink_set_geometry`), canvas `drawImage` still gets the frame (`paintCurrentFrameInContext`), new samples no longer repaint the page (only the first one, for the hole), the streaming thread no longer waits for a paint; MSE `TrackQueue` water levels 1000/500 ms (were 200/100 ms: the busy main thread let the video run dry on YouTube) |
+| 0018-ps5-single-web-process-and-no-decoder-drains | PS5 only: one WebProcess for all navigations (no process swaps, WebProcess cache or prewarming; `PS5WK_PROCESS_SWAPS=1` restores them): each payload costs ~300 of 8192 system page tables and swaps exhausted them; still-frame events are dropped before avdec too (`PS5WK_STILL_FRAME=1` keeps them): avdec's drain flushed libav's reference frames, so video stayed broken until the next keyframe |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -430,7 +431,8 @@ for openat a positive result is kept only if it is open on the named file
 (same device and inode). After the fix: 20 stress loads, 0 failed, 0 EBADF
 (before: 13 double closes of fd 20 per run).
 
-**Payload count / page tables** (open; probably the TV freeze): during the
+**Payload count / page tables: fixed by one WebProcess (0018).** Findings
+first (before the fix): during the
 stress runs elfldr began failing to spawn WebProcesses ("Error spawning
 payload", up to 6 retries), and two WebProcesses hit memory failures (libc
 heap could not grow by 8 MB, SIGABRT; a libpas out-of-memory panic in GC).
@@ -439,21 +441,30 @@ Several WebProcesses stay alive across swaps (the YouTube process lived
 costs ~300 of the system's 8192 CPU page tables (*Findings*: three exhausted
 it). After the last run elfldr could not start any payload at all (not even
 klogsrv). On the TV, ten WebProcesses were launched in 154 s and the
-NetworkProcess ended just before the freeze. Next: keep at most one
-WebProcess besides the active one (no process prewarming, no swap for
-same-tab file:// <-> https where WebKit allows it, end swapped-out processes
-at once), and watch `page table CPU` in the kernel log while stressing.
+NetworkProcess ended just before the freeze. Patch 0018 makes the process
+pool use a single WebProcess on PS5 (`setUsesSingleWebProcess`, checked
+before every swap reason including COOP), with no WebProcess cache and no
+prewarming (`PS5WK_PROCESS_SWAPS=1` in the UIProcess restores upstream). After
+a reboot: page tables 4870/8192 idle; a 10-load stress run (2 WebProcess
+launches) peaked at 6583 and returned to 4939; elfldr still spawned after
+every run; 0 failed loads. Navigations also no longer upload a 114 MB
+payload each.
 
-**Video black at the start (open):** on the TV the sink sent 14.6 frames/s,
-then 3.4/s for ~5 s, then 24/s; audio ran throughout and the WebProcess
-main thread was busy (render updates 29 ms average, 180 ms max). Not
-reproduced in the harness yet (BBB started at 55 frames/s). Leading
-hypothesis: YouTube's quality switch appends a new representation over the
-range WebKit already enqueued (1 s ahead since 0017), WebKit flushes the
-video track and re-enqueues from the keyframe before the current time, and
-the software decoder has to get through up to a GOP before a frame is due
-again. To check with `GST_DEBUG=webkitmsesrc:7` (per-track pushes) and the
-SourceBuffer release logs (`reenqueuing at time`).
+**Video black at the start: found and fixed (0018).** Reproduced in the
+harness on Sintel (video stuck at frame 69 from t=8 to 15 s around the
+cookie dialog's pause, audio running). `GST_DEBUG=webkitmsesrc:7` showed the
+video samples up to PTS 14.5 s already pushed, preceded by WebKitMediaSrc
+still-frame events (sent whenever 100 ms pass without samples; YouTube's
+appends come in bursts while the main thread is busy), and output resumed
+exactly at the next keyframe (PTS 15). avdec handles a still-frame event by
+draining, which flushes libav (`avcodec_flush_buffers`) and drops its
+reference frames: every inter frame after it failed to decode (silently,
+with 0016's `max-errors -1`) until the next keyframe. This is also the
+earlier "24–35 s without video" on YouTube. 0018 drops still-frame events
+before avdec on PS5, as WebKit already does for other decoders
+(`PS5WK_STILL_FRAME=1` lets them through). After: Sintel played through
+the pause without a gap (harness and title); with the events let through
+again (A/B) the 12 s freeze came back.
 
 **"Stutter" on YouTube (analysis):** Sintel on YouTube is 24 fps; the title
 showed it at a steady 23.4–24.0 frames/s, 0 dropped, 2–3 ms after due. On a
@@ -461,8 +472,14 @@ showed it at a steady 23.4–24.0 frames/s, 0 dropped, 2–3 ms after due. On a
 cadence), which judders on pans; the local clips are 30/60 fps (even
 cadence). The `[video]` lines now include how many vsyncs each frame stayed
 on screen (`held 1/2/3/4+ vsyncs` and the last 16 holds), to tell 3:2
-cadence from pacing jitter on the next run. Big Buck Bunny (60 fps) never
-loaded in that TV run, so 60 fps YouTube on the TV is still unjudged.
+cadence from pacing jitter: Sintel shows a clean `3232323...` (inherent
+3:2, not jitter). For 60 fps, frame selection now has hysteresis (an older
+due frame is dropped for a newer one only if the newer one is due a
+quarter vsync inside the threshold): the local 1080p60 clip in the title
+went from ~1 drop per 5 s to 0 in steady state. YouTube Big Buck Bunny
+720p60 in the title: 54–59 frames/s with drops while the page loads (the
+WebProcess at 1.2 cores drops late frames), then 58.7–59.7/s with 0–2
+drops per 5 s at 0.34–0.41 cores.
 
 ### Step 2b: Videodec2 in the title (plan, not built)
 

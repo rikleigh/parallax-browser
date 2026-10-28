@@ -377,6 +377,13 @@ bool consume(int64_t displayUS, int64_t slackUS, bool commitGeometry, const Cons
             auto& front = stream->queue.front();
             // A target far ahead means a broken clock mapping: show it now.
             bool due = !front.targetUS || front.targetUS <= displayUS + slackUS || front.targetUS > displayUS + 2000000;
+            // Hysteresis: replace an already chosen frame (dropping it) only
+            // if the newer one is clearly due. Frames due right at the
+            // threshold, with a millisecond or two of jitter, otherwise got
+            // dropped and then repeated (a hitch at 60 fps on 60 Hz).
+            if (due && haveChosen && front.targetUS && front.targetUS <= displayUS + 2000000
+                && front.targetUS > displayUS + slackUS - slackUS / 2)
+                due = false;
             if (!due)
                 break;
             if (haveChosen)
