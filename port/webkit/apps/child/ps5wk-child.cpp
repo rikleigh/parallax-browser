@@ -140,6 +140,22 @@ static void setupEnvironment()
     setenv("GIO_USE_VFS", "local", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
     setenv("TZ", "UTC", 0);
+    setenv("ICU_DATA", "/data/ps5webkit/share/icu", 0); // icudt76l.dat (ICU stub data linked)
+    // Optional overrides for debugging, one KEY=VALUE per line (e.g.
+    // WEBKIT_DEBUG=Network,Loading,IPC). Read last, so they win.
+    if (FILE* f = fopen("/data/ps5webkit/child.env", "r")) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            char* eq = strchr(line, '=');
+            if (line[0] == '#' || !eq)
+                continue;
+            *eq = 0;
+            setenv(line, eq + 1, 1);
+            LOG("env %s=%s", line, eq + 1);
+        }
+        fclose(f);
+    }
 }
 
 struct MainArgs {

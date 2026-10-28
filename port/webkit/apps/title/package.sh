@@ -62,6 +62,7 @@ for tok in $cmd; do
     case "$tok" in
         *.o|*.a) [[ $tok = /* ]] || tok="$BLD/$tok"; inputs+=("$tok") ;;
         -l*|-L*) inputs+=("$tok") ;;
+        -Wl,--wrap=*) IFS=, read -ra w <<< "${tok#-Wl,}"; inputs+=("${w[@]}") ;; # ps5compat libkernel fixes
     esac
 done
 # libc++ 19 is already in the list (CMAKE_CXX_STANDARD_LIBRARIES); drop the

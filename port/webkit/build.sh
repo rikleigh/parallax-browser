@@ -97,7 +97,15 @@ step_shim() {
       prospero-clang -O2 -fPIC -ffunction-sections -fdata-sections -I"$SHIM/include" \
           -c "$SHIM/ps5shim.c" -o "$BLD/shim/ps5shim.o"
       rm -f "$BLD/shim/libps5shim.a"
-      prospero-ar rcs "$BLD/shim/libps5shim.a" "$BLD/shim/ps5shim.o" )
+      prospero-ar rcs "$BLD/shim/libps5shim.a" "$BLD/shim/ps5shim.o"
+      # ICU's stub data library: the 32 MB of ICU data stay out of the ELFs
+      # (elfldr refused a 125 MB payload image) and are read from
+      # $ICU_DATA/icudt76l.dat on the console (/data/ps5webkit/share/icu).
+      local icusrc="$ROOT/toolchain/icu/src-76.1/icu/source"
+      prospero-clang++ -O2 -fPIC -nostdinc++ -isystem "$LIBCXX/include/c++/v1" -DU_STATIC_IMPLEMENTATION \
+          -I"$icusrc/common" -I"$ICU/include" -c "$icusrc/stubdata/stubdata.cpp" -o "$BLD/shim/icustubdata.o"
+      rm -f "$BLD/shim/libicudata-stub.a"
+      prospero-ar rcs "$BLD/shim/libicudata-stub.a" "$BLD/shim/icustubdata.o" )
 }
 
 # ---------------------------------------------------------------- configure
@@ -112,7 +120,7 @@ WEBKIT_OPTIONS=(
     -DUSE_SKIA=ON -DUSE_GBM=OFF -DUSE_LIBDRM=OFF -DUSE_VULKAN=OFF
     -DENABLE_JIT=OFF -DENABLE_DFG_JIT=OFF -DENABLE_FTL_JIT=OFF -DENABLE_C_LOOP=OFF
     -DENABLE_WEBASSEMBLY=OFF -DENABLE_SAMPLING_PROFILER=OFF -DENABLE_REMOTE_INSPECTOR=OFF
-    -DENABLE_RESOURCE_USAGE=OFF -DENABLE_MEMORY_SAMPLER=OFF
+    -DENABLE_RESOURCE_USAGE=OFF -DENABLE_MEMORY_SAMPLER=OFF -DENABLE_RELEASE_LOG=ON
     -DUSE_SYSTEM_MALLOC=OFF
     -DENABLE_WEBGL=OFF -DENABLE_WEBGPU=OFF -DENABLE_WEBXR=OFF -DENABLE_GPU_PROCESS=OFF
     -DUSE_GSTREAMER=OFF -DENABLE_VIDEO=OFF -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
@@ -156,7 +164,7 @@ step_configure() {
     # find modules only name the top-level archives.
     local depslibs=""
     [ -z "${FAKE_DEPS:-}" ] && depslibs="$("$PKGCONFIG" --libs gio-unix-2.0 gioopenssl libsoup-3.0 fontconfig freetype2 \
-        harfbuzz-icu libxml-2.0 sqlite3 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl)"
+        harfbuzz-icu libxml-2.0 sqlite3 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl | sed 's/ -licudata//g')"
     ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
       export PKG_CONFIG="$pc"
       cmake -G Ninja -S "$SRC" -B "$BLD" \
@@ -171,7 +179,7 @@ step_configure() {
         -DICU_ROOT="$ICU" -DICU_INCLUDE_DIR="$ICU/include" \
         -DICU_UC_LIBRARY_RELEASE="$ICU/lib/libicuuc.a" \
         -DICU_I18N_LIBRARY_RELEASE="$ICU/lib/libicui18n.a" \
-        -DICU_DATA_LIBRARY_RELEASE="$ICU/lib/libicudata.a" \
+        -DICU_DATA_LIBRARY_RELEASE="$BLD/shim/libicudata-stub.a" \
         ${EXTRA_CMAKE_ARGS:-} ) 2>&1 | tee "$WK/configure.log" | grep -E "^-- (Enabled|  |Could)|Error|error|Missing|not found|NOT" | head -80
     [ -f "$BLD/build.ninja" ] && echo "configure: OK" || { echo "configure: FAILED (see $WK/configure.log)"; return 1; }
 }

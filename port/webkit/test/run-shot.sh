@@ -29,13 +29,18 @@ prospero-strip -o "$OUTD/stripped/ps5wk-child.elf" "$CHILD"
 prospero-strip -o "$OUTD/stripped/ps5wk-shot.elf" "$SHOT"
 ls -la "$OUTD/stripped"
 
+ICUDAT="$ROOT/toolchain/icu/src-76.1/icu/source/data/in/icudt76l.dat"
+if ! curl -s --max-time 5 "$FTP/data/ps5webkit/share/icu/" | grep -q icudt76l.dat; then
+    echo "==> uploading ICU data to /data/ps5webkit/share/icu/"
+    curl -s --ftp-create-dirs -T "$ICUDAT" "$FTP/data/ps5webkit/share/icu/icudt76l.dat"
+fi
 if [[ -z ${SKIP_UPLOAD:-} ]]; then
     echo "==> uploading ps5wk-child.elf to /data/ps5webkit/ (FTP)"
     curl -s --ftp-create-dirs -T "$OUTD/stripped/ps5wk-child.elf" "$FTP/data/ps5webkit/ps5wk-child.elf"
 fi
 
 echo "==> ps5wk-shot $URL (timeout $TIMEOUT s)" | tee "$LOG"
-{ cat "$OUTD/stripped/ps5wk-shot.elf"; printf 'url=%s timeout=%s\n' "$URL" "$TIMEOUT"; } |
+{ cat "$OUTD/stripped/ps5wk-shot.elf"; printf 'url=%s timeout=%s %s\n' "$URL" "$TIMEOUT" "${SHOT_DEBUG:+debug=$SHOT_DEBUG}"; } |
     socat -t $((TIMEOUT + 60)) -T $((TIMEOUT + 60)) - "TCP:$PS5_HOST:$PS5_PORT" 2>&1 | tee -a "$LOG" | grep -v '^THUMB ' || true
 
 grep '^THUMB ' "$LOG" | cut -c7- | tr -d '\n' | base64 -D > "$OUTD/$STAMP.ppm" 2>/dev/null || true

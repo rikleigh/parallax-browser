@@ -103,16 +103,23 @@ static bool writeAll(int fd, const void* data, size_t size)
     return true;
 }
 
-static gpointer uploadThread(gpointer data)
-{
-    std::unique_ptr<UploadJob> job(static_cast<UploadJob*>(data));
-    const char* tag = job->tag.c_str();
-    gint64 t0 = g_get_monotonic_time();
+// elfldr takes one payload at a time: two concurrent uploads left the second
+// payload with unapplied relocations (SIGSEGV in a static initializer), and
+// a spawn right after another one can fail with "Error spawning payload"
+// (2026-10-28). Uploads are serialized, the next one waits until the
+// previous payload has printed its first line (it is running) or 10 s, and
+// a refused spawn is retried.
+static GMutex s_uploadLock;
 
-    int elf = open(job->elfPath.c_str(), O_RDONLY);
+// Connects to elfldr and sends the ELF plus the header line. Returns the
+// connection (the payload's stdout) or -1.
+static int sendToElfldr(const UploadJob& job, const char* tag)
+{
+    gint64 t0 = g_get_monotonic_time();
+    int elf = open(job.elfPath.c_str(), O_RDONLY);
     if (elf < 0) {
-        g_warning("[ps5-launch %s] cannot open child ELF %s: errno %d", tag, job->elfPath.c_str(), errno);
-        return nullptr;
+        g_warning("[ps5-launch %s] cannot open child ELF %s: errno %d", tag, job.elfPath.c_str(), errno);
+        return -1;
     }
     struct sockaddr_in address { };
     address.sin_family = AF_INET;
@@ -124,9 +131,8 @@ static gpointer uploadThread(gpointer data)
         if (s >= 0)
             close(s);
         close(elf);
-        return nullptr;
+        return -1;
     }
-
     static char chunk[1 << 20];
     size_t total = 0;
     bool ok = true;
@@ -143,21 +149,61 @@ static gpointer uploadThread(gpointer data)
         total += static_cast<size_t>(n);
     }
     close(elf);
-    ok = ok && writeAll(s, job->header.c_str(), job->header.length());
+    ok = ok && writeAll(s, job.header.c_str(), job.header.length());
     PS5_LOG("[ps5-launch %s] sent %zu bytes + header to elfldr in %.0f ms%s", tag, total,
         (g_get_monotonic_time() - t0) / 1000.0, ok ? "" : " (write failed)");
+    if (!ok) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+static gpointer uploadThread(gpointer data)
+{
+    std::unique_ptr<UploadJob> job(static_cast<UploadJob*>(data));
+    const char* tag = job->tag.c_str();
+    gint64 t0 = g_get_monotonic_time();
+    char line[2048];
+    size_t used = 0;
+    int s = -1;
+
+    g_mutex_lock(&s_uploadLock);
+    for (int attempt = 1; attempt <= 6 && s < 0; attempt++) {
+        s = sendToElfldr(*job, tag);
+        if (s < 0)
+            break;
+        // Wait for the payload's first output: it is running, or elfldr
+        // refused the spawn.
+        struct pollfd p { s, POLLIN, 0 };
+        if (poll(&p, 1, 10000) != 1)
+            break; // silent but maybe alive; relay whatever comes
+        ssize_t n = read(s, line, sizeof(line) - 1);
+        if (n <= 0) {
+            close(s);
+            s = -1;
+            g_warning("[ps5-launch %s] payload closed its output at once (attempt %d)", tag, attempt);
+            break;
+        }
+        line[n] = 0;
+        if (strstr(line, "Error spawning payload")) {
+            close(s);
+            s = -1;
+            g_warning("[ps5-launch %s] elfldr: Error spawning payload (attempt %d); retrying", tag, attempt);
+            g_usleep(attempt * 1000 * 1000);
+            continue;
+        }
+        used = static_cast<size_t>(n);
+    }
+    g_mutex_unlock(&s_uploadLock);
+    if (s < 0) {
+        g_warning("[ps5-launch %s] launch failed", tag);
+        return nullptr;
+    }
 
     // The payload's stdout/stderr come back on this connection: relay them
     // to our log, line by line, until the payload exits.
-    char line[2048];
-    size_t used = 0;
     for (;;) {
-        ssize_t n = read(s, line + used, sizeof(line) - 1 - used);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            break;
-        used += static_cast<size_t>(n);
         line[used] = 0;
         char* start = line;
         for (char* nl; (nl = strchr(start, '\n')); start = nl + 1) {
@@ -171,6 +217,12 @@ static gpointer uploadThread(gpointer data)
             fprintf(stderr, "[%s] %s\n", tag, line);
             used = 0;
         }
+        ssize_t n = read(s, line + used, sizeof(line) - 1 - used);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        used += static_cast<size_t>(n);
     }
     if (used) {
         line[used] = 0;

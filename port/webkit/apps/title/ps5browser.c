@@ -164,6 +164,7 @@ int main(void)
     setenv("HOME", "/data/ps5webkit/home", 0);
     setenv("XDG_RUNTIME_DIR", "/data/ps5webkit/home", 0);
     setenv("GIO_USE_VFS", "local", 0);
+    setenv("ICU_DATA", "/data/ps5webkit/share/icu", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
     g_io_openssl_load(NULL);
 

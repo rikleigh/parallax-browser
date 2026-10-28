@@ -1,0 +1,63 @@
+diff --git a/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp b/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp
+index 0031d7feeb..cd660044a9 100644
+--- a/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp
++++ b/Source/WebKit/Platform/IPC/unix/ConnectionUnix.cpp
+@@ -135,7 +135,7 @@ bool Connection::processMessage()
+     memcpySpan(asMutableByteSpan(messageInfo), consumeSpan(messageData, sizeof(messageInfo)));
+ 
+     if (messageInfo.attachmentCount() > attachmentMaxAmount || (!messageInfo.isBodyOutOfLine() && messageInfo.bodySize() > messageMaxSize)) {
+-        ASSERT_NOT_REACHED();
++        SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
+         return false;
+     }
+ 
+@@ -171,20 +171,20 @@ bool Connection::processMessage()
+         ASSERT(messageInfo.bodySize());
+ 
+         if (attachmentInfo[attachmentCount].isNull()) {
+-            ASSERT_NOT_REACHED();
++            SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
+             return false;
+         }
+ 
+         auto fd = UnixFileDescriptor { m_fileDescriptors[attachmentFileDescriptorCount - 1], UnixFileDescriptor::Adopt };
+         if (!fd) {
+-            ASSERT_NOT_REACHED();
++            SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
+             return false;
+         }
+ 
+         auto handle = WebCore::SharedMemory::Handle { WTF::move(fd), messageInfo.bodySize() };
+         oolMessageBody = WebCore::SharedMemory::map(WTF::move(handle), WebCore::SharedMemory::Protection::ReadOnly);
+         if (!oolMessageBody) {
+-            ASSERT_NOT_REACHED();
++            SAFE_WTFLOGALWAYS("IPC processMessage: malformed message in process %d (line %d)", getpid(), __LINE__);
+             return false;
+         }
+     }
+@@ -253,6 +253,8 @@ static ssize_t readBytesFromSocket(int socketDescriptor, Vector<uint8_t>& buffer
+         }
+ 
+         if (message.msg_flags & MSG_CTRUNC) {
++            SAFE_WTFLOGALWAYS("IPC: control data truncated (MSG_CTRUNC) on socket %d in process %d", socketDescriptor, getpid());
++            errno = EBADMSG;
+             // Control data has been discarded, which is expected by processMessage(), so consider this a read failure.
+             buffer.shrink(previousBufferSize);
+             return -1;
+@@ -298,6 +300,7 @@ void Connection::readyReadHandler()
+                 return;
+ 
+             if (errno == ECONNRESET) {
++                SAFE_WTFLOGALWAYS("IPC: connection reset on socket %d in process %d", socketDescriptor(), getpid());
+                 connectionDidClose();
+                 return;
+             }
+@@ -310,6 +313,8 @@ void Connection::readyReadHandler()
+         }
+ 
+         if (!bytesRead) {
++            if (m_readBuffer.size() >= m_readBuffer.capacity())
++                SAFE_WTFLOGALWAYS("IPC: read buffer full (%zu bytes of unprocessed messages) on socket %d in process %d; closing", m_readBuffer.size(), socketDescriptor(), getpid());
+             connectionDidClose();
+             return;
+         }

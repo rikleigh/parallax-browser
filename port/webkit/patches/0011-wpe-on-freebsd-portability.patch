@@ -1,3 +1,19 @@
+diff --git a/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp b/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
+index c8fae2687c..88b9d6e9ef 100644
+--- a/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
+@@ -261,7 +261,10 @@ size_t StructureMemoryManager::computePreferredStructureHeapReservationSize()
+     static std::once_flag onceKey;
+     std::call_once(onceKey, [] {
+         size_t baseSize { 0 };
+-#if PLATFORM(PLAYSTATION) || OS(QNX)
++#if PLATFORM(PLAYSTATION) || OS(QNX) || defined(PS5_PAYLOAD_SDK)
++        // PS5 payloads: a 4 GB reservation (8 GB while aligning) costs CPU
++        // page tables, a small system-wide pool (8192); three WebKit
++        // processes exhausted it and every later mmap failed (2026-10-28).
+         baseSize = 128 * MB;
+ #elif (PLATFORM(IOS_FAMILY) && !CPU(ARM64E)) || PLATFORM(WATCHOS) || PLATFORM(APPLETV)
+         baseSize = 512 * MB;
 diff --git a/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp b/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
 index 6b2f079bd7..12e8f7de19 100644
 --- a/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp

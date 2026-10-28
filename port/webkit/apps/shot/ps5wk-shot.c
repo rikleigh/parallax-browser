@@ -73,6 +73,8 @@ static void readArguments(void)
             width = atoi(token + 6);
         else if (!strncmp(token, "height=", 7))
             height = atoi(token + 7);
+        else if (!strncmp(token, "debug=", 6))
+            setenv("WEBKIT_DEBUG", token + 6, 1); // also reaches the NetworkProcess (creation parameters)
     }
 }
 
@@ -236,6 +238,7 @@ int main(void)
     setenv("HOME", "/data/ps5webkit/home", 0);
     setenv("XDG_RUNTIME_DIR", "/system_tmp/ps5wk", 0);
     setenv("GIO_USE_VFS", "local", 0);
+    setenv("ICU_DATA", "/data/ps5webkit/share/icu", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
     g_io_openssl_load(NULL);
 
