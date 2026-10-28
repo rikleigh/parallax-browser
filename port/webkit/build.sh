@@ -115,7 +115,7 @@ WEBKIT_OPTIONS=(
     -DENABLE_RESOURCE_USAGE=OFF -DENABLE_MEMORY_SAMPLER=OFF
     -DUSE_SYSTEM_MALLOC=OFF
     -DENABLE_WEBGL=OFF -DENABLE_WEBGPU=OFF -DENABLE_WEBXR=OFF -DENABLE_GPU_PROCESS=OFF
-    -DENABLE_VIDEO=OFF -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
+    -DUSE_GSTREAMER=OFF -DENABLE_VIDEO=OFF -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
     -DENABLE_WEB_CODECS=OFF -DENABLE_MEDIA_RECORDER=OFF -DENABLE_MEDIA_SESSION=OFF
     -DENABLE_ENCRYPTED_MEDIA=OFF -DENABLE_THUNDER=OFF -DUSE_EXTERNAL_HOLEPUNCH=OFF
     -DENABLE_GAMEPAD=OFF -DENABLE_SPEECH_SYNTHESIS=OFF -DENABLE_SPELLCHECK=OFF
@@ -126,7 +126,7 @@ WEBKIT_OPTIONS=(
     -DUSE_LIBBACKTRACE=OFF -DUSE_ATK=OFF -DUSE_AVIF=OFF -DUSE_LCMS=OFF -DUSE_JPEGXL=OFF
     -DUSE_LIBHYPHEN=OFF -DUSE_FLITE=OFF -DUSE_LIBSECRET=OFF
     -DUSE_SYSPROF_CAPTURE=OFF -DUSE_SYSTEM_SYSPROF_CAPTURE=OFF
-    -DUSE_OPENSSL=ON -DUSE_WOFF2="${USE_WOFF2:-OFF}"
+    -DUSE_SKIA_OPENTYPE_SVG=OFF -DUSE_OPENSSL=ON -DUSE_WOFF2="${USE_WOFF2:-OFF}"
     -DENABLE_MINIBROWSER=OFF -DENABLE_API_TESTS=OFF -DENABLE_LAYOUT_TESTS=OFF -DENABLE_TOOLS=OFF
     -DUSE_SYSTEM_UNIFDEF=ON
     -DLD_PACK_RELATIVE_RELOCS=OFF
@@ -144,13 +144,20 @@ step_configure() {
     # SDK's file plus search paths.
     local depstc
     depstc="$(ls "$ROOT"/port/deps/*.cmake 2>/dev/null | head -1 || true)"
-    [ -n "$depstc" ] && tc="$depstc"
+    [ -n "$depstc" ] && [ -z "${FAKE_DEPS:-}" ] && tc="$depstc"
+    # FAKE_DEPS=1: placeholder epoxy/xkbcommon (headers that #error), so
+    # configure completes and JSC/WTF/bmalloc build while port/deps finishes.
+    local roots="$SYSROOT;$ICU" pc="$PKGCONFIG"
+    if [ -n "${FAKE_DEPS:-}" ]; then
+        roots="$roots;$WK/fake"; pc="$WK/fake/pkg-config"
+        EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS:-} -DEpoxy_INCLUDE_DIR=$WK/fake/include -DEpoxy_LIBRARY=$WK/fake/lib/libepoxy.a"
+    fi
     ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
-      export PKG_CONFIG="$PKGCONFIG"
+      export PKG_CONFIG="$pc"
       cmake -G Ninja -S "$SRC" -B "$BLD" \
         -DCMAKE_TOOLCHAIN_FILE="$tc" \
-        -DCMAKE_FIND_ROOT_PATH="$SYSROOT;$ICU" -DCMAKE_PREFIX_PATH="$SYSROOT" \
-        -DPKG_CONFIG_EXECUTABLE="$PKGCONFIG" -DPS5_PORT_DIR="$HERE" -DPS5WK_LOG_HOST="$PS5WK_LOG_HOST" -DPS5WK_LOG_PORT="$PS5WK_LOG_PORT" \
+        -DCMAKE_FIND_ROOT_PATH="$roots" -DCMAKE_PREFIX_PATH="$SYSROOT" \
+        -DPKG_CONFIG_EXECUTABLE="$pc" -DPS5_PORT_DIR="$HERE" -DPS5WK_LOG_HOST="$PS5WK_LOG_HOST" -DPS5WK_LOG_PORT="$PS5WK_LOG_PORT" \
         "${WEBKIT_OPTIONS[@]}" \
         -DCMAKE_C_FLAGS="$cflags" -DCMAKE_CXX_FLAGS="$cxxflags" \
         -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
@@ -169,8 +176,11 @@ step_build() {
     local targets="${NINJA_TARGETS:-}"
     log "ninja -j$JOBS ${targets:-<all>}"
     local t0=$(date +%s)
-    ninja -C "$BLD" -j"$JOBS" ${NINJA_FLAGS:-} $targets 2>&1 | tee "$WK/ninja.log" | grep -vE '^\[[0-9]+/[0-9]+\] ' | tail -60
-    local rc=${PIPESTATUS[0]}
+    set +e
+    ninja -C "$BLD" -j"$JOBS" ${NINJA_FLAGS:-} $targets > "$WK/ninja.log" 2>&1
+    local rc=$?
+    set -e
+    grep -E "error:|FAILED|undefined symbol" "$WK/ninja.log" | head -40
     echo "ninja exit $rc after $(( $(date +%s) - t0 )) s" | tee -a "$WK/build-times.log"
     return "$rc"
 }

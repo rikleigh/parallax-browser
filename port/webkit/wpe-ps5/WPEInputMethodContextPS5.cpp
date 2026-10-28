@@ -21,7 +21,7 @@
 #include "WPEPS5Private.h"
 #include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/WTFGType.h>
-#include <wtf/text/CString.h>
+#include <string>
 
 // Text input through the system keyboard (libSceImeDialog). WebKit focuses
 // this context when an editable element gets focus. The keyboard opens:
@@ -36,7 +36,7 @@ G_DECLARE_FINAL_TYPE(WPEInputMethodContextPS5, wpe_input_method_context_ps5, WPE
 
 struct _WPEInputMethodContextPS5Private {
     bool focused { false };
-    CString surrounding;
+    std::string surrounding;
     guint cursorIndex { 0 };
     bool waiting { false };
 };
@@ -65,7 +65,7 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
     auto purpose = wpe_input_method_context_get_input_purpose(context);
     bool url = purpose == WPE_INPUT_PURPOSE_URL;
     const char* title = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "Password" : url ? "Address" : purpose == WPE_INPUT_PURPOSE_SEARCH ? "Search" : "Text";
-    const char* initial = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "" : priv->surrounding.data();
+    const char* initial = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "" : priv->surrounding.c_str();
 
     g_object_ref(context);
     priv->waiting = wpe_display_ps5_request_text(display, title, initial, url, [](const char* text, gpointer userData) {
@@ -76,8 +76,8 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
             bool replace = wpe_input_method_context_get_input_purpose(context) != WPE_INPUT_PURPOSE_PASSWORD;
             if (replace && priv->surrounding.length()) {
                 // Replace the whole surrounding text with the dialog's result.
-                glong before = utf16Length(priv->surrounding.data(), priv->cursorIndex);
-                glong total = utf16Length(priv->surrounding.data(), priv->surrounding.length());
+                glong before = utf16Length(priv->surrounding.c_str(), priv->cursorIndex);
+                glong total = utf16Length(priv->surrounding.c_str(), priv->surrounding.length());
                 g_signal_emit_by_name(context, "delete-surrounding", static_cast<int>(-before), static_cast<guint>(total));
             }
             g_signal_emit_by_name(context, "committed", text);
@@ -142,7 +142,7 @@ static void wpeInputMethodContextPS5FocusOut(WPEInputMethodContext* context)
 static void wpeInputMethodContextPS5SetSurrounding(WPEInputMethodContext* context, const gchar* text, guint length, guint cursorIndex, guint)
 {
     auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
-    priv->surrounding = CString(std::span<const char>(text ? text : "", text ? length : 0));
+    priv->surrounding.assign(text ? text : "", text ? length : 0);
     priv->cursorIndex = std::min<guint>(cursorIndex, length);
 }
 

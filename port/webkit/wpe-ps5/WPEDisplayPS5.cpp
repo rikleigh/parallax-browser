@@ -30,7 +30,7 @@
 #include <wtf/glib/RunLoopSourcePriority.h>
 #include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/WTFGType.h>
-#include <wtf/text/CString.h>
+#include <string>
 
 /**
  * WPEDisplayPS5:
@@ -99,8 +99,8 @@ struct _WPEDisplayPS5Private {
     std::unique_ptr<PendingText> pendingText;
 
     GRefPtr<WPEProcessManager> processManager;
-    CString childELF;
-    CString logHost;
+    std::string childELF;
+    std::string logHost;
     int logPort { 0 };
 };
 WEBKIT_DEFINE_FINAL_TYPE_WITH_CODE(WPEDisplayPS5, wpe_display_ps5, WPE_TYPE_DISPLAY, WPEDisplay,
@@ -227,7 +227,7 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
         return FALSE;
     }
 
-    auto pending = makeUnique<PendingText>();
+    auto pending = std::make_unique<PendingText>();
     pending->callback = callback;
     pending->userData = userData;
     utf8ToUTF16(initialText, pending->buffer, G_N_ELEMENTS(pending->buffer));
@@ -498,7 +498,7 @@ static gboolean wpeDisplayPS5Connect(WPEDisplay* display, GError** error)
     g_source_attach(priv->padSource.get(), g_main_context_get_thread_default());
 
     // WebProcess and NetworkProcess are elfldr payloads (FEASIBILITY §4.8).
-    priv->processManager = adoptGRef(wpe_process_manager_ps5_new(priv->childELF.data()));
+    priv->processManager = adoptGRef(wpe_process_manager_ps5_new(priv->childELF.c_str()));
     wpe_process_manager_set_default(priv->processManager.get());
 
     PS5_LOG("display connected: %dx%d, pad %d", width, height, priv->pad);
@@ -568,7 +568,7 @@ WPEDisplay* wpe_display_ps5_new(void)
 void wpe_display_ps5_set_child_elf(WPEDisplayPS5* display, const char* path)
 {
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
-    display->priv->childELF = path;
+    display->priv->childELF = path ? path : "";
     if (display->priv->processManager)
         wpe_process_manager_ps5_set_child_elf(display->priv->processManager.get(), path);
 }
@@ -576,6 +576,6 @@ void wpe_display_ps5_set_child_elf(WPEDisplayPS5* display, const char* path)
 void wpe_display_ps5_set_log_sink(WPEDisplayPS5* display, const char* host, int port)
 {
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
-    display->priv->logHost = host;
+    display->priv->logHost = host ? host : "";
     display->priv->logPort = port;
 }

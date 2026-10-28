@@ -1,0 +1,162 @@
+diff --git a/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp b/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
+index 6b2f079bd7..12e8f7de19 100644
+--- a/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
++++ b/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
+@@ -15,6 +15,8 @@
+ 
+ #if defined(SK_BUILD_FOR_MAC) || defined(SK_BUILD_FOR_IOS)
+ #include <malloc/malloc.h>
++#elif defined(__FreeBSD__)
++#include <malloc_np.h> // malloc_usable_size; <malloc.h> is an #error stub
+ #elif defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_UNIX)
+ #include <malloc.h>
+ #elif defined(SK_BUILD_FOR_WIN)
+diff --git a/Source/WTF/wtf/PlatformWPE.cmake b/Source/WTF/wtf/PlatformWPE.cmake
+index ebc66aa1f9..7e7f44dfdd 100644
+--- a/Source/WTF/wtf/PlatformWPE.cmake
++++ b/Source/WTF/wtf/PlatformWPE.cmake
+@@ -19,9 +19,6 @@ list(APPEND WTF_SOURCES
+     glib/TimeZoneGLib.cpp
+     glib/URLGLib.cpp
+ 
+-    linux/CurrentProcessMemoryStatus.cpp
+-    linux/HighPriorityThreads.cpp
+-
+     posix/CPUTimePOSIX.cpp
+     posix/FileHandlePOSIX.cpp
+     posix/FileSystemPOSIX.cpp
+@@ -38,11 +35,23 @@ list(APPEND WTF_SOURCES
+ 
+ if (ANDROID)
+     list(APPEND WTF_SOURCES
++        linux/CurrentProcessMemoryStatus.cpp
++        linux/HighPriorityThreads.cpp
++
+         generic/MemoryFootprintGeneric.cpp
+         generic/MemoryPressureHandlerGeneric.cpp
+     )
++elseif (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
++    # As PlatformGTK.cmake: no /proc memory status or SCHED_RR threads.
++    list(APPEND WTF_SOURCES
++        generic/MemoryFootprintGeneric.cpp
++
++        unix/MemoryPressureHandlerUnix.cpp
++    )
+ else ()
+     list(APPEND WTF_SOURCES
++        linux/CurrentProcessMemoryStatus.cpp
++        linux/HighPriorityThreads.cpp
+         linux/MemoryFootprintLinux.cpp
+ 
+         unix/MemoryPressureHandlerUnix.cpp
+diff --git a/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp b/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
+index 61c33bf761..bf0879c2aa 100644
+--- a/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
++++ b/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
+@@ -24,6 +24,8 @@
+  */
+ 
+ #include "config.h"
++
++#if ENABLE(VIDEO)
+ #include "JSHTMLMediaElement.h"
+ 
+ #include "TrackOpaqueRoot.h"
+@@ -40,3 +42,5 @@ void JSHTMLMediaElement::visitAdditionalChildrenInGCThread(Visitor& visitor)
+ DEFINE_VISIT_ADDITIONAL_CHILDREN_IN_GC_THREAD(JSHTMLMediaElement);
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(VIDEO)
+diff --git a/Source/WebCore/page/text-extraction/TextExtraction.cpp b/Source/WebCore/page/text-extraction/TextExtraction.cpp
+index 1a8a443a00..cdc5199f0e 100644
+--- a/Source/WebCore/page/text-extraction/TextExtraction.cpp
++++ b/Source/WebCore/page/text-extraction/TextExtraction.cpp
+@@ -981,12 +981,14 @@ static inline Variant<SkipExtraction, ItemData, URL, Editable> extractItemData(N
+     if (is<HTMLCanvasElement>(element))
+         return { ItemData { ContainerType::Canvas } };
+ 
++#if ENABLE(VIDEO)
+     if (RefPtr media = dynamicDowncast<HTMLMediaElement>(element)) {
+         return { MediaItemData {
+             .type = is<HTMLVideoElement>(*media) ? MediaType::Video : MediaType::Audio,
+             .hasControls = media->controls(),
+         } };
+     }
++#endif
+ 
+     if (CheckedPtr box = dynamicDowncast<RenderBox>(node.renderer()); box && box->canBeScrolledAndHasScrollableArea()) {
+         if (CheckedPtr layer = box->layer()) {
+diff --git a/Source/WebCore/platform/MediaSamplesDecoder.cpp b/Source/WebCore/platform/MediaSamplesDecoder.cpp
+index dc6aec8548..03e948a71a 100644
+--- a/Source/WebCore/platform/MediaSamplesDecoder.cpp
++++ b/Source/WebCore/platform/MediaSamplesDecoder.cpp
+@@ -24,6 +24,8 @@
+  */
+ 
+ #include "config.h"
++
++#if ENABLE(VIDEO)
+ #include "MediaSamplesDecoder.h"
+ 
+ #include "AV1Utilities.h"
+@@ -723,3 +725,5 @@ void MediaSamplesDecoder::didDecodeVideo(Ref<VideoFrame>&& frame, int64_t sequen
+ }
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(VIDEO)
+diff --git a/Source/WebCore/platform/PacedMediaSamplesDecoder.cpp b/Source/WebCore/platform/PacedMediaSamplesDecoder.cpp
+index 6feb030b54..893baef343 100644
+--- a/Source/WebCore/platform/PacedMediaSamplesDecoder.cpp
++++ b/Source/WebCore/platform/PacedMediaSamplesDecoder.cpp
+@@ -24,6 +24,8 @@
+  */
+ 
+ #include "config.h"
++
++#if ENABLE(VIDEO)
+ #include "PacedMediaSamplesDecoder.h"
+ 
+ #include "TrackInfo.h"
+@@ -383,3 +385,5 @@ void PacedMediaSamplesDecoder::updateReadiness()
+ }
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(VIDEO)
+diff --git a/Source/WebCore/platform/audio/PlatformRawAudioData.cpp b/Source/WebCore/platform/audio/PlatformRawAudioData.cpp
+index 08a4f6c814..82196f33c3 100644
+--- a/Source/WebCore/platform/audio/PlatformRawAudioData.cpp
++++ b/Source/WebCore/platform/audio/PlatformRawAudioData.cpp
+@@ -18,6 +18,8 @@
+  */
+ 
+ #include "config.h"
++
++#if ENABLE(VIDEO)
+ #include "PlatformRawAudioData.h"
+ 
+ #include "AudioSampleFormat.h"
+@@ -63,3 +65,5 @@ void PlatformRawAudioData::copyToInterleaved(PlaneData source, std::span<uint8_t
+ }
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(VIDEO)
+diff --git a/Source/WebCore/platform/network/DNS.cpp b/Source/WebCore/platform/network/DNS.cpp
+index bc8629a354..46a73830eb 100644
+--- a/Source/WebCore/platform/network/DNS.cpp
++++ b/Source/WebCore/platform/network/DNS.cpp
+@@ -34,6 +34,11 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/URL.h>
+ 
++#if OS(UNIX)
++#include <netinet/in.h>
++#include <sys/socket.h>
++#endif
++
+ #if PLATFORM(IOS_FAMILY)
+ #include <wtf/cocoa/RuntimeApplicationChecksCocoa.h>
+ #endif

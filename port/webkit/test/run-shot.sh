@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Payload-side first light: upload the child payload to the console (FTP),
+# send ps5wk-shot to elfldr with its arguments on stdin, and decode the
+# thumbnail it prints.
+#
+#   port/webkit/test/run-shot.sh [url] [timeout-s]
+#
+# Output: toolchain/wpe-webkit/shots/<time>.log and .ppm/.png (sips).
+# The ELFs are stripped copies of the build (debug info stays on the Mac).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+. "$ROOT/env.sh" >/dev/null
+. "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
+WK="$ROOT/toolchain/wpe-webkit"
+BLD="${BLD:-$WK/build}"
+URL="${1:-https://example.com/}"
+TIMEOUT="${2:-150}"
+FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
+OUTD="$WK/shots"; mkdir -p "$OUTD"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="$OUTD/$STAMP.log"
+
+find_elf() { for d in "$BLD/bin" "$BLD/ps5-apps"; do [[ -f $d/$1 ]] && { echo "$d/$1"; return; }; done; echo "missing $1" >&2; exit 1; }
+CHILD="$(find_elf ps5wk-child)"
+SHOT="$(find_elf ps5wk-shot)"
+mkdir -p "$OUTD/stripped"
+prospero-strip -o "$OUTD/stripped/ps5wk-child.elf" "$CHILD"
+prospero-strip -o "$OUTD/stripped/ps5wk-shot.elf" "$SHOT"
+ls -la "$OUTD/stripped"
+
+if [[ -z ${SKIP_UPLOAD:-} ]]; then
+    echo "==> uploading ps5wk-child.elf to /data/ps5webkit/ (FTP)"
+    curl -s --ftp-create-dirs -T "$OUTD/stripped/ps5wk-child.elf" "$FTP/data/ps5webkit/ps5wk-child.elf"
+fi
+
+echo "==> ps5wk-shot $URL (timeout $TIMEOUT s)" | tee "$LOG"
+{ cat "$OUTD/stripped/ps5wk-shot.elf"; printf 'url=%s timeout=%s\n' "$URL" "$TIMEOUT"; } |
+    socat -t $((TIMEOUT + 60)) -T $((TIMEOUT + 60)) - "TCP:$PS5_HOST:$PS5_PORT" 2>&1 | tee -a "$LOG" | grep -v '^THUMB ' || true
+
+grep '^THUMB ' "$LOG" | cut -c7- | tr -d '\n' | base64 -D > "$OUTD/$STAMP.ppm" 2>/dev/null || true
+if [[ -s "$OUTD/$STAMP.ppm" ]]; then
+    sips -s format png "$OUTD/$STAMP.ppm" --out "$OUTD/$STAMP.png" >/dev/null 2>&1 || true
+    echo "thumbnail: $OUTD/$STAMP.png"
+fi
+echo "log: $LOG"
+grep '^RESULT' "$LOG" || true

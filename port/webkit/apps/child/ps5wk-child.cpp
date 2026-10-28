@@ -137,8 +137,6 @@ static void setupEnvironment()
     setenv("XDG_CONFIG_HOME", "/data/ps5webkit/home/config", 0);
     setenv("XDG_RUNTIME_DIR", "/system_tmp/ps5wk", 0);
     setenv("TMPDIR", "/system_tmp/ps5wk", 0);
-    setenv("FONTCONFIG_FILE", "/data/ps5webkit/fonts/fonts.conf", 0);
-    setenv("SSL_CERT_FILE", "/data/ps5webkit/cacert.pem", 0);
     setenv("GIO_USE_VFS", "local", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
     setenv("TZ", "UTC", 0);

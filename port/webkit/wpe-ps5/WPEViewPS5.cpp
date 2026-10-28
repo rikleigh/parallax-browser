@@ -64,7 +64,8 @@ static void wpeViewPS5Constructed(GObject* object)
             return;
         }
 
-        int width, height;
+        int width = 0;
+        int height = 0;
         wpe_toplevel_get_size(toplevel, &width, &height);
         if (width && height)
             wpe_view_resized(view, width, height);

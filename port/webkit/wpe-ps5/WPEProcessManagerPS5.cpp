@@ -35,8 +35,7 @@
 #include <wtf/HashMap.h>
 #include <wtf/glib/GRefPtr.h>
 #include <wtf/glib/WTFGType.h>
-#include <wtf/text/CString.h>
-#include <wtf/text/MakeString.h>
+#include <string>
 
 // WebKit's auxiliary processes as elfldr payloads (see PS5LaunchProtocol.h).
 // launch() returns at once; the ELF upload runs on a thread (the WebProcess
@@ -57,8 +56,8 @@ struct PendingLaunch {
 };
 
 struct _WPEProcessManagerPS5Private {
-    CString childELF;
-    CString socketPath;
+    std::string childELF;
+    std::string socketPath;
     int listenFD { -1 };
     guint listenWatch { 0 };
     guint waitDirTimer { 0 };
@@ -84,9 +83,9 @@ static const char* typeName(WPEProcessType type)
 // ---------------------------------------------------- upload + output relay
 
 struct UploadJob {
-    CString elfPath;
-    CString header;
-    CString tag;
+    std::string elfPath;
+    std::string header;
+    std::string tag;
 };
 
 static bool writeAll(int fd, const void* data, size_t size)
@@ -107,12 +106,12 @@ static bool writeAll(int fd, const void* data, size_t size)
 static gpointer uploadThread(gpointer data)
 {
     std::unique_ptr<UploadJob> job(static_cast<UploadJob*>(data));
-    const char* tag = job->tag.data();
+    const char* tag = job->tag.c_str();
     gint64 t0 = g_get_monotonic_time();
 
-    int elf = open(job->elfPath.data(), O_RDONLY);
+    int elf = open(job->elfPath.c_str(), O_RDONLY);
     if (elf < 0) {
-        g_warning("[ps5-launch %s] cannot open child ELF %s: errno %d", tag, job->elfPath.data(), errno);
+        g_warning("[ps5-launch %s] cannot open child ELF %s: errno %d", tag, job->elfPath.c_str(), errno);
         return nullptr;
     }
     struct sockaddr_in address { };
@@ -144,7 +143,7 @@ static gpointer uploadThread(gpointer data)
         total += static_cast<size_t>(n);
     }
     close(elf);
-    ok = ok && writeAll(s, job->header.data(), job->header.length());
+    ok = ok && writeAll(s, job->header.c_str(), job->header.length());
     PS5_LOG("[ps5-launch %s] sent %zu bytes + header to elfldr in %.0f ms%s", tag, total,
         (g_get_monotonic_time() - t0) / 1000.0, ok ? "" : " (write failed)");
 
@@ -248,7 +247,7 @@ static bool bindListener(WPEProcessManagerPS5* manager)
     auto* priv = manager->priv;
     struct sockaddr_un address { };
     address.sun_family = AF_UNIX;
-    g_strlcpy(address.sun_path, priv->socketPath.data(), sizeof(address.sun_path));
+    g_strlcpy(address.sun_path, priv->socketPath.c_str(), sizeof(address.sun_path));
     unlink(address.sun_path);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0 || bind(fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) || listen(fd, 8)) {
@@ -317,7 +316,7 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
     }
     fcntl(ipcFD, F_SETFD, FD_CLOEXEC);
 
-    auto launch = makeUnique<PendingLaunch>();
+    auto launch = std::make_unique<PendingLaunch>();
     launch->handle = priv->nextHandle++;
     launch->processIdentifier = wpe_process_launch_options_get_process_id(options);
     launch->type = type;
@@ -326,10 +325,13 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
 
     auto* job = new UploadJob;
     job->elfPath = priv->childELF;
-    job->header = CString(makeString(PS5WK_LAUNCH_HEADER " "_s, PS5WK_LAUNCH_VERSION, ' ', String::fromLatin1(typeName(type)), ' ',
-        launch->processIdentifier, ' ', String::fromUTF8(priv->socketPath.data()), '\n').utf8());
-    job->tag = CString(makeString(String::fromLatin1(typeName(type)), launch->processIdentifier).utf8());
-    PS5_LOG("[ps5-launch] launching %s process %" G_GUINT64_FORMAT " from %s", typeName(type), launch->processIdentifier, priv->childELF.data());
+    char text[512];
+    snprintf(text, sizeof(text), PS5WK_LAUNCH_HEADER " %d %s %" G_GUINT64_FORMAT " %s\n", PS5WK_LAUNCH_VERSION, typeName(type),
+        launch->processIdentifier, priv->socketPath.c_str());
+    job->header = text;
+    snprintf(text, sizeof(text), "%s%" G_GUINT64_FORMAT, typeName(type), launch->processIdentifier);
+    job->tag = text;
+    PS5_LOG("[ps5-launch] launching %s process %" G_GUINT64_FORMAT " from %s", typeName(type), launch->processIdentifier, priv->childELF.c_str());
 
     ensureListener(manager);
     guint64 handle = launch->handle;
@@ -365,7 +367,7 @@ static void wpeProcessManagerPS5Dispose(GObject* object)
     }
     if (priv->listenFD >= 0) {
         close(priv->listenFD);
-        unlink(priv->socketPath.data());
+        unlink(priv->socketPath.c_str());
         priv->listenFD = -1;
     }
     G_OBJECT_CLASS(wpe_process_manager_ps5_parent_class)->dispose(object);
@@ -384,7 +386,9 @@ WPEProcessManager* wpe_process_manager_ps5_new(const char* childELF)
     auto* manager = WPE_PROCESS_MANAGER_PS5(g_object_new(WPE_TYPE_PROCESS_MANAGER_PS5, nullptr));
     auto* priv = manager->priv;
     priv->childELF = childELF && *childELF ? childELF : "/app0/ps5wk-child.elf";
-    priv->socketPath = CString(makeString(PS5WK_LAUNCH_DIR "/ui-"_s, getpid(), ".sock"_s).utf8());
+    char path[128];
+    snprintf(path, sizeof(path), PS5WK_LAUNCH_DIR "/ui-%d.sock", static_cast<int>(getpid()));
+    priv->socketPath = path;
     // A payload whose title went away gets EPIPE, not a signal; same here.
     signal(SIGPIPE, SIG_IGN);
     return WPE_PROCESS_MANAGER(manager);
