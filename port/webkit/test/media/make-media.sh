@@ -14,6 +14,11 @@
 #   sync-2160p30-hevc.mp4   3840x2160 30 fps HEVC Main (x265 with B-frames), AAC, 30 s  (hardware decoding, step 2b)
 #   sync-2160p30-hevc10.mp4 3840x2160 30 fps HEVC Main10, AAC, 30 s
 #   sync-3840p30-hevc.mp4   7680x3840 30 fps HEVC Main (the 2:1 size of 8K VR video), AAC, 30 s
+#   switch-h264.mp4         H.264 avc3 (parameter sets in band, as BBC News's DASH streams)
+#                           changing size mid-stream: 396x704, 540x960, 1280x720, 396x704,
+#                           5 s each, AAC with the beeps, 20 s; switch-h264.m2ts the same in MPEG-TS
+#   sound-test.m4a          audio only (no video decoder involved): a 440 Hz tone with a
+#                           1760 Hz beep at the start of every second, AAC-LC stereo, 60 s
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -50,9 +55,36 @@ make sync-2160p30-hevc.mp4   3840x2160 30 30 "-c:v libx265 -preset superfast -ta
 make sync-2160p30-hevc10.mp4 3840x2160 30 30 "$HEVC 20M -profile:v main10 -pix_fmt p010le" "$AAC"
 make sync-3840p30-hevc.mp4   7680x3840 30 30 "$HEVC 40M -pix_fmt yuv420p" "$AAC"
 
+# Resolution switches inside one stream (as adaptive players make them):
+# H.264 segments of different sizes with their SPS/PPS in band, in one avc3
+# MP4. h264parse sees each new SPS and renegotiates the decoder mid-stream.
+# No B-frames: raw H.264 carries no timestamps, so pts = dts here.
+if [ ! -s "$OUT/switch-h264.mp4" ]; then
+    tmp="$(mktemp -d)"
+    for size in 396x704 540x960 1280x720 396x704; do
+        $FF -f lavfi -i "testsrc2=size=${size}:rate=30" -vf "drawtext=fontfile=$FONT:fontsize=$(( ${size#*x} / 10 )):fontcolor=white:box=1:boxcolor=black@0.6:x=(w-tw)/2:y=(h-th)/2:text='${size} %{pts\:hms}'" \
+            -t 5 -c:v libx264 -profile:v high -preset veryfast -pix_fmt yuv420p -g 30 -bf 0 -b:v 1M -x264-params repeat-headers=1 -f h264 - >> "$tmp/all.h264"
+    done
+    $FF -r 30 -f h264 -i "$tmp/all.h264" -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000" -map 0:v -map 1:a \
+        -c:v copy -tag:v avc3 -af "volume=2.8,aformat=channel_layouts=stereo" -c:a aac -b:a 96k -t 20 -movflags +faststart "$OUT/switch-h264.mp4"
+    # The same in MPEG-TS: no container size, so the caps follow each SPS
+    # (the decoder sees a new format, as with MSE init segments).
+    $FF -i "$OUT/switch-h264.mp4" -c copy -bsf:v h264_mp4toannexb -f mpegts "$OUT/switch-h264.m2ts"
+    rm -rf "$tmp"
+    echo "  switch-h264.mp4, switch-h264.m2ts"
+fi
+
+# Audio only, for "is there sound at all" checks on the TV (sine is 1/8 of
+# full scale: peak about 0.35).
+if [ ! -s "$OUT/sound-test.m4a" ]; then
+    $FF -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000" -af "volume=2.8,aformat=channel_layouts=stereo" \
+        -t 60 -c:a aac -b:a 128k -movflags +faststart "$OUT/sound-test.m4a"
+    echo "  sound-test.m4a"
+fi
+
 if [ "${1:-}" = --upload ]; then
     FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
-    for f in "$OUT"/*.mp4 "$OUT"/*.webm; do
+    for f in "$OUT"/*.mp4 "$OUT"/*.webm "$OUT"/*.m4a "$OUT"/*.m2ts; do
         echo "  upload $(basename "$f")"
         curl -s --ftp-create-dirs -T "$f" "$FTP/data/ps5webkit/media/$(basename "$f")"
     done

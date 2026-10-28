@@ -659,6 +659,31 @@ childenv=K=V;K=V` (new) sets environment for that run's children only
 (`/data/ps5webkit/child-<pid>.env`), e.g. GST_DEBUG, without touching the
 title's.
 
+**Resolution switches inside a stream (BBC News, found and fixed
+2026-10-28).** In a log-only run, BBC News's embedded H.264 video (dash.js,
+avc3: parameter sets in band) went from 396x704 to 540x960; the title kept
+the decoder (the new size fits the 1920x1088 one) and Videodec2 failed
+every decode call after the switch (960 x rc 0x811d0300, no picture).
+Reproduced with `media/switch-h264.mp4` (make-media.sh: 396x704 -> 540x960
+-> 1280x720 -> 396x704 in one avc3 MP4, 5 s each): 0 pictures after the first
+switch. Videodec2 needs a drain and a reset before a new sequence, even
+one that fits. Two fixes, both drain the pictures of the old format first
+(they are shown) and then `reset` the decoder: the proxy drains (DDRAIN)
+before a DOPEN for another size or depth (GstVideoDecoder doesn't drain on
+new caps); and the title drains and resets by itself when a keyframe brings
+a different SPS (or HEVC VPS/SPS) than the one it decoded, for switches
+whose caps keep the container's size (an MP4 track with in-band SPS).
+Identical repeated SPSs (codec_data's copy plus the in-band one) don't
+count. A decoder that no longer fits is still reopened as before; slots
+follow the existing rules (the drain hands out or releases every picture).
+Checked in the title: `switch-h264.mp4` with seeks (an in-band switch and a
+seek across one) and `switch-h264.m2ts` (MPEG-TS: the caps follow each SPS,
+three proxy drains) play every picture, 0 decode errors (598 of 601 shown,
+1 dropped); YouTube 4K60 with the switch to 2160p and a `seekTo`: 5761
+pictures, 0 errors, ~60 frames/s. Harness (fake decoder):
+`switch-h264.m2ts` at 30 frames/s through the switches. The decoder's
+close line counts `format changes`.
+
 Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
 matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
 draws nothing; two 8K decoders at once won't fit the title's flexible

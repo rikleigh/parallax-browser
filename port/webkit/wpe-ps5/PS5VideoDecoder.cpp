@@ -115,9 +115,11 @@ struct Decoder {
     void* hw { nullptr };
     unsigned codec { 0 }, profile { 0 }, bitDepth { 8 };
     int width { 0 }, height { 0 };
+    uint64_t formatChanges { 0 };
     size_t frameBytes { 0 }, frameAlign { 0 };
     bool needKeyframe { true };
     std::vector<uint8_t> paramSets; // last SPS/PPS(/VPS), Annex-B
+    std::vector<uint8_t> sequenceSets; // the SPS (and VPS) among them
     std::map<uint32_t, int64_t> outstanding; // key -> PTS of AUs without a picture yet
     pthread_t thread { };
     bool threadStarted { false };
@@ -218,6 +220,16 @@ static void sendRefused(Decoder& d, uint32_t key, uint32_t epoch)
 
 // ---------------------------------------------------------------- bitstream
 
+// SPS (H.264), VPS/SPS (HEVC): the sets that describe the sequence (size,
+// profile, reference frames); a PPS may change without a new sequence.
+static bool isSequenceSet(unsigned codec, uint8_t header)
+{
+    if (codec == PS5WK_VCODEC_H264)
+        return (header & 0x1f) == 7;
+    unsigned type = (header >> 1) & 0x3f;
+    return type == 32 || type == 33;
+}
+
 static bool isParamSet(unsigned codec, uint8_t header)
 {
     if (codec == PS5WK_VCODEC_H264) {
@@ -229,7 +241,7 @@ static bool isParamSet(unsigned codec, uint8_t header)
 }
 
 // The parameter-set NAL units of an Annex-B access unit, with 4-byte start codes.
-static std::vector<uint8_t> paramSetsOf(unsigned codec, const uint8_t* p, size_t n)
+static std::vector<uint8_t> paramSetsOf(unsigned codec, const uint8_t* p, size_t n, bool sequenceOnly = false)
 {
     std::vector<uint8_t> out;
     size_t i = 0;
@@ -249,10 +261,14 @@ static std::vector<uint8_t> paramSetsOf(unsigned codec, const uint8_t* p, size_t
         size_t nextLength;
         size_t next = nextStart(i, nextLength);
         size_t end = next < n ? next - nextLength : n;
-        if (end > i && isParamSet(codec, p[i])) {
+        if (end > i && (sequenceOnly ? isSequenceSet(codec, p[i]) : isParamSet(codec, p[i]))) {
             static const uint8_t startCode[4] = { 0, 0, 0, 1 };
-            out.insert(out.end(), startCode, startCode + 4);
-            out.insert(out.end(), p + i, p + end);
+            std::vector<uint8_t> unit(startCode, startCode + 4);
+            unit.insert(unit.end(), p + i, p + end);
+            // The sequence sets once each (codec_data's copy in front of an
+            // identical in-band one is the same sequence).
+            if (!sequenceOnly || std::search(out.begin(), out.end(), unit.begin(), unit.end()) == out.end())
+                out.insert(out.end(), unit.begin(), unit.end());
         }
         i = next;
     }
@@ -502,6 +518,8 @@ static bool decodeUnit(Decoder& d, const uint8_t* data, size_t size, uint64_t pt
     return !rc;
 }
 
+static void drain(Decoder&, uint32_t epoch);
+
 static void processAU(Decoder& d, AccessUnit& au)
 {
     d.aus++;
@@ -537,9 +555,25 @@ static void processAU(Decoder& d, AccessUnit& au)
         return;
     }
     auto sets = paramSetsOf(d.codec, au.data.data(), au.data.size());
-    if (!sets.empty())
+    if (!sets.empty()) {
+        // A new sequence (another SPS: a resolution switch inside the
+        // stream, as adaptive players make them) needs the hardware drained
+        // and reset first: Videodec2 failed every decode call after an
+        // in-band H.264 switch from 396x704 to 540x960 without it
+        // (0x811d0300, BBC News, 2026-10-28), whether or not the caps
+        // changed. Repeated identical SPSs don't count.
+        auto sequence = keyframe ? paramSetsOf(d.codec, sets.data(), sets.size(), true) : std::vector<uint8_t>();
+        if (!sequence.empty()) {
+            if (!d.sequenceSets.empty() && sequence != d.sequenceSets && !d.needKeyframe) {
+                d.formatChanges++;
+                DLOG("decoder %u: new sequence parameters at AU %u: drained and reset (%llu so far)", d.id, au.key,
+                    (unsigned long long)d.formatChanges);
+                drain(d, au.epoch);
+            }
+            d.sequenceSets = std::move(sequence);
+        }
         d.paramSets = std::move(sets);
-    else if (d.needKeyframe && !d.paramSets.empty())
+    } else if (d.needKeyframe && !d.paramSets.empty())
         au.data.insert(au.data.begin(), d.paramSets.begin(), d.paramSets.end());
     d.needKeyframe = false;
     d.outstanding[au.key] = au.ptsNS;
@@ -688,7 +722,8 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
     }
 
     // Same decoder again (caps renegotiated, e.g. a resolution switch): keep
-    // it if it covers the new size.
+    // it if it covers the new size. (The proxy drained it first, which
+    // resets the hardware; a new SPS in band resets it too, see processAU.)
     if (d->hw) {
         if (d->codec == codec && d->profile == profile && d->bitDepth == depth && width <= d->width && height <= d->height) {
             DLOG("decoder %u: %dx%d fits the decoder (%dx%d); kept", d->id, width, height, d->width, d->height);
@@ -747,6 +782,7 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
     d->frameAlign = frameAlign;
     d->needKeyframe = true;
     d->paramSets.clear();
+    d->sequenceSets.clear();
     d->outstanding.clear();
     g_mutex_lock(&d->lock);
     d->slots = std::move(slots);
@@ -879,9 +915,10 @@ void serve(int fd, int pid, int streamID)
     }
 done:
     if (d->id || d->aus) { // a connection that never opened a decoder (no hardware) says nothing
-        DLOG("decoder %u from pid %d closed: %llu AUs (%.1f MB), %llu pictures, %llu hidden, %llu errors (first rc 0x%08x), %llu skipped before a keyframe, %llu refused",
+        DLOG("decoder %u from pid %d closed: %llu AUs (%.1f MB), %llu pictures, %llu hidden, %llu errors (first rc 0x%08x), %llu skipped before a keyframe, %llu refused, %llu format changes",
             d->id, pid, (unsigned long long)d->aus, auBytes / 1048576.0, (unsigned long long)d->pictures, (unsigned long long)d->hidden,
-            (unsigned long long)d->errors, static_cast<unsigned>(d->firstRC), (unsigned long long)d->skipped, (unsigned long long)refused);
+            (unsigned long long)d->errors, static_cast<unsigned>(d->firstRC), (unsigned long long)d->skipped, (unsigned long long)refused,
+            (unsigned long long)d->formatChanges);
     }
     closeHardware(*d);
     d->fd = -1;

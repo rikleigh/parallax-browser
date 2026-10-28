@@ -384,6 +384,8 @@ static void parse_codec_data(GstPs5VdecProxy *self, guint codec, GstBuffer *code
     gst_buffer_unmap(codec_data, &map);
 }
 
+static GstFlowReturn ps5_drain_all(GstPs5VdecProxy *self);
+
 static gboolean ps5_set_format(GstVideoDecoder *dec, GstVideoCodecState *state)
 {
     GstPs5VdecProxy *self = GST_PS5_VDEC_PROXY(dec);
@@ -398,12 +400,25 @@ static gboolean ps5_set_format(GstVideoDecoder *dec, GstVideoCodecState *state)
     if (packetized && !self->nal_length_size)
         self->nal_length_size = 4;
 
+    /* A new format on a running decoder (a resolution switch: GstVideoDecoder
+     * doesn't drain on new caps): the pictures of the old format come out
+     * first, then the title resets the hardware (DRAINED). Videodec2 failed
+     * every H.264 decode call after an in-band 396x704 -> 540x960 switch
+     * without it (BBC News). */
+    gboolean drained = FALSE;
+    if (self->decoder_id && self->width && (codec != self->codec || depth != self->depth || w != self->width || h != self->height)) {
+        GstFlowReturn ret = ps5_drain_all(self);
+        drained = TRUE;
+        if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING)
+            g_printerr("[ps5vdecproxy] %p: drain before the new format: %s\n", (void *)self, gst_flow_get_name(ret));
+    }
+
     /* A new decoder only when it changes (a resolution switch keeps it if it fits; the title decides). */
     gint64 start = g_get_monotonic_time();
     gboolean ok = title_open(self, codec, depth, w, h);
-    g_printerr("[ps5vdecproxy] %p: %s %dx%d %u-bit (%s): %s in %.0f ms%s\n", (void *)self, gst_structure_get_name(s), w, h, depth,
+    g_printerr("[ps5vdecproxy] %p: %s %dx%d %u-bit (%s): %s in %.0f ms%s%s\n", (void *)self, gst_structure_get_name(s), w, h, depth,
         format ? format : "frames", ok ? "hardware decoder" : "title refused", (g_get_monotonic_time() - start) / 1000.0,
-        ok ? "" : " (playback fails: the title accepted these caps before)");
+        drained ? " (drained the old format first)" : "", ok ? "" : " (playback fails: the title accepted these caps before)");
     if (!ok)
         return FALSE;
     self->codec = codec;
