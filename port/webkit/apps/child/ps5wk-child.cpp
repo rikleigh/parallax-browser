@@ -139,7 +139,7 @@ static int rendezvous(const char* path, unsigned long long processIdentifier)
     return fd;
 }
 
-static void setupEnvironment()
+static void setupEnvironment(const char* launchPath)
 {
     // elfldr payloads start with an empty environment.
     mkdir("/data/ps5webkit", 0777);
@@ -166,8 +166,14 @@ static void setupEnvironment()
     mkdir("/data/ps5webkit/home/cache/media", 0777);
     setenv("WPE_SHELL_MEDIA_DISK_CACHE_PATH", "/data/ps5webkit/home/cache/media", 0);
     // Optional overrides for debugging, one KEY=VALUE per line (e.g.
-    // WEBKIT_DEBUG=Network,Loading,IPC). Read last, so they win.
-    if (FILE* f = fopen("/data/ps5webkit/child.env", "r")) {
+    // WEBKIT_DEBUG=Network,Loading,IPC). Read last, so they win:
+    // child.env for every child, then child-<UIProcess pid>.env for the
+    // children of one UIProcess only (ps5wk-shot childenv=..., so harness
+    // runs don't touch the browser title's children).
+    auto readEnvFile = [](const char* file) {
+        FILE* f = fopen(file, "r");
+        if (!f)
+            return;
         char line[512];
         while (fgets(line, sizeof(line), f)) {
             line[strcspn(line, "\r\n")] = 0;
@@ -176,9 +182,16 @@ static void setupEnvironment()
                 continue;
             *eq = 0;
             setenv(line, eq + 1, 1);
-            LOG("env %s=%s", line, eq + 1);
+            LOG("env %s=%s (%s)", line, eq + 1, file);
         }
         fclose(f);
+    };
+    readEnvFile("/data/ps5webkit/child.env");
+    int uiPid = 0;
+    if (const char* slash = strrchr(launchPath, '/'); slash && sscanf(slash + 1, "ui-%d.sock", &uiPid) == 1) {
+        char file[64];
+        snprintf(file, sizeof(file), "/data/ps5webkit/child-%d.env", uiPid);
+        readEnvFile(file);
     }
 }
 
@@ -395,7 +408,7 @@ int main(int, char**)
     if (fd < 0)
         return 1;
 
-    setupEnvironment();
+    setupEnvironment(path);
     // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):
     // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock; hole-punch video frames
     // to its video server (wpe-ps5/PS5VideoServer.cpp): <dir>/video-<pid>.sock.

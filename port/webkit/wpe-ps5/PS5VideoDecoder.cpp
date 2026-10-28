@@ -321,17 +321,22 @@ static int waitFreeSlot(Decoder& d)
         // After 1.5 s without a free slot, take back the oldest one nobody
         // is drawing (worst case: a frame skipped after a long pause).
         int64_t now = g_get_monotonic_time();
+        // The older half of the pictures nobody is drawing goes back at
+        // once (one at a time only crawled at ~1 picture per second).
         if (now - start > 1500000 && now - lastReclaim > 500000) {
-            Slot* oldest = nullptr;
+            std::vector<Slot*> held;
             for (auto& s : d.slots) {
-                if (s.state == Slot::Held && !s.pinned && (!oldest || s.token < oldest->token))
-                    oldest = &s;
+                if (s.state == Slot::Held && !s.pinned)
+                    held.push_back(&s);
             }
-            if (oldest) {
-                oldest->state = Slot::Free;
-                if (!d.reclaimed++ || !(d.reclaimed % 50))
-                    DLOG("decoder %u: no free output slot for %.1f s: took back picture %u (%llu so far)", d.id, (now - start) / 1e6,
-                        oldest->token, (unsigned long long)d.reclaimed);
+            std::sort(held.begin(), held.end(), [](Slot* a, Slot* b) { return a->token < b->token; });
+            size_t count = std::max<size_t>(1, held.size() / 2);
+            for (size_t i = 0; i < count && i < held.size(); i++)
+                held[i]->state = Slot::Free;
+            if (!held.empty()) {
+                d.reclaimed += std::min(count, held.size());
+                DLOG("decoder %u: no free output slot for %.1f s: took back %zu pictures from %u (%llu so far)", d.id, (now - start) / 1e6,
+                    std::min(count, held.size()), held[0]->token, (unsigned long long)d.reclaimed);
             }
             lastReclaim = now;
         }
@@ -951,6 +956,17 @@ void fakeOut(FakeDecoder* f, void* frame, ps5wk_vdec_picture* pic)
 int fakeDecode(void* h, const void*, size_t, uint64_t pts, int64_t ptsNS, void* frame, ps5wk_vdec_picture* pic)
 {
     auto* f = static_cast<FakeDecoder*>(h);
+    // PS5WK_FAKE_VDEC_DELAY_MS=<ms>[:<s>]: a slow decoder (frames late at
+    // the sink: QoS), for the first <s> seconds only if given (a burst of
+    // load, as on YouTube's busy pages).
+    static const char* knob = g_getenv("PS5WK_FAKE_VDEC_DELAY_MS");
+    static const int delayMS = knob ? atoi(knob) : 0;
+    static const int burstS = knob && strchr(knob, ':') ? atoi(strchr(knob, ':') + 1) : 0;
+    static const int64_t startUS = g_get_monotonic_time();
+    if (delayMS > 0 && (!burstS || g_get_monotonic_time() - startUS < burstS * 1000000LL)) {
+        struct timespec ts = { delayMS / 1000, (delayMS % 1000) * 1000000L };
+        nanosleep(&ts, nullptr);
+    }
     f->held.emplace(ptsNS, pts);
     if (f->held.size() > 4) // a reorder window, as the hardware's pipeline
         fakeOut(f, frame, pic);

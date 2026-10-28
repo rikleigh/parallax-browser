@@ -21,6 +21,8 @@
  * the network session's directories (default /data/ps5webkit/shot/...; the
  * title's are /data/ps5webkit/browser/...). Page console
  * messages are printed by the WebProcess ([webN] CONSOLE lines).
+ * childenv=K=V;K=V: environment for this run's children only
+ * (/data/ps5webkit/child-<pid>.env, e.g. GST_DEBUG), never the title's.
  * fakevdec=1: the video server advertises a fake hardware decoder (empty
  * pictures in display order), so ps5vdecproxy and REMOTE frames run in
  * payload-only tests (Videodec2 itself only works in the title).
@@ -53,6 +55,7 @@ static int settleSeconds = 3;
 static char userAgent[16] = "safari";
 static char jsFile[256];
 static char onloadFile[256];
+static char childEnvFile[64]; /* childenv=: this run's children's env file, removed at exit */
 /* Stress mode: cycle=<file of URLs> rounds=<n> dwell=<s>: load each URL in
  * turn (dwell seconds after it finished or failed), rounds times, counting
  * load failures and WebProcess terminations (RESULT ps5wk-shot stress). */
@@ -121,6 +124,19 @@ static void readArguments(void)
             g_strlcpy(onloadFile, token + 7, sizeof(onloadFile));
         else if (!strncmp(token, "js=", 3))
             g_strlcpy(jsFile, token + 3, sizeof(jsFile));
+        else if (!strncmp(token, "childenv=", 9)) {
+            /* KEY=VALUE[;KEY=VALUE...] for this run's children only:
+             * /data/ps5webkit/child-<our pid>.env (removed at exit). */
+            snprintf(childEnvFile, sizeof(childEnvFile), "/data/ps5webkit/child-%d.env", (int)getpid());
+            FILE* f = fopen(childEnvFile, "w");
+            if (f) {
+                for (char* p = token + 9; *p; p++)
+                    fputc(*p == ';' ? '\n' : *p, f);
+                fputc('\n', f);
+                fclose(f);
+            }
+        } else if (!strncmp(token, "fakevdecdelay=", 14))
+            setenv("PS5WK_FAKE_VDEC_DELAY_MS", token + 14, 1); /* ms per access unit: a decoder too slow for the stream */
         else if (!strncmp(token, "fakevdec=", 9))
             setenv("PS5WK_FAKE_VDEC", token + 9, 1); /* 1: the fake title decoder (ps5vdecproxy plumbing without Videodec2) */
         else if (!strncmp(token, "debug=", 6))
@@ -479,5 +495,7 @@ int main(void)
     g_main_loop_run(loop);
     printf("ps5wk-shot done (%d) after %.1f s\n", exitCode, secondsSinceStart());
     fflush(stdout);
+    if (childEnvFile[0])
+        unlink(childEnvFile);
     _exit(exitCode); // children follow when their IPC sockets close
 }

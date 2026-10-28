@@ -86,6 +86,7 @@ struct _GstPs5VideoSink {
     gboolean have_info;
     guint format, colorimetry;
     gboolean remote; /* ps5vdecproxy's placeholders */
+    gint64 default_max_lateness;
     guint64 remote_sent, remote_dropped;
     struct ps5wk_remote_picture prepared; /* the last placeholder prepare() saw */
     gboolean prepared_pending;            /* ... and not rendered yet */
@@ -382,6 +383,13 @@ static gboolean ps5_set_caps(GstBaseSink *bsink, GstCaps *caps)
     guint ch = (h + 1) / 2, cw = (w + 1) / 2;
     GstCapsFeatures *features = gst_caps_get_features(caps, 0);
     gboolean remote = features && gst_caps_features_contains(features, "memory:PS5Remote");
+    /* Hardware-decoded frames are never dropped here: GstBaseSink drops a
+     * late buffer before prepare() and render(), so the title never learnt
+     * that its picture was gone, and a burst of late frames (YouTube under
+     * load, TV test 2026-10-28) left every decoder slot held: playback stuck.
+     * The title shows the newest due frame at each vsync and gives the
+     * skipped ones back, so late frames are dropped there instead. */
+    gst_base_sink_set_max_lateness(bsink, remote ? -1 : self->default_max_lateness);
     g_mutex_lock(&self->lock);
     self->info = info;
     self->have_info = TRUE;
@@ -606,9 +614,10 @@ static GstFlowReturn ps5_preroll(GstBaseSink *bsink, GstBuffer *buffer)
     return show(GST_PS5_VIDEO_SINK(bsink), buffer, TRUE);
 }
 
-/* Every buffer that reaches the sink passes here before it is synced
- * (and maybe dropped as late, without render()): a placeholder the sink saw
- * but never rendered goes back to the title's decoder. */
+/* A placeholder that got as far as prepare() but was never rendered goes
+ * back to the title's decoder. (GstBaseSink drops late buffers *before*
+ * prepare(); that case is handled by not dropping hardware-decoded frames
+ * at all: max-lateness -1 in set_caps.) */
 static GstFlowReturn ps5_prepare(GstBaseSink *bsink, GstBuffer *buffer)
 {
     GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
@@ -719,6 +728,7 @@ static void gst_ps5_video_sink_init(GstPs5VideoSink *self)
     self->fd = -1;
     self->shm_fd = -1;
     gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), TRUE);
+    self->default_max_lateness = gst_base_sink_get_max_lateness(GST_BASE_SINK(self));
 }
 
 static void gst_ps5_video_sink_class_init(GstPs5VideoSinkClass *klass)

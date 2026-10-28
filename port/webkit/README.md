@@ -627,6 +627,36 @@ URL (`<url> 40`), screenshots also at +30 s for dwells of 34 s or more;
 `test/media/title-seek-and-2160.js` (title `test-onload.js`: seeks on
 video.html, 2160p and a seek on YouTube), `test/media/yt-2160.js`.
 
+**TV test of 05afe91 (2026-10-28, evening): YouTube 4K stuck after a few
+seconds, found and fixed.** The owner's YouTube session (more JavaScript:
+the WebProcess at 1.0–1.2 cores, the player re-laid out once) played
+VP9 2160p60 for ~5 s, then the decoder sat at "12/12 slots held, 0 pinned"
+and only the 1.5 s take-back moved it (0.7 pictures/s); local HEVC clips
+were fine. Two places dropped late placeholders *without anybody telling
+the title*, so their decoder slots stayed held:
+1. GstVideoDecoder's own QoS (since 1.18) drops output buffers later than
+   the sink's last QoS report inside `finish_frame`.
+2. GstBaseSink checks lateness *before* calling `prepare()` (when a sink has
+   one) and drops the buffer without `prepare()` or `render()`, so the
+   RDROP report in `prepare()` never fired for late buffers.
+The slot bookkeeping only recovered when a later frame got rendered; a
+burst of more than 12 late frames took every slot, nothing could be decoded
+in time again, and every new picture was late too. My log-only runs had a
+lighter page and never more than a few late frames in a row. Reproduced in
+the harness with a slow fake decoder (`ps5wk-shot fakevdec=1
+fakevdecdelay=22`: 12/12 held, 0.7 pictures/s, as on the TV). Fix: the
+proxy turns the base class's QoS off (`qos` FALSE) and drops late pictures
+itself (`gst_video_decoder_get_max_decode_time` < 0) with a PRELEASE;
+`ps5videosink` sets max-lateness -1 for hardware-decoded caps, so it never
+drops one silently (the title skips stale frames at each vsync and releases
+them); the take-back safety net returns the older half of the held slots
+at once. Harness after the fix: a 6 s burst of a too-slow decoder
+(`fakevdecdelay=22:6`) drops 360 late pictures, then plays 60.0 frames/s
+with 8/12 slots in use; seeks and YouTube unchanged. `ps5wk-shot
+childenv=K=V;K=V` (new) sets environment for that run's children only
+(`/data/ps5webkit/child-<pid>.env`), e.g. GST_DEBUG, without touching the
+title's.
+
 Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
 matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
 draws nothing; two 8K decoders at once won't fit the title's flexible

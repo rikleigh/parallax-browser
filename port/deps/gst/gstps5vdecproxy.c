@@ -70,7 +70,7 @@ struct _GstPs5VdecProxy {
     GByteArray *au;          /* scratch */
     gboolean drained;
     /* counts */
-    guint64 sent, sent_bytes, pictures, released, stale, clipped, other_epoch;
+    guint64 sent, sent_bytes, pictures, released, stale, clipped, other_epoch, late;
     gint64 log_window;
     guint64 log_sent, log_pictures;
     double log_wait_ms;
@@ -417,9 +417,10 @@ static void maybe_log(GstPs5VdecProxy *self)
     double s = (now - self->log_window) / 1e6;
     if (self->sent != self->log_sent)
         g_printerr("[ps5vdecproxy] %p: %.1f AUs/s sent (%.1f Mbit/s), %.1f pictures/s; waited %.0f ms for the title; "
-                   "%" G_GUINT64_FORMAT " released, %" G_GUINT64_FORMAT " stale, %" G_GUINT64_FORMAT " clipped, %" G_GUINT64_FORMAT " of older epochs so far\n",
+                   "%" G_GUINT64_FORMAT " released, %" G_GUINT64_FORMAT " stale, %" G_GUINT64_FORMAT " clipped, %" G_GUINT64_FORMAT " late, %" G_GUINT64_FORMAT " of older epochs so far\n",
             (void *)self, (self->sent - self->log_sent) / s, self->sent_bytes * 8 / 1e6 / s,
-            (self->pictures - self->log_pictures) / s, self->log_wait_ms, self->released, self->stale, self->clipped, self->other_epoch);
+            (self->pictures - self->log_pictures) / s, self->log_wait_ms, self->released, self->stale, self->clipped, self->late,
+            self->other_epoch);
     self->log_window = now;
     self->log_sent = self->sent;
     self->log_pictures = self->pictures;
@@ -484,6 +485,14 @@ static GstFlowReturn handle_reply(GstPs5VdecProxy *self, const struct ps5wk_vide
         self->clipped++;
         send_prelease(self, msg->ps5wk_token);
         gst_video_decoder_release_frame(dec, frame);
+        return GST_FLOW_OK;
+    }
+    /* Too late (the sink's QoS reports, as the base class would judge it):
+     * dropped here, where the title can be told. */
+    if (gst_video_decoder_get_max_decode_time(dec, frame) < 0) {
+        self->late++;
+        send_prelease(self, msg->ps5wk_token);
+        gst_video_decoder_drop_frame(dec, frame);
         return GST_FLOW_OK;
     }
     struct ps5wk_remote_picture remote = { PS5WK_REMOTE_MAGIC, self->decoder_id, msg->ps5wk_token, msg->ps5wk_epoch };
@@ -642,7 +651,7 @@ static gboolean ps5_start(GstVideoDecoder *dec)
 {
     GstPs5VdecProxy *self = GST_PS5_VDEC_PROXY(dec);
     self->epoch = 1;
-    self->sent = self->pictures = self->released = self->stale = self->clipped = self->other_epoch = 0;
+    self->sent = self->pictures = self->released = self->stale = self->clipped = self->other_epoch = self->late = 0;
     return TRUE;
 }
 
@@ -651,8 +660,8 @@ static gboolean ps5_stop(GstVideoDecoder *dec)
     GstPs5VdecProxy *self = GST_PS5_VDEC_PROXY(dec);
     if (self->sent)
         g_printerr("[ps5vdecproxy] %p: stop after %" G_GUINT64_FORMAT " AUs, %" G_GUINT64_FORMAT " pictures, %" G_GUINT64_FORMAT
-                   " released, %" G_GUINT64_FORMAT " stale, %" G_GUINT64_FORMAT " clipped\n", (void *)self, self->sent, self->pictures,
-            self->released, self->stale, self->clipped);
+                   " released, %" G_GUINT64_FORMAT " stale, %" G_GUINT64_FORMAT " clipped, %" G_GUINT64_FORMAT " dropped late\n",
+            (void *)self, self->sent, self->pictures, self->released, self->stale, self->clipped, self->late);
     if (self->input_state)
         gst_video_codec_state_unref(self->input_state);
     self->input_state = NULL;
@@ -699,6 +708,13 @@ static void gst_ps5_vdec_proxy_init(GstPs5VdecProxy *self)
     self->au = g_byte_array_new();
     gst_video_decoder_set_packetized(GST_VIDEO_DECODER(self), TRUE);
     gst_video_decoder_set_needs_format(GST_VIDEO_DECODER(self), TRUE);
+    /* No QoS drops in the base class: it drops late output buffers inside
+     * finish_frame without telling us, so the title never got those slots
+     * back; once a burst of late frames had taken all of them, nothing could
+     * be decoded in time again (TV test 2026-10-28: YouTube 4K stuck after
+     * a few seconds). handle_reply drops late pictures itself, with a
+     * PRELEASE, and ps5videosink doesn't drop them either (max-lateness -1). */
+    g_object_set(self, "qos", FALSE, NULL);
 }
 
 static void gst_ps5_vdec_proxy_class_init(GstPs5VdecProxyClass *klass)
