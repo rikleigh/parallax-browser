@@ -1,0 +1,89 @@
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.cpp b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+index 9acfd0a4d1..050888b29e 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -596,6 +596,13 @@ RenderLayerCompositor::~RenderLayerCompositor()
+ 
+ void RenderLayerCompositor::enableCompositingMode(bool enable /* = true */)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 Milestone 1 paints without compositing (no GraphicsLayerFactory:
++    // NonCompositedFrameRenderer RELEASE_ASSERTs). View transitions forced
++    // compositing on (document.startViewTransition on YouTube watch pages).
++    if (enable && !m_renderView.settings().acceleratedCompositingEnabled())
++        return;
++#endif
+     if (enable != m_compositing) {
+         m_compositing = enable;
+         
+diff --git a/Source/WebKit/Platform/IPC/Connection.cpp b/Source/WebKit/Platform/IPC/Connection.cpp
+index 88ca5b9680..22c6079f03 100644
+--- a/Source/WebKit/Platform/IPC/Connection.cpp
++++ b/Source/WebKit/Platform/IPC/Connection.cpp
+@@ -26,6 +26,11 @@
+ #include "config.h"
+ #include "Connection.h"
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include <stdio.h>
++#include <unistd.h>
++#endif
++
+ #include "Encoder.h"
+ #include "GeneratedSerializers.h"
+ #include "Logging.h"
+@@ -1240,8 +1245,24 @@ void Connection::dispatchIncomingMessageForTesting(UniqueRef<Decoder>&& decoder)
+ }
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++static std::atomic<const Connection*> s_ps5ExitProcessOnClose;
++
++void Connection::ps5ExitProcessWhenClosed()
++{
++    s_ps5ExitProcessOnClose = this;
++}
++#endif
++
+ void Connection::connectionDidClose()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (s_ps5ExitProcessOnClose.load() == this) {
++        fflush(stdout);
++        fflush(stderr);
++        _exit(0);
++    }
++#endif
+     // The connection is now invalid.
+     m_isValid = false;
+     platformInvalidate();
+diff --git a/Source/WebKit/Platform/IPC/Connection.h b/Source/WebKit/Platform/IPC/Connection.h
+index f4c27d6120..c461f4f9de 100644
+--- a/Source/WebKit/Platform/IPC/Connection.h
++++ b/Source/WebKit/Platform/IPC/Connection.h
+@@ -470,6 +470,11 @@ public:
+     bool open(Client&, SerialFunctionDispatcher& = RunLoop::currentSingleton());
+     // Ensures that messages sent prior to the call are not affected by invalidate() or crash done after the call returns.
+     Error flushSentMessages(Timeout);
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 payloads: _exit(0) as soon as this connection (to the UI process)
++    // closes, on the IPC thread, before anything can wait on it and abort.
++    void ps5ExitProcessWhenClosed();
++#endif
+     void invalidate();
+ 
+     template<typename PC, typename BasePromise>
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.cpp b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+index 208672c552..02741be39c 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.cpp
++++ b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+@@ -117,6 +117,9 @@ void AuxiliaryProcess::initialize(AuxiliaryProcessInitializationParameters&& par
+     Ref connection = IPC::Connection::createClientConnection(WTF::move(parameters.connectionIdentifier), connectionReceiveQueueQOS());
+     lazyInitialize(m_connection, connection.copyRef());
+     initializeConnection(connection.ptr());
++#if defined(PS5_PAYLOAD_SDK)
++    connection->ps5ExitProcessWhenClosed();
++#endif
+     connection->open(*this);
+ }
+ 

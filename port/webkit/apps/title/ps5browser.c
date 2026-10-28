@@ -279,11 +279,39 @@ static gboolean memTimer(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* A page whose WebProcess keeps crashing would reload forever: after the
+ * second crash on the same address within 30 s, show an error page instead. */
+static char* lastCrashURI;
+static gint64 lastCrashTime;
+
 static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminationReason reason, gpointer data)
 {
     (void)data;
-    SPIKE_FAIL("webprocess", "terminated (reason %d); reloading", reason);
-    webkit_web_view_reload(view);
+    const char* uri = webkit_web_view_get_uri(view);
+    gint64 now = g_get_monotonic_time();
+    gboolean again = uri && lastCrashURI && !strcmp(uri, lastCrashURI) && now - lastCrashTime < 30 * G_USEC_PER_SEC;
+    g_free(lastCrashURI);
+    lastCrashURI = g_strdup(uri ? uri : "");
+    lastCrashTime = now;
+    if (!again) {
+        SPIKE_FAIL("webprocess", "terminated (reason %d); reloading", reason);
+        webkit_web_view_reload(view);
+        return;
+    }
+    SPIKE_FAIL("webprocess", "terminated (reason %d) again on %s within 30 s; showing an error page", reason, lastCrashURI);
+    char* escaped = g_markup_escape_text(lastCrashURI, -1);
+    char* html = g_strdup_printf("<!doctype html><html><head><meta charset=\"utf-8\"><title>Page crashed</title>"
+        "<style>body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:64px;font-size:24px}"
+        "a{color:#9cc7ff}code{color:#9aa4b2;word-break:break-all}</style></head><body>"
+        "<h1>This page keeps crashing</h1><p>The browser stopped reloading it after two crashes.</p>"
+        "<p><code>%s</code></p><p><a href=\"%s\">Try again</a> &middot; <a href=\"file:///data/ps5webkit/start.html\">Start page</a></p>"
+        "<p>O goes back.</p></body></html>", escaped, escaped);
+    /* Not a failed load of the page itself, so Back still works. */
+    webkit_web_view_load_alternate_html(view, html, lastCrashURI, NULL);
+    g_free(html);
+    g_free(escaped);
+    /* The error page itself must not count as the page crashing again. */
+    lastCrashTime = 0;
 }
 
 static char* homeURL(void)

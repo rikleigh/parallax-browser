@@ -62,6 +62,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 
 | 0012-ipc-unix-log-failures | diagnostics: log why each IPC connection closes, in `Platform/IPC/glib/ConnectionGLib.cpp` (the file GLib ports use) |
 | 0013-ps5-payload-exit-and-cache-without-hard-links | `AuxiliaryProcess::didClose` exits at once (`_exit`) in PS5 payloads: the GLib teardown after the run loop stopped aborted (SIGABRT) in every swapped-out WebProcess. The network cache copies a blob when `link()` fails (EOPNOTSUPP on `/data`) instead of leaving the record without its body (`Failed to create hard link`) |
+| 0014-ps5-exit-on-ui-close-and-no-forced-compositing | payloads `_exit(0)` on the IPC thread as soon as the connection to the UI process closes (end of stream or HUP; 0013 only covered `didClose` on the main thread, and swapped-out processes still aborted); `RenderLayerCompositor::enableCompositingMode` is a no-op when accelerated compositing is off: `document.startViewTransition()` (YouTube watch pages) forced compositing on and `NonCompositedFrameRenderer::graphicsLayerFactory()` RELEASE_ASSERTed (SIGABRT, every watch page) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -206,7 +207,12 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   Do not read the payload's own ELF header: elfldr maps the first PT_LOAD
   (file offset 0x4000) at the image base, so `__ehdr_start` is the base but
   no header is there (the first build did, and faulted before its handlers
-  were installed). Not yet triggered on purpose.
+  were installed). The PS5 kernel's ucontext is not the SDK header's:
+  FreeBSD's mcontext sits at +0x40 instead of +0x10 (`test/sigctx/sigctx.c`:
+  rip +0xe0, rsp +0xf8, rbp +0x88); with the header's layout the first
+  reports had `sp 0x0` and a wrong pc. `abort()` (all WebKit RELEASE_ASSERTs
+  here) shows as SIGABRT code 0, pc in libkernel's raise, `addr` = pc + 2;
+  the stack scan then gives the WebKit frames.
 - **Payload threads had 64 KiB stacks.** The payload libc's default thread
   stack is 64 KiB (`test/stack/stack.c`: default attr 64 KiB, 16 KiB guard),
   and WTF leaves most thread types to the platform default, Web Workers'
@@ -230,6 +236,21 @@ disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
   was not reproduced, so its cause stays open (most likely the aborting
   process or the record without a body). `new Audio()` is stubbed as well
   (`ReferenceError: Can't find variable: Audio` from voice search).
+
+- **YouTube watch pages crashed every WebProcess** 4–7 s after loading
+  (TV test 2026-10-28, a reload loop). Symbolized crash guard stack:
+  `jsDocumentPrototypeFunction_startViewTransition` ->
+  `Document::setActiveViewTransition` -> `RenderLayerCompositor::enableCompositingMode`
+  -> `FrameRenderer::graphicsLayerFactory()` RELEASE_ASSERT (we paint without
+  compositing). Fixed in 0014; `ps5wk-shot` keeps the watch page up for 30 s
+  showing the player's "Your browser can't play this video". The title
+  shows an error page instead of reloading after a second WebProcess crash
+  on the same address within 30 s.
+  Still open: `Error receiving data: Bad file descriptor` (and the earlier
+  `Connection reset by peer`) on YouTube's main document in the title, both
+  at the moment a swapped-out WebProcess died and the NetworkProcess saw its
+  connection close; not reproduced in the harness or log-only title runs
+  since those processes exit cleanly.
 
 ## Status and timings (2026-10-28)
 

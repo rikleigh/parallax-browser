@@ -23,7 +23,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/ucontext.h>
 #include <unistd.h>
 
 // The image's address range, from symbols the linker defines: __ehdr_start
@@ -155,9 +154,14 @@ static void handler(int sig, siginfo_t* info, void* context)
         _exit(71);
     inHandler = 1;
 
-    const mcontext_t* mc = context ? &((const ucontext_t*)context)->uc_mcontext : NULL;
-    uintptr_t pc = mc ? (uintptr_t)mc->mc_rip : 0;
-    uintptr_t sp = mc ? (uintptr_t)mc->mc_rsp : 0;
+    // The PS5 kernel's ucontext is not the SDK header's: FreeBSD's mcontext
+    // starts at +0x40, not +0x10 (test/sigctx/sigctx.c on 13.60: rip +0xe0,
+    // rsp +0xf8, rbp +0x88). For SIGABRT from abort(), pc is libkernel's
+    // raise and si_addr is pc + 2.
+    const uintptr_t* words = (const uintptr_t*)context;
+    uintptr_t pc = words ? words[0xe0 / 8] : 0;
+    uintptr_t sp = words ? words[0xf8 / 8] : 0;
+    uintptr_t fp = words ? words[0x88 / 8] : 0;
     uintptr_t base = (uintptr_t)&__ehdr_start;
 
     line_t line;
@@ -179,6 +183,8 @@ static void handler(int sig, siginfo_t* info, void* context)
     }
     put(&line, " sp ");
     putHex(&line, sp);
+    put(&line, " fp ");
+    putHex(&line, fp);
     put(&line, " thread ");
     putHex(&line, (uintptr_t)pthread_self());
     flush(&line);
