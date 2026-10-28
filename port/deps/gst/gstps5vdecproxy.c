@@ -14,7 +14,9 @@
  * - Ranked above avdec_* (PRIMARY + 100) for H.264 (8-bit 4:2:0 up to
  *   4096x2304), HEVC Main/Main10 and VP9 profiles 0/2 (up to 8192x4352),
  *   progressive only. Anything else is refused in the accept-caps query,
- *   and when the title has no decoder (ps5wk-shot, PS5WK_HWDEC=0, or
+ *   and so is any size the title cannot open a decoder for (the first
+ *   accept-caps query asks it: DOPEN, kept for set_format); when the title
+ *   has no decoder (ps5wk-shot, PS5WK_HWDEC=0, or
  *   /data/ps5webkit/no-hwdec in the title) the element fails to reach
  *   READY without posting an error: decodebin3 then takes the next decoder
  *   (avdec_*, dav1d), so software decoding stays the fallback.
@@ -247,7 +249,41 @@ static gboolean caps_supported(GstPs5VdecProxy *self, GstCaps *caps, char *why, 
         g_snprintf(why, why_size, "%dx%d too large", w, h);
         return FALSE;
     }
+    /* Videodec2 (13.60) holds HEVC streams to their own level more tightly
+     * than the spec: a level 5.x stream taller than 2176 lines or wider than
+     * 4096 (2048x4096, 2880x2880; legal 5.1, what encoders write) fails every
+     * decode call (0x811d0111) even in a level 6.1 decoder. Software then. */
+    const char *level = gst_structure_get_string(s, "level");
+    if (codec == PS5WK_VCODEC_HEVC && (h > 2176 || w > 4096) && level && g_ascii_strtod(level, NULL) < 6.0) {
+        g_snprintf(why, why_size, "HEVC level %s at %dx%d (the hardware wants level 6 above 2176 lines)", level, w, h);
+        return FALSE;
+    }
     return TRUE;
+}
+
+/* DOPEN: the title opens (or keeps) a decoder for this codec and size. */
+static gboolean title_open(GstPs5VdecProxy *self, guint codec, guint depth, int w, int h)
+{
+    struct ps5wk_video_msg msg;
+    memset(&msg, 0, sizeof msg);
+    msg.type = PS5WK_VMSG_DOPEN;
+    msg.role = codec;
+    msg.ps5wk_profile = depth > 8 ? 2 : 1;
+    msg.ps5wk_bit_depth = depth;
+    msg.width = (uint32_t)MAX(w, 16);
+    msg.height = (uint32_t)MAX(h, 16);
+    msg.ps5wk_epoch = self->epoch;
+    if (!send_all(self, &msg, sizeof msg))
+        return FALSE;
+    while (recv_msg(self, &msg, 6000)) {
+        if (msg.type == PS5WK_VMSG_DOPEN_ACK) {
+            if (msg.status == 0)
+                self->decoder_id = msg.ps5wk_decoder;
+            return msg.status == 0;
+        }
+        /* PICTUREs of the previous format, still in flight: dropped (released by the flush/drain before). */
+    }
+    return FALSE;
 }
 
 static gboolean ps5_sink_query(GstVideoDecoder *dec, GstQuery *query)
@@ -262,6 +298,25 @@ static gboolean ps5_sink_query(GstVideoDecoder *dec, GstQuery *query)
         char why[96] = "not in the template";
         if (ok)
             ok = caps_supported(self, caps, why, sizeof why);
+        /* decodebin3 asks this at READY, before linking, and takes the next
+         * decoder (avdec_*) if we say no. So the title opens the decoder now:
+         * whatever Videodec2 refuses falls back to software decoding instead
+         * of failing playback in set_format (the first headset test's
+         * 1920x3840 HEVC). set_format's DOPEN then keeps this decoder. Only
+         * before the first decoder: later caps changes arrive with frames in
+         * flight on the connection. */
+        const GstStructure *s = ok ? gst_caps_get_structure(caps, 0) : NULL;
+        int w = 0, h = 0;
+        if (s && !self->decoder_id && gst_structure_get_int(s, "width", &w) && gst_structure_get_int(s, "height", &h) && w > 0 && h > 0) {
+            guint codec = codec_of(s), depth = depth_of(codec, s);
+            gint64 start = g_get_monotonic_time();
+            ok = connect_title(self) && title_open(self, codec, depth, w, h);
+            g_printerr("[ps5vdecproxy] %p: %s %dx%d %u-bit: %s in %.0f ms\n", (void *)self, gst_structure_get_name(s), w, h, depth,
+                ok ? "the title opened a hardware decoder" : "the title cannot decode it, software decoding instead",
+                (g_get_monotonic_time() - start) / 1000.0);
+            if (!ok)
+                g_snprintf(why, sizeof why, "the title could not open a decoder for %dx%d", w, h);
+        }
         if (!ok)
             g_printerr("[ps5vdecproxy] %p: not decoding %s in hardware: %s\n", (void *)self,
                 caps && gst_caps_get_size(caps) ? gst_structure_get_name(gst_caps_get_structure(caps, 0)) : "?", why);
@@ -344,31 +399,11 @@ static gboolean ps5_set_format(GstVideoDecoder *dec, GstVideoCodecState *state)
         self->nal_length_size = 4;
 
     /* A new decoder only when it changes (a resolution switch keeps it if it fits; the title decides). */
-    struct ps5wk_video_msg msg;
-    memset(&msg, 0, sizeof msg);
-    msg.type = PS5WK_VMSG_DOPEN;
-    msg.role = codec;
-    msg.ps5wk_profile = depth > 8 ? 2 : 1;
-    msg.ps5wk_bit_depth = depth;
-    msg.width = (uint32_t)MAX(w, 16);
-    msg.height = (uint32_t)MAX(h, 16);
-    msg.ps5wk_epoch = self->epoch;
     gint64 start = g_get_monotonic_time();
-    if (!send_all(self, &msg, sizeof msg))
-        return FALSE;
-    gboolean ok = FALSE;
-    while (recv_msg(self, &msg, 6000)) {
-        if (msg.type == PS5WK_VMSG_DOPEN_ACK) {
-            ok = msg.status == 0;
-            if (ok)
-                self->decoder_id = msg.ps5wk_decoder;
-            break;
-        }
-        /* PICTUREs of the previous format, still in flight: dropped (released by the flush/drain before). */
-    }
+    gboolean ok = title_open(self, codec, depth, w, h);
     g_printerr("[ps5vdecproxy] %p: %s %dx%d %u-bit (%s): %s in %.0f ms%s\n", (void *)self, gst_structure_get_name(s), w, h, depth,
         format ? format : "frames", ok ? "hardware decoder" : "title refused", (g_get_monotonic_time() - start) / 1000.0,
-        ok ? "" : " (playback fails: the title had said it could)");
+        ok ? "" : " (playback fails: the title accepted these caps before)");
     if (!ok)
         return FALSE;
     self->codec = codec;

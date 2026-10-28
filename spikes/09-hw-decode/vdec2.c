@@ -284,8 +284,11 @@ static uint32_t level_for(uint32_t codec, int w, int h)
     const int64_t px = (int64_t)w * h;
     if (codec == VDEC2_CODEC_AVC)
         return px <= 2228224 ? 41 : px <= 8912896 ? 52 : 62;
+    /* 13.60 refuses HEVC level 5.1 above 2176 lines (1920x2304, 2880x2880,
+     * 1920x3840: 0x811d0200 at QueryDecoderMemoryInfo); 6.1 opens up to
+     * 4352 lines (the browser's size probe, port/webkit/README.md). */
     if (codec == VDEC2_CODEC_HEVC)
-        return px <= 2228224 ? 123 : px <= 8912896 ? 153 : 183;
+        return h > 2176 || w > 4096 ? 183 : px <= 2228224 ? 123 : px <= 8912896 ? 153 : 183;
     return px <= 2228224 ? 41 : px <= 8912896 ? 51 : 61;
 }
 

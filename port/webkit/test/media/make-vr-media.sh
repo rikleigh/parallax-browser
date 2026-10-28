@@ -16,7 +16,8 @@
 #   vrtest_360_SBS.mp4    3840x1920  360 side by side (left eye left)
 #   vrtest_180_mono.mp4   1920x1920  180 mono (half equirectangular)
 #   vrtest_180_LR.mp4     3840x1920  180 side by side
-#   vrtest_180_TB.mp4     1920x3840  180 top/bottom
+#   vrtest_180_TB.mp4     2048x4096  180 top/bottom (2048 per eye, a size VR sites use; portrait,
+#                                    which Videodec2 opens only as a square decoder)
 #   vrtest_MKX200_LR.mp4  3840x1920  200 degree equidistant fisheye per eye, side by side
 # All HEVC (hvc1, VideoToolbox), 30 fps, 60 s, with a quiet AAC tone.
 set -euo pipefail
@@ -82,6 +83,7 @@ clip() {
 
 M="$OUT/eye-mono.png" L="$OUT/eye-left.png" R="$OUT/eye-right.png"
 HE="v360=input=e:output=he:w=1920:h=1920"
+HE2K="v360=input=e:output=he:w=2048:h=2048"
 FE="v360=input=e:output=fisheye:h_fov=200:v_fov=200:w=1920:h=1920"
 echo "==> $OUT"
 clip vrtest_360_mono.mp4 "[0:v]$(clock 72),format=yuv420p[v]" "$M" "$M"
@@ -89,7 +91,7 @@ clip vrtest_360_TB.mp4 "[0:v]$(clock 72)[l];[1:v]$(clock 72)[r];[l][r]vstack,for
 clip vrtest_360_SBS.mp4 "[0:v]scale=1920:1920,$(clock 40)[l];[1:v]scale=1920:1920,$(clock 40)[r];[l][r]hstack,format=yuv420p[v]" "$L" "$R"
 clip vrtest_180_mono.mp4 "[0:v]$HE,$(clock 72),format=yuv420p[v]" "$M" "$M"
 clip vrtest_180_LR.mp4 "[0:v]$HE,$(clock 72)[l];[1:v]$HE,$(clock 72)[r];[l][r]hstack,format=yuv420p[v]" "$L" "$R"
-clip vrtest_180_TB.mp4 "[0:v]$HE,$(clock 72)[l];[1:v]$HE,$(clock 72)[r];[l][r]vstack,format=yuv420p[v]" "$L" "$R"
+clip vrtest_180_TB.mp4 "[0:v]$HE2K,$(clock 72)[l];[1:v]$HE2K,$(clock 72)[r];[l][r]vstack,format=yuv420p[v]" "$L" "$R"
 clip vrtest_MKX200_LR.mp4 "[0:v]$FE,$(clock 72)[l];[1:v]$FE,$(clock 72)[r];[l][r]hstack,format=yuv420p[v]" "$L" "$R"
 
 if [ "${1:-}" = --upload ]; then

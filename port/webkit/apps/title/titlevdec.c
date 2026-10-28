@@ -156,6 +156,50 @@ static const struct ps5wk_vdec_backend title_backend = {
     tv_report,
 };
 
+/* /data/ps5webkit/vdec-probe (a file): before the backend is installed, open
+ * and close a decoder for each size below and log what Videodec2 accepts
+ * (portrait and square VR formats; the first headset test found 1920x3840
+ * HEVC refused at QueryDecoderMemoryInfo, 0x811d0200). */
+static void probe_sizes(void)
+{
+    static const struct { unsigned codec, profile, level; int w, h; } k[] = {
+        { VDEC2_CODEC_HEVC, 1, 0, 3840, 1920 }, { VDEC2_CODEC_HEVC, 1, 0, 1920, 3840 }, { VDEC2_CODEC_HEVC, 1, 183, 1920, 3840 },
+        { VDEC2_CODEC_HEVC, 1, 0, 1920, 1920 }, { VDEC2_CODEC_HEVC, 1, 0, 1920, 2048 }, { VDEC2_CODEC_HEVC, 1, 0, 1920, 2176 },
+        { VDEC2_CODEC_HEVC, 1, 0, 1920, 2304 }, { VDEC2_CODEC_HEVC, 1, 0, 1920, 2560 }, { VDEC2_CODEC_HEVC, 1, 0, 1080, 1920 },
+        { VDEC2_CODEC_HEVC, 1, 0, 2160, 3840 }, { VDEC2_CODEC_HEVC, 1, 0, 2048, 4096 }, { VDEC2_CODEC_HEVC, 1, 0, 2880, 5760 },
+        { VDEC2_CODEC_HEVC, 1, 0, 2880, 2880 }, { VDEC2_CODEC_HEVC, 1, 0, 3840, 3840 }, { VDEC2_CODEC_HEVC, 1, 0, 4096, 4096 },
+        { VDEC2_CODEC_HEVC, 1, 0, 4352, 4352 }, { VDEC2_CODEC_HEVC, 1, 0, 5120, 5120 }, { VDEC2_CODEC_HEVC, 1, 0, 5760, 5760 },
+        { VDEC2_CODEC_HEVC, 1, 0, 7680, 3840 }, { VDEC2_CODEC_HEVC, 1, 0, 8192, 4352 }, { VDEC2_CODEC_HEVC, 1, 0, 8192, 8192 },
+        { VDEC2_CODEC_HEVC, 2, 0, 1920, 3840 }, { VDEC2_CODEC_HEVC, 2, 0, 3840, 3840 },
+        { VDEC2_CODEC_AVC, 100, 0, 1080, 1920 }, { VDEC2_CODEC_AVC, 100, 0, 1920, 1920 }, { VDEC2_CODEC_AVC, 100, 0, 1088, 1920 },
+        { VDEC2_CODEC_AVC, 100, 0, 2160, 3840 }, { VDEC2_CODEC_AVC, 100, 0, 2304, 4096 },
+        { VDEC2_CODEC_VP9, 0, 0, 1080, 1920 }, { VDEC2_CODEC_VP9, 0, 0, 2160, 3840 }, { VDEC2_CODEC_VP9, 0, 0, 3840, 3840 },
+        { VDEC2_CODEC_VP9, 0, 0, 4096, 4096 },
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        vdec2_config_t c;
+        memset(&c, 0, sizeof c);
+        c.codec = k[i].codec;
+        c.profile = k[i].profile;
+        c.level = k[i].level;
+        c.width = k[i].w;
+        c.height = k[i].h;
+        c.caller_frames = 1;
+        c.pipeline_depth = (long)k[i].w * k[i].h > 3840L * 2176 ? 2 : 4;
+        vdec2_info_t info;
+        memset(&info, 0, sizeof info);
+        const char *stage = "";
+        int rc = 0;
+        vdec2_t *v = vdec2_open(&c, &info, &stage, &rc);
+        fprintf(stderr, "[vdec] probe %s %s profile %u level %u %dx%d (%s): %s%s rc 0x%08x; flexible %.1f MB, frame %.1f MB\n",
+            v ? "OPEN" : "REFUSED", c.codec == VDEC2_CODEC_HEVC ? "HEVC" : c.codec == VDEC2_CODEC_AVC ? "H.264" : "VP9", c.profile,
+            info.level, k[i].w, k[i].h, k[i].h > k[i].w ? "portrait" : k[i].h == k[i].w ? "square" : "landscape",
+            v ? "" : "at ", v ? "" : stage, (unsigned)rc, info.cpu_bytes / 1048576.0, info.frame_bytes / 1048576.0);
+        if (v)
+            vdec2_close(v);
+    }
+}
+
 /* After the log is up: install the backend if the module bound. */
 void ps5wk_title_vdec_install(void);
 void ps5wk_title_vdec_install(void)
@@ -170,6 +214,11 @@ void ps5wk_title_vdec_install(void)
     if (s_load_rc != 0) {
         fprintf(stderr, "[vdec] libSceVideodec2 not bound (0x%08x): %s; software decoding only\n", (unsigned)s_load_rc, vdec2_load_report());
         return;
+    }
+    int probe = open("/data/ps5webkit/vdec-probe", O_RDONLY);
+    if (probe >= 0) {
+        close(probe);
+        probe_sizes();
     }
     ps5wk_video_set_decoder_backend(&title_backend);
 }

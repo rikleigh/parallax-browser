@@ -752,8 +752,11 @@ the headset to be released.
   view ray: equirectangular 360/180, equidistant fisheye (field of view from
   the name, 180 by default), or a 70-degree-wide flat screen in a dark room;
   stereo layouts pick the eye's half (left/top = left eye). The hint is
-  head-locked at the same tangents in both eyes. Recentring keeps the yaw
-  of the head at entry (or at Square).
+  head-locked at the same tangents in both eyes. The video's front starts
+  at the tracking space's forward (-z, where the system centres its own VR
+  views, as PS5VR does); Square moves it to where the head looks (yaw
+  only). Not recentred on the head at entry: the tracker's first poses
+  after it registers are a stale default (see *Headset test 1*).
 - Leaving: `psvr2_close` leaves VR mode, unregisters, closes the tracker,
   reprojection and Hmd2 and now **releases the ~130 MB of direct memory**
   psvr2 took (Spike 3b/9 leaked it per session); a failed open undoes
@@ -769,7 +772,7 @@ patterns (FFmpeg `v360` from a labelled equirectangular grid: a cell every
 30 degrees with its yaw/pitch, FRONT/RIGHT/BACK/LEFT/UP/DOWN, a green front
 cell, a clock at the front; stereo clips have a red "LEFT EYE" and a blue
 "RIGHT EYE" grid): `vrtest_360_mono`, `vrtest_360_TB`, `vrtest_360_SBS`,
-`vrtest_180_mono`, `vrtest_180_LR`, `vrtest_180_TB`, `vrtest_MKX200_LR`
+`vrtest_180_mono`, `vrtest_180_LR`, `vrtest_180_TB` (2048x4096), `vrtest_MKX200_LR`
 (200-degree fisheye). The start page has a "View in VR tests" row.
 
 **Knobs (log-only tests).** `/data/ps5webkit/vr-sim`: no Hmd2 at all; the eye
@@ -805,6 +808,44 @@ the new param.json, opens the headset (device status 2, not worn) and
 closes, twice. The real Hmd2 VR mode (`psvr2_start`, submits, tracking,
 `psvr2_close` with its memory release) has not run in the browser yet: that
 is the owner's headset check.
+
+**Headset test 1 (owner, 2026-10-28) and fixes.** 360 mono, 180 SBS,
+360 TB, fisheye, flat, the controls and repeated enter/leave worked in the
+headset (60 frames/s, 120 Hz out, 0 submit errors; each exit released 129
+MB, all rc 0). Two problems:
+- **The view started facing LEFT 90.** Every entry logged "recentred (yaw
+  -91.x)" while the owner faced forward: the tracker's first poses after it
+  registers are a stale default, as PS5VR notes ("always yaw 90.5", its sign
+  convention), so it never recentres on entry. Our yaw maths equals PS5VR's
+  (a CPU check over 100,000 random poses: our yaw0 is minus PS5VR's angle,
+  and after a recentre the head's forward maps to longitude 0); the bug was
+  using the stale pose. Now the front starts at tracking-space forward and
+  only Square recentres; `[vr] head yaw` is logged at headset frames 2, 60
+  and 300.
+- **180 TB (then 1920x3840) did not play:** Videodec2 refused the size and
+  playback failed with FormatError. A size probe in the title
+  (`/data/ps5webkit/vdec-probe`, `[vdec] probe` lines) found: HEVC at level
+  5.1 opens at most 2176 lines (1920x2304, 2880x2880, 2048x4096 refused,
+  0x811d0200 at QueryDecoderMemoryInfo); at level 6.1, 1920x3840, 3840x3840,
+  4096x4096 and 4352x4352 open; above 4352 lines nothing does (5120x5120,
+  8192x8192, 2880x5760); H.264 and VP9 open portrait sizes (1080x1920,
+  2160x3840, 2304x4096 H.264; up to 4096x4096 VP9). So vdec2 now asks for
+  level 6.1 above 2176 lines or 4096 columns. But a decoder opened that way
+  still fails every decode call (0x811d0111) on a stream whose own SPS says
+  level 5.1, as encoders write for 2048x4096 or 2880x2880 (the spec allows
+  it); a 3840x3840 stream tagged 6.0 decodes. (A square decoder covering a
+  portrait picture failed the same way.) Fixes in the WebProcess's
+  `ps5vdecproxy`: HEVC above 2176 lines or 4096 columns with a level below 6
+  is not taken (software decoding instead), and the first accept-caps query
+  now has the title open the decoder (DOPEN, kept for set_format), so any
+  size the title refuses falls back to software decoding instead of failing
+  playback. `/data/ps5webkit/vdec-refuse` (`<w>x<h>`) makes the title refuse
+  a size, to test that path. Checked log-only: `vrtest_180_TB` (now
+  2048x4096, level 5.1) plays in software at 30 frames/s and the eye buffers
+  show 180 TB correctly; `vrtest_360_TB` with `vdec-refuse 3840x3840` falls
+  back to software and plays; self-test PASS both times. Next: rewriting
+  the SPS level (general_level_idc) to 6.1 for such streams could keep them
+  on the hardware decoder.
 
 Not done: YouTube's own 360/180 formats. Its player data says
 `projectionType` per format (read and logged; `EQUIRECTANGULAR` and

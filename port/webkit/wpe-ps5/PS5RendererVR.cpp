@@ -85,7 +85,6 @@ struct PS5VRState {
     float tan[2][4] { };
     int projection { 0 };
     float fisheyeHalf { static_cast<float>(M_PI / 2) };
-    bool haveYaw { false };
     bool recenter { false };
     float yaw0 { 0 };
     int sourceStream { -1 };
@@ -597,7 +596,6 @@ bool PS5Renderer::vrStart(int projection, float fisheyeDegrees, char* message, s
         memcpy(vr->tan[0], left, sizeof(left));
         memcpy(vr->tan[1], right, sizeof(right));
         vr->simNextUS = nowUS();
-        vr->haveYaw = true; // the scripted directions are absolute: front = yaw 0
     }
 
     vr->startUS = vr->windowUS = nowUS();
@@ -708,19 +706,25 @@ void PS5Renderer::vrRenderEyes(unsigned buffer, const void* framePointer)
     if (vr->hintTexture && vr->hintUntilUS && nowUS() < vr->hintUntilUS) {
         // Text about 2.5 degrees tall (the panel's 40 px lines), at most 60
         // degrees wide, centred about 22 degrees below the view's centre.
-        const float w = std::clamp(vr->hintWidth * 0.0011f, 0.4f, 1.15f), h = w * vr->hintHeight / std::max(1, vr->hintWidth), cy = -0.40f;
+        const float w = std::clamp(vr->hintWidth * 0.0016f, 0.5f, 1.15f), h = w * vr->hintHeight / std::max(1, vr->hintWidth), cy = -0.40f;
         glUniform4f(s_uHintRect, -w / 2, cy - h / 2, w / 2, cy + h / 2);
     } else
         glUniform4f(s_uHintRect, 0, 0, 0, 0);
 
-    // Recentre: the video's front goes where the head looks now (yaw only,
-    // so the horizon stays level).
-    if (frame.tracked && (!vr->haveYaw || vr->recenter)) {
+    // The video's front starts at the tracking space's forward (-z), where
+    // the system centres its own VR views. Not on the head at entry: the
+    // tracker's first poses after it registers are a stale default (yaw
+    // about -91 degrees here; PS5VR saw "always 90.5" in its convention),
+    // which put LEFT 90 in front in the first headset test. Square
+    // recentres on the live pose (yaw only, so the horizon stays level).
+    if (frame.tracked && vr->recenter) {
         vr->yaw0 = yawOf(frame.head.quat);
-        vr->haveYaw = true;
         vr->recenter = false;
-        VRLOG("recentred (yaw %.1f degrees)", vr->yaw0 * 180 / M_PI);
+        VRLOG("recentred (head yaw %.1f degrees, positive = left)", vr->yaw0 * 180 / M_PI);
     }
+    if (frame.tracked && !vr->sim && (vr->frames == 2 || vr->frames == 60 || vr->frames == 300))
+        VRLOG("head yaw %.1f degrees at headset frame %llu (positive = left; the front is at yaw %.1f)", yawOf(frame.head.quat) * 180 / M_PI,
+            static_cast<unsigned long long>(vr->frames), vr->yaw0 * 180 / M_PI);
     const float yawQuat[4] = { 0, sinf(-vr->yaw0 / 2), 0, cosf(-vr->yaw0 / 2) };
     float yaw[9];
     quatToMat3(yawQuat, yaw);

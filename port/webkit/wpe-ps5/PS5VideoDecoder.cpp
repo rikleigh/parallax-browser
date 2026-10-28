@@ -664,6 +664,18 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
         return 1;
     if (width > backend->max_width || height > backend->max_height)
         return 1;
+    // Test knob: /data/ps5webkit/vdec-refuse holding "<width>x<height>"
+    // refuses that size, as Videodec2 does some (the WebProcess must then
+    // decode it in software).
+    if (FILE* knob = fopen("/data/ps5webkit/vdec-refuse", "r")) {
+        int refuseWidth = 0, refuseHeight = 0;
+        bool match = fscanf(knob, "%dx%d", &refuseWidth, &refuseHeight) == 2 && refuseWidth == width && refuseHeight == height;
+        fclose(knob);
+        if (match) {
+            DLOG("decoder for pid %d: %dx%d refused (/data/ps5webkit/vdec-refuse)", d->pid, width, height);
+            return 2;
+        }
+    }
     // Room for adaptive streams: VP9 is cheap at 4K (13 MB), H.264 up to
     // 1080p costs 24 MB; HEVC is sized as asked.
     int openWidth = width, openHeight = height;
