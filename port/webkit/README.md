@@ -104,7 +104,9 @@ default it asks for no password.
   request carry `pin=4821` (a query or form field, or an `X-PS5-PIN` header).
   The page then shows a PIN box, and `http://<ps5>:9040/?pin=4821` gives a
   bookmarklet with the PIN built in. `/data/ps5webkit/push-off` (a file):
-  no link server. Both files are read at startup.
+  the server listens on 127.0.0.1 only, so nothing on the LAN reaches it but
+  the in-app Settings still work (see *Settings*). Both files are read at
+  startup.
 - The port is fixed at 9040. The other ports in use are elfldr 9021, the
   launcher 9031, ftpsrv 2121 and the Mac's log server 9999.
 - **Checked on the console** (2026-10-29, log only, no TV): with the browser
@@ -151,6 +153,129 @@ domain prefix). Nothing is written on the Mac.
   plain, HttpOnly, SameSite None/Lax cookies were all added and saved, and a
   page on the Mac received them in its `Cookie` header. The Chrome reader
   needs the keychain prompt, so the first real run is the owner's.
+
+## Settings
+
+The browser's main knobs are on one settings page. It works from the PS5 and
+from any other device, and both use the same code (`apps/title/settings.c`,
+served by the link server in `ps5browser.c`).
+
+- **On the PS5:** press **R3** (click the right stick) to open Settings. Press
+  R3 again, or O, or *Back to the page*, to go back to the page you were on.
+  The start page also has a *Settings* tile. The page is
+  `http://127.0.0.1:9040/settings` and is made for the D-pad: big buttons,
+  a yellow focus ring and a dark theme. X picks an option. For the home page
+  field, X or Triangle brings up the keyboard. R3 does nothing while you are
+  in View in VR, because the headset owns the pad there.
+- **On a Mac or phone:** open `http://192.168.1.50:9040/settings`. It
+  follows the system's light or dark mode.
+
+Each setting has a one-line explanation, its current value, its default and
+a badge that says what applies it. When a saved change is not in use yet,
+the badge says so and a banner offers the restart that applies it. Changes
+are saved as soon as you press a button.
+
+| Setting | Stored as | Applies |
+| --- | --- | --- |
+| JavaScript JIT: all tiers (default) / up to DFG / Baseline only / off | `child.env`: `PS5WK_JIT=1/dfg/baseline/0` | page restart |
+| Painting threads: 1-8 (default 4; 1 = the old single-thread path) | `PS5WK_PAINT_THREADS` | page restart |
+| Fast scrolling (default on) | `PS5WK_SCROLL_COPY=0` when off | page restart |
+| Page memory limit: off / 2 / 3 (default) / 4 / 6 GB | `PS5WK_MEM_RESTART_MB` | page restart |
+| Give back freed memory (default on) | `PS5WK_PAS_DECOMMIT=0` when off | page restart (the NetworkProcess at the next browser start) |
+| Video under the page, i.e. hole punch (default on) | `PS5WK_HOLEPUNCH=0` when off | page restart |
+| Offer VP9 video (default on; off makes YouTube send H.264) | `PS5WK_MEDIA_VP9=0` when off | page restart |
+| Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
+| Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
+| Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
+| Home page (empty = the built-in start page) | `/data/ps5webkit/home-url.txt` | next start |
+
+The page also has these actions: *Clear cookies* and *Clear all website
+data* (`webkit_website_data_manager_clear` on the browser's network session:
+cookies, or every type, of any age), *Restart page* and *Restart browser*.
+Clearing data, turning the link server off from another device and
+restarting the browser each ask for a second press.
+
+- **child.env** is rewritten in place. Comments, `JSC_*`, `WEBKIT_DEBUG` and
+  any other lines stay as they were. The first line of a setting gets the
+  new value and any repeats of it are dropped. A setting put back to its
+  default loses its line. The new file goes to `child.env.tmp` and is then
+  renamed over `child.env`, so a child never reads half a file.
+- **Restart page** ends the WebProcess and loads the page shown in a new one,
+  the same way the memory limit does (`memRestart`). The new process reads
+  `child.env`. The log shows `[mem] WebProcess ended (Settings: restart
+  page)` and `RESULT ps5browser page-restart PASS`. The NetworkProcess keeps
+  running, and of these settings only *Give back freed memory* matters to
+  it.
+- **Restart browser** needs the launcher payload (`tools/launcher`). The
+  title asks the launcher for `status`, and goes ahead only if the reply
+  names PPSA99020. It writes the page you were on to `open-url.txt` (the page
+  R3 left, when Settings itself is showing) and winds down exactly as for the
+  launcher's `stop`: media stopped, audio ports and sockets closed, the
+  WebProcess ended. After the wind-down it asks for `status` once more. Then
+  `title_exit.c` sends the launcher `kill -9` and `launch PPSA99020` on one
+  connection (`spike_title_relaunch`). The launcher reads the second line
+  only once the kill is done. Its kill only ever targets the running app,
+  which is this title, and its `launch` refuses to start while any app is
+  running. If the launcher isn't running, the page says to restart the
+  browser from the home screen, and nothing closes. On the Mac, the page
+  waits until the browser answers again with a new start time.
+- **Link server off** (`push-off`): the server now listens on 127.0.0.1 only,
+  instead of not running at all. R3 still opens Settings, but phones,
+  `ps5open` and the bookmarklet can't reach the PS5. Turn it back on from the
+  PS5's Settings, or delete the file over FTP.
+
+API (the page uses it too). No CORS headers are sent. A request with an
+`Origin` header must come from the same address it was sent to, and the
+address must be an IP, `localhost`, a name without dots or a `.local`/`.lan`/`.home`
+name. So no other web page can change settings, whether by posting a form
+or through DNS rebinding. A PIN set in `push-pin.txt` applies as it does for
+`/open`, except to the PS5 itself (127.0.0.1). The page then shows a PIN
+box.
+
+```sh
+curl http://192.168.1.50:9040/settings.json        # every setting: value, default, inUse, restart, pending; uri, started, status
+curl -d '{"jit":"dfg","paint_threads":2}' http://192.168.1.50:9040/settings   # or form fields: -d jit=dfg -d sound=0
+curl -X POST 'http://192.168.1.50:9040/restart?scope=page'     # or scope=browser
+curl -X POST 'http://192.168.1.50:9040/clear?what=cookies'     # or what=all
+```
+
+Settings are named by their id (`jit`, `paint_threads`, `scroll_copy`,
+`mem_restart_mb`, `pas_decommit`, `holepunch`, `media_vp9`, `hwdec`, `sound`,
+`link_server`, `home_url`) or by their child.env or file name
+(`PS5WK_JIT=0`). Booleans take `1`/`0`, `true`/`false` or `on`/`off`, and
+`null` means the default. A request with any invalid value changes nothing
+(400). The reply is the full settings JSON plus a `"message"` such as
+`Saved: JavaScript JIT. Restart the page to apply.` The results of clearing
+data and restarting the page arrive later, in `"status"`. The log shows
+`settings from http <ip>: ...` and `settings: ...` lines.
+
+Not exposed, because they are test or debug knobs: `test-urls.txt`,
+`test-onload.js`, `vr-sim`, `vr-probe`, `vr-selftest`, `debug-screenshot`,
+`vdec-probe`, `vdec-refuse`, `page-texture`, `audio-null`, `audio-selftest`,
+and the A/B and logging lines in child.env (`PS5WK_PAINT_ASYNC`,
+`PS5WK_PAINT_RECORD`, `PS5WK_PAINT_BBH`, `PS5WK_PAINT_MIN_PX`,
+`PS5WK_IDLE_GAP`, `PS5WK_SHM_READBACK`, `PS5WK_*_LOG`, `PS5WK_PROFILE`,
+`PS5WK_FD_TRACE`, `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_AV1`, `PS5WK_HWDEC`,
+`PS5WK_PROCESS_SWAPS`, `PS5WK_STILL_FRAME`). They still work in child.env,
+and the page leaves them alone.
+
+**Checked on the console** (2026-10-29, log only, no TV): from the Mac,
+`/settings.json` read the console's files. Setting JIT to DFG and painting
+threads to 2 wrote exactly those two lines and kept the comments. *Restart
+page*, with the PS5 browser showing its own `http://127.0.0.1:9040/settings`,
+started a new WebProcess with `JIT: on (PS5WK_JIT=dfg …)` and `painting on 2
+threads`, and the page reloaded from the title's own server with no stall.
+A test cookie was added, and *Clear cookies* removed it from
+`cookies.sqlite`. *Restart browser* wound down (0 audio streams, the audio
+server stopped). The launcher log showed `kill -9`, `OK killed PPSA99020`
+and `launch PPSA99020`, and the new title answered after about 4 s. With
+the link server off, the restarted title listened on 127.0.0.1 only: the Mac
+got no answer, and the PS5 browser loaded Settings. Requests with a foreign
+`Origin` or `Host` got 403. Screen captures showed the page rendered by the
+PS5's WebKit (the script ran, focus was on the selected JIT button). Not
+checked yet: R3 and D-pad navigation on the TV, the PIN box, and *Clear all
+website data* (skipped so the owner's site data was kept; same code path
+as cookies).
 
 ## Build
 
@@ -265,6 +390,11 @@ Milestone 1 placeholder media interfaces) is gone.
   title with hole-punch video; audio already lives there.
 
 ### Knobs
+
+The knobs meant for users (JIT, painting, memory, hole punch, VP9, hardware
+decoding, sound, the link server, the home page) can be changed on the
+**Settings** page (R3 on the PS5, or `http://<ps5>:9040/settings`; see
+*Settings*). The table lists them all, debug knobs included.
 
 | | |
 | --- | --- |
@@ -1307,7 +1437,8 @@ browser); X = click at the pointer when it is shown (it shows for 8 s after
 the left stick moves), otherwise Enter; O = Back; left stick = pointer;
 right stick = scroll under the pointer; Options = URL/search prompt;
 Triangle = keyboard for the focused field (it also opens by itself when X
-focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom.
+focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
+R3 = Settings (XF86Tools; see *Settings*).
 
 GL goes through libepoxy; in the title, `--wrap=dlopen/dlsym` and
 `apps/title/dlshim.c` resolve epoxy's lookups to the statically linked
@@ -1603,7 +1734,7 @@ malloc family + `aligned_alloc`/`memalign` (dheap), `mmap/munmap/madvise`,
 Runtime needs on the console (already there): `/data/ps5webkit` runtime tree
 from port/deps (certs, fonts, fonts.conf, xkb) and
 `/data/ps5webkit/share/icu/icudt76l.dat` (uploaded by `test/run-shot.sh`).
-Optional: `/data/ps5webkit/home-url.txt` (start page),
+Optional: `/data/ps5webkit/home-url.txt` (start page; Settings sets it),
 `/data/ps5webkit/child.env` (`WEBKIT_DEBUG=...` for the children; very
 verbose).
 

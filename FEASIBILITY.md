@@ -693,6 +693,16 @@ port.
   heap locks with a pthread mutex too. Knobs: `PS5WK_PAINT_THREADS`,
   `PS5WK_SCROLL_COPY`, `PS5WK_PAINT_ASYNC`, `PS5WK_RENDER_LOG`. Waiting for the
   owner's TV check (scrolling, video, View in VR).
+- **Settings (2026-10-29, port/webkit/README.md, *Settings*):** one settings
+  page, opened with R3 on the PS5 or at `http://<ps5>:9040/settings` from a
+  Mac or phone. It covers the JIT tiers, painting threads, fast scrolling,
+  the memory limit, decommit, hole punch, VP9, hardware decoding, sound,
+  the link server and the home page, and can clear cookies or all website
+  data. It rewrites child.env while keeping the other lines, and applies
+  changes by restarting the page (a new WebProcess) or the whole browser
+  (wind-down, then the launcher's kill and launch on one connection).
+  Checked on the console by log; R3 and the D-pad are waiting for the
+  owner's TV check.
 - **Next (follow-up, not started): payload malloc and mutex contention.**
   `port/webkit/test/lockbench` (a payload; 400k operations per thread):
 

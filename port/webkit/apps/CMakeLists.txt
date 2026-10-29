@@ -85,7 +85,7 @@ add_dependencies(ps5wk-shot WebKit)
 
 set(PS5WK_LOG_HOST "192.168.1.20" CACHE STRING "Mac address for the title's TCP log (tools/logserver.sh)")
 set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
-add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/common/ps5audioserver.c)
+add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/common/ps5audioserver.c)
 target_include_directories(ps5browser PRIVATE ${PS5_API_INCLUDE_DIRECTORIES} ${PS5_PORT_DIR}/../../spikes)
 target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_PORT=${PS5WK_LOG_PORT})
 target_link_libraries(ps5browser PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)

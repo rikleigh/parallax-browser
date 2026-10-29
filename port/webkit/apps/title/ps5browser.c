@@ -12,6 +12,7 @@
  *   right stick: scroll, D-pad: move between links (spatial navigation),
  *   O: back, Options: type a URL or search, Square: reload,
  *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard,
+ *   R3 (press the right stick): Settings, and back to the page from there,
  *   touchpad: View in VR (the playing video in the PS VR2 headset; its own
  *   controls while there, see viewinvr.c).
  *
@@ -22,6 +23,7 @@
 #include "../common/ps5audioserver.h"
 #include "../common/webmem.h"
 #include "common/title.h"
+#include "settings.h"
 #include "viewinvr.h"
 
 #include <arpa/inet.h>
@@ -69,6 +71,8 @@ static void memLog(const char* milestone)
 
 static WebKitWebView* webView;
 static GMainLoop* mainLoop;
+static WebKitNetworkSession* networkSession;
+static gint64 startedAt; /* Unix seconds: the settings page sees a restart */
 
 /* ---- Clean wind-down (asked by the launcher before it SIGKILLs us) ----
  * tools/launcher "stop" connects to PS5WK_CONTROL_SOCKET and sends "quit".
@@ -117,6 +121,7 @@ static gboolean beginWindDown(gpointer data)
 
 static const char* pushRequest(const char* text, const char* from, char** uriOut);
 static void setShownURI(const char* uri);
+static void toggleSettings(void);
 
 static void* controlThread(void* unused)
 {
@@ -225,6 +230,9 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
         return TRUE;
     case WPE_KEY_Reload:
         webkit_web_view_reload(webView);
+        return TRUE;
+    case WPE_KEY_Tools: /* R3 */
+        toggleSettings();
         return TRUE;
     case WPE_KEY_ZoomIn:
     case WPE_KEY_ZoomOut:
@@ -391,9 +399,12 @@ static gboolean readTestURLs(void)
 
 /* The WebProcess memory limit (apps/common/webmem.h): over it, the next
  * top-level navigation ends the WebProcess and loads the address in a new
- * one. memRestartURI is set from then until the new WebProcess commits. */
+ * one. memRestartURI is set from then until the new WebProcess commits.
+ * "Restart page" in Settings does the same for the page shown
+ * (settingsRestart), so that a new WebProcess reads child.env. */
 static char* memRestartURI;
 static gboolean memRestarting;
+static gboolean settingsRestart;
 
 static gboolean memRestart(gpointer data)
 {
@@ -406,7 +417,8 @@ static gboolean memRestart(gpointer data)
      * own (it launched one that the load below then didn't use). */
     webkit_web_view_stop_loading(webView);
     webkit_web_view_terminate_web_process(webView); /* web-process-terminated, then the load below */
-    spike_log("[mem] WebProcess ended; loading %s in a new one", memRestartURI);
+    ps5wk_settings_applied(PS5WK_SETTINGS_PAGE);
+    spike_log("[mem] WebProcess ended (%s); loading %s in a new one", settingsRestart ? "Settings: restart page" : "memory limit", memRestartURI);
     char* uri = memRestartURI;
     memRestartURI = NULL;
     webkit_web_view_load_uri(webView, uri);
@@ -432,7 +444,16 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     }
     if (event == WEBKIT_LOAD_COMMITTED && memRestarting) {
         memRestarting = FALSE;
-        SPIKE_PASS("mem-restart", "new WebProcess committed %s", webkit_web_view_get_uri(view));
+        if (settingsRestart) {
+            settingsRestart = FALSE;
+            SPIKE_PASS("page-restart", "new WebProcess committed %s", webkit_web_view_get_uri(view));
+            GDateTime* now = g_date_time_new_now_local();
+            char* time = g_date_time_format(now, "%H:%M:%S");
+            ps5wk_settings_set_status("The page restarted at %s with the settings on disk.", time);
+            g_free(time);
+            g_date_time_unref(now);
+        } else
+            SPIKE_PASS("mem-restart", "new WebProcess committed %s", webkit_web_view_get_uri(view));
     }
     if (event == WEBKIT_LOAD_COMMITTED) {
         ps5wk_vr_stop(FALSE, "another page");
@@ -490,6 +511,7 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     g_free(lastCrashURI);
     lastCrashURI = g_strdup(uri ? uri : "");
     lastCrashTime = now;
+    ps5wk_settings_applied(PS5WK_SETTINGS_PAGE); /* the next WebProcess reads child.env */
     if (!again) {
         SPIKE_FAIL("webprocess", "terminated (reason %d); reloading", reason);
         webkit_web_view_reload(view);
@@ -537,13 +559,17 @@ static int fileExists(const char* path);
  *   POST /cookies        Netscape cookies.txt lines (tools/ps5open --cookies,
  *       from Chrome) added to the cookie store. Knob:
  *       /data/ps5webkit/push-cookie-key.txt: a key the X-PS5-Key header must match
+ *   GET /settings, GET /settings.json, POST /settings, POST /restart,
+ *       POST /clear  the settings page and its API (settingsServe below)
  * The control socket takes "open <url>" too. Bare hosts get https://, other
  * words a search; only http, https and file:///data/ps5webkit/ URLs load.
  * Loading a page also leaves View in VR (onLoadChanged).
- * Knobs: /data/ps5webkit/push-off (a file): no server.
+ * Knobs: /data/ps5webkit/push-off (a file): the server listens on
+ * 127.0.0.1 only (the in-app Settings page still opens; the LAN can't).
  * /data/ps5webkit/push-pin.txt: a PIN that requests must carry (pin=...).
  * A request is read within 3 s and 64 KB, one at a time: a slow or
- * oversized client gets an error, never a stuck title. */
+ * oversized client gets an error, never a stuck title. Nothing here waits
+ * for the main loop (the browser itself loads /settings from this thread). */
 #define PS5WK_PUSH_PORT 9040
 #define PS5WK_PUSH_MAX 65536 /* a site's cookies fit */
 #define PS5WK_COOKIE_KEY "/data/ps5webkit/push-cookie-key.txt"
@@ -551,7 +577,9 @@ static int fileExists(const char* path);
 
 static GMutex shownLock;
 static char* shownURI; /* the committed page, for /status (any thread) */
+static char* settingsReturnURI; /* the page R3 left for Settings (shownLock) */
 static char* pushPIN;
+static gboolean pushLocalOnly; /* push-off: 127.0.0.1 only */
 static WebKitCookieManager* cookieManager;
 
 static void setShownURI(const char* uri)
@@ -805,20 +833,26 @@ static char* jsonString(const char* s)
     return g_string_free(out, FALSE);
 }
 
-static void pushReply(int client, int status, const char* type, const char* body)
+/* cors: let pages of any origin call it (not the settings: see settingsServe). */
+static void pushReplyCORS(int client, int status, const char* type, const char* body, gboolean cors)
 {
     const char* reason = status == 200 ? "OK" : status == 204 ? "No Content" : status == 400 ? "Bad Request"
         : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed"
         : status == 408 ? "Request Timeout" : status == 413 ? "Payload Too Large" : "Service Unavailable";
     size_t length = body ? strlen(body) : 0;
-    char* head = g_strdup_printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, X-PS5-PIN, X-PS5-Key\r\nAccess-Control-Allow-Private-Network: true\r\n"
-        "Cache-Control: no-store\r\nConnection: close\r\n\r\n", status, reason, type, length);
+    char* head = g_strdup_printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n%s"
+        "Cache-Control: no-store\r\nConnection: close\r\n\r\n", status, reason, type, length,
+        cors ? "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-PS5-PIN, X-PS5-Key\r\nAccess-Control-Allow-Private-Network: true\r\n" : "");
     send(client, head, strlen(head), 0);
     if (length)
         send(client, body, length, 0);
     g_free(head);
+}
+
+static void pushReply(int client, int status, const char* type, const char* body)
+{
+    pushReplyCORS(client, status, type, body, TRUE);
 }
 
 static const char pushPageStyle[] =
@@ -896,7 +930,285 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
     return FALSE;
 }
 
-static void pushServe(int client, const char* from)
+/* ---- Settings (README: "Settings"; the table is in settings.c) ----
+ *   GET /settings        the page (the PS5 opens it with R3: toggleSettings)
+ *   GET /settings.json   every setting: value, default, the value in use,
+ *       what applies it ("page", "browser", "none"), whether it waits for
+ *       that restart; the page shown; the last action's result
+ *   POST /settings       JSON {"jit":"dfg","sound":false} or form fields
+ *       jit=dfg&sound=0 (ids, or the child.env/file names); replies with
+ *       the settings and "message"
+ *   POST /restart?scope=page|browser   page: a new WebProcess for the page
+ *       shown (reads child.env); browser: the title starts again
+ *   POST /clear?what=cookies|all       WebKit's website data
+ * The PIN applies as for /open, except to the PS5 itself (127.0.0.1). No
+ * CORS headers, and requests with an Origin header must come from the
+ * address they were sent to, by IP or a local name: other web pages
+ * (a form posted from a site, DNS rebinding) can't change settings. */
+#define PS5WK_TITLE_ID "PPSA99020"
+#define PS5WK_LAUNCHER_PORT 9031
+
+/* title_exit.c (titles only): a title ID there is launched again after the
+ * SIGKILL that ends the title. */
+extern char spike_title_relaunch[16] __attribute__((weak));
+
+static gboolean isSettingsURI(const char* uri)
+{
+    return uri && g_str_has_prefix(uri, PS5WK_SETTINGS_URL);
+}
+
+/* Main loop: R3 opens Settings, and from there goes back to the page. */
+static void toggleSettings(void)
+{
+    if (ps5wk_vr_active() || windDownStart)
+        return;
+    const char* current = webkit_web_view_get_uri(webView);
+    if (isSettingsURI(current)) {
+        spike_log("settings: R3, back to the page");
+        if (webkit_web_view_can_go_back(webView))
+            webkit_web_view_go_back(webView);
+        else {
+            char* home = homeURL();
+            webkit_web_view_load_uri(webView, home);
+            g_free(home);
+        }
+        return;
+    }
+    g_mutex_lock(&shownLock);
+    g_free(settingsReturnURI);
+    settingsReturnURI = g_strdup(current && *current ? current : "");
+    g_mutex_unlock(&shownLock);
+    spike_log("settings: R3, opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
+    loadStart = g_get_monotonic_time();
+    webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
+}
+
+/* host: the Host header; origin: the Origin header or "". */
+static gboolean settingsRequestAllowed(const char* host, const char* origin)
+{
+    if (!*host)
+        return !*origin;
+    char name[128];
+    snprintf(name, sizeof name, "%s", host);
+    name[strcspn(name, ":")] = 0;
+    struct in_addr address;
+    gboolean local = inet_pton(AF_INET, name, &address) == 1 || !g_ascii_strcasecmp(name, "localhost") || !strchr(name, '.');
+    static const char* localSuffixes[] = { ".local", ".lan", ".home", ".internal", ".home.arpa" };
+    for (unsigned i = 0; !local && i < G_N_ELEMENTS(localSuffixes); i++)
+        local = g_str_has_suffix(name, localSuffixes[i]);
+    if (!local)
+        return FALSE;
+    if (!*origin)
+        return TRUE; /* curl, scripts */
+    char expected[160];
+    snprintf(expected, sizeof expected, "http://%s", host);
+    return !g_ascii_strcasecmp(origin, expected);
+}
+
+static gboolean restartPageOnMain(gpointer data)
+{
+    (void)data;
+    if (!webView || windDownStart || memRestartURI || memRestarting)
+        return G_SOURCE_REMOVE;
+    const char* uri = webkit_web_view_get_uri(webView);
+    memRestartURI = uri && *uri && strcmp(uri, "about:blank") ? g_strdup(uri) : homeURL();
+    settingsRestart = TRUE;
+    memRestart(NULL);
+    return G_SOURCE_REMOVE;
+}
+
+static void dataCleared(GObject* manager, GAsyncResult* result, gpointer data)
+{
+    const char* what = data;
+    GError* error = NULL;
+    if (webkit_website_data_manager_clear_finish(WEBKIT_WEBSITE_DATA_MANAGER(manager), result, &error)) {
+        spike_log("settings: %s cleared", what);
+        ps5wk_settings_set_status("%s cleared.", what);
+    } else {
+        spike_log("settings: %s not cleared: %s", what, error ? error->message : "?");
+        ps5wk_settings_set_status("%s not cleared: %s", what, error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
+}
+
+static gboolean clearDataOnMain(gpointer data)
+{
+    gboolean all = GPOINTER_TO_INT(data);
+    if (!networkSession || windDownStart)
+        return G_SOURCE_REMOVE;
+    /* Timespan 0: everything, however old. */
+    webkit_website_data_manager_clear(webkit_network_session_get_website_data_manager(networkSession),
+        all ? WEBKIT_WEBSITE_DATA_ALL : WEBKIT_WEBSITE_DATA_COOKIES, 0, NULL, dataCleared,
+        (gpointer)(all ? "All website data" : "Cookies"));
+    return G_SOURCE_REMOVE;
+}
+
+/* One command to the launcher payload; its reply line in reply. */
+static gboolean launcherAsk(const char* command, char* reply, size_t size)
+{
+    reply[0] = 0;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return FALSE;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_port = htons(PS5WK_LAUNCHER_PORT);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct timeval timeout = { .tv_sec = 3 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+    ssize_t n = -1;
+    if (!connect(fd, (struct sockaddr*)&address, sizeof address) && send(fd, command, strlen(command), 0) == (ssize_t)strlen(command))
+        n = recv(fd, reply, size - 1, 0);
+    close(fd);
+    reply[n > 0 ? n : 0] = 0;
+    reply[strcspn(reply, "\r\n")] = 0;
+    return n > 0;
+}
+
+/* "Restart browser": the launcher payload (tools/launcher) starts titles.
+ * It must be there and see this title running; then the page to come back
+ * to goes in PS5WK_PENDING_URL, the title winds down as for "quit", and
+ * title_exit.c sends the launcher "kill -9" and "launch PPSA99020" on one
+ * connection (it reads the second line once the kill is done). NULL, or
+ * why not. Never on another title: the launcher kills the running app,
+ * which is this one. */
+static const char* restartBrowser(const char* from)
+{
+    if (!spike_title_relaunch)
+        return "only the PS5 title can restart itself";
+    if (windDownStart)
+        return "the browser is already closing";
+    char reply[160];
+    if (!launcherAsk("status\n", reply, sizeof reply))
+        return "the launcher payload isn't running (tools/launch.sh sends it): close the browser and start it again from the home screen";
+    if (strncmp(reply, "OK ", 3) || !strstr(reply, PS5WK_TITLE_ID)) {
+        spike_log("settings: restart refused, launcher status \"%s\"", reply);
+        return "the launcher doesn't see the browser running";
+    }
+    g_mutex_lock(&shownLock);
+    const char* back = shownURI && !isSettingsURI(shownURI) ? shownURI : settingsReturnURI;
+    const char* error = NULL;
+    char* uri = back && *back ? pushNormalize(back, &error) : NULL;
+    g_mutex_unlock(&shownLock);
+    if (uri) {
+        int fd = open(PS5WK_PENDING_URL, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) {
+            (void)!write(fd, uri, strlen(uri));
+            close(fd);
+        }
+    }
+    spike_log("settings: browser restart asked by %s; launcher says \"%s\"; coming back to %s", from, reply, uri ? uri : "the home page");
+    g_free(uri);
+    snprintf(spike_title_relaunch, sizeof spike_title_relaunch, "%s", PS5WK_TITLE_ID);
+    g_main_context_invoke(NULL, beginWindDown, NULL);
+    return NULL;
+}
+
+static void settingsReplyJSON(int client, int status, gboolean ok, const char* message)
+{
+    char* quoted = jsonString(message);
+    char* reply = g_strdup_printf("{\"ok\":%s,\"%s\":%s}\n", ok ? "true" : "false", ok ? "message" : "error", quoted);
+    pushReplyCORS(client, status, "application/json", reply, FALSE);
+    g_free(reply);
+    g_free(quoted);
+}
+
+static char* settingsState(const char* message)
+{
+    char* shown = copyShownURI();
+    g_mutex_lock(&shownLock);
+    char* back = g_strdup(settingsReturnURI ? settingsReturnURI : "");
+    g_mutex_unlock(&shownLock);
+    char* shownJSON = jsonString(shown);
+    char* backJSON = jsonString(back);
+    char* messageJSON = message ? jsonString(message) : NULL;
+    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,%s%s%s",
+        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false",
+        message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "");
+    char* state = ps5wk_settings_json(extra);
+    g_free(extra);
+    g_free(messageJSON);
+    g_free(backJSON);
+    g_free(shownJSON);
+    g_free(back);
+    g_free(shown);
+    return state;
+}
+
+/* Push thread: the routes above. Replies at once: what needs the main loop
+ * is queued there, and its result shows in /settings.json ("status"). */
+static void settingsServe(int client, const char* from, gboolean loopback, gboolean get, gboolean post, const char* path,
+    const char* query, const char* body, const char* type, const char* host, const char* origin, gboolean pinOK)
+{
+    if (!strcmp(path, "/settings") && get) {
+        pushReplyCORS(client, 200, "text/html; charset=utf-8", ps5wk_settings_page, FALSE);
+        return;
+    }
+    gboolean known = (!strcmp(path, "/settings.json") && get)
+        || (post && (!strcmp(path, "/settings") || !strcmp(path, "/restart") || !strcmp(path, "/clear")));
+    if (!known) {
+        settingsReplyJSON(client, !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
+            || !strcmp(path, "/settings") ? 405 : 404, FALSE, "method not allowed or no such page");
+        return;
+    }
+    if (!pinOK && !loopback) {
+        settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
+        return;
+    }
+    if (!settingsRequestAllowed(host, origin)) {
+        spike_log("settings: refused a request from %s (Host \"%s\", Origin \"%s\")", from, host, origin);
+        settingsReplyJSON(client, 403, FALSE, "refused: open the settings at the PS5's IP address (http://<ip>:9040/settings)");
+        return;
+    }
+    if (windDownStart && post) {
+        settingsReplyJSON(client, 503, FALSE, "the browser is closing");
+        return;
+    }
+    if (!strcmp(path, "/settings.json")) {
+        char* state = settingsState(NULL);
+        pushReplyCORS(client, 200, "application/json", state, FALSE);
+        g_free(state);
+    } else if (!strcmp(path, "/settings")) {
+        gboolean json = strstr(type, "json") || *body == '{';
+        char* message = NULL;
+        int changed = 0;
+        gboolean ok = ps5wk_settings_update(body, json, &message, &changed);
+        spike_log("settings from %s: %s (%.300s)", from, message, body);
+        if (ok || changed) {
+            char* state = settingsState(message);
+            pushReplyCORS(client, ok ? 200 : 503, "application/json", state, FALSE);
+            g_free(state);
+        } else
+            settingsReplyJSON(client, 400, FALSE, message);
+        g_free(message);
+    } else {
+        char* scope = query ? formValue(query, !strcmp(path, "/restart") ? "scope" : "what") : NULL;
+        if (!scope)
+            scope = formValue(body, !strcmp(path, "/restart") ? "scope" : "what");
+        if (!strcmp(path, "/restart") && scope && (!strcmp(scope, "page") || !strcmp(scope, "web"))) {
+            spike_log("settings: page restart asked by %s", from);
+            ps5wk_settings_set_status("Restarting the page…");
+            g_idle_add(restartPageOnMain, NULL);
+            settingsReplyJSON(client, 200, TRUE, "Restarting the page.");
+        } else if (!strcmp(path, "/restart") && scope && !strcmp(scope, "browser")) {
+            const char* error = restartBrowser(from);
+            if (!error)
+                ps5wk_settings_set_status("Restarting the browser…");
+            settingsReplyJSON(client, error ? 503 : 200, !error, error ? error : "Restarting the browser.");
+        } else if (!strcmp(path, "/clear") && scope && (!strcmp(scope, "cookies") || !strcmp(scope, "all"))) {
+            gboolean all = !strcmp(scope, "all");
+            spike_log("settings: clearing %s, asked by %s", all ? "all website data" : "cookies", from);
+            g_idle_add(clearDataOnMain, GINT_TO_POINTER(all));
+            settingsReplyJSON(client, 200, TRUE, all ? "Clearing all website data." : "Clearing cookies.");
+        } else
+            settingsReplyJSON(client, 400, FALSE, !strcmp(path, "/restart") ? "scope=page or scope=browser" : "what=cookies or what=all");
+        g_free(scope);
+    }
+}
+
+static void pushServe(int client, const char* from, gboolean loopback)
 {
     char* request = g_malloc(PS5WK_PUSH_MAX + 1);
     size_t used = 0, headerEnd = 0, contentLength = 0;
@@ -953,8 +1265,9 @@ static void pushServe(int client, const char* from)
         return;
     }
     const char* headers = strchr(request, '\n') ? strchr(request, '\n') + 1 : "";
-    char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "", keyHeader[128] = "";
+    char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "", keyHeader[128] = "", origin[160] = "";
     headerValue(headers, "Accept", accept, sizeof accept);
+    headerValue(headers, "Origin", origin, sizeof origin);
     headerValue(headers, "X-PS5-Key", keyHeader, sizeof keyHeader);
     headerValue(headers, "Content-Type", type, sizeof type);
     headerValue(headers, "Host", host, sizeof host);
@@ -963,9 +1276,11 @@ static void pushServe(int client, const char* from)
     if (query)
         *query++ = 0;
     const char* path = target;
+    gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear");
 
     if (!strcmp(method, "OPTIONS")) {
-        pushReply(client, 204, "text/plain", NULL);
+        /* No CORS for the settings: a page elsewhere can't send them JSON. */
+        pushReplyCORS(client, 204, "text/plain", NULL, !settingsPath);
         g_free(request);
         return;
     }
@@ -986,7 +1301,9 @@ static void pushServe(int client, const char* from)
     gboolean html = strstr(accept, "text/html") != NULL;
     gboolean json = strstr(accept, "application/json") || (query && strstr(query, "format=json"));
 
-    if (!strcmp(path, "/status") && get) {
+    if (settingsPath) {
+        settingsServe(client, from, loopback, get, post, path, query, body, type, host, origin, pinOK);
+    } else if (!strcmp(path, "/status") && get) {
         char* shown = copyShownURI();
         char* quoted = jsonString(shown);
         char* reply = g_strdup_printf("{\"ok\":true,\"uri\":%s}\n", quoted);
@@ -1055,7 +1372,7 @@ static void pushServe(int client, const char* from)
     } else if (!strcmp(path, "/") || !strcmp(path, "/open") || !strcmp(path, "/status") || !strcmp(path, "/cookies")) {
         pushReply(client, 405, "text/plain", "ERR method not allowed\n");
     } else {
-        pushReply(client, 404, "text/plain", "ERR not found (/, /open?url=..., /status)\n");
+        pushReply(client, 404, "text/plain", "ERR not found (/, /open?url=..., /status, /settings)\n");
     }
     g_free(url);
     g_free(pin);
@@ -1073,7 +1390,7 @@ static void* pushThread(void* unused)
         memset(&address, 0, sizeof address);
         address.sin_family = AF_INET;
         address.sin_port = htons(PS5WK_PUSH_PORT);
-        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        address.sin_addr.s_addr = htonl(pushLocalOnly ? INADDR_LOOPBACK : INADDR_ANY);
         if (fd >= 0)
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
         if (fd >= 0 && !bind(fd, (struct sockaddr*)&address, sizeof address) && !listen(fd, 8))
@@ -1086,7 +1403,10 @@ static void* pushThread(void* unused)
         fd = -1;
         sleep(2);
     }
-    spike_log("push: listening on TCP %d (http://<this PS5>:%d/)%s", PS5WK_PUSH_PORT, PS5WK_PUSH_PORT, pushPIN ? ", PIN required" : "");
+    if (pushLocalOnly)
+        spike_log("push: listening on 127.0.0.1:%d only (push-off: Settings with R3, nothing from the LAN)", PS5WK_PUSH_PORT);
+    else
+        spike_log("push: listening on TCP %d (http://<this PS5>:%d/)%s", PS5WK_PUSH_PORT, PS5WK_PUSH_PORT, pushPIN ? ", PIN required" : "");
     for (;;) {
         struct sockaddr_in peer;
         socklen_t peerLength = sizeof peer;
@@ -1101,7 +1421,7 @@ static void* pushThread(void* unused)
         char ip[INET_ADDRSTRLEN];
         if (inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip))
             snprintf(from, sizeof from, "http %s", ip);
-        pushServe(client, from);
+        pushServe(client, from, peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
         close(client);
     }
     return NULL;
@@ -1110,8 +1430,8 @@ static void* pushThread(void* unused)
 static void pushStart(void)
 {
     if (fileExists("/data/ps5webkit/push-off")) {
-        spike_log("push: off (/data/ps5webkit/push-off)");
-        return;
+        spike_log("push: /data/ps5webkit/push-off: 127.0.0.1 only");
+        pushLocalOnly = TRUE;
     }
     gchar* pin = NULL;
     if (g_file_get_contents("/data/ps5webkit/push-pin.txt", &pin, NULL, NULL)) {
@@ -1221,6 +1541,7 @@ int main(int argc, char** argv)
         ps5wk_title_vdec_preload();
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
     loadStart = g_get_monotonic_time();
+    startedAt = g_get_real_time() / G_USEC_PER_SEC;
     signal(SIGPIPE, SIG_IGN);
     // WebKit, GLib and the child payloads (relayed) log to stderr.
     if (spike_log_fd >= 0 && dup2(spike_log_fd, 2) != 2) {
@@ -1257,6 +1578,8 @@ int main(int argc, char** argv)
     setenv("XDG_DATA_DIRS", "/data/ps5webkit/share", 0); /* share/mime/globs2 */
     setenv("GSETTINGS_BACKEND", "memory", 0);
     g_io_openssl_load(NULL);
+    /* The values in use until something restarts (the settings page). */
+    ps5wk_settings_init("/data/ps5webkit", pushNormalize);
 
     /* open(), not access(): access() said no for an existing file here. */
     int flag = open("/data/ps5webkit/debug-screenshot", O_RDONLY);
@@ -1316,6 +1639,7 @@ int main(int argc, char** argv)
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
+    networkSession = session;
     /* Without this WPE keeps cookies in memory only: every site logged out
      * and YouTube's consent dialog back after each restart. */
     cookieManager = webkit_network_session_get_cookie_manager(session);
@@ -1363,5 +1687,14 @@ int main(int argc, char** argv)
     g_main_loop_run(loop);
     ps5wk_vr_stop(TRUE, "main loop ended");
     ps5wk_audio_server_stop();
+    /* Restart browser, after the wind-down: title_exit.c launches the title
+     * again only if the launcher still sees this title in front. */
+    if (spike_title_relaunch && spike_title_relaunch[0]) {
+        char reply[160];
+        if (!launcherAsk("status\n", reply, sizeof reply) || strncmp(reply, "OK ", 3) || !strstr(reply, PS5WK_TITLE_ID)) {
+            spike_log("settings: no restart after all (launcher status \"%s\")", reply);
+            spike_title_relaunch[0] = 0;
+        }
+    }
     return 0;
 }

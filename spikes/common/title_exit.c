@@ -24,6 +24,12 @@
 
 #define LAUNCHER_PORT 9031
 
+/* A title that wants to start again (ps5browser's "Restart browser") puts
+ * its title ID here. The launcher then gets "launch <ID>" after the kill,
+ * on the same connection: it reads that line once the kill is done (the
+ * title is gone by then; the launcher's reply just goes nowhere). */
+char spike_title_relaunch[16];
+
 /* Returns only if the launcher couldn't be asked or didn't act in time. */
 static void ask_launcher_to_kill_us(void)
 {
@@ -36,9 +42,12 @@ static void ask_launcher_to_kill_us(void)
     if (fd < 0)
         return;
     if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
-        static const char cmd[] = "kill -9\n";
-        spike_log("closing the title through the launcher (SIGKILL)");
-        if (write(fd, cmd, sizeof cmd - 1) == (ssize_t)(sizeof cmd - 1))
+        char cmd[48] = "kill -9\n";
+        if (spike_title_relaunch[0])
+            snprintf(cmd, sizeof cmd, "kill -9\nlaunch %.15s\n", spike_title_relaunch);
+        spike_log("closing the title through the launcher (SIGKILL)%s%s", spike_title_relaunch[0] ? ", then starting " : "",
+                  spike_title_relaunch);
+        if (write(fd, cmd, strlen(cmd)) == (ssize_t)strlen(cmd))
             for (int i = 0; i < 30; i++)
                 usleep(100 * 1000);
     }
