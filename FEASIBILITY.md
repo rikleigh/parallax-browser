@@ -693,3 +693,27 @@ port.
   heap locks with a pthread mutex too. Knobs: `PS5WK_PAINT_THREADS`,
   `PS5WK_SCROLL_COPY`, `PS5WK_PAINT_ASYNC`, `PS5WK_RENDER_LOG`. Waiting for the
   owner's TV check (scrolling, video, View in VR).
+- **Next (follow-up, not started): payload malloc and mutex contention.**
+  `port/webkit/test/lockbench` (a payload; 400k operations per thread):
+
+  | threads | malloc/free pair | pthread mutex lock/unlock | sem_wait/sem_post | ALU |
+  | --- | --- | --- | --- | --- |
+  | 1 | 0.30 us | 17.5 ns | 0.97 us | 2.5 ns |
+  | 2 | 47.8 us | 4.2 us | 1.08 us | 1.7 ns |
+  | 4 | 106 us | 13.4 us | 1.28 us | 2.6 ns |
+  | 6 | 162 us | 20.8 us | 1.74 us | 4.4 ns |
+
+  Total malloc throughput falls from 3.3 to 0.04 million pairs/s as soon as
+  two threads allocate, and a contended pthread mutex hands over at ~4-20 us
+  per lock; semaphores scale. Patch 0032 moved Skia and C++ `new`/`delete`
+  in ps5wk-child to libpas. Still on the slow paths: glib, GStreamer, libsoup,
+  FreeType/HarfBuzz/ICU (`malloc`, `g_malloc`), `GMutex`/`GCond` and libc++
+  `std::mutex` (pthread), WTF's ParkingLot park path, and the title's heap
+  (Spike 10's dlmalloc behind one pthread mutex) plus its render, decoder and
+  audio threads. Candidates: interpose `pthread_mutex_*`/`pthread_cond_*` in
+  the payloads (`--wrap`, an adaptive spin-then-semaphore or `_umtx_op` lock;
+  `pthread_mutex_t` is a pointer, `PTHREAD_MUTEX_INITIALIZER` is NULL, and
+  condition variables have to be wrapped with the mutex), and a libpas-backed
+  `malloc` for the remaining C code (careful with memory the console's libc
+  allocates and our code frees). Measure with lockbench, then
+  `test/paint/paint-ab.sh` and YouTube playback (dropped frames) before and after.
