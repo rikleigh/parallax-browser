@@ -25,6 +25,101 @@ decoded frames under the page (see *Hole-punch video* below). Step 2b
 No WebGL, WebXR, GPU process, Web Audio, WebRTC, speech, geolocation,
 sandbox, introspection, docs, journald or libbacktrace.
 
+## Send a link from another device
+
+While the browser title runs, it serves a small link server on
+**TCP 9040** of the PS5 (`http://192.168.1.50:9040/`). Anything sent to it
+loads in the browser straight away. It is meant for the home LAN, and by
+default it asks for no password.
+
+- **A phone or any browser:** open `http://192.168.1.50:9040/`, type or
+  paste an address (or search words), and press *Open on PS5*. The page also
+  shows the address the PS5 is on now.
+- **Bookmarklet (Safari, Chrome, Firefox on the Mac):** the same page has a
+  *Send to PS5* link. Drag it to the bookmarks bar, then click it on any page.
+  It opens a small pop-up at
+  `http://<ps5>:9040/open?url=<this page>`, which loads the page on the PS5,
+  shows "Opening on the PS5", and closes itself. A pop-up or navigation is
+  used instead of `fetch`, because an https page may not fetch from a plain
+  http address (mixed content). If the pop-up is blocked, the bookmarklet
+  opens the same address in the current tab instead.
+- **Terminal:** `tools/ps5open <url>` (bare hosts get `https://`, other words
+  a DuckDuckGo search). With no argument it sends the front Safari tab, or
+  Chrome's if Safari has none: if Safari or Chrome is the frontmost app, that
+  one is used; `-s` or `-c` picks one. `ps5open --status` prints the page
+  the PS5 is showing. For `ps5open` anywhere, link it onto your PATH:
+  `ln -s "$PWD/tools/ps5open" /usr/local/bin/ps5open`.
+  **If the browser isn't running**, ps5open starts it through the launcher
+  payload (`tools/launch.sh PPSA99020 <url>`) and the title opens that link
+  instead of the start page. Long links (over 200 characters) go in
+  `/data/ps5webkit/open-url.txt` over FTP first; the title reads that file
+  once at startup, then deletes it. ps5open never closes another title. If
+  a game is running, it says so and stops.
+- **curl / scripts:** `curl 'http://192.168.1.50:9040/open?url=example.com'`
+  or `curl --data-urlencode url=https://example.com http://192.168.1.50:9040/open`
+  (a plain body `curl -d https://example.com …/open` works too). The reply is
+  `OK loading <url>` (HTTP 200), or `ERR <why>` (400, 403 for a wrong PIN, or
+  503 while the browser is closing). Send `Accept: application/json` for
+  `{"ok":true,"url":…}`. `GET /status` gives `{"ok":true,"uri":…}`. CORS is
+  open (`Access-Control-Allow-Origin: *`, plus the Private Network Access
+  header), so http pages and local tools can call it with `fetch`.
+- **On the console** the title's control socket takes `open <url>` too
+  (`/system_tmp/ps5wk/ps5browser-control.sock`, the socket that the launcher's
+  `stop` uses).
+
+### "Send to PS5" in the Share menu
+
+- **Mac (Shortcuts app):** create a new shortcut and turn on *Show in Share
+  Sheet* (in *Details*), with Safari web pages and URLs as input. Add the
+  *Run Shell Script* action with input *Shortcut Input* passed as arguments,
+  and the script `/path/to/ps5webkit/tools/ps5open "$1"`. Name the
+  shortcut "Send to PS5". It then shows in Safari's Share menu, and under
+  Services and Quick Actions. To give it a key, use System Settings >
+  Keyboard > Keyboard Shortcuts > Services. Run without input, ps5open sends
+  the front tab.
+- **iPhone/iPad (Shortcuts):** create a new shortcut with *Show in Share
+  Sheet* and input *URLs*. Add the action *Get Contents of URL* with the
+  address `http://192.168.1.50:9040/open?url=` followed by *Shortcut Input*,
+  URL-encoded by an *Encode Shortcut Input with URL encoding* action placed
+  before it. Allow local network access the first time it runs. Share any
+  page, then pick *Send to PS5*.
+- **Android:** use the bookmarklet in Chrome's bookmarks, or keep the page
+  `http://192.168.1.50:9040/` as a home-screen shortcut.
+
+### What is allowed, and the details
+
+- Only `http://`, `https://` and `file:///data/ps5webkit/…` URLs load (no `..`).
+  `javascript:`, `data:`, `about:` and other files are refused. Control
+  characters are refused, and spaces in a URL become `%20`.
+- **View in VR:** a sent link leaves VR first. The headset is released, and
+  the page loads on the TV, just as following a link from the page does.
+- The server runs on its own thread and serves one request at a time. A
+  request must arrive within 3 s and 16 KB, so a slow or oversized client
+  gets 408 or 413, and the title never waits on it. The page loads on the
+  GLib main loop. The title log shows `push from http <ip>: <url>`, then
+  `push: loading <url>` and `load committed: <url>`.
+- If the title is suspended (rest mode), it can't answer. ps5open then times
+  out and tries the launcher, which reports that the title is running.
+- **Knobs:** `/data/ps5webkit/push-pin.txt` (a PIN, e.g. `4821`) makes every
+  request carry `pin=4821` (a query or form field, or an `X-PS5-PIN` header).
+  The page then shows a PIN box, and `http://<ps5>:9040/?pin=4821` gives a
+  bookmarklet with the PIN built in. `/data/ps5webkit/push-off` (a file):
+  no link server. Both files are read at startup.
+- The port is fixed at 9040. The other ports in use are elfldr 9021, the
+  launcher 9031, ftpsrv 2121 and the Mac's log server 9999.
+- **Checked on the console** (2026-10-29, log only, no TV): with the browser
+  stopped, ps5open started it with the link as the launch argument (the
+  title gets it as argv[1], with an empty argv[0]), and with a 514-character
+  link through `open-url.txt`. Both loaded at startup. Six links sent while
+  it ran committed (GET, form POST, plain POST, JSON, the bookmarklet's
+  `/open?url=` and `/?url=` with `Accept: text/html`). `javascript:` and
+  `file:///etc/passwd` were refused. A 5 s trickle got 408, a 40 KB body
+  413, random bytes 400, and 20 concurrent requests all got 200; the title
+  kept running throughout. Not checked yet: the bookmarklet and Shortcuts in
+  a real Safari/Chrome/iPhone, the PIN on the console (tested on the Mac
+  with a host build of the same code), and `ps5open` with no argument
+  (reading the front tab needs macOS Automation permission the first time).
+
 ## Build
 
 ```sh

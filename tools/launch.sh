@@ -90,4 +90,4 @@ if [[ "$ok" == OK && "$app" != none ]]; then
     fi
     if [[ "$running" == PPSA99020 ]]; then stop_title || exit 1; else run kill || exit 1; fi
 fi
-run launch "$title" ${1:-}
+run launch "$title" ${1:+"$1"}

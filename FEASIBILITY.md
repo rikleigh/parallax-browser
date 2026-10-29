@@ -669,3 +669,9 @@ port.
   heap returned at any time in a 48-load session), and a memory limit
   (`PS5WK_MEM_RESTART_MB`, default 3 GB) restarts the WebProcess at the next
   navigation. Details in port/webkit/README.md.
+- **Send a link from another device** (2026-10-28; port/webkit/README.md,
+  *Send a link from another device*): the title serves a link server on TCP
+  9040. A page with a text box, a bookmarklet, `tools/ps5open [url]` (with no
+  URL it sends the front Safari/Chrome tab, and starts the browser with the
+  link if it isn't running) and a Share-menu shortcut all load a link in
+  the browser.

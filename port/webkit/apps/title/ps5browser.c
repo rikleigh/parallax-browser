@@ -24,7 +24,10 @@
 #include "common/title.h"
 #include "viewinvr.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -33,6 +36,7 @@
 #include <sys/filio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <wpe/ps5/wpe-ps5.h>
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
@@ -111,6 +115,9 @@ static gboolean beginWindDown(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static const char* pushRequest(const char* text, const char* from, char** uriOut);
+static void setShownURI(const char* uri);
+
 static void* controlThread(void* unused)
 {
     (void)unused;
@@ -139,15 +146,24 @@ static void* controlThread(void* unused)
             usleep(100 * 1000);
             continue;
         }
-        char line[64] = "";
+        char line[4096] = "";
         ssize_t n = recv(client, line, sizeof line - 1, 0);
         line[n > 0 ? n : 0] = 0;
-        if (!strncmp(line, "quit", 4)) {
+        if (!strncmp(line, "open ", 5)) {
+            /* "open <url>": load it, as tools/ps5open's HTTP request does. */
+            line[strcspn(line, "\r\n")] = 0;
+            char* uri = NULL;
+            const char* error = pushRequest(line + 5, "control socket", &uri);
+            char* reply = g_strdup_printf("%s %s\n", uri ? "OK loading" : "ERR", uri ? uri : error);
+            send(client, reply, strlen(reply), 0);
+            g_free(reply);
+            g_free(uri);
+        } else if (!strncmp(line, "quit", 4)) {
             static const char reply[] = "OK winding down\n";
             send(client, reply, sizeof reply - 1, 0);
             g_main_context_invoke(NULL, beginWindDown, NULL);
         } else {
-            static const char reply[] = "ERR unknown command (quit)\n";
+            static const char reply[] = "ERR unknown command (quit, open <url>)\n";
             send(client, reply, sizeof reply - 1, 0);
         }
         close(client);
@@ -418,8 +434,10 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
         memRestarting = FALSE;
         SPIKE_PASS("mem-restart", "new WebProcess committed %s", webkit_web_view_get_uri(view));
     }
-    if (event == WEBKIT_LOAD_COMMITTED)
+    if (event == WEBKIT_LOAD_COMMITTED) {
         ps5wk_vr_stop(FALSE, "another page");
+        setShownURI(webkit_web_view_get_uri(view));
+    }
     if (event == WEBKIT_LOAD_FINISHED) {
         const char* title = webkit_web_view_get_title(view) ? webkit_web_view_get_title(view) : "";
         SPIKE_PASS("load", "%s \"%s\" (%.1f s after start)", webkit_web_view_get_uri(view), title, (g_get_monotonic_time() - loadStart) / 1e6);
@@ -503,6 +521,510 @@ static char* homeURL(void)
         g_free(contents);
     }
     return g_strdup(PS5WK_HOME_URL);
+}
+
+static int fileExists(const char* path);
+
+/* ---- Send a link from another device (README: "Send a link from another
+ * device") ----
+ * A small HTTP server on TCP PS5WK_PUSH_PORT, on its own thread:
+ *   GET /open?url=<encoded>, POST /open (body: the URL, or url=<encoded>)
+ *       load it here; "OK loading <url>" (JSON for Accept: application/json,
+ *       a "Sent" page for browsers, which closes itself in a pop-up)
+ *   GET /?url=<encoded>  the same, for the bookmarklet's pop-up
+ *   GET /                a page to type a link into, and the bookmarklet
+ *   GET /status          {"ok":true,"uri":"<the page shown>"}
+ * The control socket takes "open <url>" too. Bare hosts get https://, other
+ * words a search; only http, https and file:///data/ps5webkit/ URLs load.
+ * Loading a page also leaves View in VR (onLoadChanged).
+ * Knobs: /data/ps5webkit/push-off (a file): no server.
+ * /data/ps5webkit/push-pin.txt: a PIN that requests must carry (pin=...).
+ * A request is read within 3 s and 16 KB, one at a time: a slow or
+ * oversized client gets an error, never a stuck title. */
+#define PS5WK_PUSH_PORT 9040
+#define PS5WK_PUSH_MAX 16384
+#define PS5WK_PENDING_URL "/data/ps5webkit/open-url.txt"
+
+static GMutex shownLock;
+static char* shownURI; /* the committed page, for /status (any thread) */
+static char* pushPIN;
+
+static void setShownURI(const char* uri)
+{
+    g_mutex_lock(&shownLock);
+    g_free(shownURI);
+    shownURI = g_strdup(uri ? uri : "");
+    g_mutex_unlock(&shownLock);
+}
+
+static char* copyShownURI(void)
+{
+    g_mutex_lock(&shownLock);
+    char* uri = g_strdup(shownURI ? shownURI : "");
+    g_mutex_unlock(&shownLock);
+    return uri;
+}
+
+/* Any thread. A new URI to load, or NULL and *error. */
+static char* pushNormalize(const char* text, const char** error)
+{
+    char* input = g_strstrip(g_strdup(text ? text : ""));
+    char* uri = NULL;
+    *error = NULL;
+    if (!*input)
+        *error = "no URL";
+    else if (strlen(input) > 8000)
+        *error = "URL too long";
+    for (const char* p = input; !*error && *p; p++) {
+        if ((unsigned char)*p < 0x20 || *p == 0x7f)
+            *error = "control characters in the URL";
+    }
+    if (!*error)
+        uri = uriFromInput(input);
+    g_free(input);
+    if (!uri) {
+        if (!*error)
+            *error = "no URL";
+        return NULL;
+    }
+    if (strstr(uri, "://") && strchr(uri, ' ')) { /* pasted with spaces */
+        GString* fixed = g_string_new(NULL);
+        for (const char* p = uri; *p; p++) {
+            if (*p == ' ')
+                g_string_append(fixed, "%20");
+            else
+                g_string_append_c(fixed, *p);
+        }
+        g_free(uri);
+        uri = g_string_free(fixed, FALSE);
+    }
+    if (!g_ascii_strncasecmp(uri, "http://", 7) || !g_ascii_strncasecmp(uri, "https://", 8)) {
+        GUri* parsed = g_uri_parse(uri, G_URI_FLAGS_ENCODED | G_URI_FLAGS_PARSE_RELAXED, NULL);
+        if (!parsed || !g_uri_get_host(parsed) || !*g_uri_get_host(parsed))
+            *error = "not a valid http(s) URL";
+        if (parsed)
+            g_uri_unref(parsed);
+    } else if (!strncmp(uri, "file:///data/ps5webkit/", 23)) {
+        if (strstr(uri, "..") || strcasestr(uri, "%2e"))
+            *error = "no .. in file URLs";
+    } else {
+        *error = "only http, https and file:///data/ps5webkit/ URLs";
+    }
+    if (*error) {
+        g_free(uri);
+        return NULL;
+    }
+    return uri;
+}
+
+static gboolean pushOpenOnMain(gpointer data)
+{
+    const char* uri = data;
+    if (!webView || windDownStart)
+        return G_SOURCE_REMOVE;
+    if (ps5wk_vr_active())
+        ps5wk_vr_stop(FALSE, "a link was sent");
+    spike_log("push: loading %s", uri);
+    loadStart = g_get_monotonic_time();
+    webkit_web_view_load_uri(webView, uri);
+    return G_SOURCE_REMOVE;
+}
+
+/* Any thread: check text and load it on the main loop. NULL and *uriOut
+ * (free it) when it is on its way, else the reason. */
+static const char* pushRequest(const char* text, const char* from, char** uriOut)
+{
+    const char* error = NULL;
+    *uriOut = NULL;
+    if (windDownStart)
+        return "the browser is closing";
+    char* uri = pushNormalize(text, &error);
+    if (!uri) {
+        spike_log("push from %s refused (%s): %.200s", from, error, text ? text : "");
+        return error;
+    }
+    spike_log("push from %s: %s", from, uri);
+    *uriOut = g_strdup(uri);
+    g_idle_add_full(G_PRIORITY_DEFAULT, pushOpenOnMain, uri, g_free);
+    return NULL;
+}
+
+/* The start page address: a launch argument with "://" (tools/launch.sh
+ * PPSA99020 <url>), else PS5WK_PENDING_URL (tools/ps5open puts long URLs
+ * there before launching; read once, deleted, ignored after 10 minutes). */
+static char* startURLFromLaunch(int argc, char** argv)
+{
+    /* Read and delete the file in any case, so that it can't open later. */
+    gchar* contents = NULL;
+    gboolean stale = FALSE;
+    if (g_file_get_contents(PS5WK_PENDING_URL, &contents, NULL, NULL)) {
+        struct stat st;
+        stale = !stat(PS5WK_PENDING_URL, &st) && st.st_mtime > 1000000000 && time(NULL) - st.st_mtime > 600;
+        unlink(PS5WK_PENDING_URL);
+    }
+    for (int i = 0; argv && i < argc; i++) {
+        spike_log("launch argument %d: %.300s", i, argv[i] ? argv[i] : "(null)");
+        if (argv[i] && strstr(argv[i], "://")) {
+            const char* error = NULL;
+            char* uri = pushNormalize(argv[i], &error);
+            if (uri) {
+                g_free(contents);
+                return uri;
+            }
+            spike_log("launch argument %d refused: %s", i, error);
+        }
+    }
+    if (!contents)
+        return NULL;
+    char* uri = NULL;
+    const char* error = NULL;
+    if (stale)
+        spike_log("%s: older than 10 minutes, ignored", PS5WK_PENDING_URL);
+    else if (!(uri = pushNormalize(contents, &error)))
+        spike_log("%s refused: %s", PS5WK_PENDING_URL, error);
+    else
+        spike_log("start URL from %s", PS5WK_PENDING_URL);
+    g_free(contents);
+    return uri;
+}
+
+/* application/x-www-form-urlencoded value of key, or NULL. */
+static char* formValue(const char* form, const char* key)
+{
+    size_t keyLength = strlen(key);
+    for (const char* p = form; p && *p;) {
+        size_t length = strcspn(p, "&");
+        if (length > keyLength && !strncmp(p, key, keyLength) && p[keyLength] == '=') {
+            char* raw = g_strndup(p + keyLength + 1, length - keyLength - 1);
+            for (char* c = raw; *c; c++) {
+                if (*c == '+')
+                    *c = ' ';
+            }
+            char* value = g_uri_unescape_string(raw, NULL);
+            g_free(raw);
+            return value;
+        }
+        p += length;
+        if (*p)
+            p++;
+    }
+    return NULL;
+}
+
+static char* jsonString(const char* s)
+{
+    GString* out = g_string_new("\"");
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        if (*p == '"' || *p == '\\')
+            g_string_append_printf(out, "\\%c", *p);
+        else if (*p < 0x20)
+            g_string_append_printf(out, "\\u%04x", *p);
+        else
+            g_string_append_c(out, (char)*p);
+    }
+    g_string_append_c(out, '"');
+    return g_string_free(out, FALSE);
+}
+
+static void pushReply(int client, int status, const char* type, const char* body)
+{
+    const char* reason = status == 200 ? "OK" : status == 204 ? "No Content" : status == 400 ? "Bad Request"
+        : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed"
+        : status == 408 ? "Request Timeout" : status == 413 ? "Payload Too Large" : "Service Unavailable";
+    size_t length = body ? strlen(body) : 0;
+    char* head = g_strdup_printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-PS5-PIN\r\nAccess-Control-Allow-Private-Network: true\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\n\r\n", status, reason, type, length);
+    send(client, head, strlen(head), 0);
+    if (length)
+        send(client, body, length, 0);
+    g_free(head);
+}
+
+static const char pushPageStyle[] =
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<style>:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#15181d;--muted:#5d6672;--card:#fff;--line:#d5d9df;--accent:#0b5cd5}"
+    "@media(prefers-color-scheme:dark){:root{--bg:#10141c;--fg:#e8ecf2;--muted:#9aa4b2;--card:#1a202b;--line:#2e3644;--accent:#6aa8ff}}"
+    "body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.45 -apple-system,system-ui,sans-serif}"
+    "main{max-width:34rem;margin:0 auto;padding:24px 16px}h1{font-size:1.4rem;margin:0 0 16px}"
+    "form{display:flex;flex-direction:column;gap:10px}input{font:inherit;padding:12px;border:1px solid var(--line);"
+    "border-radius:10px;background:var(--card);color:var(--fg);min-width:0}button{font:inherit;font-weight:600;padding:12px;"
+    "border:0;border-radius:10px;background:var(--accent);color:#fff}p,li{color:var(--muted)}code{word-break:break-all}"
+    "a.bm{display:inline-block;padding:8px 14px;border:1px dashed var(--accent);border-radius:8px;color:var(--accent);"
+    "text-decoration:none;font-weight:600}#status{min-height:1.5em;color:var(--fg)}</style>";
+
+/* The page with the text box; host: what the bookmarklet calls. */
+static char* pushIndexPage(const char* host, const char* pin)
+{
+    char* shown = copyShownURI();
+    char* shownHTML = g_markup_escape_text(shown, -1);
+    char* pinPart = pin ? g_strdup_printf("+'&pin=%s'", pin) : g_strdup("");
+    char* bookmarklet = g_strdup_printf("javascript:(function(){var u='http://%s/open?url='+encodeURIComponent(location.href)%s;"
+        "var w=window.open(u,'ps5open','width=420,height=260');if(!w)location.href=u;})()", host, pinPart);
+    char* bookmarkletHTML = g_markup_escape_text(bookmarklet, -1);
+    char* page = g_strdup_printf("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Send to PS5</title>%s</head><body><main>"
+        "<h1>Send a link to the PS5</h1>"
+        "<form id=\"f\" method=\"post\" action=\"/open\">"
+        "<input name=\"url\" id=\"url\" placeholder=\"Address or search\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" inputmode=\"url\" autofocus required>"
+        "%s<button>Open on PS5</button></form><p id=\"status\"></p>"
+        "<p>Showing now: <code>%s</code></p>"
+        "<h2>Bookmarklet</h2><p>Drag this to the bookmarks bar, then click it on any page to open that page on the PS5:</p>"
+        "<p><a class=\"bm\" href=\"%s\">Send to PS5</a></p>"
+        "<p>From a terminal: <code>curl 'http://%s/open?url=example.com'</code></p>"
+        "<script>document.getElementById('f').onsubmit=function(e){e.preventDefault();var s=document.getElementById('status');"
+        "s.textContent='Sending…';fetch('/open',{method:'POST',headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(this))})"
+        ".then(function(r){return r.json()}).then(function(j){s.textContent=j.ok?'Opening '+j.url:'Not sent: '+j.error})"
+        ".catch(function(){s.textContent='The PS5 did not answer'})}</script></main></body></html>",
+        pushPageStyle, pushPIN ? "<input name=\"pin\" placeholder=\"PIN\" inputmode=\"numeric\" autocomplete=\"off\">" : "",
+        shownHTML, bookmarkletHTML, host);
+    g_free(shown);
+    g_free(shownHTML);
+    g_free(pinPart);
+    g_free(bookmarklet);
+    g_free(bookmarkletHTML);
+    return page;
+}
+
+static char* pushResultPage(const char* uri, const char* error)
+{
+    char* text = g_markup_escape_text(uri ? uri : error, -1);
+    char* page = g_strdup_printf("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>%s</title>%s</head><body><main>"
+        "<h1>%s</h1><p><code>%s</code></p><p><a href=\"/\">Send another link</a></p>"
+        "<script>if(%s&&window.opener)setTimeout(function(){window.close()},1200)</script></main></body></html>",
+        uri ? "Sent to PS5" : "Not sent", pushPageStyle, uri ? "Opening on the PS5" : "Not sent", text, uri ? "true" : "false");
+    g_free(text);
+    return page;
+}
+
+/* A header's value (case-insensitive name), copied into out. */
+static gboolean headerValue(const char* headers, const char* name, char* out, size_t size)
+{
+    size_t nameLength = strlen(name);
+    for (const char* line = headers; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        if (!g_ascii_strncasecmp(line, name, nameLength) && line[nameLength] == ':') {
+            const char* value = line + nameLength + 1;
+            while (*value == ' ' || *value == '\t')
+                value++;
+            size_t length = strcspn(value, "\r\n");
+            if (length >= size)
+                length = size - 1;
+            memcpy(out, value, length);
+            out[length] = 0;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void pushServe(int client, const char* from)
+{
+    char* request = g_malloc(PS5WK_PUSH_MAX + 1);
+    size_t used = 0, headerEnd = 0, contentLength = 0;
+    gint64 deadline = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+    int status = 0;
+    for (;;) {
+        if (headerEnd && used >= headerEnd + contentLength)
+            break;
+        if (used >= PS5WK_PUSH_MAX) {
+            status = 413;
+            break;
+        }
+        int wait = (int)((deadline - g_get_monotonic_time()) / 1000);
+        struct pollfd p = { .fd = client, .events = POLLIN };
+        if (wait <= 0 || poll(&p, 1, wait) <= 0) {
+            status = 408;
+            break;
+        }
+        ssize_t n = recv(client, request + used, PS5WK_PUSH_MAX - used, 0);
+        if (n <= 0) {
+            status = 400;
+            break;
+        }
+        used += (size_t)n;
+        request[used] = 0;
+        if (!headerEnd) {
+            char* end = strstr(request, "\r\n\r\n");
+            if (end) {
+                headerEnd = (size_t)(end - request) + 4;
+                char value[32];
+                if (headerValue(request, "Content-Length", value, sizeof value))
+                    contentLength = strtoul(value, NULL, 10);
+                if (contentLength > PS5WK_PUSH_MAX - headerEnd) {
+                    status = 413;
+                    break;
+                }
+            }
+        }
+    }
+    if (status) {
+        if (status != 400 || used)
+            pushReply(client, status, "text/plain", status == 408 ? "ERR request too slow\n" : status == 413 ? "ERR request too large\n" : "ERR bad request\n");
+        g_free(request);
+        return;
+    }
+    request[headerEnd - 2] = 0; /* headers end with one \r\n */
+    const char* body = request + headerEnd;
+    request[headerEnd + contentLength] = 0;
+
+    char method[8] = "", target[2048] = "";
+    if (sscanf(request, "%7s %2047s", method, target) != 2) {
+        pushReply(client, 400, "text/plain", "ERR bad request\n");
+        g_free(request);
+        return;
+    }
+    const char* headers = strchr(request, '\n') ? strchr(request, '\n') + 1 : "";
+    char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "";
+    headerValue(headers, "Accept", accept, sizeof accept);
+    headerValue(headers, "Content-Type", type, sizeof type);
+    headerValue(headers, "Host", host, sizeof host);
+    headerValue(headers, "X-PS5-PIN", pinHeader, sizeof pinHeader);
+    char* query = strchr(target, '?');
+    if (query)
+        *query++ = 0;
+    const char* path = target;
+
+    if (!strcmp(method, "OPTIONS")) {
+        pushReply(client, 204, "text/plain", NULL);
+        g_free(request);
+        return;
+    }
+    gboolean get = !strcmp(method, "GET") || !strcmp(method, "HEAD");
+    gboolean post = !strcmp(method, "POST");
+    char* url = query ? formValue(query, "url") : NULL;
+    char* pin = query ? formValue(query, "pin") : NULL;
+    gboolean form = post && (strstr(type, "application/x-www-form-urlencoded") || !strncmp(body, "url=", 4));
+    if (post && !url && form)
+        url = formValue(body, "url");
+    if (post && !url) /* also curl -d <url>, which says form-urlencoded */
+        url = g_strdup(body);
+    if (post && form && !pin)
+        pin = formValue(body, "pin");
+    if (!pin && *pinHeader)
+        pin = g_strdup(pinHeader);
+    gboolean pinOK = !pushPIN || (pin && !strcmp(pin, pushPIN));
+    gboolean html = strstr(accept, "text/html") != NULL;
+    gboolean json = strstr(accept, "application/json") || (query && strstr(query, "format=json"));
+
+    if (!strcmp(path, "/status") && get) {
+        char* shown = copyShownURI();
+        char* quoted = jsonString(shown);
+        char* reply = g_strdup_printf("{\"ok\":true,\"uri\":%s}\n", quoted);
+        pushReply(client, 200, "application/json", reply);
+        g_free(reply);
+        g_free(quoted);
+        g_free(shown);
+    } else if ((!strcmp(path, "/open") && (get || post)) || (!strcmp(path, "/") && ((get && url) || post))) {
+        char* uri = NULL;
+        const char* error = !pinOK ? "wrong or missing PIN" : NULL;
+        if (!error)
+            error = pushRequest(url, from, &uri);
+        int code = !error ? 200 : !pinOK ? 403 : windDownStart ? 503 : 400;
+        char* reply;
+        if (json && !html) {
+            char* quoted = jsonString(uri ? uri : error);
+            reply = g_strdup_printf("{\"ok\":%s,\"%s\":%s}\n", uri ? "true" : "false", uri ? "url" : "error", quoted);
+            g_free(quoted);
+        } else if (html) {
+            reply = pushResultPage(uri, error);
+        } else {
+            reply = g_strdup_printf("%s %s\n", uri ? "OK loading" : "ERR", uri ? uri : error);
+        }
+        pushReply(client, code, json && !html ? "application/json" : html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", reply);
+        g_free(reply);
+        g_free(uri);
+    } else if ((!strcmp(path, "/") || !strcmp(path, "/index.html")) && get) {
+        /* The bookmarklet calls the address this page was reached by. */
+        gboolean hostOK = *host != 0;
+        for (const char* c = host; *c; c++) {
+            if (!g_ascii_isalnum(*c) && *c != '.' && *c != ':' && *c != '-')
+                hostOK = FALSE;
+        }
+        if (!hostOK) {
+            struct sockaddr_in local;
+            socklen_t length = sizeof local;
+            char ip[INET_ADDRSTRLEN] = "0.0.0.0";
+            if (!getsockname(client, (struct sockaddr*)&local, &length))
+                inet_ntop(AF_INET, &local.sin_addr, ip, sizeof ip);
+            snprintf(host, sizeof host, "%s:%d", ip, PS5WK_PUSH_PORT);
+        }
+        char* page = pushIndexPage(host, pushPIN && pinOK ? pushPIN : NULL);
+        pushReply(client, 200, "text/html; charset=utf-8", page);
+        g_free(page);
+    } else if (!strcmp(path, "/") || !strcmp(path, "/open") || !strcmp(path, "/status")) {
+        pushReply(client, 405, "text/plain", "ERR method not allowed\n");
+    } else {
+        pushReply(client, 404, "text/plain", "ERR not found (/, /open?url=..., /status)\n");
+    }
+    g_free(url);
+    g_free(pin);
+    g_free(request);
+}
+
+static void* pushThread(void* unused)
+{
+    (void)unused;
+    int fd = -1;
+    for (unsigned attempt = 0; fd < 0; attempt++) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1;
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof address);
+        address.sin_family = AF_INET;
+        address.sin_port = htons(PS5WK_PUSH_PORT);
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (fd >= 0)
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (fd >= 0 && !bind(fd, (struct sockaddr*)&address, sizeof address) && !listen(fd, 8))
+            break;
+        int err = errno;
+        if (attempt % 30 == 0)
+            spike_log("push: port %d: %s (attempt %u; trying again every 2 s)", PS5WK_PUSH_PORT, strerror(err), attempt + 1);
+        if (fd >= 0)
+            close(fd);
+        fd = -1;
+        sleep(2);
+    }
+    spike_log("push: listening on TCP %d (http://<this PS5>:%d/)%s", PS5WK_PUSH_PORT, PS5WK_PUSH_PORT, pushPIN ? ", PIN required" : "");
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t peerLength = sizeof peer;
+        int client = accept(fd, (struct sockaddr*)&peer, &peerLength);
+        if (client < 0) {
+            usleep(100 * 1000);
+            continue;
+        }
+        struct timeval timeout = { .tv_sec = 3 };
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+        char from[INET_ADDRSTRLEN + 8] = "http ?";
+        char ip[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip))
+            snprintf(from, sizeof from, "http %s", ip);
+        pushServe(client, from);
+        close(client);
+    }
+    return NULL;
+}
+
+static void pushStart(void)
+{
+    if (fileExists("/data/ps5webkit/push-off")) {
+        spike_log("push: off (/data/ps5webkit/push-off)");
+        return;
+    }
+    gchar* pin = NULL;
+    if (g_file_get_contents("/data/ps5webkit/push-pin.txt", &pin, NULL, NULL)) {
+        g_strstrip(pin);
+        if (*pin)
+            pushPIN = pin;
+        else
+            g_free(pin);
+    }
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, pushThread, NULL))
+        pthread_detach(thread);
+    else
+        spike_log("push: no thread");
 }
 
 /* Titles differ from payloads in which socket calls work (Spike 8): log
@@ -590,7 +1112,7 @@ static int fileExists(const char* path)
 void ps5wk_title_vdec_preload(void) __attribute__((weak));
 void ps5wk_title_vdec_install(void) __attribute__((weak));
 
-int main(void)
+int main(int argc, char** argv)
 {
     /* Before the unjail in spike_title_init (PS5VR: libSceVideodec2 does
      * not load after it). */
@@ -716,19 +1238,24 @@ int main(void)
     memLog("web view created");
     g_timeout_add_seconds(60, memTimer, NULL);
 
+    char* start = startURLFromLaunch(argc, argv);
     if (readTestURLs()) {
+        if (start)
+            spike_log("test URL list wins over the start URL %s", start);
         loadNextTestURL();
     } else {
-        char* home = homeURL();
+        char* home = start ? g_strdup(start) : homeURL();
         spike_log("loading %s", home);
         loadStart = g_get_monotonic_time();
         webkit_web_view_load_uri(webView, home);
         g_free(home);
     }
 
+    g_free(start);
     pthread_t control;
     if (!pthread_create(&control, NULL, controlThread, NULL))
         pthread_detach(control);
+    pushStart();
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     mainLoop = loop;
     g_main_loop_run(loop);
