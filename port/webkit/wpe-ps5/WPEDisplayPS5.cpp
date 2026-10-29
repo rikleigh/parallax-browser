@@ -55,6 +55,7 @@
  *   L2 / R2          ZoomOut / ZoomIn (XF86ZoomOut/In)
  *   Options          Menu (the browser opens its URL prompt)
  *   R3               Tools (XF86Tools; the browser opens its Settings page)
+ *   L3               HomePage (XF86HomePage; the browser loads its home page)
  *   left stick       moves the drawn pointer
  *   right stick      scrolls under the pointer
  *   (the application's button handler sees presses first; ps5browser takes
@@ -313,6 +314,7 @@ static const KeyMapping keyMappings[] = {
     { PS5_PAD_R2, WPE_KEY_ZoomIn, 0, static_cast<WPEModifiers>(0), false },
     { PS5_PAD_OPTIONS, WPE_KEY_Menu, 135, static_cast<WPEModifiers>(0), false },
     { PS5_PAD_R3, WPE_KEY_Tools, 0, static_cast<WPEModifiers>(0), false },
+    { PS5_PAD_L3, WPE_KEY_HomePage, 180, static_cast<WPEModifiers>(0), false },
 };
 
 static double stickValue(uint8_t raw)

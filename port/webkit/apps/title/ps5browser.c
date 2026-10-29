@@ -13,6 +13,7 @@
  *   O: back, Options: type a URL or search, Square: reload,
  *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard,
  *   R3 (press the right stick): Settings, and back to the page from there,
+ *   L3 (press the left stick): home page,
  *   touchpad: View in VR (the playing video in the PS VR2 headset; its own
  *   controls while there, see viewinvr.c).
  *
@@ -122,6 +123,7 @@ static gboolean beginWindDown(gpointer data)
 static const char* pushRequest(const char* text, const char* from, char** uriOut);
 static void setShownURI(const char* uri);
 static void toggleSettings(void);
+static char* homeURL(void);
 
 static void* controlThread(void* unused)
 {
@@ -234,6 +236,13 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
     case WPE_KEY_Tools: /* R3 */
         toggleSettings();
         return TRUE;
+    case WPE_KEY_HomePage: { /* L3 */
+        char* home = homeURL();
+        spike_log("home: L3, opening %s", home);
+        webkit_web_view_load_uri(webView, home);
+        g_free(home);
+        return TRUE;
+    }
     case WPE_KEY_ZoomIn:
     case WPE_KEY_ZoomOut:
         zoom *= wpe_event_keyboard_get_keyval(event) == WPE_KEY_ZoomIn ? 1.15 : 1 / 1.15;
