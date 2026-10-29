@@ -4,6 +4,9 @@
 #   ps5open                the front Safari or Chrome tab
 #   ps5open -s | -c        the front tab of Safari (-s) or Chrome (-c)
 #   ps5open --status       what the PS5 browser is showing
+#   ps5open --cookies [url] copy Chrome's cookies for the site first (logged
+#                          in on the PS5 too), then open it; no url: the
+#                          front Chrome tab. PS5_CHROME_PROFILE picks a profile
 # Sends it to the browser's link server (http://$PS5_HOST:9040/open). If the
 # browser isn't running, starts it with the link through the launcher payload
 # (tools/launch.sh PPSA99020 <url>); it never closes another title.
@@ -76,9 +79,22 @@ wait_for_server() {
     return 1
 }
 
+# Copy Chrome's cookies for the site of $1 to the PS5 browser (running).
+send_cookies() {
+    local cookies reply key=()
+    cookies="$(python3 -I "$ROOT/tools/chrome-cookies.py" "$1" ${PS5_CHROME_PROFILE:+--profile "$PS5_CHROME_PROFILE"})" || return 1
+    [[ -n "${PS5_COOKIE_KEY:-}" ]] && key=(-H "X-PS5-Key: $PS5_COOKIE_KEY")
+    reply="$(printf '%s\n' "$cookies" | curl -sS --max-time 10 -H 'Content-Type: text/plain' ${key[@]+"${key[@]}"} \
+        --data-binary @- "$BASE/cookies" 2>&1)"
+    echo "$reply"
+    [[ "$reply" == OK* ]]
+}
+
 browser=""
+cookies=0
 case "${1:-}" in
-    -h|--help) sed -n "2,12p" "$0"; exit 0 ;;
+    --cookies) cookies=1; browser="Google Chrome"; shift ;;
+    -h|--help) sed -n "2,15p" "$0"; exit 0 ;;
     --status) curl -sS --max-time 5 "$BASE/status" || die "no answer from $BASE (browser not running?)"; exit ;;
     -s) browser=Safari; shift ;;
     -c) browser="Google Chrome"; shift ;;
@@ -91,6 +107,28 @@ fi
 # The title adds https:// too; done here so a launch argument is a full URL.
 if [[ "$url" != *://* && "$url" != *" "* && "$url" == *.* ]]; then
     url="https://$url"
+fi
+
+if [[ $cookies == 1 ]]; then
+    # Cookies need the browser running: start it on its home page first.
+    if ! curl -s --max-time 3 "$BASE/status" >/dev/null 2>&1; then
+        status="$("$ROOT/tools/launch.sh" --status 2>&1 | tail -1)"
+        case "$status" in
+            "OK none") echo "browser not running: starting $TITLE"
+                "$ROOT/tools/launch.sh" "$TITLE" >/dev/null || die "launch failed" ;;
+            "OK "*" $TITLE") ;;
+            "OK "*) die "another title is running (${status#OK }); not closing it. Close it on the PS5 first." ;;
+            *) die "no answer from the browser ($BASE) or the launcher: $status" ;;
+        esac
+        wait_for_server 60 || die "the link server did not answer within 60 s"
+        # Cookies sent before the first page has loaded can miss the saved
+        # cookie store (seen once): wait for the home page.
+        for _ in $(seq 30); do
+            [[ "$(curl -s --max-time 3 "$BASE/status")" == *'"uri":"'[!\"]* ]] && break
+            sleep 1
+        done
+    fi
+    send_cookies "$url" || die "cookies not sent"
 fi
 
 send_link "$url"

@@ -94,7 +94,7 @@ default it asks for no password.
 - **View in VR:** a sent link leaves VR first. The headset is released, and
   the page loads on the TV, just as following a link from the page does.
 - The server runs on its own thread and serves one request at a time. A
-  request must arrive within 3 s and 16 KB, so a slow or oversized client
+  request must arrive within 3 s and 64 KB, so a slow or oversized client
   gets 408 or 413, and the title never waits on it. The page loads on the
   GLib main loop. The title log shows `push from http <ip>: <url>`, then
   `push: loading <url>` and `load committed: <url>`.
@@ -119,6 +119,38 @@ default it asks for no password.
   a real Safari/Chrome/iPhone, the PIN on the console (tested on the Mac
   with a host build of the same code), and `ps5open` with no argument
   (reading the front tab needs macOS Automation permission the first time).
+
+### Log in with Chrome's cookies
+
+`tools/ps5open --cookies [url]` copies Chrome's cookies for that site to the
+PS5 browser, then opens the page there (no url: the front Chrome tab).
+`tools/chrome-cookies.py <site>` reads them: cookies of the whole site (e.g.
+`bbc.co.uk` and every subdomain, for `www.bbc.co.uk`), from the Chrome profile whose cookies changed
+last (`PS5_CHROME_PROFILE="Profile 1"` picks another; `--list-profiles`).
+Chrome encrypts cookie values with the "Chrome Safe Storage" key in the login
+keychain, so macOS asks once ("Always Allow" stops the question). Values are
+decrypted with `openssl` (AES-128-CBC, database version 24 drops the SHA-256
+domain prefix). Nothing is written on the Mac.
+
+- The title's `POST /cookies` takes Netscape cookies.txt lines (domain,
+  subdomains flag, path, secure, expiry in Unix seconds or 0, name, value,
+  and an optional SameSite None/Lax/Strict; `#HttpOnly_` before the domain)
+  and adds them with `webkit_cookie_manager_add_cookie`, so no restart is
+  needed. Persistent ones go to `browser/data/cookies.sqlite`; session
+  cookies (expiry 0) last until the browser closes. The log shows
+  `push from http <ip>: N cookies for <domains>`.
+- Open by default, like the rest of the link server. Knob:
+  `/data/ps5webkit/push-cookie-key.txt` makes `/cookies` require the same
+  key in an `X-PS5-Key` header (`PS5_COOKIE_KEY` for ps5open).
+- If the browser isn't running, ps5open starts it on its home page and waits
+  for that page before sending: in one test, a cookie sent within a second
+  or two of startup never reached the saved store.
+- Some sites (Google/YouTube, banks, streaming services) tie a login to the
+  device and may log out one side; log in on the PS5 itself for those.
+- **Checked on the console** (2026-10-29): host-only and domain, secure and
+  plain, HttpOnly, SameSite None/Lax cookies were all added and saved, and a
+  page on the Mac received them in its `Cookie` header. The Chrome reader
+  needs the keychain prompt, so the first real run is the owner's.
 
 ## Build
 

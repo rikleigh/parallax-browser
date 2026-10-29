@@ -534,20 +534,25 @@ static int fileExists(const char* path);
  *   GET /?url=<encoded>  the same, for the bookmarklet's pop-up
  *   GET /                a page to type a link into, and the bookmarklet
  *   GET /status          {"ok":true,"uri":"<the page shown>"}
+ *   POST /cookies        Netscape cookies.txt lines (tools/ps5open --cookies,
+ *       from Chrome) added to the cookie store. Knob:
+ *       /data/ps5webkit/push-cookie-key.txt: a key the X-PS5-Key header must match
  * The control socket takes "open <url>" too. Bare hosts get https://, other
  * words a search; only http, https and file:///data/ps5webkit/ URLs load.
  * Loading a page also leaves View in VR (onLoadChanged).
  * Knobs: /data/ps5webkit/push-off (a file): no server.
  * /data/ps5webkit/push-pin.txt: a PIN that requests must carry (pin=...).
- * A request is read within 3 s and 16 KB, one at a time: a slow or
+ * A request is read within 3 s and 64 KB, one at a time: a slow or
  * oversized client gets an error, never a stuck title. */
 #define PS5WK_PUSH_PORT 9040
-#define PS5WK_PUSH_MAX 16384
+#define PS5WK_PUSH_MAX 65536 /* a site's cookies fit */
+#define PS5WK_COOKIE_KEY "/data/ps5webkit/push-cookie-key.txt"
 #define PS5WK_PENDING_URL "/data/ps5webkit/open-url.txt"
 
 static GMutex shownLock;
 static char* shownURI; /* the committed page, for /status (any thread) */
 static char* pushPIN;
+static WebKitCookieManager* cookieManager;
 
 static void setShownURI(const char* uri)
 {
@@ -649,6 +654,80 @@ static const char* pushRequest(const char* text, const char* from, char** uriOut
     return NULL;
 }
 
+static void cookieAdded(GObject* manager, GAsyncResult* result, gpointer data)
+{
+    char* name = data;
+    GError* error = NULL;
+    if (!webkit_cookie_manager_add_cookie_finish(WEBKIT_COOKIE_MANAGER(manager), result, &error)) {
+        spike_log("push: cookie %s not added: %s", name, error ? error->message : "?");
+        g_clear_error(&error);
+    }
+    g_free(name);
+}
+
+static gboolean pushCookiesOnMain(gpointer data)
+{
+    GPtrArray* cookies = data;
+    for (guint i = 0; cookieManager && i < cookies->len; i++) {
+        SoupCookie* cookie = g_ptr_array_index(cookies, i);
+        webkit_cookie_manager_add_cookie(cookieManager, cookie, NULL, cookieAdded,
+            g_strdup_printf("%s on %s", soup_cookie_get_name(cookie), soup_cookie_get_domain(cookie)));
+    }
+    return G_SOURCE_REMOVE;
+}
+
+/* Any thread: cookies.txt lines (domain, subdomains flag, path, secure,
+ * expiry in Unix seconds or 0 for a session cookie, name, value, and
+ * optionally SameSite None/Lax/Strict; "#HttpOnly_" before the domain) to
+ * the cookie store, on the main loop. The number queued; *domains: the
+ * distinct domains, for the log. */
+static unsigned pushCookies(const char* text, char** domains)
+{
+    GPtrArray* cookies = g_ptr_array_new_with_free_func((GDestroyNotify)soup_cookie_free);
+    GString* seen = g_string_new(NULL);
+    char** lines = g_strsplit(text, "\n", -1);
+    for (char** line = lines; *line; line++) {
+        g_strchomp(*line);
+        gboolean httpOnly = g_str_has_prefix(*line, "#HttpOnly_");
+        const char* entry = httpOnly ? *line + 10 : *line;
+        if (!*entry || *entry == '#')
+            continue;
+        char** f = g_strsplit(entry, "\t", 9);
+        guint n = g_strv_length(f);
+        if (n >= 7 && *f[0] && *f[5]) {
+            gint64 expires = g_ascii_strtoll(f[4], NULL, 10);
+            gint64 now = g_get_real_time() / G_USEC_PER_SEC;
+            if (!expires || expires > now) {
+                SoupCookie* cookie = soup_cookie_new(f[5], f[6], f[0], *f[2] ? f[2] : "/", -1);
+                soup_cookie_set_secure(cookie, !g_ascii_strcasecmp(f[3], "TRUE"));
+                soup_cookie_set_http_only(cookie, httpOnly);
+                if (expires) {
+                    GDateTime* when = g_date_time_new_from_unix_utc(expires);
+                    soup_cookie_set_expires(cookie, when);
+                    g_date_time_unref(when);
+                }
+                if (n >= 8)
+                    soup_cookie_set_same_site_policy(cookie, !g_ascii_strcasecmp(f[7], "Strict") ? SOUP_SAME_SITE_POLICY_STRICT
+                        : !g_ascii_strcasecmp(f[7], "Lax") ? SOUP_SAME_SITE_POLICY_LAX : SOUP_SAME_SITE_POLICY_NONE);
+                g_ptr_array_add(cookies, cookie);
+                char* key = g_strdup_printf(" %s ", f[0]);
+                if (!strstr(seen->str, key) && seen->len < 400)
+                    g_string_append_printf(seen, "%s%s", seen->len ? "" : " ", key + 1);
+                g_free(key);
+            }
+        }
+        g_strfreev(f);
+    }
+    g_strfreev(lines);
+    unsigned count = cookies->len;
+    *domains = g_strstrip(g_string_free(seen, FALSE));
+    if (count)
+        g_idle_add_full(G_PRIORITY_DEFAULT, pushCookiesOnMain, cookies, (GDestroyNotify)g_ptr_array_unref);
+    else
+        g_ptr_array_unref(cookies);
+    return count;
+}
+
 /* The start page address: a launch argument with "://" (tools/launch.sh
  * PPSA99020 <url>), else PS5WK_PENDING_URL (tools/ps5open puts long URLs
  * there before launching; read once, deleted, ignored after 10 minutes). */
@@ -734,7 +813,7 @@ static void pushReply(int client, int status, const char* type, const char* body
     size_t length = body ? strlen(body) : 0;
     char* head = g_strdup_printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
         "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, X-PS5-PIN\r\nAccess-Control-Allow-Private-Network: true\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-PS5-PIN, X-PS5-Key\r\nAccess-Control-Allow-Private-Network: true\r\n"
         "Cache-Control: no-store\r\nConnection: close\r\n\r\n", status, reason, type, length);
     send(client, head, strlen(head), 0);
     if (length)
@@ -874,8 +953,9 @@ static void pushServe(int client, const char* from)
         return;
     }
     const char* headers = strchr(request, '\n') ? strchr(request, '\n') + 1 : "";
-    char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "";
+    char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "", keyHeader[128] = "";
     headerValue(headers, "Accept", accept, sizeof accept);
+    headerValue(headers, "X-PS5-Key", keyHeader, sizeof keyHeader);
     headerValue(headers, "Content-Type", type, sizeof type);
     headerValue(headers, "Host", host, sizeof host);
     headerValue(headers, "X-PS5-PIN", pinHeader, sizeof pinHeader);
@@ -914,6 +994,27 @@ static void pushServe(int client, const char* from)
         g_free(reply);
         g_free(quoted);
         g_free(shown);
+    } else if (!strcmp(path, "/cookies") && post) {
+        /* Open by default (home network); with a key file, requests must
+         * carry it in X-PS5-Key (not the PIN: cookies log into accounts). */
+        gchar* key = NULL;
+        if (g_file_get_contents(PS5WK_COOKIE_KEY, &key, NULL, NULL))
+            g_strstrip(key);
+        if (key && *key && strcmp(key, keyHeader)) {
+            spike_log("push from %s: cookies refused (wrong key)", from);
+            pushReply(client, 403, "text/plain", "ERR wrong or missing cookie key (X-PS5-Key)\n");
+        } else if (windDownStart || !cookieManager) {
+            pushReply(client, 503, "text/plain", "ERR the browser is closing\n");
+        } else {
+            char* domains = NULL;
+            unsigned count = pushCookies(body, &domains);
+            spike_log("push from %s: %u cookies for %s", from, count, *domains ? domains : "(none)");
+            char* reply = g_strdup_printf("OK %u cookies added\n", count);
+            pushReply(client, count ? 200 : 400, "text/plain", count ? reply : "ERR no usable cookies\n");
+            g_free(reply);
+            g_free(domains);
+        }
+        g_free(key);
     } else if ((!strcmp(path, "/open") && (get || post)) || (!strcmp(path, "/") && ((get && url) || post))) {
         char* uri = NULL;
         const char* error = !pinOK ? "wrong or missing PIN" : NULL;
@@ -951,7 +1052,7 @@ static void pushServe(int client, const char* from)
         char* page = pushIndexPage(host, pushPIN && pinOK ? pushPIN : NULL);
         pushReply(client, 200, "text/html; charset=utf-8", page);
         g_free(page);
-    } else if (!strcmp(path, "/") || !strcmp(path, "/open") || !strcmp(path, "/status")) {
+    } else if (!strcmp(path, "/") || !strcmp(path, "/open") || !strcmp(path, "/status") || !strcmp(path, "/cookies")) {
         pushReply(client, 405, "text/plain", "ERR method not allowed\n");
     } else {
         pushReply(client, 404, "text/plain", "ERR not found (/, /open?url=..., /status)\n");
@@ -1217,7 +1318,8 @@ int main(int argc, char** argv)
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
     /* Without this WPE keeps cookies in memory only: every site logged out
      * and YouTube's consent dialog back after each restart. */
-    webkit_cookie_manager_set_persistent_storage(webkit_network_session_get_cookie_manager(session),
+    cookieManager = webkit_network_session_get_cookie_manager(session);
+    webkit_cookie_manager_set_persistent_storage(cookieManager,
         "/data/ps5webkit/browser/data/cookies.sqlite", WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
     /* A TV browser: media may start without a gesture (YouTube, players
      * that autoplay; the pad's X is not always on the video). */
