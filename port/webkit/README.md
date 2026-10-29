@@ -173,6 +173,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0020-ps5-hardware-decoded-video-samples | PS5 only: samples from `ps5vdecproxy` (`video/x-raw(memory:PS5Remote)`, a picture decoded in the title) are not painted (canvas `drawImage` gets nothing) and `videoFrameForCurrentTime` returns null, instead of mapping a placeholder buffer |
 | 0030-ps5-jit | the JIT (Baseline, DFG, FTL, YARR) for PS5 payloads: off by default on PS5 (`useJIT=false` in `Options::overrideDefaults`, a title can map RWX memory but faults executing it), turned on by ps5wk-child for WebProcesses and by the jsc shell; a 128 MB executable pool (x86_64's 1 GB would cost ~512 page tables); WebAssembly built (B3 does not compile without it) but off at run time, no fast memory; DFG/FTL compiler threads get 2 MB stacks; WTF's fault handlers use the alternate signal stack and pass faults that are not theirs to the crash guard; `ps5wk_jit_memory()` for the `[mem]` line and the crash guard; jsc shell links the dependency libraries and reads ICU data from /data/ps5webkit/share/icu; `InlineCacheCompiler.h` includes `CCallHelpers.h` (LLIntOffsetsExtractor did not compile with the JIT on) |
 | 0031-ps5-libpas-decommit | PS5 only: libpas gives decommitted memory back (replaces 0006's zero-only decommit): 16 KiB granules (the page size), decommit maps fresh anonymous pages over whole pages (`madvise` and `mprotect` leave them resident on the console, `test/memprobe`), commit is a no-op; executable memory is only zeroed; `PS5WK_PAS_DECOMMIT=0` restores the zero-only behaviour; `pas_page_malloc_ps5_decommitted_bytes` for the `[mem]` line |
+| 0032-ps5-cpu-painting | PS5 only, CPU page painting (see *CPU painting* below): a frame is recorded into an SkPicture and replayed in horizontal bands on `PS5WK_PAINT_THREADS` threads (default 4; `PS5WK_PAINT_ASYNC=1`: replayed on the pool while the main thread goes on); scrolls move the last frame's pixels and only the uncovered strip and what changed is painted, every frame starts from a copy of the last one (`PS5WK_SCROLL_COPY=0`: repaint on scroll, as upstream); damage is painted as non-overlapping rects (`rectsForPainting`; iterating the damage painted overlaps several times); no full-frame `readPixels` of the SHM surface onto itself (`PS5WK_SHM_READBACK=1` restores it); Skia's heap (`sk_malloc`) is WebKit's libpas (the console's libc malloc collapses under threads, `test/lockbench`); `[render]` lines with per-phase timing; the 0016 throttle no longer drops an update when it fires during a pending frame |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -242,7 +243,14 @@ Milestone 1 placeholder media interfaces) is gone.
 | `child.env`: `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_VP9=0`, `PS5WK_MEDIA_AV1=1`, `GST_DEBUG=...` | WebProcess decoding, codec advertising, GStreamer logs |
 | `child.env`: `PS5WK_PROFILE=1` | sampling profiler of the WebProcess main thread (`apps/common/profiler.c`, 2 ms SIGPROF; `test/prof.sh` fetches and symbolizes) |
 | `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
-| `[render]` lines (WebProcess, every 5 s while rendering more than 25 updates) | rendering updates per second, average/max duration, how many were followed by the idle gap |
+| `[render]` lines (WebProcess, every 5 s while rendering at least 5 updates) | rendering updates per second; total time per update (avg, p50, p95, max); the update phase (style, layout, rAF, JavaScript); paint (avg, p95, max; Mpx painted per update, updates painted in bands, threads, time spent copying the last frame forward, async rasters); `copy` (the rest: frame hand-off); `frame done` (frame sent until the UIProcess presented it, vsync included); updates followed by the idle gap |
+| `child.env`: `PS5WK_RENDER_LOG=0` / `1` (default) / `2` / `3` | `[render]` lines off; every 5 s; also one `[render1]` line per update (`test/paint/paint-ab-summary.py` reads them); also every scroll and the rects painted |
+| `child.env`: `PS5WK_PAINT_THREADS=<1-8>` (default 4) | CPU painting threads (see *CPU painting*): 1 paints directly on the main thread as upstream; more record the frame and replay it in bands (the main thread takes bands too) |
+| `child.env`: `PS5WK_PAINT_ASYNC=1` | the main thread records and goes on (JavaScript, timers, input) while `PS5WK_PAINT_THREADS` pool threads replay; the frame is sent when they are done (off by default: a little less throughput on image-heavy pages) |
+| `child.env`: `PS5WK_SCROLL_COPY=0` | scrolls repaint the whole view (upstream), and frames don't start from a copy of the last one |
+| `child.env`: `PS5WK_PAINT_MIN_PX=<n>` (default 65536), `PS5WK_PAINT_BBH=0`, `PS5WK_PAINT_RECORD=1` | A/B knobs: damage below n pixels is painted directly; record without a bounding box hierarchy; record and replay even on one thread |
+| `child.env`: `PS5WK_IDLE_GAP=<percent>` (default 100) | the idle gap after a rendering update longer than 6 ms, in percent of its duration (0 = none) |
+| `child.env`: `PS5WK_SHM_READBACK=1` | the old full-frame `readPixels` of the shared-memory surface onto itself after each frame (A/B only) |
 | `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child: 7680x4320@60 when the title decodes in hardware (step 2b; the child asks the title's video server at start), else 1920x1080@60 (software: YouTube stays ≤1080p) |
 | `child.env`: `PS5WK_MEM_LOG=<s>` (0 = off), `PS5WK_CPU_LOG=all` | the WebProcess memory watchdog period (default 60 s); `[cpu]` lines every 5 s whatever the load |
 | `child.env`: `PS5WK_MEM_RESTART_MB=<MB>` (default 3072, 0 = off) | WebProcess memory limit: over this much libpas memory committed, the title (and ps5wk-shot's stress mode) ends the WebProcess at the next top-level navigation and loads the page in a new one (see *WebProcess memory*) |
@@ -1154,6 +1162,87 @@ Wikipedia restarted the WebProcess, Wikipedia loaded in 2.1-2.3 s and Hacker
 News after it in the new process, twice. A navigation that was a POST is
 reloaded as a GET (load-changed gives no method); at 3 GB this should be
 rare: the 48-load mix stayed under 0.9 GB committed.
+
+## CPU painting (patch 0032, 2026-10-29)
+
+Pages are painted on the CPU in the WebProcess (no GPU in payloads,
+FEASIBILITY §4.8), non-composited: each rendering update paints the damaged
+rects of the whole view with Skia into a shared-memory buffer, and the title
+copies the damaged rows into its GL buffer (1 ms for a full page). The time
+went into painting, on the main thread, one thread only.
+
+**What changed** (WebKit patch 0032, `ps5wk-child.cpp`):
+
+- **Painting on several threads.** The frame is recorded into an SkPicture
+  (main thread, with an R-tree), then replayed in horizontal bands of whole
+  rows on `PS5WK_PAINT_THREADS` (default 4) threads, the main thread
+  included. Small damage (under 64k pixels or 64 rows) is painted directly.
+  Recording plus one-thread replay costs about what direct painting costs
+  (Wikipedia 4.3 + 4.2 ms against 13.8 ms direct), so nothing is lost.
+- **The console's libc malloc and pthread mutexes collapse under
+  contention** (`test/lockbench`, a payload): a malloc/free pair takes 0.3 us
+  on one thread and 48/106/162 us per pair on 2/4/6 threads (3.3 -> 0.04
+  million pairs/s in total); a pthread mutex lock/unlock 17 ns on one thread
+  and 4-21 us on 2-6; `sem_wait`/`sem_post` stay at ~1 us and plain ALU work
+  scales. With Skia on libc malloc, four threads replayed GitHub in 49 ms
+  against 4.4 ms on one. Now Skia's heap (`sk_malloc`, patch 0032) and every
+  C++ `new`/`delete` in ps5wk-child go to WebKit's libpas (per-thread
+  caches): GitHub replays in 1.4 ms on four threads. glib, GStreamer and
+  libsoup still use libc malloc and `GMutex` (pthread): contention between
+  the main thread and those threads probably costs too (not changed yet).
+  The title's heap (Spike 10's dlmalloc) also locks with a pthread mutex.
+- **Scrolling moves pixels.** A scroll (`DrawingArea::scroll`, called by
+  WebKit when the frame can blit) shifts the last frame's pixels and paints
+  only the uncovered strip plus what changed; damage from earlier in the
+  same frame moves with the content. Every frame starts from a copy of the
+  last one (the stale parts of the buffer, ~1 ms), so a buffer of the swap
+  chain no longer repaints what changed in the frames it missed. Pages with
+  fixed or sticky elements over the content (BBC News's banner, Wikipedia's
+  sticky columns) still damage most of the view on each scroll step.
+- **Smaller fixes:** the damage was painted rect by rect from `Damage`'s
+  iterator, whose rects overlap (each overlap painted again; now
+  `rectsForPainting()`); after each frame the SHM surface was read back onto
+  itself (`readPixels` of the whole 8 MB frame into the same memory); the
+  0016 throttle timer dropped an update when it fired while a frame was
+  pending.
+
+**Measured** (`test/paint/paint-ab.sh`: ps5wk-shot at 1920x1080, the page
+scrolls down and up for 10 s, 40 px per 16 ms timer tick; per rendering
+update during the scroll; "before" = `PS5WK_PAINT_THREADS=1
+PS5WK_SHM_READBACK=1 PS5WK_SCROLL_COPY=0` on the libc-malloc build, or one
+thread where noted):
+
+| page | before: update / paint ms (avg) | updates/s | after (defaults): update / paint ms | updates/s |
+| --- | --- | --- | --- | --- |
+| local test page (`test/paint/static.html?plain`: text, shadows, gradients, rotated cards, SVG) | 49.9 / 49.7 | 10 | 3.2 / 3.1 (0.05 Mpx painted per update) | 85 |
+| same, scroll copy off (`t4ns`) | | | 20.5 / 20.3 (2 Mpx) | 23 |
+| BBC News | 37.5 / 32.8 | 22.6 | 18.8 / 13.7 (record 5.9, replay 6.7) | 40.8 |
+| Wikipedia (one thread on the same build) | 14.3 / 13.4 | 35 | 4.3 / 2.8 | 95 |
+| GitHub (one thread, before libpas) | 11.7 / 9.6 | 43 | 8.0 / 5.7 | 55 (`PS5WK_PAINT_ASYNC=1`: 61, main thread 6.5 ms per update) |
+| Hacker News | ~1 / ~0.6 | ~37 | ~1.6 / ~1.3 | ~34 (only the scrollbar and the strip change) |
+
+Single runs vary with the pages' content (Wikipedia and YouTube serve
+different banners from run to run); YouTube's home page doesn't scroll in
+the harness (the consent dialog), and old.reddit.com redirects to a login
+page. With libc malloc and 4 threads text-heavy pages got slower (GitHub
+paint 54.7 ms per update, Wikipedia 14.9); image-heavy BBC already doubled.
+
+Pixels: the local test page's last frame after the scroll (scrolled back to
+0) is identical with 4 threads and with async replay; against one-thread
+direct painting about 1600 of 2 million pixels differ by antialiasing levels
+(max 56 of 255, at rotated cards' edges and the scrollbar), not visible in
+side-by-side crops.
+
+**Title** (log-only PPSA99020 run, defaults, 2026-10-29 00:26): YouTube 4K60
+VP9 in Videodec2 with the hole punch at 47-60 frames/s shown, BBC News,
+Wikipedia, GitHub, Hacker News and YouTube's home page load, no crash.
+BBC News keeps repainting its whole view while idle: 26-30 updates/s at
+16-19 ms each (2.07 Mpx in bands; the owner's session before showed 35-70 ms
+per update at 6-14/s on busy pages). Flexible memory stayed at 283-284 MB.
+
+**Not done:** frames aren't pipelined (with `PS5WK_PAINT_ASYNC=1` the next
+update still waits for the replay); glib/GStreamer malloc and pthread
+mutexes; composited scrolling of fixed/sticky content.
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

@@ -675,3 +675,21 @@ port.
   URL it sends the front Safari/Chrome tab, and starts the browser with the
   link if it isn't running) and a Share-menu shortcut all load a link in
   the browser.
+- **Faster CPU painting (2026-10-29, patch 0032, port/webkit/README.md,
+  *CPU painting*):** "slow HTML rendering" was the WebProcess painting each
+  frame on its main thread alone. Frames are now recorded and replayed in
+  bands on 4 threads, scrolls move the last frame's pixels and paint only
+  the uncovered strip, overlapping damage is painted once, and a full-frame
+  self-copy per frame is gone. Found on the way: the console's libc malloc
+  and pthread mutexes collapse when threads contend (a malloc/free pair 0.3 us
+  alone, 48-162 us with 2-6 threads; `test/lockbench`), which made extra
+  painting threads slower than one; Skia's heap and C++ `new` in the child now
+  use libpas. Scrolling a 1080p page in the harness: a local test page 10 ->
+  85 updates/s (50 -> 3 ms each), BBC News 23 -> 41/s, Wikipedia 35 -> 95/s
+  (one thread vs four), GitHub 43 -> 55/s. The title ran YouTube (hardware
+  video, hole punch), BBC News, Wikipedia, GitHub and Hacker News with the
+  new child; BBC's idle full-view repaints now take 16-19 ms. glib/GStreamer
+  still use libc malloc and pthread mutexes (next candidate), and the title's
+  heap locks with a pthread mutex too. Knobs: `PS5WK_PAINT_THREADS`,
+  `PS5WK_SCROLL_COPY`, `PS5WK_PAINT_ASYNC`, `PS5WK_RENDER_LOG`. Waiting for the
+  owner's TV check (scrolling, video, View in VR).

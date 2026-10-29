@@ -1,0 +1,974 @@
+diff --git a/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp b/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
+index 12e8f7de19..ca1d54f5bb 100644
+--- a/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
++++ b/Source/ThirdParty/skia/src/ports/SkMemory_malloc.cpp
+@@ -74,6 +74,43 @@ void sk_out_of_memory(void) {
+ #endif
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: the console's libc malloc serialises threads very badly (a
++// malloc/free pair goes from 0.3 us on one thread to 48-160 us each on 2-6
++// threads, test/lockbench), and the CPU page painting threads allocate in
++// Skia all the time. Skia's heap is WebKit's (libpas, per-thread caches).
++namespace WTF {
++void* fastMalloc(size_t);
++void* fastZeroedMalloc(size_t);
++void* fastRealloc(void*, size_t);
++void fastFree(void*);
++size_t fastMallocSize(const void*);
++}
++
++void* sk_realloc_throw(void* addr, size_t size) {
++    if (size == 0) {
++        sk_free(addr);
++        return nullptr;
++    }
++    return WTF::fastRealloc(addr, size); // crashes when out of memory
++}
++
++void sk_free(void* p) {
++    if (p != nullptr) {
++        WTF::fastFree(p);
++    }
++}
++
++void* sk_malloc_flags(size_t size, unsigned flags) {
++    // fastMalloc crashes when out of memory, as SK_MALLOC_THROW asks; callers
++    // that can live without the memory get the same.
++    return (flags & SK_MALLOC_ZERO_INITIALIZE) ? WTF::fastZeroedMalloc(size) : WTF::fastMalloc(size);
++}
++
++size_t sk_malloc_size(void* addr, size_t size) {
++    return std::max(addr ? WTF::fastMallocSize(addr) : 0, size);
++}
++#else
+ void* sk_realloc_throw(void* addr, size_t size) {
+     if (size == 0) {
+         sk_free(addr);
+@@ -138,3 +175,4 @@ size_t sk_malloc_size(void* addr, size_t size) {
+ 
+     return completeSize;
+ }
++#endif // PS5_PAYLOAD_SDK
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index 1af594fd56..dba01a6c8f 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -48,6 +48,7 @@
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkCanvas.h>
+ #include <skia/core/SkColorSpace.h>
++#include <skia/core/SkPixmap.h>
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
+@@ -456,8 +457,18 @@ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame()
+         if (m_surface->usesGL()) {
+             GLContext::ScopedGLContextCurrent scopedCurrent(*PlatformDisplay::sharedDisplay().skiaGLContext());
+             m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+-        } else
++        } else {
++#if defined(PS5_PAYLOAD_SDK)
++            // The CPU surface wraps the shared bitmap itself
++            // (ShareableBitmap::createSurface): reading it back would copy
++            // the whole frame onto itself (PS5WK_SHM_READBACK=1 does, for A/B tests).
++            static const bool readBack = getenv("PS5WK_SHM_READBACK") && !strcmp(getenv("PS5WK_SHM_READBACK"), "1");
++            SkPixmap pixmap;
++            if (!readBack && m_skiaSurface->peekPixels(&pixmap) && pixmap.addr() == m_bitmap->mutableSpan().data())
++                return;
++#endif
+             m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
++        }
+         return;
+     }
+ 
+@@ -1095,6 +1106,9 @@ void AcceleratedSurface::willRenderFrame(const IntSize& size)
+         m_pendingFrameNotifyTargets.clear();
+ #if ENABLE(DAMAGE_TRACKING)
+         m_damageTracker.reset();
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++        m_ps5LastRenderedTargetID = 0;
+ #endif
+     }
+ 
+@@ -1166,6 +1180,9 @@ void AcceleratedSurface::didRenderFrame(TargetContents targetContents)
+ #endif
+ 
+     m_target->didRenderFrame();
++#if defined(PS5_PAYLOAD_SDK)
++    m_ps5LastRenderedTargetID = targetContents == TargetContents::Valid ? m_target->id() : 0;
++#endif
+     m_pendingFrameNotifyTargets.insert(0, { m_target, WTF::move(damageRects) });
+     m_target = nullptr;
+ }
+@@ -1187,6 +1204,73 @@ const std::optional<Damage>& AcceleratedSurface::renderTargetDamage()
+ }
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK) && ENABLE(DAMAGE_TRACKING)
++// Rows of dstRect in dst = the same rows moved back by offset in src (memmove:
++// src and dst may be the same buffer; rows are walked so that none is
++// overwritten before it is read).
++static void ps5CopyPixels(const SkPixmap& dst, const SkPixmap& src, const IntRect& dstRect, const IntSize& offset)
++{
++    if (dstRect.isEmpty())
++        return;
++    size_t rowBytes = static_cast<size_t>(dstRect.width()) * 4;
++    auto copyRow = [&](int y) {
++        memmove(dst.writable_addr(dstRect.x(), y), src.addr(dstRect.x() - offset.width(), y - offset.height()), rowBytes);
++    };
++    if (offset.height() > 0) {
++        for (int y = dstRect.maxY() - 1; y >= dstRect.y(); y--)
++            copyRow(y);
++    } else {
++        for (int y = dstRect.y(); y < dstRect.maxY(); y++)
++            copyRow(y);
++    }
++}
++
++void AcceleratedSurface::ps5CopyForward(const Damage& paintDamage, const IntRect& scrollRect, const IntSize& scrollDelta)
++{
++    if (!m_target || !m_useSkia || usesGL() || !m_ps5LastRenderedTargetID)
++        return;
++    RenderTarget* last = nullptr;
++    m_swapChain.forEachTarget([&](RenderTarget& target) {
++        if (target.id() == m_ps5LastRenderedTargetID)
++            last = &target;
++    });
++    SkPixmap dst, src;
++    if (!last || !m_target->skiaSurface() || !last->skiaSurface() || !m_target->skiaSurface()->peekPixels(&dst) || !last->skiaSurface()->peekPixels(&src))
++        return;
++    if (dst.width() != src.width() || dst.height() != src.height() || dst.colorType() != src.colorType() || dst.info().bytesPerPixel() != 4)
++        return;
++
++    IntRect surfaceRect(0, 0, dst.width(), dst.height());
++    IntRect scroll = intersection(scrollRect, surfaceRect);
++    Region painted;
++    for (const auto& rect : paintDamage)
++        painted.unite(rect);
++
++    if (last != m_target) {
++        // What this target missed since it was last current, outside the
++        // scrolled rectangle and what gets painted now: as in the last frame.
++        Region stale;
++        if (const auto& damage = m_target->damage()) {
++            for (const auto& rect : *damage)
++                stale.unite(intersection(rect, surfaceRect));
++        } else
++            stale = Region(surfaceRect);
++        if (!scroll.isEmpty())
++            stale.subtract(scroll);
++        stale.subtract(painted);
++        for (const auto& rect : stale.rects())
++            ps5CopyPixels(dst, src, rect, { });
++    }
++    if (!scroll.isEmpty()) {
++        IntRect kept = scroll;
++        kept.move(scrollDelta);
++        kept.intersect(scroll);
++        ps5CopyPixels(dst, src, kept, scrollDelta);
++    }
++    m_target->setDamage(paintDamage);
++}
++#endif
++
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+ void AcceleratedSurface::releaseBuffer(uint64_t targetID, UnixFileDescriptor&& releaseFence)
+ {
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index a76cad2de8..1b28441718 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -146,6 +146,12 @@ public:
+     void setFrameDamageRectangleThreshold(unsigned threshold) { m_damageTracker.setRectangleThreshold(threshold); }
+     const std::optional<WebCore::Damage>& frameDamage() const LIFETIME_BOUND { return m_damageTracker.frameDamage(); }
+     const std::optional<WebCore::Damage>& renderTargetDamage();
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 CPU rendering: before painting, bring the target up to date from
++    // the last rendered frame (moving the scrolled rectangle by the scroll
++    // delta), so that only paintDamage needs painting.
++    void ps5CopyForward(const WebCore::Damage& paintDamage, const WebCore::IntRect& scrollRect, const WebCore::IntSize& scrollDelta);
++#endif
+ #endif
+ 
+     void didCreateCompositingRunLoop(WTF::RunLoop&);
+@@ -207,6 +213,9 @@ private:
+         // The damage record is maintained by SwapChainDamageTracker alone, which is what keeps it meaning
+         // everything that changed since this target was last current.
+         friend class SwapChainDamageTracker;
++#if defined(PS5_PAYLOAD_SDK)
++        friend class AcceleratedSurface; // ps5CopyForward
++#endif
+ 
+         void setDamage(std::optional<WebCore::Damage>&& damage) { m_damage = WTF::move(damage); }
+         const std::optional<WebCore::Damage>& damage() LIFETIME_BOUND { return m_damage; }
+@@ -500,6 +509,9 @@ private:
+     RefPtr<WTF::RunLoop> m_compositingRunLoop;
+ #if ENABLE(DAMAGE_TRACKING)
+     SwapChainDamageTracker m_damageTracker;
++#if defined(PS5_PAYLOAD_SDK)
++    uint64_t m_ps5LastRenderedTargetID { 0 };
++#endif
+ #endif
+ };
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+index 10df3e718e..408207d01c 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+@@ -77,8 +77,15 @@ void DrawingAreaCoordinatedGraphics::setNeedsDisplayInRect(const IntRect& rect)
+     m_renderer->setNeedsDisplayInRect(rect);
+ }
+ 
+-void DrawingAreaCoordinatedGraphics::scroll(const IntRect&, const IntSize&)
++void DrawingAreaCoordinatedGraphics::scroll(const IntRect& scrollRect, const IntSize& scrollDelta)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_renderer && m_renderer->ps5Scroll(scrollRect, scrollDelta))
++        return;
++#else
++    UNUSED_PARAM(scrollRect);
++    UNUSED_PARAM(scrollDelta);
++#endif
+     setNeedsDisplay();
+ }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/FrameRenderer.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/FrameRenderer.h
+index f7a92c96de..991fa2bea4 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/FrameRenderer.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/FrameRenderer.h
+@@ -33,6 +33,7 @@ class FloatPoint;
+ class GraphicsLayer;
+ class GraphicsLayerFactory;
+ class IntRect;
++class IntSize;
+ class Region;
+ class RunLoopObserver;
+ }
+@@ -51,6 +52,10 @@ public:
+     virtual uint64_t surfaceID() const = 0;
+     virtual void setNeedsDisplay() { }
+     virtual void setNeedsDisplayInRect(const WebCore::IntRect&) { }
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: a scroll the renderer can apply by moving pixels (false: repaint).
++    virtual bool ps5Scroll(const WebCore::IntRect&, const WebCore::IntSize&) { return false; }
++#endif
+     virtual void updateRenderingWithForcedRepaint() = 0;
+     virtual void scheduleRenderingUpdate() = 0;
+     virtual void suspend();
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+index 5fef711b5b..e64ab15d15 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+@@ -41,12 +41,438 @@
+ #include <wtf/Scope.h>
+ #include <wtf/SetForScope.h>
+ #include <wtf/SystemTracing.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include <WebCore/IntRect.h>
++#include <WebCore/Region.h>
++#include <wtf/Condition.h>
++#include <wtf/Lock.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/WorkerPool.h>
++#include <wtf/text/StringBuilder.h>
++#include <wtf/text/StringToIntegerConversion.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkBBHFactory.h>
++#include <skia/core/SkPicture.h>
++#include <skia/core/SkPictureRecorder.h>
++#include <skia/core/SkPixmap.h>
++#include <skia/core/SkRegion.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#endif
+ 
+ namespace WebKit {
+ using namespace WebCore;
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(NonCompositedFrameRenderer);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: the page is painted on the CPU (the WebProcess has no GPU). Painting
++// one frame is recorded into an SkPicture on the main thread and replayed in
++// horizontal bands on several threads (PS5WK_PAINT_THREADS, 1 = paint
++// directly on the main thread as upstream does).
++static unsigned ps5EnvUnsigned(const char* name, unsigned fallback, unsigned minimum, unsigned maximum)
++{
++    const char* text = getenv(name);
++    if (!text || !*text)
++        return fallback;
++    auto value = parseInteger<unsigned>(StringView::fromLatin1(text));
++    return value ? std::clamp(*value, minimum, maximum) : fallback;
++}
++
++static unsigned ps5PaintThreads()
++{
++    static unsigned threads = [] {
++        unsigned value = ps5EnvUnsigned("PS5WK_PAINT_THREADS", 4, 1, 8);
++        WTFLogAlways("[render] painting on %u thread%s (PS5WK_PAINT_THREADS)", value, value == 1 ? "" : "s");
++        return value;
++    }();
++    return threads;
++}
++
++// Below this many damaged pixels a frame is painted directly (recording
++// would cost more than the threads save).
++static uint64_t ps5PaintMinPixels()
++{
++    static uint64_t pixels = ps5EnvUnsigned("PS5WK_PAINT_MIN_PX", 65536, 0, 1u << 30);
++    return pixels;
++}
++
++// [render] lines: 0 = off, 1 = every 5 s (default), 2 = also one line per update, 3 = and per scroll.
++static unsigned ps5RenderLog()
++{
++    static unsigned level = ps5EnvUnsigned("PS5WK_RENDER_LOG", 1, 0, 3);
++    return level;
++}
++
++// The idle gap after a long update, in percent of its duration (default 100).
++static unsigned ps5IdleGapPercent()
++{
++    static unsigned percent = ps5EnvUnsigned("PS5WK_IDLE_GAP", 100, 0, 400);
++    return percent;
++}
++
++// Scrolls move the last frame's pixels and only the uncovered strip (plus
++// what changed) is painted; every frame starts from a copy of the last one
++// (PS5WK_SCROLL_COPY=0: repaint the whole view on scroll, as upstream).
++static bool ps5ScrollCopy()
++{
++    static bool enabled = ps5EnvUnsigned("PS5WK_SCROLL_COPY", 1, 0, 1);
++    return enabled;
++}
++
++// PS5WK_PAINT_RECORD=1: record and replay in bands even on one thread (A/B).
++static bool ps5PaintRecordAlways()
++{
++    static bool enabled = ps5EnvUnsigned("PS5WK_PAINT_RECORD", 0, 0, 1);
++    return enabled;
++}
++
++// PS5WK_PAINT_BBH=0: record without a bounding box hierarchy (A/B).
++static bool ps5PaintBBH()
++{
++    static bool enabled = ps5EnvUnsigned("PS5WK_PAINT_BBH", 1, 0, 1);
++    return enabled;
++}
++
++static double s_ps5RecordMS, s_ps5ReplayMS;
++
++// PS5WK_PAINT_ASYNC=1: the main thread records and goes on (JavaScript,
++// timers, input) while the pool replays; the frame is sent when the bands are done.
++static bool ps5PaintAsync()
++{
++    static bool enabled = ps5EnvUnsigned("PS5WK_PAINT_ASYNC", 0, 0, 1);
++    return enabled;
++}
++
++static WorkerPool& ps5PaintPool()
++{
++    // Synchronous replay: the main thread takes bands too.
++    static NeverDestroyed<Ref<WorkerPool>> pool = WorkerPool::create("PS5Paint"_s, std::max(1u, ps5PaintThreads() - (ps5PaintAsync() ? 0 : 1)));
++    return pool.get();
++}
++
++// Runs work(0..count-1) on the calling thread and up to threads-1 pool
++// threads, and returns when every item is done.
++static void ps5ParallelFor(unsigned count, NOESCAPE const Function<void(unsigned)>& work)
++{
++    struct Shared : ThreadSafeRefCounted<Shared> {
++        std::atomic<unsigned> next { 0 };
++        Lock lock;
++        Condition condition;
++        unsigned helpersDone WTF_GUARDED_BY_LOCK(lock) { 0 };
++    };
++    Ref shared = adoptRef(*new Shared);
++    auto runItems = [&work, count](Shared& state) {
++        for (unsigned index; (index = state.next.fetch_add(1, std::memory_order_relaxed)) < count;)
++            work(index);
++    };
++    unsigned helpers = count > 1 ? std::min(ps5PaintThreads() - 1, count - 1) : 0;
++    for (unsigned i = 0; i < helpers; i++) {
++        ps5PaintPool().postTask([shared, &runItems] {
++            runItems(shared.get());
++            Locker locker { shared->lock };
++            shared->helpersDone++;
++            shared->condition.notifyAll();
++        });
++    }
++    runItems(shared.get());
++    // The helpers reference this frame's stack: wait until all have finished.
++    Locker locker { shared->lock };
++    while (shared->helpersDone < helpers)
++        shared->condition.wait(shared->lock);
++}
++
++struct PS5RenderStats {
++    Vector<float> totalMS, updateMS, paintMS;
++    double copyMS { 0 }, forwardMS { 0 }, waitMS { 0 }, megapixels { 0 }, rasterMS { 0 };
++    unsigned waits { 0 }, throttled { 0 }, banded { 0 }, rasters { 0 };
++    MonotonicTime windowStart;
++
++    static float percentile(Vector<float>& values, double fraction)
++    {
++        if (values.isEmpty())
++            return 0;
++        std::sort(values.begin(), values.end());
++        return values[std::min<size_t>(values.size() - 1, static_cast<size_t>(fraction * values.size()))];
++    }
++    static float average(const Vector<float>& values)
++    {
++        double sum = 0;
++        for (auto value : values)
++            sum += value;
++        return values.isEmpty() ? 0 : sum / values.size();
++    }
++
++    void add(MonotonicTime end, double total, double update, double paint, double copy, double forward, double pixels, bool wasBanded, bool gap)
++    {
++        if (!windowStart)
++            windowStart = end;
++        totalMS.append(total);
++        updateMS.append(update);
++        paintMS.append(paint);
++        copyMS += copy;
++        forwardMS += forward;
++        megapixels += pixels / 1e6;
++        if (wasBanded)
++            banded++;
++        if (gap)
++            throttled++;
++        if (ps5RenderLog() >= 2)
++            WTFLogAlways("[render1] %.1f ms: update %.1f, paint %.1f (%.2f Mpx%s, forward %.1f, record %.1f, replay %.1f), copy %.1f", total, update, paint, pixels / 1e6, wasBanded ? ", bands" : "", forward,
++                wasBanded ? s_ps5RecordMS : 0.0, wasBanded ? s_ps5ReplayMS : 0.0, copy);
++        if (end - windowStart < 5_s)
++            return;
++        unsigned count = totalMS.size();
++        if (count >= 5 && ps5RenderLog()) {
++            double seconds = (end - windowStart).seconds();
++            float totalAverage = average(totalMS), updateAverage = average(updateMS), paintAverage = average(paintMS);
++            WTFLogAlways("[render] %u updates in %.1f s (%.1f/s), %.1f ms average, p50 %.1f, p95 %.1f, %.1f ms max; update %.1f avg %.1f p95; paint %.1f avg %.1f p95 %.1f max (%.2f Mpx avg, %u in bands, %u threads, %.2f copying forward; %u async, %.1f ms avg); copy %.2f; frame done %.1f ms avg; %u followed by an idle gap",
++                count, seconds, count / seconds, totalAverage, percentile(totalMS, 0.5), percentile(totalMS, 0.95), percentile(totalMS, 1),
++                updateAverage, percentile(updateMS, 0.95), paintAverage, percentile(paintMS, 0.95), percentile(paintMS, 1),
++                megapixels / count, banded, ps5PaintThreads(), forwardMS / count, rasters, rasters ? rasterMS / rasters : 0.0, copyMS / count, waits ? waitMS / waits : 0.0, throttled);
++        }
++        totalMS.shrink(0);
++        updateMS.shrink(0);
++        paintMS.shrink(0);
++        copyMS = forwardMS = waitMS = megapixels = rasterMS = 0;
++        waits = throttled = banded = rasters = 0;
++        windowStart = end;
++    }
++};
++
++static PS5RenderStats& ps5RenderStats()
++{
++    static NeverDestroyed<PS5RenderStats> stats;
++    return stats.get();
++}
++
++bool NonCompositedFrameRenderer::ps5Scroll(const IntRect& scrollRect, const IntSize& scrollDelta)
++{
++    if (!ps5ScrollCopy() || m_context || !m_frameDamage || m_webPage->deviceScaleFactor() != 1 || m_surface->skiaClearColor({ })) {
++        if (ps5RenderLog() >= 3)
++            WTFLogAlways("[render1] scroll repaints (copy %d, damage %d, scale %.2f)", ps5ScrollCopy(), !!m_frameDamage, m_webPage->deviceScaleFactor());
++        return false;
++    }
++    IntRect rect = intersection(scrollRect, m_webPage->bounds());
++    if (rect.isEmpty() || scrollDelta.isZero())
++        return true;
++    if (!m_ps5ScrollRect.isEmpty() && m_ps5ScrollRect != rect)
++        return false; // a second scrolled rectangle in one frame: repaint
++
++    // What was damaged earlier in this frame moves with the content (the old
++    // place stays damaged too), and the strip the scroll uncovers is new.
++    auto damaged = m_frameDamage->rects();
++    if (ps5RenderLog() >= 3) {
++        StringBuilder text;
++        for (const auto& r : damaged)
++            text.append(' ', r.width(), 'x', r.height(), '+', r.x(), '+', r.y());
++        WTFLogAlways("[render1] damage before scroll:%s", text.toString().utf8().data());
++    }
++    for (auto moved : damaged) {
++        moved.move(scrollDelta);
++        moved.intersect(rect);
++        if (!moved.isEmpty())
++            m_frameDamage->add(moved);
++    }
++    IntRect kept = rect;
++    kept.move(scrollDelta);
++    kept.intersect(rect);
++    Region uncovered(rect);
++    uncovered.subtract(kept);
++    for (const auto& strip : uncovered.rects())
++        m_frameDamage->add(strip);
++
++    m_ps5ScrollRect = rect;
++    m_ps5ScrollDelta += scrollDelta;
++    if (ps5RenderLog() >= 3)
++        WTFLogAlways("[render1] scroll %dx%d+%d+%d by %d,%d; damage %zu rects, bounds %dx%d+%d+%d", rect.width(), rect.height(), rect.x(), rect.y(),
++            scrollDelta.width(), scrollDelta.height(), m_frameDamage->size(), m_frameDamage->bounds().width(), m_frameDamage->bounds().height(), m_frameDamage->bounds().x(), m_frameDamage->bounds().y());
++    scheduleRenderingUpdate();
++    return true;
++}
++
++// One frame's recording and its bands (device pixels in the target buffer).
++struct PS5RasterJob : ThreadSafeRefCounted<PS5RasterJob> {
++    sk_sp<SkPicture> picture;
++    SkPixmap pixmap;
++    SkSurfaceProps props;
++    IntRect bounds;
++    Vector<IntRect> rects;
++    unsigned bandCount { 0 };
++    int bandHeight { 0 };
++    std::atomic<unsigned> nextBand { 0 };
++    std::atomic<unsigned> bandsLeft { 0 };
++    MonotonicTime start;
++    double rasterMS { 0 };
++    Lock lock;
++    Condition condition;
++    bool done WTF_GUARDED_BY_LOCK(lock) { false };
++    NonCompositedFrameRenderer* renderer { nullptr }; // main thread only; null once completed
++
++    void paintBand(unsigned band) const
++    {
++        int y0 = bounds.y() + band * bandHeight;
++        int y1 = std::min(bounds.maxY(), y0 + bandHeight);
++        if (y1 <= y0)
++            return;
++        SkRegion clip;
++        for (const auto& rect : rects) {
++            auto part = intersection(rect, IntRect(bounds.x(), y0, bounds.width(), y1 - y0));
++            if (!part.isEmpty())
++                clip.op(SkIRect::MakeXYWH(part.x(), part.y() - y0, part.width(), part.height()), SkRegion::kUnion_Op);
++        }
++        if (clip.isEmpty())
++            return;
++        auto bandCanvas = SkCanvas::MakeRasterDirect(pixmap.info().makeWH(pixmap.width(), y1 - y0), pixmap.writable_addr(0, y0), pixmap.rowBytes(), &props);
++        if (!bandCanvas)
++            return;
++        bandCanvas->clipRegion(clip);
++        bandCanvas->translate(0, -y0);
++        picture->playback(bandCanvas.get());
++    }
++};
++
++
++RefPtr<PS5RasterJob> NonCompositedFrameRenderer::ps5RecordBands(SkCanvas& canvas, const Vector<IntRect>& deviceRects)
++{
++    s_ps5RecordMS = s_ps5ReplayMS = 0;
++    if ((ps5PaintThreads() < 2 && !ps5PaintRecordAlways() && !ps5PaintAsync()) || m_context || m_surface->shouldPaintMirrored())
++        return nullptr;
++
++    SkPixmap pixmap;
++    if (!canvas.peekPixels(&pixmap))
++        return nullptr;
++    IntRect surfaceRect(0, 0, pixmap.width(), pixmap.height());
++
++    IntRect bounds;
++    uint64_t pixels = 0;
++    for (auto rect : deviceRects) {
++        rect.intersect(surfaceRect);
++        bounds.unite(rect);
++        pixels += static_cast<uint64_t>(rect.width()) * rect.height();
++    }
++    if (bounds.isEmpty() || pixels < ps5PaintMinPixels() || bounds.height() < 64)
++        return nullptr;
++
++    Ref webPage = m_webPage;
++    float scale = webPage->deviceScaleFactor();
++
++    auto recordStart = MonotonicTime::now();
++    // Record the frame in device pixels (the replay only offsets it), with a
++    // bounding box hierarchy so each band visits only its own operations.
++    SkPictureRecorder recorder;
++    SkRTreeFactory rtreeFactory;
++    auto* recordingCanvas = recorder.beginRecording(SkRect::MakeIWH(pixmap.width(), pixmap.height()), ps5PaintBBH() ? &rtreeFactory : nullptr);
++    {
++        GraphicsContextSkia recordingContext(*recordingCanvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM);
++        recordingContext.beginRecording(GraphicsContextSkia::RecordingMode::Tile);
++        recordingContext.applyDeviceScaleFactor(scale);
++        for (const auto& rect : deviceRects) {
++            auto userRect = rect;
++            userRect.scale(1 / scale);
++            webPage->drawRect(recordingContext, userRect);
++        }
++        recordingContext.endRecording();
++    }
++    auto picture = recorder.finishRecordingAsPicture();
++    if (!picture)
++        return nullptr;
++    s_ps5RecordMS = (MonotonicTime::now() - recordStart).milliseconds();
++
++    Ref job = adoptRef(*new PS5RasterJob);
++    job->picture = WTF::move(picture);
++    job->pixmap = pixmap;
++    job->props = canvas.getBaseProps();
++    job->bounds = bounds;
++    job->rects = deviceRects;
++    // Bands of whole rows: several per thread, so an expensive band (a blur,
++    // a large image) doesn't leave the other threads idle.
++    job->bandCount = std::clamp<unsigned>(bounds.height() / 32, 1, ps5PaintThreads() * 3);
++    job->bandHeight = (bounds.height() + job->bandCount - 1) / job->bandCount;
++    return job;
++}
++
++bool NonCompositedFrameRenderer::ps5PaintInBands(SkCanvas& canvas, const Vector<IntRect>& deviceRects)
++{
++    RefPtr job = ps5RecordBands(canvas, deviceRects);
++    if (!job)
++        return false;
++    auto replayStart = MonotonicTime::now();
++    if (ps5PaintAsync()) {
++        // Every pool thread takes bands; the last one done hands the frame
++        // back to the main thread (ps5RasterDone).
++        job->renderer = this;
++        job->start = replayStart;
++        job->bandsLeft = job->bandCount;
++        m_ps5RasterJob = job;
++        for (unsigned i = 0; i < std::min(ps5PaintThreads(), job->bandCount); i++) {
++            ps5PaintPool().postTask([job] {
++                for (unsigned band; (band = job->nextBand.fetch_add(1, std::memory_order_relaxed)) < job->bandCount;) {
++                    job->paintBand(band);
++                    if (job->bandsLeft.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++                        job->rasterMS = (MonotonicTime::now() - job->start).milliseconds();
++                        {
++                            Locker locker { job->lock };
++                            job->done = true;
++                            job->condition.notifyAll();
++                        }
++                        RunLoop::mainSingleton().dispatch([job] {
++                            if (auto* renderer = job->renderer)
++                                renderer->ps5RasterDone();
++                        });
++                    }
++                }
++            });
++        }
++        return true;
++    }
++    ps5ParallelFor(job->bandCount, [&](unsigned band) {
++        job->paintBand(band);
++    });
++    s_ps5ReplayMS = (MonotonicTime::now() - replayStart).milliseconds();
++    return true;
++}
++
++// Main thread: blocks until the frame's bands are painted, then completes it.
++void NonCompositedFrameRenderer::ps5WaitForRaster()
++{
++    RefPtr job = m_ps5RasterJob;
++    if (!job)
++        return;
++    {
++        Locker locker { job->lock };
++        while (!job->done)
++            job->condition.wait(job->lock);
++    }
++    ps5RasterDone();
++}
++
++void NonCompositedFrameRenderer::ps5RasterDone()
++{
++    RefPtr job = std::exchange(m_ps5RasterJob, nullptr);
++    if (!job)
++        return;
++    job->renderer = nullptr;
++    ps5RenderStats().rasterMS += job->rasterMS;
++    ps5RenderStats().rasters++;
++    if (ps5RenderLog() >= 2)
++        WTFLogAlways("[render1] async raster %.1f ms, %u bands", job->rasterMS, job->bandCount);
++
++    // The rest of updateRendering().
++    Ref webPage = m_webPage;
++    RefPtr drawingArea = webPage->drawingArea();
++    m_surface->didRenderFrame();
++    webPage->didUpdateRendering();
++    if (drawingArea) {
++        drawingArea->didCompleteRenderingUpdateDisplay();
++        drawingArea->dispatchPendingCallbacksAfterEnsuringDrawing();
++    }
++    if (m_isWaitingForFrameComplete)
++        m_pendingNotifyFrame = true;
++    else
++        finishRenderingUpdate();
++}
++#endif
++
+ std::unique_ptr<NonCompositedFrameRenderer> NonCompositedFrameRenderer::create(WebPage& webPage)
+ {
+     auto instance = makeUnique<NonCompositedFrameRenderer>(webPage);
+@@ -82,6 +508,15 @@ bool NonCompositedFrameRenderer::initialize()
+ 
+ NonCompositedFrameRenderer::~NonCompositedFrameRenderer()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (RefPtr job = std::exchange(m_ps5RasterJob, nullptr)) {
++        // The pool still writes into the surface's buffer: wait for it.
++        job->renderer = nullptr;
++        Locker locker { job->lock };
++        while (!job->done)
++            job->condition.wait(job->lock);
++    }
++#endif
+     if (m_forcedRepaintAsyncCallback)
+         m_forcedRepaintAsyncCallback();
+     if (m_context)
+@@ -151,6 +586,11 @@ void NonCompositedFrameRenderer::resetFrameDamage()
+ 
+ void NonCompositedFrameRenderer::sizeDidChange()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    ps5WaitForRaster();
++    m_ps5ScrollRect = { };
++    m_ps5ScrollDelta = { };
++#endif
+ #if ENABLE(DAMAGE_TRACKING)
+     resetFrameDamage();
+     addDirtyRect(m_webPage->bounds());
+@@ -194,14 +634,22 @@ void NonCompositedFrameRenderer::ps5ScheduleRenderingUpdate()
+ 
+ void NonCompositedFrameRenderer::ps5ThrottleTimerFired()
+ {
+-    if (m_layerTreeStateIsFrozen || m_isSuspended || !canUpdateRendering())
++    if (m_layerTreeStateIsFrozen || m_isSuspended)
++        return;
++    if (!canUpdateRendering()) {
++        m_shouldRenderFollowupFrame = true;
+         return;
++    }
+     scheduleRenderingUpdateRunLoopObserver();
+ }
+ #endif
+ 
+ bool NonCompositedFrameRenderer::canUpdateRendering() const
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_ps5RasterJob)
++        return false;
++#endif
+     return !m_pendingNotifyFrame;
+ }
+ 
+@@ -217,27 +665,20 @@ void NonCompositedFrameRenderer::updateRendering()
+     WTFBeginSignpost(this, NonCompositedRenderingUpdate);
+ #if defined(PS5_PAYLOAD_SDK)
+     auto ps5UpdateStart = MonotonicTime::now();
++    MonotonicTime ps5UpdateEnd, ps5PaintStart, ps5PaintEnd;
++    double ps5Pixels = 0, ps5ForwardMS = 0;
++    bool ps5Banded = false;
+     auto ps5SetNextUpdate = makeScopeExit([&] {
+         auto end = MonotonicTime::now();
+         auto took = end - ps5UpdateStart;
+-        m_ps5NextUpdate = took > 6_ms ? end + took : end;
+-        // Every 5 s while it renders: how long updates take (TV-test logs).
+-        static unsigned count, throttled;
+-        static double totalMS, maxMS;
+-        static MonotonicTime windowStart = end;
+-        count++;
+-        totalMS += took.milliseconds();
+-        maxMS = std::max(maxMS, took.milliseconds());
+-        if (took > 6_ms)
+-            throttled++;
+-        if (end - windowStart >= 5_s) {
+-            if (count > 25)
+-                WTFLogAlways("[render] %u updates in %.1f s (%.1f/s), %.1f ms average, %.1f ms max, %u followed by an idle gap",
+-                    count, (end - windowStart).seconds(), count / (end - windowStart).seconds(), totalMS / count, maxMS, throttled);
+-            count = throttled = 0;
+-            totalMS = maxMS = 0;
+-            windowStart = end;
+-        }
++        bool gap = took > 6_ms && ps5IdleGapPercent();
++        m_ps5NextUpdate = gap ? end + took * (ps5IdleGapPercent() / 100.0) : end;
++        // Every 5 s while it renders: where an update's time goes (TV-test logs).
++        if (!ps5UpdateEnd)
++            ps5UpdateEnd = end;
++        double paintMS = ps5PaintEnd ? (ps5PaintEnd - ps5PaintStart).milliseconds() : 0;
++        double copyMS = ps5PaintEnd ? (end - ps5PaintEnd).milliseconds() : 0;
++        ps5RenderStats().add(end, took.milliseconds(), (ps5UpdateEnd - ps5UpdateStart).milliseconds(), paintMS, copyMS, ps5ForwardMS, ps5Pixels, ps5Banded, gap);
+     });
+ #endif
+ 
+@@ -245,9 +686,16 @@ void NonCompositedFrameRenderer::updateRendering()
+     webPage->updateRendering();
+     webPage->finalizeRenderingUpdate({ });
+     webPage->flushPendingEditorStateUpdate();
++#if defined(PS5_PAYLOAD_SDK)
++    ps5UpdateEnd = MonotonicTime::now();
++#endif
+ 
+ #if ENABLE(DAMAGE_TRACKING)
+     if (m_frameDamage && m_frameDamage->isEmpty() && !m_forcedRepaintAsyncCallback) {
++#if defined(PS5_PAYLOAD_SDK)
++        m_ps5ScrollRect = { };
++        m_ps5ScrollDelta = { };
++#endif
+         webPage->didUpdateRendering({ });
+         WTFEndSignpost(this, NonCompositedRenderingUpdate);
+         return;
+@@ -285,14 +733,38 @@ void NonCompositedFrameRenderer::updateRendering()
+             canvas->concat(matrix);
+         }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        ps5PaintStart = MonotonicTime::now();
++#endif
+ #if ENABLE(DAMAGE_TRACKING)
+         if (m_frameDamage) {
+             if (m_frameDamageHistoryForTesting)
+                 m_frameDamageHistoryForTesting->append(m_frameDamage->regionForTesting());
++#if defined(PS5_PAYLOAD_SDK)
++            // Copy forward: paint this frame's damage only; the UIProcess
++            // (and the other buffers) also get the scrolled rectangle.
++            std::optional<Damage> ps5PaintDamage;
++            if (ps5ScrollCopy() && !m_context && !m_surface->skiaClearColor({ })) {
++                ps5PaintDamage = *m_frameDamage;
++                if (!m_ps5ScrollRect.isEmpty())
++                    m_frameDamage->add(m_ps5ScrollRect);
++            }
++#endif
+             m_surface->setFrameDamage(WTF::move(*m_frameDamage));
+             resetFrameDamage();
++#if defined(PS5_PAYLOAD_SDK)
++            if (ps5PaintDamage) {
++                auto copyStart = MonotonicTime::now();
++                m_surface->ps5CopyForward(*ps5PaintDamage, m_ps5ScrollRect, m_ps5ScrollDelta);
++                ps5ForwardMS = (MonotonicTime::now() - copyStart).milliseconds();
++            }
++#endif
+         }
+ #endif
++#if defined(PS5_PAYLOAD_SDK)
++        m_ps5ScrollRect = { };
++        m_ps5ScrollDelta = { };
++#endif
+ 
+         auto drawRect = [&](const IntRect& rect) {
+             WTFBeginSignpost(canvas, DrawRect, "Skia/%s, dirty region %ix%i+%i+%i", m_context ? "GPU" : "CPU", rect.x(), rect.y(), rect.width(), rect.height());
+@@ -300,7 +772,38 @@ void NonCompositedFrameRenderer::updateRendering()
+             WTFEndSignpost(canvas, DrawRect);
+         };
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        Vector<IntRect> ps5DeviceRects;
+ #if ENABLE(DAMAGE_TRACKING)
++        if (auto& renderTargetDamage = m_surface->renderTargetDamage()) {
++            // Not overlapping (iterating the damage repaints the overlaps).
++            for (const auto& rect : renderTargetDamage->rectsForPainting())
++                ps5DeviceRects.append(rect);
++        } else
++#endif
++        {
++            auto scaledRect = webPage->bounds();
++            scaledRect.scale(webPage->deviceScaleFactor());
++            ps5DeviceRects.append(scaledRect);
++        }
++        for (const auto& rect : ps5DeviceRects)
++            ps5Pixels += static_cast<double>(rect.width()) * rect.height();
++        if (ps5RenderLog() >= 3) {
++            StringBuilder text;
++            for (const auto& r : ps5DeviceRects)
++                text.append(' ', r.width(), 'x', r.height(), '+', r.x(), '+', r.y());
++            WTFLogAlways("[render1] painting:%s", text.toString().utf8().data());
++        }
++        ps5Banded = ps5PaintInBands(*canvas, ps5DeviceRects);
++        if (!ps5Banded) {
++            for (const auto& rect : ps5DeviceRects) {
++                auto scaledRect = rect;
++                scaledRect.scale(1 / webPage->deviceScaleFactor());
++                drawRect(scaledRect);
++            }
++        }
++        ps5PaintEnd = MonotonicTime::now();
++#elif ENABLE(DAMAGE_TRACKING)
+         if (auto& renderTargetDamage = m_surface->renderTargetDamage()) {
+             for (const auto& rect : *renderTargetDamage) {
+                 auto scaledRect = rect;
+@@ -314,6 +817,13 @@ void NonCompositedFrameRenderer::updateRendering()
+ #endif
+ 
+         canvas->restore();
++#if defined(PS5_PAYLOAD_SDK)
++        if (m_ps5RasterJob) {
++            // Painting goes on in the pool; ps5RasterDone() completes the update.
++            WTFEndSignpost(this, NonCompositedRenderingUpdate);
++            return;
++        }
++#endif
+ 
+         if (m_context) {
+             if (auto* surface = canvas->getSurface())
+@@ -342,6 +852,9 @@ void NonCompositedFrameRenderer::updateRendering()
+ void NonCompositedFrameRenderer::finishRenderingUpdate()
+ {
+     m_isWaitingForFrameComplete = true;
++#if defined(PS5_PAYLOAD_SDK)
++    m_ps5FrameSentTime = MonotonicTime::now();
++#endif
+     m_surface->sendFrame();
+ 
+     if (m_forcedRepaintAsyncCallback)
+@@ -352,6 +865,14 @@ void NonCompositedFrameRenderer::frameComplete()
+ {
+     WTFEmitSignpost(this, FrameComplete);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_ps5FrameSentTime) {
++        // Frame sent -> the UIProcess copied and presented it (vsync included).
++        ps5RenderStats().waitMS += (MonotonicTime::now() - m_ps5FrameSentTime).milliseconds();
++        ps5RenderStats().waits++;
++        m_ps5FrameSentTime = { };
++    }
++#endif
+     m_isWaitingForFrameComplete = false;
+ 
+     bool pendingNotifyFrame = std::exchange(m_pendingNotifyFrame, false);
+@@ -370,6 +891,9 @@ void NonCompositedFrameRenderer::frameComplete()
+ 
+ void NonCompositedFrameRenderer::updateRenderingWithForcedRepaint()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    ps5WaitForRaster();
++#endif
+     if (!canUpdateRendering() || m_isUpdatingRendering)
+         return;
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+index 507ff029fa..1ea6000001 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+@@ -37,6 +37,9 @@ class GLContext;
+ 
+ namespace WebKit {
+ class WebPage;
++#if defined(PS5_PAYLOAD_SDK)
++struct PS5RasterJob;
++#endif
+ 
+ class NonCompositedFrameRenderer final : public FrameRenderer {
+     WTF_MAKE_TZONE_ALLOCATED(NonCompositedFrameRenderer);
+@@ -97,6 +100,21 @@ private:
+     void ps5ThrottleTimerFired();
+     RunLoop::Timer m_ps5ThrottleTimer;
+     MonotonicTime m_ps5NextUpdate;
++    // Paints the damaged rectangles (device pixels) by recording them into
++    // an SkPicture on the main thread and replaying it in horizontal bands on
++    // PS5WK_PAINT_THREADS threads. False: paint directly (one thread).
++    bool ps5PaintInBands(SkCanvas&, const Vector<WebCore::IntRect>& deviceRects);
++    RefPtr<PS5RasterJob> ps5RecordBands(SkCanvas&, const Vector<WebCore::IntRect>& deviceRects);
++    void ps5WaitForRaster();
++public:
++    void ps5RasterDone();
++private:
++    RefPtr<PS5RasterJob> m_ps5RasterJob; // painting in the pool (PS5WK_PAINT_ASYNC)
++    MonotonicTime m_ps5FrameSentTime;
++    // A scroll applied by moving the last frame's pixels (device pixels).
++    bool ps5Scroll(const WebCore::IntRect&, const WebCore::IntSize&) override;
++    WebCore::IntRect m_ps5ScrollRect;
++    WebCore::IntSize m_ps5ScrollDelta;
+ #endif
+ #if ENABLE(DAMAGE_TRACKING)
+     std::optional<WebCore::Damage> m_frameDamage;

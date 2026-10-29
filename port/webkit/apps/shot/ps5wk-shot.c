@@ -13,7 +13,7 @@
  * Stdin carries the arguments (elfldr passes none for raw uploads): one line
  * "url=<url> child=<path> timeout=<s> width=<w> height=<h> settle=<s>
  * ua=safari|default js=<file> onload=<file> data=<dir> cache=<dir>
- * cycle=<file> rounds=<n> dwell=<s> fakevdec=1" (dwell < 0: that long after starting
+ * cycle=<file> rounds=<n> dwell=<s> fakevdec=1 frame=<path>" (dwell < 0: that long after starting
  * each load), any order, all optional. settle: seconds to
  * keep running after the load finished (default 3); ua=safari uses the
  * browser title's user agent; js: a script file on the console evaluated in
@@ -56,6 +56,7 @@ static int settleSeconds = 3;
 static char userAgent[16] = "safari";
 static char jsFile[256];
 static char onloadFile[256];
+static char framePath[256]; /* frame=<path>: write the last frame there (PPM) */
 static char childEnvFile[64]; /* childenv=: this run's children's env file, removed at exit */
 /* Stress mode: cycle=<file of URLs> rounds=<n> dwell=<s>: load each URL in
  * turn (dwell seconds after it finished or failed), rounds times, counting
@@ -124,6 +125,8 @@ static void readArguments(void)
             cycleDwell = atoi(token + 6);
         else if (!strncmp(token, "onload=", 7))
             g_strlcpy(onloadFile, token + 7, sizeof(onloadFile));
+        else if (!strncmp(token, "frame=", 6))
+            g_strlcpy(framePath, token + 6, sizeof(framePath));
         else if (!strncmp(token, "js=", 3))
             g_strlcpy(jsFile, token + 3, sizeof(jsFile));
         else if (!strncmp(token, "childenv=", 9)) {
@@ -204,6 +207,28 @@ static void report(void)
     gboolean painted = nonWhite * 1000 > total && nonWhite < total; // > 0.1% not background
     RESULT("paint", painted, "%dx%d, %u frames, first at %.1f s, fnv64 %016llx, %.2f%% of pixels differ from the background", lastWidth, lastHeight,
         framesRendered, (firstFrameTime - startTime) / 1e6, (unsigned long long)hash, total ? 100.0 * nonWhite / total : 0.0);
+
+    // frame=<path>: the whole last frame as a binary PPM on the console
+    // (pixel comparisons between painting modes, test/paint).
+    if (*framePath) {
+        FILE* f = fopen(framePath, "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", lastWidth, lastHeight);
+            guint8* row = g_malloc((gsize)lastWidth * 3);
+            for (int y = 0; y < lastHeight; y++) {
+                const guint8* src = p + (size_t)y * lastStride;
+                for (int x = 0; x < lastWidth; x++) {
+                    row[x * 3] = src[x * 4 + 2];
+                    row[x * 3 + 1] = src[x * 4 + 1];
+                    row[x * 3 + 2] = src[x * 4];
+                }
+                fwrite(row, 3, lastWidth, f);
+            }
+            g_free(row);
+            fclose(f);
+            printf("RESULT ps5wk-shot frame INFO %s\n", framePath);
+        }
+    }
 
     // Thumbnail: box-filtered to 320 px wide, binary PPM, base64 in lines.
     int tw = 320, th = lastHeight * 320 / (lastWidth ? lastWidth : 1);

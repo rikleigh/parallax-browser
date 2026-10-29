@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
+#include <new>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -55,6 +56,37 @@ extern size_t pas_compact_heap_reservation_bump __attribute__((weak));
 // JSC's executable memory pool (WebKit patch 0030; absent without the JIT).
 void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
 }
+
+// C++ allocations go to WebKit's heap (libpas, per-thread caches), not the
+// console's libc malloc: that one serialises threads very badly (a
+// malloc/free pair takes 0.3 us on one thread and 48-160 us each on 2-6
+// threads, test/lockbench), which made the CPU page painting threads slower
+// than one thread. Skia's own heap goes there too (SkMemory_malloc.cpp, 0032).
+namespace WTF {
+void* fastMalloc(size_t);
+void* fastAlignedMalloc(size_t alignment, size_t);
+void fastFree(void*);
+}
+void* operator new(size_t size) { return WTF::fastMalloc(size); }
+void* operator new[](size_t size) { return WTF::fastMalloc(size); }
+void* operator new(size_t size, const std::nothrow_t&) noexcept { return WTF::fastMalloc(size); }
+void* operator new[](size_t size, const std::nothrow_t&) noexcept { return WTF::fastMalloc(size); }
+void* operator new(size_t size, std::align_val_t alignment) { return WTF::fastAlignedMalloc(static_cast<size_t>(alignment), size); }
+void* operator new[](size_t size, std::align_val_t alignment) { return WTF::fastAlignedMalloc(static_cast<size_t>(alignment), size); }
+void* operator new(size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept { return WTF::fastAlignedMalloc(static_cast<size_t>(alignment), size); }
+void* operator new[](size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept { return WTF::fastAlignedMalloc(static_cast<size_t>(alignment), size); }
+void operator delete(void* p) noexcept { WTF::fastFree(p); }
+void operator delete[](void* p) noexcept { WTF::fastFree(p); }
+void operator delete(void* p, size_t) noexcept { WTF::fastFree(p); }
+void operator delete[](void* p, size_t) noexcept { WTF::fastFree(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { WTF::fastFree(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { WTF::fastFree(p); }
+void operator delete(void* p, std::align_val_t) noexcept { WTF::fastFree(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { WTF::fastFree(p); }
+void operator delete(void* p, size_t, std::align_val_t) noexcept { WTF::fastFree(p); }
+void operator delete[](void* p, size_t, std::align_val_t) noexcept { WTF::fastFree(p); }
+void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { WTF::fastFree(p); }
+void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { WTF::fastFree(p); }
 
 static double nowMS()
 {
