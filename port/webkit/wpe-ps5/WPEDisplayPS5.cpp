@@ -792,3 +792,24 @@ void wpe_display_ps5_vr_sim_look(WPEDisplayPS5* display, double yaw, double pitc
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
     PS5Renderer::singleton().setVRSimLook(static_cast<float>(yaw), static_cast<float>(pitch));
 }
+
+struct ThumbnailsRequest {
+    WPEDisplayPS5* display;
+    WPEDisplayPS5ThumbnailsCallback callback;
+    gpointer userData;
+};
+
+void wpe_display_ps5_video_thumbnails(WPEDisplayPS5* display, guint frames, WPEDisplayPS5ThumbnailsCallback callback, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    auto* request = new ThumbnailsRequest { WPE_DISPLAY_PS5(g_object_ref(display)), callback, userData };
+    PS5Renderer::singleton().requestVideoThumbnails(frames,
+        [](const uint8_t* luma, unsigned count, int width, int height, void* data) {
+            auto* request = static_cast<ThumbnailsRequest*>(data);
+            if (request->callback)
+                request->callback(request->display, luma, count, PS5Renderer::kThumbnailSize, width, height, request->userData);
+            g_object_unref(request->display);
+            delete request;
+        },
+        request);
+}

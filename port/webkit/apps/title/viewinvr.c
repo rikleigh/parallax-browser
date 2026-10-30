@@ -4,10 +4,15 @@
  *
  * The touchpad button asks the page which video plays (a script in the
  * page: the playing <video>, largest first, in the page and same-origin
- * frames), guesses the projection from the page title, the address and the
- * stream's address (`180`, `360`, `SBS`/`LR`, `TB`/`OU`, `fisheye`,
- * `MKX200`; YouTube's own projection data when it has some; otherwise a
- * flat screen), and has the display take the video into the headset
+ * frames) and the title for small thumbnails of the playing video. The
+ * projection: YouTube's own data when it has some, else keywords in the page
+ * title, the address and the stream's address (`180`, `360`, `SBS`/`LR`,
+ * `TB`/`OU`, `fisheye`, `MKX200`), else the pictures and the frame's shape
+ * (vrlayout.c: halves that match are stereo, a 2:1 picture whose edges join
+ * is 360, black corners are fisheye; a 2:1 frame is 180 side by side when
+ * nothing decides). A Triangle choice is remembered per site, frame shape
+ * and guess (/data/ps5webkit/vr-projections.txt). Then the display takes
+ * the video into the headset
  * (wpe-ps5 PS5RendererVR.cpp: the title draws the same decoded frames there;
  * the page keeps playing). While in VR the pad is ours:
  *
@@ -28,11 +33,25 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "viewinvr.h"
+#include "vrlayout.h"
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+
+/* What the page says: YouTube's projection data, or keywords in the title,
+ * the addresses and the element's attributes. */
+typedef struct {
+    int youtube;    /* projection from YouTube's player data, -1: none */
+    int angle;      /* 180, 360 or 0 */
+    int layout;     /* LAYOUT_* from a stereo word, LAYOUT_ANY: none */
+    int fisheyeFOV; /* a fisheye lens named (degrees), 0: none */
+    char words[96]; /* what was found, for the log */
+} PageHints;
+
+enum { LAYOUT_ANY, LAYOUT_SBS, LAYOUT_TB, LAYOUT_MONO };
 
 static WPEDisplayPS5* vrDisplay;
 static WebKitWebView* vrWebView;
@@ -42,6 +61,22 @@ static int vrProjection;
 static double vrFisheye = 180;
 static gboolean vrControls; /* the page's video element was found */
 static char* vrTitle;
+
+/* The projection guess of this entry (see guessProjection, decide). */
+static unsigned vrSeq;              /* entry attempt: later answers of an older one are dropped */
+static char* vrProbeReply;          /* the page's answer, until the thumbnails are in too */
+static gboolean vrHaveThumbnails;
+static PageHints vrHints;
+static VRLayoutStats vrStats;       /* the video's thumbnails seen this entry */
+static int vrVideoWidth, vrVideoHeight;
+static int vrGuess;                 /* what the guess gave (before a remembered choice) */
+static gboolean vrGuessConclusive;  /* the page or the pictures decided (not the frame's shape alone) */
+static gboolean vrPicked;           /* Triangle this entry: remembered when leaving */
+static gboolean vrRemembered;       /* started from a remembered choice */
+static char* vrOrigin;
+static char vrAspect[8];
+static char vrShown[128];           /* why, for the hint and the TV */
+static unsigned vrRefines;          /* thumbnails asked for again in VR */
 
 /* ---------------------------------------------------------------- the page's video */
 
@@ -161,6 +196,11 @@ static const char* const kProjectionLabels[] = {
     "180\xC2\xB0 mono", "180\xC2\xB0 3D side by side", "180\xC2\xB0 3D top/bottom", "Fisheye 3D side by side",
 };
 
+G_STATIC_ASSERT(VRLAYOUT_FLAT == WPE_DISPLAY_PS5_VR_FLAT && VRLAYOUT_360 == WPE_DISPLAY_PS5_VR_360
+    && VRLAYOUT_360_SBS == WPE_DISPLAY_PS5_VR_360_SBS && VRLAYOUT_360_TB == WPE_DISPLAY_PS5_VR_360_TB
+    && VRLAYOUT_180 == WPE_DISPLAY_PS5_VR_180 && VRLAYOUT_180_SBS == WPE_DISPLAY_PS5_VR_180_SBS
+    && VRLAYOUT_180_TB == WPE_DISPLAY_PS5_VR_180_TB && VRLAYOUT_FISHEYE_SBS == WPE_DISPLAY_PS5_VR_FISHEYE_SBS);
+
 /* Triangle's order: the common VR formats first. */
 static const int kCycle[] = {
     WPE_DISPLAY_PS5_VR_FLAT, WPE_DISPLAY_PS5_VR_180_SBS, WPE_DISPLAY_PS5_VR_180_TB, WPE_DISPLAY_PS5_VR_180,
@@ -240,31 +280,31 @@ static int numberAfter(char** words, const char* word)
     return 0;
 }
 
-static int guessProjection(const char* reply, double* fisheye, char* why, size_t whySize)
+static void readHints(const char* reply, PageHints* hints)
 {
-    *fisheye = 180;
+    memset(hints, 0, sizeof *hints);
+    hints->youtube = -1;
     char* yt = field(reply, "yt");
     char* ytStereo = field(reply, "ytstereo");
-    int result = -1;
     if (yt && *yt) {
         /* YouTube says: EQUIRECTANGULAR, EQUIRECTANGULAR_THREED_TOP_BOTTOM,
          * MESH (equi-angular cubemap / VR180 mesh: not unpacked yet) or
          * RECTANGULAR. */
         if (strstr(yt, "EQUIRECTANGULAR_THREED_TOP_BOTTOM") || (strstr(yt, "EQUIRECTANGULAR") && ytStereo && strstr(ytStereo, "TOP_BOTTOM")))
-            result = WPE_DISPLAY_PS5_VR_360_TB;
+            hints->youtube = WPE_DISPLAY_PS5_VR_360_TB;
         else if (strstr(yt, "EQUIRECTANGULAR"))
-            result = WPE_DISPLAY_PS5_VR_360;
+            hints->youtube = WPE_DISPLAY_PS5_VR_360;
         else if (strstr(yt, "MESH"))
-            result = WPE_DISPLAY_PS5_VR_360; /* best effort: the frames are a cubemap (see README) */
+            hints->youtube = WPE_DISPLAY_PS5_VR_360; /* best effort: the frames are a cubemap (see README) */
         else if (strstr(yt, "RECTANGULAR"))
-            result = WPE_DISPLAY_PS5_VR_FLAT;
-        if (result >= 0)
-            snprintf(why, whySize, "YouTube projection %s%s%s", yt, ytStereo && *ytStereo ? ", " : "", ytStereo ? ytStereo : "");
+            hints->youtube = WPE_DISPLAY_PS5_VR_FLAT;
+        if (hints->youtube >= 0)
+            snprintf(hints->words, sizeof hints->words, "YouTube projection %s%s%s", yt, ytStereo && *ytStereo ? ", " : "", ytStereo ? ytStereo : "");
     }
     g_free(yt);
     g_free(ytStereo);
-    if (result >= 0)
-        return result;
+    if (hints->youtube >= 0)
+        return;
 
     /* Keywords in the title, the addresses and the element's attributes. */
     const char* keys[] = { "title", "yttitle", "url", "src", "hints" };
@@ -305,25 +345,177 @@ static int guessProjection(const char* reply, double* fisheye, char* why, size_t
     gboolean sbs = strongSBS || ((is180 || is360 || fisheyeFOV) && weakSBS);
     gboolean tb = strongTB || ((is180 || is360) && weakTB);
 
-    if (fisheyeFOV) {
-        result = WPE_DISPLAY_PS5_VR_FISHEYE_SBS;
-        *fisheye = fisheyeFOV;
-    } else if (is180)
-        /* VR180 is nearly always stereo; side by side unless it says otherwise. */
-        result = tb ? WPE_DISPLAY_PS5_VR_180_TB : mono && !sbs ? WPE_DISPLAY_PS5_VR_180 : WPE_DISPLAY_PS5_VR_180_SBS;
-    else if (is360)
-        result = tb ? WPE_DISPLAY_PS5_VR_360_TB : sbs ? WPE_DISPLAY_PS5_VR_360_SBS : WPE_DISPLAY_PS5_VR_360;
-    else if (strongSBS)
-        result = WPE_DISPLAY_PS5_VR_180_SBS; /* VR sites' "SBS" without an angle */
-    else if (strongTB)
-        result = WPE_DISPLAY_PS5_VR_180_TB;
-    else
-        result = WPE_DISPLAY_PS5_VR_FLAT;
-    snprintf(why, whySize, "keywords:%s%s%s%s%s%s%s", is180 ? " 180" : "", is360 ? " 360" : "", sbs ? " sbs" : "", tb ? " tb" : "",
-        mono ? " mono" : "", fisheyeFOV ? " fisheye" : "", result == WPE_DISPLAY_PS5_VR_FLAT ? " none (flat)" : "");
+    hints->fisheyeFOV = fisheyeFOV;
+    hints->angle = is180 ? 180 : is360 ? 360 : 0;
+    hints->layout = tb ? LAYOUT_TB : sbs ? LAYOUT_SBS : mono && hints->angle ? LAYOUT_MONO : LAYOUT_ANY;
+    snprintf(hints->words, sizeof hints->words, "keywords%s%s%s%s%s%s", is180 ? " 180" : "", is360 ? " 360" : "", sbs ? " sbs" : "",
+        tb ? " tb" : "", mono ? " mono" : "", fisheyeFOV ? " fisheye" : "");
     g_strfreev(words);
     g_free(lower);
-    return result;
+}
+
+static gboolean nearRatio(double value, double target)
+{
+    return target > 0 && fabs(value / target - 1) < 0.04;
+}
+
+/* The projection from the page's hints first, then the pictures and the
+ * frame's shape (vrlayout.c) where the page says nothing (or names an
+ * angle but no stereo layout). why: for the log; shown: for the hint. */
+static int guessProjection(const PageHints* hints, const VRLayoutStats* stats, int width, int height, double* fisheye,
+    char* why, size_t whySize, char* shown, size_t shownSize)
+{
+    *fisheye = 180;
+    if (hints->youtube >= 0) {
+        snprintf(why, whySize, "%s", hints->words);
+        snprintf(shown, shownSize, "From the page");
+        return hints->youtube;
+    }
+    if (hints->fisheyeFOV) {
+        *fisheye = hints->fisheyeFOV;
+        snprintf(why, whySize, "%s %d", hints->words, hints->fisheyeFOV);
+        snprintf(shown, shownSize, "From the page");
+        return WPE_DISPLAY_PS5_VR_FISHEYE_SBS;
+    }
+    VRLayoutGuess pictures;
+    vrlayout_classify(stats, width, height, &pictures);
+    if (hints->angle) {
+        /* An angle named: the stereo layout from a word, else from the
+         * pictures, else what that angle usually is. */
+        int layout = hints->layout;
+        const char* from = "";
+        if (layout == LAYOUT_ANY && pictures.conclusive && pictures.stereo >= 0) {
+            layout = pictures.stereo == 1 ? LAYOUT_SBS : pictures.stereo == 2 ? LAYOUT_TB : LAYOUT_MONO;
+            from = "pictures";
+        }
+        int result;
+        if (hints->angle == 180)
+            result = layout == LAYOUT_TB ? WPE_DISPLAY_PS5_VR_180_TB : layout == LAYOUT_MONO ? WPE_DISPLAY_PS5_VR_180 : WPE_DISPLAY_PS5_VR_180_SBS;
+        else
+            result = layout == LAYOUT_TB ? WPE_DISPLAY_PS5_VR_360_TB : layout == LAYOUT_SBS ? WPE_DISPLAY_PS5_VR_360_SBS : WPE_DISPLAY_PS5_VR_360;
+        if (*from)
+            snprintf(why, whySize, "%s; layout from the pictures: %s", hints->words, pictures.why);
+        else
+            snprintf(why, whySize, "%s%s", hints->words, hints->layout == LAYOUT_ANY ? (hints->angle == 180 ? " (side by side assumed)" : " (mono assumed)") : "");
+        snprintf(shown, shownSize, *from ? "From the page and the picture" : "From the page");
+        return result;
+    }
+    if (hints->layout == LAYOUT_SBS || hints->layout == LAYOUT_TB) {
+        /* A stereo word without an angle: the eyes' shape tells (2:1 eyes
+         * are 360, square ones 180). */
+        double eye = width > 0 && height > 0 ? (double)width / height * (hints->layout == LAYOUT_SBS ? 0.5 : 2) : 1;
+        gboolean is360 = nearRatio(eye, 2);
+        snprintf(why, whySize, "%s, %s eyes", hints->words, is360 ? "2:1" : "square");
+        snprintf(shown, shownSize, "From the page");
+        if (hints->layout == LAYOUT_SBS)
+            return is360 ? WPE_DISPLAY_PS5_VR_360_SBS : WPE_DISPLAY_PS5_VR_180_SBS;
+        return is360 ? WPE_DISPLAY_PS5_VR_360_TB : WPE_DISPLAY_PS5_VR_180_TB;
+    }
+    /* Nothing on the page: the pictures (or the frame's shape alone). */
+    if (pictures.projection == WPE_DISPLAY_PS5_VR_FISHEYE_SBS)
+        *fisheye = pictures.fisheye;
+    snprintf(why, whySize, "%s", pictures.why);
+    snprintf(shown, shownSize, "Guessed: %s", pictures.why);
+    return pictures.projection;
+}
+
+/* ---------------------------------------------------------------- remembered choices */
+
+/* What the user picked with Triangle, per page origin, frame shape and
+ * what the guess was: "when the guess is X for this shape on this site, show
+ * Y". A small text file, newest last, at most kMemoryMax lines:
+ *   <origin> <aspect key> <guess> <choice> <fisheye degrees>
+ * Simulated runs (vr-sim) keep their own file. */
+#define kMemoryMax 64
+
+static const char* memoryPath(void)
+{
+    struct stat st;
+    return stat("/data/ps5webkit/vr-sim", &st) == 0 ? "/data/ps5webkit/vr-projections-sim.txt" : "/data/ps5webkit/vr-projections.txt";
+}
+
+static char** memoryRead(void)
+{
+    char* contents = NULL;
+    if (!g_file_get_contents(memoryPath(), &contents, NULL, NULL))
+        return g_new0(char*, 1);
+    char** lines = g_strsplit(contents, "\n", -1);
+    g_free(contents);
+    return lines;
+}
+
+static gboolean memoryLineMatches(const char* line, const char* origin, const char* aspect, int guess, int* choice, double* fisheye)
+{
+    char o[300], a[16];
+    int g = -1, c = -1;
+    double f = 180;
+    if (sscanf(line, "%299s %15s %d %d %lf", o, a, &g, &c, &f) < 4)
+        return FALSE;
+    if (strcmp(o, origin) || strcmp(a, aspect) || g != guess || c < 0 || c >= WPE_DISPLAY_PS5_VR_N_PROJECTIONS)
+        return FALSE;
+    if (choice)
+        *choice = c;
+    if (fisheye)
+        *fisheye = f >= 120 && f <= 240 ? f : 180;
+    return TRUE;
+}
+
+static gboolean memoryLookup(const char* origin, const char* aspect, int guess, int* choice, double* fisheye)
+{
+    if (!origin || !*origin)
+        return FALSE;
+    char** lines = memoryRead();
+    gboolean found = FALSE;
+    for (char** line = lines; *line; line++)
+        found = memoryLineMatches(*line, origin, aspect, guess, choice, fisheye) || found; /* the newest (last) wins */
+    g_strfreev(lines);
+    return found;
+}
+
+/* Remembers the choice (newest last), or forgets it when it is the guess. */
+static void memoryStore(const char* origin, const char* aspect, int guess, int choice, double fisheye)
+{
+    if (!origin || !*origin || strlen(origin) >= 300 || strchr(origin, ' '))
+        return;
+    char** lines = memoryRead();
+    GPtrArray* keep = g_ptr_array_new();
+    for (char** line = lines; *line; line++) {
+        if (**line && !memoryLineMatches(*line, origin, aspect, guess, NULL, NULL))
+            g_ptr_array_add(keep, *line);
+    }
+    char* added = choice != guess ? g_strdup_printf("%s %s %d %d %.0f", origin, aspect, guess, choice, fisheye) : NULL;
+    if (added)
+        g_ptr_array_add(keep, added);
+    GString* out = g_string_new(NULL);
+    for (guint i = keep->len > kMemoryMax ? keep->len - kMemoryMax : 0; i < keep->len; i++)
+        g_string_append_printf(out, "%s\n", (char*)g_ptr_array_index(keep, i));
+    GError* error = NULL;
+    if (!g_file_set_contents(memoryPath(), out->str, (gssize)out->len, &error))
+        spike_log("vr: remembering the projection: %s", error ? error->message : "?");
+    else
+        spike_log("vr: %s for %s, %s frames, guess %d: %s", added ? "remembered" : "forgot", origin, aspect, guess,
+            added ? added : "back to the guess");
+    g_clear_error(&error);
+    g_string_free(out, TRUE);
+    g_free(added);
+    g_ptr_array_free(keep, TRUE);
+    g_strfreev(lines);
+}
+
+/* "https://host:port" of an address ("file://" for files), newly allocated. */
+static char* originOf(const char* url)
+{
+    if (!url)
+        return g_strdup("");
+    const char* scheme = strstr(url, "://");
+    if (!scheme)
+        return g_strdup("");
+    const char* host = scheme + 3;
+    size_t length = strcspn(host, "/?#");
+    char* origin = g_strdup_printf("%.*s://%.*s", (int)(scheme - url), url, (int)length, host);
+    char* lower = g_ascii_strdown(origin, -1);
+    g_free(origin);
+    return lower;
 }
 
 /* ---------------------------------------------------------------- hint and TV notice */
@@ -349,10 +541,10 @@ static void formatTime(double seconds, char* out, size_t size)
 static void showHint(const char* status, double seconds)
 {
     char* label = projectionLabel(vrProjection, vrFisheye);
-    char* hint = g_strdup_printf("%s\n%s%s%s", label, status ? status : "", status ? "\n" : "",
+    char* hint = g_strdup_printf("%s\n%s%s%s%s%s", label, vrShown, *vrShown ? "\n" : "", status ? status : "", status ? "\n" : "",
         vrControls ? CONTROLS_PLAYER "\n" CONTROLS_VIEW : CONTROLS_VIEW "\n(no player controls on this page)");
-    char* tv = g_strdup_printf("Playing in the PS VR2 headset\n%s\n%s\n%s", vrTitle && *vrTitle ? vrTitle : "Video", label,
-        vrControls ? CONTROLS : "\xE2\x97\x8B back to the TV");
+    char* tv = g_strdup_printf("Playing in the PS VR2 headset\n%s\n%s%s%s\n%s", vrTitle && *vrTitle ? vrTitle : "Video", label,
+        *vrShown ? "  \xC2\xB7  " : "", vrShown, vrControls ? CONTROLS : "\xE2\x97\x8B back to the TV");
     wpe_display_ps5_vr_set_text(vrDisplay, hint, seconds, tv);
     g_free(hint);
     g_free(tv);
@@ -418,11 +610,24 @@ static void nextProjection(void)
     while (i < n && kCycle[i] != vrProjection)
         i++;
     int next = kCycle[(i + 1) % n];
+    vrPicked = TRUE;
+    snprintf(vrShown, sizeof vrShown, next == vrGuess ? "The guess (the site's choice is forgotten when you leave)"
+                                                      : "Your choice: remembered for this site when you leave");
     /* fisheye: keep the guessed field of view, else the common 190 */
     setProjection(next, next == WPE_DISPLAY_PS5_VR_FISHEYE_SBS && vrFisheye == 180 ? 190 : vrFisheye);
 }
 
 /* ---------------------------------------------------------------- enter / leave */
+
+/* Leaving: a Triangle choice is remembered for the site (or forgotten
+ * when it went back to the guess). */
+static void rememberChoice(void)
+{
+    if (!vrPicked)
+        return;
+    vrPicked = FALSE;
+    memoryStore(vrOrigin, vrAspect, vrGuess, vrProjection, vrFisheye);
+}
 
 static void onVRState(WPEDisplayPS5* display, gboolean active, const char* message, gpointer data)
 {
@@ -435,19 +640,141 @@ static void onVRState(WPEDisplayPS5* display, gboolean active, const char* messa
         showHint(NULL, 6);
         return;
     }
+    rememberChoice();
     SPIKE_RESULT("vr", "INFO", "not in VR: %s", message ? message : "");
     if (message && *message)
         wpe_display_ps5_show_message(vrDisplay, message, 5);
 }
 
+/* The guess from what is known so far (the page's hints, the thumbnails),
+ * then a remembered choice for this site, frame shape and guess. Returns
+ * the projection; logs it. */
+static int decide(double* fisheye, const char* when)
+{
+    char why[256] = "";
+    int guess = guessProjection(&vrHints, &vrStats, vrVideoWidth, vrVideoHeight, fisheye, why, sizeof why, vrShown, sizeof vrShown);
+    VRLayoutGuess pictures;
+    vrlayout_classify(&vrStats, vrVideoWidth, vrVideoHeight, &pictures);
+    vrGuessConclusive = vrHints.youtube >= 0 || vrHints.fisheyeFOV || vrHints.layout != LAYOUT_ANY || pictures.conclusive;
+    vrGuess = guess;
+    vrlayout_aspect_key(vrVideoWidth, vrVideoHeight, vrAspect, sizeof vrAspect);
+    int projection = guess, choice = -1;
+    double choiceFisheye = 180;
+    vrRemembered = memoryLookup(vrOrigin, vrAspect, guess, &choice, &choiceFisheye);
+    if (vrRemembered) {
+        projection = choice;
+        if (choice == WPE_DISPLAY_PS5_VR_FISHEYE_SBS)
+            *fisheye = choiceFisheye;
+        snprintf(vrShown, sizeof vrShown, "Remembered for this site (\xE2\x96\xB3 to change)");
+    }
+    char* label = projectionLabel(projection, *fisheye);
+    char* guessLabel = projectionLabel(guess, *fisheye);
+    int d = vrStats.detailed ? vrStats.detailed : 1;
+    spike_log("vr: projection%s: %s (%s%s%s%s) [%s, %d thumbnails, %d detailed: halves %.2f, top/bottom %.2f, edges break %.0f%%, fisheye %d]",
+        when, label, vrRemembered ? "remembered for this site; the guess was " : "", vrRemembered ? guessLabel : "", vrRemembered ? ": " : "", why,
+        vrOrigin && *vrOrigin ? vrOrigin : "no origin", vrStats.frames, vrStats.detailed, vrStats.sbs / d, vrStats.tb / d,
+        vrStats.wrap / d * 100, vrStats.fisheyeSBS);
+    g_free(label);
+    g_free(guessLabel);
+    return projection;
+}
+
+static void onThumbnails(WPEDisplayPS5* display, const guint8* luma, guint frames, guint size, int width, int height, gpointer data);
+
+/* In VR, when the first thumbnails could not decide (too little detail, a
+ * fade, a title card): look again a little later, until the user picks. */
+static gboolean refineGuess(gpointer data)
+{
+    if (GPOINTER_TO_UINT(data) != vrSeq || vrPicked || vrRemembered)
+        return G_SOURCE_REMOVE;
+    if (!vrOn)
+        return vrStarting ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE; /* the headset is still coming up */
+    wpe_display_ps5_video_thumbnails(vrDisplay, 3, onThumbnails, GUINT_TO_POINTER(vrSeq));
+    return G_SOURCE_REMOVE;
+}
+
+static void startWhenReady(void)
+{
+    if (!vrProbeReply || !vrHaveThumbnails)
+        return;
+    char* reply = vrProbeReply;
+    vrProbeReply = NULL;
+    readHints(reply, &vrHints);
+    vrControls = fieldNumber(reply, "found", 0) != 0;
+    if (!vrVideoWidth) { /* no thumbnails: the page's size of the element's video */
+        char* size = field(reply, "size");
+        if (size)
+            sscanf(size, "%dx%d", &vrVideoWidth, &vrVideoHeight);
+        g_free(size);
+    }
+    g_free(vrOrigin);
+    char* url = field(reply, "url");
+    vrOrigin = originOf(url && *url ? url : webkit_web_view_get_uri(vrWebView));
+    g_free(url);
+    g_free(vrTitle);
+    vrTitle = field(reply, "yttitle");
+    if (!vrTitle || !*vrTitle) {
+        g_free(vrTitle);
+        vrTitle = field(reply, "title");
+    }
+    if (!vrTitle)
+        vrTitle = g_strdup(webkit_web_view_get_title(vrWebView) ? webkit_web_view_get_title(vrWebView) : "");
+    if (strlen(vrTitle) > 90)
+        strcpy(vrTitle + 87, "...");
+    g_free(reply);
+
+    double fisheye = 180;
+    int projection = decide(&fisheye, "");
+    vrProjection = projection;
+    vrFisheye = fisheye;
+    spike_log("vr: player controls %s", vrControls ? "yes" : "no (no <video> found in the page)");
+    wpe_display_ps5_vr_start(vrDisplay, (WPEDisplayPS5VRProjection)projection, fisheye, onVRState, NULL);
+    if (!vrGuessConclusive && !vrRemembered)
+        g_timeout_add_seconds(3, refineGuess, GUINT_TO_POINTER(vrSeq));
+}
+
+static void onThumbnails(WPEDisplayPS5* display, const guint8* luma, guint frames, guint size, int width, int height, gpointer data)
+{
+    (void)display;
+    if (GPOINTER_TO_UINT(data) != vrSeq)
+        return; /* an older entry's */
+    for (guint i = 0; luma && i < frames; i++)
+        vrlayout_add(&vrStats, luma + (size_t)i * size * size, (int)size);
+    if (frames && width > 0 && height > 0) {
+        vrVideoWidth = width;
+        vrVideoHeight = height;
+    }
+    if (vrStarting && !vrHaveThumbnails) {
+        vrHaveThumbnails = TRUE;
+        startWhenReady();
+        return;
+    }
+    /* A second look, in VR. */
+    if (!vrOn || vrPicked || vrRemembered)
+        return;
+    vrRefines++;
+    double fisheye = vrFisheye;
+    int projection = decide(&fisheye, " (looked again)");
+    if (projection != vrProjection || fisheye != vrFisheye) {
+        setProjection(projection, fisheye);
+        showHint("Projection guessed again", 4);
+    }
+    if (!vrGuessConclusive && !vrRemembered && vrRefines < 3)
+        g_timeout_add_seconds(5, refineGuess, GUINT_TO_POINTER(vrSeq));
+}
+
 static void onProbeDone(GObject* object, GAsyncResult* result, gpointer data)
 {
-    (void)data;
     GError* error = NULL;
     JSCValue* value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
     char* reply = value ? jsc_value_to_string(value) : NULL;
     if (value)
         g_object_unref(value);
+    if (GPOINTER_TO_UINT(data) != vrSeq || !vrStarting) {
+        g_free(reply);
+        g_clear_error(&error);
+        return;
+    }
     if (!reply) {
         /* No script (page gone, or it threw): the title may still have a
          * video stream (e.g. a cross-origin player frame); try without
@@ -462,28 +789,9 @@ static void onProbeDone(GObject* object, GAsyncResult* result, gpointer data)
             *p = ' ';
     spike_log("vr: page: %s", oneLine);
     g_free(oneLine);
-
-    char why[160] = "";
-    double fisheye = 180;
-    int projection = guessProjection(reply, &fisheye, why, sizeof why);
-    vrControls = fieldNumber(reply, "found", 0) != 0;
-    g_free(vrTitle);
-    vrTitle = field(reply, "yttitle");
-    if (!vrTitle || !*vrTitle) {
-        g_free(vrTitle);
-        vrTitle = field(reply, "title");
-    }
-    if (!vrTitle)
-        vrTitle = g_strdup(webkit_web_view_get_title(vrWebView) ? webkit_web_view_get_title(vrWebView) : "");
-    if (strlen(vrTitle) > 90)
-        strcpy(vrTitle + 87, "...");
-    vrProjection = projection;
-    vrFisheye = fisheye;
-    char* label = projectionLabel(projection, fisheye);
-    spike_log("vr: projection guess %s (%s); player controls %s", label, why, vrControls ? "yes" : "no (no <video> found in the page)");
-    g_free(label);
-    g_free(reply);
-    wpe_display_ps5_vr_start(vrDisplay, (WPEDisplayPS5VRProjection)projection, fisheye, onVRState, NULL);
+    g_free(vrProbeReply);
+    vrProbeReply = reply;
+    startWhenReady();
 }
 
 void ps5wk_vr_toggle(void)
@@ -495,8 +803,20 @@ void ps5wk_vr_toggle(void)
         return;
     }
     vrStarting = TRUE;
+    vrSeq++;
+    g_free(vrProbeReply);
+    vrProbeReply = NULL;
+    vrHaveThumbnails = FALSE;
+    memset(&vrStats, 0, sizeof vrStats);
+    vrVideoWidth = vrVideoHeight = 0;
+    vrPicked = vrRemembered = FALSE;
+    vrRefines = 0;
+    vrShown[0] = 0;
     spike_log("vr: View in VR asked");
-    webkit_web_view_evaluate_javascript(vrWebView, kProbeScript, -1, NULL, "ps5wk-vr-probe.js", NULL, onProbeDone, NULL);
+    /* Both answers start it: the page's (video, title, addresses) and the
+     * video's thumbnails for the layout guess (about 0.4 s). */
+    webkit_web_view_evaluate_javascript(vrWebView, kProbeScript, -1, NULL, "ps5wk-vr-probe.js", NULL, onProbeDone, GUINT_TO_POINTER(vrSeq));
+    wpe_display_ps5_video_thumbnails(vrDisplay, 3, onThumbnails, GUINT_TO_POINTER(vrSeq));
 }
 
 void ps5wk_vr_stop(gboolean wait, const char* why)
@@ -504,9 +824,11 @@ void ps5wk_vr_stop(gboolean wait, const char* why)
     if (!vrDisplay || (!vrOn && !vrStarting && !wpe_display_ps5_vr_is_active(vrDisplay)))
         return;
     spike_log("vr: back to the TV (%s)", why ? why : "");
+    rememberChoice();
     wpe_display_ps5_vr_stop(vrDisplay, wait);
     vrOn = FALSE;
     vrStarting = FALSE;
+    vrSeq++; /* answers still on their way are an old entry's */
 }
 
 gboolean ps5wk_vr_active(void)
@@ -713,9 +1035,119 @@ static gboolean selftestStart(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* /data/ps5webkit/vr-guesstest (with vr-sim): after every test URL, enter
+ * VR, log the projection guess and check it against the file's lines
+ * "<part of the address> <projection number>" (no line: logged only), then
+ * the remembered choice: Triangle once, leave, enter again (the choice must
+ * come back, "remembered"), Triangle back round to the guess, leave (the
+ * choice is forgotten), enter (the guess again). */
+static unsigned guessStep, guessWait;
+static int guessExpected, guessChosen, guessFirst;
+static char* guessURL;
+
+static void guessCheck(const char* what, gboolean ok, const char* detail)
+{
+    char* label = projectionLabel(vrProjection, vrFisheye);
+    SPIKE_RESULT("vr-guess", ok ? "PASS" : "FAIL", "%s %s: %s (%s)%s%s", guessURL ? guessURL : "?", what, label, vrShown, detail ? "; " : "",
+        detail ? detail : "");
+    g_free(label);
+}
+
+static gboolean guessTick(gpointer data)
+{
+    (void)data;
+    /* steps that wait for the headset: up to 10 s */
+    gboolean waitsForVR = guessStep == 1 || guessStep == 5 || guessStep == 9;
+    if (waitsForVR && !vrOn) {
+        if (++guessWait > 20) {
+            SPIKE_FAIL("vr-guess", "%s: not in VR at step %u", guessURL ? guessURL : "?", guessStep);
+            return G_SOURCE_REMOVE;
+        }
+        return G_SOURCE_CONTINUE;
+    }
+    guessWait = 0;
+    switch (guessStep++) {
+    case 0: /* enter */
+        ps5wk_vr_toggle();
+        return G_SOURCE_CONTINUE;
+    case 1: case 2: case 3: case 4: case 5: case 6: case 9: case 10: /* wait (and let a second look happen) */
+        return G_SOURCE_CONTINUE;
+    case 7: { /* the guess */
+        char detail[96];
+        guessFirst = vrProjection;
+        if (guessExpected >= 0) {
+            snprintf(detail, sizeof detail, "expected %d", guessExpected);
+            guessCheck("guess", vrProjection == guessExpected && !vrRemembered, detail);
+        } else
+            guessCheck("guess (no expectation)", TRUE, NULL);
+        onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_TRIANGLE, NULL);
+        guessChosen = vrProjection;
+        onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_CIRCLE, NULL); /* leave: remembered */
+        return G_SOURCE_CONTINUE;
+    }
+    case 8: /* enter again, once the simulated headset is down */
+        if (wpe_display_ps5_vr_is_active(vrDisplay))
+            guessStep--;
+        else
+            ps5wk_vr_toggle();
+        return G_SOURCE_CONTINUE;
+    case 11: { /* the choice is back; Triangle round to the guess, leave: forgotten */
+        char detail[96];
+        snprintf(detail, sizeof detail, "chose %d after the guess %d", guessChosen, guessFirst);
+        guessCheck("remembered", vrProjection == guessChosen && vrRemembered, detail);
+        for (unsigned i = 1; i < G_N_ELEMENTS(kCycle); i++)
+            onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_TRIANGLE, NULL);
+        onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_CIRCLE, NULL);
+        int choice = -1;
+        gboolean still = memoryLookup(vrOrigin, vrAspect, vrGuess, &choice, NULL);
+        snprintf(detail, sizeof detail, "back at %d, the guess %d; site memory %s", vrProjection, guessFirst, still ? "STILL HAS IT" : "forgot it");
+        guessCheck("forgotten", vrProjection == guessFirst && !still, detail);
+        g_free(guessURL);
+        guessURL = NULL;
+        return G_SOURCE_REMOVE;
+    }
+    default:
+        return G_SOURCE_REMOVE;
+    }
+}
+
+static gboolean guessStart(gpointer data)
+{
+    (void)data;
+    g_free(guessURL);
+    guessURL = g_strdup(webkit_web_view_get_uri(vrWebView) ? webkit_web_view_get_uri(vrWebView) : "");
+    guessExpected = -1;
+    char* contents = NULL;
+    if (g_file_get_contents("/data/ps5webkit/vr-guesstest", &contents, NULL, NULL)) {
+        char** lines = g_strsplit(contents, "\n", -1);
+        for (char** line = lines; *line; line++) {
+            char part[200];
+            int projection = -1;
+            if (sscanf(*line, "%199s %d", part, &projection) == 2 && strstr(guessURL, part))
+                guessExpected = projection;
+        }
+        g_strfreev(lines);
+        g_free(contents);
+    }
+    if (vrOn || vrStarting)
+        ps5wk_vr_stop(FALSE, "guess test");
+    guessStep = guessWait = 0;
+    spike_log("vr: guess test for %s (expected %d)", guessURL, guessExpected);
+    guessTick(NULL);
+    g_timeout_add(500, guessTick, NULL);
+    return G_SOURCE_REMOVE;
+}
+
 void ps5wk_vr_selftest_schedule(unsigned delaySeconds)
 {
     static gboolean scheduled;
+    struct stat st;
+    if (stat("/data/ps5webkit/vr-guesstest", &st) == 0) {
+        if (stat("/data/ps5webkit/vr-sim", &st) != 0)
+            SPIKE_SKIP("vr-guess", "needs /data/ps5webkit/vr-sim (it never drives a real headset)");
+        else
+            g_timeout_add_seconds(delaySeconds, guessStart, NULL); /* every test URL */
+    }
     int fd = open("/data/ps5webkit/vr-selftest", O_RDONLY);
     if (fd < 0 || scheduled) {
         if (fd >= 0)

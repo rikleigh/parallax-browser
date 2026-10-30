@@ -420,6 +420,19 @@ void PS5Renderer::setVRSimLook(float yawDegrees, float pitchDegrees)
     g_mutex_unlock(&m_lock);
 }
 
+void PS5Renderer::requestVideoThumbnails(unsigned count, ThumbnailsDone done, void* userData)
+{
+    if (!m_initialized) {
+        if (done)
+            done(nullptr, 0, 0, 0, userData);
+        return;
+    }
+    g_mutex_lock(&m_lock);
+    m_thumbnailRequest = { true, std::clamp(count, 1u, 8u), done, userData };
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
 // ---------------------------------------------------------------- render thread
 
 void PS5Renderer::vrHandleRequests()
@@ -869,6 +882,7 @@ void PS5Renderer::vrFrame()
             handleVideo(stream, videoFrame, data);
         });
     vr->windowVideo += convertedBefore;
+    serviceThumbnails(nowUS());
     if (vr->sourceStream >= 0) {
         bool present = false;
         for (unsigned i = 0; i < m_videoSourceCount; i++)
@@ -916,5 +930,172 @@ void PS5Renderer::vrFrame()
             vr->sourceWidth = m_videoSources[i].width;
             vr->sourceHeight = m_videoSources[i].height;
         }
+    }
+}
+
+// ---------------------------------------------------------------- video thumbnails (layout guess)
+
+// Each output pixel is one cell of the video: the mean luma of 8 x 8
+// bilinear taps spread over it (row 0 = the picture's top, as the video
+// texture's row 0).
+static const char* kThumbnailFragmentShader = R"(#version 430 core
+uniform sampler2D video;
+uniform vec2 cell; // one thumbnail cell in the video's uv
+out vec4 color;
+void main()
+{
+    vec2 base = floor(gl_FragCoord.xy) * cell;
+    float sum = 0.0;
+    for (int j = 0; j < 8; j++)
+        for (int i = 0; i < 8; i++)
+            sum += dot(texture(video, base + (vec2(float(i), float(j)) + 0.5) * cell / 8.0).rgb, vec3(0.2126, 0.7152, 0.0722));
+    color = vec4(sum / 64.0, 0.0, 0.0, 1.0);
+}
+)";
+
+static GLuint s_thumbProgram, s_thumbTexture, s_thumbFBO;
+static GLint s_uThumbVideo, s_uThumbCell;
+static bool s_thumbFailed;
+
+struct ThumbnailsCall {
+    PS5Renderer::ThumbnailsDone done;
+    void* userData;
+    std::vector<uint8_t> luma;
+    unsigned frames;
+    int width, height;
+};
+
+static void postThumbnails(ThumbnailsCall* call)
+{
+    g_main_context_invoke_full(nullptr, G_PRIORITY_DEFAULT, [](gpointer data) -> gboolean {
+        auto* call = static_cast<ThumbnailsCall*>(data);
+        if (call->done)
+            call->done(call->frames ? call->luma.data() : nullptr, call->frames, call->width, call->height, call->userData);
+        return G_SOURCE_REMOVE;
+    }, call, [](gpointer data) { delete static_cast<ThumbnailsCall*>(data); });
+}
+
+// One thumbnail of the video texture into out (kThumbnailSize^2 bytes).
+bool PS5Renderer::takeThumbnail(unsigned texture, uint8_t* out)
+{
+    constexpr int n = kThumbnailSize;
+    if (!s_thumbProgram && !s_thumbFailed) {
+        char log[512] = { };
+        GLuint vs = compileShader(GL_VERTEX_SHADER, kVRVertexShader, log, sizeof(log));
+        GLuint fs = vs ? compileShader(GL_FRAGMENT_SHADER, kThumbnailFragmentShader, log, sizeof(log)) : 0;
+        GLuint program = 0;
+        GLint ok = 0;
+        if (vs && fs) {
+            program = glCreateProgram();
+            glAttachShader(program, vs);
+            glAttachShader(program, fs);
+            glLinkProgram(program);
+            glGetProgramiv(program, GL_LINK_STATUS, &ok);
+            if (!ok)
+                glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        }
+        if (vs)
+            glDeleteShader(vs);
+        if (fs)
+            glDeleteShader(fs);
+        if (ok) {
+            glGenTextures(1, &s_thumbTexture);
+            glBindTexture(GL_TEXTURE_2D, s_thumbTexture);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, n, n);
+            glGenFramebuffers(1, &s_thumbFBO);
+            glBindFramebuffer(GL_FRAMEBUFFER, s_thumbFBO);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_thumbTexture, 0);
+            ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (!ok)
+                snprintf(log, sizeof(log), "framebuffer incomplete");
+        }
+        if (!ok) {
+            VRLOG("thumbnail shader failed: %s", log);
+            if (program)
+                glDeleteProgram(program);
+            s_thumbFailed = true;
+            return false;
+        }
+        s_thumbProgram = program;
+        s_uThumbVideo = glGetUniformLocation(program, "video");
+        s_uThumbCell = glGetUniformLocation(program, "cell");
+    }
+    if (!s_thumbProgram)
+        return false;
+    glBindFramebuffer(GL_FRAMEBUFFER, s_thumbFBO);
+    glViewport(0, 0, n, n);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glUseProgram(s_thumbProgram);
+    glBindVertexArray(m_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(s_uThumbVideo, 0);
+    glUniform2f(s_uThumbCell, 1.0f / n, 1.0f / n);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    static uint8_t rgba[n * n * 4];
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, n, n, GL_RGBA, GL_UNSIGNED_BYTE, rgba); // waits for the draw: a 64 KB read
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    for (int i = 0; i < n * n; i++)
+        out[i] = rgba[i * 4];
+    return true;
+}
+
+// After each consume pass (TV or headset): the pending request's next
+// thumbnail when the playing stream has a new frame, the answer when enough
+// were taken or the time is up.
+void PS5Renderer::serviceThumbnails(int64_t now)
+{
+    Thumbnails& t = m_thumbnails;
+    g_mutex_lock(&m_lock);
+    ThumbnailRequest request = m_thumbnailRequest;
+    m_thumbnailRequest.pending = false;
+    g_mutex_unlock(&m_lock);
+    if (request.pending) {
+        if (t.active)
+            postThumbnails(new ThumbnailsCall { t.done, t.userData, { }, 0, t.width, t.height }); // replaced
+        t = { };
+        t.active = true;
+        t.count = request.count;
+        t.done = request.done;
+        t.userData = request.userData;
+        t.deadlineUS = now + 1000000;
+    }
+    if (!t.active)
+        return;
+    // The stream the headset shows, else the newest (the playing video).
+    const VideoSource* source = nullptr;
+    for (unsigned i = 0; i < m_videoSourceCount; i++) {
+        if (m_vr && m_videoSources[i].stream == m_vr->sourceStream)
+            source = &m_videoSources[i];
+    }
+    for (unsigned i = 0; !source && i < m_videoSourceCount; i++) {
+        if (!source || m_videoSources[i].lastFrameUS > source->lastFrameUS)
+            source = &m_videoSources[i];
+    }
+    if (source && now >= t.nextUS && (!t.taken || source->lastFrameUS != t.lastFrameUS)) {
+        constexpr size_t bytes = kThumbnailSize * kThumbnailSize;
+        t.luma.resize((t.taken + 1) * bytes);
+        int64_t start = nowUS();
+        if (takeThumbnail(source->texture, t.luma.data() + t.taken * bytes)) {
+            t.taken++;
+            t.width = source->width;
+            t.height = source->height;
+            t.lastFrameUS = source->lastFrameUS;
+            t.nextUS = now + 200000;
+            t.stallUS = now + 400000; // no newer frame by then (paused): answer
+            VRLOG("thumbnail %u/%u of video stream %d (%dx%d) in %.2f ms", t.taken, t.count, source->stream, source->width, source->height,
+                (nowUS() - start) / 1000.0);
+        } else
+            t.deadlineUS = now; // no shader: answer with what there is
+    }
+    bool stalled = t.taken && now >= t.stallUS && (!source || source->lastFrameUS == t.lastFrameUS);
+    if (t.taken >= t.count || now >= t.deadlineUS || stalled) {
+        auto* call = new ThumbnailsCall { t.done, t.userData, std::move(t.luma), t.taken, t.width, t.height };
+        t = { };
+        postThumbnails(call);
     }
 }

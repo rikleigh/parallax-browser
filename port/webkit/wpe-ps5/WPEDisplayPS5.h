@@ -146,6 +146,23 @@ WPE_API void        wpe_display_ps5_vr_set_text (WPEDisplayPS5 *display,
                                                  const char    *hint,
                                                  double         seconds,
                                                  const char    *tv_text);
+/* Small luma pictures of the playing video, for guessing its layout: up
+ * to @frames decoded frames about 200 ms apart (fewer when it is paused),
+ * each @size x @size bytes (128), every byte the mean luma of its part of
+ * the picture, row 0 = top; @luma is NULL and @frames 0 without a video.
+ * The callback runs on the main thread; a new request answers a pending
+ * one with no frames. */
+typedef void (* WPEDisplayPS5ThumbnailsCallback) (WPEDisplayPS5 *display,
+                                                  const guint8  *luma,
+                                                  guint          frames,
+                                                  guint          size,
+                                                  int            video_width,
+                                                  int            video_height,
+                                                  gpointer       user_data);
+WPE_API void        wpe_display_ps5_video_thumbnails (WPEDisplayPS5                  *display,
+                                                      guint                           frames,
+                                                      WPEDisplayPS5ThumbnailsCallback callback,
+                                                      gpointer                        user_data);
 /* Simulation only: the head direction (degrees, right and up positive). */
 WPE_API void        wpe_display_ps5_vr_sim_look (WPEDisplayPS5 *display,
                                                  double         yaw,

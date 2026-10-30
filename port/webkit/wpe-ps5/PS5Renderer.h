@@ -119,6 +119,16 @@ public:
     void setVRSimLook(float yawDegrees, float pitchDegrees);
     // A short message over the page on the TV (e.g. "No headset").
     void showMessage(const char* text, double seconds);
+    // Small luma pictures of the playing video (View in VR's layout guess):
+    // up to `count` decoded frames at least 200 ms apart, within 1 s (fewer
+    // if the video is paused: no newer frame within 400 ms ends it), each kThumbnailSize x kThumbnailSize bytes,
+    // every cell the average of its part of the frame (8 x 8 taps), row 0 =
+    // top. done(luma, frames, videoWidth, videoHeight, userData) runs on the
+    // main thread (frames 0: no video). A new request answers a pending one
+    // with no frames.
+    static constexpr int kThumbnailSize = 128;
+    using ThumbnailsDone = void (*)(const uint8_t* luma, unsigned frames, int width, int height, void* userData);
+    void requestVideoThumbnails(unsigned count, ThumbnailsDone, void* userData);
 
 private:
     PS5Renderer() = default;
@@ -145,6 +155,8 @@ private:
     void vrDrawTV(int64_t now);
     void vrCapture(unsigned buffer, char* path);
     void vrUpdateText(int64_t now);
+    void serviceThumbnails(int64_t now);
+    bool takeThumbnail(unsigned texture, uint8_t* out);
 
     bool m_initialized { false };
     void* m_eglDisplay { nullptr };
@@ -242,6 +254,21 @@ private:
         std::string tvText;
     } m_vrRequest;
     bool m_vrActiveShared { false }; // guarded by m_lock (vrActive(), stopVR(wait))
+    struct ThumbnailRequest {
+        bool pending { false };
+        unsigned count { 0 };
+        ThumbnailsDone done { nullptr };
+        void* userData { nullptr };
+    } m_thumbnailRequest; // guarded by m_lock
+    struct Thumbnails { // render thread
+        bool active { false };
+        unsigned count { 0 }, taken { 0 };
+        ThumbnailsDone done { nullptr };
+        void* userData { nullptr };
+        int64_t deadlineUS { 0 }, nextUS { 0 }, stallUS { 0 }, lastFrameUS { 0 };
+        int width { 0 }, height { 0 };
+        std::vector<uint8_t> luma;
+    } m_thumbnails;
     PS5VRState* m_vr { nullptr }; // render thread
 
     // vsync estimate (CLOCK_MONOTONIC us)

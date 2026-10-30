@@ -1187,10 +1187,12 @@ the headset to be released.
   `640x360`), `sbs`/`3dh`/`side by side` (and `lr` next to an angle),
   `tb`/`ou`/`3dv`/`top-bottom`/`over-under`, `mono`, `fisheye[NNN]`,
   `mkx200`/`mkx220`, `vrca220`, `rf52`; 180 without a stereo word is
-  side by side (VR180 nearly always is); SBS/TB without an angle is 180;
-  nothing = flat. With no `<video>` reachable (a cross-origin player frame)
-  it still enters VR on the title's newest video stream, without player
-  controls.
+  side by side (VR180 nearly always is); SBS/TB without an angle is 180
+  for square eyes and 360 for 2:1 eyes. When the page says nothing (or
+  names an angle but no stereo layout), the video's own pictures decide (see
+  *Projection guess* below); a Triangle choice is remembered per site. With
+  no `<video>` reachable (a cross-origin player frame) it still enters VR on
+  the title's newest video stream, without player controls.
 - The display (`wpe_display_ps5_vr_*`, `wpe_display_ps5_set_button_handler`)
   hands the request to the render thread and captures the pad.
 - The render thread (`PS5RendererVR.cpp`): `psvr2_open` (Hmd2, VrTracker2,
@@ -1238,13 +1240,73 @@ the headset to be released.
 - Text (TV notice, hint, messages): FreeType with the browser's Noto fonts
   (NotoSans-Bold; the pad's ✕ ○ △ □ ◀ ▶ from NotoSansSymbols2).
 
+**Projection guess (2026-10-30).** Many VR streams carry no hint at all
+(a 3840x1920 HLS stream with a plain address: 180 side by side, shown flat
+before). Order: YouTube's data, then the page's keywords, then the
+pictures, then a remembered choice on top.
+- *Pictures* (`apps/title/vrlayout.c`, plain C): on the touchpad the title
+  asks the render thread for three 128x128 luma thumbnails of the playing
+  video 200 ms apart (`wpe_display_ps5_video_thumbnails`; a small shader
+  averages 8 x 8 taps per cell of the converted RGBA frame, so hardware,
+  software and 10-bit frames alike, 64 KB `glReadPixels`; fewer when paused,
+  none without a video), then enters VR (about 0.4 s later than before).
+  Per thumbnail: the left and right halves are compared (normalised
+  correlation after taking out each row's and each column's mean, best of
+  shifts up to 4 cells sideways and 1 up/down for disparity), likewise the
+  top and bottom halves; the share of rows whose left and right edges break
+  (a 360 equirectangular picture's edges join); dark corners around a
+  bright circle in each half (fisheye). The frame's shape picks which split
+  matters: 2:1 and 4:1 side by side, 1:1 and 1:2 top/bottom, anything else is
+  flat. Halves that match (0.6 or more) are stereo: 2:1 = 180 SBS (fisheye
+  SBS 190 with circles), 4:1 = 360 SBS, 1:1 = 360 TB, 1:2 = 180 TB. Halves
+  that differ (under 0.4): a 2:1 frame whose edges join (under 25% of rows
+  break) is 360 mono, otherwise flat. In between, or too little detail (a
+  dark fade): the shape alone (2:1 of 1280 or more = 180 SBS, 1:1 of 1440 or
+  more = 360 TB, 1:2 = 180 TB), and in VR it looks again after 3 s and then
+  every 5 s (at most three times) until something decides or you pick.
+- *Remembered choices*: Triangle's last pick is stored when you leave VR,
+  keyed by the page's origin, the frame's shape (aspect x 100, e.g. `200`)
+  and what the guess was ("on this site, when the guess is flat for a 2:1
+  frame, show 180 SBS"), in `/data/ps5webkit/vr-projections.txt` (one line
+  each, newest last, at most 64; `vr-projections-sim.txt` with `vr-sim`).
+  Cycling back to the guess forgets it. Nothing about any site is in the
+  code.
+- The log says what decided and why: `vr: projection: 180° 3D side by side
+  (2:1 frame, halves match 0.98) [origin, 3 thumbnails, 3 detailed: halves
+  0.98, top/bottom -0.09, edges break 78%, fisheye 0]`; the headset hint
+  and the TV notice show the projection with a short reason ("Guessed: ...",
+  "From the page", "Remembered for this site", "Your choice: ...").
+- Tested on the Mac: `test/vrlayout/run.sh` (FFmpeg thumbnails of the clips
+  below, both as exact cell averages and the shader's taps) 48/48: the
+  `guess_*` clips (180 SBS 0.98, 360 mono with 17% edge breaks, 360 TB
+  0.98, 180 TB 0.99, fisheye 0.98 with circles, flat 2:1 fractal zoom with
+  80-100% edge breaks), the flat test patterns and 2:1 HLS variants (flat),
+  and the `vrtest_*` grids (their grids repeat, so the 360 mono grid looks
+  like SBS to the pictures: its keywords decide).
+- Tested on the console (log-only, `vr-sim`, 2026-10-30): `vr-guesstest` over
+  the seven `guess_*` clips, `vrtest_180_LR` (keywords) and the 2:1 HLS
+  variants: 27/27 PASS (guess, remembered, forgotten for each), the same
+  numbers as on the Mac: 180 SBS halves 0.98, 360 mono halves -0.09 and 17%
+  edge breaks, 360 TB 0.98, 180 TB 0.99, fisheye 0.98 with circles, flat
+  2:1 zoom 34-80% breaks, HLS 98-99%. Thumbnails: 1.7 ms each at 3840x1920
+  (15 ms for the first, the shader compile), 0.4-0.6 ms at 2048x2048 and
+  below. `vr-selftest` on `guess_a`: PASS (guessed 180 SBS; re-entries with
+  the video paused took one thumbnail). An edge measure counting only rows
+  with detail gave 39% breaks for the 360 clip on the console (19% on the
+  Mac) and was dropped.
+
 **Test clips.** `test/media/make-vr-media.sh [--upload]` makes HEVC test
 patterns (FFmpeg `v360` from a labelled equirectangular grid: a cell every
 30 degrees with its yaw/pitch, FRONT/RIGHT/BACK/LEFT/UP/DOWN, a green front
 cell, a clock at the front; stereo clips have a red "LEFT EYE" and a blue
 "RIGHT EYE" grid): `vrtest_360_mono`, `vrtest_360_TB`, `vrtest_360_SBS`,
 `vrtest_180_mono`, `vrtest_180_LR`, `vrtest_180_TB` (2048x4096), `vrtest_MKX200_LR`
-(200-degree fisheye). The start page has a "View in VR tests" row.
+(200-degree fisheye). The start page has a "View in VR tests" row. The
+same script makes the layout-guess clips (H.264, no keywords in the names;
+a generated world from six FFmpeg patterns, nothing periodic): `guess_a`
+180 SBS 3840x1920, `guess_b` 360 mono 3840x1920, `guess_c` 360 TB
+2048x2048, `guess_d` 180 TB 1440x2880, `guess_e` fisheye 190 SBS
+3840x1920, `guess_f` flat 3840x1920, `guess_g` flat 1920x1080.
 
 **Knobs (log-only tests).** `/data/ps5webkit/vr-sim`: no Hmd2 at all; the eye
 buffers are rendered on a 60 Hz timer with a scripted head direction, and a
@@ -1253,7 +1315,12 @@ screen capture request reads them back (`[vr] SHOT`). `/data/ps5webkit/vr-selfte
 same path as the touchpad, captures the eye buffers looking front, right,
 back, left, up and down, cycles every projection, presses X, right, left, X,
 Square, Options and O, then enters and leaves three more times
-(`RESULT ps5browser vr-selftest`). `/data/ps5webkit/vr-probe`: afterwards
+(`RESULT ps5browser vr-selftest`). `/data/ps5webkit/vr-guesstest` (only with
+`vr-sim`; lines `<part of the address> <projection number>`): after every
+test URL, enters VR, checks the guess (`RESULT ps5browser vr-guess ... guess`),
+presses Triangle and leaves, enters again (`... remembered`: the choice is
+back), presses Triangle round to the guess and leaves (`... forgotten`); use
+a dwell of 30 s per URL. `/data/ps5webkit/vr-probe`: afterwards
 opens and closes Hmd2 twice without tracker or VR mode (nothing shows in a
 headset): binding, param.json attributes, device status. Logs: `[vr]`
 (every 5 s: headset frames, render time, tracked, video frames shown,

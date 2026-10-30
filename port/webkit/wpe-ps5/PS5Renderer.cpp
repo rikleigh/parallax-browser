@@ -530,7 +530,7 @@ void PS5Renderer::threadMain()
         for (;;) {
             if (m_pageJob.pending || m_frameRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
                 break;
-            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged)
+            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged || m_thumbnailRequest.pending)
                 break;
             int64_t now = nowUS();
             if (m_messageUntilUS && now >= m_messageUntilUS)
@@ -547,6 +547,8 @@ void PS5Renderer::threadMain()
             int64_t deadline = PS5VideoServer::nextDeadline();
             if (m_messageUntilUS)
                 deadline = std::min(deadline, m_messageUntilUS + 2000);
+            if (m_thumbnails.active) // a paused video: answer at the deadline with what was taken
+                deadline = std::min(deadline, std::min(m_thumbnails.deadlineUS, m_thumbnails.taken ? m_thumbnails.stallUS : INT64_MAX) + 2000);
             if (deadline <= now + 2000)
                 break;
             if (deadline == INT64_MAX)
@@ -587,6 +589,7 @@ void PS5Renderer::threadMain()
             m_videoActive = PS5VideoServer::consume(displayUS, static_cast<int64_t>(m_periodUS / 2), commitGeometry,
                 [this](PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data) { handleVideo(stream, frame, data); });
         }
+        serviceThumbnails(nowUS());
 
         drawScene();
         if (capturePath)
