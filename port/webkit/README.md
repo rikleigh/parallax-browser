@@ -413,6 +413,7 @@ decoding, sound, the link server, the home page) can be changed on the
 | `child.env`: `PS5WK_PAINT_MIN_PX=<n>` (default 65536), `PS5WK_PAINT_BBH=0`, `PS5WK_PAINT_RECORD=1` | A/B knobs: damage below n pixels is painted directly; record without a bounding box hierarchy; record and replay even on one thread |
 | `child.env`: `PS5WK_IDLE_GAP=<percent>` (default 100) | the idle gap after a rendering update longer than 6 ms, in percent of its duration (0 = none) |
 | `child.env`: `PS5WK_SHM_READBACK=1` | the old full-frame `readPixels` of the shared-memory surface onto itself after each frame (A/B only) |
+| `child.env`: `WEBKIT_GST_ENABLE_HLS_SUPPORT=0` | no HLS in `<video>` (the child sets 1; see *HLS streams*) |
 | `WEBKIT_GST_VIDEO_DECODING_LIMIT` | set by the child: 7680x4320@60 when the title decodes in hardware (step 2b; the child asks the title's video server at start), else 1920x1080@60 (software: YouTube stays ≤1080p) |
 | `child.env`: `PS5WK_MEM_LOG=<s>` (0 = off), `PS5WK_CPU_LOG=all` | the WebProcess memory watchdog period (default 60 s); `[cpu]` lines every 5 s whatever the load |
 | `child.env`: `PS5WK_MEM_RESTART_MB=<MB>` (default 3072, 0 = off) | WebProcess memory limit: over this much libpas memory committed, the title (and ps5wk-shot's stress mode) ends the WebProcess at the next top-level navigation and loads the page in a new one (see *WebProcess memory*) |
@@ -1014,6 +1015,45 @@ The plan this followed:
    output slot pool of about depth + 4 frames per stream.
 4. **"View in VR"** samples the same RGBA texture on a sphere or dome
    (Spike 9's `vr360`/`vr180`), so it needs nothing from the page.
+
+## HLS streams (`<video>` with an .m3u8, a VR site, 2026-10-30)
+
+a VR site's player (Delight XR) puts an HLS master playlist (a signed
+nginx-vod `.urlset/master.m3u8`) in a `<source>`; the `<source>` failed at
+once (networkState 3, nothing fetched) because WebKit only advertises
+`application/vnd.apple.mpegurl` / `application/x-mpegurl` and only lets
+playbin plug `hlsdemux` when `WEBKIT_GST_ENABLE_HLS_SUPPORT=1`, and our
+GStreamer had no `hlsdemux` anyway (adaptivedemux2's `hlsdemux2` is there,
+but WebKit demotes it: it downloads with its own libsoup).
+
+- **port/deps:** gst-plugins-bad's legacy `hls` plugin is now built and
+  registered (`hlsdemux`; port/deps/README.md). It fetches the playlists and
+  segments through `webkitwebsrc` (GstURIDownloader forwards the
+  need-context for WebKit's loader to the pipeline), so they go through the
+  NetworkProcess with the page's cookies, as WebKit intends. TS, fMP4
+  (`EXT-X-MAP`) and AES-128 (OpenSSL) segments; alternate audio renditions
+  (`EXT-X-MEDIA`) are not played by the legacy demuxer, only the variant's
+  own streams.
+- **ps5wk-child** sets `WEBKIT_GST_ENABLE_HLS_SUPPORT=1` (child.env can set
+  0). `canPlayType('application/vnd.apple.mpegurl')` now says "maybe", so
+  players that prefer native HLS (Safari-style) use it instead of hls.js +
+  MSE.
+- Downstream nothing changes: tsdemux or qtdemux, h264parse/h265parse, the
+  hardware decoder (`ps5vdecproxy`) or avdec, aacparse and avdec_aac. A
+  variant switch is a new SPS (TS) or a new init segment (fMP4) on the same
+  pads, so caps change mid-stream and the proxy drains and reopens the
+  decoder as for BBC's switches (*Resolution switches* above).
+
+Test streams: `test/media/make-media.sh` makes `hls-ts/` (640x360 and
+1280x720 H.264 + AAC, 2 s TS segments) and `hls-fmp4/` (960x540 and
+1920x1080 HEVC + AAC, fMP4), each variant labelled, the low one listed
+first so hlsdemux starts there and switches up. `video.html` plays them from
+file:// (`--upload` copies them) and takes `&type=<MIME>` to load through
+`<source type=...>` as players do (it logs `canPlayType`, the `<source>`
+error and `resize` events with the new size). Over HTTP from the Mac:
+`tools/serve-media.py` (port 8771, logs each request's User-Agent and Range:
+WebKit's user agent means webkitwebsrc fetched it), then
+`file:///data/ps5webkit/video.html?src=http://<mac>:8771/hls-ts/master.m3u8&type=application/x-mpegURL`.
 
 ## View in VR (Milestone 2 step 3, 2026-10-28)
 

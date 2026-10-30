@@ -21,6 +21,11 @@
 #                           B-frames, no audio, 6 s, with and without the VUI reorder limits
 #   sound-test.m4a          audio only (no video decoder involved): a 440 Hz tone with a
 #                           1760 Hz beep at the start of every second, AAC-LC stereo, 60 s
+#   hls-ts/master.m3u8      HLS (as a VR site serves): 640x360 and 1280x720 H.264 + AAC
+#                           variants, MPEG-TS segments of 2 s, 40 s, low variant listed first
+#                           (hlsdemux starts there and switches up: a size change mid-stream)
+#   hls-fmp4/master.m3u8    the same with HEVC (hvc1) 960x540 and 1920x1080, fMP4 segments
+#                           (EXT-X-MAP)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -110,11 +115,39 @@ if [ ! -s "$OUT/sound-test.m4a" ]; then
     echo "  sound-test.m4a"
 fi
 
+# HLS: two variants of the same clip with keyframes every 2 s at the same
+# frames (no scene cuts), so hlsdemux can switch at any segment. Each
+# variant draws its name. Serve the directory over HTTP (tools/serve-media.py)
+# or play it from file:// (video.html's HLS tiles).
+hls() { # <dir> <segment type> <vcodec args> <WxH low> <bitrate low> <WxH high> <bitrate high>
+    local dir=$1 type=$2 vargs=$3 lo=$4 lob=$5 hi=$6 hib=$7 fs
+    [ -s "$OUT/$dir/master.m3u8" ] && { echo "  $dir (exists)"; return; }
+    rm -rf "$OUT/$dir"; mkdir -p "$OUT/$dir"
+    label() { # <WxH> <name> -> drawtext chain for one variant
+        fs=$(( ${1#*x} / 6 ))
+        echo "scale=${1/x/:},drawtext=fontfile=$FONT:fontsize=$fs:fontcolor=white:box=1:boxcolor=black@0.6:x=(w-tw)/2:y=(h-th)/2:text='%{eif\:t\:d}.%{eif\:mod(n\,30)\:d\:2}',drawbox=x=0:y=0:w=iw/8:h=ih/8:color=white:t=fill:enable='lt(mod(t\,1)\,0.1)',drawtext=fontfile=$FONT:fontsize=$((fs/3)):fontcolor=yellow:x=20:y=h-th-20:text='$2 $1'"
+    }
+    ( cd "$OUT/$dir" && $FF -f lavfi -i "testsrc2=size=1920x1080:rate=30" -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000" \
+        -filter_complex "[0:v]split=2[a][b];[a]$(label "$lo" "$dir low")[v0];[b]$(label "$hi" "$dir high")[v1];[1:a]volume=0.25,aformat=channel_layouts=stereo,asplit=2[a0][a1]" \
+        -map "[v0]" -map "[a0]" -map "[v1]" -map "[a1]" -t 40 \
+        $vargs -g 60 -keyint_min 60 -sc_threshold 0 -b:v:0 "$lob" -b:v:1 "$hib" -c:a aac -b:a 128k \
+        -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type "$type" -hls_flags independent_segments \
+        -master_pl_name master.m3u8 -var_stream_map "v:0,a:0,name:low v:1,a:1,name:high" \
+        -hls_segment_filename "%v/seg%03d.$([ "$type" = fmp4 ] && echo m4s || echo ts)" "%v/index.m3u8" )
+    echo "  $dir ($(du -sh "$OUT/$dir" | cut -f1))"
+}
+hls hls-ts   mpegts "-c:v libx264 -profile:v high -preset veryfast -pix_fmt yuv420p" 640x360 800k 1280x720 3M
+hls hls-fmp4 fmp4   "-c:v libx265 -preset superfast -tag:v hvc1 -pix_fmt yuv420p -x265-params log-level=error" 960x540 1M 1920x1080 5M
+
 if [ "${1:-}" = --upload ]; then
     FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
     for f in "$OUT"/*.mp4 "$OUT"/*.webm "$OUT"/*.m4a "$OUT"/*.m2ts; do
         echo "  upload $(basename "$f")"
         curl -s --ftp-create-dirs -T "$f" "$FTP/data/ps5webkit/media/$(basename "$f")"
+    done
+    for f in "$OUT"/hls-*/master.m3u8 "$OUT"/hls-*/*/*; do
+        r="${f#$OUT/}"; echo "  upload $r"
+        curl -s --ftp-create-dirs -T "$f" "$FTP/data/ps5webkit/media/$r"
     done
     curl -s --ftp-create-dirs -T "$HERE/video.html" "$FTP/data/ps5webkit/video.html"
     curl -s --ftp-create-dirs -T "$HERE/preview.html" "$FTP/data/ps5webkit/preview.html"

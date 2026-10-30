@@ -1,7 +1,8 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Video test</title>
 <!-- Milestone 2 test page (file:///data/ps5webkit/video.html, uploaded by
-     test/media/make-media.sh --upload). ?src=<url> plays that URL; the stats
+     test/media/make-media.sh --upload). ?src=<url> plays that URL
+     (&type=<MIME>: through <source type=...>, as players set HLS); the stats
      line (and window.ps5wkVideoStats() for ps5wk-shot js= dumps) shows decoded
      and dropped frames and the measured frame rate. -->
 <style>
@@ -32,6 +33,8 @@ body.geometry #label{display:block;position:absolute;left:40px;top:40px;padding:
 <li><a href="https://www.youtube.com/watch?v=jNQXAC9IVRw">YouTube: Me at the zoo</a></li>
 <li><a href="?src=media/sync-1080p30-h264.mp4&amp;test=geometry">Clipped, overlaid, scrolling (1080p30)</a></li>
 <li><a href="https://www.youtube.com/watch?v=eRsGyueVLvQ">YouTube: Sintel (1080p24)</a></li>
+<li><a href="?src=media/hls-ts/master.m3u8&amp;type=application/x-mpegURL">HLS: H.264 + AAC, TS, 2 variants</a></li>
+<li><a href="?src=media/hls-fmp4/master.m3u8&amp;type=application/vnd.apple.mpegurl">HLS: HEVC + AAC, fMP4, 2 variants</a></li>
 <li><a href="start.html">Start page</a></li>
 </ul>
 <div id="clip"><video id="v" controls playsinline></video><div id="label">over the video</div></div>
@@ -45,13 +48,20 @@ if (params.get('test') === 'geometry') {
   setInterval(function () { down = !down; window.scrollTo(0, down ? 160 : 0); console.log('GEOMETRY scrolled to ' + window.scrollY); }, 3000);
 }
 var last = null, fps = 0, log = [];
-if (src) {
+if (src && params.get('type')) {
+  var source = document.createElement('source');
+  source.type = params.get('type'); source.src = src;
+  source.addEventListener('error', function () { log.push('source error (networkState ' + v.networkState + ')'); });
+  v.appendChild(source);
+  log.push('canPlayType ' + v.canPlayType(params.get('type')));
+  v.play().catch(function (e) { stats.textContent = 'play(): ' + e.name + ' ' + e.message + ' (press X on the video)'; });
+} else if (src) {
   v.src = src;
   v.play().catch(function (e) { stats.textContent = 'play(): ' + e.name + ' ' + e.message + ' (press X on the video)'; });
 }
-['loadedmetadata', 'canplay', 'playing', 'waiting', 'stalled', 'ended', 'error', 'pause'].forEach(function (n) {
+['loadedmetadata', 'canplay', 'playing', 'waiting', 'stalled', 'ended', 'error', 'pause', 'resize'].forEach(function (n) {
   v.addEventListener(n, function () {
-    log.push(n + '@' + v.currentTime.toFixed(2));
+    log.push(n + '@' + v.currentTime.toFixed(2) + (n === 'resize' ? ' ' + v.videoWidth + 'x' + v.videoHeight : ''));
     if (n === 'error') log.push('MediaError ' + (v.error && v.error.code) + ' ' + (v.error && v.error.message));
   });
 });

@@ -712,6 +712,14 @@ port.
   then waited for. Now 32 in flight, waits that end on a flush or stop, and
   a decode error after 9 s of silence from the title. Built, not yet checked
   on the console: `preview.html` with synthetic previews.
+- **HLS in `<video>` (2026-10-30, port/webkit/README.md, *HLS streams*):**
+  a VR site's player sets an HLS master playlist as a `<source>`, which
+  failed at once: WebKit only takes HLS with `WEBKIT_GST_ENABLE_HLS_SUPPORT=1`
+  and through the legacy `hlsdemux` (downloads via webkitwebsrc and the
+  NetworkProcess), which we didn't build. gst-plugins-bad's `hls` plugin is
+  now in gstreamer-full and the children set the variable. Synthetic streams
+  (`make-media.sh`: TS H.264 and fMP4 HEVC, two variants each) and
+  `tools/serve-media.py` for the check. Built, not yet checked on the console.
 - **Next (follow-up, not started): payload malloc and mutex contention.**
   `port/webkit/test/lockbench` (a payload; 400k operations per thread):
 

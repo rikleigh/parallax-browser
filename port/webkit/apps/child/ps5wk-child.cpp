@@ -196,6 +196,11 @@ static void setupEnvironment(const char* launchPath)
     // Media: WEBKIT_GST_VIDEO_DECODING_LIMIT (what MSE/canPlayType accept)
     // is set in main() once the title says whether it decodes in hardware.
     // GST_DEBUG etc. can be added through child.env.
+    // HLS in <video src=...m3u8> (a VR site's player): without this WebKit
+    // neither advertises application/vnd.apple.mpegurl nor lets playbin plug
+    // hlsdemux (the legacy one from gst-plugins-bad, whose downloads go
+    // through webkitwebsrc and the NetworkProcess). child.env can set 0.
+    setenv("WEBKIT_GST_ENABLE_HLS_SUPPORT", "1", 0);
     // Progressive media is buffered on disk (GStreamer downloadbuffer); the
     // default /var/tmp does not exist for payloads.
     mkdir("/data/ps5webkit/home/cache", 0777);

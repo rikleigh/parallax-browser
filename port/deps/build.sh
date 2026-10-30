@@ -665,12 +665,13 @@ step_gst_plugins_good() {
 }
 
 step_gst_plugins_bad() {
-    log "gst-plugins-bad $GST_VER (videoparsers, mpegtsdemux + libgstmpegts, codecparsers)"
+    log "gst-plugins-bad $GST_VER (videoparsers, mpegtsdemux + libgstmpegts, codecparsers, legacy hls)"
     fetch https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-$GST_VER.tar.xz \
         670d888bde8242579b0d8e91f60cf337aa7be20ca7c315ebfbdd6e5a9218d104
     unpack gst-plugins-bad "$FETCHED"
     meson_pkg gst-plugins-bad "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dintrospection=disabled -Dtools=disabled -Dorc=disabled -Dgpl=disabled \
-        -Dvideoparsers=enabled -Dmpegtsdemux=enabled -Did3tag=enabled -Dmpegdemux=enabled
+        -Dvideoparsers=enabled -Dmpegtsdemux=enabled -Did3tag=enabled -Dmpegdemux=enabled \
+        -Dhls=enabled -Dhls-crypto=openssl
     fix_sysroot; cleanup gst-plugins-bad
 }
 
@@ -687,12 +688,15 @@ step_gst_libav() {
 GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions playback
                   videoconvertscale volume pbtypes rawparse subparse gio isomp4 matroska
                   audioparsers id3demux apetag icydemux wavparse adaptivedemux2
-                  videoparsersbad mpegtsdemux mpegpsdemux id3tag libav autodetect
+                  videoparsersbad mpegtsdemux mpegpsdemux id3tag hls libav autodetect
                   deinterlace videofilter audiofx)
 # (WebKit's software video path sets playbin's deinterlace and soft-colorbalance
 # flags; a missing deinterlace/videobalance is a missing-plugin message, which
 # WebKit turns into MEDIA_ERR_SRC_NOT_SUPPORTED. audiofx = scaletempo for
-# playbackRate with preserved pitch.)
+# playbackRate with preserved pitch. hls = the legacy hlsdemux, which fetches
+# playlists and segments through the highest-ranked http source, WebKit's
+# webkitwebsrc; adaptivedemux2's hlsdemux2 has its own libsoup and WebKit
+# demotes it. The children set WEBKIT_GST_ENABLE_HLS_SUPPORT=1.)
 # Plus our own static plugins "ps5audio" (gst/gstps5audiosink.c, audio to the
 # title) and "ps5video" (gst/gstps5videosink.c, hole-punch video frames to the
 # title, and gst/gstps5vdecproxy.c, access units to the title's hardware
