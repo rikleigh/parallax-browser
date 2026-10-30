@@ -332,6 +332,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0031-ps5-libpas-decommit | PS5 only: libpas gives decommitted memory back (replaces 0006's zero-only decommit): 16 KiB granules (the page size), decommit maps fresh anonymous pages over whole pages (`madvise` and `mprotect` leave them resident on the console, `test/memprobe`), commit is a no-op; executable memory is only zeroed; `PS5WK_PAS_DECOMMIT=0` restores the zero-only behaviour; `pas_page_malloc_ps5_decommitted_bytes` for the `[mem]` line |
 | 0032-ps5-cpu-painting | PS5 only, CPU page painting (see *CPU painting* below): a frame is recorded into an SkPicture and replayed in horizontal bands on `PS5WK_PAINT_THREADS` threads (default 4; `PS5WK_PAINT_ASYNC=1`: replayed on the pool while the main thread goes on); scrolls move the last frame's pixels and only the uncovered strip and what changed is painted, every frame starts from a copy of the last one (`PS5WK_SCROLL_COPY=0`: repaint on scroll, as upstream); damage is painted as non-overlapping rects (`rectsForPainting`; iterating the damage painted overlaps several times); no full-frame `readPixels` of the SHM surface onto itself (`PS5WK_SHM_READBACK=1` restores it); Skia's heap (`sk_malloc`) is WebKit's libpas (the console's libc malloc collapses under threads, `test/lockbench`); `[render]` lines with per-phase timing; the 0016 throttle no longer drops an update when it fires during a pending frame |
 | 0033-ps5-hlsdemux2 | PS5 only: HLS through adaptivedemux2's `hlsdemux2` when `WEBKIT_GST_ENABLE_HLS_SUPPORT=1` (upstream always demotes it: it downloads with its own libsoup, which a sandboxed media process can't; the PS5 WebProcess can), the only HLS demuxer playbin3 takes; webkitwebsrc adds the page's User-Agent to its http-headers event (the NetworkProcess adds it to the real request), which hlsdemux2 uses for its own requests |
+| 0034-ps5-network-cache-and-dns | PS5 only (see *Locks, malloc and networking* below): the disk cache writes each body once, straight to the record's blob file, and counts it (0013 wrote `Blobs/<hash>` and copied it in full, and the copies were counted nowhere, so the cache never shrank); DocumentBrowser's disk cache is desktop-sized (1 GB with 16 GB free; was 75 MB); typed DNS lookups (libsoup's IPv4-only/IPv6-only) are answered from a prefetched Default answer, filtered by family, and "not found" when it has no address of that family |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -1492,6 +1493,143 @@ per update at 6-14/s on busy pages). Flexible memory stayed at 283-284 MB.
 **Not done:** frames aren't pipelined (with `PS5WK_PAINT_ASYNC=1` the next
 update still waits for the replay); glib/GStreamer malloc and pthread
 mutexes; composited scrolling of fixed/sticky content.
+
+## Locks, malloc and networking (2026-10-30)
+
+`test/lockbench` showed the console's libc malloc and pthread mutexes
+collapsing as soon as two threads meet (FEASIBILITY §9: a malloc/free pair
+0.3 us alone, 48-162 us with 2-6 threads; a contended mutex 4-20 us per
+hand-over; semaphores fine). 0032 moved Skia and C++ `new` in the child to
+libpas. This round moves the rest, in `apps/common/`:
+
+- **ps5locks.c** (ps5wk-child and the title, `--wrap` of every
+  `pthread_mutex_*`, `pthread_cond_*`, `pthread_rwlock_*` and the mutex and
+  condition attribute calls; `PS5_LOCK_FUNCTIONS` in apps/CMakeLists.txt):
+  futex locks on `_umtx_op(UMTX_OP_WAIT_UINT_PRIVATE/WAKE_PRIVATE)`, the
+  call libpas's own lock already uses on the console. The unlocking thread
+  may take the lock straight back (no hand-over convoy); a waiter spins 100
+  times, then sleeps. The 8 bytes of `pthread_mutex_t` (a pointer on this
+  libc, NULL or 1 for the static initializers) hold the futex word itself;
+  recursive mutexes point to a small malloc'd block (owner and count).
+  Condition variables are a sequence futex with a waiter count and the
+  attribute's clock (glib's GCond waits on CLOCK_MONOTONIC); rwlocks prefer
+  readers (a reader may read again while a writer waits). Errorcheck
+  mutexes act as normal ones (this libc's default type *is* errorcheck, so
+  they can't be told apart). This covers GMutex/GCond/GRecMutex/GRWLock,
+  libc++ `std::mutex`/`condition_variable`, WTF's `Mutex`/`ThreadCondition`
+  and so ParkingLot's park path, libpas's scavenger, and in the title Spike
+  10's dlmalloc arenas (8 arenas, each behind a pthread mutex) and the
+  render, decoder and audio threads. `check-lock-imports.sh` runs after each
+  link (and in package.sh) and fails the build if the executable imports a
+  mutex/cond/rwlock function that is not wrapped.
+- **ps5malloc.c** (ps5wk-child only): `malloc`, `calloc`, `realloc`, `free`,
+  `posix_memalign`, `aligned_alloc`, `memalign` and `malloc_usable_size` on
+  libpas (WTF's exported `tryFastAlignedMalloc`/`fastFree` and
+  `bmalloc::api::tryReallocOutOfLine`: fastMalloc's heap, so `new`/`free`
+  mixes work too). glib, GStreamer, libsoup, FreeType, HarfBuzz, ICU,
+  fontconfig, libxml2, SQLite and OpenSSL now allocate with per-thread
+  caches. **Ownership:** a block is libpas's exactly when it lies in an
+  anonymous mapping made through the child's `__wrap_mmap` (libpas gets all
+  its memory there; the console's malloc lives in another module and never
+  does): a two-level bitmap of 16 KiB pages, set by `__wrap_mmap`, cleared by
+  `__wrap_munmap` before the real unmap. `free`/`realloc` of anything else
+  (`getcwd(NULL)` and `realpath(NULL)` still come from the console's libc)
+  go to the console's libc. None of the libc functions the
+  child imports frees or reallocates a block the caller made (no `getline`,
+  `putenv`, `open_memstream`). **Emulated TLS:** `__thread` is emulated
+  (compiler-rt's `__emutls_get_address`, which mallocs a thread's block on
+  first use), and libpas keeps its thread cache in a `__thread`: the child
+  now defines `__emutls_get_address` (compiler-rt's logic) on the console's
+  malloc, otherwise the first allocation on each thread recursed.
+- **Off switches** (decided at the first call, before main, for the life of
+  the process): `/data/ps5webkit/no-fastlock` (children),
+  `/data/ps5webkit/no-fastlock-title` (the title), `/data/ps5webkit/no-pasmalloc`
+  (children's malloc). The child logs `locks: futex ...; malloc: libpas ...`
+  at start, and the `[mem]` line ends with `locks futex: N mutex parks, N cond
+  waits, N rwlock parks; malloc libpas: N foreign frees, N foreign reallocs, N
+  fallbacks`.
+- **Memory accounting changes:** libpas's committed memory (the `[mem]`
+  line and the `PS5WK_MEM_RESTART_MB` limit) now includes what glib and
+  GStreamer allocate, which the console's heap held before (uncounted).
+- **Checks on the Mac:** `test/lockbench/host-test.sh` builds ps5locks.c and
+  ps5malloc.c for macOS (`__ulock_wait/__ulock_wake` stand in for
+  `_umtx_op`, libpas is stubbed) and runs mutex, timed lock, recursive,
+  condition variable (signal, broadcast, recursive mutex), timed wait on both
+  clocks, rwlock and bitmap/emulated-TLS tests; it passes under
+  ThreadSanitizer and UBSan. The console's numbers come from
+  `ps5wk-lockbench` (`NINJA_TARGETS=ps5wk-lockbench`; libc against futex
+  locks and libpas, 1-6 threads, condition ping-pong and a 4+4 queue).
+
+**Measured on the console** (2026-10-30, log-only):
+
+| `ps5wk-lockbench`, ns per operation per thread (1 / 2 / 4 / 6 threads) | console's libc | ps5locks / ps5malloc |
+| --- | --- | --- |
+| malloc/free pair | 279 / 46 676 / 106 535 / 162 113 | 46 / 45 / 53 / 90 |
+| mutex lock/unlock (one shared mutex) | 21 / 4 251 / 13 646 / 21 012 | 19 / 89 / 364 / 588 (spin 100; spin 0: 130 / 187 / 277) |
+| rwlock, 1 write in 64 | 18 / 135 / 757 / 1 322 | 17 / 84 / 184 / 314 |
+| condition ping-pong, round trip | 8.5 us | 3.7 us |
+| 4 producers + 4 consumers queue | 0.13 M items/s | 2.85 M items/s |
+
+Total malloc throughput with 6 threads: 0.04 -> 67 M pairs/s. In a tight
+4-6 thread loop spin 0 beats spin 100 (21 vs 10 M locks/s); at 2 threads spin
+100 wins (22.5 vs 15.4); the default stays 100. `_umtx_op` wait/wake works
+in payloads and in the title (imports 0 of 444 NULL).
+
+End to end the browser did not get measurably faster: the page painting
+was already on libpas (0032), and in these runs the threads seldom met.
+- `test/paint/paint-ab.sh`, t4, one round, off switches on vs off: scroll
+  updates/s Wikipedia 81.6 -> 79.4, local page 86.0 -> 85.6, GitHub 54.5 ->
+  57.8, Hacker News 37.8 -> 37.0, BBC News 48.2 -> 40.8 (BBC's page changes
+  between runs); during the load, rendering updates were shorter on Wikipedia
+  (avg 12.1 -> 6.7 ms, p95 158 -> 3.4) and GitHub (44 -> 28 ms), single runs.
+- Title, YouTube 4K60 VP9 (hardware decoding, hole punch) for ~62 s, then
+  the page detaches its MediaSource by itself in both modes: 3643 frames, 16
+  dropped (all off) vs 3715 frames, 12 dropped (new); WebProcess 0.5-1.2
+  cores and title 0.7-1.1 cores in both.
+- Long session (48 loads of `test/stress/long-session.txt`, new child): 0
+  failures, 0 crashes, 0 fallbacks; peak RSS 923 MB (925 MB after 0031);
+  libpas committed 790-1035 MB (670-890 before: it now holds what glib and
+  GStreamer allocate). NetworkProcess: libpas 266-288 MB of pages, peak RSS
+  208-218 MB, as before.
+
+**Networking** (from the code, and `test/net/net-ab.sh`, which loads each
+site cold and warm through ps5wk-shot and prints DNS/connect/TLS/TTFB from
+Resource Timing, `net-summary.py`):
+
+- The NetworkProcess is its own ps5wk-child payload (one per UIProcess);
+  libsoup runs on its main thread, `getaddrinfo` on glib's resolver pool
+  (up to 20 threads), TLS handshakes on the GTask pool (10 threads, then slow
+  growth).
+- libsoup: one session, 256 connections, 6 per host, HTTP/2 with ALPN (so
+  most hosts use one connection), idle timeout 115 s, TCP_NODELAY.
+- DNS: WebKit's `WebKitCachedResolver` keeps answers 60 s (400 per family
+  map). DNS prefetching filled only the Default map, which libsoup's typed
+  lookups never read: fixed in 0034. GNetworkAddress's happy eyeballs waits up
+  to 50 ms for the IPv6 answer once the IPv4 one is in; a prefetched host now
+  gets "no IPv6" at once from the cache.
+- TLS: glib-networking's OpenSSL backend, CA bundle
+  `/data/ps5webkit/etc/ssl/cert.pem` loaded once per process, session
+  resumption on (50 sessions, 10 min, in memory per process); each new
+  connection builds its own `SSL_CTX` (OpenSSL 3, not changed).
+- Disk cache `/data/ps5webkit/browser/cache/WebKitCache/Version 18`; before
+  0034 every body over 16 KiB was written twice and the cache had no working
+  size limit. Memory cache 96 MB (DocumentBrowser). Preconnect
+  (`<link rel=preconnect>`) and speculative revalidation are on.
+- 0034 checked on the console: with the old child, every cache directory
+  had `Blobs/` copies of the bodies (34 KB to 12.9 MB per site, beside the
+  records' copies); with the new one `Blobs/` stays empty, and the warm loads
+  were served from the records' blobs (Wikipedia 30 of 31 resources, GitHub
+  173 of 174, BBC 105 of 106). One round of cold/warm loads, old child vs new
+  (ms to the load event): Wikipedia 891/874 vs 1077/864, GitHub 2287/2875 vs
+  2247/1584, Hacker News 871/343 vs 554/281, BBC 1379/1290 vs 1509/820,
+  YouTube 3656/2681 vs 2923/2463. Single runs over the internet; the
+  cold-load spread is network noise. New TLS connections took 20-50 ms,
+  connect 35-80 ms (YouTube's video hosts ~245 ms), DNS 20-70 ms per new host;
+  the old child's cold YouTube load once spent 2 x 570 ms in DNS.
+- Not changed, worth measuring first: 8 KB reads per main-loop callback
+  (`gDefaultReadBufferSize`), per-connection `SSL_CTX_new`, the WebProcess's
+  own libsoup for hlsdemux2 (no shared connections or TLS sessions with the
+  NetworkProcess).
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

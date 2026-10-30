@@ -722,8 +722,10 @@ port.
   Checked in the title with synthetic streams (TS H.264 and fMP4 HEVC, two
   variants each, `make-media.sh`): both played to the end through the
   hardware decoder with the switch up, 0 decode errors, audio to the title.
-- **Next (follow-up, not started): payload malloc and mutex contention.**
-  `port/webkit/test/lockbench` (a payload; 400k operations per thread):
+- **Payload malloc, mutex contention and networking (2026-10-30, checked on
+  the console by log; port/webkit/README.md, *Locks, malloc and
+  networking*).** `port/webkit/test/lockbench` (a payload; 400k operations per
+  thread, the console's libc):
 
   | threads | malloc/free pair | pthread mutex lock/unlock | sem_wait/sem_post | ALU |
   | --- | --- | --- | --- | --- |
@@ -734,15 +736,54 @@ port.
 
   Total malloc throughput falls from 3.3 to 0.04 million pairs/s as soon as
   two threads allocate, and a contended pthread mutex hands over at ~4-20 us
-  per lock; semaphores scale. Patch 0032 moved Skia and C++ `new`/`delete`
-  in ps5wk-child to libpas. Still on the slow paths: glib, GStreamer, libsoup,
-  FreeType/HarfBuzz/ICU (`malloc`, `g_malloc`), `GMutex`/`GCond` and libc++
-  `std::mutex` (pthread), WTF's ParkingLot park path, and the title's heap
-  (Spike 10's dlmalloc behind one pthread mutex) plus its render, decoder and
-  audio threads. Candidates: interpose `pthread_mutex_*`/`pthread_cond_*` in
-  the payloads (`--wrap`, an adaptive spin-then-semaphore or `_umtx_op` lock;
-  `pthread_mutex_t` is a pointer, `PTHREAD_MUTEX_INITIALIZER` is NULL, and
-  condition variables have to be wrapped with the mutex), and a libpas-backed
-  `malloc` for the remaining C code (careful with memory the console's libc
-  allocates and our code frees). Measure with lockbench, then
-  `test/paint/paint-ab.sh` and YouTube playback (dropped frames) before and after.
+  per lock; semaphores scale. What changed:
+  - **ps5locks** (`apps/common/ps5locks.c`, ps5wk-child and the title):
+    every `pthread_mutex_*`/`pthread_cond_*`/`pthread_rwlock_*` (and the
+    attribute calls) wrapped onto futex words on `_umtx_op`, the call libpas's
+    lock already uses on the console: no hand-over convoy, spin 100 then
+    sleep. Covers GMutex/GCond/GRecMutex/GRWLock, libc++ `std::mutex`, WTF's
+    Mutex/ThreadCondition (ParkingLot's park path), and in the title Spike
+    10's dlmalloc arenas (there are 8, each behind a pthread mutex, not one
+    global lock) and its render/decoder/audio threads. A build check fails
+    if an unwrapped mutex/cond/rwlock function is imported.
+  - **ps5malloc** (`apps/common/ps5malloc.c`, ps5wk-child): malloc and its
+    family on libpas (fastMalloc's heap). Ownership by address: a bitmap of
+    the 16 KiB pages of every anonymous mapping made through the child's
+    `__wrap_mmap` (libpas's only source; the console's malloc never maps
+    through it); anything else (`strdup`, `vasprintf`, `getcwd(NULL)`,
+    `realpath(NULL)` from the console's libc) is freed by the console's libc.
+    The child defines `__emutls_get_address` on the console's malloc
+    (libpas's thread cache is an emulated `__thread`, and compiler-rt's
+    emutls mallocs: it would recurse).
+  - Off switches, decided before main: `/data/ps5webkit/no-fastlock`,
+    `no-fastlock-title`, `no-pasmalloc`. Counters (parks, cond waits, foreign
+    frees) in the child's `[mem]` line.
+  - **Networking** (read from the code, survey in the README): the
+    NetworkProcess is its own payload; libsoup with HTTP/2, 6 per host;
+    WebKit's DNS cache 60 s; TLS via glib-networking/OpenSSL with session
+    resumption; disk cache under `browser/cache`. Patch 0034 fixes three
+    things found: the disk cache wrote every body over 16 KiB twice (0013's
+    copy when `link()` fails) and never shrank (the copies were counted
+    nowhere); DocumentBrowser's disk cache was 75 MB (now 1 GB with 16 GB
+    free); DNS prefetch answers went into a cache map libsoup's typed
+    IPv4/IPv6 lookups never read.
+  - **Measured on the console** (`ps5wk-lockbench`, per operation per
+    thread, 1/2/4/6 threads): malloc/free 279 ns/46.7/107/162 us with the
+    console's libc, 46/45/53/90 ns with ps5malloc (6 threads: 0.04 -> 67 M
+    pairs/s); a contended mutex 4.3/13.6/21.0 us -> 89/364/588 ns; condition
+    ping-pong 8.5 -> 3.7 us; a 4+4 producer/consumer queue 0.13 -> 2.85 M
+    items/s. `_umtx_op` works in payloads and in the title.
+  - **End to end no measurable change** in these runs (painting was already
+    on libpas): paint-ab scroll rates within run-to-run noise; YouTube 4K60
+    in the title 16 vs 12 dropped of ~3700 frames, same CPU; a 48-load long
+    session passed (0 failures, no crash, 0 foreign frees once `strdup` and
+    `vasprintf` were wrapped, peak RSS 923 MB). libpas committed is now
+    790-1035 MB in that session (670-890 before) because it holds glib and
+    GStreamer memory too. Patch 0034 checked: no more `Blobs/` copies (up to
+    12.9 MB per site before), warm loads served from the records' blobs.
+  - Logic tests on the Mac: `test/lockbench/host-test.sh` (clean under
+    ThreadSanitizer and UBSan).
+  - Still open: per-connection `SSL_CTX_new`, 8 KB reads per main-loop
+    callback, the WebProcess's separate libsoup for hlsdemux2; whether spin
+    0 or 100 is better for real workloads (spin 0 wins the 4-6 thread
+    microbenchmark, spin 100 the 2-thread one).
