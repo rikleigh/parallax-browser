@@ -26,6 +26,10 @@
 #                           (hlsdemux starts there and switches up: a size change mid-stream)
 #   hls-fmp4/master.m3u8    the same with HEVC (hvc1) 960x540 and 1920x1080, fMP4 segments
 #                           (EXT-X-MAP)
+#   hls-vr/master.m3u8      H.264 2160x1080 30 fps level 5.0 and two 3840x1920 60 fps level 5.2
+#                           variants with different SPS/PPS, TS segments of 4 s; mixed.m3u8
+#                           switches between them at fixed segments; refs16.m3u8 asks for more
+#                           reference frames than level 5.2 allows at 3840x1920
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -139,13 +143,70 @@ hls() { # <dir> <segment type> <vcodec args> <WxH low> <bitrate low> <WxH high> 
 hls hls-ts   mpegts "-c:v libx264 -profile:v high -preset veryfast -pix_fmt yuv420p" 640x360 800k 1280x720 3M
 hls hls-fmp4 fmp4   "-c:v libx265 -preset superfast -tag:v hvc1 -pix_fmt yuv420p -x265-params log-level=error:open-gop=0" 960x540 1M 1920x1080 5M
 
+# HLS shaped like a VR site's adaptive H.264 (the 2026-10-30 freeze: the
+# picture stopped for good at 3840x1920 while the audio went on, Videodec2
+# failing every AU with 0x811d0304): a 2160x1080 30 fps Main level 5.0
+# variant and two 3840x1920 60 fps Main level 5.2 variants of the same size
+# with different encoder settings (references, B-frames, bitrate: different
+# SPS/PPS), MPEG-TS segments of 4 s cut at the same times (a keyframe every
+# 2 s in every variant). master.m3u8 lists the low variant first (hlsdemux2
+# starts there and switches up by bandwidth); mixed.m3u8 is one media
+# playlist whose segments alternate between the three variants the way an
+# adaptive player's switches arrive (no discontinuity tags), so every switch
+# (2160 -> 3840 A -> 3840 B -> 3840 A -> 2160 ...) happens on every run, also
+# from file://. refs16.m3u8: 3840x1920 level 5.2 asking for 16 reference
+# frames, more than level 5.2's DPB holds at that size (6): not conforming,
+# for a decoder sized from the level. The variants draw their names.
+hls_vr() {
+    local dir=hls-vr secs=48 v
+    [ -s "$OUT/$dir/mixed.m3u8" ] && { echo "  $dir (exists)"; return; }
+    rm -rf "$OUT/$dir"; mkdir -p "$OUT/$dir"
+    vr_variant() { # <name> <WxH> <fps> <level> <x264 args> <bitrate>
+        local name=$1 size=$2 fps=$3 level=$4 xargs=$5 rate=$6 fs
+        fs=$(( ${size#*x} / 8 ))
+        mkdir -p "$OUT/$dir/$name"
+        ( cd "$OUT/$dir/$name" && $FF -f lavfi -i "testsrc2=size=$size:rate=$fps" -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000" \
+            -filter_complex "[0:v]drawtext=fontfile=$FONT:fontsize=$fs:fontcolor=white:box=1:boxcolor=black@0.6:x=(w-tw)/2:y=(h-th)/2:text='%{eif\:t\:d}.%{eif\:mod(n\,$fps)\:d\:2}',drawbox=x=0:y=0:w=iw/8:h=ih/8:color=white:t=fill:enable='lt(mod(t\,1)\,0.1)',drawtext=fontfile=$FONT:fontsize=$((fs/2)):fontcolor=yellow:x=40:y=h-th-40:text='$name $size $fps fps level $level'[v];[1:a]volume=0.25,aformat=channel_layouts=stereo[a]" \
+            -map "[v]" -map "[a]" -t $secs \
+            -c:v libx264 -profile:v main -level:v "$level" -preset veryfast -pix_fmt yuv420p -x264-params "$xargs" \
+            -b:v "$rate" -maxrate "$rate" -bufsize "$rate" -force_key_frames "expr:gte(t,n_forced*2)" -sc_threshold 0 \
+            -c:a aac -b:a 128k \
+            -f hls -hls_time 4 -hls_playlist_type vod -hls_segment_type mpegts -hls_flags independent_segments \
+            -hls_segment_filename "seg%03d.ts" index.m3u8 )
+    }
+    vr_variant low  2160x1080 30 5.0 "ref=3:bframes=3"                      6M
+    vr_variant a    3840x1920 60 5.2 "ref=3:bframes=3:b-pyramid=normal"     16M
+    vr_variant b    3840x1920 60 5.2 "ref=5:bframes=1:b-pyramid=none:weightp=0:8x8dct=0" 12M
+    vr_variant refs16 3840x1920 60 5.2 "ref=16:bframes=3"                   16M
+    {   echo "#EXTM3U"; echo "#EXT-X-VERSION:3"; echo "#EXT-X-INDEPENDENT-SEGMENTS"
+        echo '#EXT-X-STREAM-INF:BANDWIDTH=6500000,RESOLUTION=2160x1080,FRAME-RATE=30.000,CODECS="avc1.4d4032,mp4a.40.2"'; echo "low/index.m3u8"
+        echo '#EXT-X-STREAM-INF:BANDWIDTH=12500000,RESOLUTION=3840x1920,FRAME-RATE=60.000,CODECS="avc1.4d4034,mp4a.40.2"'; echo "b/index.m3u8"
+        echo '#EXT-X-STREAM-INF:BANDWIDTH=16500000,RESOLUTION=3840x1920,FRAME-RATE=60.000,CODECS="avc1.4d4034,mp4a.40.2"'; echo "a/index.m3u8"
+    } > "$OUT/$dir/master.m3u8"
+    # mixed.m3u8: segment i from the variant in the pattern (the segment
+    # lines of one variant playlist, with the variant's directory).
+    local pattern=(low low a a b b a low b a b a) i=0 line
+    {   echo "#EXTM3U"; echo "#EXT-X-VERSION:3"; echo "#EXT-X-TARGETDURATION:4"; echo "#EXT-X-MEDIA-SEQUENCE:0"
+        echo "#EXT-X-PLAYLIST-TYPE:VOD"; echo "#EXT-X-INDEPENDENT-SEGMENTS"
+        while read -r line; do
+            case "$line" in
+                "#EXTINF:"*) echo "$line" ;;
+                seg*.ts) v=${pattern[$((i % ${#pattern[@]}))]}; echo "$v/$line"; i=$((i + 1)) ;;
+            esac
+        done < "$OUT/$dir/low/index.m3u8"
+        echo "#EXT-X-ENDLIST"; } > "$OUT/$dir/mixed.m3u8"
+    sed 's|^seg|refs16/seg|' "$OUT/$dir/refs16/index.m3u8" > "$OUT/$dir/refs16.m3u8"
+    echo "  $dir ($(du -sh "$OUT/$dir" | cut -f1)): master.m3u8, mixed.m3u8 (${pattern[*]}), refs16.m3u8"
+}
+hls_vr
+
 if [ "${1:-}" = --upload ]; then
     FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
     for f in "$OUT"/*.mp4 "$OUT"/*.webm "$OUT"/*.m4a "$OUT"/*.m2ts; do
         echo "  upload $(basename "$f")"
         curl -s --ftp-create-dirs -T "$f" "$FTP/data/ps5webkit/media/$(basename "$f")"
     done
-    for f in "$OUT"/hls-*/master.m3u8 "$OUT"/hls-*/*/*; do
+    for f in "$OUT"/hls-*/*.m3u8 "$OUT"/hls-*/*/*; do
         r="${f#$OUT/}"; echo "  upload $r"
         curl -s --ftp-create-dirs -T "$f" "$FTP/data/ps5webkit/media/$r"
     done

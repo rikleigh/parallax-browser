@@ -1,0 +1,36 @@
+--- a/gst/mpegtsdemux/tsdemux.c
++++ b/gst/mpegtsdemux/tsdemux.c
+@@ -3919,6 +3919,7 @@
+   if (stream->continuity_counter != CONTINUITY_UNSET) {
+     if (((stream->continuity_counter + 1) % 16) != cc) {
+       if (stream->state != PENDING_PACKET_EMPTY) {
++        gint previous = stream->continuity_counter;
+ #ifndef GST_DISABLE_GST_DEBUG
+         gchar *pad_name = NULL;
+ 
+@@ -3949,7 +3950,24 @@
+         }
+         stream->state = PENDING_PACKET_EMPTY;
+ 
+-        return GST_FLOW_OK;
++        /* PS5: a packet that starts a PES is kept. HLS segments made by
++         * separate muxers (each variant, or each segment, numbered on its
++         * own) meet with a continuity jump at every boundary that switches
++         * between them; dropping this packet lost the whole first PES of the
++         * new segment, its IDR access unit with the SPS/PPS, and the
++         * hardware decoder then met P frames without their reference
++         * (Videodec2's sticky 0x811d0304, a frozen picture). Only the
++         * unfinished PES before the jump is dropped. */
++        {
++          static guint mismatches;
++          if (mismatches++ < 10 || mismatches % 100 == 0)
++            g_printerr ("[tsdemux] continuity jump on pid 0x%04x (%d after %d)%s; %u so far\n",
++                stream->stream.pid, cc, previous,
++                packet->payload_unit_start_indicator ?
++                ": the PES it starts is kept" : "", mismatches);
++        }
++        if (!packet->payload_unit_start_indicator)
++          return GST_FLOW_OK;
+       }
+     }
+   }

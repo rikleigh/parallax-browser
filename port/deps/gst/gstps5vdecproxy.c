@@ -627,10 +627,31 @@ static const guint8 *build_au(GstPs5VdecProxy *self, const guint8 *data, gsize s
     }
     GByteArray *au = self->au;
     g_byte_array_set_size(au, 0);
-    if (keyframe && self->param_sets->len)
-        g_byte_array_append(au, self->param_sets->data, self->param_sets->len);
     static const guint8 start[4] = { 0, 0, 0, 1 };
     gsize i = 0, ls = self->nal_length_size;
+    /* codec_data's parameter sets only when the keyframe carries no SPS and
+     * PPS of its own (avc3/hev1, or h264parse keeping them in band): two
+     * copies that differ (codec_data written before the encoder changed a
+     * PPS) put two different sets with one ID in an AU, which Videodec2
+     * refuses (0x811d0301, PS5VR's HEVC remuxes). */
+    if (keyframe && self->param_sets->len) {
+        gboolean sps = FALSE, pps = FALSE, vps = self->codec == PS5WK_VCODEC_H264;
+        for (gsize k = 0; k + ls < size;) {
+            gsize len = 0;
+            for (gsize b = 0; b < ls; b++)
+                len = len << 8 | data[k + b];
+            k += ls;
+            if (!len || len > size - k)
+                break;
+            guint type = self->codec == PS5WK_VCODEC_H264 ? data[k] & 0x1f : (data[k] >> 1) & 0x3f;
+            sps |= self->codec == PS5WK_VCODEC_H264 ? type == 7 : type == 33;
+            pps |= self->codec == PS5WK_VCODEC_H264 ? type == 8 : type == 34;
+            vps |= self->codec != PS5WK_VCODEC_H264 && type == 32;
+            k += len;
+        }
+        if (!sps || !pps || !vps)
+            g_byte_array_append(au, self->param_sets->data, self->param_sets->len);
+    }
     while (i + ls <= size) {
         gsize len = 0;
         for (gsize k = 0; k < ls; k++)

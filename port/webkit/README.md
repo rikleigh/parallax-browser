@@ -1075,6 +1075,78 @@ error and `resize` events with the new size). Over HTTP from the Mac:
 then
 `file:///data/ps5webkit/video.html?src=http://<mac>:8771/hls-ts/master.m3u8&type=application/x-mpegURL`.
 
+**4K60 H.264 HLS froze for good (a VR site on the TV, found and fixed
+2026-10-30).** 2160x1080 Main level 5.0 switching up to 3840x1920 60 fps
+level 5.2 played for a few seconds after each switch up. Then Videodec2 failed every AU
+with `0x811d0304` in 0.08 ms, through keyframes too, and the picture stopped
+while the audio went on. Only a switch down, whose drain resets the decoder,
+brought it back. Three things, all fixed:
+1. **Videodec2's error states are sticky** (libSceVideodec2 13.60,
+   disassembly). `sceVideodec2Decode` keeps flags in the decoder object
+   (+0x48, +0x4c, +0x50). Once a decode sets one, every later call returns
+   that code at once, without decoding, until `sceVideodec2Reset` (which
+   zeroes +0x44..+0x53) or a new decoder. `0x811d0300` comes from VdecCore's
+   `0x80c0000f` (decode status 0x18, hardware result 9): a new sequence
+   without a reset, BBC's switch. `0x811d0304` comes from `0x80c00013`
+   (status 0x15 or 0x1a, hardware result 3 or 11). `0x811d0100` is a
+   decode after a Flush. The other errors are per AU: `0x811d0301`
+   (VdecCore 0x80c00012), `0x811d0302` (0x80c00011), `0x811d0303`
+   (0x80c00010). The title never reset a decoder on errors. **Now**
+   (`PS5VideoDecoder.cpp`) a sticky code, or 8 failed calls in a row,
+   resets it: `vdec2_renew` (delete, create, Reset), the pictures in
+   flight are dropped, and decoding resumes at the next keyframe, with
+   the cached parameter sets in front. If the failing AU is a keyframe,
+   it goes to the fresh decoder again at once, so no GOP is lost. The
+   first failure of a run logs the AU (keyframe or not, NAL types), slot
+   waits and call times; the 5 s line counts `resets after errors` and
+   pictures the decoder `flagged`. Each new H.264 SPS is logged with its
+   profile, level, size, reference frames, VUI reorder and DPB, and the
+   DPB the level allows at that size (`MORE THAN THE LEVEL ALLOWS` when
+   exceeded).
+2. **What put it there (synthetic repro): the IDR of an HLS segment was
+   lost.** `make-media.sh`'s `hls-vr/` (2160x1080 level 5.0 and two
+   3840x1920 60 fps level 5.2 variants with different references and
+   B-frames; `mixed.m3u8` switches between them every few segments) gave
+   exactly the TV log's picture. `0x811d0304` hit the second AU of every
+   segment that switched variants, and two AUs fewer than the files hold
+   reached the title per switch. tsdemux checks MPEG-TS continuity
+   counters. Segments from separate muxers jump there, and on a jump it
+   dropped both the unfinished PES and **the packet that starts the next
+   PES**. That threw away the new segment's whole first PES: its IDR,
+   with the SPS/PPS. Videodec2 then got P frames with no reference
+   picture, under the old variant's SPS. **Patch
+   `port/deps/patches/gst-plugins-bad/0001-...`**: a packet that starts a
+   PES is kept after a jump, and only the unfinished PES before it is
+   dropped (one AU per jump). The child logs
+   `[tsdemux] continuity jump on pid ...` (first 10, then every 100th).
+   hlsdemux2's own variant switches (`master.m3u8`) reset tsdemux and
+   never hit this. Whether the site's segments jump in continuity (each
+   segment muxed on its own) is for the TV check: the `[tsdemux]` line
+   will tell.
+3. **Proxy:** codec_data's parameter sets go in front of a keyframe only
+   when it has no SPS and PPS (and VPS) of its own. Two copies that
+   differed would put two different sets with one ID in an AU (PS5VR saw
+   `0x811d0301` from that).
+
+Checked in the title (log-only, 2026-10-30; `hls-vr` over HTTP from the
+Mac, `tools/serve-media.py`):
+
+| run | before | after |
+| --- | --- | --- |
+| `mixed.m3u8` (6 switches, 2520 AUs) | 2508 AUs reached the title; 27 errors (`0x811d0304` and `0x811d0301`), 6 resets; without the reset it froze at the first switch | 2514 AUs, **2514 pictures, 0 errors**, 5 in-band SPS changes drained and reset, 60 frames/s at 3840x1920 |
+| `master.m3u8` (hlsdemux2's ABR, up, a↔b, down) | 0 errors | 0 errors |
+| `switch-h264.mp4` with `vdec-inject noseqreset` (sticky `0x811d0300` on hardware) | 0 pictures after the first switch (BBC) | 3 resets, the keyframe decoded again each time: 588 of 600 pictures |
+| `refs16.m3u8` (16 references at level 5.2: not conforming) | — | `0x811d0302`/`0x811d0303` from the first IDR; reset at every keyframe, no picture (not decodable by a level-sized DPB; software would be needed) |
+
+The same build played `sync-1080p30-h264.mp4` (avc1, codec_data only),
+`hls-fmp4` (HEVC with a switch), `sync-2160p30-hevc.mp4` and VP9 with 0
+errors. Test knobs, `/data/ps5webkit/vdec-inject` (words, read at each
+decoder open): `noseqreset` (skips the drain at a new in-band SPS, which
+makes the sticky `0x811d0300` happen), `norecover` (the old behaviour),
+`corrupt=<key>` and `truncate=<key>` (damage or cut that AU). The fake
+backend fails with `0x811d0304` from call n until a reset under
+`PS5WK_FAKE_VDEC_STICKY=<n>` (ps5wk-shot).
+
 ## View in VR (Milestone 2 step 3, 2026-10-28)
 
 The `<video>` playing in the page goes into the PS VR2 headset; the page

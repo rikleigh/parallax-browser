@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <pthread.h>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,8 +125,19 @@ struct Decoder {
     pthread_t thread { };
     bool threadStarted { false };
 
+    // Recovery from a decoder that fails every call (decoder thread).
+    bool hwStuck { false };
+    int stuckRC { 0 };
+    unsigned errorRun { 0 }; // decode calls in a row that failed
+    uint64_t ausSinceReset { 0 }, picturesSinceReset { 0 };
+    double lastCallMS { 0 }, lastSlotWaitMS { 0 };
+    // Test knobs (/data/ps5webkit/vdec-inject, read at DOPEN).
+    bool injectNoSequenceReset { false }, injectNoRecovery { false };
+    uint32_t injectCorruptKey { 0 }, injectTruncateKey { 0 };
+
     // Stats (decoder thread).
     uint64_t aus { 0 }, pictures { 0 }, hidden { 0 }, errors { 0 }, skipped { 0 }, noPTS { 0 }, reclaimed { 0 };
+    uint64_t recoveries { 0 }, flagged { 0 };
     int64_t windowStartUS { 0 };
     uint64_t windowAUs { 0 }, windowPictures { 0 };
     double windowCallMS { 0 }, windowCallMaxMS { 0 }, windowSlotWaitMS { 0 };
@@ -273,6 +285,231 @@ static std::vector<uint8_t> paramSetsOf(unsigned codec, const uint8_t* p, size_t
         i = next;
     }
     return out;
+}
+
+// The NAL unit types of an Annex-B access unit, for the log ("7 8 5" or
+// "33 34 19 ..."), at most `max` of them.
+static std::string nalTypesOf(unsigned codec, const uint8_t* p, size_t n, unsigned max = 12)
+{
+    std::string out;
+    unsigned count = 0;
+    for (size_t k = 0; k + 3 < n; k++) {
+        if (p[k] || p[k + 1] || p[k + 2] != 1)
+            continue;
+        uint8_t header = p[k + 3];
+        unsigned type = codec == PS5WK_VCODEC_H264 ? header & 0x1f : (header >> 1) & 0x3f;
+        if (count++ == max) {
+            out += " ...";
+            break;
+        }
+        char b[8];
+        snprintf(b, sizeof b, "%s%u", out.empty() ? "" : " ", type);
+        out += b;
+        k += 3;
+    }
+    return out.empty() ? std::string("none") : out;
+}
+
+// H.264 SPS -> one line for the log: profile, level, size, reference frames
+// and the DPB the level allows at that size (Videodec2 sizes its DPB from
+// the level it is opened with: a stream asking for more references than
+// its level allows is not conforming).
+namespace {
+struct BitReader {
+    std::vector<uint8_t> rbsp;
+    size_t bit { 0 };
+    bool overrun { false };
+    BitReader(const uint8_t* p, size_t n)
+    {
+        unsigned zeros = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (zeros >= 2 && p[i] == 3) {
+                zeros = 0; // emulation prevention byte
+                continue;
+            }
+            rbsp.push_back(p[i]);
+            zeros = p[i] ? 0 : zeros + 1;
+        }
+    }
+    unsigned u(unsigned bits)
+    {
+        unsigned v = 0;
+        for (unsigned i = 0; i < bits; i++) {
+            if (bit >= rbsp.size() * 8) {
+                overrun = true;
+                return v;
+            }
+            v = v << 1 | ((rbsp[bit >> 3] >> (7 - (bit & 7))) & 1);
+            bit++;
+        }
+        return v;
+    }
+    unsigned ue()
+    {
+        unsigned zeros = 0;
+        while (!u(1) && !overrun && zeros < 32)
+            zeros++;
+        return zeros ? (1u << zeros) - 1 + u(zeros) : 0;
+    }
+    int se()
+    {
+        unsigned v = ue();
+        return v & 1 ? static_cast<int>((v + 1) / 2) : -static_cast<int>(v / 2);
+    }
+};
+}
+
+static unsigned h264MaxDpbMbs(unsigned level)
+{
+    switch (level) {
+    case 9: case 10: return 396;
+    case 11: return 900;
+    case 12: case 13: case 20: return 2376;
+    case 21: return 4752;
+    case 22: case 30: return 8100;
+    case 31: return 18000;
+    case 32: return 20480;
+    case 40: case 41: return 32768;
+    case 42: return 34816;
+    case 50: return 110400;
+    case 51: case 52: return 184320;
+    default: return level >= 60 ? 696320 : 0;
+    }
+}
+
+static std::string describeH264SPS(const uint8_t* nal, size_t n)
+{
+    // nal: the SPS NAL unit after its start code (header byte first).
+    if (n < 4)
+        return "short SPS";
+    BitReader b(nal + 1, n - 1);
+    unsigned profile = b.u(8), constraints = b.u(8), level = b.u(8), id = b.ue();
+    unsigned chroma = 1;
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86
+        || profile == 118 || profile == 128 || profile == 138 || profile == 139 || profile == 134 || profile == 135) {
+        chroma = b.ue();
+        if (chroma == 3)
+            b.u(1);
+        b.ue();
+        b.ue();
+        b.u(1);
+        if (b.u(1)) {
+            for (unsigned i = 0; i < (chroma == 3 ? 12u : 8u); i++) {
+                if (!b.u(1))
+                    continue;
+                int last = 8, next = 8;
+                for (unsigned j = 0; j < (i < 6 ? 16u : 64u); j++) {
+                    if (next)
+                        next = (last + b.se() + 256) % 256;
+                    last = next ? next : last;
+                }
+            }
+        }
+    }
+    unsigned frameNumBits = b.ue() + 4, pocType = b.ue();
+    if (!pocType)
+        b.ue();
+    else if (pocType == 1) {
+        b.u(1);
+        b.se();
+        b.se();
+        unsigned cycle = b.ue();
+        for (unsigned i = 0; i < cycle && i < 256; i++)
+            b.se();
+    }
+    unsigned refs = b.ue(), gaps = b.u(1);
+    unsigned widthMbs = b.ue() + 1, heightMapUnits = b.ue() + 1, frameMbsOnly = b.u(1);
+    if (!frameMbsOnly)
+        b.u(1);
+    b.u(1);
+    if (b.u(1)) {
+        b.ue();
+        b.ue();
+        b.ue();
+        b.ue();
+    }
+    int reorder = -1, maxDecFrames = -1;
+    if (b.u(1)) { // VUI
+        if (b.u(1) && b.u(8) == 255)
+            b.u(32);
+        if (b.u(1))
+            b.u(1);
+        if (b.u(1)) {
+            b.u(4);
+            if (b.u(1))
+                b.u(24);
+        }
+        if (b.u(1)) {
+            b.ue();
+            b.ue();
+        }
+        if (b.u(1)) {
+            b.u(32);
+            b.u(32);
+            b.u(1);
+        }
+        auto hrd = [&] {
+            unsigned count = b.ue() + 1;
+            b.u(8);
+            for (unsigned i = 0; i < count && i < 32; i++) {
+                b.ue();
+                b.ue();
+                b.u(1);
+            }
+            b.u(20);
+        };
+        bool nal = b.u(1);
+        if (nal)
+            hrd();
+        bool vcl = b.u(1);
+        if (vcl)
+            hrd();
+        if (nal || vcl)
+            b.u(1);
+        b.u(1);
+        if (b.u(1)) {
+            b.u(1);
+            b.ue();
+            b.ue();
+            b.ue();
+            b.ue();
+            reorder = static_cast<int>(b.ue());
+            maxDecFrames = static_cast<int>(b.ue());
+        }
+    }
+    unsigned heightMbs = heightMapUnits * (frameMbsOnly ? 1 : 2);
+    unsigned dpbMbs = h264MaxDpbMbs(level == 11 && (constraints & 0x10) && profile != 100 ? 9 : level);
+    unsigned dpbFrames = dpbMbs && widthMbs * heightMbs ? std::min(16u, dpbMbs / (widthMbs * heightMbs)) : 0;
+    char line[320];
+    snprintf(line, sizeof line,
+        "SPS %u: profile %u (constraints 0x%02x) level %u.%u, %ux%u MBs (%ux%u)%s, %u reference frames%s, frame_num %u bits, POC type %u; "
+        "VUI reorder %d, max_dec_frame_buffering %d; the level's DPB holds %u frames at this size%s%s",
+        id, profile, constraints, level / 10, level % 10, widthMbs, heightMbs, widthMbs * 16, heightMbs * 16, frameMbsOnly ? "" : " interlaced", refs,
+        gaps ? " (gaps allowed)" : "", frameNumBits, pocType, reorder, maxDecFrames, dpbFrames,
+        dpbFrames && (refs > dpbFrames || maxDecFrames > static_cast<int>(dpbFrames)) ? " (MORE THAN THE LEVEL ALLOWS)" : "",
+        b.overrun ? " (truncated)" : "");
+    return line;
+}
+
+// The SPSs of an Annex-B buffer, described (H.264 only).
+static void logSequence(const char* prefix, uint32_t id, unsigned codec, const std::vector<uint8_t>& sets)
+{
+    if (codec != PS5WK_VCODEC_H264)
+        return;
+    const uint8_t* p = sets.data();
+    size_t n = sets.size();
+    for (size_t k = 0; k + 3 < n; k++) {
+        if (p[k] || p[k + 1] || p[k + 2] != 1)
+            continue;
+        size_t start = k + 3, end = start;
+        while (end + 2 < n && !(p[end] == 0 && p[end + 1] == 0 && (p[end + 2] == 1 || (p[end + 2] == 0 && end + 3 < n && p[end + 3] == 1))))
+            end++;
+        if (end + 2 >= n)
+            end = n;
+        if ((p[start] & 0x1f) == 7)
+            DLOG("decoder %u: %s%s", id, prefix, describeH264SPS(p + start, end - start).c_str());
+        k = end - 1;
+    }
 }
 
 // VP9 superframe (annex B of the VP9 spec) -> frames.
@@ -483,10 +720,12 @@ static void logStats(Decoder& d)
         queued = d.queue.size();
         g_mutex_unlock(&d.lock);
         DLOG("decoder %u (pid %d): %.1f AUs/s in, %.1f pictures/s out; decode call %.2f ms avg %.2f max, waited %.0f ms for slots; "
-             "%u/%zu slots held (%u pinned), %zu AUs queued; so far %llu pictures, %llu hidden, %llu errors, %llu skipped, %llu without pts",
+             "%u/%zu slots held (%u pinned), %zu AUs queued; so far %llu pictures, %llu hidden, %llu errors, %llu skipped, %llu without pts, "
+             "%llu resets after errors, %llu flagged",
             d.id, d.pid, d.windowAUs / seconds, d.windowPictures / seconds, d.windowCalls ? d.windowCallMS / d.windowCalls : 0.0,
             d.windowCallMaxMS, d.windowSlotWaitMS, held, d.slots.size(), pinned, queued, (unsigned long long)d.pictures,
-            (unsigned long long)d.hidden, (unsigned long long)d.errors, (unsigned long long)d.skipped, (unsigned long long)d.noPTS);
+            (unsigned long long)d.hidden, (unsigned long long)d.errors, (unsigned long long)d.skipped, (unsigned long long)d.noPTS,
+            (unsigned long long)d.recoveries, (unsigned long long)d.flagged);
     }
     d.windowStartUS = now;
     d.windowAUs = d.windowPictures = 0;
@@ -494,8 +733,32 @@ static void logStats(Decoder& d)
     d.windowCalls = 0;
 }
 
-static bool decodeUnit(Decoder& d, const uint8_t* data, size_t size, uint64_t pts, int64_t ptsNS, uint32_t epoch)
+// Videodec2's error states (libSceVideodec2 13.60, read from the
+// disassembly): sceVideodec2Decode keeps three flags in the decoder object
+// (+0x48, +0x4c, +0x50). Once a decode sets one, every later Decode returns
+// its code at once, without decoding, until sceVideodec2Reset clears them
+// (Reset zeroes +0x44..+0x53; a new decoder starts clear):
+//   0x811d0300  VdecCore 0x80c0000f, its decode status 0x18 (hardware
+//               result 9): a new sequence without a reset (BBC's in-band
+//               resolution switch, 2026-10-28)
+//   0x811d0304  VdecCore 0x80c00013, its decode status 0x15 or 0x1a
+//               (hardware result 3 or 11): the 4K60 H.264 HLS freeze of
+//               2026-10-30, every AU failed in 0.08 ms for minutes
+//   0x811d0100  Decode after a Flush without a Reset
+// Other decode errors (0x811d0301-0303: an IRAP refused, ...) are per AU.
+static bool stickyError(int rc)
 {
+    unsigned u = static_cast<unsigned>(rc);
+    return u == 0x811d0300u || u == 0x811d0304u || u == 0x811d0100u;
+}
+
+// Decode calls in a row that may fail with a per-AU error before the decoder
+// is reset anyway (and decoding resumes at the next keyframe).
+static constexpr unsigned maxErrorRun = 8;
+
+static bool decodeUnit(Decoder& d, const uint8_t* data, size_t size, uint64_t pts, int64_t ptsNS, uint32_t epoch, bool keyframe)
+{
+    int64_t waitStart = nowUS();
     int slot = waitFreeSlot(d);
     if (slot < 0)
         return false;
@@ -507,15 +770,69 @@ static bool decodeUnit(Decoder& d, const uint8_t* data, size_t size, uint64_t pt
     d.windowCallMS += ms;
     d.windowCallMaxMS = std::max(d.windowCallMaxMS, ms);
     d.windowCalls++;
+    d.ausSinceReset++;
     if (rc) {
         if (!d.errors++)
             d.firstRC = rc;
-        if (d.errors <= 5 || !(d.errors % 100))
+        if (!d.errorRun++) {
+            // The first failure after decoding went well: what led to it.
+            unsigned held = 0;
+            g_mutex_lock(&d.lock);
+            for (auto& s : d.slots)
+                held += s.state == Slot::Held;
+            g_mutex_unlock(&d.lock);
+            DLOG("decoder %u: decode rc 0x%08x%s at key %u (%s, %zu bytes, NAL types %s) after %llu AUs and %llu pictures since the last reset; "
+                 "this call %.2f ms, waited %.1f ms for a slot (previous call %.2f ms, waited %.1f ms), %u/%zu slots held, %llu pictures flagged so far",
+                d.id, static_cast<unsigned>(rc), stickyError(rc) ? " (sticky until a reset)" : "", static_cast<unsigned>(pts),
+                keyframe ? "keyframe" : "not a keyframe", size, nalTypesOf(d.codec, data, size).c_str(), (unsigned long long)d.ausSinceReset,
+                (unsigned long long)d.picturesSinceReset, ms, (start - waitStart) / 1000.0, d.lastCallMS, d.lastSlotWaitMS, held, d.slots.size(),
+                (unsigned long long)d.flagged);
+        } else if (d.errors <= 5 || !(d.errors % 100))
             DLOG("decoder %u: decode rc 0x%08x (%llu errors; AU %zu bytes, key %u)", d.id, static_cast<unsigned>(rc),
                 (unsigned long long)d.errors, size, static_cast<unsigned>(pts));
+        if (!d.injectNoRecovery && (stickyError(rc) || d.errorRun >= maxErrorRun)) {
+            d.hwStuck = true;
+            d.stuckRC = rc;
+        }
+    } else
+        d.errorRun = 0;
+    d.lastCallMS = ms;
+    d.lastSlotWaitMS = (start - waitStart) / 1000.0;
+    if (pic.valid) {
+        d.picturesSinceReset++;
+        if (pic.error && !d.flagged++)
+            DLOG("decoder %u: first picture flagged with an error by the decoder (key %u)", d.id, static_cast<unsigned>(pic.pts));
     }
     handlePicture(d, pic, slot, epoch);
     return !rc;
+}
+
+// The decoder fails every call (a sticky error, or maxErrorRun failures in
+// a row): what is in flight is lost; a fresh decoder (vdec2_renew: delete,
+// create, reset) takes the stream again at the next keyframe, with the
+// cached parameter sets in front if it carries none. Without this the
+// picture froze for good while the audio went on (2026-10-30), until a
+// variant switch happened to drain and reset the decoder.
+static void recover(Decoder& d, uint32_t epoch)
+{
+    d.hwStuck = false;
+    d.recoveries++;
+    std::vector<uint32_t> lost;
+    for (auto& [key, ptsNS] : d.outstanding)
+        lost.push_back(key);
+    for (auto key : lost)
+        sendPicture(d, key, epoch, 3, nullptr);
+    d.outstanding.clear();
+    int64_t start = nowUS();
+    int rc = backend->reset(d.hw);
+    if (d.recoveries <= 10 || !(d.recoveries % 50))
+        DLOG("decoder %u: reset after rc 0x%08x (%u failed calls in a row, %llu AUs since the last reset): %zu pictures in flight dropped, "
+             "reset rc 0x%08x in %.1f ms; decoding resumes at a keyframe (%llu recoveries so far)",
+            d.id, static_cast<unsigned>(d.stuckRC), d.errorRun, (unsigned long long)d.ausSinceReset, lost.size(), static_cast<unsigned>(rc),
+            (nowUS() - start) / 1000.0, (unsigned long long)d.recoveries);
+    d.errorRun = 0;
+    d.ausSinceReset = d.picturesSinceReset = 0;
+    d.needKeyframe = true;
 }
 
 static void drain(Decoder&, uint32_t epoch);
@@ -541,14 +858,42 @@ static void processAU(Decoder& d, AccessUnit& au)
         for (auto& [p, n] : frames) {
             bool show = vp9Shown(p, n);
             shown |= show;
-            ok &= decodeUnit(d, p, n, au.key | (show ? 0 : hiddenFlag), au.ptsNS, au.epoch);
+            ok &= decodeUnit(d, p, n, au.key | (show ? 0 : hiddenFlag), au.ptsNS, au.epoch, keyframe);
+            if (d.hwStuck)
+                break;
         }
         if (!shown || !ok)
             sendPicture(d, au.key, au.epoch, shown ? 3 : 1, nullptr);
+        if (d.hwStuck)
+            recover(d, au.epoch);
         return;
     }
 
     // H.264 / HEVC (Annex-B): start at a keyframe with its parameter sets.
+    if (d.codec == PS5WK_VCODEC_H264) {
+        // Diagnostics: an AU holding more than one picture's start (two
+        // access unit delimiters, or IDR and non-IDR slices together), or a
+        // non-keyframe carrying an SPS.
+        unsigned auds = 0, idr = 0, nonIdr = 0, sps = 0;
+        const uint8_t* p = au.data.data();
+        size_t n = au.data.size();
+        for (size_t k = 0; k + 3 < n; k++) {
+            if (p[k] || p[k + 1] || p[k + 2] != 1)
+                continue;
+            unsigned type = p[k + 3] & 0x1f;
+            auds += type == 9;
+            idr += type == 5;
+            nonIdr += type == 1;
+            sps += type == 7;
+            k += 3;
+        }
+        if (auds > 1 || (idr && nonIdr) || (sps && !keyframe) || (idr && !keyframe)) {
+            static unsigned reported;
+            if (reported++ < 20)
+                DLOG("decoder %u: odd AU %u (%s, %zu bytes): NAL types %s", d.id, au.key, keyframe ? "keyframe" : "not a keyframe", n,
+                    nalTypesOf(d.codec, p, n, 24).c_str());
+        }
+    }
     if (d.needKeyframe && !keyframe) {
         d.skipped++;
         sendPicture(d, au.key, au.epoch, 2, nullptr);
@@ -564,7 +909,9 @@ static void processAU(Decoder& d, AccessUnit& au)
         // changed. Repeated identical SPSs don't count.
         auto sequence = keyframe ? paramSetsOf(d.codec, sets.data(), sets.size(), true) : std::vector<uint8_t>();
         if (!sequence.empty()) {
-            if (!d.sequenceSets.empty() && sequence != d.sequenceSets && !d.needKeyframe) {
+            if (sequence != d.sequenceSets)
+                logSequence(d.sequenceSets.empty() ? "" : "new ", d.id, d.codec, sequence);
+            if (!d.sequenceSets.empty() && sequence != d.sequenceSets && !d.needKeyframe && !d.injectNoSequenceReset) {
                 d.formatChanges++;
                 DLOG("decoder %u: new sequence parameters at AU %u: drained and reset (%llu so far)", d.id, au.key,
                     (unsigned long long)d.formatChanges);
@@ -572,13 +919,46 @@ static void processAU(Decoder& d, AccessUnit& au)
             }
             d.sequenceSets = std::move(sequence);
         }
-        d.paramSets = std::move(sets);
-    } else if (d.needKeyframe && !d.paramSets.empty())
+        d.paramSets = sets;
+    }
+    bool prepended = false;
+    if (sets.empty() && d.needKeyframe && !d.paramSets.empty()) {
         au.data.insert(au.data.begin(), d.paramSets.begin(), d.paramSets.end());
+        prepended = true;
+    }
     d.needKeyframe = false;
     d.outstanding[au.key] = au.ptsNS;
-    if (!decodeUnit(d, au.data.data(), au.data.size(), au.key, au.ptsNS, au.epoch))
+    if (au.key && (au.key == d.injectCorruptKey || au.key == d.injectTruncateKey) && au.data.size() > 64) {
+        // Test knob: damage this AU's slice data (the last NAL unit's second
+        // half), or cut it in half, as a lost or truncated segment would.
+        size_t size = au.data.size();
+        if (au.key == d.injectTruncateKey)
+            au.data.resize(size / 2);
+        else
+            for (size_t i = size / 2; i < size; i++)
+                au.data[i] = static_cast<uint8_t>(i * 2654435761u >> 13) | 1;
+        DLOG("decoder %u: AU %u %s (/data/ps5webkit/vdec-inject)", d.id, au.key, au.key == d.injectTruncateKey ? "cut in half" : "damaged");
+    }
+    bool ok = decodeUnit(d, au.data.data(), au.data.size(), au.key, au.ptsNS, au.epoch, keyframe);
+    if (!ok && d.hwStuck && keyframe) {
+        // The keyframe itself met the stuck decoder (a sticky error answers
+        // at once, without decoding): a fresh decoder takes it again, once,
+        // so no GOP is lost (BBC's switch without the drain, 0x811d0300,
+        // decoded at the retry).
+        d.outstanding.erase(au.key);
+        recover(d, au.epoch);
+        if (sets.empty() && !prepended && !d.paramSets.empty())
+            au.data.insert(au.data.begin(), d.paramSets.begin(), d.paramSets.end());
+        d.needKeyframe = false;
+        d.outstanding[au.key] = au.ptsNS;
+        ok = decodeUnit(d, au.data.data(), au.data.size(), au.key, au.ptsNS, au.epoch, keyframe);
+        if (d.recoveries <= 10 || !(d.recoveries % 50))
+            DLOG("decoder %u: keyframe %u again on the fresh decoder: %s", d.id, au.key, ok ? "decoded" : "failed too");
+    }
+    if (!ok)
         sendPicture(d, au.key, au.epoch, 3, nullptr);
+    if (d.hwStuck)
+        recover(d, au.epoch);
 }
 
 static void drain(Decoder& d, uint32_t epoch)
@@ -604,6 +984,9 @@ static void drain(Decoder& d, uint32_t epoch)
     d.outstanding.clear();
     backend->reset(d.hw);
     d.needKeyframe = true;
+    d.hwStuck = false;
+    d.errorRun = 0;
+    d.ausSinceReset = d.picturesSinceReset = 0;
 }
 
 static void* decoderThread(void* data)
@@ -624,6 +1007,9 @@ static void* decoderThread(void* data)
             backend->reset(d->hw);
             d->needKeyframe = true;
             d->outstanding.clear();
+            d->hwStuck = false;
+            d->errorRun = 0;
+            d->ausSinceReset = d->picturesSinceReset = 0;
             continue;
         }
         if (!d->queue.empty()) {
@@ -686,6 +1072,35 @@ static unsigned openDecoders()
     unsigned n = decoders.size();
     g_mutex_unlock(&decodersLock);
     return n;
+}
+
+// Test knobs, /data/ps5webkit/vdec-inject (words, read at each DOPEN):
+//   noseqreset   don't drain and reset at a new in-band SPS (reproduces
+//                Videodec2's sticky 0x811d0300 with switch-h264.mp4)
+//   norecover    don't reset a decoder that fails every call (the old way)
+//   corrupt=<key> / truncate=<key>   damage / cut that AU (H.264, HEVC)
+static void readInjectKnobs(Decoder& d)
+{
+    d.injectNoSequenceReset = d.injectNoRecovery = false;
+    d.injectCorruptKey = d.injectTruncateKey = 0;
+    FILE* f = fopen("/data/ps5webkit/vdec-inject", "r");
+    if (!f)
+        return;
+    char word[64];
+    while (fscanf(f, "%63s", word) == 1) {
+        unsigned key = 0;
+        if (!strcmp(word, "noseqreset"))
+            d.injectNoSequenceReset = true;
+        else if (!strcmp(word, "norecover"))
+            d.injectNoRecovery = true;
+        else if (sscanf(word, "corrupt=%u", &key) == 1)
+            d.injectCorruptKey = key;
+        else if (sscanf(word, "truncate=%u", &key) == 1)
+            d.injectTruncateKey = key;
+    }
+    fclose(f);
+    DLOG("decoder for pid %d: /data/ps5webkit/vdec-inject:%s%s corrupt key %u, truncate key %u", d.pid, d.injectNoSequenceReset ? " noseqreset" : "",
+        d.injectNoRecovery ? " norecover" : "", d.injectCorruptKey, d.injectTruncateKey);
 }
 
 // DOPEN: returns the status for DOPEN_ACK.
@@ -781,6 +1196,10 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
     d->frameBytes = frameBytes;
     d->frameAlign = frameAlign;
     d->needKeyframe = true;
+    d->hwStuck = false;
+    d->errorRun = 0;
+    d->ausSinceReset = d->picturesSinceReset = 0;
+    readInjectKnobs(*d);
     d->paramSets.clear();
     d->sequenceSets.clear();
     d->outstanding.clear();
@@ -915,10 +1334,10 @@ void serve(int fd, int pid, int streamID)
     }
 done:
     if (d->id || d->aus) { // a connection that never opened a decoder (no hardware) says nothing
-        DLOG("decoder %u from pid %d closed: %llu AUs (%.1f MB), %llu pictures, %llu hidden, %llu errors (first rc 0x%08x), %llu skipped before a keyframe, %llu refused, %llu format changes",
+        DLOG("decoder %u from pid %d closed: %llu AUs (%.1f MB), %llu pictures, %llu hidden, %llu errors (first rc 0x%08x), %llu skipped before a keyframe, %llu refused, %llu format changes, %llu resets after errors",
             d->id, pid, (unsigned long long)d->aus, auBytes / 1048576.0, (unsigned long long)d->pictures, (unsigned long long)d->hidden,
             (unsigned long long)d->errors, static_cast<unsigned>(d->firstRC), (unsigned long long)d->skipped, (unsigned long long)refused,
-            (unsigned long long)d->formatChanges);
+            (unsigned long long)d->formatChanges, (unsigned long long)d->recoveries);
     }
     closeHardware(*d);
     d->fd = -1;
@@ -980,6 +1399,8 @@ void release(uint32_t decoder, uint32_t token, bool wasPinned)
 namespace {
 struct FakeDecoder {
     std::multimap<int64_t, uint64_t> held; // PTS -> pts given; display order out
+    unsigned calls { 0 };
+    bool stuck { false }; // as Videodec2's sticky errors: every call fails until a reset
 };
 
 void* fakeOpen(unsigned, unsigned, unsigned, int, int, size_t* frameBytes, size_t* frameAlign, char*, size_t)
@@ -1016,6 +1437,13 @@ int fakeDecode(void* h, const void*, size_t, uint64_t pts, int64_t ptsNS, void* 
         struct timespec ts = { delayMS / 1000, (delayMS % 1000) * 1000000L };
         nanosleep(&ts, nullptr);
     }
+    // PS5WK_FAKE_VDEC_STICKY=<n>: call n fails and so does every call after
+    // it until a reset, with Videodec2's 0x811d0304 (the recovery path).
+    static const char* sticky = g_getenv("PS5WK_FAKE_VDEC_STICKY");
+    if (sticky && ++f->calls == static_cast<unsigned>(atoi(sticky)))
+        f->stuck = true;
+    if (f->stuck)
+        return static_cast<int>(0x811d0304u);
     f->held.emplace(ptsNS, pts);
     if (f->held.size() > 4) // a reorder window, as the hardware's pipeline
         fakeOut(f, frame, pic);
@@ -1033,6 +1461,7 @@ int fakeFlush(void* h, void* frame, ps5wk_vdec_picture* pic)
 int fakeReset(void* h)
 {
     static_cast<FakeDecoder*>(h)->held.clear();
+    static_cast<FakeDecoder*>(h)->stuck = false;
     return 0;
 }
 

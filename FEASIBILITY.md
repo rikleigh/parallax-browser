@@ -722,6 +722,20 @@ port.
   Checked in the title with synthetic streams (TS H.264 and fMP4 HEVC, two
   variants each, `make-media.sh`): both played to the end through the
   hardware decoder with the switch up, 0 decode errors, audio to the title.
+- **4K60 H.264 HLS froze for good (2026-10-30, port/webkit/README.md,
+  *HLS streams*).** Videodec2's error states are sticky (13.60
+  disassembly): after `0x811d0304`/`0x811d0300` every Decode fails at once
+  until a Reset. The title never reset a decoder on errors, so the picture
+  stopped while the audio went on. What triggered it (synthetic repro
+  `hls-vr/mixed.m3u8`): tsdemux dropped the packet that starts a PES after
+  an MPEG-TS continuity jump between segments, so the new segment's IDR
+  with its SPS/PPS never reached the decoder. Fixes: the title resets a
+  stuck decoder and resumes at a keyframe (retrying a failed keyframe
+  once); a gst-plugins-bad patch keeps the PES start after a jump; the
+  proxy no longer doubles parameter sets. Checked log-only in the title:
+  `mixed.m3u8` went from 27 errors to 0 (2514 of 2514 pictures), and
+  hlsdemux2's ABR switches, local H.264/HEVC/VP9 played without errors.
+  The TV check on the site is still to do.
 - **Payload malloc, mutex contention and networking (2026-10-30, checked on
   the console by log; port/webkit/README.md, *Locks, malloc and
   networking*).** `port/webkit/test/lockbench` (a payload; 400k operations per
