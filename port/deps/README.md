@@ -237,7 +237,7 @@ Plugins registered (`gst-inspect` names in brackets):
 | core | coreelements [queue, queue2, multiqueue, typefind, tee, identity, fakesink, capsfilter, ...] |
 | -base | app [appsrc, appsink], playback [playbin3, decodebin3, parsebin, uridecodebin3, urisourcebin], typefindfunctions, audioconvert, audioresample, videoconvertscale, volume, pbtypes, rawparse, subparse, gio |
 | -good | isomp4 [qtdemux], matroska [matroskademux], audioparsers [aacparse, mpegaudioparse, ...], adaptivedemux2 [hlsdemux2, dashdemux2, mssdemux2], id3demux, apetag, icydemux, wavparse |
-| -bad | videoparsersbad [h264parse, h265parse, vp9parse, av1parse, ...], mpegtsdemux [tsdemux], mpegpsdemux, id3tag, hls [hlsdemux, hlssink, hlssink2] |
+| -bad | videoparsersbad [h264parse, h265parse, vp9parse, av1parse, ...], mpegtsdemux [tsdemux], mpegpsdemux, id3tag |
 | gst-libav | avdec_h264, avdec_h265, avdec_vp8, avdec_vp9, avdec_libdav1d (AV1), avdec_aac, avdec_opus, avdec_mp3, avdec_flac, ... |
 
 Not registered: `soup` (souphttpsrc; it is built because adaptivedemux2
@@ -246,13 +246,9 @@ GL, mse (WebKit has its own MSE), encoders, ALSA/pulse sinks (audio output is
 the PS5 backend's job), orc. adaptivedemux2 links libsoup and uses OpenSSL
 for HLS AES-128.
 
-HLS goes through **-bad's legacy `hls` plugin** (`-Dhls=enabled
--Dhls-crypto=openssl`), not adaptivedemux2: legacy hlsdemux downloads the
-playlists and segments with GstURIDownloader / `gst_element_make_from_uri`,
-which picks the highest-ranked http source, WebKit's `webkitwebsrc` (the
-NetworkProcess, the page's cookies). WebKit demotes `hlsdemux2`/`dashdemux2`
-to rank NONE because they fetch with their own libsoup. WebKit also needs
-`WEBKIT_GST_ENABLE_HLS_SUPPORT=1`, which ps5wk-child sets.
+HLS goes through adaptivedemux2's `hlsdemux2` (WebKit patch 0033 keeps its
+rank; port/webkit/README.md, *HLS streams*). -bad's legacy `hls` plugin is
+not built: playbin3's urisourcebin refuses it (not streams-aware).
 
 FFmpeg configuration: `--disable-everything` plus decoders aac, aac_fixed,
 aac_latm, mp3, mp3float, opus, vorbis, flac, pcm_s16le/f32le, h264, hevc,

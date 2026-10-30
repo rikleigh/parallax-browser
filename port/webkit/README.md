@@ -331,6 +331,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0030-ps5-jit | the JIT (Baseline, DFG, FTL, YARR) for PS5 payloads: off by default on PS5 (`useJIT=false` in `Options::overrideDefaults`, a title can map RWX memory but faults executing it), turned on by ps5wk-child for WebProcesses and by the jsc shell; a 128 MB executable pool (x86_64's 1 GB would cost ~512 page tables); WebAssembly built (B3 does not compile without it) but off at run time, no fast memory; DFG/FTL compiler threads get 2 MB stacks; WTF's fault handlers use the alternate signal stack and pass faults that are not theirs to the crash guard; `ps5wk_jit_memory()` for the `[mem]` line and the crash guard; jsc shell links the dependency libraries and reads ICU data from /data/ps5webkit/share/icu; `InlineCacheCompiler.h` includes `CCallHelpers.h` (LLIntOffsetsExtractor did not compile with the JIT on) |
 | 0031-ps5-libpas-decommit | PS5 only: libpas gives decommitted memory back (replaces 0006's zero-only decommit): 16 KiB granules (the page size), decommit maps fresh anonymous pages over whole pages (`madvise` and `mprotect` leave them resident on the console, `test/memprobe`), commit is a no-op; executable memory is only zeroed; `PS5WK_PAS_DECOMMIT=0` restores the zero-only behaviour; `pas_page_malloc_ps5_decommitted_bytes` for the `[mem]` line |
 | 0032-ps5-cpu-painting | PS5 only, CPU page painting (see *CPU painting* below): a frame is recorded into an SkPicture and replayed in horizontal bands on `PS5WK_PAINT_THREADS` threads (default 4; `PS5WK_PAINT_ASYNC=1`: replayed on the pool while the main thread goes on); scrolls move the last frame's pixels and only the uncovered strip and what changed is painted, every frame starts from a copy of the last one (`PS5WK_SCROLL_COPY=0`: repaint on scroll, as upstream); damage is painted as non-overlapping rects (`rectsForPainting`; iterating the damage painted overlaps several times); no full-frame `readPixels` of the SHM surface onto itself (`PS5WK_SHM_READBACK=1` restores it); Skia's heap (`sk_malloc`) is WebKit's libpas (the console's libc malloc collapses under threads, `test/lockbench`); `[render]` lines with per-phase timing; the 0016 throttle no longer drops an update when it fires during a pending frame |
+| 0033-ps5-hlsdemux2 | PS5 only: HLS through adaptivedemux2's `hlsdemux2` when `WEBKIT_GST_ENABLE_HLS_SUPPORT=1` (upstream always demotes it: it downloads with its own libsoup, which a sandboxed media process can't; the PS5 WebProcess can), the only HLS demuxer playbin3 takes; webkitwebsrc adds the page's User-Agent to its http-headers event (the NetworkProcess adds it to the real request), which hlsdemux2 uses for its own requests |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -1016,43 +1017,61 @@ The plan this followed:
 4. **"View in VR"** samples the same RGBA texture on a sphere or dome
    (Spike 9's `vr360`/`vr180`), so it needs nothing from the page.
 
-## HLS streams (`<video>` with an .m3u8, a VR site, 2026-10-30)
+## HLS streams (`<video>` with an .m3u8, 2026-10-30)
 
-a VR site's player (Delight XR) puts an HLS master playlist (a signed
-nginx-vod `.urlset/master.m3u8`) in a `<source>`; the `<source>` failed at
-once (networkState 3, nothing fetched) because WebKit only advertises
-`application/vnd.apple.mpegurl` / `application/x-mpegurl` and only lets
-playbin plug `hlsdemux` when `WEBKIT_GST_ENABLE_HLS_SUPPORT=1`, and our
-GStreamer had no `hlsdemux` anyway (adaptivedemux2's `hlsdemux2` is there,
-but WebKit demotes it: it downloads with its own libsoup).
+A video site's player put an HLS master playlist (a signed nginx-vod
+`.urlset/master.m3u8`) in a `<source>`, which failed at once (networkState 3,
+nothing fetched): WebKit only advertises `application/vnd.apple.mpegurl` /
+`application/x-mpegurl` with `WEBKIT_GST_ENABLE_HLS_SUPPORT=1`, and it always
+demotes adaptivedemux2's `hlsdemux2` (it downloads with its own libsoup,
+which a sandboxed media process can't).
 
-- **port/deps:** gst-plugins-bad's legacy `hls` plugin is now built and
-  registered (`hlsdemux`; port/deps/README.md). It fetches the playlists and
-  segments through `webkitwebsrc` (GstURIDownloader forwards the
-  need-context for WebKit's loader to the pipeline), so they go through the
-  NetworkProcess with the page's cookies, as WebKit intends. TS, fMP4
-  (`EXT-X-MAP`) and AES-128 (OpenSSL) segments; alternate audio renditions
-  (`EXT-X-MEDIA`) are not played by the legacy demuxer, only the variant's
-  own streams.
 - **ps5wk-child** sets `WEBKIT_GST_ENABLE_HLS_SUPPORT=1` (child.env can set
   0). `canPlayType('application/vnd.apple.mpegurl')` now says "maybe", so
   players that prefer native HLS (Safari-style) use it instead of hls.js +
   MSE.
+- **Patch 0033** keeps `hlsdemux2`'s rank on PS5 when HLS is on. The
+  WebProcess is a payload with libsoup and the same TLS setup as the
+  NetworkProcess, so hlsdemux2's own downloads work. webkitwebsrc fetches
+  the master playlist (through the NetworkProcess, with cookies), hlsdemux2
+  the variant playlists and segments. It takes the User-Agent and Referer
+  from webkitwebsrc's http-headers event; the User-Agent is added there by
+  0033, since the NetworkProcess sets it on the real request only. **Not
+  sent: the page's cookies** (WebKit keeps them in the NetworkProcess), and
+  the requests skip WebKit's CORS checks. Signed segment URLs need neither.
+  hlsdemux2 also plays separate audio renditions (`EXT-X-MEDIA`).
+- **First try, dropped:** gst-plugins-bad's legacy `hlsdemux`, which
+  downloads through webkitwebsrc. playbin3 (WebKit's choice for all
+  playback on GStreamer 1.28) refuses it: "Adaptive demuxer is not
+  streams-aware". With `WEBKIT_GST_USE_PLAYBIN2=1` it fetched the first
+  segment and then stalled. It is not built.
 - Downstream nothing changes: tsdemux or qtdemux, h264parse/h265parse, the
   hardware decoder (`ps5vdecproxy`) or avdec, aacparse and avdec_aac. A
-  variant switch is a new SPS (TS) or a new init segment (fMP4) on the same
-  pads, so caps change mid-stream and the proxy drains and reopens the
-  decoder as for BBC's switches (*Resolution switches* above).
+  variant switch is a new SPS (TS) or a new init segment (fMP4), so caps
+  change mid-stream and the proxy drains and reopens the decoder as for
+  BBC's switches (*Resolution switches* above).
+
+**Checked in the title** (log-only, 2026-10-30): `hls-ts` over HTTP and
+from file:// played to the end, 640x360 -> 1280x720 at 2 s (the proxy
+drained, the title kept its 1920x1088 decoder), 1200 pictures, 0 decode
+errors, 1 frame dropped, 30 frames/s, audio to the title. `hls-fmp4` (HEVC)
+over HTTP: 960x540 -> 1920x1080 reopened the decoder (8 frames dropped at
+the switch, none after), 0 errors. Every request after the master playlist
+came from hlsdemux2 with the browser's User-Agent (`tools/serve-media.py`).
+A first HEVC stream with x265's default open GOPs dropped ~5 frames at every
+segment start: ffmpeg's segments overlapped in PTS (the keyframe and a B
+frame with the same timestamp); `make-media.sh` now encodes closed GOPs.
+Not checked: seeking in an HLS stream, AES-128 segments, live playlists.
 
 Test streams: `test/media/make-media.sh` makes `hls-ts/` (640x360 and
 1280x720 H.264 + AAC, 2 s TS segments) and `hls-fmp4/` (960x540 and
 1920x1080 HEVC + AAC, fMP4), each variant labelled, the low one listed
-first so hlsdemux starts there and switches up. `video.html` plays them from
+first so hlsdemux2 starts there and switches up. `video.html` plays them from
 file:// (`--upload` copies them) and takes `&type=<MIME>` to load through
 `<source type=...>` as players do (it logs `canPlayType`, the `<source>`
 error and `resize` events with the new size). Over HTTP from the Mac:
-`tools/serve-media.py` (port 8771, logs each request's User-Agent and Range:
-WebKit's user agent means webkitwebsrc fetched it), then
+`tools/serve-media.py` (port 8771, logs each request's User-Agent and Range),
+then
 `file:///data/ps5webkit/video.html?src=http://<mac>:8771/hls-ts/master.m3u8&type=application/x-mpegURL`.
 
 ## View in VR (Milestone 2 step 3, 2026-10-28)

@@ -713,13 +713,15 @@ port.
   a decode error after 9 s of silence from the title. Built, not yet checked
   on the console: `preview.html` with synthetic previews.
 - **HLS in `<video>` (2026-10-30, port/webkit/README.md, *HLS streams*):**
-  a VR site's player sets an HLS master playlist as a `<source>`, which
-  failed at once: WebKit only takes HLS with `WEBKIT_GST_ENABLE_HLS_SUPPORT=1`
-  and through the legacy `hlsdemux` (downloads via webkitwebsrc and the
-  NetworkProcess), which we didn't build. gst-plugins-bad's `hls` plugin is
-  now in gstreamer-full and the children set the variable. Synthetic streams
-  (`make-media.sh`: TS H.264 and fMP4 HEVC, two variants each) and
-  `tools/serve-media.py` for the check. Built, not yet checked on the console.
+  a site's player set an HLS master playlist as a `<source>`, which failed
+  at once: WebKit only takes HLS with `WEBKIT_GST_ENABLE_HLS_SUPPORT=1`, and
+  demotes adaptivedemux2's `hlsdemux2` because it downloads by itself. The
+  children set the variable and patch 0033 keeps hlsdemux2 (the WebProcess
+  payload has its own networking; the page's User-Agent is passed on, not
+  its cookies). The legacy hlsdemux was tried first: playbin3 refuses it.
+  Checked in the title with synthetic streams (TS H.264 and fMP4 HEVC, two
+  variants each, `make-media.sh`): both played to the end through the
+  hardware decoder with the switch up, 0 decode errors, audio to the title.
 - **Next (follow-up, not started): payload malloc and mutex contention.**
   `port/webkit/test/lockbench` (a payload; 400k operations per thread):
 

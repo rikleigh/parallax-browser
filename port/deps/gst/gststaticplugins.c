@@ -11,10 +11,10 @@
  * Keep GST_PS5_PLUGINS in sync with GST_FULL_PLUGINS in build.sh.
  * Not registered on purpose: "soup" (souphttpsrc): WebKit fetches media
  * through its own webkitwebsrc and NetworkProcess; adaptivedemux2 links
- * libsoup itself for its downloads (WebKit demotes hlsdemux2/dashdemux2 for
- * that reason). "hls" is gst-plugins-bad's legacy hlsdemux: it downloads
- * through gst_element_make_from_uri, i.e. webkitwebsrc and the
- * NetworkProcess, which is WebKit's supported HLS path.
+ * libsoup itself for its downloads (WebKit demotes hlsdemux2 for that
+ * reason; patch 0033 keeps it for HLS on PS5, where the WebProcess has its
+ * own networking). -bad's legacy hlsdemux is not built: playbin3's
+ * urisourcebin refuses demuxers that are not streams-aware.
  */
 #include <gst/gst.h>
 
@@ -27,7 +27,7 @@
                          X(apetag) X(icydemux) X(wavparse) X(adaptivedemux2) \
                          X(autodetect) X(deinterlace) X(videofilter) X(audiofx) \
     /* -bad */           X(videoparsersbad) X(mpegtsdemux) X(mpegpsdemux)    \
-                         X(id3tag) X(hls)                                    \
+                         X(id3tag)                                           \
     /* gst-libav */      X(libav)                                            \
     /* ours: audio and hole-punch video to the title */ X(ps5audio) X(ps5video)
 

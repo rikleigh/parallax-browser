@@ -137,7 +137,7 @@ hls() { # <dir> <segment type> <vcodec args> <WxH low> <bitrate low> <WxH high> 
     echo "  $dir ($(du -sh "$OUT/$dir" | cut -f1))"
 }
 hls hls-ts   mpegts "-c:v libx264 -profile:v high -preset veryfast -pix_fmt yuv420p" 640x360 800k 1280x720 3M
-hls hls-fmp4 fmp4   "-c:v libx265 -preset superfast -tag:v hvc1 -pix_fmt yuv420p -x265-params log-level=error" 960x540 1M 1920x1080 5M
+hls hls-fmp4 fmp4   "-c:v libx265 -preset superfast -tag:v hvc1 -pix_fmt yuv420p -x265-params log-level=error:open-gop=0" 960x540 1M 1920x1080 5M
 
 if [ "${1:-}" = --upload ]; then
     FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"

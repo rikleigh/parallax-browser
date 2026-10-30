@@ -1,0 +1,116 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp b/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp
+index 290806b4fb..d6e2839cfd 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp
+@@ -606,6 +606,15 @@ void registerWebKitGStreamerElements()
+         if (gst_check_version(1, 22, 0)) {
+             std::array<ASCIILiteral, 3> elementNames = { "dashdemux2"_s, "hlsdemux2"_s, "mssdemux2"_s };
+             for (auto& elementName : elementNames) {
++#if defined(PS5_PAYLOAD_SDK)
++                // PS5: the WebProcess is a payload with its own networking (libsoup and the
++                // NetworkProcess's TLS setup), so hlsdemux2 can download by itself. It is the
++                // only HLS demuxer playbin3 takes (urisourcebin wants a streams-aware one; the
++                // legacy hlsdemux fails there). It gets the User-Agent and Referer from
++                // webkitwebsrc's http-headers event, not the cookies.
++                if (elementName == "hlsdemux2"_s && hlsSupport == "1"_s)
++                    continue;
++#endif
+                 if (GRefPtr factory = adoptGRef(gst_element_factory_find(elementName)))
+                     gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE_CAST(factory.get()), GST_RANK_NONE);
+             }
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index a6c0f3bfc7..f5a984ebc0 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -386,6 +386,11 @@ void MediaPlayerPrivateGStreamer::load(const String& urlString)
+     }
+ 
+     registerWebKitGStreamerElements();
++#if defined(PS5_PAYLOAD_SDK)
++    // hlsdemux2 downloads by itself and takes the User-Agent from webkitwebsrc's
++    // http-headers event (GStreamerCommon.cpp); the request there has none yet.
++    m_userAgent = player->userAgent();
++#endif
+ 
+     if (!m_pipeline)
+         createGSTPlayBin(url);
+@@ -1178,6 +1183,9 @@ void MediaPlayerPrivateGStreamer::sourceSetup(GstElement* sourceElement)
+ 
+         auto* source = WEBKIT_WEB_SRC_CAST(m_source.get());
+         webKitWebSrcSetReferrer(source, m_referrer);
++#if defined(PS5_PAYLOAD_SDK)
++        webKitWebSrcSetUserAgent(source, m_userAgent);
++#endif
+         webKitWebSrcSetResourceLoader(source, m_loader);
+         webKitWebSrcSetPlayer(source, ThreadSafeWeakPtr { *this });
+ #if ENABLE(MEDIA_STREAM)
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+index 22c2c55b40..7917984815 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+@@ -380,6 +380,9 @@ protected:
+     const Ref<MainThreadNotifier<MainThreadNotification>> m_notifier;
+     ThreadSafeWeakPtr<MediaPlayer> m_player;
+     String m_referrer;
++#if defined(PS5_PAYLOAD_SDK)
++    String m_userAgent;
++#endif
+     mutable MediaTime m_cachedPosition;
+     mutable bool m_isCachedPositionValid { false };
+     mutable MediaTime m_cachedDuration;
+diff --git a/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.cpp
+index aa08f5155d..ccd488c06d 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.cpp
+@@ -107,6 +107,9 @@ struct WebKitWebSrcPrivate {
+         // MediaPlayer referrer cached value. The corresponding method has to be called from the
+         // main thread, so the value needs to be cached before use in non-main thread.
+         String referrer;
++#if defined(PS5_PAYLOAD_SDK)
++        String userAgent; // for the http-headers event (hlsdemux2's own requests)
++#endif
+ 
+         // Properties used for GStreamer data-flow in create().
+         bool isFlushing { false };
+@@ -951,6 +954,14 @@ void webKitWebSrcSetReferrer(WebKitWebSrc* src, const String& referrer)
+     members->referrer = referrer;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++void webKitWebSrcSetUserAgent(WebKitWebSrc* src, const String& userAgent)
++{
++    DataMutexLocker members { src->priv->dataMutex };
++    members->userAgent = userAgent;
++}
++#endif
++
+ bool webKitSrcPassedCORSAccessCheck(WebKitWebSrc* src)
+ {
+     DataMutexLocker members { src->priv->dataMutex };
+@@ -1056,6 +1067,12 @@ void CachedResourceStreamingClient::responseReceived(PlatformMediaResource&, con
+     GUniquePtr<GstStructure> headers(gst_structure_new_empty("request-headers"));
+     for (const auto& header : m_request.httpHeaderFields())
+         gstStructureSet(headers.get(), header.key.utf8(), G_TYPE_STRING, header.value.utf8());
++#if defined(PS5_PAYLOAD_SDK)
++    // The NetworkProcess adds the User-Agent; hlsdemux2 downloads by itself and
++    // takes it from here (patch 0033).
++    if (!members->userAgent.isEmpty() && !m_request.hasHTTPHeaderField(HTTPHeaderName::UserAgent))
++        gst_structure_set(headers.get(), "User-Agent", G_TYPE_STRING, members->userAgent.utf8().data(), nullptr);
++#endif
+     GST_DEBUG_OBJECT(src.get(), "R%u: Request headers going downstream: %" GST_PTR_FORMAT, m_requestNumber, headers.get());
+     gst_structure_set(httpHeaders.get(), "request-headers", GST_TYPE_STRUCTURE, headers.get(), nullptr);
+ 
+diff --git a/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.h b/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.h
+index 37f9fc7ed2..468488ae1f 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.h
++++ b/Source/WebCore/platform/graphics/gstreamer/WebKitWebSourceGStreamer.h
+@@ -57,6 +57,9 @@ struct WebKitWebSrcClass {
+ GType webkit_web_src_get_type(void);
+ void webKitWebSrcSetResourceLoader(WebKitWebSrc*, WebCore::PlatformMediaResourceLoader&);
+ void webKitWebSrcSetReferrer(WebKitWebSrc*, const String&);
++#if defined(PS5_PAYLOAD_SDK)
++void webKitWebSrcSetUserAgent(WebKitWebSrc*, const String&);
++#endif
+ bool webKitSrcPassedCORSAccessCheck(WebKitWebSrc*);
+ bool webKitSrcIsCrossOrigin(WebKitWebSrc*, const WebCore::SecurityOrigin&);
+ bool webKitSrcIsSeekable(WebKitWebSrc*);
