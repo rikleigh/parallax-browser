@@ -17,6 +17,8 @@
 #   switch-h264.mp4         H.264 avc3 (parameter sets in band, as BBC News's DASH streams)
 #                           changing size mid-stream: 396x704, 540x960, 1280x720, 396x704,
 #                           5 s each, AAC with the beeps, 20 s; switch-h264.m2ts the same in MPEG-TS
+#   preview-*.mp4           hover previews for preview.html: 380x222/440x248 H.264 High with
+#                           B-frames, no audio, 6 s, with and without the VUI reorder limits
 #   sound-test.m4a          audio only (no video decoder involved): a 440 Hz tone with a
 #                           1760 Hz beep at the start of every second, AAC-LC stereo, 60 s
 set -euo pipefail
@@ -74,6 +76,32 @@ if [ ! -s "$OUT/switch-h264.mp4" ]; then
     echo "  switch-h264.mp4, switch-h264.m2ts"
 fi
 
+# Hover previews (test/media/preview.html): small H.264 High clips without
+# audio, as listing pages play them on hover. -novui: the SPS without the VUI
+# bitstream_restriction (strip-vui-restriction.py), as some encoders write
+# them; a decoder must then hold the level's whole DPB (16 frames at
+# 380x222 level 2.2 or 440x248 level 3.0, 7 at 380x222 level 2.0) before the
+# first picture. Videodec2 never output a picture for such VR site previews
+# (2026-10-30) while the proxy stopped at 16 frames in flight.
+preview() { # <name> <WxH> <level> [novui]
+    local name=$1 size=$2 level=$3 tmp
+    [ -s "$OUT/$name" ] && { echo "  $name (exists)"; return; }
+    tmp="$(mktemp -d)"
+    $FF -f lavfi -i "testsrc2=size=$size:rate=30" -vf "drawtext=fontfile=$FONT:fontsize=$(( ${size#*x} / 5 )):fontcolor=white:box=1:boxcolor=black@0.6:x=(w-tw)/2:y=(h-th)/2:text='%{eif\:t\:d}.%{eif\:mod(n\,30)\:d\:2}'" \
+        -t 6 -an -c:v libx264 -profile:v high -level "$level" -preset veryfast -pix_fmt yuv420p -g 60 -bf 3 -b:v 400k "$tmp/a.mp4"
+    if [ "${4:-}" = novui ]; then
+        python3 -I "$HERE/strip-vui-restriction.py" "$tmp/a.mp4" "$OUT/$name"
+    else
+        mv "$tmp/a.mp4" "$OUT/$name"
+    fi
+    rm -rf "$tmp"
+    echo "  $name ($(du -h "$OUT/$name" | cut -f1))"
+}
+preview preview-380x222-l22.mp4       380x222 2.2
+preview preview-380x222-l22-novui.mp4 380x222 2.2 novui
+preview preview-440x248-l30-novui.mp4 440x248 3.0 novui
+preview preview-380x222-l20-novui.mp4 380x222 2.0 novui
+
 # Audio only, for "is there sound at all" checks on the TV (sine is 1/8 of
 # full scale: peak about 0.35).
 if [ ! -s "$OUT/sound-test.m4a" ]; then
@@ -89,6 +117,7 @@ if [ "${1:-}" = --upload ]; then
         curl -s --ftp-create-dirs -T "$f" "$FTP/data/ps5webkit/media/$(basename "$f")"
     done
     curl -s --ftp-create-dirs -T "$HERE/video.html" "$FTP/data/ps5webkit/video.html"
+    curl -s --ftp-create-dirs -T "$HERE/preview.html" "$FTP/data/ps5webkit/preview.html"
     curl -s --ftp-create-dirs -T "$ROOT/port/webkit/runtime/start.html" "$FTP/data/ps5webkit/start.html"
     echo "uploaded to /data/ps5webkit/media/, video.html, start.html"
 fi

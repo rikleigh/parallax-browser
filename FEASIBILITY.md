@@ -703,6 +703,15 @@ port.
   (wind-down, then the launcher's kill and launch on one connection).
   Checked on the console by log; R3 and the D-pad are waiting for the
   owner's TV check.
+- **VR site hover previews froze the page (2026-10-30, port/webkit/README.md,
+  *Hover previews*):** small H.264 High previews (380x222 level 2.2) got no
+  picture from Videodec2, and removing one hung the WebProcess. Videodec2
+  holds a level-sized DPB (16 frames at that size) plus 4 pipeline frames
+  before its first picture, while the proxy stopped at 16 frames in flight
+  and waited forever, on the streaming thread the main thread's teardown
+  then waited for. Now 32 in flight, waits that end on a flush or stop, and
+  a decode error after 9 s of silence from the title. Built, not yet checked
+  on the console: `preview.html` with synthetic previews.
 - **Next (follow-up, not started): payload malloc and mutex contention.**
   `port/webkit/test/lockbench` (a payload; 400k operations per thread):
 

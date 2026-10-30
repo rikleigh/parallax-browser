@@ -1,0 +1,50 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Preview test</title>
+<!-- Hover previews, as listing pages make them (a VR site): a muted autoplay
+     <video> over a thumbnail, removed again after a moment. Cycles through
+     the clips (file:///data/ps5webkit/preview.html, uploaded by
+     test/media/make-media.sh --upload; ?src=<url>[,<url>...] for others,
+     ?hold=<ms> how long each plays, ?rounds=<n>). Logs PREVIEW lines: frames
+     shown per clip, and PREVIEW DONE at the end. A WebProcess stuck in the
+     teardown shows as "0 page uploads" in the title log and no DONE. -->
+<style>
+body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:32px 48px}
+h1{font-weight:600;font-size:32px;margin:0 0 16px}
+#tile{position:relative;width:440px;height:248px;background:#2d3a52;border-radius:8px;overflow:hidden}
+#tile video{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:cover}
+#tick{font:28px monospace;margin:16px 0}
+#log{font:20px monospace;color:#c8f0c8;white-space:pre}
+</style></head><body>
+<h1>Preview test</h1>
+<div id="tile"></div>
+<div id="tick">0</div>
+<div id="log"></div>
+<script>
+var params = new URLSearchParams(location.search);
+var clips = (params.get('src') || 'media/preview-380x222-l22-novui.mp4,media/preview-440x248-l30-novui.mp4,' +
+  'media/preview-380x222-l22.mp4,media/preview-380x222-l20-novui.mp4').split(',');
+var hold = +(params.get('hold') || 2500), rounds = +(params.get('rounds') || 2);
+var tile = document.getElementById('tile'), logEl = document.getElementById('log'), n = 0, ticks = 0;
+function say(s) { console.log('PREVIEW ' + s); logEl.textContent = (s + '\n' + logEl.textContent).slice(0, 3000); }
+// The page's own heartbeat: it stops when the WebProcess main thread does.
+setInterval(function () { document.getElementById('tick').textContent = ++ticks; }, 100);
+function next() {
+  if (n >= clips.length * rounds) { say('DONE ' + n + ' previews'); return; }
+  var src = clips[n % clips.length], v = document.createElement('video'), t0 = performance.now(), events = [];
+  v.muted = true; v.autoplay = true; v.loop = true; v.playsInline = true; v.src = src;
+  ['playing', 'waiting', 'error'].forEach(function (e) { v.addEventListener(e, function () { events.push(e + '@' + Math.round(performance.now() - t0)); }); });
+  tile.appendChild(v);
+  setTimeout(function () {
+    var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+    say((n + 1) + ' ' + src + ' ' + v.videoWidth + 'x' + v.videoHeight + ' t=' + v.currentTime.toFixed(2) + ' frames ' + q.totalVideoFrames +
+      ' ready ' + v.readyState + ' ' + events.join(' ') + (v.error ? ' MediaError ' + v.error.code : ''));
+    var t1 = performance.now();
+    v.pause(); v.removeAttribute('src'); v.load(); v.remove();
+    say('removed in ' + Math.round(performance.now() - t1) + ' ms');
+    n++;
+    setTimeout(next, 500);
+  }, hold);
+}
+setTimeout(next, 1000);
+</script>
+</body></html>

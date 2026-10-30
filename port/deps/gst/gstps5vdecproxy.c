@@ -28,6 +28,11 @@
  *   first keyframe, errors). At most PS5_MAX_PENDING frames are pending.
  *   flush = DFLUSH with a new epoch (replies of older epochs are ignored),
  *   drain/finish = DDRAIN and wait for DRAINED.
+ * - Waits for the title end at a flush or a stop (the sink pad's flushing
+ *   flag, plus a wakeup pipe so the poll returns at once): the WebProcess
+ *   main thread deactivates the pads when a page drops a video and waits
+ *   for the streaming thread. If the title sends nothing at all for
+ *   PS5_STALL_MS, the stream fails with a decode error instead.
  * Wire format: port/webkit/wpe-ps5/PS5VideoProtocol.h.
  */
 #define PACKAGE "ps5webkit"
@@ -35,6 +40,7 @@
 #include <gst/video/video.h>
 #include <gst/video/gstvideodecoder.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,8 +52,16 @@
 
 #include "PS5VideoProtocol.h"
 
-#define PS5_MAX_PENDING 16
+/* Frames in flight before handle_frame waits for a picture. More than the
+ * longest the hardware can hold before its first picture: an H.264/HEVC
+ * stream without the VUI reorder limits makes the decoder fill the level's
+ * whole DPB (16 frames at small sizes: 380x222 level 2.2) on top of
+ * Videodec2's pipeline depth of 4. With 16 a VR site's hover previews
+ * never got a picture (17 AUs sent, the title waiting for more). Below the
+ * title's AU queue (64). */
+#define PS5_MAX_PENDING 32
 #define PS5_REPLY_TIMEOUT_MS 3000
+#define PS5_STALL_MS 9000
 #define PS5_REMOTE_FEATURE "memory:PS5Remote"
 
 GST_DEBUG_CATEGORY_STATIC(ps5_vdec_proxy_debug);
@@ -59,6 +73,8 @@ G_DECLARE_FINAL_TYPE(GstPs5VdecProxy, gst_ps5_vdec_proxy, GST, PS5_VDEC_PROXY, G
 struct _GstPs5VdecProxy {
     GstVideoDecoder parent;
     int fd;
+    int wake[2];             /* wakes a waiting poll at a flush or a stop */
+    gint stopping;           /* PAUSED -> READY under way (atomic) */
     guint codecs;            /* HELLO_ACK */
     int max_width, max_height;
     guint decoder_id;        /* DOPEN_ACK */
@@ -72,7 +88,7 @@ struct _GstPs5VdecProxy {
     GByteArray *au;          /* scratch */
     gboolean drained;
     /* counts */
-    guint64 sent, sent_bytes, pictures, released, stale, clipped, other_epoch, late;
+    guint64 sent, sent_bytes, pictures, released, stale, clipped, other_epoch, late, replies;
     gint64 log_window;
     guint64 log_sent, log_pictures;
     double log_wait_ms;
@@ -109,14 +125,38 @@ static gboolean send_all(GstPs5VdecProxy *self, const void *data, gsize size)
     return self->fd >= 0;
 }
 
-/* One whole message; FALSE on timeout (timeout_ms >= 0) or a closed connection. */
+/* A flush or a stop is under way: waits for the title give up. */
+static gboolean flushing(GstPs5VdecProxy *self)
+{
+    GstVideoDecoder *dec = GST_VIDEO_DECODER(self);
+    return g_atomic_int_get(&self->stopping) || GST_PAD_IS_FLUSHING(GST_VIDEO_DECODER_SINK_PAD(dec))
+        || GST_PAD_IS_FLUSHING(GST_VIDEO_DECODER_SRC_PAD(dec));
+}
+
+static void wake_up(GstPs5VdecProxy *self)
+{
+    if (self->wake[1] >= 0 && write(self->wake[1], "w", 1) < 0) {
+        /* full already: a wakeup is pending anyway */
+    }
+}
+
+/* The wakeup was seen (flush done, or stopped): later waits wait again. */
+static void wake_clear(GstPs5VdecProxy *self)
+{
+    char buffer[64];
+    while (self->wake[0] >= 0 && read(self->wake[0], buffer, sizeof buffer) > 0) {
+    }
+}
+
+/* One whole message; FALSE on timeout (timeout_ms >= 0), a wakeup (left
+ * pending until wake_clear) or a closed connection. */
 static gboolean recv_msg(GstPs5VdecProxy *self, struct ps5wk_video_msg *msg, int timeout_ms)
 {
     if (self->fd < 0)
         return FALSE;
     if (timeout_ms >= 0) {
-        struct pollfd pfd = { self->fd, POLLIN, 0 };
-        if (poll(&pfd, 1, timeout_ms) <= 0)
+        struct pollfd pfd[2] = { { self->fd, POLLIN, 0 }, { self->wake[0], POLLIN, 0 } };
+        if (poll(pfd, self->wake[0] >= 0 ? 2 : 1, timeout_ms) <= 0 || !(pfd[0].revents & (POLLIN | POLLHUP | POLLERR)))
             return FALSE;
     }
     guint8 *p = (guint8 *)msg;
@@ -491,6 +531,7 @@ static void send_prelease(GstPs5VdecProxy *self, guint token)
 static GstFlowReturn handle_reply(GstPs5VdecProxy *self, const struct ps5wk_video_msg *msg)
 {
     GstVideoDecoder *dec = GST_VIDEO_DECODER(self);
+    self->replies++;
     if (msg->type == PS5WK_VMSG_DRAINED) {
         if (msg->ps5wk_epoch == self->epoch)
             self->drained = TRUE;
@@ -637,15 +678,35 @@ static GstFlowReturn ps5_handle_frame(GstVideoDecoder *dec, GstVideoCodecFrame *
     self->sent_bytes += size;
 
     GstFlowReturn ret = read_replies(self, 0);
-    gint64 start = g_get_monotonic_time();
+    gint64 start = g_get_monotonic_time(), logged = start, progress = start;
+    guint64 replies = self->replies;
     while (ret == GST_FLOW_OK && pending_frames(self) > PS5_MAX_PENDING) {
-        ret = read_replies(self, PS5_REPLY_TIMEOUT_MS);
-        if (ret == GST_FLOW_OK && g_get_monotonic_time() - start > PS5_REPLY_TIMEOUT_MS * 1000) {
+        if (flushing(self)) {
+            ret = GST_FLOW_FLUSHING;
+            break;
+        }
+        ret = read_replies(self, self->wake[0] >= 0 ? PS5_REPLY_TIMEOUT_MS : 100);
+        gint64 now = g_get_monotonic_time();
+        if (self->replies != replies) {
+            replies = self->replies;
+            progress = now;
+        }
+        if (ret == GST_FLOW_OK && now - logged > PS5_REPLY_TIMEOUT_MS * 1000) {
             g_printerr("[ps5vdecproxy] %p: no picture from the title for %d ms with %u frames pending (%" G_GUINT64_FORMAT " AUs sent, %"
                        G_GUINT64_FORMAT " pictures, %" G_GUINT64_FORMAT " released, %" G_GUINT64_FORMAT " stale, %" G_GUINT64_FORMAT
-                       " clipped, %" G_GUINT64_FORMAT " of older epochs)\n", (void *)self, PS5_REPLY_TIMEOUT_MS, pending_frames(self),
+                       " clipped, %" G_GUINT64_FORMAT " of older epochs)\n", (void *)self, (int)((now - progress) / 1000), pending_frames(self),
                 self->sent, self->pictures, self->released, self->stale, self->clipped, self->other_epoch);
-            start = g_get_monotonic_time();
+            logged = now;
+        }
+        /* The title's decoder is stuck: fail this stream (the page gets a
+         * decode error) rather than hold the streaming thread for good. */
+        if (ret == GST_FLOW_OK && now - progress > PS5_STALL_MS * 1000) {
+            GST_ELEMENT_ERROR(self, STREAM, DECODE, ("The hardware video decoder stopped answering"),
+                ("no reply from the title for %d ms with %u frames pending (%" G_GUINT64_FORMAT " AUs sent, %" G_GUINT64_FORMAT " pictures)",
+                    PS5_STALL_MS, pending_frames(self), self->sent, self->pictures));
+            g_printerr("[ps5vdecproxy] %p: the title's decoder is stuck (%" G_GUINT64_FORMAT " AUs sent, %" G_GUINT64_FORMAT
+                       " pictures): stream failed\n", (void *)self, self->sent, self->pictures);
+            ret = GST_FLOW_ERROR;
         }
     }
     self->log_wait_ms += (g_get_monotonic_time() - start) / 1000.0;
@@ -666,9 +727,14 @@ static GstFlowReturn ps5_drain_all(GstPs5VdecProxy *self)
         return GST_FLOW_ERROR;
     gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
     GstFlowReturn ret = GST_FLOW_OK;
-    while (!self->drained && ret == GST_FLOW_OK && g_get_monotonic_time() < deadline)
+    while (!self->drained && ret == GST_FLOW_OK && g_get_monotonic_time() < deadline) {
+        if (flushing(self)) {
+            ret = GST_FLOW_FLUSHING;
+            break;
+        }
         ret = read_replies(self, 200);
-    if (!self->drained)
+    }
+    if (!self->drained && ret != GST_FLOW_FLUSHING)
         g_printerr("[ps5vdecproxy] %p: drain did not finish (%s)\n", (void *)self, gst_flow_get_name(ret));
     return ret == GST_FLOW_ERROR && self->fd >= 0 ? GST_FLOW_OK : ret;
 }
@@ -686,6 +752,7 @@ static GstFlowReturn ps5_drain(GstVideoDecoder *dec)
 static gboolean ps5_flush(GstVideoDecoder *dec)
 {
     GstPs5VdecProxy *self = GST_PS5_VDEC_PROXY(dec);
+    wake_clear(self);
     self->epoch++;
     if (self->fd >= 0 && self->decoder_id) {
         struct ps5wk_video_msg msg;
@@ -701,7 +768,9 @@ static gboolean ps5_start(GstVideoDecoder *dec)
 {
     GstPs5VdecProxy *self = GST_PS5_VDEC_PROXY(dec);
     self->epoch = 1;
-    self->sent = self->pictures = self->released = self->stale = self->clipped = self->other_epoch = self->late = 0;
+    self->sent = self->pictures = self->released = self->stale = self->clipped = self->other_epoch = self->late = self->replies = 0;
+    wake_clear(self);
+    g_atomic_int_set(&self->stopping, 0);
     return TRUE;
 }
 
@@ -719,7 +788,17 @@ static gboolean ps5_stop(GstVideoDecoder *dec)
     if (self->fd >= 0)
         close(self->fd); /* the title closes its decoder */
     self->fd = -1;
+    wake_clear(self);
+    g_atomic_int_set(&self->stopping, 0);
     return TRUE;
+}
+
+/* FLUSH_START (the pad is flushing already): a wait for the title ends now. */
+static gboolean ps5_sink_event(GstVideoDecoder *dec, GstEvent *event)
+{
+    if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_START)
+        wake_up(GST_PS5_VDEC_PROXY(dec));
+    return GST_VIDEO_DECODER_CLASS(gst_ps5_vdec_proxy_parent_class)->sink_event(dec, event);
 }
 
 /* Fail READY quietly when the title has no decoder: decodebin3 then tries
@@ -730,6 +809,12 @@ static GstStateChangeReturn ps5_change_state(GstElement *element, GstStateChange
     if (transition == GST_STATE_CHANGE_NULL_TO_READY && !connect_title(self)) {
         GST_INFO_OBJECT(self, "no hardware decoder in the title");
         return GST_STATE_CHANGE_FAILURE;
+    }
+    /* Deactivating the sink pad waits for handle_frame to return (with the
+     * WebProcess main thread, when a page removes a video): end its wait. */
+    if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
+        g_atomic_int_set(&self->stopping, 1);
+        wake_up(self);
     }
     GstStateChangeReturn ret = GST_ELEMENT_CLASS(gst_ps5_vdec_proxy_parent_class)->change_state(element, transition);
     if (transition == GST_STATE_CHANGE_READY_TO_NULL && self->fd >= 0) {
@@ -746,6 +831,10 @@ static void ps5_finalize(GObject *object)
     GstPs5VdecProxy *self = GST_PS5_VDEC_PROXY(object);
     if (self->fd >= 0)
         close(self->fd);
+    for (int i = 0; i < 2; i++) {
+        if (self->wake[i] >= 0)
+            close(self->wake[i]);
+    }
     g_byte_array_unref(self->param_sets);
     g_byte_array_unref(self->au);
     G_OBJECT_CLASS(gst_ps5_vdec_proxy_parent_class)->finalize(object);
@@ -754,6 +843,25 @@ static void ps5_finalize(GObject *object)
 static void gst_ps5_vdec_proxy_init(GstPs5VdecProxy *self)
 {
     self->fd = -1;
+    /* Non-blocking both ends (wake_clear reads until empty); without it the
+     * waits just poll in short steps. */
+    self->wake[0] = self->wake[1] = -1;
+    int p[2];
+    if (!pipe(p)) {
+        gboolean ok = TRUE;
+        for (int i = 0; i < 2; i++) {
+            fcntl(p[i], F_SETFL, fcntl(p[i], F_GETFL) | O_NONBLOCK);
+            fcntl(p[i], F_SETFD, FD_CLOEXEC);
+            ok = ok && (fcntl(p[i], F_GETFL) & O_NONBLOCK);
+        }
+        if (ok) {
+            self->wake[0] = p[0];
+            self->wake[1] = p[1];
+        } else {
+            close(p[0]);
+            close(p[1]);
+        }
+    }
     self->param_sets = g_byte_array_new();
     self->au = g_byte_array_new();
     gst_video_decoder_set_packetized(GST_VIDEO_DECODER(self), TRUE);
@@ -787,6 +895,7 @@ static void gst_ps5_vdec_proxy_class_init(GstPs5VdecProxyClass *klass)
     dec_class->drain = ps5_drain;
     dec_class->flush = ps5_flush;
     dec_class->sink_query = ps5_sink_query;
+    dec_class->sink_event = ps5_sink_event;
     dec_class->decide_allocation = ps5_decide_allocation;
 }
 

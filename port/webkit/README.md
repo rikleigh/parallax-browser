@@ -824,7 +824,9 @@ planned below, with these details:
   frames with a 16-byte placeholder buffer (`struct ps5wk_remote_picture`:
   decoder, token, epoch) in `video/x-raw(memory:PS5Remote)` caps; VP9
   hidden frames, frames before the first keyframe and errors are released.
-  At most 16 frames pending. Seek = DFLUSH with a new epoch; EOS = DDRAIN.
+  At most 32 frames pending (was 16: see *Hover previews* below). Seek =
+  DFLUSH with a new epoch; EOS = DDRAIN. Waits for the title end at once on a
+  flush or PAUSED -> READY.
   Pictures outside the segment (decoding restarts at the keyframe before a
   seek target) are released at once (PRELEASE): the base class would clip
   them and the title would never get the slot back.
@@ -955,6 +957,32 @@ three proxy drains) play every picture, 0 decode errors (598 of 601 shown,
 pictures, 0 errors, ~60 frames/s. Harness (fake decoder):
 `switch-h264.m2ts` at 30 frames/s through the switches. The decoder's
 close line counts `format changes`.
+
+**Hover previews that froze the page (a VR site, found 2026-10-30).** Listing
+pages play small H.264 High clips on hover (380x222 `avc1.640016`, level
+2.2; 440x248 `avc1.64001E`, level 3.0). The title's decoder never sent a
+picture (17 AUs sent, 0 pictures), and when the page removed the preview the
+WebProcess hung until the browser was restarted. Two causes. (1) As far as
+the counts tell (to be confirmed with preview.html), Videodec2 holds
+pictures until the stream's DPB is full, sized from the level and the
+picture size (16 frames at these sizes, the maximum), plus its pipeline
+depth of 4: about 19-20 AUs before the first picture (BBC's 832x468 level
+3.1, DPB 11: 26 AUs, 12 pictures; a 500x300 level 2.1 preview, DPB 7,
+played). The proxy stopped sending at 16 frames pending and waited for a
+picture: deadlock. The limit is now 32 (the title queues up to 64 AUs).
+(2) `handle_frame` waited for that picture in a loop that never looked at
+flushing; removing the video sets the pipeline to NULL on the WebProcess
+main thread, whose sink pad deactivation waits for the streaming thread:
+the main thread stopped ("0 page uploads"). The waits now end at once on
+FLUSH_START or PAUSED -> READY (the pads' flushing flags and a wakeup pipe
+in the poll), and after 9 s without any reply from the title the stream
+fails with a decode error instead of waiting. Test:
+`test/media/preview.html` (uploaded with the clips by `make-media.sh
+--upload`) cycles 380x222/440x248 previews made with FFmpeg, with and
+without the SPS's VUI reorder limits (`strip-vui-restriction.py`), each
+removed after 2.5 s; `PREVIEW` lines give the frames shown and how long the
+removal took. The level 2.0 clip (DPB 7) is the control that should play
+even with the old limit.
 
 Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
 matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
