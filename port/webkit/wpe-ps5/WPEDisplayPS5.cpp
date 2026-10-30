@@ -268,7 +268,16 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
     param.placeholder = pending->placeholder;
     param.title = pending->title;
 
-    int rc = priv->ime.init(&param, nullptr);
+    // The keyboard's own pointer follows the touchpad, and a touchpad that
+    // reports a touch (a resting finger, or none at all) pins the selection
+    // so the D-pad can't move it: keys are picked with the D-pad and X only.
+    PS5ImeParamExtended extended { };
+    extended.option = PS5_IME_EXT_OPTION_DISABLE_POINTER;
+    int rc = priv->ime.init(&param, &extended);
+    if (rc) {
+        PS5_LOG("sceImeDialogInit with the pointer disabled failed (0x%08x); trying without", rc);
+        rc = priv->ime.init(&param, nullptr);
+    }
     if (rc) {
         PS5_LOG("sceImeDialogInit failed: 0x%08x", rc);
         return FALSE;

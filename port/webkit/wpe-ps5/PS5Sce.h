@@ -128,6 +128,24 @@ struct PS5ImeDialogParam {
 };
 static_assert(sizeof(PS5ImeDialogParam) == 96, "SceImeDialogParam is 96 bytes");
 
+// The second argument of sceImeDialogInit (SceImeParamExtended; layout and
+// flag values as OpenOrbis and shadPS4 give them).
+enum : uint32_t {
+    PS5_IME_EXT_OPTION_DISABLE_POINTER = 0x40, // no touchpad/motion pointer
+};
+
+struct PS5ImeParamExtended {
+    uint32_t option;
+    uint8_t colors[9][4]; // base, line, text field, preedit, buttons x3, text, special
+    int32_t priority;
+    char* additionalDictionaryPath;
+    void* extKeyboardFilter;
+    uint32_t disableDevice;
+    uint32_t extKeyboardMode;
+    int8_t reserved[60];
+};
+static_assert(sizeof(PS5ImeParamExtended) == 136, "SceImeParamExtended is 136 bytes");
+
 enum PS5ImeDialogStatus : int32_t {
     PS5_IME_DIALOG_STATUS_NONE = 0,
     PS5_IME_DIALOG_STATUS_RUNNING = 1,

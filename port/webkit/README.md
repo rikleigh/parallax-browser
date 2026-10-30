@@ -1463,6 +1463,12 @@ same way and `sceCommonDialogInitialize` returns 0. Log on the console:
 
 `sceImeDialogInit` takes the PS4 `SceImeDialogParam` (96 bytes; the
 disassembly copies 0x60 bytes and reads `type` at +4 and `option` at +0x20).
+The second argument is the extended parameter (`PS5ImeParamExtended` in
+`PS5Sce.h`, 136 bytes as in OpenOrbis and shadPS4): without it the dialog
+took touchpad input as a pointer, so the key selector jumped around and the
+D-pad couldn't move it. `wpe_display_ps5_request_text` passes it with
+`PS5_IME_EXT_OPTION_DISABLE_POINTER` (0x40), and opens the dialog without it
+if init refuses it.
 
 ## Process launching
 
