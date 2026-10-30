@@ -1,0 +1,165 @@
+diff --git a/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp b/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp
+index 7c0e72bf37..b1cfb02228 100644
+--- a/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp
++++ b/Source/WebKit/NetworkProcess/cache/NetworkCacheBlobStorage.cpp
+@@ -156,6 +156,26 @@ BlobStorage::Blob BlobStorage::add(const String& path, const Data& data, bool ad
+         m_memoryCache->remove(path);
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: /data has no hard links (link() fails with EOPNOTSUPP), so the
++    // shared Blobs/<hash> file was written and then copied in full to the
++    // record's blob (patch 0013): every body written twice, no sharing, and
++    // the copies counted nowhere (synchronize() deletes every Blobs/ file,
++    // whose link count is always 1), so the cache never shrank. Write the
++    // body once, straight to the record's blob; Storage::synchronize()
++    // counts those files.
++    auto mappedBody = data.mapToFile(path);
++    if (mappedBody.isNull())
++        return { };
++    m_approximateSize += mappedBody.size();
++    BlobStorage::Blob directResult { mappedBody, hash };
++#if ENABLE(NETWORK_CACHE_BLOB_STORAGE_MEMORY_CACHE)
++    if (addToMemoryCache && m_memoryCache)
++        m_memoryCache->add(path, directResult);
++#endif
++    return directResult;
++#endif
++
+     bool blobExists = FileSystem::fileExists(blobPath);
+     if (blobExists) {
+         if (FileSystem::makeSafeToUseMemoryMapForPath(blobPath)) {
+diff --git a/Source/WebKit/NetworkProcess/cache/NetworkCacheStorage.cpp b/Source/WebKit/NetworkProcess/cache/NetworkCacheStorage.cpp
+index 8ff9d653ee..090b23fce5 100644
+--- a/Source/WebKit/NetworkProcess/cache/NetworkCacheStorage.cpp
++++ b/Source/WebKit/NetworkProcess/cache/NetworkCacheStorage.cpp
+@@ -507,6 +507,11 @@ void Storage::synchronize()
+         size_t recordsSize = 0;
+         unsigned recordCount = 0;
+         unsigned blobCount = 0;
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: bodies are written straight to the records' blob files
++        // (BlobStorage::add), so their sizes are counted here.
++        size_t blobBytes = 0;
++#endif
+ 
+         String anyType;
+         traverseRecordsFiles(recordsPathIsolatedCopy(), anyType, [&](const String& fileName, const String& hashString, const String& type, bool isBlob, const String& recordDirectoryPath) {
+@@ -521,6 +526,9 @@ void Storage::synchronize()
+             if (isBlob) {
+                 ++blobCount;
+                 blobFilter->add(hash);
++#if defined(PS5_PAYLOAD_SDK)
++                blobBytes += FileSystem::fileSize(filePath).value_or(0);
++#endif
+                 return;
+             }
+ 
+@@ -530,6 +538,9 @@ void Storage::synchronize()
+         });
+ 
+         recordsSize = estimateRecordsSize(recordCount, blobCount);
++#if defined(PS5_PAYLOAD_SDK)
++        recordsSize += blobBytes;
++#endif
+ 
+         m_blobStorage.synchronize();
+ 
+diff --git a/Source/WebKit/NetworkProcess/glib/DNSCache.cpp b/Source/WebKit/NetworkProcess/glib/DNSCache.cpp
+index cc39e72676..2e3340bb5f 100644
+--- a/Source/WebKit/NetworkProcess/glib/DNSCache.cpp
++++ b/Source/WebKit/NetworkProcess/glib/DNSCache.cpp
+@@ -28,6 +28,10 @@
+ 
+ #include <wtf/glib/RunLoopSourcePriority.h>
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include <gio/gio.h>
++#endif
++
+ namespace WebKit {
+ 
+ static const Seconds expireInterval = 60_s;
+@@ -64,8 +68,30 @@ std::optional<Vector<GRefPtr<GInetAddress>>> DNSCache::lookup(const UTF8CString&
+     Locker locker { m_lock };
+     auto& map = mapForType(type);
+     auto it = map.find(host);
+-    if (it == map.end())
++    if (it == map.end()) {
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: DNS prefetching (DNSResolveQueueGLib) fills the Default map,
++        // but libsoup's connections look a host up as IPv4-only and IPv6-only
++        // (GNetworkAddress's happy eyeballs), which never read it: prefetched
++        // answers went unused. Answer a typed lookup from a Default answer,
++        // filtered by family. The result can be empty (no address of that
++        // family); WebKitCachedResolver returns "not found" for it, so an
++        // IPv4-only host doesn't wait out the IPv6 attempt.
++        if (type != Type::Default) {
++            auto defaultIt = m_dnsMap.find(host);
++            if (defaultIt != m_dnsMap.end() && defaultIt->value.expirationTime > MonotonicTime::now()) {
++                auto family = type == Type::IPv4Only ? G_SOCKET_FAMILY_IPV4 : G_SOCKET_FAMILY_IPV6;
++                Vector<GRefPtr<GInetAddress>> filtered;
++                for (auto& address : defaultIt->value.addressList) {
++                    if (g_inet_address_get_family(address.get()) == family)
++                        filtered.append(address);
++                }
++                return filtered;
++            }
++        }
++#endif
+         return std::nullopt;
++    }
+ 
+     auto& response = it->value;
+     if (response.expirationTime <= MonotonicTime::now()) {
+diff --git a/Source/WebKit/NetworkProcess/glib/WebKitCachedResolver.cpp b/Source/WebKit/NetworkProcess/glib/WebKitCachedResolver.cpp
+index d79cce4d96..10bf96fd60 100644
+--- a/Source/WebKit/NetworkProcess/glib/WebKitCachedResolver.cpp
++++ b/Source/WebKit/NetworkProcess/glib/WebKitCachedResolver.cpp
+@@ -137,6 +137,10 @@ static GList* webkitCachedResolverLookupByNameWithFlags(GResolver* resolver, con
+     auto cacheType = dnsCacheType(flags);
+     auto host = UTF8CString::unsafeFromUTF8(hostname);
+     auto addressList = priv->cache->lookup(host, cacheType);
++    if (addressList && addressList->isEmpty()) {
++        g_set_error(error, G_RESOLVER_ERROR, G_RESOLVER_ERROR_NOT_FOUND, "No address of this family for %s (cached)", hostname);
++        return nullptr;
++    }
+     if (addressList)
+         return addressListVectorToGList(addressList.value());
+ 
+@@ -153,6 +157,10 @@ static void webkitCachedResolverLookupByNameWithFlagsAsync(GResolver* resolver,
+     auto cacheType = dnsCacheType(flags);
+     auto host = UTF8CString::unsafeFromUTF8(hostname);
+     auto addressList = priv->cache->lookup(host, cacheType);
++    if (addressList && addressList->isEmpty()) {
++        g_task_return_new_error(task.get(), G_RESOLVER_ERROR, G_RESOLVER_ERROR_NOT_FOUND, "No address of this family for %s (cached)", hostname);
++        return;
++    }
+     if (addressList) {
+         g_task_return_pointer(task.get(), addressListVectorToGList(addressList.value()), reinterpret_cast<GDestroyNotify>(g_resolver_free_addresses));
+         return;
+diff --git a/Source/WebKit/Shared/CacheModel.cpp b/Source/WebKit/Shared/CacheModel.cpp
+index 84b8ac8db9..be8032d88b 100644
+--- a/Source/WebKit/Shared/CacheModel.cpp
++++ b/Source/WebKit/Shared/CacheModel.cpp
+@@ -137,6 +137,20 @@ uint64_t calculateURLCacheDiskCapacity(CacheModel cacheModel, uint64_t diskFreeS
+         break;
+     }
+     case CacheModel::DocumentBrowser: {
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: the browser picks DocumentBrowser for its process model (one
++        // WebProcess, no process cache), not to save disk: /data has room for
++        // a desktop-sized cache (the PrimaryWebBrowser sizes).
++        if (diskFreeSize >= 16384)
++            urlCacheDiskCapacity = 1 * GB;
++        else if (diskFreeSize >= 8192)
++            urlCacheDiskCapacity = 500 * MB;
++        else if (diskFreeSize >= 4096)
++            urlCacheDiskCapacity = 250 * MB;
++        else
++            urlCacheDiskCapacity = 100 * MB;
++        break;
++#endif
+         // Disk cache capacity (in bytes)
+         if (diskFreeSize >= 16384)
+             urlCacheDiskCapacity = 75 * MB;
