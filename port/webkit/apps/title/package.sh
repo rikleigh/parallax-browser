@@ -139,6 +139,8 @@ echo "imports: $(wc -l < "$W/imports.inc") functions"
 prospero-clang -std=c11 -O2 "${TF[@]}" -fno-builtin -Wno-incompatible-library-redeclaration -I"$W" \
     -c "$HERE/importcheck.c" -o "$W/importcheck.o"
 title_link "${defsyms[@]}" "$W/importcheck.o"
+# ps5locks (copied --wrap options): no unwrapped pthread mutex/cond/rwlock import.
+"$PORT/apps/common/check-lock-imports.sh" "$W/llvm-pie.elf" $(printf '%s\n' "${inputs[@]}" | sed -n 's/^--wrap=//p')
 
 # Symbols for crash triage (kernel-log rips minus the 0x400000 load base).
 cp "$W/llvm-pie.elf" "$OUT/ps5browser-symbols.elf"

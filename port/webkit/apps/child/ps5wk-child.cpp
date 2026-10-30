@@ -14,6 +14,7 @@
 #include "PS5VideoProtocol.h"
 #include "../common/crashguard.h"
 #include "../common/profiler.h"
+#include "../common/ps5locks.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -53,6 +54,14 @@ extern size_t pas_page_malloc_num_allocated_bytes __attribute__((weak));
 extern intptr_t pas_page_malloc_ps5_decommitted_bytes __attribute__((weak));
 extern size_t pas_compact_heap_reservation_size __attribute__((weak));
 extern size_t pas_compact_heap_reservation_bump __attribute__((weak));
+// ps5malloc.c: malloc and its family on libpas, and which pointers are its.
+void ps5malloc_note_map(void* address, size_t length, int flags);
+void ps5malloc_note_unmap(void* address, size_t length);
+typedef struct {
+    int pas;
+    uint64_t foreign_frees, foreign_reallocs, fallbacks, bitmap_failures;
+} ps5malloc_stats_t;
+void ps5malloc_stats(ps5malloc_stats_t*);
 // JSC's executable memory pool (WebKit patch 0030; absent without the JIT).
 void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
 }
@@ -412,6 +421,12 @@ extern "C" void* __wrap_mmap(void* address, size_t length, int prot, int flags, 
         errno = savedErrno;
         return result;
     }
+    // Anonymous mappings are where libpas's blocks live (ps5malloc's
+    // ownership bitmap); anything else mapped over a range takes it out.
+    if (flags & MAP_ANON)
+        ps5malloc_note_map(result, length, flags);
+    else if (flags & MAP_FIXED)
+        ps5malloc_note_unmap(result, length);
     if (!(flags & MAP_FIXED) || !address) {
         if (length >= (1u << 20))
             rememberBig(result, length);
@@ -427,6 +442,9 @@ extern "C" void* __wrap_mmap(void* address, size_t length, int prot, int flags, 
 
 extern "C" int __wrap_munmap(void* address, size_t length)
 {
+    // Out of the bitmap first: once unmapped, the console's malloc could get
+    // the range (libpas unmaps only memory with no live blocks in it).
+    ps5malloc_note_unmap(address, length);
     int result = __real_munmap(address, length);
     munmapCalls.fetch_add(1, std::memory_order_relaxed);
     if (!result && length >= (1u << 20))
@@ -515,16 +533,25 @@ static void* memLogger(void* data)
             else
                 snprintf(jitText, sizeof jitText, "; JIT off");
         }
+        ps5locks_stats_t locks;
+        ps5locks_stats(&locks);
+        ps5malloc_stats_t heap;
+        ps5malloc_stats(&heap);
+        char lockText[224];
+        snprintf(lockText, sizeof lockText, "; locks %s: %llu mutex parks, %llu cond waits, %llu rwlock parks; malloc %s: %llu foreign frees, %llu foreign reallocs, %llu fallbacks%s",
+            locks.fast ? "futex" : "libc", (unsigned long long)locks.mutex_parks, (unsigned long long)locks.cond_waits,
+            (unsigned long long)locks.rwlock_parks, heap.pas ? "libpas" : "libc", (unsigned long long)heap.foreign_frees,
+            (unsigned long long)heap.foreign_reallocs, (unsigned long long)heap.fallbacks, heap.bitmap_failures ? ", BITMAP FAILURES" : "");
         char rssText[48];
         if (rss >= 0)
             snprintf(rssText, sizeof rssText, "rss %.1f MB, peak", rss / 1024.0);
         else
             snprintf(rssText, sizeof rssText, "peak rss");
-        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB (%.1f given back, %.1f committed), resident in big mappings %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed%s",
+        LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB (%.1f given back, %.1f committed), resident in big mappings %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed%s%s",
             tag, (nowMS() - start) / 1e3, rssText, usage.ru_maxrss / 1024.0,
             flexible / 1048576.0, ((double)flexible - (double)startFlexible) / 1048576.0, pas, givenBack, committed, resident, compact, compactSize,
             (long long)mmapLiveCount.load(), mmapLiveBytes.load() / 1048576.0, mmapPeakBytes.load() / 1048576.0, mmapLargest.load() / 1048576.0,
-            (unsigned long long)mmapCalls.load(), (unsigned long long)munmapCalls.load(), (unsigned long long)mmapFailures.load(), jitText);
+            (unsigned long long)mmapCalls.load(), (unsigned long long)munmapCalls.load(), (unsigned long long)mmapFailures.load(), jitText, lockText);
     }
     return nullptr;
 }
@@ -567,6 +594,14 @@ int main(int, char**)
         sceKernelAvailableFlexibleMemorySize(&flexible);
     startFlexible = flexible;
     LOG("%s process %llu starting (parent %d, flexible memory %zu MB)", type, processIdentifier, (int)getppid(), flexible >> 20);
+    {
+        ps5locks_stats_t locks;
+        ps5locks_stats(&locks);
+        ps5malloc_stats_t heap;
+        ps5malloc_stats(&heap);
+        LOG("locks: %s; malloc: %s", locks.fast ? "futex (ps5locks; /data/ps5webkit/no-fastlock turns it off)" : "the console's libc (no-fastlock)",
+            heap.pas ? "libpas (ps5malloc; /data/ps5webkit/no-pasmalloc turns it off)" : "the console's libc (no-pasmalloc)");
+    }
 
     int fd = rendezvous(path, processIdentifier);
     if (fd < 0)

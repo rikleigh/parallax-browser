@@ -70,11 +70,36 @@ separate_arguments(PS5_DEPS_LINK UNIX_COMMAND "${PS5_DEPS_LIBS}")
 # gives every thread an alternate signal stack.
 set(PS5_CRASHGUARD ${PS5_APPS_DIR}/common/crashguard.c)
 
-add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUARD} ${PS5_APPS_DIR}/common/profiler.c)
+# ps5locks: pthread mutexes, condition variables and rwlocks on futex words
+# (the console's convoy at 4-20 us per contended hand-over, test/lockbench).
+# Every pthread function that touches these objects must be in this list:
+# check-lock-imports.sh fails the build if the executable imports another.
+set(PS5_LOCKS ${PS5_APPS_DIR}/common/ps5locks.c)
+set(PS5_LOCK_FUNCTIONS
+    pthread_mutex_init pthread_mutex_destroy pthread_mutex_lock pthread_mutex_trylock pthread_mutex_timedlock pthread_mutex_unlock
+    pthread_mutexattr_init pthread_mutexattr_destroy pthread_mutexattr_settype pthread_mutexattr_gettype
+    pthread_cond_init pthread_cond_destroy pthread_cond_wait pthread_cond_timedwait pthread_cond_signal pthread_cond_broadcast
+    pthread_condattr_init pthread_condattr_destroy pthread_condattr_setclock pthread_condattr_getclock
+    pthread_rwlock_init pthread_rwlock_destroy pthread_rwlock_rdlock pthread_rwlock_tryrdlock pthread_rwlock_timedrdlock
+    pthread_rwlock_wrlock pthread_rwlock_trywrlock pthread_rwlock_timedwrlock pthread_rwlock_unlock)
+set(PS5_LOCK_WRAPS "")
+foreach (_f IN LISTS PS5_LOCK_FUNCTIONS)
+    list(APPEND PS5_LOCK_WRAPS "-Wl,--wrap=${_f}")
+endforeach ()
+# ps5malloc: malloc and its family on libpas in ps5wk-child (ps5malloc.c).
+set(PS5_MALLOC_WRAPS -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=posix_memalign
+    -Wl,--wrap=aligned_alloc -Wl,--wrap=memalign -Wl,--wrap=malloc_usable_size -Wl,--wrap=strdup -Wl,--wrap=vasprintf)
+
+add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUARD} ${PS5_APPS_DIR}/common/profiler.c
+    ${PS5_LOCKS} ${PS5_APPS_DIR}/common/ps5malloc.c)
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
-target_link_options(ps5wk-child PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=close -Wl,--wrap=socket -Wl,--wrap=mmap -Wl,--wrap=munmap)
+target_link_options(ps5wk-child PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=close -Wl,--wrap=socket -Wl,--wrap=mmap -Wl,--wrap=munmap
+    ${PS5_LOCK_WRAPS} ${PS5_MALLOC_WRAPS})
 target_link_libraries(ps5wk-child PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK})
 add_dependencies(ps5wk-child ps5wk-objects)
+add_custom_command(TARGET ps5wk-child POST_BUILD
+    COMMAND ${PS5_APPS_DIR}/common/check-lock-imports.sh $<TARGET_FILE:ps5wk-child> ${PS5_LOCK_FUNCTIONS}
+    VERBATIM)
 
 add_executable(ps5wk-shot ${PS5_APPS_DIR}/shot/ps5wk-shot.c ${PS5_CRASHGUARD} ${PS5_APPS_DIR}/common/ps5audioserver.c)
 target_include_directories(ps5wk-shot PRIVATE ${PS5_API_INCLUDE_DIRECTORIES})
@@ -85,9 +110,24 @@ add_dependencies(ps5wk-shot WebKit)
 
 set(PS5WK_LOG_HOST "192.168.1.20" CACHE STRING "Mac address for the title's TCP log (tools/logserver.sh)")
 set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
-add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/common/ps5audioserver.c)
+# The title gets ps5locks too: package.sh relinks these objects and copies
+# the --wrap options from this link line (its heap, Spike 10's dlmalloc
+# arenas, locks with pthread mutexes).
+add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/common/ps5audioserver.c
+    ${PS5_APPS_DIR}/title/ps5locks-title.c)
 target_include_directories(ps5browser PRIVATE ${PS5_API_INCLUDE_DIRECTORIES} ${PS5_PORT_DIR}/../../spikes)
 target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_PORT=${PS5WK_LOG_PORT})
+target_link_options(ps5browser PRIVATE ${PS5_LOCK_WRAPS})
 target_link_libraries(ps5browser PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)
 add_dependencies(ps5browser ps5wk-objects)
 add_dependencies(ps5browser WebKit)
+add_custom_command(TARGET ps5browser POST_BUILD
+    COMMAND ${PS5_APPS_DIR}/common/check-lock-imports.sh $<TARGET_FILE:ps5browser> ${PS5_LOCK_FUNCTIONS}
+    VERBATIM)
+
+# lockbench (test/lockbench): the console's libc malloc and locks against
+# ps5malloc (libpas, from WebKit's objects) and ps5locks. A payload.
+add_executable(ps5wk-lockbench ${PS5_PORT_DIR}/test/lockbench/lockbench.c ${PS5_LOCKS} ${PS5_APPS_DIR}/common/ps5malloc.c)
+target_link_options(ps5wk-lockbench PRIVATE -Wl,--wrap=mmap -Wl,--wrap=munmap ${PS5_LOCK_WRAPS} ${PS5_MALLOC_WRAPS})
+target_link_libraries(ps5wk-lockbench PRIVATE ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK})
+add_dependencies(ps5wk-lockbench ps5wk-objects)
