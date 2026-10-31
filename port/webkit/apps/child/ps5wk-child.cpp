@@ -64,6 +64,8 @@ typedef struct {
 void ps5malloc_stats(ps5malloc_stats_t*);
 // JSC's executable memory pool (WebKit patch 0030; absent without the JIT).
 void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
+// JIT compilations, failures and the memory-pressure multiplier (patch 0035).
+void ps5wk_jit_counts(unsigned long long* counts, size_t n) __attribute__((weak));
 }
 
 // C++ allocations go to WebKit's heap (libpas, per-thread caches), not the
@@ -311,6 +313,7 @@ static void queryTitleDecoder(unsigned& codecs, int& maxWidth, int& maxHeight)
 
 struct MainArgs {
     bool network;
+    const char* tag;
     int argc;
     char* argv[4];
     int result;
@@ -328,7 +331,7 @@ static void* cpuLogger(void* data)
     double lastWall = nowMS();
     for (;;) {
         struct timespec ts { 5, 0 };
-        nanosleep(&ts, nullptr);
+        while (nanosleep(&ts, &ts) && errno == EINTR) { } // signals (the profiler's SIGPROF) cut sleeps short
         struct rusage now;
         getrusage(RUSAGE_SELF, &now);
         double wall = nowMS();
@@ -487,7 +490,7 @@ static void* memLogger(void* data)
     bool over = false;
     for (unsigned tick = 1;; tick++) {
         struct timespec ts { 5, 0 };
-        nanosleep(&ts, nullptr);
+        while (nanosleep(&ts, &ts) && errno == EINTR) { } // signals (the profiler's SIGPROF) cut sleeps short
         double mapped = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : 0;
         double givenBack = &pas_page_malloc_ps5_decommitted_bytes && pas_page_malloc_ps5_decommitted_bytes > 0
             ? pas_page_malloc_ps5_decommitted_bytes / 1048576.0 : 0;
@@ -522,14 +525,18 @@ static void* memLogger(void* data)
         double resident = residentBigMB();
         double compact = &pas_compact_heap_reservation_bump ? pas_compact_heap_reservation_bump / 1048576.0 : -1;
         double compactSize = &pas_compact_heap_reservation_size ? pas_compact_heap_reservation_size / 1048576.0 : -1;
-        char jitText[96] = "";
+        char jitText[256] = "";
         if (ps5wk_jit_memory) {
             void *jitStart = nullptr, *jitEnd = nullptr;
             size_t jitAllocated = 0, jitCommitted = 0;
             ps5wk_jit_memory(&jitStart, &jitEnd, &jitAllocated, &jitCommitted);
+            unsigned long long counts[16] = { };
+            if (ps5wk_jit_counts)
+                ps5wk_jit_counts(counts, 16);
             if (jitStart)
-                snprintf(jitText, sizeof jitText, "; JIT code %.1f MB (committed %.1f of %.0f MB)", jitAllocated / 1048576.0,
-                    jitCommitted / 1048576.0, ((char*)jitEnd - (char*)jitStart) / 1048576.0);
+                snprintf(jitText, sizeof jitText, "; JIT code %.1f MB (committed %.1f of %.0f MB), compiled Baseline %llu / DFG %llu / FTL %llu (%llu / %llu / %llu ms), %llu failed, %llu allocations refused, thresholds x%.2f",
+                    jitAllocated / 1048576.0, jitCommitted / 1048576.0, ((char*)jitEnd - (char*)jitStart) / 1048576.0, counts[6], counts[7], counts[8],
+                    counts[10], counts[11], counts[12], counts[5], counts[4], counts[13] / 1000.0);
             else
                 snprintf(jitText, sizeof jitText, "; JIT off");
         }
@@ -559,8 +566,8 @@ static void* memLogger(void* data)
 static void* runWebKit(void* data)
 {
     auto* args = static_cast<MainArgs*>(data);
-    if (!args->network)
-        ps5wk_profiler_start("web");
+    // PS5WK_PROFILE: both processes (files <tag>-<pid>.prof, e.g. web3-812.prof).
+    ps5wk_profiler_start(args->tag);
     args->result = args->network ? WebKit::NetworkProcessMain(args->argc, args->argv) : WebKit::WebProcessMain(args->argc, args->argv);
     return nullptr;
 }
@@ -649,7 +656,9 @@ int main(int, char**)
     static char idArg[32], fdArg[16];
     snprintf(idArg, sizeof(idArg), "%llu", processIdentifier);
     snprintf(fdArg, sizeof(fdArg), "%d", fd);
-    static MainArgs args { network, 3, { const_cast<char*>(network ? "WPENetworkProcess" : "WPEWebProcess"), idArg, fdArg, nullptr }, 0 };
+    static char profileTag[32];
+    snprintf(profileTag, sizeof(profileTag), "%s", tag);
+    static MainArgs args { network, profileTag, 3, { const_cast<char*>(network ? "WPENetworkProcess" : "WPEWebProcess"), idArg, fdArg, nullptr }, 0 };
 
     // WebKit's main thread is whichever thread initializes it (WTF generic
     // MainThread); run it on a thread with a known, large stack for JSC.

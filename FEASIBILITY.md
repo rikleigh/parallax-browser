@@ -801,3 +801,40 @@ port.
     callback, the WebProcess's separate libsoup for hlsdemux2; whether spin
     0 or 100 is better for real workloads (spin 0 wins the 4-6 thread
     microbenchmark, spin 100 the 2-thread one).
+- **Where the time goes (2026-10-31, profiled on the console by log;
+  port/webkit/README.md, *Profiling*).** A sampling profiler for both
+  children (`PS5WK_PROFILE=1`: every thread, weighted by its own CPU clock,
+  DWARF-CFI unwinding in the signal handler, folded stacks per second;
+  `test/prof/prof-run.sh`, `prof.py`), and JIT counters plus per-tier
+  tagging of JIT code (patch 0035). Findings, biggest first:
+  - **JavaScript** is 55-60% of a WebProcess main thread that is 40-80% busy
+    for 15-25 s on YouTube and news sites (YouTube search: 14 s of main
+    thread CPU). JIT code itself is 10-19 points; the C++ runtime, the parser
+    and the LLInt are the rest. The tiers work (YouTube: 3573 Baseline, 2279
+    DFG, 77 FTL compiles, 0 failures, 0 refused allocations), but our 128 MB
+    executable pool raises every tier-up threshold x1.8-1.9 on YouTube
+    (JSC's memory-pressure multiplier; ~x1.05 with upstream's 1 GB).
+  - **CPU painting** limits scrolling on pages with fixed/sticky content:
+    BBC News repaints 2.07 Mpx per step, paint 25-28 ms of 35-43 ms per
+    update (11-22 updates/s); bilinear image scaling is 7% of the main thread,
+    copying the last frame forward 1-3 ms per update. The **bitmap transfer
+    is not the problem**: the title uploads a full 8 MB frame in ~1 ms and
+    uses 0.05-0.17 cores. GPU painting would pay off for paint-bound
+    scrolling (BBC-like pages), not for script-bound loads (YouTube).
+  - **NetworkProcess**: libsoup's HSTS store writes SQLite on the network
+    main thread for every `Strict-Transport-Security` response (each moves
+    the expiry): ~3.3 s of wall time (12%) in a The Verge load.
+  - rAF runs at 110-158/s while scrolling (updates aren't paced to 60 Hz).
+  - Owner's reports: no reload loops (YouTube: two top-level loads, the
+    rest in-page; the title logs the previous URI on "load started"; The
+    Verge was article-then-back; reddit a login redirect). Apple's product
+    page uses its own scroll-driven JS (no CSS scroll timelines), sticky
+    sections and scrubbed videos; in the harness it chose its full
+    experience but its videos never got a source, so pinned video sections
+    stay still. To be checked in the title.
+  - Tooling fixes: elfldr briefly refuses loopback connections (ECONNREFUSED)
+    under back-to-back launches; the process manager now retries for 10 s.
+    On 13.60 another thread's CPU clock reads as the caller's.
+  - Next (not done): a larger JIT pool A/B (hours), HSTS writes only on real
+    changes (hours), 60 Hz pacing (hours), composited fixed/sticky layers or
+    GPU painting for scrolling (days to weeks).

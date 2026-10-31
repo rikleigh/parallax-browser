@@ -128,8 +128,27 @@ static int sendToElfldr(const UploadJob& job, const char* tag)
     address.sin_family = AF_INET;
     address.sin_port = htons(PS5WK_ELFLDR_PORT);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0 || connect(s, reinterpret_cast<struct sockaddr*>(&address), sizeof(address))) {
+    // elfldr sometimes refuses connections for a moment (ECONNREFUSED on
+    // loopback while it is busy with another payload: seen in back-to-back
+    // ps5wk-shot runs, 2026-10-31): retry for up to 10 s.
+    int s = -1;
+    for (int attempt = 1;; attempt++) {
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s >= 0 && !connect(s, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)))
+            break;
+        int savedErrno = errno;
+        if (s >= 0)
+            close(s);
+        s = -1;
+        if (savedErrno != ECONNREFUSED || attempt >= 40) {
+            errno = savedErrno;
+            break;
+        }
+        if (attempt == 1)
+            g_message("[ps5-launch %s] elfldr refused the connection; retrying for up to 10 s", tag);
+        g_usleep(250 * 1000);
+    }
+    if (s < 0) {
         g_warning("[ps5-launch %s] cannot reach elfldr on 127.0.0.1:%d: errno %d", tag, PS5WK_ELFLDR_PORT, errno);
         if (s >= 0)
             close(s);

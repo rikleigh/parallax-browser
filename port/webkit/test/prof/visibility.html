@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- prof-run.sh / ps5wk-shot test page: does the page think it is visible,
+     do requestAnimationFrame and IntersectionObserver run, and do they follow
+     scrolling? Logs "VIS ..." console lines once a second for 12 s while a
+     timer scrolls the page down. -->
+<meta charset="utf-8">
+<title>visibility test</title>
+<style>body{margin:0;font:20px sans-serif} .box{height:300px;margin:40px;background:#8ac;border:2px solid #246}</style>
+<div id="boxes"></div>
+<script>
+const boxes = document.getElementById("boxes");
+for (let i = 0; i < 60; i++) { const d = document.createElement("div"); d.className = "box"; d.textContent = "box " + i; boxes.appendChild(d); }
+let raf = 0, ioCalls = 0, ioVisible = new Set(), everVisible = new Set(), visChanges = 0;
+const tick = () => { raf++; requestAnimationFrame(tick); };
+requestAnimationFrame(tick);
+const io = new IntersectionObserver(entries => {
+    ioCalls++;
+    for (const e of entries) { const i = [...boxes.children].indexOf(e.target); if (e.isIntersecting) { ioVisible.add(i); everVisible.add(i); } else ioVisible.delete(i); }
+});
+for (const b of boxes.children) io.observe(b);
+document.addEventListener("visibilitychange", () => { visChanges++; console.log("VIS visibilitychange -> " + document.visibilityState); });
+const t0 = performance.now();
+let lastRaf = 0, n = 0;
+const report = setInterval(() => {
+    const s = (performance.now() - t0) / 1000;
+    console.log("VIS t=" + s.toFixed(1) + " visibility=" + document.visibilityState + " hidden=" + document.hidden + " focus=" + document.hasFocus()
+        + " rafPerS=" + (raf - lastRaf) + " ioCalls=" + ioCalls + " visibleNow=[" + [...ioVisible].sort((a, b) => a - b).join(",") + "] everVisible=" + everVisible.size
+        + " scrollY=" + Math.round(scrollY) + " innerHeight=" + innerHeight);
+    lastRaf = raf;
+    if (++n >= 12) clearInterval(report);
+}, 1000);
+setTimeout(() => { const id = setInterval(() => { window.scrollBy(0, 60); if (scrollY > 15000) clearInterval(id); }, 16); }, 2000);
+</script>

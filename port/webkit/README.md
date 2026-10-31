@@ -333,6 +333,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0032-ps5-cpu-painting | PS5 only, CPU page painting (see *CPU painting* below): a frame is recorded into an SkPicture and replayed in horizontal bands on `PS5WK_PAINT_THREADS` threads (default 4; `PS5WK_PAINT_ASYNC=1`: replayed on the pool while the main thread goes on); scrolls move the last frame's pixels and only the uncovered strip and what changed is painted, every frame starts from a copy of the last one (`PS5WK_SCROLL_COPY=0`: repaint on scroll, as upstream); damage is painted as non-overlapping rects (`rectsForPainting`; iterating the damage painted overlaps several times); no full-frame `readPixels` of the SHM surface onto itself (`PS5WK_SHM_READBACK=1` restores it); Skia's heap (`sk_malloc`) is WebKit's libpas (the console's libc malloc collapses under threads, `test/lockbench`); `[render]` lines with per-phase timing; the 0016 throttle no longer drops an update when it fires during a pending frame |
 | 0033-ps5-hlsdemux2 | PS5 only: HLS through adaptivedemux2's `hlsdemux2` when `WEBKIT_GST_ENABLE_HLS_SUPPORT=1` (upstream always demotes it: it downloads with its own libsoup, which a sandboxed media process can't; the PS5 WebProcess can), the only HLS demuxer playbin3 takes; webkitwebsrc adds the page's User-Agent to its http-headers event (the NetworkProcess adds it to the real request), which hlsdemux2 uses for its own requests |
 | 0034-ps5-network-cache-and-dns | PS5 only (see *Locks, malloc and networking* below): the disk cache writes each body once, straight to the record's blob file, and counts it (0013 wrote `Blobs/<hash>` and copied it in full, and the copies were counted nowhere, so the cache never shrank); DocumentBrowser's disk cache is desktop-sized (1 GB with 16 GB free; was 75 MB); typed DNS lookups (libsoup's IPv4-only/IPv6-only) are answered from a prefetched Default answer, filtered by family, and "not found" when it has no address of that family |
+| 0035-ps5-profiling | PS5 only (see *Profiling* below): JIT counters for the profiler and the `[mem]` line (`ps5wk_jit_counts`: compiles by tier and outcome, compile ms, refused executable allocations, the executable-memory pressure multiplier); every executable allocation noted with the tier of the compiling thread (`ps5wk_jit_tier(pc)`); WTF threads named with `pthread_set_name_np` |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -405,7 +406,7 @@ decoding, sound, the link server, the home page) can be changed on the
 | `/data/ps5webkit/audio-selftest` | title: open a port at start, 0.1 s of silence, leave it open (`RESULT ps5browser audio-selftest`) |
 | `[ps5audio]` lines | per stream: `sceAudioOutGetPortState` when the port opens and after 2 s (output bits, channels, volume, reroute count), failed `sceAudioOutOpen`/`SetVolume` calls, and at close the samples' peak and RMS and the count of failed `sceAudioOutOutput` calls (is the WebProcess sending silence? is the port refusing data?) |
 | `child.env`: `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_VP9=0`, `PS5WK_MEDIA_AV1=1`, `GST_DEBUG=...` | WebProcess decoding, codec advertising, GStreamer logs |
-| `child.env`: `PS5WK_PROFILE=1` | sampling profiler of the WebProcess main thread (`apps/common/profiler.c`, 2 ms SIGPROF; `test/prof.sh` fetches and symbolizes) |
+| `child.env`: `PS5WK_PROFILE=1` | sampling profiler, every thread of both children weighted by CPU time (`=wall`: the main thread by wall time; `apps/common/profiler.c`, see *Profiling*); `test/prof/prof-run.sh` runs pages, `test/prof.sh` summarizes the newest profiles |
 | `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
 | `[render]` lines (WebProcess, every 5 s while rendering at least 5 updates) | rendering updates per second; total time per update (avg, p50, p95, max); the update phase (style, layout, rAF, JavaScript); paint (avg, p95, max; Mpx painted per update, updates painted in bands, threads, time spent copying the last frame forward, async rasters); `copy` (the rest: frame hand-off); `frame done` (frame sent until the UIProcess presented it, vsync included); updates followed by the idle gap |
 | `child.env`: `PS5WK_RENDER_LOG=0` / `1` (default) / `2` / `3` | `[render]` lines off; every 5 s; also one `[render1]` line per update (`test/paint/paint-ab-summary.py` reads them); also every scroll and the rects painted |
@@ -1769,6 +1770,165 @@ Resource Timing, `net-summary.py`):
   (`gDefaultReadBufferSize`), per-connection `SSL_CTX_new`, the WebProcess's
   own libsoup for hlsdemux2 (no shared connections or TLS sessions with the
   NetworkProcess).
+
+## Profiling: where the time goes (2026-10-31)
+
+The locks/malloc round made those 30-2000x faster in microbenchmarks and
+browsing no faster, so this round measured before changing anything.
+
+**Tooling** (all off unless `PS5WK_PROFILE` is set; checked on the console):
+
+- **`apps/common/profiler.c`** (ps5wk-child, both processes). `PS5WK_PROFILE=1`:
+  a helper thread sends SIGPROF (`pthread_kill`) to every thread every 2 ms;
+  the handler reads the thread's *own* CPU clock and records a sample
+  weighted by the CPU it used since its last one, so the profile is CPU time
+  per thread, and threads that stayed idle are signalled less and less
+  (down to ~1/s). On 13.60 `pthread_getcpuclockid()` + `clock_gettime()` of
+  another thread returns the *calling* thread's time, hence the reading
+  inside the handler (`CLOCK_THREAD_CPUTIME_ID` of the calling thread is
+  right). `PS5WK_PROFILE=wall`: the main thread every 2 ms, idle or not
+  (what it waits on; slows the page down noticeably). `PS5WK_PROFILE=itimer`
+  (`setitimer(ITIMER_PROF)`) exists but has never run on the console.
+- **Unwinding** (`apps/common/ps5unwind.c`): the executable's own
+  `.eh_frame_hdr`/`.eh_frame` (DWARF CFI) in the signal handler, every stack
+  read bounds-checked against the thread's stack (the crash guard's
+  `pthread_create` trampoline records it); rbp chains for JSC's LLInt and JIT
+  frames and through libkernel/libc. Up to 128 frames. `test/prof/unwind-test.sh`
+  checks the CFI rules against `llvm-dwarfdump --eh-frame` on the Mac
+  (27k rows, all equal).
+- **Output**: `/data/ps5webkit/prof/<tag>-<pid>.prof`, stacks folded per
+  1 s window, per-thread CPU and names (WTF threads are now named on PS5,
+  patch 0035), JIT pcs tagged with the tier that compiled them (patch 0035
+  notes every executable allocation with the compiling thread's tier), and
+  the JIT counters below.
+- **`test/prof/prof-run.sh <url>...`**: ps5wk-shot at 1920x1080 cold/warm with
+  the profiler, `page.js` (TTFB, DOMContentLoaded, load, FCP, resources),
+  `DIAG=1` (`page-diag.js`: html classes, Apple's `causeForBase`, videos,
+  images, `pushState`/`beforeunload`), `SCROLL=1` (paint-ab's scroll),
+  `PROFILE=wall`, `YTCONSENT=1` (YouTube's "reject all" cookie, then a reload).
+  It waits until elfldr is idle between runs. **`test/prof/prof.py`**:
+  symbolizes (llvm-symbolizer), CPU per thread, the main thread by *area*
+  (innermost frame that names one) and by *phase* (outermost), JavaScript by
+  tier, a per-second timeline, `--folded` for flame graphs (speedscope).
+  `test/prof.sh` summarizes the newest profiles on the console (title runs).
+- **Patch 0035**: JIT counters (`ps5wk_jit_counts`: compiles by tier and
+  outcome, compile ms, refused executable allocations, the executable-memory
+  pressure multiplier); in the `[mem]` line too.
+- **Fixed on the way**: elfldr sometimes refuses loopback connections for a
+  moment (ECONNREFUSED; two of four back-to-back harness runs failed to start
+  their children): `WPEProcessManagerPS5` now retries for up to 10 s (the
+  title too, once rebuilt). The child's `[cpu]`/`[mem]` loggers resume their
+  sleep after a signal.
+
+**Measured** (ps5wk-shot, single cold runs over the internet, profiler on;
+main thread = WebKit's main thread in the WebProcess, CPU over the ~15-25 s
+of the run):
+
+| page | load event / FCP (ms) | main thread CPU | where (main thread) | other threads |
+| --- | --- | --- | --- | --- |
+| YouTube search results | 2484 / 2092 | 14.1 s (78% busy) | JS 56% (C++ runtime 24, JIT code 19, parse 7, LLInt 4), style 13, layout 6, paint 6 | JIT compilers 3.0 s; pressure multiplier 1.91 |
+| YouTube home (no account: "try searching"), warm | 3353 / 2460 | 8.3 s | JS ~55%, style 12% | JIT compilers 1.9 s; multiplier 1.82 |
+| The Verge /tech | 8905 / 3185 | 9.5 s | JS ~60% (runtime 29, JIT code 13, parse 11), style 8, layout 6 | JIT 3.1 s, a Worker 0.6 s; NetworkProcess main 1.8 s (26% HSTS writes) |
+| BBC News (load + scroll) | 1759 / 581 | 14.4 s (79% busy) | layout 19, paint raster 16 (bilinear image scaling alone 7%), JS 26, style 9 | 3 paint threads 1.8 s each |
+| GitHub (load + scroll) | 2272 / 1071 | 8.2 s | paint raster 22 (clearing 6%), layout 11, JS 17, style 9 | 3 paint threads 0.8 s each |
+| Apple iPhone page (load + scroll) | 3118 / 522 | 9.0 s | scroll: paint (record+raster) 40%, copying the last frame forward 17%, layout 20 | 3 paint threads 0.7 s each |
+| Wikipedia | 727 / 582 | 2.0 s | layout 20, style 16, JS 13 | - |
+| Hacker News | 497 / 368 | 0.7 s | mostly idle | - |
+
+- **JavaScript** is the biggest single cost on script-heavy pages (YouTube,
+  The Verge: 55-60% of a main thread that is 40-80% busy for 15-25 s). Of
+  that, JIT-compiled code is only 10-19 points; the rest is the C++ runtime
+  (property lookups, `JSLexicalEnvironment::getOwnPropertySlot`, hash
+  tables, strings), the parser/bytecode generator (7-12%) and the LLInt
+  (4-5%). The tiers are used and never fail: YouTube compiled 3573 Baseline,
+  2279 DFG, 77 FTL code blocks, 0 failed, 0 refused allocations. But
+  executable memory pressure raises every tier-up threshold: JSC multiplies
+  them by `available / (available - used)`, and with our 128 MB pool
+  YouTube reaches **x1.8-1.9** (upstream's 1 GB: ~x1.05).
+- **CPU painting** dominates scrolling on pages with fixed/sticky content:
+  BBC repaints 2.07 Mpx per scroll step (paint 25-28 ms of 35-43 ms per
+  update, 11-22 updates/s); bilinear scaling of images is 7% of the main
+  thread; copying the last frame forward is 1-3 ms per update (17% of the
+  main thread while scrolling the Apple page). Wikipedia and GitHub scroll
+  at 55-95 updates/s.
+- **The bitmap transfer is cheap**: the title uploads a full 8 MB frame in
+  ~1.0 ms (`[present]` lines of the owner's session; 0.05-0.17 cores for the
+  title while browsing and during hardware video). The WebProcess used ~0.8
+  cores while YouTube played.
+- **Loads**: style, layout and JS during load make rendering updates of
+  30-130 ms (YouTube: update 32 ms avg, p95 132; paint 8 ms avg for 1.1 Mpx).
+- **NetworkProcess**: libsoup's HSTS store writes SQLite (journal created,
+  written, deleted) on the network main thread for *every* response with a
+  `Strict-Transport-Security` header, because each one moves the policy's
+  expiry: The Verge load spent 0.48 s of CPU and **~3.3 s of wall time (12%)**
+  of the thread that carries all network I/O and IPC in it; 1-7% of the CPU
+  on the other sites. The disk cache's blob writes (SHA-1, mmap) run on a
+  background thread (0.3-0.5 s per load).
+- **Platform taxes** seen in the flat JS profile: libpas page construction
+  and epoch reads ~2.5%, emulated TLS (`__emutls_get_address`) 0.5%,
+  `MonotonicTime::now` 0.6%.
+- `requestAnimationFrame` runs at 110-158/s while scrolling (63/s idle):
+  rendering updates aren't paced to 60 Hz, so rAF-driven animations do up to
+  2.5x the work.
+
+**The owner's reports** (2026-10-31 session log, `tv17.log`, and harness runs):
+
+- **YouTube "reloads"**: the session has exactly two top-level loads on
+  YouTube (home, a channel); everything after is YouTube's in-page
+  navigation. The title logs `load started:` with the *previous* URI, which
+  makes back/forward look like reloads. Slow thumbnails: in the harness the
+  thumbnails in view do load (IntersectionObserver, visibility and rAF work:
+  `test/prof/visibility.html`); YouTube's main thread is 78% busy for ~15 s
+  with JavaScript, and thumbnails are filled in by that JavaScript.
+- **The Verge three times, reddit twice**: no reload loop. In the harness
+  /tech loads once and stays (no `pushState`, no `beforeunload` in 16 s). The
+  session's sequence is /tech -> an article (committed) -> back to /tech
+  (the article's load ended by the back navigation) -> /tech again. reddit:
+  old.reddit redirected to its login page, whose script then navigated to
+  www.reddit.com.
+- **Apple's product page**: no CSS scroll-driven animations
+  (`animation-timeline`, `scroll-timeline`, `view-timeline`: none). It is
+  Apple's own scroll-driven JS: scroll listeners, `getBoundingClientRect`,
+  rAF, CSS custom properties (`setProperty('--...')` x52), transforms and
+  opacity, sticky containers (19 sticky elements), and `inline-media`
+  videos that are loaded and scrubbed as their sections scroll into view;
+  the realtime viewer needs WebGL2 (we have none: it falls back to images).
+  The page chose its full experience in the harness (`html.enhanced
+  inline-media`, no `causeForBase`), but none of its 8 videos ever got a
+  source while the page was scrolled end to end (`readyState` 0), so the
+  sections that are videos stay still, which can look like scrolling being
+  stuck in a pinned section. This was in the harness (no hardware decoder
+  there; still to be checked in the title). Scrolling itself ran at 45-97
+  updates/s in the harness. Without accelerated compositing every
+  transform/opacity change is a CPU repaint.
+
+**Ranked bottlenecks and fixes** (not done yet; effort is a rough guess):
+
+1. **JavaScript on the main thread** (YouTube, news sites: 55-60% of a busy
+   main thread). Cheapest lever first: a larger JIT pool
+   (`JSC_jitMemoryReservationSize`, 128 -> 256-512 MB; YouTube's thresholds
+   are x1.9 now), and an A/B of tier thresholds (`JSC_thresholdFor*`,
+   `PS5WK_JIT`). Then the runtime itself: why `getOwnPropertySlot` on lexical
+   environments and the parser show up so much (bytecode cache: JSC's
+   `CachedBytecode` for repeat visits). Effort: hours for the pool A/B, days
+   for the rest.
+2. **CPU painting of fixed/sticky pages while scrolling** (BBC 2 Mpx per
+   step, 11-22 updates/s): composited layers for fixed/sticky content
+   painted once and moved, or GPU painting in the title (FEASIBILITY §4.8);
+   smaller wins: cache scaled images (bilinear scaling 7%), skip the
+   copy-forward when the whole view is repainted (1-3 ms). Effort: days to
+   weeks.
+3. **HSTS writes on the network thread** (up to 3.3 s of a load): keep HSTS
+   policies in memory and write them only when they really change (a
+   libsoup patch: ignore expiry moves of less than a day, or journal in
+   memory/WAL). Effort: hours.
+4. **Rendering updates not paced to the display** (rAF 110-158/s while
+   scrolling): cap updates at 60/s. Effort: hours.
+5. **Apple's videos never loading** (harness): check in the title with
+   hardware decoding; if they stay empty, trace the page's inline-media
+   load trigger. Effort: a day.
+6. Platform taxes (libpas page construction, emulated TLS, clock reads):
+   1-3% each, later.
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

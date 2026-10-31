@@ -278,12 +278,19 @@ typedef struct {
     void* argument;
 } thread_start_t;
 
+// profiler.c (ps5wk-child): the thread's stack bounds and CPU clock.
+void ps5wk_profiler_thread(int starting) __attribute__((weak));
+
 static void* threadTrampoline(void* data)
 {
     thread_start_t start = *(thread_start_t*)data;
     free(data);
     ps5wk_crash_guard_thread();
+    if (ps5wk_profiler_thread)
+        ps5wk_profiler_thread(1);
     void* result = start.start(start.argument);
+    if (ps5wk_profiler_thread)
+        ps5wk_profiler_thread(0);
     stack_t current;
     if (!sigaltstack(NULL, &current) && !(current.ss_flags & SS_DISABLE) && current.ss_sp && !(current.ss_flags & SS_ONSTACK)) {
         stack_t disable;

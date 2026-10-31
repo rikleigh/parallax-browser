@@ -1,0 +1,177 @@
+diff --git a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+index 44011106fe..b00384922d 100644
+--- a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
++++ b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+@@ -32,6 +32,9 @@
+ #include "JITOperationValidation.h"
+ #include "LinkBuffer.h"
+ #include <bit>
++#if defined(PS5_PAYLOAD_SDK)
++#include <mutex>
++#endif
+ #include <wtf/CryptographicallyRandomNumber.h>
+ #include <wtf/FastBitVector.h>
+ #include <wtf/FileSystem.h>
+@@ -1167,6 +1170,61 @@ double ExecutableAllocator::memoryPressureMultiplier(size_t addedMemoryUsage)
+     return result;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Profiling (apps/common/profiler.c): which tier made the code at a JIT pc.
++// Every allocation from the pool is noted with the tier of the compiler
++// thread that made it (JITPlan::compileInThread sets ps5CurrentJITTier);
++// anything else (thunks, inline caches, the regexp JIT, made on the main
++// thread) is tier 0. A ring of the last 64k allocations, searched newest
++// first, so reused memory maps to its newest owner.
++thread_local int ps5CurrentJITTier;
++static constexpr unsigned ps5JITRangeCount = 1 << 16;
++struct PS5JITRange {
++    std::atomic<uintptr_t> start;
++    std::atomic<uintptr_t> end;
++    std::atomic<int> tier;
++};
++static PS5JITRange* ps5JITRanges;
++static std::atomic<unsigned> ps5JITRangeNext;
++// Counters: [0..3] allocations by tier (other, Baseline, DFG, FTL), [4] failed
++// "can fail" allocations (the pool's reserve reached or exhausted).
++std::atomic<unsigned long long> ps5JITCounters[16];
++
++static void ps5NoteJITAllocation(void* start, void* end)
++{
++    static std::once_flag once;
++    std::call_once(once, [] {
++        ps5JITRanges = static_cast<PS5JITRange*>(calloc(ps5JITRangeCount, sizeof(PS5JITRange)));
++    });
++    int tier = ps5CurrentJITTier;
++    ps5JITCounters[tier & 3]++;
++    if (!ps5JITRanges)
++        return;
++    auto& range = ps5JITRanges[ps5JITRangeNext.fetch_add(1, std::memory_order_relaxed) & (ps5JITRangeCount - 1)];
++    range.start.store(0, std::memory_order_relaxed);
++    range.tier.store(tier, std::memory_order_relaxed);
++    range.end.store(reinterpret_cast<uintptr_t>(end), std::memory_order_relaxed);
++    range.start.store(reinterpret_cast<uintptr_t>(start), std::memory_order_release);
++}
++
++// The tier that made the code at pc: 0 other, 1 Baseline, 2 DFG, 3 FTL, -1 unknown.
++extern "C" int ps5wk_jit_tier(const void* pc)
++{
++    if (!ps5JITRanges)
++        return -1;
++    uintptr_t address = reinterpret_cast<uintptr_t>(pc);
++    unsigned next = ps5JITRangeNext.load(std::memory_order_acquire);
++    unsigned count = std::min(next, ps5JITRangeCount);
++    for (unsigned i = 1; i <= count; i++) {
++        auto& range = ps5JITRanges[(next - i) & (ps5JITRangeCount - 1)];
++        uintptr_t start = range.start.load(std::memory_order_acquire);
++        if (start && address >= start && address < range.end.load(std::memory_order_relaxed))
++            return range.tier.load(std::memory_order_relaxed);
++    }
++    return -1;
++}
++#endif
++
+ RefPtr<ExecutableMemoryHandle> ExecutableAllocator::allocate(size_t sizeInBytes, JITCompilationEffort effort)
+ {
+     FixedVMPoolExecutableAllocator* allocator = g_jscConfig.fixedVMPoolExecutableAllocator;
+@@ -1195,6 +1253,9 @@ RefPtr<ExecutableMemoryHandle> ExecutableAllocator::allocate(size_t sizeInBytes,
+         if (bytesAllocated > bytesAvailable) {
+             if (Options::logExecutableAllocation())
+                 dataLog("Allocation failed because bytes allocated ", bytesAllocated,  " > ", bytesAvailable, " bytes available.\n");
++#if defined(PS5_PAYLOAD_SDK)
++            ps5JITCounters[4]++;
++#endif
+             return nullptr;
+         }
+     }
+@@ -1205,8 +1266,14 @@ RefPtr<ExecutableMemoryHandle> ExecutableAllocator::allocate(size_t sizeInBytes,
+             dataLog("Ran out of executable memory while allocating ", sizeInBytes, " bytes.\n");
+             CRASH();
+         }
++#if defined(PS5_PAYLOAD_SDK)
++        ps5JITCounters[4]++;
++#endif
+         return nullptr;
+     }
++#if defined(PS5_PAYLOAD_SDK)
++    ps5NoteJITAllocation(result->start().untaggedPtr(), result->end().untaggedPtr());
++#endif
+ 
+     void* start = allocator->memoryStart();
+     void* end = allocator->memoryEnd();
+@@ -1249,6 +1316,19 @@ extern "C" void ps5wk_jit_memory(void** start, void** end, size_t* allocated, si
+     if (committed)
+         *committed = valid ? allocator->bytesCommitted() : 0;
+ }
++
++// JIT counters for the profiler and the [mem] line: [0..3] executable
++// allocations by tier (other, Baseline, DFG, FTL), [4] failed allocations,
++// [5..9] compilations finished by path (fail, Baseline, DFG, FTL, cancelled),
++// [10..12] compile milliseconds by tier (Baseline, DFG, FTL), [13] the
++// threshold multiplier from executable memory pressure, times 1000.
++extern "C" void ps5wk_jit_counts(unsigned long long* counts, size_t n)
++{
++    for (size_t i = 0; i < n && i < 16; i++)
++        counts[i] = ps5JITCounters[i].load(std::memory_order_relaxed);
++    if (n > 13 && g_jscConfig.fixedVMPoolExecutableAllocator)
++        counts[13] = static_cast<unsigned long long>(ExecutableAllocator::memoryPressureMultiplier(0) * 1000);
++}
+ #endif
+ 
+ size_t ExecutableAllocator::committedByteCount()
+diff --git a/Source/JavaScriptCore/jit/JITPlan.cpp b/Source/JavaScriptCore/jit/JITPlan.cpp
+index 9c79074b05..eada6e1c37 100644
+--- a/Source/JavaScriptCore/jit/JITPlan.cpp
++++ b/Source/JavaScriptCore/jit/JITPlan.cpp
+@@ -49,6 +49,10 @@ extern Seconds totalDFGCompileTime;
+ extern Seconds totalFTLCompileTime;
+ extern Seconds totalFTLDFGCompileTime;
+ extern Seconds totalFTLB3CompileTime;
++#if defined(PS5_PAYLOAD_SDK)
++extern thread_local int ps5CurrentJITTier;
++extern std::atomic<unsigned long long> ps5JITCounters[16];
++#endif
+ 
+ JITPlan::JITPlan(JITCompilationMode mode, CodeBlock* codeBlock)
+     : m_mode(mode)
+@@ -275,6 +279,12 @@ void JITPlan::compileInThread(JITWorklistThread* thread)
+ 
+     CompilationScope compilationScope;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    int ps5Tier = isFTL() ? 3 : mode() == JITCompilationMode::Baseline ? 1 : 2;
++    SetForScope ps5TierScope(ps5CurrentJITTier, ps5Tier);
++    MonotonicTime ps5Before = MonotonicTime::now();
++#endif
++
+ #if ENABLE(DFG_JIT)
+     if (DFG::logCompilationChanges(m_mode) || Options::logPhaseTimes()) [[unlikely]]
+         dataLog("DFG(Plan) compiling ", *m_codeBlock, " with ", m_mode, ", instructions size = ", m_codeBlock->instructionsSize(), "\n");
+@@ -282,6 +292,13 @@ void JITPlan::compileInThread(JITWorklistThread* thread)
+ 
+     CompilationPath path = compileInThreadImpl();
+     RELEASE_ASSERT((path == CancelPath) == (m_stage == JITPlanStage::Canceled));
++#if defined(PS5_PAYLOAD_SDK)
++    {
++        unsigned index = path == FailPath ? 5 : path == BaselinePath ? 6 : path == DFGPath ? 7 : path == FTLPath ? 8 : 9;
++        ps5JITCounters[index]++;
++        ps5JITCounters[9 + ps5Tier] += static_cast<unsigned long long>((MonotonicTime::now() - ps5Before).milliseconds());
++    }
++#endif
+ 
+     if (!computeCompileTimes) [[likely]]
+         return;
+diff --git a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+index 459f36a619..184d73863f 100644
+--- a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
++++ b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+@@ -468,6 +468,9 @@ void Thread::initializeCurrentThreadInternal(const char* threadName)
+     rename_thread(find_thread(nullptr), normalizeThreadName(threadName));
+ #elif OS(LINUX)
+     prctl(PR_SET_NAME, normalizeThreadName(threadName));
++#elif defined(PS5_PAYLOAD_SDK)
++    // Names for the profiler (apps/common/profiler.c) and the system.
++    pthread_set_name_np(pthread_self(), normalizeThreadName(threadName));
+ #else
+     UNUSED_PARAM(threadName);
+ #endif
