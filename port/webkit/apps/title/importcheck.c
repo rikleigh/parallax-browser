@@ -42,3 +42,13 @@ unsigned ps5wk_title_check_imports(char* out, size_t size, unsigned* total)
     *total = (unsigned)(sizeof imports / sizeof imports[0]);
     return missing;
 }
+
+/* The package's build id (package.sh): logged at start, names the folder
+ * with this package's unstripped binaries (titles/debug/<id>/). */
+#ifndef PS5WK_TITLE_BUILD_ID
+#define PS5WK_TITLE_BUILD_ID "unknown"
+#endif
+const char* ps5wk_title_build_id(void)
+{
+    return PS5WK_TITLE_BUILD_ID;
+}

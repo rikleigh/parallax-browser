@@ -1,0 +1,72 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WC feed stress</title>
+<!-- GPU compositing (WC) stress, a long feed scrolled by itself for
+     minutes (COMPOSITING-PLAN.md, "WC title abort"): every post is a
+     composited card with opacity < 1 whose composited children overlap
+     (TextureMapper paints it through an intermediate surface from
+     BitmapTexturePool, sized to the visible part, so a new size on every
+     scroll step), a rounded clip, an autoplaying muted looping video, a
+     blurred badge and a transform-animated spinner. Synthetic clips only
+     (test/media/make-media.sh feed-*), served next to the page:
+       tools/serve-media.py --port 8774 --page port/webkit/test/paint/wcfeed.html
+       then http://<mac>:8774/wcfeed.html   (?mins=<n> scroll time, default 5;
+       ?posts=<n>, default 60; ?videos=0 without video; ?step=<px per 16 ms>, default 24)
+     Logs WCFEED lines every 10 s (scrollY, playing videos, rAF/s) and
+     WCFEED DONE at the end. -->
+<style>
+body{font-family:sans-serif;background:#0f1218;color:#e6e9ef;margin:0;padding:24px 0}
+.post{position:relative;width:1100px;margin:0 auto 40px;padding:20px;border-radius:18px;background:linear-gradient(135deg,#283246,#1b2232);opacity:.96;will-change:transform;overflow:hidden}
+.post h2{margin:0 0 12px;font-size:26px}
+.post p{margin:8px 0;font-size:19px;line-height:1.45;color:#c4cad6}
+.media{position:relative;height:560px;border-radius:14px;overflow:hidden;background:#000;will-change:transform}
+.media video{width:100%;height:100%;object-fit:contain;display:block}
+.overlay{position:absolute;left:0;right:0;bottom:0;height:200px;background:linear-gradient(transparent,#000c);will-change:transform;pointer-events:none}
+.badge{position:absolute;right:24px;top:24px;padding:8px 14px;border-radius:20px;background:#ff5a36cc;filter:blur(.6px) drop-shadow(0 2px 6px #000);will-change:transform;font-weight:700}
+.spin{position:absolute;left:24px;top:24px;width:48px;height:48px;border-radius:50%;border:6px solid #fff6;border-top-color:#fff;animation:spin 1s linear infinite}
+.bar{height:46px;margin-top:12px;border-radius:10px;background:repeating-linear-gradient(90deg,#33405a 0 40px,#2a3549 40px 80px)}
+@keyframes spin{to{transform:rotate(360deg)}}
+#hud{position:fixed;right:16px;top:16px;z-index:9;padding:8px 12px;font:16px monospace;background:#000b;border-radius:8px}
+</style></head><body>
+<div id="hud">-</div>
+<div id="feed"></div>
+<script>
+var q = new URLSearchParams(location.search);
+var mins = +(q.get('mins') || 5), posts = +(q.get('posts') || 60), step = +(q.get('step') || 24);
+var withVideo = q.get('videos') !== '0', media = q.get('media') || '';
+var clips = ['feed-480x854-h264.mp4', 'feed-854x480-h264.mp4', 'feed-480x854-vp9.webm'];
+var feed = document.getElementById('feed'), hud = document.getElementById('hud');
+for (var i = 0; i < posts; i++) {
+  var post = document.createElement('div');
+  post.className = 'post';
+  var vid = withVideo ? '<video autoplay muted loop playsinline src="' + media + clips[i % clips.length] + '"></video>' : '';
+  post.innerHTML = '<h2>Post ' + (i + 1) + '</h2><p>Synthetic text for a feed card: a heading, two lines of copy, a media box with an overlay gradient, a badge and a spinner. Number ' + (i + 1) + '.</p>'
+    + '<div class="media">' + vid + '<div class="overlay"></div><div class="badge">LIVE ' + (i + 1) + '</div><div class="spin"></div></div>'
+    + '<div class="bar"></div><p>Comments ' + (i * 7 % 300) + ' · shares ' + (i * 3 % 90) + '</p>';
+  feed.appendChild(post);
+}
+function say(s) { console.log('WCFEED ' + s); hud.textContent = s; }
+var frames = 0;
+(function raf() { frames++; requestAnimationFrame(raf); })();
+var t0 = Date.now(), dir = 1, lastReport = t0, lastFrames = 0;
+setTimeout(function () {
+  say('start: ' + posts + ' posts, video ' + withVideo + ', ' + mins + ' min, ' + step + ' px per tick, height ' + document.documentElement.scrollHeight);
+  var id = setInterval(function () {
+    var now = Date.now();
+    var max = document.documentElement.scrollHeight - innerHeight;
+    if (scrollY >= max - 1) dir = -1;
+    if (scrollY <= 0) dir = 1;
+    scrollBy(0, dir * step);
+    if (now - lastReport >= 10000) {
+      var playing = 0;
+      document.querySelectorAll('video').forEach(function (v) { if (!v.paused && v.readyState >= 2) playing++; });
+      say(((now - t0) / 1000).toFixed(0) + ' s: scrollY ' + scrollY + ', ' + playing + ' videos playing, rAF ' + ((frames - lastFrames) * 1000 / (now - lastReport)).toFixed(1) + '/s');
+      lastReport = now; lastFrames = frames;
+    }
+    if (now - t0 > mins * 60000) {
+      clearInterval(id);
+      say('DONE after ' + ((now - t0) / 1000).toFixed(0) + ' s, scrollY ' + scrollY);
+    }
+  }, 16);
+}, 3000);
+</script>
+</body></html>

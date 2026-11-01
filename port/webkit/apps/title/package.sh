@@ -62,6 +62,8 @@ prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$PORT/wpe-ps5
 # libc.a without syscalls.o (raw syscalls: illegal in a title, and they
 # override libkernel's exports); titlesys.c defines what libkernel lacks.
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlesys.c" -o "$W/obj/titlesys.o"
+# abort() logs the thread and a backtrace first (--wrap=abort below).
+prospero-clang -std=gnu11 -O2 -Wall -fno-omit-frame-pointer "${TF[@]}" -c "$HERE/titleabort.c" -o "$W/obj/titleabort.o"
 cp "$SYS/lib/libc.a" "$W/libc-title.a"
 /opt/homebrew/opt/llvm@18/bin/llvm-ar d "$W/libc-title.a" syscalls.o
 /opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |
@@ -100,7 +102,7 @@ title_link() {
     "$LLD" -T "$HERE/ps5-pie-webkit.ld" --eh-frame-hdr -z nodynamic-undefined-weak \
         --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=posix_memalign \
         --wrap=aligned_alloc --wrap=memalign --wrap=malloc_usable_size \
-        --wrap=mmap --wrap=munmap --wrap=madvise \
+        --wrap=mmap --wrap=munmap --wrap=madvise --wrap=abort \
         --wrap=pthread_create --wrap=pthread_join --wrap=pthread_exit \
         --wrap=dlopen --wrap=dlsym --wrap=fcntl --wrap=pipe2 --wrap=dup --wrap=dup2 \
         --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close \
@@ -127,7 +129,7 @@ for so in "${sdk_stubs[@]}" "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDri
 done | sort -u > "$W/stub-symbols.txt"
 defsyms=()
 for sym in $(/opt/homebrew/opt/llvm@18/bin/llvm-readelf --dyn-syms "$W/llvm-pie.elf" | awk '$7 == "UND" && $5 == "WEAK" { print $8 }'); do
-    [[ $sym == ps5wk_title_check_imports ]] && continue # importcheck.o, second link
+    [[ $sym == ps5wk_title_check_imports || $sym == ps5wk_title_build_id ]] && continue # importcheck.o, second link
     grep -qx "$sym" "$W/stub-symbols.txt" || defsyms+=("--defsym=$sym=0")
 done
 (( ${#defsyms[@]} )) && echo "weak symbols set to null: ${defsyms[*]#--defsym=}"
@@ -136,14 +138,16 @@ done
     awk '$7 == "UND" && $4 == "FUNC" && $5 == "GLOBAL" { sub(/@.*/, "", $8); print $8 }' |
     grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u | sed 's/.*/IMPORT(&)/' > "$W/imports.inc"
 echo "imports: $(wc -l < "$W/imports.inc") functions"
+# Build id: logged by the title at start ("build <id>"); the unstripped
+# binaries of this package are kept under $OUT/debug/<id>/ (step 5).
+SRCDIR="${SRC:-$(dirname "$BLD")/$(basename "$BLD" | sed 's/^build/src/')}"
+BUILD_ID="$(date +%Y%m%d-%H%M%S)-$(git -C "$SRCDIR" rev-parse --short=10 HEAD 2>/dev/null || echo nogit)"
+echo "build id: $BUILD_ID"
 prospero-clang -std=c11 -O2 "${TF[@]}" -fno-builtin -Wno-incompatible-library-redeclaration -I"$W" \
-    -c "$HERE/importcheck.c" -o "$W/importcheck.o"
+    -DPS5WK_TITLE_BUILD_ID="\"$BUILD_ID\"" -c "$HERE/importcheck.c" -o "$W/importcheck.o"
 title_link "${defsyms[@]}" "$W/importcheck.o"
 # ps5locks (copied --wrap options): no unwrapped pthread mutex/cond/rwlock import.
 "$PORT/apps/common/check-lock-imports.sh" "$W/llvm-pie.elf" $(printf '%s\n' "${inputs[@]}" | sed -n 's/^--wrap=//p')
-
-# Symbols for crash triage (kernel-log rips minus the 0x400000 load base).
-cp "$W/llvm-pie.elf" "$OUT/ps5browser-symbols.elf"
 
 # 4. Convert, fake-sign, assemble the folder title.
 "$TOOL" link --in "$W/llvm-pie.elf" --out "$W/eboot.elf" --stub-dir "$SYS/lib" \
@@ -175,5 +179,27 @@ if sys.argv[6]:
 print("param.json: attribute 0x%x attribute3 0x%x (PS VR2)" % (p["attribute"], p["attribute3"]))
 open(sys.argv[2], "w").write(json.dumps(p, indent=2) + "\n")
 PY
+
+# 5. Unstripped binaries for crash triage, per build id; the last 5 kept.
+# Kernel-log backtraces of the title are load addresses: minus 0x400000.
+#   llvm-addr2line -f -C -i -e $OUT/debug/<id>/ps5browser.elf 0x<addr - 0x400000>
+#   (child: ps5wk-child, elf offsets from the crash guard's report)
+# Debug sections are zlib-compressed (half the size; addr2line reads them).
+DBG="$OUT/debug/$BUILD_ID"; mkdir -p "$DBG"
+OBJCOPY=/opt/homebrew/opt/llvm@18/bin/llvm-objcopy
+"$OBJCOPY" --compress-debug-sections=zlib "$W/llvm-pie.elf" "$DBG/ps5browser.elf" & p1=$!
+"$OBJCOPY" --compress-debug-sections=zlib "$CHILD" "$DBG/ps5wk-child" & p2=$!
+wait $p1; wait $p2
+{
+    echo "build id: $BUILD_ID"
+    echo "packaged: $(date '+%Y-%m-%d %H:%M:%S') from $BLD"
+    echo "source: $(git -C "$SRCDIR" log -1 --format='%h %s' 2>/dev/null || echo '?')"
+    echo "uncommitted in source: $(git -C "$SRCDIR" status --short -uno 2>/dev/null | wc -l | tr -d ' ') files"
+    (cd "$app" && shasum eboot.bin ps5wk-child.elf)
+} > "$DBG/build.txt"
+git -C "$SRCDIR" diff HEAD > "$DBG/source-uncommitted.diff" 2>/dev/null || true
+ln -sfn "debug/$BUILD_ID/ps5browser.elf" "$OUT/ps5browser-symbols.elf"
+ls -1d "$OUT"/debug/*/ | sort | sed -e :a -e '$d;N;2,5ba' -e 'P;D' | while read -r old; do rm -rf -- "$old"; done
+echo "symbols: $DBG ($(du -sh "$DBG" | cut -f1))"
 ls -la "$app" "$app/sce_sys"
 echo "title: $app ($(du -sh "$app" | cut -f1)); eboot $(du -h "$app/eboot.bin" | cut -f1), child $(du -h "$app/ps5wk-child.elf" | cut -f1)"

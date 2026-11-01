@@ -60,6 +60,7 @@ void g_io_openssl_load(void*);
 void ps5wk_title_mem_log(const char* milestone) __attribute__((weak));
 size_t ps5wk_title_flexible_free(void) __attribute__((weak));
 unsigned ps5wk_title_check_imports(char* out, size_t size, unsigned* total) __attribute__((weak));
+const char* ps5wk_title_build_id(void) __attribute__((weak));
 static double flexibleMB(void)
 {
     return ps5wk_title_flexible_free ? ps5wk_title_flexible_free() / 1048576.0 : -1.0;
@@ -1564,8 +1565,8 @@ int main(int argc, char** argv)
     }
     setvbuf(stderr, NULL, _IOLBF, 0);
     g_log_set_default_handler(logHandler, NULL);
-    spike_log("ps5browser: WPE WebKit %u.%u.%u, pid %d", webkit_get_major_version(), webkit_get_minor_version(),
-        webkit_get_micro_version(), (int)getpid());
+    spike_log("ps5browser: WPE WebKit %u.%u.%u, pid %d, build %s", webkit_get_major_version(), webkit_get_minor_version(),
+        webkit_get_micro_version(), (int)getpid(), ps5wk_title_build_id ? ps5wk_title_build_id() : "(payload)");
     spike_notify("ps5webkit browser starting");
     memLog("main");
     if (ps5wk_title_check_imports) {
