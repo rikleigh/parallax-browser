@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WC pacing: timer-driven changes</title>
+<!-- GPU compositing (WC) frame pacing (COMPOSITING-PLAN.md, "TV test 2
+     fixes"): a box moved from setInterval (16 ms), not rAF, so each rendering
+     update is asked for at a random point between two presents, like pages
+     that animate from timers or change on scroll events. Logs "INTERVAL n
+     ticks/s, m frames shown/s" every second; frames shown are counted with a
+     rAF that only watches (it starts no animation of its own: it is
+     requested again only from the timer). -->
+<style>body{margin:0;background:#fff;font:20px sans-serif}#box{position:absolute;top:200px;left:0;width:200px;height:200px;background:#2a6;will-change:transform}
+p{margin:16px}</style></head><body><p>setInterval-driven box</p><div id="box"></div>
+<script>
+var box = document.getElementById('box'), x = 0, ticks = 0, shown = 0, start = performance.now(), want = false;
+setInterval(function () {
+  x = (x + 8) % 1600; box.style.transform = 'translateX(' + x + 'px)'; ticks++;
+  if (!want) { want = true; requestAnimationFrame(function () { shown++; want = false; }); }
+  var now = performance.now();
+  if (now - start >= 1000) { console.log('INTERVAL ' + (ticks * 1000 / (now - start)).toFixed(1) + ' ticks/s, ' + (shown * 1000 / (now - start)).toFixed(1) + ' frames shown/s'); ticks = shown = 0; start = now; }
+}, 16);
+</script></body></html>

@@ -538,6 +538,10 @@ static struct {
     int64_t windowStart;
     unsigned frames, uploads, videoFrames, remoteFrames, intervals;
     double renderMS, renderMaxMS, swapMS, swapMaxMS, uploadMS, uploadMaxMS, uploadBytes, videoMS, videoMaxMS, intervalMS;
+    // Where "render" goes: compositor updates applied, video consumed and
+    // converted, scene painted, the frame drawn (its first draw into the
+    // window waits for the previous frame's flip).
+    double applyMS, consumeMS, sceneMS, drawMS, drawMaxMS;
 } stats;
 
 static void maybeLogStats(int64_t now)
@@ -554,6 +558,8 @@ static void maybeLogStats(int64_t now)
             stats.intervals ? stats.intervalMS / stats.intervals : 0.0, stats.uploads, stats.uploads ? stats.uploadMS / stats.uploads : 0.0,
             stats.uploadMaxMS, stats.uploads ? stats.uploadBytes / stats.uploads / 1048576.0 : 0.0, stats.videoFrames, stats.remoteFrames,
             stats.videoFrames ? stats.videoMS / stats.videoFrames : 0.0, stats.videoMaxMS);
+        g_message("[wpe-ps5] [present] render: apply %.2f ms avg, video %.2f, scene %.2f, draw %.2f avg %.1f max (incl. the wait for the previous flip)",
+            stats.applyMS / stats.frames, stats.consumeMS / stats.frames, stats.sceneMS / stats.frames, stats.drawMS / stats.frames, stats.drawMaxMS);
     }
     stats = { };
     stats.windowStart = now;
@@ -600,11 +606,21 @@ void PS5Renderer::threadMain()
             if (m_messageUntilUS && now >= m_messageUntilUS)
                 break; // take the message down
             if (m_videoActive) {
-                // Video: a frame every vsync (the swap waits for it). Should
-                // a swap ever return early, don't spin.
-                if (!m_lastSwapEnd || now - m_lastSwapEnd >= 10000)
+                // Video: a frame every vsync. The swap returns at once and
+                // the next frame's first draw waits for that swap's flip, so
+                // the frame can start right after the swap (it waited 10 ms,
+                // from when the swap itself waited: with a scene that takes
+                // more than ~6 ms to paint, frames missed their vsync, and an
+                // update that came in after the frame had started waited a
+                // frame more). 2 ms: should a draw ever stop waiting, don't spin.
+                // /data/ps5webkit/wc-wait-old: 10 ms as before (A/B).
+                static const int64_t afterSwapUS = [] {
+                    struct stat st;
+                    return stat("/data/ps5webkit/wc-wait-old", &st) ? 2000 : 10000;
+                }();
+                if (!m_lastSwapEnd || now - m_lastSwapEnd >= afterSwapUS)
                     break;
-                g_cond_wait_until(&m_cond, &m_lock, m_lastSwapEnd + 12000);
+                g_cond_wait_until(&m_cond, &m_lock, m_lastSwapEnd + afterSwapUS);
                 continue;
             }
             // Idle: sleep until a frame or geometry change is due.
@@ -642,6 +658,7 @@ void PS5Renderer::threadMain()
             copyPage();
         if (m_compositorReady)
             m_compositor->applyPending();
+        int64_t applied = nowUS();
 
         // The frame drawn now goes on screen at the next vsync after the
         // last swap returned. Keep a vsync grid (smoothed swap-return times)
@@ -658,6 +675,7 @@ void PS5Renderer::threadMain()
                 [this](PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data) { handleVideo(stream, frame, data); });
         }
         serviceThumbnails(nowUS());
+        int64_t consumed = nowUS();
 
         m_sceneTexture = 0;
         m_layerVideoKeyCount = 0;
@@ -667,12 +685,15 @@ void PS5Renderer::threadMain()
                 m_sceneTexture = 0;
         }
 
+        int64_t painted = nowUS();
         drawScene();
+        int64_t drawn = nowUS();
         if (capturePath)
             writeCapture(capturePath);
         int64_t swapStart = nowUS();
         eglSwapBuffers(m_eglDisplay, m_eglSurface);
         int64_t swapEnd = nowUS();
+        int64_t previousSwapEnd = m_lastSwapEnd;
         // The swap waited for the GPU: decoded pictures drawn this frame go back to their decoders.
         PS5VideoServer::presented();
         if (m_compositorReady)
@@ -706,6 +727,20 @@ void PS5Renderer::threadMain()
         }
 
         double renderMS = (swapStart - start) / 1000.0, swapMS = (swapEnd - swapStart) / 1000.0;
+        stats.applyMS += (applied - start) / 1000.0;
+        stats.consumeMS += (consumed - applied) / 1000.0;
+        stats.sceneMS += (painted - consumed) / 1000.0;
+        stats.drawMS += (drawn - painted) / 1000.0;
+        stats.drawMaxMS = std::max(stats.drawMaxMS, (drawn - painted) / 1000.0);
+        // /data/ps5webkit/wc-frame-log: one line per frame (frame pacing checks).
+        static const bool frameLog = [] {
+            struct stat st;
+            return !stat("/data/ps5webkit/wc-frame-log", &st);
+        }();
+        if (frameLog)
+            g_message("[frame] render t=%.1f: started %.2f ms after the last swap, apply %.2f, video %.2f, scene %.2f, draw %.2f, swap %.2f",
+                start / 1000.0, previousSwapEnd ? (start - previousSwapEnd) / 1000.0 : -1.0, (applied - start) / 1000.0, (consumed - applied) / 1000.0,
+                (painted - consumed) / 1000.0, (drawn - painted) / 1000.0, swapMS);
         stats.frames++;
         stats.renderMS += renderMS;
         stats.renderMaxMS = std::max(stats.renderMaxMS, renderMS);
