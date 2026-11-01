@@ -950,6 +950,8 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  *       the settings and "message"
  *   POST /restart?scope=page|browser   page: a new WebProcess for the page
  *       shown (reads child.env); browser: the title starts again
+ *   POST /restart?scope=crash   test only: SIGKILL to the WebProcess, which
+ *       then looks like a crash to WebKit (the page reloads as after one)
  *   POST /clear?what=cookies|all       WebKit's website data
  * The PIN applies as for /open, except to the PS5 itself (127.0.0.1). No
  * CORS headers, and requests with an Origin header must come from the
@@ -1202,6 +1204,15 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
             ps5wk_settings_set_status("Restarting the page…");
             g_idle_add(restartPageOnMain, NULL);
             settingsReplyJSON(client, 200, TRUE, "Restarting the page.");
+        } else if (!strcmp(path, "/restart") && scope && !strcmp(scope, "crash")) {
+            /* Crash-recovery tests (COMPOSITING-PLAN.md, M6): the WebProcess
+             * pid from its memory status file (written every 5 s). */
+            int webPid = 0;
+            double committed = 0, limit = 0;
+            ps5wk_webmem_over(&webPid, &committed, &limit);
+            int rc = webPid > 0 ? kill(webPid, SIGKILL) : -1;
+            spike_log("settings: crash test asked by %s: kill(%d, SIGKILL) = %d (errno %d)", from, webPid, rc, rc ? errno : 0);
+            settingsReplyJSON(client, rc ? 503 : 200, !rc, rc ? "No WebProcess to kill." : "WebProcess killed.");
         } else if (!strcmp(path, "/restart") && scope && !strcmp(scope, "browser")) {
             const char* error = restartBrowser(from);
             if (!error)
