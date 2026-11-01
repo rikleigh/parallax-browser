@@ -1,0 +1,76 @@
+--- a/gst/playback/gststreamsynchronizer.c
++++ b/gst/playback/gststreamsynchronizer.c
+@@ -1049,10 +1049,35 @@
+   GstSyncStream *stream = NULL;
+   GstStreamSyncPad *sinkpad, *srcpad;
+   gchar *tmp;
++  guint number = sync->current_stream_number;
++
++  /* A number whose pads don't exist yet, reserved before the lock is
++   * dropped below: a pad requested while another request was adding its
++   * pads, or after READY->NULL reset the counter while a pad requested
++   * during the state change was still there, got the same name; adding it
++   * failed ("Padname sink_0 is not unique"), the pad was freed and
++   * playsink aborted on it (gst_play_sink_do_reconfigure: assertion (it)). */
++  for (;;) {
++    GstPad *existing;
++
++    tmp = g_strdup_printf ("sink_%u", number);
++    existing = gst_element_get_static_pad (GST_ELEMENT_CAST (sync), tmp);
++    g_free (tmp);
++    if (!existing) {
++      tmp = g_strdup_printf ("src_%u", number);
++      existing = gst_element_get_static_pad (GST_ELEMENT_CAST (sync), tmp);
++      g_free (tmp);
++    }
++    if (!existing)
++      break;
++    gst_object_unref (existing);
++    number++;
++  }
++  sync->current_stream_number = number + 1;
+ 
+   stream = g_new0 (GstSyncStream, 1);
+   stream->transform = sync;
+-  stream->stream_number = sync->current_stream_number;
++  stream->stream_number = number;
+   g_cond_init (&stream->stream_finish_cond);
+   stream->stream_start_seqnum = G_MAXUINT32;
+   stream->segment_seqnum = G_MAXUINT32;
+@@ -1061,7 +1086,7 @@
+   stream->send_gap_event = FALSE;
+   stream->refcount = 1;
+ 
+-  tmp = g_strdup_printf ("sink_%u", sync->current_stream_number);
++  tmp = g_strdup_printf ("sink_%u", number);
+   stream->sinkpad =
+       gst_streamsync_pad_new_from_static_template (&sinktemplate, tmp);
+   g_free (tmp);
+@@ -1079,7 +1104,7 @@
+   GST_PAD_SET_PROXY_ALLOCATION (stream->sinkpad);
+   GST_PAD_SET_PROXY_SCHEDULING (stream->sinkpad);
+ 
+-  tmp = g_strdup_printf ("src_%u", sync->current_stream_number);
++  tmp = g_strdup_printf ("src_%u", number);
+   stream->srcpad =
+       gst_streamsync_pad_new_from_static_template (&srctemplate, tmp);
+   g_free (tmp);
+@@ -1122,7 +1147,6 @@
+   GST_STREAM_SYNCHRONIZER_LOCK (sync);
+ 
+   sync->streams = g_list_prepend (sync->streams, g_steal_pointer (&stream));
+-  sync->current_stream_number++;
+ 
+   return GST_PAD_CAST (sinkpad);
+ }
+@@ -1301,7 +1325,9 @@
+       GST_DEBUG_OBJECT (self, "State change READY->NULL");
+ 
+       GST_STREAM_SYNCHRONIZER_LOCK (self);
+-      self->current_stream_number = 0;
++      /* Not while a stream is left: its pads keep their names. */
++      if (!self->streams)
++        self->current_stream_number = 0;
+       GST_STREAM_SYNCHRONIZER_UNLOCK (self);
+       break;
+     }
