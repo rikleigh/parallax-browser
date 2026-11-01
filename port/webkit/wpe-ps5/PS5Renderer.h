@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+class PS5CompositorClient;
 struct PS5VideoStream;
 struct PS5VideoFrame;
 struct PS5VRState;
@@ -85,6 +86,14 @@ public:
 
     // CPU time of the render thread so far (seconds), or -1.
     double renderThreadCPUSeconds() const;
+
+    // GPU compositing (PS5Compositor.h): main thread, before the render thread
+    // starts (initialize() sets the WC build's client itself). The client is
+    // set up on the render thread once GL is up; while it has a frame, its
+    // scene texture is drawn instead of the page buffer.
+    void setCompositor(PS5CompositorClient*);
+    // Any thread: the compositor has work (applyPending/paint/didPresent).
+    void requestCompositorFrame();
 
     // Hardware decoding (PS5VideoDecoder's output buffers): a persistent,
     // coherent GL buffer made on the render thread (blocks until it is);
@@ -162,6 +171,7 @@ private:
     void* m_eglDisplay { nullptr };
     void* m_eglSurface { nullptr };
     void* m_eglContext { nullptr };
+    void* m_eglConfig { nullptr };
     int m_width { 0 };
     int m_height { 0 };
 
@@ -192,11 +202,18 @@ private:
     std::vector<BufferRequest*> m_bufferRequests;
     std::vector<unsigned> m_bufferFrees;
     bool m_frameRequested { false };
+    bool m_compositorRequested { false };
     bool m_pointerVisible { false };
     double m_pointerX { 0 }, m_pointerY { 0 };
     char* m_capturePath { nullptr };
 
     // Render thread only.
+    PS5CompositorClient* m_compositor { nullptr }; // set before the render thread starts
+    bool m_compositorReady { false };
+    bool m_compositorSetUpDone { false };
+    void setUpCompositorIfWanted();
+    unsigned m_sceneTexture { 0 };
+    int m_sceneWidth { 0 }, m_sceneHeight { 0 };
     PageJob m_job;
     bool m_drawPointer { false };
     double m_drawPointerX { 0 }, m_drawPointerY { 0 };

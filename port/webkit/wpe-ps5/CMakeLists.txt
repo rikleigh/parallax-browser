@@ -27,3 +27,8 @@ target_include_directories(WPEPlatformPS5 SYSTEM PRIVATE ${WPEPlatform_SYSTEM_IN
 target_include_directories(WPEPlatformPS5 SYSTEM PRIVATE ${FREETYPE_INCLUDE_DIR_ft2build} ${PS5_PORT_DIR}/../../spikes/common)
 target_link_libraries(WPEPlatformPS5 ${WPEPlatform_LIBRARIES})
 add_dependencies(WPEPlatformPS5 WPEPlatformGeneratedEnumTypesHeader)
+# GPU compositing (WC build only): PS5Renderer gets the UIProcess's WC scene
+# host as its PS5CompositorClient (PS5Compositor.h).
+if (USE_GRAPHICS_LAYER_WC)
+    target_compile_definitions(WPEPlatformPS5 PRIVATE PS5WK_WC=1)
+endif ()

@@ -19,6 +19,7 @@
 #include "config.h"
 #include "PS5Renderer.h"
 
+#include "PS5Compositor.h"
 #include "PS5GLBench.h"
 #include "PS5Text.h"
 #include "PS5VideoDecoder.h"
@@ -262,9 +263,17 @@ bool PS5Renderer::initialize(char* error, unsigned errorSize)
         return true;
     g_mutex_init(&m_lock);
     g_cond_init(&m_cond);
+#if defined(PS5WK_WC) && PS5WK_WC
+    if (!m_compositor)
+        m_compositor = ps5wkWCCompositorClient();
+#endif
+    if (m_compositor)
+        m_compositor->attach([] { PS5Renderer::singleton().requestCompositorFrame(); });
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
-    pthread_attr_setstacksize(&attributes, 1 << 20);
+    // 8 MiB: the GPU compositor compiles shaders on this thread (Mesa's GLSL
+    // compiler recurses deeply; 1 MiB was enough for our own shaders only).
+    pthread_attr_setstacksize(&attributes, 8 << 20);
     if (pthread_create(&m_thread, &attributes, threadEntry, this)) {
         snprintf(error, errorSize, "render thread: pthread_create failed");
         return false;
@@ -417,6 +426,7 @@ bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
     m_eglDisplay = display;
     m_eglSurface = surface;
     m_eglContext = context;
+    m_eglConfig = config;
 
     // First frame: black, so the TV shows the title is alive.
     glClearColor(0, 0, 0, 1);
@@ -426,7 +436,35 @@ bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
         reinterpret_cast<const char*>(glGetString(GL_VERSION)), m_width, m_height,
         m_pageAsTexture ? "as a texture (glTexSubImage2D)" : "in a persistent GL buffer");
     ps5GLBenchMaybeRun(m_width, m_height); // spike S1a, /data/ps5webkit/glbench only
+
     return true;
+}
+
+// Render thread: the compositor's set-up, once, when it asks (after WebKit is up).
+void PS5Renderer::setUpCompositorIfWanted()
+{
+    if (!m_compositor || m_compositorSetUpDone || !m_compositor->wantsSetUp())
+        return;
+    m_compositorSetUpDone = true;
+    {
+        PS5CompositorContext compositorContext { m_eglDisplay, m_eglConfig, m_eglContext, m_eglSurface, m_width, m_height,
+            [] { PS5Renderer::singleton().requestCompositorFrame(); } };
+        int64_t compositorStart = nowUS();
+        m_compositorReady = m_compositor->setUp(compositorContext);
+        // The compositor's GL state must not leak into ours.
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindVertexArray(m_vao);
+        glUseProgram(0);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glActiveTexture(GL_TEXTURE0);
+        glViewport(0, 0, m_width, m_height);
+        while (glGetError() != GL_NO_ERROR) { }
+        g_message("[wpe-ps5] PS5Renderer: GPU compositor %s (%.1f ms)", m_compositorReady ? "ready" : "FAILED: CPU page only",
+            (nowUS() - compositorStart) / 1000.0);
+    }
 }
 
 void PS5Renderer::submitPage(const uint8_t* data, int width, int height, unsigned stride, const Rect* damage, unsigned damageCount,
@@ -457,6 +495,20 @@ void PS5Renderer::present(bool pointerVisible, double pointerX, double pointerY)
     m_pointerX = pointerX;
     m_pointerY = pointerY;
     m_frameRequested = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+void PS5Renderer::setCompositor(PS5CompositorClient* client)
+{
+    if (!m_initialized)
+        m_compositor = client;
+}
+
+void PS5Renderer::requestCompositorFrame()
+{
+    g_mutex_lock(&m_lock);
+    m_compositorRequested = true;
     g_cond_broadcast(&m_cond);
     g_mutex_unlock(&m_lock);
 }
@@ -523,14 +575,24 @@ void PS5Renderer::threadMain()
     for (;;) {
         // View in VR: the headset paces the thread (PS5RendererVR.cpp).
         vrHandleRequests();
+        setUpCompositorIfWanted();
         if (m_vr) {
             vrFrame();
+            // Composited pages keep going at the headset's rate (their replies
+            // pace the WebProcess); the scene is painted again on the TV after.
+            if (m_compositorReady) {
+                g_mutex_lock(&m_lock);
+                m_compositorRequested = false;
+                g_mutex_unlock(&m_lock);
+                m_compositor->applyPending();
+                m_compositor->didPresent();
+            }
             continue;
         }
         char* capturePath = nullptr;
         g_mutex_lock(&m_lock);
         for (;;) {
-            if (m_pageJob.pending || m_frameRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
+            if (m_pageJob.pending || m_frameRequested || m_compositorRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
                 break;
             if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged || m_thumbnailRequest.pending)
                 break;
@@ -563,6 +625,7 @@ void PS5Renderer::threadMain()
         if (m_job.pending)
             g_cond_broadcast(&m_cond); // a waiting submitPage
         m_frameRequested = false;
+        m_compositorRequested = false;
         m_drawPointer = m_pointerVisible;
         m_drawPointerX = m_pointerX;
         m_drawPointerY = m_pointerY;
@@ -570,12 +633,15 @@ void PS5Renderer::threadMain()
         m_capturePath = nullptr;
         g_mutex_unlock(&m_lock);
 
+        setUpCompositorIfWanted();
         serviceBufferRequests();
         int64_t start = nowUS();
         updateMessage(start);
         bool commitGeometry = m_job.pending;
         if (m_job.pending)
             copyPage();
+        if (m_compositorReady)
+            m_compositor->applyPending();
 
         // The frame drawn now goes on screen at the next vsync after the
         // last swap returned. Keep a vsync grid (smoothed swap-return times)
@@ -593,6 +659,13 @@ void PS5Renderer::threadMain()
         }
         serviceThumbnails(nowUS());
 
+        m_sceneTexture = 0;
+        if (m_compositorReady) {
+            m_sceneTexture = m_compositor->paint(displayUS, &m_sceneWidth, &m_sceneHeight);
+            if (m_sceneWidth <= 0 || m_sceneHeight <= 0)
+                m_sceneTexture = 0;
+        }
+
         drawScene();
         if (capturePath)
             writeCapture(capturePath);
@@ -601,6 +674,8 @@ void PS5Renderer::threadMain()
         int64_t swapEnd = nowUS();
         // The swap waited for the GPU: decoded pictures drawn this frame go back to their decoders.
         PS5VideoServer::presented();
+        if (m_compositorReady)
+            m_compositor->didPresent();
 
         // vsync grid: follow swap returns within a quarter period, else reset.
         if (m_lastSwapEnd) {
@@ -873,6 +948,7 @@ void PS5Renderer::drawScene()
     glViewport(0, 0, m_width, m_height);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     glBindVertexArray(m_vao);
@@ -885,18 +961,21 @@ void PS5Renderer::drawScene()
         out[3] = static_cast<float>(1.0 - y / m_height * 2.0);
     };
 
-    // Where the page goes: scaled to fit, centred (normally 1:1).
+    // Where the page goes: scaled to fit, centred (normally 1:1). With a
+    // composited scene, the scene texture is the page.
+    const int contentWidth = m_sceneTexture ? m_sceneWidth : m_pageWidth;
+    const int contentHeight = m_sceneTexture ? m_sceneHeight : m_pageHeight;
     double scale = 1, pageX = 0, pageY = 0, pageW = 0, pageH = 0;
-    if (m_pageWidth > 0) {
-        scale = std::min(static_cast<double>(m_width) / m_pageWidth, static_cast<double>(m_height) / m_pageHeight);
-        pageW = m_pageWidth * scale;
-        pageH = m_pageHeight * scale;
+    if (contentWidth > 0) {
+        scale = std::min(static_cast<double>(m_width) / contentWidth, static_cast<double>(m_height) / contentHeight);
+        pageW = contentWidth * scale;
+        pageH = contentHeight * scale;
         pageX = (m_width - pageW) / 2;
         pageY = (m_height - pageH) / 2;
     }
 
     // Videos under the page, clipped to it.
-    if (m_videoDrawCount && m_pageWidth > 0) {
+    if (m_videoDrawCount && contentWidth > 0) {
         glUseProgram(m_program);
         glUniform1i(m_uTexture, 0);
         glUniform1i(m_uOpaque, 1);
@@ -915,12 +994,19 @@ void PS5Renderer::drawScene()
     }
 
     // The page, premultiplied, over the videos (holes are transparent).
-    if (m_pageWidth > 0) {
+    if (contentWidth > 0) {
         float r[4];
         ndc(pageX, pageY, pageW, pageH, r);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        if (!m_pageAsTexture) {
+        if (m_sceneTexture) {
+            // The composited scene (TextureMapper painted it top row first).
+            glUseProgram(m_program);
+            glUniform1i(m_uTexture, 0);
+            glUniform1i(m_uOpaque, 0);
+            glBindTexture(GL_TEXTURE_2D, m_sceneTexture);
+            glUniform4f(m_uRect, r[0], r[1], r[2], r[3]);
+        } else if (!m_pageAsTexture) {
             glUseProgram(m_pageProgram);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_pageBuffer);
             glUniform4f(m_uPageNDC, r[0], r[1], r[2], r[3]);
