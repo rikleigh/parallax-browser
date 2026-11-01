@@ -299,6 +299,7 @@ About 63 MB. Fonts are fetched by the `fonts` step (not committed).
 | `glib/0001-ps5-configure-memalign-ppoll.patch` | don't use `memalign` (needs the `#error` `<malloc.h>`); don't use `ppoll` on PS5 (broken in libkernel, see above) |
 | `glib/0002-unix-fd-query-path-no-F_KINFO.patch` | SDK headers lack `F_KINFO`; fall back to "not supported" |
 | `gst-libav/0001-keep-avdec_libdav1d.patch` | register avdec_libdav1d (only AV1 decoder here), and don't drop frames from decoders without direct rendering (they stayed DECODE_ONLY) |
+| `libsoup/0001-hsts-db-write-only-real-policy-changes.patch` | the HSTS database is written only for real policy changes (a new host, a removal, includeSubDomains changed, the expiry moved by more than a day or half the max-age), not for every response's expiry refresh: each was an SQLite transaction on the NetworkProcess main thread (journal created, written, deleted). The in-memory policy stays current; stored rows are also no longer rewritten at startup |
 
 ## Licenses
 

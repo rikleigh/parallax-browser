@@ -1,0 +1,111 @@
+--- a/libsoup/hsts/soup-hsts-enforcer-db.c
++++ b/libsoup/hsts/soup-hsts-enforcer-db.c
+@@ -44,8 +44,27 @@
+ typedef struct {
+ 	char *filename;
+ 	sqlite3 *db;
++	/* PS5: what the database holds per host (host -> StoredPolicy), so
++	 * that only real changes are written; see should_store(). */
++	GHashTable *stored;
+ } SoupHSTSEnforcerDBPrivate;
+ 
++typedef struct {
++	gint64 expiry;
++	gboolean include_subdomains;
++} StoredPolicy;
++
++/* PS5: every response with a Strict-Transport-Security header renews its
++ * host's policy, so the expiry moves by the seconds since the last one, and
++ * upstream wrote an SQLite transaction (journal created, written, deleted)
++ * for each such response, on the thread that runs all network I/O. Only
++ * real changes are written now: a new host, a removed policy (max-age=0 or
++ * expired), includeSubDomains changed, or the expiry moved by more than a
++ * day (or half the max-age, when that is shorter). The in-memory policy is
++ * always the current one, so enforcement is unchanged; after a restart a
++ * policy can expire at most that much earlier than it would have. */
++#define STORE_EXPIRY_SLACK_SECONDS (24 * 60 * 60)
++
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupHSTSEnforcerDB, soup_hsts_enforcer_db, SOUP_TYPE_HSTS_ENFORCER,
+ 			       G_ADD_PRIVATE(SoupHSTSEnforcerDB))
+ 
+@@ -53,7 +72,40 @@
+ 
+ static void
+ soup_hsts_enforcer_db_init (SoupHSTSEnforcerDB *db)
++{
++        SoupHSTSEnforcerDBPrivate *priv = soup_hsts_enforcer_db_get_instance_private (db);
++
++	priv->stored = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
++}
++
++static void
++remember_stored (SoupHSTSEnforcerDBPrivate *priv, const char *host,
++		 gint64 expiry, gboolean include_subdomains)
++{
++	StoredPolicy *stored = g_new (StoredPolicy, 1);
++
++	stored->expiry = expiry;
++	stored->include_subdomains = include_subdomains;
++	g_hash_table_replace (priv->stored, g_strdup (host), stored);
++}
++
++/* TRUE when the database's row for the policy's host differs from it by
++ * more than an expiry refresh. */
++static gboolean
++should_store (SoupHSTSEnforcerDBPrivate *priv, SoupHSTSPolicy *policy, gint64 expiry)
+ {
++	StoredPolicy *stored = g_hash_table_lookup (priv->stored, soup_hsts_policy_get_domain (policy));
++	gint64 slack = STORE_EXPIRY_SLACK_SECONDS;
++	gint64 delta;
++
++	if (!stored)
++		return TRUE;
++	if (!stored->include_subdomains != !soup_hsts_policy_includes_subdomains (policy))
++		return TRUE;
++	if ((gint64)(soup_hsts_policy_get_max_age (policy) / 2) < slack)
++		slack = (gint64)(soup_hsts_policy_get_max_age (policy) / 2);
++	delta = expiry - stored->expiry;
++	return delta > slack || delta < -slack;
+ }
+ 
+ static void
+@@ -63,6 +115,7 @@
+ 
+ 	g_free (priv->filename);
+ 	sqlite3_close (priv->db);
++	g_clear_pointer (&priv->stored, g_hash_table_destroy);
+ 
+ 	G_OBJECT_CLASS (soup_hsts_enforcer_db_parent_class)->finalize (object);
+ }
+@@ -167,6 +220,11 @@
+ 	policy = soup_hsts_policy_new_full (host, max_age, expires, include_subdomains);
+ 
+ 	if (policy) {
++		/* PS5: the row is what the database holds; setting the policy
++		 * from it then writes nothing back (upstream rewrote every row
++		 * at startup). */
++		remember_stored (soup_hsts_enforcer_db_get_instance_private ((SoupHSTSEnforcerDB*)hsts_enforcer),
++				 soup_hsts_policy_get_domain (policy), (gint64)expire_time, include_subdomains);
+ 		soup_hsts_enforcer_set_policy (hsts_enforcer, policy);
+ 		soup_hsts_policy_free (policy);
+ 	}
+@@ -271,6 +329,7 @@
+ 		g_assert (query);
+ 		exec_query_with_try_create_table (priv->db, query, NULL, NULL);
+ 		sqlite3_free (query);
++		g_hash_table_remove (priv->stored, soup_hsts_policy_get_domain (old_policy));
+ 	}
+ 
+ 	/* Insert the new policy or update the existing one. */
+@@ -278,6 +337,11 @@
+ 		gulong expires;
+ 
+ 		expires = (gulong)g_date_time_to_unix (soup_hsts_policy_get_expires (new_policy));
++		/* PS5: an expiry refresh is kept in memory only. */
++		if (!should_store (priv, new_policy, (gint64)expires))
++			return;
++		remember_stored (priv, soup_hsts_policy_get_domain (new_policy), (gint64)expires,
++				 soup_hsts_policy_includes_subdomains (new_policy));
+ 		query = sqlite3_mprintf (QUERY_INSERT,
+ 					 soup_hsts_policy_get_domain (new_policy),
+ 					 soup_hsts_policy_get_domain (new_policy),
