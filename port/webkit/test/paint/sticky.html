@@ -1,0 +1,67 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>sticky and fixed test</title>
+<!-- GPU compositing checks (COMPOSITING-PLAN.md, M3): sticky and fixed
+     content while the page scrolls, no animation, so captures of the CPU
+     path and the composited path can be diffed. A sticky header (stuck
+     from the start), a sticky sidebar under it (its own overflow: auto, like
+     a docs site's navigation), sticky section headings, a table whose
+     header row is sticky inside an overflow scroller, a fixed footer.
+     The table scroller follows the page: every page scroll sets its
+     scrollTop from scrollY (a triangle wave), so scroll scripts that only
+     scroll the window (scroll-raf.js, scroll-to.js) exercise both and end
+     in the same state on both paths. ~9000 px tall. -->
+<style>
+body { margin: 0; font: 18px/1.45 sans-serif; color: #1b2030; background: #f4f1ea; }
+header { position: sticky; top: 0; height: 60px; z-index: 10; background: #20304f; color: #fff; display: flex; align-items: center; padding: 0 28px; font-size: 24px; box-shadow: 0 3px 12px rgba(0,0,0,.3); }
+.layout { display: flex; align-items: flex-start; gap: 32px; padding: 0 32px 80px 0; }
+aside { position: sticky; top: 60px; width: 300px; flex: none; height: calc(100vh - 60px - 48px); overflow: auto; background: #e3dccb; border-right: 3px solid #b9ad92; }
+aside a { display: block; padding: 6px 20px; color: #20304f; text-decoration: none; border-bottom: 1px solid #cfc5ad; }
+aside a:nth-child(5n) { background: #d6cdb6; font-weight: bold; }
+main { flex: 1; min-width: 0; padding-top: 24px; }
+section { margin: 0 0 40px; background: #fff; border-radius: 14px; padding: 0 24px 24px; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+h2 { position: sticky; top: 60px; margin: 0 -24px 12px; padding: 10px 24px; background: #4a6fa5; color: #fff; border-radius: 14px 14px 0 0; }
+p { max-width: 1000px; }
+.tablewrap { height: 380px; overflow: auto; border: 3px solid #20304f; border-radius: 8px; background: #fff; }
+table { border-collapse: collapse; width: 100%; font-size: 16px; }
+th { position: sticky; top: 0; background: #c0392b; color: #fff; padding: 8px 12px; text-align: left; }
+td { padding: 6px 12px; border-bottom: 1px solid #ddd; }
+tr:nth-child(even) td { background: #f1f4f9; }
+footer { position: fixed; left: 0; right: 0; bottom: 0; height: 48px; background: rgba(32, 48, 79, .92); color: #fff; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; font-size: 18px; }
+.filler { height: 700px; background: repeating-linear-gradient(0deg, #fff 0 38px, #eef0f5 38px 40px); border-radius: 8px; }
+</style></head><body>
+<header>Sticky and fixed test: sticky header, sticky sidebar, sticky table header, fixed footer</header>
+<div class="layout">
+<aside id="nav"></aside>
+<main id="main"></main>
+</div>
+<footer><span>fixed footer</span><span id="pos">scrollY 0</span></footer>
+<script>
+(function () {
+    var words = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow. How vexingly quick daft zebras jump. ";
+    var nav = document.getElementById("nav"), main = document.getElementById("main"), html = "";
+    for (var i = 1; i <= 80; i++)
+        html += '<a href="#s' + i + '">Navigation entry ' + i + '</a>';
+    nav.innerHTML = html;
+    html = "";
+    for (var s = 1; s <= 9; s++) {
+        html += '<section id="s' + s + '"><h2>Section ' + s + ': sticky heading</h2>';
+        for (var p = 0; p < 3; p++)
+            html += '<p>' + s + '.' + p + ' ' + words + words + words + '</p>';
+        if (s === 2) {
+            html += '<div class="tablewrap" id="wrap"><table><thead><tr><th>#</th><th>Name</th><th>Value</th><th>Notes</th></tr></thead><tbody>';
+            for (var r = 1; r <= 60; r++)
+                html += '<tr><td>' + r + '</td><td>Row ' + r + '</td><td>' + (r * 37 % 101) + '</td><td>' + words.slice(0, 40 + r % 30) + '</td></tr>';
+            html += '</tbody></table></div>';
+        }
+        html += '<div class="filler"></div></section>';
+    }
+    main.innerHTML = html;
+    var wrap = document.getElementById("wrap"), pos = document.getElementById("pos");
+    window.addEventListener("scroll", function () {
+        var range = wrap.scrollHeight - wrap.clientHeight, t = (window.scrollY / 2) % (2 * range);
+        wrap.scrollTop = t < range ? t : 2 * range - t;
+        pos.textContent = "scrollY " + window.scrollY;
+    });
+})();
+</script>
+</body></html>

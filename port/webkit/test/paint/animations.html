@@ -1,0 +1,98 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>animations test</title>
+<!-- GPU compositing checks (COMPOSITING-PLAN.md, M3): transform and opacity
+     animations of every kind WebKit can hand to the compositor (CSS
+     animations, a CSS transition toggled every second, Web Animations) next
+     to one driven from JavaScript (rAF sets style.transform), which only
+     the main thread can step. The button (or ?auto) blocks the main thread
+     for 100 ms every 300 ms. ?auto: 6 s idle, 6 s blocking, 6 s idle, with
+     console markers ANIM-PHASE idle|busy|idle2|end and, per phase, the
+     rAF rate and the longest gap between rAF callbacks (ANIM-STATS). -->
+<style>
+body { margin: 0; font: 20px/1.4 sans-serif; color: #1b2030; background: #f4f1ea; }
+h1 { font-size: 26px; margin: 24px 40px; }
+.grid { display: grid; grid-template-columns: repeat(3, 420px); gap: 40px; padding: 0 40px; }
+.cell { height: 260px; background: repeating-linear-gradient(45deg, #fff 0 20px, #ece6d6 20px 40px); border-radius: 14px; position: relative; overflow: hidden; }
+.cell span { position: absolute; left: 12px; bottom: 8px; font-size: 16px; }
+.box { position: absolute; left: 30px; top: 50px; width: 140px; height: 140px; border-radius: 16px; color: #fff; font-weight: bold; display: flex; align-items: center; justify-content: center; text-align: center; }
+@keyframes slide { from { transform: translateX(0) rotate(0deg); } to { transform: translateX(220px) rotate(360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .15; } }
+@keyframes grow { from { transform: scale(.6); } to { transform: scale(1.2); } }
+.slide { background: #3a7bd5; animation: slide 2s linear infinite alternate; }
+.pulse { background: #d5543a; left: 140px; animation: pulse 1.5s ease-in-out infinite; }
+.grow { background: #3ad59a; color: #123; left: 140px; animation: grow 1.2s ease-in-out infinite alternate; }
+.trans { background: #7b3ad5; transition: transform 0.9s ease-in-out, opacity 0.9s ease-in-out; }
+.trans.on { transform: translateX(220px) rotate(45deg); opacity: .4; }
+.waapi { background: #e0a020; color: #222; }
+.js { background: #555; }
+button { margin: 24px 40px; font-size: 22px; padding: 10px 22px; }
+#status { margin: 0 40px; font-size: 18px; }
+</style></head><body>
+<h1>Animations test: CSS animations, CSS transition, Web Animations, JavaScript (rAF)</h1>
+<div class="grid">
+  <div class="cell"><div class="box slide">CSS<br>transform</div><span>@keyframes translate + rotate</span></div>
+  <div class="cell"><div class="box pulse">CSS<br>opacity</div><span>@keyframes opacity</span></div>
+  <div class="cell"><div class="box grow">CSS<br>scale</div><span>@keyframes scale</span></div>
+  <div class="cell"><div class="box trans" id="trans">CSS<br>transition</div><span>transition toggled every 1 s</span></div>
+  <div class="cell"><div class="box waapi" id="waapi">Web<br>Animations</div><span>element.animate() transform + opacity</span></div>
+  <div class="cell"><div class="box js" id="js">JS<br>rAF</div><span>style.transform from requestAnimationFrame</span></div>
+</div>
+<button id="block">Block main thread (100 ms every 300 ms): off</button>
+<div id="status"></div>
+<script>
+(function () {
+    var trans = document.getElementById("trans"), js = document.getElementById("js"), button = document.getElementById("block"), status = document.getElementById("status");
+    setInterval(function () { trans.classList.toggle("on"); }, 1000);
+    document.getElementById("waapi").animate([
+        { transform: "translateX(0) scale(1)", opacity: 1 },
+        { transform: "translateX(220px) scale(.7)", opacity: .5 }
+    ], { duration: 1600, iterations: Infinity, direction: "alternate", easing: "ease-in-out" });
+
+    var blocker = null;
+    function setBlocking(on) {
+        if (on && !blocker) {
+            blocker = setInterval(function () {
+                var end = performance.now() + 100;
+                while (performance.now() < end) { }
+            }, 300);
+        } else if (!on && blocker) {
+            clearInterval(blocker);
+            blocker = null;
+        }
+        button.textContent = "Block main thread (100 ms every 300 ms): " + (blocker ? "on" : "off");
+    }
+    button.onclick = function () { setBlocking(!blocker); };
+
+    // rAF: the JavaScript-driven box, and per-phase stats.
+    var start = performance.now(), last = start, frames = 0, maxGap = 0, longGaps = 0, phase = "idle";
+    function frame(now) {
+        var t = (now - start) / 1000, p = (t % 4) / 2;
+        js.style.transform = "translateX(" + (220 * (p < 1 ? p : 2 - p)).toFixed(1) + "px)";
+        var gap = now - last;
+        last = now;
+        frames++;
+        if (gap > maxGap) maxGap = gap;
+        if (gap > 25) longGaps++;
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    var phaseStart = performance.now();
+    function report(next) {
+        var seconds = (performance.now() - phaseStart) / 1000;
+        var line = "ANIM-STATS " + phase + ": " + seconds.toFixed(1) + " s, rAF " + (frames / seconds).toFixed(1) + "/s, longest rAF gap " + maxGap.toFixed(0) + " ms, " + longGaps + " gaps > 25 ms";
+        console.log(line);
+        status.textContent = line;
+        frames = 0; maxGap = 0; longGaps = 0; phaseStart = performance.now();
+        phase = next;
+        if (next !== "end")
+            console.log("ANIM-PHASE " + next);
+    }
+    if (location.search.indexOf("auto") >= 0) {
+        console.log("ANIM-PHASE idle");
+        setTimeout(function () { report("busy"); setBlocking(true); }, 6000);
+        setTimeout(function () { setBlocking(false); report("idle2"); }, 12000);
+        setTimeout(function () { report("end"); console.log("ANIM-PHASE end"); }, 18000);
+    }
+})();
+</script>
+</body></html>
