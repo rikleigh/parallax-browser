@@ -29,7 +29,10 @@
  * WebProcess). Every message is one struct ps5wk_video_msg (128 bytes).
  *
  * WebProcess -> title:
- *   HELLO     magic, version, pid
+ *   HELLO     magic, version, pid; sinks: pts_ns = the sink's stream key
+ *             (random, never 0; 0 from sinks before GPU compositing): a
+ *             composited page names its video layer's stream by it
+ *             (GraphicsLayerWC -> WCScene -> PS5Renderer::videoTexture)
  *   SHM       slots, slot_bytes, generation; the shared memory fd rides
  *             along (SCM_RIGHTS). A new generation replaces the old one:
  *             frames of older generations are dropped.

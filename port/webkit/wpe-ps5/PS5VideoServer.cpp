@@ -166,7 +166,8 @@ static void* receiverThread(void* data)
                 stream->fd = -1;
                 return nullptr;
             }
-            VLOG("stream %d from pid %d connected", stream->id, msg.pid);
+            stream->key = static_cast<uint64_t>(msg.pts_ns);
+            VLOG("stream %d from pid %d connected%s", stream->id, msg.pid, stream->key ? " (with a stream key)" : "");
             continue;
         }
         switch (msg.type) {

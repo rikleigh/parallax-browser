@@ -233,14 +233,21 @@ private:
     int m_pageWidth { 0 };
     int m_pageHeight { 0 };
     unsigned m_pointerTexture { 0 };
-    struct VideoDraw { unsigned texture; int x, y, width, height; };
-    VideoDraw m_videoDraws[8];
+    static constexpr unsigned kMaxVideoStreams = 16; // drawn or kept as sources per frame
+    struct VideoDraw { unsigned texture; int x, y, width, height; uint64_t key; };
+    VideoDraw m_videoDraws[kMaxVideoStreams];
     unsigned m_videoDrawCount { 0 };
     // Every stream with a converted frame, refreshed by each consume pass
-    // (the TV's or the headset's): what "View in VR" can show.
-    struct VideoSource { int stream; unsigned texture; int width, height; int64_t lastFrameUS; };
-    VideoSource m_videoSources[8];
+    // (the TV's or the headset's): what "View in VR" can show, and what a
+    // composited page's video layers draw (key: the sink's stream key).
+    struct VideoSource { int stream; unsigned texture; int width, height; int64_t lastFrameUS; uint64_t key; uint32_t frames; };
+    VideoSource m_videoSources[kMaxVideoStreams];
     unsigned m_videoSourceCount { 0 };
+    // GPU compositing: the stream keys the scene drew as video layers this
+    // frame (PS5CompositorContext::videoTexture); not drawn under the page.
+    static unsigned compositorVideoTexture(uint64_t key, int* width, int* height, uint32_t* frames);
+    uint64_t m_layerVideoKeys[kMaxVideoStreams] { };
+    unsigned m_layerVideoKeyCount { 0 };
 
     // Message over the page (guarded by m_lock: m_messageText/m_messageSeconds/
     // m_messageChanged; render thread: the rest).

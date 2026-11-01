@@ -68,6 +68,7 @@ struct PS5VideoStream {
     int id { 0 };
     int pid { 0 };
     int fd { -1 };
+    uint64_t key { 0 }; // the sink's stream key (HELLO), 0 if none; set before the stream gets frames
 
     // Guarded by lock.
     GMutex lock;

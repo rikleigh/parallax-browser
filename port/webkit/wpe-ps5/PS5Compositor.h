@@ -37,6 +37,12 @@ struct PS5CompositorContext {
     // Any thread: asks the render thread for a frame (applyPending, paint,
     // swap, didPresent) as soon as it is idle.
     void (*requestFrame)();
+    // Render thread, during paint(): the RGBA texture (row 0 = top, opaque)
+    // the newest frame of the video stream whose sink sent `key` in its
+    // HELLO was converted into, or 0 (no such stream, no frame yet); frames
+    // counts the frames converted into it so far. A stream drawn this way
+    // is not drawn under the page (hole punch is the CPU path's).
+    unsigned (*videoTexture)(uint64_t key, int* width, int* height, uint32_t* frames);
 };
 
 class PS5CompositorClient {

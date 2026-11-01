@@ -448,7 +448,7 @@ void PS5Renderer::setUpCompositorIfWanted()
     m_compositorSetUpDone = true;
     {
         PS5CompositorContext compositorContext { m_eglDisplay, m_eglConfig, m_eglContext, m_eglSurface, m_width, m_height,
-            [] { PS5Renderer::singleton().requestCompositorFrame(); } };
+            [] { PS5Renderer::singleton().requestCompositorFrame(); }, compositorVideoTexture };
         int64_t compositorStart = nowUS();
         m_compositorReady = m_compositor->setUp(compositorContext);
         // The compositor's GL state must not leak into ours.
@@ -660,6 +660,7 @@ void PS5Renderer::threadMain()
         serviceThumbnails(nowUS());
 
         m_sceneTexture = 0;
+        m_layerVideoKeyCount = 0;
         if (m_compositorReady) {
             m_sceneTexture = m_compositor->paint(displayUS, &m_sceneWidth, &m_sceneHeight);
             if (m_sceneWidth <= 0 || m_sceneHeight <= 0)
@@ -815,6 +816,7 @@ struct PS5VideoGL {
     int width { 0 }, height { 0 };
     bool valid { false };
     int64_t lastFrameUS { 0 };
+    uint32_t frames { 0 }; // converted so far (video layers repaint when it moves)
 };
 
 void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data)
@@ -929,6 +931,7 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             gl->valid = true;
             gl->lastFrameUS = start;
+            gl->frames++;
         }
         double ms = (nowUS() - start) / 1000.0;
         stats.videoFrames++;
@@ -936,10 +939,36 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
         stats.videoMaxMS = std::max(stats.videoMaxMS, ms);
     }
 
-    if (gl->valid && stream.geometry.visible && stream.geometry.width > 0 && stream.geometry.height > 0 && m_videoDrawCount < 8)
-        m_videoDraws[m_videoDrawCount++] = { gl->texture, stream.geometry.x, stream.geometry.y, stream.geometry.width, stream.geometry.height };
-    if (gl->valid && m_videoSourceCount < 8)
-        m_videoSources[m_videoSourceCount++] = { stream.id, gl->texture, gl->width, gl->height, gl->lastFrameUS };
+    if (gl->valid && stream.geometry.visible && stream.geometry.width > 0 && stream.geometry.height > 0 && m_videoDrawCount < kMaxVideoStreams)
+        m_videoDraws[m_videoDrawCount++] = { gl->texture, stream.geometry.x, stream.geometry.y, stream.geometry.width, stream.geometry.height, stream.key };
+    if (gl->valid && m_videoSourceCount < kMaxVideoStreams)
+        m_videoSources[m_videoSourceCount++] = { stream.id, gl->texture, gl->width, gl->height, gl->lastFrameUS, stream.key, gl->frames };
+}
+
+// Render thread, from the compositor's paint (after this frame's consume
+// pass): a video layer's contents.
+unsigned PS5Renderer::compositorVideoTexture(uint64_t key, int* width, int* height, uint32_t* frames)
+{
+    PS5Renderer& self = singleton();
+    *width = *height = 0;
+    *frames = 0;
+    if (!key)
+        return 0;
+    for (unsigned i = 0; i < self.m_videoSourceCount; i++) {
+        const auto& source = self.m_videoSources[i];
+        if (source.key != key)
+            continue;
+        bool listed = false;
+        for (unsigned k = 0; k < self.m_layerVideoKeyCount; k++)
+            listed |= self.m_layerVideoKeys[k] == key;
+        if (!listed && self.m_layerVideoKeyCount < kMaxVideoStreams)
+            self.m_layerVideoKeys[self.m_layerVideoKeyCount++] = key;
+        *width = source.width;
+        *height = source.height;
+        *frames = source.frames;
+        return source.texture;
+    }
+    return 0;
 }
 
 void PS5Renderer::drawScene()
@@ -984,6 +1013,11 @@ void PS5Renderer::drawScene()
         glScissor(static_cast<GLint>(pageX), static_cast<GLint>(m_height - pageY - pageH), static_cast<GLsizei>(pageW), static_cast<GLsizei>(pageH));
         for (unsigned i = 0; i < m_videoDrawCount; i++) {
             const auto& v = m_videoDraws[i];
+            bool layer = false;
+            for (unsigned k = 0; m_sceneTexture && v.key && k < m_layerVideoKeyCount; k++)
+                layer |= m_layerVideoKeys[k] == v.key;
+            if (layer)
+                continue; // a video layer of the composited scene
             float r[4];
             ndc(pageX + v.x * scale, pageY + v.y * scale, v.width * scale, v.height * scale, r);
             glBindTexture(GL_TEXTURE_2D, v.texture);

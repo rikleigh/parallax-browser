@@ -39,6 +39,10 @@
  * - "stats" (rendered/dropped, read by WebKit for getVideoPlaybackQuality)
  *   counts the frames the title showed and dropped, plus the sink's own
  *   QoS drops.
+ * - "stream-key": a random 64-bit key, fixed for the sink's life and sent
+ *   in every HELLO. With GPU compositing the page doesn't punch a hole: the
+ *   video's layer names this key, and the title draws the stream's frames
+ *   as that layer's contents (COMPOSITING-PLAN.md, M4).
  */
 #define PACKAGE "ps5webkit"
 #include <gst/gst.h>
@@ -73,6 +77,7 @@ G_DECLARE_FINAL_TYPE(GstPs5VideoSink, gst_ps5_video_sink, GST, PS5_VIDEO_SINK, G
 struct _GstPs5VideoSink {
     GstVideoSink parent;
 
+    guint64 stream_key;      /* HELLO; read by WebKit ("stream-key") */
     GMutex lock;             /* fd writes, geometry, slots */
     int fd;                  /* connection to the title, -1 */
     gboolean connect_failed; /* do not retry every frame */
@@ -113,7 +118,7 @@ struct _GstPs5VideoSink {
     guint lead_count;
 };
 
-enum { PROP_0, PROP_STATS };
+enum { PROP_0, PROP_STATS, PROP_STREAM_KEY };
 enum { SIGNAL_REPAINT_REQUESTED, LAST_SIGNAL };
 static guint signals[LAST_SIGNAL];
 
@@ -250,6 +255,7 @@ static void connect_locked(GstPs5VideoSink *self)
     msg.magic = PS5WK_VIDEO_MAGIC;
     msg.version = PS5WK_VIDEO_VERSION;
     msg.pid = (int32_t)getpid();
+    msg.pts_ns = (int64_t)self->stream_key;
     send_msg(self, &msg, -1);
     self->title_displayed = self->title_dropped = 0;
     self->geometry_sent = FALSE;
@@ -682,6 +688,10 @@ static gboolean ps5_propose_allocation(GstBaseSink *bsink, GstQuery *query)
 static void ps5_get_property(GObject *object, guint id, GValue *value, GParamSpec *pspec)
 {
     GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(object);
+    if (id == PROP_STREAM_KEY) {
+        g_value_set_uint64(value, self->stream_key);
+        return;
+    }
     if (id != PROP_STATS) {
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, pspec);
         return;
@@ -711,6 +721,10 @@ static void ps5_finalize(GObject *object)
 static void gst_ps5_video_sink_init(GstPs5VideoSink *self)
 {
     g_mutex_init(&self->lock);
+    /* Random (the title matches layers to streams by it), never 0. */
+    do
+        self->stream_key = ((guint64)g_random_int() << 32) | g_random_int();
+    while (!self->stream_key);
     self->fd = -1;
     self->shm_fd = -1;
     gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), TRUE);
@@ -725,6 +739,9 @@ static void gst_ps5_video_sink_class_init(GstPs5VideoSinkClass *klass)
     object_class->get_property = ps5_get_property;
     object_class->finalize = ps5_finalize;
     g_object_class_override_property(object_class, PROP_STATS, "stats");
+    g_object_class_install_property(object_class, PROP_STREAM_KEY, g_param_spec_uint64("stream-key", "Stream key",
+        "Names this sink's stream to the title (HELLO), for a composited video layer", 0, G_MAXUINT64, 0,
+        G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
     signals[SIGNAL_REPAINT_REQUESTED] = g_signal_new("repaint-requested", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL,
         NULL, G_TYPE_NONE, 1, GST_TYPE_SAMPLE | G_SIGNAL_TYPE_STATIC_SCOPE);
     gst_element_class_set_static_metadata(element_class, "PS5 hole-punch video sink", "Sink/Video",
