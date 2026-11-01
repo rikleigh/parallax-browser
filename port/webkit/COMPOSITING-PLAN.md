@@ -651,3 +651,116 @@ are new, VIDEOSTATS now carries requestVideoFrameCallback counts):
 hardware-decoded video still draws nothing (unchanged); HDR still shown with
 the BT.709 matrix; a video layer is repainted only when its stream converts
 a frame, so a layer whose stream exceeds 16 per frame stays empty.
+
+## WC title abort while scrolling a video feed (2026-11-01)
+
+The owner's TV test of WC mode (a heavy feed page with many autoplaying
+videos, scrolled for a while) killed the title: kernel log "A user thread
+receives a fatal signal / abort is called", thread `eboot.bin` (the main
+thread), nothing in the title log.
+
+**Symbolizing:** the crashed eboot (downloaded from the console) is a plain
+ELF, code at file offset 0x4000 for vaddr 0, and the kernel's backtrace
+values are load addresses: the title's text is mapped at 0x400000
+(`xotext: 0000000000400000` in the same report), so subtract 0x400000.
+Byte windows before each return address in the crashed eboot matched the
+next build's symbols uniquely:
+
+    0x40017b  _start
+    0x40b59f  main
+    0x555b3c9 g_main_loop_run / g_main_context_iterate / g_main_context_dispatch
+    0x315b590 WTF::RunLoop timer source (RunLoopGLib.cpp:94/122)
+    0x44d0840 WebCore::BitmapTexturePool::releaseUnusedTexturesTimerFired()
+    0x44c8597 WebCore::PlatformDisplay::sharedDisplay(): RELEASE_ASSERT(s_sharedDisplay) -> abort()
+
+**Cause:** BitmapTexturePool (TextureMapper's intermediate surfaces: a
+composited layer with opacity < 1 whose children overlap, masks, filters,
+3D) has an 80 MB limit (`BITMAP_TEXTURE_POOL_MAX_SIZE_IN_MB`). S1b made
+`scheduleReleaseUnusedTextures` return on PS5 (the title's render thread
+releases on every WCScene update), but `enterLimitExceededModeIfNeeded`
+started the main-thread timer itself (`startOneShot(0_s)`). The timer ran
+on the title's main thread with no GL context current and asked
+`PlatformDisplay::sharedDisplay()` for a sharing context; the title has no
+shared display: RELEASE_ASSERT, abort. A surface is sized to the visible
+part of its layer, so while scrolling every step allocates new sizes and
+the pool fills within seconds on pages with translucent composited cards.
+Not the animation or tile-arena work, and not an allocation failure.
+
+**Fix** (`src-wc` 7d09449da9, `BitmapTexturePool.cpp`): no main-thread timer
+on PS5 when the limit is exceeded either (the per-update release on the
+render thread uses the 50 ms limit-mode tolerance), and the timer path uses
+`sharedDisplayIfExists()`. c290e972ee logs `[wc] texture pool over its 80 MB
+limit` (first time and every 100th).
+
+**Reproduction** (`test/paint/wcfeed.html`, a self-scrolling feed of 60
+translucent composited cards with synthetic videos, 5 min, served by
+`tools/serve-media.py --page`): the pool went over 80 MB within seconds of
+the first scroll step (82.6 MB in 49 textures) and 700 times in 5 min; the
+fixed title ran the 5 minutes at 57-58 rAF/s (492 layers, GL textures
+96 MB median, 137 MB max). Before the fix the first of these would have
+aborted.
+
+**Tooling** (outer repo bc85844):
+- `package.sh` gives each package a build id (time + source commit), which
+  the title logs at start (`ps5browser: ... build <id>`), and keeps the
+  unstripped `ps5browser.elf` and `ps5wk-child` (debug sections
+  zlib-compressed, ~340 MB each) with `build.txt` (eboot/child sha1, source
+  commit, number of uncommitted files) and the uncommitted source diff in
+  `toolchain/wpe-webkit/titles/debug/<id>/`; the last 5 are kept and
+  `titles/ps5browser-symbols.elf` links to the newest.
+  `llvm-addr2line -f -C -i -e titles/debug/<id>/ps5browser.elf 0x<addr - 0x400000>`.
+- `--wrap=abort` (`apps/title/titleabort.c`): an abort in the title
+  (RELEASE_ASSERT/CRASH, libc++ hardening after its stderr message,
+  g_error after logHandler's line) first logs
+  `[abort] abort() called on thread 0x... (main): backtrace 0x... (self 0x...)`
+  to the title log, its file log and the kernel log (frame-pointer walk,
+  load addresses as in the kernel's report; no stdio, no malloc).
+- `test/paint/scroll-long.js`: a 4-minute scroll for `test-onload.js`.
+
+**Page tables and swap, WC vs CPU** (log-only runs, same build
+20261101-162413-c290e972ee, compositing flag on/off; kernel VM Stats; idle
+before the runs 5010-5030 CPU page tables):
+
+| scenario | mode | page tables max | swap out | title direct memory | WebProcess mmaps at end | scrolled |
+| --- | --- | --- | --- | --- | --- | --- |
+| feed page from the TV test, `scroll-long.js` 4 min | WC | 6673 | 452 -> 811 | 731-885 MB | 1603 MB (148 live) | 124k px in 182 s, rAF 20-25/s |
+| | CPU | 6540 | 582 -> 582 | up to 2661 MB | 1320 MB (117 live) | 58k px in 182 s, rAF 8-15/s |
+| `wcfeed.html` 5 min | WC | 6636 | 442 -> 444 | 6623 MB at load, then 1006-1486 | 1005 MB | 57-58 rAF/s |
+| | CPU | 7209 (a WebProcess crash and reload during the run) | 443 -> 838 | 7679 MB, flexible 8 MB free | 1468 MB (peak 1908) | 8-42 rAF/s |
+
+- Page tables follow the WebProcess's mappings (libpas growth as the
+  feed grows: on the feed page +371 MB of WebProcess mmaps over 4 min
+  against +332 page tables), not the title: the title's anonymous mmaps stay
+  at 264 MB and GL textures at 50-147 MB in WC mode; the tile arena keeps 8
+  MB chunks. WC scrolled twice as far in the same time (more feed loaded),
+  so its slightly higher peak is more page, not more cost per page. The
+  owner's 7284 had a WebProcess with 1782 MB in 169 mappings (peak 1853 MB)
+  plus the console's own load; it was not an allocation failure (the abort
+  was the assertion above).
+- Decoder direct memory does not show in the page-table count (6.6 GB of
+  direct memory at the 60-video load, page tables 6636).
+- **Video decoders (not WC):** every VP9 stream gets a 3840x2160 decoder
+  (`PS5VideoDecoder.cpp:1128`, "VP9 is cheap at 4K"): 535 MB direct memory
+  and 12 x 12 MB output buffers for a 480x854 clip; H.264 ones are opened
+  at 1920x1088 (70 MB). A page that starts 60 muted autoplay videos opens a
+  decoder for each before WebKit suspends the off-screen ones: 6.6-7.7 GB of
+  direct memory, flexible memory down to 5-8 MB, then
+  `MapNamedFlexibleMemory rc=0x8002000c` and software decoding. Worth a cap
+  (decoders per WebProcess, or the VP9 size from the stream) in M6.
+
+**WebProcess abort in GStreamer's playsink (not WC, seen in both modes):**
+with many videos started and suspended at once (`wcfeed.html` in CPU mode
+here, in WC mode in M4's run, and once on 2026-10-31) the WebProcess
+logged `Padname src_0 / sink_0 is not unique in element streamsynchronizerN`
+and aborted in `gst_play_sink_do_reconfigure` (`gstplaysink.c:3625`,
+assertion `it`; crash guard stack: g_assertion_message_expr <-
+gst_play_sink_do_reconfigure <- sinkpad_blocked_cb). streamsynchronizer
+names its request pads from a counter that `new_pad` increments only after
+dropping and retaking its lock to add the pads, and that READY->NULL resets
+to 0 even while a pad requested during the state change is still there
+(WebKit sets suspended videos' pipelines to NULL from the main thread while
+the streaming thread reconfigures playsink). The next request then reuses
+`sink_0`, adding the pad fails and frees it, and playsink asserts on it.
+Patch `port/deps/patches/gst-plugins-base/0001-streamsynchronizer-unique-pad-names.patch`:
+the number is reserved before the lock is dropped, skips names that exist,
+and the counter is reset only when no stream is left.
