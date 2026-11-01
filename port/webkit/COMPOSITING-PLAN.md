@@ -778,3 +778,193 @@ held 590 mappings (1816 MB, 2555 MB resident in big mappings, page tables
 (page tables 5013). Not seen in the same scenario with the earlier build
 (c290e972ee: 398 decoders opened and closed over 5 min). Needs a thread
 dump of the stalled WebProcess; a decoder cap would avoid the state.
+
+## M6 results (2026-11-01)
+
+Robustness: decoder budget, GL texture cap, WebProcess crash recovery,
+settings, long session. Commits: outer repo 4268463 (decoder budget, VP9
+sizing), ddd34f8 (crash-test endpoint); `src-wc` b9007fb2c3 (suspend after
+preroll), 900ba6f6ad (GL cap, scene teardown). Builds tested
+20261101-175542 / -180658 / -182441 (-0e6aee371a source base), all with the
+deps archive of 17:31 (gstreamer-full with the streamsynchronizer patch).
+
+**Decoder admission** (both modes; `port/webkit/wpe-ps5/PS5VideoDecoder.cpp`,
+"budget" section and `openHardware`):
+- At most 8 hardware decoders at once; their memory (decoder + output
+  buffers, measured around each open, opens serialized under `openLock`)
+  within 2048 MB of direct memory; an open must leave 64 MB of flexible
+  memory free (`admit`). Over budget, the DOPEN waits up to 0.5 s for
+  decoders to close (off-screen videos being suspended), then is refused
+  (status 5): that pipeline run decodes in software. decodebin3 drops its
+  decoder at PAUSED -> READY (`gst_decodebin3_reset`), so a suspended video
+  that comes back asks the title again.
+- VP9 decoders are sized to the stream (at least 1920x1088); 4K headroom
+  only for streams above 1080p while it fits in half the budget. Measured
+  over the runs below: VP9 1920x1088 208 MB direct (median of 389 opens,
+  p10-p90 143-282), 6 MB flexible, against 535 + 32 + 12 x 12 MB at
+  3840x2160; H.264 1920x1088 107 MB (745 opens, 57-180; the spread is
+  frees landing in the measuring window), 24 MB flexible.
+- `/data/ps5webkit/vdec-budget` overrides (`decoders= direct= reserve=
+  wait= vp9headroom=0/1/2`); open/close lines log each decoder's cost and
+  `budget N decoders, X MB (peak ..., refused, waited, VP9 sized to the stream)`.
+- Why not take decoders back from paused or hidden videos: ca31aee removed
+  the slot take-back because the pictures still belong to the WebProcess
+  (preroll, playsink's queue); closing a decoder under a live pipeline
+  would need the proxy to reopen it and wait for a keyframe. Instead the
+  pipelines themselves let go (below), and the budget bounds the rest.
+- **WebKit side** (`MediaPlayerPrivateGStreamer::updateStates` ->
+  `ps5SuspendAfterPreroll`): a muted video made off screen was marked
+  suspended while its pipeline was still NULL, and its preroll then went
+  ahead (only PLAYING is held back while suspended), so every off-screen
+  video of a feed kept a decoder open, paused. Once prerolled (metadata,
+  first frame, ready states delivered) it now goes to its suspend state (NULL;
+  MSE players keep PAUSED as before) and resumes like a video that scrolled
+  away. `PS5WK_MEDIA_SUSPEND_PREROLLED=0` = old behaviour.
+
+`wcfeed.html?mins=2` (60 posts with muted looping synthetic videos, 2 min
+self-scroll), log-only. "old" = the same binary with
+`vdec-budget: decoders=999 direct=999999 reserve=0 wait=0 vp9headroom=2`
+and `PS5WK_MEDIA_SUSPEND_PREROLLED=0`. Whether all videos start at once at
+the load varies from run to run (WCFEED's playing count at 10 s: 9-12 in
+some runs, 55-58 in others); the 10.5 GB / 5.1 GB "before" figures are the
+burst case from earlier rounds:
+
+| run | mode | decoders opened (VP9 4K) | most open at once | refused -> software | title direct max | flexible min | suspended after preroll | page tables max | rAF |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crash agent, build 0e6aee371a (burst) | WC | | 20 | (opens failing, 3 s each) | 10.5 GB | 0-13 MB | | 7201 | WebProcess stalled |
+| M4 round (burst) | WC | 170 | | 3 (flexible exhausted) | 5.1 GB | | | 6636 | 57-58 |
+| A: old, same binary (no burst) | WC | 162 (55) | 6 (2154 MB) | 0 | 2515 MB | 158 MB | 0 | 6293 | 58-59 |
+| B: suspend + budget, 4K VP9 while roomy | WC | 201 (66) | 6 (1013 MB) | 0 | 1587 MB | 184 MB | 58 | 6268 | 58-59 |
+| C: final (burst at load: 58 playing at 10 s) | WC | 178 (0) | 8 (1493 MB) | 34 | 1728 MB | 85 MB | 57 | 6764 | 20 at 10 s, then 58-59 |
+| D: final | CPU | 158 (0) | 8 (1682 MB) | 27 | 1241 MB | 159 MB | 55 | 6647 | 23 at 10 s, then 40-42 |
+| G: final (burst; first 60 s, cap test run) | WC | 76 (0) | 8 (1462 MB) | 15 | 1826 MB | 160 MB | 37 | 6529 | 40 at 20 s, then 57-59 |
+
+- The budget holds: never more than 8 decoders or ~1.7 GB of decoder memory;
+  flexible memory stayed above the 64 MB reserve (measured minimum 85 MB;
+  65 MB in the budget's own view, opens in flight subtracted); no
+  `MapNamedFlexibleMemory` failure and no stall in any run. Earlier CPU runs
+  of the page reached 7679 MB (plan section above).
+- Refusals happen only in the load burst (prerolls of off-screen videos,
+  which then go to NULL); the visible videos played hardware-decoded at
+  30 frames/s (runs C, D: `[video]` stats windows 28.8-29.6 shown/s, 0-3
+  dropped).
+  Software prerolls cost CPU for a few seconds at the load (rAF 20-40 in
+  the first 10-20 s of the burst runs).
+- Page tables follow the WebProcess (6268-6764 in every run, swap flat at
+  459-464 MB); decoder direct memory does not show there.
+
+**GL texture cap** (WC; `PS5WCHost.cpp` `SceneHost::checkGLMemory`, called
+each presented frame; `DrawingAreaProxyWCPS5::glMemoryAction`;
+`GraphicsLayerWC::setTileCoverageReduced`): decisions go by a ~1 s average of
+`BitmapTextureUploaderPS5::textureBytes()` (the texture pool's
+intermediate surfaces swing 49-101 MB from one second to the next on
+`wcfeed.html`). Above 128 MB: logged (every 30 s). Above the 160 MB cap:
+`DrawingArea::SetTileCoverageReducedWC(true)` to the shown page's
+WebProcess: tiles for the visible rect only, no margin, no whole-layer tiling
+of animated layers; back to normal after 20 s under 96 MB. Still over the
+cap 5 s later, or over 240 MB: the page's WebProcess is ended and the page
+reloads (the title's web-process-terminated handler) in a new one that
+paints on the CPU, for that WebProcess's life. `/data/ps5webkit/wc-gl-cap`
+(MB) moves the cap. Checked with the cap at 100 MB on `wcfeed.html` (its GL
+textures run at 94-97 MB median, 136 MB max): first version (instantaneous
+value) reduced coverage at 104 MB and fell back to the CPU 5 s later on a
+pool spike (100.8 MB), the reload painted on 4 threads, `[wc]` lines gone,
+rAF 30; with the average, coverage was reduced at 100.5 MB and the page
+stayed composited (no fallback in the remaining 40 s). Reduced coverage
+saves little on this page: its textures are mostly the pool's surfaces for
+the 60 translucent cards (the pool went over its own 80 MB limit), not
+tiles. At the default 160 MB cap no run reached the cap (max 137 MB).
+
+Page tables: title GL textures and the tile arena's shm chunks don't show
+as a separate cost: page tables 6264-6764 in every WC and CPU run, the same
+spread as M5 (the WebProcess's mappings dominate).
+
+**WebProcess crash recovery** (WC, `wcfeed.html`, `POST /restart?scope=crash`
+= SIGKILL to the WebProcess, then `POST /restart?scope=page`):
+- crash: `RESULT ps5browser webprocess FAIL terminated (reason 0); reloading`,
+  a new drawing area at once, `[wc] scene 19 removed: 492 layers, 60 video
+  layers; GL textures 100.7 -> 58.0 MB, 0 scenes left`; every decoder of the
+  dead WebProcess released (`budget 0 decoders, 0 MB`); the reloaded page
+  composited again (492 layers, 58 rAF/s, videos playing) within ~3 s.
+- page restart: `scene 24 removed: ... GL textures 125.4 -> 83.5 MB`,
+  `RESULT ps5browser page-restart PASS`, composited again.
+- The 58 / 83.5 MB left with no scene were BitmapTexturePool's free
+  surfaces (a global pool, released only by scene updates). The host now
+  empties the pool when its last scene goes: after the fix the same crash
+  went `64.4 -> 7.9 MB` (the 8.3 MB scene texture; also on the CPU
+  fallback reload: `100.8 -> 7.9 MB`).
+- Title direct memory after the reloads: 993.7 MB (crash), 877.2 MB (page
+  restart), as in steady play of the page; no stale video layers: the new
+  scene's video layers are the new page's own (9, then 60 as its posts
+  were made).
+
+**Settings** (the `compositing` item, `apps/title/settings.c`, ba6c52c):
+README.md is not touched here (uncommitted hunks of another round); its
+Settings table should get this row, after *Offer VP9 video*:
+
+| Setting | Stored as | Applies |
+| --- | --- | --- |
+| GPU compositing, experimental (default off; WC builds only) | `/data/ps5webkit/compositing` when on (opt-in flag file) | page restart |
+
+and `compositing` in the list of setting ids (after `media_vp9`), with
+this note under the table: *GPU compositing* puts pages together on the
+GPU in layers (WebKit's WC compositor in the title, this file). WebKit reads
+the flag whenever a page gets a new WebProcess, so *Restart page* applies it
+(the log shows `[wc] page N: WC compositor`); without it, or in a build
+without the compositor, pages paint on the CPU. A page whose GL textures
+stay over the 160 MB cap gets a new WebProcess that paints on the CPU
+(`[wc] ... this page goes to the CPU path`); the next WebProcess composites
+again. Test knobs, not in Settings: `/data/ps5webkit/wc-gl-cap`,
+`/data/ps5webkit/vdec-budget`, `PS5WK_MEDIA_SUSPEND_PREROLLED` (child.env),
+`POST /restart?scope=crash`.
+
+**Long session** (WC, build 20261101-182441, 18:29-19:12, 43 min, one
+title and one WebProcess throughout; `test-urls.txt` of 40 loads: neutral
+public pages (Wikipedia, MDN, BBC News, docs.python.org, w3.org, gnu.org,
+DuckDuckGo lite, example.com/org) and the synthetic pages (`wcfeed.html`
+x4, `feed.html` x2, `feed-players.html` x2, `video.html` with H.264 1080p30
+/ 1080p60, VP9, HEVC 2160p fill, `sticky.html`, `animations.html?auto`,
+`layers.html`, `static.html`); `test-onload.js` scrolled every page down
+for 20 s and up for 10 s):
+- No crash: no title abort, no WebProcess crash or restart, no playsink
+  abort, no CPU fallback, no coverage reduction (one known `g_bytes_get_data`
+  GLib-CRITICAL on BBC News, seen 64 times in earlier logs). The 4 URL
+  "failures" are the harness: two of the four `wcfeed.html` loads never
+  report load-finished within 60 s (as in earlier rounds) and are counted
+  twice.
+- Title direct memory after each load: 655-704 MB on every neutral page
+  from the first (example.com 635.8, Wikipedia 644.4) to the last
+  (DuckDuckGo 663.7, `animations.html` 658.4); media pages 741-1078 MB
+  while their decoders are open, back to the baseline at the next page.
+  Flexible memory 277 MB free after every neutral page (283 at the start;
+  202 MB at worst with a page's decoders open).
+- GL textures: median 15-55 MB per page, max 137.4 MB (`wcfeed.html`),
+  under the 160 MB cap throughout (the ~1 s average never reached the
+  128 MB log threshold).
+- Decoders: 604 opened, 605 closed, at most 7 at once (965 MB), 0 refused;
+  0 VP9 decoders at 4K; 189 videos suspended after an off-screen preroll.
+  `[video]` stats: 440 windows over 86 streams, 26.3 frames shown/s on
+  average (videos scrolled in and out mid-window), 127 dropped in all.
+- Page tables 5016 at the start, 6380-6531 through the session (6531 max,
+  +150 over the session, following the WebProcess's mappings: 45 -> 207 live,
+  713 -> 1112 MB, libpas committed 228 -> 482-541 MB as the WebProcess
+  served 40 pages), 5013 after the title stopped; swap 460.3 -> 456.7 MB.
+  Pass: no crash, title memory flat, GL under the cap; the WebProcess's own
+  growth is the known libpas behaviour (the 3 GB memory restart covers it).
+- Scrolling: page rAF while scrolled 47.6-60.3/s (median 59.9).
+
+**What is left:**
+- A decoder of a paused or hidden MSE player stays open (WebKit keeps MSE
+  pipelines PAUSED when suspended); on a long MSE feed they still count
+  against the budget, and newly visible videos then decode in software.
+  Taking such a decoder back needs the proxy to give it up and reopen at
+  the next keyframe (a protocol change in `port/deps/gst`).
+- The proxy treats a refusal as "software"; there is no "wait for a
+  decoder" or poster-only state, so a refused visible video plays in
+  software until its next suspend/resume.
+- Reduced tile coverage saves little on pages whose GL memory is
+  TextureMapper's intermediate surfaces (many translucent composited
+  layers); the pool's own 80 MB limit is the lever there.
+- The CPU fallback lasts for the WebProcess's life (one WebProcess serves
+  every navigation), not for one page.
+- The owner's TV check of the decoder budget on real feeds.
