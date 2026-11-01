@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>composited layers test</title>
+<!-- GPU compositing checks (COMPOSITING-PLAN.md): a page whose elements get
+     composited layers in the WC path, with no animation, so captures of the
+     CPU path and the composited path can be diffed pixel by pixel. Fixed
+     header and badge, sticky headings, transforms (2D, 3D, will-change),
+     opacity over stripes (premultiplied alpha), an overflow scroller, a
+     rounded clip around a composited child, filters, blend modes; 6000 px
+     tall for scroll tests. -->
+<style>
+body { margin: 0; font: 18px/1.45 sans-serif; color: #1b2030; background: repeating-linear-gradient(45deg, #f6f3ea 0 24px, #ece6d6 24px 48px); }
+header { position: fixed; top: 0; left: 0; right: 0; height: 64px; z-index: 10; background: rgba(20, 60, 120, .82); color: #fff; display: flex; align-items: center; padding: 0 28px; font-size: 24px; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
+.badge { position: fixed; right: 24px; bottom: 24px; z-index: 10; width: 120px; height: 120px; border-radius: 60px; background: radial-gradient(circle at 35% 35%, #ffe28a, #e07a10); box-shadow: 0 6px 22px rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; font-weight: bold; }
+main { padding: 88px 40px 40px; }
+section { margin: 0 0 40px; background: rgba(255,255,255,.72); border-radius: 18px; padding: 0 24px 24px; }
+h2 { position: sticky; top: 64px; margin: 0 -24px 12px; padding: 10px 24px; background: #2d3b55; color: #fff; border-radius: 18px 18px 0 0; z-index: 5; }
+.row { display: flex; gap: 28px; flex-wrap: wrap; align-items: center; }
+.box { width: 240px; height: 160px; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; text-align: center; }
+.wc { will-change: transform; background: #3a7bd5; }
+.rot { transform: rotate(-8deg); background: #d5543a; }
+.scale { transform: scale(1.15) translateZ(0); background: #3ad59a; color: #123; }
+.persp { perspective: 600px; }
+.persp .box { transform: rotateY(28deg); background: linear-gradient(90deg, #7b3ad5, #d53a9a); }
+.stripes { width: 520px; height: 180px; background: repeating-linear-gradient(90deg, #000 0 20px, #fff 20px 40px); position: relative; border-radius: 10px; }
+.stripes > div { position: absolute; inset: 20px; border-radius: 8px; }
+.op50 { background: rgb(255, 0, 0); opacity: .5; will-change: opacity; }
+.rgba { background: rgba(0, 120, 255, .5); }
+.scroller { width: 520px; height: 220px; overflow: auto; border: 3px solid #2d3b55; border-radius: 10px; background: #fff; }
+.scroller p { margin: 8px 14px; }
+.clip { width: 300px; height: 200px; border-radius: 40px; overflow: hidden; background: #222; }
+.clip .box { width: 360px; height: 240px; will-change: transform; transform: translate(-30px, -20px); background: conic-gradient(#f33, #fd3, #3d6, #39f, #c3f, #f33); color: #000; }
+.blur { filter: blur(3px); background: #3a7bd5; }
+.gray { filter: grayscale(1); background: linear-gradient(90deg, #f33, #3d6, #39f); }
+.shadowf { filter: drop-shadow(8px 8px 6px rgba(0,0,0,.5)); background: #e8b830; color: #222; }
+.blend { mix-blend-mode: multiply; background: #39f; will-change: transform; }
+p.text { max-width: 1100px; }
+.filler { height: 900px; background: linear-gradient(#fff0, #2d3b5522); border-radius: 12px; display: flex; align-items: flex-end; padding: 16px; }
+</style></head><body>
+<header>Composited layers test: fixed header, sticky headings, transforms, opacity, clips, filters</header>
+<div class="badge">fixed</div>
+<main>
+<section><h2>1. Transforms</h2>
+<div class="row">
+  <div class="box wc">will-change: transform</div>
+  <div class="box rot">rotate(-8deg)</div>
+  <div class="box scale">scale(1.15) translateZ(0)</div>
+  <div class="persp"><div class="box">perspective rotateY(28deg)</div></div>
+</div>
+<p class="text">The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow. 0123456789 &mdash; Ελληνικά Кириллица 日本語</p>
+</section>
+<section><h2>2. Opacity and alpha over stripes</h2>
+<div class="row">
+  <div class="stripes"><div class="op50"></div></div>
+  <div class="stripes"><div class="rgba"></div></div>
+</div>
+</section>
+<section><h2>3. Overflow scroller and rounded clip</h2>
+<div class="row">
+  <div class="scroller">
+    <p>Line 1 of an overflow: auto box. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>
+    <p>Line 2 of an overflow: auto box. Sed do eiusmod tempor incididunt ut labore et dolore.</p>
+    <p>Line 3 of an overflow: auto box. Ut enim ad minim veniam, quis nostrud exercitation.</p>
+    <p>Line 4 of an overflow: auto box. Duis aute irure dolor in reprehenderit in voluptate.</p>
+    <p>Line 5 of an overflow: auto box. Excepteur sint occaecat cupidatat non proident.</p>
+    <p>Line 6 of an overflow: auto box. Sunt in culpa qui officia deserunt mollit anim.</p>
+    <p>Line 7 of an overflow: auto box. The end.</p>
+  </div>
+  <div class="clip"><div class="box">composited child in a rounded clip</div></div>
+</div>
+</section>
+<section><h2>4. Filters and blending</h2>
+<div class="row">
+  <div class="box blur">filter: blur(3px)</div>
+  <div class="box gray">filter: grayscale(1)</div>
+  <div class="box shadowf">filter: drop-shadow</div>
+  <div class="box blend">mix-blend-mode: multiply</div>
+</div>
+</section>
+<section><h2>5. Long content (scrolling)</h2><div class="filler">5: bottom of the filler</div></section>
+<section><h2>6. More long content</h2><div class="filler">6: bottom of the filler</div></section>
+<section><h2>7. Even more</h2><div class="filler">7: bottom of the filler</div></section>
+<section><h2>8. Last section</h2><div class="filler">8: the end of the page</div></section>
+</main>
+</body></html>

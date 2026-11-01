@@ -184,3 +184,130 @@ method matched exactly. Per tile, the same at every batch size (±2 %):
   copies, filters keep working), 1 MB each, no TextureMapper shader change.
   The linear-texture path (glTexStorage2D with 2 levels + swizzle) is the
   simpler fallback if 2.25 MB per tile is acceptable or the driver is patched.
+
+## M1 results (2026-11-01)
+
+Log-only PPSA99020 runs of the WC build (`build-wc`), compositing switch
+off then on, `test-urls.txt` + `debug-screenshot` (960x540 captures of the
+composed back buffer at +2 s and +10 s). Diff = pixels whose largest channel
+difference is over 24 (and over 64), CPU path vs WC:
+
+| page | > 24 | > 64 | what differs |
+| --- | --- | --- | --- |
+| example.com | 0.00 % | 0.00 % | nothing |
+| `test/paint/static.html` (sticky header, shadows, rotated/translucent cards, SVG) | 0.00-0.02 % | 0.00 % | antialiasing only |
+| BBC News | 0.01 % (same stories); 1.9 % in a later run | 0.00 / 1.5 % | a story changed between runs |
+| Wikipedia article | 22 % | 10 % | the donation banner was served to one run only; the rest is identical |
+| MDN docs page (sticky header and sidebar) | 5.6-7.6 % | 5.4-6.9 % | different ads; layout identical |
+| `test/paint/layers.html` (new: fixed header/badge, sticky headings, 2D/3D/will-change transforms, opacity over stripes, overflow scroller, rounded clip, filters, blend) | 1.07 % | 0.63 % | see below |
+
+`layers.html`: the `perspective` + `rotateY` box is drawn in 3D by WC (the
+CPU path flattens it: WC is right); `scale(1.15) translateZ(0)` text is a
+little softer (WC paints the layer at 1x and scales the texture; no
+contents scale for transformed layers yet); the overflow scroller's text
+sits ~1 px lower (subpixel offset of the composited scrolled contents).
+Opacity and alpha over stripes, rounded clips, blur/grayscale/drop-shadow
+and multiply blending match.
+
+After scrolling to 1520 px in 40 px steps (`scroll-to` capture at +10 s),
+`layers.html` and Wikipedia are identical to the CPU path (0.00 %); MDN
+differs only by its ad-dependent content offset.
+
+**Bugs found and fixed** (branch `ps5-wc`):
+- Scrollbars were missing in WC mode (page and overflow): the coordinated
+  graphics scrollbar controller leaves composited scrollbar layers to a
+  scrolling thread that WC doesn't have. `WebChromeClient::ensureScrollbarsController`
+  uses the generic controller under DrawingAreaWC, and `ScrollbarThemeAdwaita::paint`
+  paints when the controller draws into scrollbar layers.
+- A layer that stopped and restarted drawing showed nothing (the scene drops
+  its backing store meanwhile): `GraphicsLayerWC::setDrawsContent(true)`
+  repaints all tiles.
+- The host repainted the scene for updates that changed nothing composited
+  (BBC sends ~60 such updates/s): skipped now (`[wc] ... N unchanged`).
+- Sticky headings were one scroll step behind after the M2 change below
+  (layer positions update incrementally; the sticky subtree is now marked).
+
+**Memory** (title, same pages): flexible memory 283.0 MB free in both modes
+on every page (unchanged). Direct memory 598.8-608.5 MB in use on the CPU
+path, 635.7-666.8 MB in WC mode (+37 to +68 MB). GL textures (`[wc]` line)
+16-43 MB per page during the screenshot round, peak 64.7 MB during the
+scroll round with M2's coverage margin (Wikipedia/MDN).
+
+**Switch:** with `/data/ps5webkit/compositing` absent the same title runs the
+CPU path (`[render] painting on 4 threads`, no `[wc]` line), checked after
+the WC runs too.
+
+## M2 results (2026-11-01)
+
+Changes (`toolchain/wpe-webkit/src-wc`, branch `ps5-wc`, commits 057ebfbb87..1b74f03f8a):
+- **Coverage margin** (`GraphicsLayerWC.cpp` `updateCoverageRect`, `WCTileGrid::setCoverageRect(coverage, keep)`):
+  tiles are made max(one tile row, half the visible height) above and below
+  what is visible and kept one more tile row beyond that. Layer resizes keep
+  the tiles whose rect didn't change (both sides; explicit removals for the
+  others). A tile keeps up to 8 dirty parts and paints them separately when
+  that saves half of the bounding rect.
+- **rAF pacing** (`DrawingAreaWC.cpp` `DisplayRefreshMonitorWC`): a
+  DisplayRefreshMonitor fired by each update's reply (sent after the swap
+  that shows it) or, with nothing in flight, by a timer at most at 60 Hz.
+- **No repaint of fixed/sticky content per scroll step** (`LocalFrameView::setViewportConstrainedObjectsNeedLayout`,
+  `scrollContentsFastPath`; PS5 and composited scrolling only): every scroll
+  step moves the layout viewport, which relaid out every fixed and sticky
+  renderer, and a relayout repaints all of it (LayoutRepainter: self needs
+  layout = full repaint). That repainted the composited fixed header and
+  every sticky heading on each step, and on Wikipedia the whole sticky
+  columns (4.7 Mpx per step). Sticky renderers now get a layer position
+  update (which repaints a moved non-composited one at its old and new
+  place), composited fixed ones an out-of-flow movement layout.
+- `[render]`/`[render1]` lines for WC in the CPU path's format
+  (`PS5WK_RENDER_LOG=2`), `PS5WK_WC_LAYER_LOG=1` per-layer paints with their
+  invalidations, `[wc] ... unchanged`.
+
+**Measured** (title, log-only, 1920x1080, `test-onload.js` =
+`test/paint/scroll-raf.js`: a rAF counter, then 5 s down and 5 s up at
+40 px per 16 ms tick; `PS5WK_RENDER_LOG=2`; summary by
+`test/paint/title-scroll-summary.py`). Per rendering update during the
+scroll; presents = updates shown per second (WC: `[wc]` presents; CPU:
+`[present]` page uploads):
+
+| page | path | updates/s | main thread ms/update (avg / p95) | Mpx painted/update (avg / p95) | presents/s | rAF/s while scrolling (avg / max) |
+| --- | --- | --- | --- | --- | --- | --- |
+| `layers.html` | CPU | 26.2 | 15.5 / 39.8 | 0.84 / 2.07 | 19.3 | 27.0 / 59.9 |
+| | WC | 58.6 | 2.4 / 6.3 | 0.107 / 0.20 | 58.6 | 58.5 / 60.0 |
+| Wikipedia article | CPU | 99.3 | 4.4 / 9.2 | 1.08 / 2.07 | 54.5 | 94.7 / 108.8 |
+| | WC | 56.6 | 6.6 / 26.3 | 0.67 / 4.64 | 56.6 | 56.7 / 59.9 |
+| MDN docs page | CPU | 39.4 | 12.4 / 15.5 | 2.04 / 2.07 | 44.0 | 45.5 / 97.7 |
+| | WC | 59.9 | 10.2 / 14.1 | 0.30 / 0.35 | 60.2 | 59.8 / 60.3 |
+| BBC News | CPU | 39.8 | 17.0 / 22.6 | 2.03 / 2.07 | 26.4 | 39.3 / 55.6 |
+| | WC | 49.3 | 6.7 / 13.4 | 0.18 / 1.01 | 48.9 | 49.9 / 60.2 |
+
+Before the fixed/sticky fix (coverage margin and pacing only) WC painted
+4.7 Mpx per step on Wikipedia and 5.5 on MDN (21-29 presents/s).
+
+- **Tile-row crossings:** steps painting ≥ 0.5 Mpx were 15 of 586
+  (`layers.html`, 2.0 Mpx, 29 ms main thread), 10 of 599 (MDN, 1.2 Mpx,
+  15 ms), 34 of 493 (BBC, 2.3 Mpx, 33 ms), 69 of 566 (Wikipedia, 3.1 Mpx,
+  20 ms; mostly the page's own invalidations). Serial tile painting costs
+  6-14 ms per Mpx on the main thread, so a crossing step misses a frame:
+  that is M5 (record once, replay tiles on 0032's pool).
+- Other steps: 0.03-0.33 Mpx and 1.7-10 ms. What is left is non-composited
+  sticky content that moves (MDN's sidebar, Wikipedia's columns: old and new
+  place repainted) and the scrollbar layer (0.02 Mpx): M3 (composited sticky).
+- **Pacing:** rAF ≤ 60/s everywhere in WC (CPU path 95/s average, 109/s max
+  on Wikipedia). Presents 57-60/s except BBC (49/s: main thread busy with
+  the page's script, ~4 ms per update before painting, 100 ms spikes).
+  `frame done` (update sent until presented) 10-15 ms.
+- Pass targets: ~0 Mpx/step except crossings: yes, apart from moving
+  non-composited sticky content (M3); ≥ 58 presents/s: `layers.html`,
+  MDN yes, Wikipedia 56.6, BBC 49 (script-bound); rAF ≤ 60/s: yes.
+
+**Console finding:** `/system_tmp/ps5wk` fills with the runtime sockets
+and `webmem-<pid>` files of killed titles (4 per launch); after ~14
+launches children can't start (ENOSPC on `listen`). The title's cleanup
+logs `cannot list /system_tmp/ps5wk: errno 1` (the directory is
+`drwxrwxrwx root`, the stale sockets are owned by uid 1, the webmem files by
+uid 0). Cleaned over FTP during this round.
+
+**Left for later:** M3 (sticky composited without coordinated scrolling,
+transform/opacity animations), M5 (tile painting off the main thread;
+crossing steps take 15-33 ms), contents scale for scaled layers (soft text
+under `scale()`), video layer (M4), VR with compositing untested.
