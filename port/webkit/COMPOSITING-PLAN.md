@@ -311,3 +311,105 @@ uid 0). Cleaned over FTP during this round.
 transform/opacity animations), M5 (tile painting off the main thread;
 crossing steps take 15-33 ms), contents scale for scaled layers (soft text
 under `scale()`), video layer (M4), VR with compositing untested.
+
+## M5 results (2026-11-01)
+
+Changes (`toolchain/wpe-webkit/src-wc`, branch `ps5-wc`, commits 8af4f0f1d2, 2f640b9488):
+- **Record once, replay on a pool** (`WebProcess/WebPage/wc/WCTilePainter.{h,cpp}`,
+  one per `DrawingAreaWC`; `GraphicsLayerWC.cpp` `WCTiledBacking::paintAndFlush`
+  hands it the layer's dirty parts). Per layer the dirty parts are recorded
+  once on the main thread into an SkPicture (R-tree; one
+  `paintGraphicsLayerContents` per rect of the parts' region, clipped), then
+  each part is replayed into its slot in bands of at least 64 rows (16k px)
+  on a `WorkerPool` of `PS5WK_PAINT_THREADS` (default 4) threads. Default
+  asynchronous: the main thread goes back to the run loop and the update is
+  sent when the last band is done (`DrawingAreaWC::sendUpdatesWC`; one update
+  in flight as before). `PS5WK_WC_PAINT_ASYNC=0`: the main thread takes bands
+  too and waits. Layers with under 64k dirty pixels (`PS5WK_WC_RECORD_MIN_PX`)
+  are painted directly into their slots. The recording context is deferred
+  (`GraphicsContextSkia` got an `IsDeferred` argument): ImageBuffers
+  (canvases, scratch buffers) are recorded as copy-on-write snapshots, not
+  their live pixels.
+- **Shared-memory tile arena** (`WCTileArena` in `WCTilePainter.cpp`): per
+  WebProcess, 8 MB `SharedMemory` chunks (`PS5WK_WC_ARENA_CHUNK_MB`), up to
+  64 MB (`PS5WK_WC_ARENA_MB`); first-fit 64-byte aligned slots; chunks beyond
+  the first are freed after 5 s empty and unused. A chunk goes once to each
+  drawing-area proxy (`WCUpdateInfo::tileArenaChunks`, read-only handle,
+  mapped once in the title and kept; freed ones in `removedTileArenaChunks`).
+  Tiles carry a `WCTileArenaSlot` (chunk, offset, stride, size;
+  `WCBackingStore.h`), checked against the chunk size by
+  `DrawingAreaProxyWCPS5::resolveTileArena` and uploaded without a copy
+  (`WCBackingStore::createNativeImage`, `WCScene.cpp`). Slots of an update are
+  free again when its reply arrives (after the present, so after the upload).
+  A part that finds no slot is painted the old way.
+- `PS5WK_WC_TILE_PAINT=0` restores the old path (a new ImageBuffer and
+  SharedMemory per part, serial). `[render1]` lines add `record`, `raster`,
+  `shm` (SharedMemory allocations) and `old way`; `[render] wc tiles:` every
+  5 s; `[wc] tile arena:` lines when chunks come and go.
+
+**Measured** (title, log-only, M2's method: `scroll-raf.js`, 5 s down and up
+at 40 px per 16 ms, `PS5WK_RENDER_LOG=2`; all three modes in one console
+session on the same binary, then the async default again on the final
+build; "crossing" = steps painting ≥ 0.5 Mpx; main thread = the whole
+rendering update on the WebProcess main thread):
+
+| page | mode | main ms/step avg / p95 | crossing steps: n, Mpx, main ms avg / p95 | presents/s | shm allocations/s (scroll; page load) |
+| --- | --- | --- | --- | --- | --- |
+| `layers.html` | old | 1.1 / 1.3 | 14, 2.0, 25.9 / 27.3 | 58.6 | 121.5; 551 |
+| | sync | 0.8 / 1.2 | 14, 2.0, 16.7 / 17.5 | 60.0 | 0.1; 5 |
+| | async | 0.5 / 1.1 (0.5 / 1.0) | 14, 2.0, 1.2 / 2.6 (1.2 / 3.2) | 60.1 (60.0) | 0.1; 5 |
+| Wikipedia article | old | 3.6 / 21.9 | 67, 2.9, 16.2 / 31.0 | 58.6 | 358.8; 811 |
+| | sync | 2.3 / 11.6 | 71, 2.8, 9.0 / 16.4 | 60.0 | 0.0; 2 |
+| | async | 1.7 / 4.7 (1.7 / 4.9) | 66, 2.7, 4.3 / 6.7 (4.4 / 6.9) | 60.1 (60.0) | 0.0; 2 |
+| MDN docs page | old | 5.5 / 7.3 | 11, 1.0, 11.3 / 14.2 | 60.0 | 189.6; 984 |
+| | sync | 5.3 / 6.9 | 11, 1.0, 8.6 / 10.6 | 60.0 | 0.0; 2 |
+| | async | 5.2 / 6.9 (5.3 / 6.7) | 11, 1.0, 7.0 / 8.0 (6.9 / 8.1) | 60.0 (60.0) | 0.0; 2 |
+| BBC News | old | 6.8 / 17.8 | 35, 2.1, 28.2 / 89.4 | 25.3 | 120.0; 356 |
+| | sync | 4.9 / 11.5 | 35, 2.3, 15.1 / 40.9 | 26.3 | 0.1; 2 |
+| | async | 3.6 / 9.4 (3.1 / 5.0) | 31, 2.3, 9.4 / 26.3 (8.7 / 23.0) | 27.0 (50.2) | 0.1; 2 |
+
+(Bracketed: the async default on the final build, a separate session.)
+- Crossing steps no longer miss frames: the main thread spends 1-9 ms on
+  them asynchronously (recording 0.4-5 ms of it; the rest is style, layout,
+  script), against 11-28 ms the old way. Pixels painted per step are
+  unchanged (same tiles, same invalidations).
+- What the pool costs, wall clock per update (async): 1.9-2.6 ms per Mpx on
+  Wikipedia and MDN, 7 ms per Mpx on `layers.html` (2 Mpx in 14 ms: its
+  45° repeating-gradient page background is expensive per pixel and scales
+  badly over threads, 25 ms serial against 16 ms on 4); BBC's page load
+  batches took up to 60 ms. That time is not on the main thread and
+  overlaps the previous frame's present; presents stayed at 60/s on the
+  three pages that reached 60 before, and `frame done` (send to present,
+  15-16 ms) did not change.
+- BBC News presented 25-27/s in every mode in the first session (`frame done`
+  30-45 ms in all three, i.e. on the title side, not the tiles) and 50/s in
+  the second; M2 had 49/s. Not from M5 (same in the old mode); worth a look
+  with M3's changes (animations, composited sticky) in the build.
+- SharedMemory allocations: 112-366/s while scrolling and 356-984 per page
+  load the old way (one shm object, fd and two mappings per tile part); now
+  2-5 per page load (chunk growth: `layers.html` grows to 5 chunks, 40 MB,
+  for its first paint) and none while scrolling.
+
+**Correctness** (`debug-screenshot` captures, 960x540, same build): new vs
+old WC path: 0.00 % pixels differ on example.com, `static.html`,
+`layers.html` and Wikipedia at +2 s and +10 s. CPU path vs new WC: same as
+M1 (`layers.html` 1.07 % > 24 / 0.63 % > 64, the 3D box and scaled text;
+example.com and Wikipedia 0.00 %; `static.html` 0.16 % > 24 / 0.00 % > 64,
+antialiasing at rows 307-332, identical between the old and new WC paths).
+After scrolling to 1500 px (`scroll-to.js`, +10 s): `layers.html` and
+Wikipedia 0.00 %.
+
+**Memory and page tables:** the arena keeps one 8 MB chunk per WebProcess
+(about 4-5 page tables in the WebProcess and as many in the title), up to
+40 MB for ~5 s after a page's first paint. The old path mapped 1 MB per tile
+part in both processes for the life of each update. The kernel's VM Stats
+(sampled only on change) can't separate either: page tables 5010-5030 idle
+before and after the runs, peaks 6309-6335 during runs with both paths;
+swap out 444-446 MB, no growth across the second session. Direct memory in
+the title is the same in both modes (`[mem]` 635.7-653.8 MB).
+
+**Left:** the gradient-heavy replay scaling (`layers.html`); recordings
+still reference ImageBuffer snapshots only, other live data (e.g. software
+video frames painted into tiles) is held by reference; the arena never
+shrinks below one chunk while a page is open; no cap on how long an async
+batch may take before the update goes (a 60 ms batch delays that frame).
