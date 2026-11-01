@@ -16,8 +16,10 @@
 #   3. https://<host>/ again: the row is not rewritten (same expiry)
 #   4. http://<host>/: must commit as https://<host>/
 #   control: http://<host>/ with another fresh data directory stays http
-# Take the console lock first. Uses ../run-shot.sh (SHOT_REMOTE=<path> starts
-# ps5wk-shot from the console's disk).
+# Take the console lock first. Uses ../run-shot.sh; ps5wk-shot is uploaded
+# once and started from the console's disk (SHOT_REMOTE, default
+# /data/ps5webkit/prof/ps5wk-shot.elf as prof-run.sh), never sent from the
+# Mac to elfldr.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -27,6 +29,7 @@ HOST="${1:-hsts.badssl.com}"
 OUT="${SHOT_OUT:-$ROOT/toolchain/wpe-webkit/shots-net/hsts-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
 export SHOT_OUT="$OUT"
+export SHOT_REMOTE="${SHOT_REMOTE:-/data/ps5webkit/prof/ps5wk-shot.elf}"
 DATA=/data/ps5webkit/hsts-test/data-$RANDOM
 CONTROL=/data/ps5webkit/hsts-test/control-$RANDOM
 DB="$DATA/cache/hsts-storage.sqlite"
