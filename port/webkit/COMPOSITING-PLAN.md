@@ -534,3 +534,120 @@ phase; "busy" = the main thread blocked 100 ms every 300 ms:
   still paints: M5.
 - The title abort seen in the owner's TV test after these builds was the
   BitmapTexturePool release timer (fixed separately, 7d09449da9).
+
+## M4 results (2026-11-01)
+
+Video in WC mode, and View in VR with compositing on. Before: a composited
+`<video>` showed nothing in WC mode (its contents layer was stubbed out).
+
+**Design as built** (src-wc commits 02a3f8847b, 0e6aee371a; outer repo
+8f838d5, 2078f47):
+- **No contents display delegate.** Under coordinated graphics the video
+  hookup is `GraphicsLayer::setContentsToMediaPlayer` (RenderLayerBacking
+  calls it for a composited RenderVideo), not a delegate, so
+  `GraphicsLayerWC::setContentsToMediaPlayer` (`GraphicsLayerWC.cpp:573`,
+  PS5 only) asks the player for its stream key through a new PS5 virtual,
+  `MediaPlayerPrivateInterface::ps5VideoStreamKey()` (`MediaPlayerPrivate.h:308`),
+  and sends it with the layer's PlatformLayer change
+  (`WCLayerUpdateInfo::PlatformLayerChanges::videoStreamKey`, `WCUpdateInfo.h:159`,
+  serialized). Other contents (`setContentsToPlatformLayer`) clear it.
+- **Stream key:** `ps5videosink` has a random, nonzero 64-bit `stream-key`
+  property, fixed for the sink's life, sent in every HELLO as `pts_ns`
+  (`gstps5videosink.c:258`; `PS5VideoProtocol.h`). Older sinks send 0 and
+  an older title ignores the field: protocol version unchanged, both builds
+  keep working (the main CPU build was rebuilt with the new archive).
+  `MediaPlayerPrivateGStreamer` reads the property when it makes the sink
+  and calls `renderingModeChanged()` so the layer asks again
+  (`MediaPlayerPrivateGStreamer.cpp:5017`).
+- **No hole punch with compositing:** with accelerated compositing
+  `RenderVideo` doesn't paint a video at all; `paint()` (snapshots,
+  flattening only) now paints the frame instead of punching a hole
+  (`:4737`), so the sink sends no GEOMETRY in WC mode. Presented-frame
+  counting (0036) also counts with compositing on while the sink is
+  ps5videosink (`:4358`; it only counted when not accelerated, which WC mode
+  is, so requestVideoFrameCallback would have stopped).
+- **Title:** the video server stores the key per stream
+  (`PS5VideoServer.cpp:169`); `PS5Renderer::compositorVideoTexture`
+  (`PS5Renderer.cpp:950`, given to the compositor as
+  `PS5CompositorContext::videoTexture`, `PS5Compositor.h:45`) returns the
+  stream's converted RGBA texture (already converted each due frame in
+  `handleVideo`) and a frame count; keys drawn as layers are skipped in the
+  "videos under the page" draw (`:1016`). Streams per frame raised from 8
+  to 16.
+- **Scene:** a layer with a key gets a `WCScene::VideoLayer`
+  (`WCScene.cpp:68`), a TextureMapperPlatformLayer whose
+  `paintToTextureMapper` draws the texture with `drawTexture(GLuint)`: the
+  layer's transform, opacity, rounded/contents clip and filters apply as
+  for any contents layer; no frame yet = nothing (the element's background
+  shows). `SceneHost::paint` repaints when `videoLayersNeedPaint()` (a video
+  layer's stream has a frame, or lost its texture, since the last paint),
+  without a WCUpdateInfo (`PS5WCHost.cpp:598`); `[wc] ... N video layers,
+  M paints for video frames only` once a second.
+- **View in VR:** nothing to change. The VR loop consumes and converts
+  frames itself and calls the compositor's applyPending/didPresent at the
+  headset rate; leaving VR repaints the scene at once (updates applied
+  during VR set it dirty; a new video frame does too). `PS5RendererVR.cpp`
+  untouched.
+
+**Tests** (log-only PPSA99020 runs, same binary, `debug-screenshot`,
+`video.html` with the synthetic clips; `?test=transform` and `?test=fill`
+are new, VIDEOSTATS now carries requestVideoFrameCallback counts):
+
+| clip (hardware-decoded unless noted) | CPU path: shown / dropped (title) | WC: shown / dropped | rVFC callbacks / presentedFrames at the last VIDEOSTATS, CPU vs WC |
+| --- | --- | --- | --- |
+| H.264 1080p30, `?test=geometry` (40 s) | 1205 / 9 | 1194 / 9 | 1015/1018 vs 1007/1017 |
+| H.264 1080p30, `?test=transform` (34 s) | 1034 / 8 | 1035 / 8 | |
+| HEVC 2160p30 (25 s) | 767 / 5 | 766 / 5 | 742/746 vs 739/745 |
+| VP9 1080p30 (25 s) | 767 / 6 | 768 / 6 | 744/747 vs 739/747 |
+| H.264 1080p60 (30 s) | 1785 / 15 | 1785 / 15 | 1758/1800 vs 1710/1800 |
+| software (`no-hwdec`): H.264 1080p30 geometry / VP9 1080p30 | | 1195 / 10, 743 / 7 | readyState 3-4 throughout |
+
+- **Geometry** (screenshots, CPU vs WC, pixels > 24 / > 64 apart): rounded
+  clip with the label over it and scrolling 0.20 / 0.12 % (+2 s) and
+  0.22 / 0.13 % (+30 s; the stats text); 4.45 % at +10 s, where the CPU
+  path still had the video at its pre-scroll place (hole-punch geometry
+  lags a scroll by a frame or more; WC moves video and page together).
+  Turned + scaled + 60 % opacity over stripes: WC shows the video correctly
+  blended and turned; the CPU path shows *nothing* there (a rotated video
+  can't be punched, and a hardware-decoded frame can't be painted into the
+  page), hence 28 %. HEVC/VP9/1080p60 0.00 % at +2 s, 0-2 % at +10 s (the
+  running clock differs by a frame). Software decoding in WC vs hardware
+  in WC: 0.06-1.3 %.
+- **Feed pages:** `feed-players.html` (8 players, MSE and progressive,
+  suspend/resume, loops) in WC: ran to the end (`FP DONE`), 0 `FP SPIN`
+  (spinner over a playing video), 8 video layers, 0 pictures lost without a
+  release, no take-backs (not compared with a CPU run of the page this
+  round). `test/paint/wcfeed.html`
+  (60 posts, a muted looping video in each, scrolled for minutes): 60 video
+  layers, 492 layers, 58-59 updates/s while scrolling; 170 decoders opened
+  and 168 closed as videos went off screen (direct memory 5.1 GB at load
+  with everything starting at once, then 1.45 and 0.87 GB; three videos fell
+  back to software when flexible memory ran short at load). The WebProcess
+  aborted after 135 s in GStreamer's playsink (`gst_play_sink_do_reconfigure:
+  assertion failed: (it)` after "Padname sink_0 is not unique in element
+  streamsynchronizer"): the same abort is in earlier runs of the same page
+  by other rounds and in a run on 2026-10-31, before this work, so it is a
+  playsink race with many pipelines, not the video layer. Open.
+- **View in VR with compositing on** (`vr-sim` + `vr-guesstest`, 20 enter
+  and leave cycles in two runs: 1080p H.264, VP9, 4K HEVC, 1080p60): every
+  guess/remembered/forgotten check PASS; the WebProcess kept sending 48-61
+  updates/s and the video kept decoding (VIDEOSTATS every second, 30
+  frames/s) while in VR, with up to 6 frames dropped at an entry; the scene
+  painted again within the first second after each exit (36 paints that
+  second; no WebProcess update needed). Title direct memory
+  after each URL flat over 12 cycles (754 -> 796.4/796.5 MB for H.264,
+  1095.2-1095.4 for 4K HEVC; 688.9 MB at the end, as the run before),
+  0 pictures lost without a release; page tables 6158-6162 during the run,
+  5012 after; swap flat at 452.9 MB.
+- **Fullscreen:** `requestFullscreen()` needs a user gesture ("transient
+  activation"), which log-only runs can't give; `?test=fill` (the video
+  fixed over the whole viewport, as the fullscreen style does) is the
+  stand-in: HEVC 2160p30 over the whole 1920x1080 view, 857 frames, 6
+  dropped, and with the page otherwise still the scene repainted for video
+  frames only (`30 paints for video frames only` per second, no updates).
+  The real fullscreen API is untested.
+
+**Not done / open:** the playsink abort above; canvas `drawImage` of a
+hardware-decoded video still draws nothing (unchanged); HDR still shown with
+the BT.709 matrix; a video layer is repainted only when its stream converts
+a frame, so a layer whose stream exceeds 16 per frame stays empty.
