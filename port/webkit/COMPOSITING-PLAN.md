@@ -763,4 +763,18 @@ the streaming thread reconfigures playsink). The next request then reuses
 `sink_0`, adding the pad fails and frees it, and playsink asserts on it.
 Patch `port/deps/patches/gst-plugins-base/0001-streamsynchronizer-unique-pad-names.patch`:
 the number is reserved before the lock is dropped, skips names that exist,
-and the counter is reset only when no stream is left.
+and the counter is reset only when no stream is left. Unpatched, the CPU
+run of `wcfeed.html` aborted twice in 5 min (17:05 and 17:07); patched
+(build 20261101-174417-0e6aee371a), 5 min in CPU mode without an abort.
+
+**Open: WebProcess stall with 60 videos in WC mode** (same build, which
+also has M4's video layers): 11 s into `wcfeed.html` the title had opened
+20 decoders (mostly 3840x2160 VP9 ones, see above), direct memory 10.5 GB,
+flexible memory 0-13 MB; further decoders failed (`MapNamedFlexibleMemory
+rc=0x8002000c`, 3 s each before falling back to software), the WebProcess
+held 590 mappings (1816 MB, 2555 MB resident in big mappings, page tables
+7201) and from then on sent no update and logged nothing but its 60 s
+`[mem]` line for the rest of the run. Title and console recovered on stop
+(page tables 5013). Not seen in the same scenario with the earlier build
+(c290e972ee: 398 decoders opened and closed over 5 min). Needs a thread
+dump of the stalled WebProcess; a decoder cap would avoid the state.
