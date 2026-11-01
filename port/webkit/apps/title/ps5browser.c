@@ -294,6 +294,26 @@ static gboolean testWaitingForLoad;
 
 static void loadNextTestURL(void);
 
+/* Screenshot series: debug-screenshot containing "series=<ms>x<count>"
+ * captures every <ms> ms from each test URL's load start, <count> times
+ * (NN-u<url>-s<shot>-<ms after load start>ms.ppm), e.g. to time images appearing. */
+static unsigned seriesInterval, seriesCount, seriesTaken;
+static guint seriesTimer;
+
+static gboolean seriesShot(gpointer data)
+{
+    (void)data;
+    char name[64];
+    unsigned ms = (unsigned)((g_get_monotonic_time() - loadStart) / 1000);
+    snprintf(name, sizeof name, "u%u-s%03u-%05ums", testURLIndex, seriesTaken + 1, ms);
+    captureScreen(name);
+    if (++seriesTaken >= seriesCount) {
+        seriesTimer = 0;
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
 static gboolean testTimeout(gpointer data)
 {
     (void)data;
@@ -320,6 +340,12 @@ static void loadNextTestURL(void)
     testWaitingForLoad = TRUE;
     loadStart = g_get_monotonic_time();
     webkit_web_view_load_uri(webView, uri);
+    if (seriesTimer)
+        g_source_remove(seriesTimer);
+    seriesTimer = 0;
+    seriesTaken = 0;
+    if (screenshots && seriesInterval && seriesCount)
+        seriesTimer = g_timeout_add(seriesInterval, seriesShot, NULL);
     testTimer = g_timeout_add_seconds(60, testTimeout, NULL);
 }
 
@@ -1607,6 +1633,13 @@ int main(int argc, char** argv)
     if (flag >= 0)
         close(flag);
     screenshots = flag >= 0 || g_getenv("PS5WK_SCREENSHOT");
+    if (flag >= 0) {
+        gchar* knob = NULL;
+        if (g_file_get_contents("/data/ps5webkit/debug-screenshot", &knob, NULL, NULL) && strstr(knob, "series=")
+            && sscanf(strstr(knob, "series=") + 7, "%ux%u", &seriesInterval, &seriesCount) == 2)
+            spike_log("debug screenshots: a series every %u ms, %u per test URL", seriesInterval, seriesCount);
+        g_free(knob);
+    }
     if (screenshots) {
         mkdir(SHOT_DIR, 0777);
         GDir* dir = g_dir_open(SHOT_DIR, 0, NULL);

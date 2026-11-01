@@ -356,10 +356,91 @@ static void openPad(WPEDisplayPS5* display)
         priv->ignoredButtons = data.buttons; // held at start: ignore until released
 }
 
+// Test knob: /data/ps5webkit/pad-scroll-test makes the right stick scroll
+// as the owner's pad does (one precise wheel event per pad tick), in cycles:
+// `secs` s down at `ry` (the stick value after padTick's curve, 0-1),
+// `secs` s up, `pause` s still, from `delay` s after the first pad tick with
+// a view; `shots` captures per direction
+// (evenly spaced, mid-scroll) to /data/ps5webkit/shots/pad-NNN-down|up.ppm.
+// Content: "delay=15 secs=4 ry=0.5 pause=4 shots=3" (any subset).
+struct PadScrollTest {
+    bool on { false };
+    double delay { 15 }, secs { 4 }, ry { 0.5 }, pause { 4 };
+    int shots { 3 };
+    double start { 0 };
+    int lastShot { -1 };
+    unsigned shotCount { 0 };
+};
+static PadScrollTest s_padScrollTest;
+
+static void padScrollTestInit()
+{
+    GUniqueOutPtr<char> contents;
+    if (!g_file_get_contents("/data/ps5webkit/pad-scroll-test", &contents.outPtr(), nullptr, nullptr))
+        return;
+    auto& test = s_padScrollTest;
+    test.on = true;
+    for (char* token = strtok(contents.get(), " \t\r\n"); token; token = strtok(nullptr, " \t\r\n")) {
+        double value;
+        char key[16];
+        if (sscanf(token, "%15[a-z]=%lf", key, &value) != 2)
+            continue;
+        if (!strcmp(key, "delay"))
+            test.delay = value;
+        else if (!strcmp(key, "secs"))
+            test.secs = value;
+        else if (!strcmp(key, "ry"))
+            test.ry = value;
+        else if (!strcmp(key, "pause"))
+            test.pause = value;
+        else if (!strcmp(key, "shots"))
+            test.shots = static_cast<int>(value);
+    }
+    PS5_LOG("pad-scroll-test: from %.0f s, %.1f s down / up at ry %.2f, %.1f s pause, %d shots per direction",
+        test.delay, test.secs, test.ry, test.pause, test.shots);
+}
+
+static void padScrollTestTick(WPEDisplayPS5* display)
+{
+    auto& test = s_padScrollTest;
+    WPEView* view = display->priv->activeView;
+    if (!test.on || !view)
+        return;
+    double t = nowSeconds();
+    if (!test.start)
+        test.start = t + test.delay;
+    double cycle = 2 * test.secs + test.pause;
+    double at = t - test.start;
+    if (at < 0 || cycle <= 0)
+        return;
+    double phase = std::fmod(at, cycle);
+    if (phase >= 2 * test.secs)
+        return;
+    bool down = phase < test.secs;
+    double ry = down ? test.ry : -test.ry;
+    const double speed = 14.0; // as padTick
+    double x = wpe_view_get_width(view) / 2.0, y = wpe_view_get_height(view) / 2.0;
+    GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
+        static_cast<WPEModifiers>(0), 0, -ry * speed, TRUE, FALSE, x, y));
+    wpe_view_event(view, event.get());
+    if (test.shots > 0) {
+        double within = down ? phase : phase - test.secs;
+        int k = static_cast<int>(within / (test.secs / (test.shots + 1)));
+        int slot = (static_cast<int>(at / cycle) * 2 + (down ? 0 : 1)) * (test.shots + 1) + k;
+        if (k >= 1 && k <= test.shots && slot != test.lastShot) {
+            test.lastShot = slot;
+            char path[128];
+            snprintf(path, sizeof path, "/data/ps5webkit/shots/pad-%03u-%s.ppm", ++test.shotCount, down ? "down" : "up");
+            wpe_display_ps5_capture_screen(display, path);
+        }
+    }
+}
+
 static void padTick(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
     pollTextDialog(display);
+    padScrollTestTick(display);
 
     WPEView* view = priv->activeView;
     if (priv->pad < 0 || !view)
@@ -538,6 +619,7 @@ static gboolean wpeDisplayPS5Connect(WPEDisplay* display, GError** error)
     wpe_display_set_available_input_devices(display, static_cast<WPEAvailableInputDevices>(WPE_AVAILABLE_INPUT_DEVICE_MOUSE | WPE_AVAILABLE_INPUT_DEVICE_KEYBOARD));
 
     openPad(displayPS5);
+    padScrollTestInit();
     // The system keyboard: loaded at run time by the title (PS5Sce.h).
     if (ps5wk_title_load_ime && !ps5wk_title_load_ime(&priv->ime)) {
         int rc = priv->ime.commonDialogInitialize ? priv->ime.commonDialogInitialize() : -1;

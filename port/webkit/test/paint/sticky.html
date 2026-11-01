@@ -9,7 +9,10 @@
      The table scroller follows the page: every page scroll sets its
      scrollTop from scrollY (a triangle wave), so scroll scripts that only
      scroll the window (scroll-raf.js, scroll-to.js) exercise both and end
-     in the same state on both paths. ~9000 px tall. -->
+     in the same state on both paths. ~9000 px tall.
+     ?quiet: no scroll listener (nothing but the scroll itself changes per
+     step, so no layout runs: the case of pages whose sticky header is the
+     only thing that moves). -->
 <style>
 body { margin: 0; font: 18px/1.45 sans-serif; color: #1b2030; background: #f4f1ea; }
 header { position: sticky; top: 0; height: 60px; z-index: 10; background: #20304f; color: #fff; display: flex; align-items: center; padding: 0 28px; font-size: 24px; box-shadow: 0 3px 12px rgba(0,0,0,.3); }
@@ -57,7 +60,7 @@ footer { position: fixed; left: 0; right: 0; bottom: 0; height: 48px; background
     }
     main.innerHTML = html;
     var wrap = document.getElementById("wrap"), pos = document.getElementById("pos");
-    window.addEventListener("scroll", function () {
+    if (!/[?&]quiet/.test(location.search)) window.addEventListener("scroll", function () {
         var range = wrap.scrollHeight - wrap.clientHeight, t = (window.scrollY / 2) % (2 * range);
         wrap.scrollTop = t < range ? t : 2 * range - t;
         pos.textContent = "scrollY " + window.scrollY;

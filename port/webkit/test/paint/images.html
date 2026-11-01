@@ -1,0 +1,88 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>image grid test</title>
+<!-- GPU compositing checks (COMPOSITING-PLAN.md, TV test 2): how fast a
+     grid of thumbnails shows up, CPU path vs composited. A video-site-like
+     page: fixed masthead, sidebar, 4 columns of 400x225 thumbnails with a
+     title under each, 30 rows. Thumbnails are synthetic JPEGs made by
+     make-images.py, served next to this page:
+       port/webkit/test/paint/make-images.py <dir>
+       tools/serve-media.py --port 8775 --page port/webkit/test/paint/images.html <dir>
+     Options (query): lazy=0 (no loading="lazy"), io (src set by an
+     IntersectionObserver, rootMargin one viewport, as such sites do instead
+     of loading="lazy"), layers (each card gets its own composited layer, as
+     on pages with hundreds of layers), n=<count> (default 120), v=<token>
+     (appended to the thumbnail URLs: a cold load without cache hits).
+     Logs: IMG <i> loaded <ms> (from navigation start), IMG-VIEWPORT all
+     images in the first viewport loaded at <ms>, IMG-SLOTS the first 12
+     thumbnail rects (CSS px) for capture analysis. Thumbnail boxes are
+     #e5e5e5 until their image is drawn. -->
+<style>
+body { margin: 0; font: 14px/1.4 sans-serif; background: #fff; color: #0f0f0f; }
+#mast { position: fixed; top: 0; left: 0; right: 0; height: 56px; background: #fff; border-bottom: 1px solid #ddd; display: flex; align-items: center; padding: 0 24px; font-size: 20px; z-index: 5; }
+#side { position: fixed; top: 57px; left: 0; bottom: 0; width: 240px; background: #f9f9f9; }
+#side div { padding: 10px 24px; }
+#grid { margin: 57px 0 0 240px; padding: 24px; display: grid; grid-template-columns: repeat(4, 400px); gap: 24px 16px; }
+.card { width: 400px; }
+.layers .card { will-change: transform; }
+.thumb { display: block; width: 400px; height: 225px; border-radius: 12px; background: #e5e5e5; object-fit: cover; }
+.title { margin-top: 10px; font-weight: 600; font-size: 16px; }
+.meta { color: #606060; }
+</style></head><body>
+<div id="mast">Image grid test</div>
+<div id="side"></div>
+<div id="grid"></div>
+<script>
+(function () {
+    var q = location.search, n = +(q.match(/[?&]n=(\d+)/) || [0, 120])[1];
+    var lazy = !/[?&]lazy=0/.test(q), io = /[?&]io/.test(q), v = (q.match(/[?&]v=(\w+)/) || [0, ""])[1];
+    if (/[?&]layers/.test(q))
+        document.body.className = "layers";
+    var side = document.getElementById("side"), grid = document.getElementById("grid"), html = "";
+    for (var s = 0; s < 14; s++)
+        html += "<div>Sidebar entry " + (s + 1) + "</div>";
+    side.innerHTML = html;
+    html = "";
+    for (var i = 0; i < n; i++) {
+        var src = "thumb-" + ("00" + i).slice(-3) + ".jpg" + (v ? "?v=" + v : "");
+        html += '<div class="card"><img class="thumb" data-i="' + i + '" width="400" height="225" alt=""'
+            + (io ? ' data-src="' + src + '"' : (lazy ? ' loading="lazy"' : '') + ' src="' + src + '"')
+            + '><div class="title">Thumbnail ' + (i + 1) + ': a title that runs over a line or so</div><div class="meta">Channel ' + (i % 17) + ' &middot; ' + (i * 7 % 90 + 1) + 'K views</div></div>';
+    }
+    grid.innerHTML = html;
+    var imgs = grid.querySelectorAll("img"), viewport = [], loaded = 0;
+    for (var k = 0; k < imgs.length; k++) {
+        var r = imgs[k].getBoundingClientRect();
+        if (r.top < innerHeight && r.bottom > 0)
+            viewport.push(imgs[k]);
+    }
+    var slots = [];
+    for (k = 0; k < 12; k++) {
+        var b = imgs[k].getBoundingClientRect();
+        slots.push(Math.round(b.left) + "," + Math.round(b.top));
+    }
+    console.log("IMG-SLOTS " + slots.join(" ") + " (" + viewport.length + " in the first viewport)");
+    var viewportLeft = viewport.length;
+    Array.prototype.forEach.call(imgs, function (img) {
+        img.addEventListener("load", function () {
+            var t = performance.now();
+            loaded++;
+            console.log("IMG " + img.dataset.i + " loaded " + t.toFixed(0) + " (" + loaded + " of " + imgs.length + ")");
+            if (viewport.indexOf(img) >= 0 && --viewportLeft == 0)
+                console.log("IMG-VIEWPORT all " + viewport.length + " images in the first viewport loaded at " + t.toFixed(0) + " ms");
+        });
+    });
+    if (io) {
+        var observer = new IntersectionObserver(function (entries) {
+            entries.forEach(function (e) {
+                if (e.isIntersecting && e.target.dataset.src) {
+                    e.target.src = e.target.dataset.src;
+                    delete e.target.dataset.src;
+                    observer.unobserve(e.target);
+                }
+            });
+        }, { rootMargin: innerHeight + "px 0px" });
+        Array.prototype.forEach.call(imgs, function (img) { observer.observe(img); });
+    }
+})();
+</script>
+</body></html>
