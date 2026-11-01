@@ -1,0 +1,268 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Feed players</title>
+<!-- Feed players with loading spinners, as social feeds build them, to check
+     the media state a page sees (events, readyState, buffered, currentTime,
+     play() promises, requestVideoFrameCallback) against what plays.
+     Muted autoplay through the autoplay attribute and through play(), and
+     IntersectionObserver play/pause at 50% visibility; MSE players append
+     one fragment at a time up to a buffer goal (as hls.js/dash.js do, with a
+     simulated network delay), progressive players loop.
+     Clips from test/media/make-media.sh (feed-*), nothing third-party.
+       tools/serve-media.py --port 8774 --page port/webkit/test/media/feed-players.html
+       then http://<mac>:8774/feed-players.html   (?secs=<n>, ?media=<base URL>)
+     Every player computes six spinner models from standard signals only:
+       E  events: on at loadstart/waiting/seeking, off at playing/pause, and at
+          seeked or canplay when readyState >= 3 (typical custom players)
+       T  video.js style: on at waiting, off at canplay/canplaythrough/
+          playing/seeked or a timeupdate with a new currentTime
+       R  readyState: on while !paused and readyState < HAVE_FUTURE_DATA
+       B  buffered: on while !paused and less than 0.3 s buffered ahead
+       P  progress: on while !paused and currentTime stood still for 1 s
+       V  frames: on from play until the first requestVideoFrameCallback,
+          and while !paused with no callback for 1 s
+     The drawn spinner is E. Console lines (prefix FP):
+       FP EV <player> <event> ct rs ns paused buffered   every media event
+                                                       (progress/timeupdate counted)
+       FP PLAY <player> <how> resolved|rejected <name>  play() promise results
+       FP t=<s> ...                                    every 2 s per player: time,
+            readyState, P(aused), V(isible), frames shown-dropped, rVFC count,
+            spinner models on
+       FP SPIN <player> <model> ...                    a model's spinner on for
+            2 s over a visible video whose currentTime advanced (the bug)
+       FP DONE ...                                     totals per player and model -->
+<style>
+body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:24px 40px;height:2700px}
+h1{font-weight:600;font-size:28px;margin:0 0 8px}
+.row{display:flex;gap:24px;align-items:flex-start;margin-bottom:24px}
+.card{position:relative;background:#2d3a52;border-radius:8px;overflow:hidden}
+.card video{display:block;width:100%;height:100%;object-fit:contain;background:#000}
+.card b{position:absolute;left:8px;top:6px;font:18px monospace;color:#ffd060;text-shadow:0 0 4px #000}
+.card i{position:absolute;left:8px;bottom:6px;font:16px monospace;font-style:normal;color:#9ef;text-shadow:0 0 4px #000}
+.spin{position:absolute;left:50%;top:50%;width:56px;height:56px;margin:-28px;border-radius:50%;border:7px solid #fff4;border-top-color:#fff;display:none;animation:r 1s linear infinite}
+.card.loading .spin{display:block}
+@keyframes r{to{transform:rotate(360deg)}}
+.tall{width:270px;height:480px}.wide{width:480px;height:270px}
+#below{position:absolute;top:1500px;left:40px}
+#tick{font:22px monospace;margin:4px 0 12px}
+#log{font:15px monospace;color:#c8f0c8;white-space:pre;position:fixed;right:24px;top:24px;width:600px;height:560px;overflow:hidden;background:#000a}
+</style></head><body>
+<h1>Feed players</h1>
+<div id="tick">0</div>
+<div class="row" id="top"></div>
+<div class="row" id="below"></div>
+<div id="log"></div>
+<script>
+var params = new URLSearchParams(location.search);
+var mediaBase = params.get('media') || (location.protocol === 'file:' ? 'media/' : '');
+var totalSecs = +(params.get('secs') || 96);
+var logEl = document.getElementById('log'), t0 = performance.now(), ticks = 0;
+function now() { return (performance.now() - t0) / 1000; }
+function say(s) { console.log('FP ' + s); logEl.textContent = (s + '\n' + logEl.textContent).slice(0, 4000); }
+setInterval(function () { document.getElementById('tick').textContent = 'page alive ' + (++ticks); }, 250);
+say('start ' + navigator.userAgent + ' rVFC ' + ('requestVideoFrameCallback' in HTMLVideoElement.prototype));
+
+function ranges(r) { var s = []; for (var i = 0; i < r.length; i++) s.push(r.start(i).toFixed(1) + '-' + r.end(i).toFixed(1)); return s.join(',') || '-'; }
+function ahead(v) { var b = v.buffered, t = v.currentTime; for (var i = 0; i < b.length; i++) if (b.start(i) <= t + 0.25 && t < b.end(i)) return b.end(i) - t; return 0; }
+var MODELS = ['E', 'T', 'R', 'B', 'P', 'V'];
+var players = {};
+
+var seen = new IntersectionObserver(function (entries) {
+  entries.forEach(function (e) {
+    var p = e.target.player;
+    if (!p) return;
+    var vis = e.intersectionRatio >= 0.5;
+    if (vis === p.visible) return;
+    p.visible = vis;
+    if (!p.io) return;
+    if (vis) doPlay(p, 'io'); else { p.v.pause(); }
+  });
+}, { threshold: [0, 0.5, 1] });
+
+function doPlay(p, how) {
+  var t = performance.now(), r;
+  try { r = p.v.play(); } catch (e) { say('PLAY ' + p.name + ' ' + how + ' threw ' + e.name); return; }
+  if (!r || !r.then) { say('PLAY ' + p.name + ' ' + how + ' returned no promise'); return; }
+  r.then(function () { p.playOk++; say('PLAY ' + p.name + ' ' + how + ' resolved in ' + Math.round(performance.now() - t) + ' ms'); },
+    function (e) { p.playFail++; say('PLAY ' + p.name + ' ' + how + ' rejected ' + e.name + ': ' + e.message); });
+}
+
+function makePlayer(name, cls, where, o) {
+  var c = document.createElement('div');
+  c.className = 'card ' + cls + ' loading';
+  c.innerHTML = '<b>' + name + '</b><div class="spin"></div><i></i>';
+  document.getElementById(where).appendChild(c);
+  var v = document.createElement('video');
+  v.playsInline = true; v.muted = true; v.loop = true; v.preload = 'auto';
+  if (o.autoplay) v.autoplay = true;
+  c.insertBefore(v, c.firstChild);
+  var p = { name: name, v: v, card: c, io: !!o.io, visible: false, kind: o.mse ? 'mse' : 'prog', label: c.querySelector('i'),
+    E: true, T: false, waitTime: -1, lastRvfc: 0, rvfc: 0, rvfcSincePlay: false, lastCt: -1, lastMove: performance.now(),
+    counts: { progress: 0, timeupdate: 0 }, events: 0, playOk: 0, playFail: 0,
+    on: {}, onPlaying: {}, spinTotal: {}, spinEvents: {}, playingSamples: 0, hist: [] };
+  MODELS.forEach(function (m) { p.onPlaying[m] = 0; p.spinTotal[m] = 0; p.spinEvents[m] = 0; });
+  c.player = p;
+  players[name] = p;
+  var all = ['loadstart', 'progress', 'suspend', 'abort', 'error', 'emptied', 'stalled', 'loadedmetadata', 'loadeddata', 'canplay',
+    'canplaythrough', 'playing', 'waiting', 'seeking', 'seeked', 'ended', 'durationchange', 'timeupdate', 'play', 'pause', 'ratechange', 'resize'];
+  all.forEach(function (ev) {
+    v.addEventListener(ev, function () {
+      if (ev in p.counts) p.counts[ev]++;
+      else {
+        p.events++;
+        say('EV ' + name + ' ' + ev + ' ct=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + ' ns=' + v.networkState + ' p=' + (v.paused ? 1 : 0) +
+          ' buf=' + ranges(v.buffered) + (ev === 'error' ? ' code=' + (v.error && v.error.code) + ' ' + (v.error && v.error.message) : ''));
+      }
+      // Model E
+      if (ev === 'loadstart' || ev === 'waiting' || ev === 'seeking') p.E = true;
+      if (ev === 'playing' || ev === 'pause') p.E = false;
+      if ((ev === 'seeked' || ev === 'canplay') && v.readyState >= 3) p.E = false;
+      // Model T (video.js)
+      if (ev === 'waiting') { p.T = true; p.waitTime = v.currentTime; }
+      if (ev === 'canplay' || ev === 'canplaythrough' || ev === 'playing' || ev === 'seeked') p.T = false;
+      if (ev === 'timeupdate' && p.T && v.currentTime !== p.waitTime) p.T = false;
+      if (ev === 'play') p.rvfcSincePlay = false;
+      p.card.classList.toggle('loading', p.E);
+    });
+  });
+  if (v.requestVideoFrameCallback) {
+    var onFrame = function () { p.rvfc++; p.lastRvfc = performance.now(); p.rvfcSincePlay = true; v.requestVideoFrameCallback(onFrame); };
+    v.requestVideoFrameCallback(onFrame);
+  }
+  if (o.mse) mseSource(p, o); else v.src = mediaBase + o.src;
+  seen.observe(c);
+  if (o.callPlay && !o.io) doPlay(p, 'load');
+  return p;
+}
+
+// MSE as hls.js/dash.js do it: init segment, then one fragment at a time
+// while less than `goal` seconds are buffered ahead, each after a short
+// simulated network delay; separate video and audio SourceBuffers.
+function boxes(buf) {
+  var d = new DataView(buf), out = [], off = 0;
+  while (off + 8 <= buf.byteLength) {
+    var size = d.getUint32(off), type = String.fromCharCode(d.getUint8(off + 4), d.getUint8(off + 5), d.getUint8(off + 6), d.getUint8(off + 7));
+    if (size < 8) break;
+    out.push({ type: type, start: off, end: off + size });
+    off += size;
+  }
+  return out;
+}
+function fragments(buf) {
+  var b = boxes(buf), first = b.findIndex(function (x) { return x.type === 'moof'; }), segs = [];
+  if (first < 0) return { init: buf, segs: [] };
+  var init = buf.slice(0, b[first].start);
+  for (var i = first; i < b.length; i++) {
+    if (b[i].type !== 'moof') continue;
+    var j = i + 1; while (j < b.length && b[j].type !== 'moof') j++;
+    segs.push(buf.slice(b[i].start, b[j - 1].end));
+  }
+  return { init: init, segs: segs };
+}
+function mseSource(p, o) {
+  var v = p.v, ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  // once: a later appendBuffer() on an ended MediaSource reopens it and fires
+  // sourceopen again (that must not add more SourceBuffers).
+  ms.addEventListener('sourceopen', function () {
+    var tracks = [['video/mp4; codecs="avc1.4D401F"', 'feed-mse-480x854-video.mp4'], ['audio/mp4; codecs="mp4a.40.2"', 'feed-mse-480x854-audio.mp4']];
+    var ended = 0;
+    tracks.forEach(function (tr) {
+      var sb = ms.addSourceBuffer(tr[0]), f, next = 0, busy = false, done = false;
+      function pump() {
+        if (ms.readyState !== 'open' || sb.updating || busy || !f || done) return;
+        // endOfStream() only once every track has appended all of its data.
+        if (next >= f.segs.length) {
+          done = true;
+          if (++ended === tracks.length) { say(p.name + ' endOfStream'); try { ms.endOfStream(); } catch (e) {} }
+          return;
+        }
+        if (next > 0 && ahead(v) > o.goal) return;
+        busy = true;
+        setTimeout(function () { busy = false; if (ms.readyState === 'open' && !sb.updating) sb.appendBuffer(f.segs[next++]); }, 120 + Math.random() * 200);
+      }
+      sb.addEventListener('updateend', pump);
+      sb.addEventListener('error', function () { say(p.name + ' SourceBuffer error'); });
+      v.addEventListener('timeupdate', pump);
+      setInterval(pump, 500);
+      fetch(mediaBase + tr[1]).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); }).then(function (data) {
+        f = fragments(data);
+        sb.appendBuffer(f.init);
+      }).catch(function (e) { say(p.name + ' fetch ' + tr[1] + ' failed: ' + e); });
+    });
+  }, { once: true });
+}
+
+// t = 0: four players on screen, four below the fold.
+makePlayer('A', 'tall', 'top', { mse: true, goal: 4, autoplay: true, io: true });          // MSE, autoplay attr, IO play/pause, tight buffer
+makePlayer('B', 'tall', 'top', { src: 'feed-480x854-h264.mp4', autoplay: true });         // progressive, autoplay attr, never paused by the page
+makePlayer('C', 'tall', 'top', { mse: true, goal: 30, io: true });                         // MSE, play() from IO only
+makePlayer('D', 'wide', 'top', { src: 'feed-854x480-h264.mp4', io: true });                // progressive, play() from IO only
+makePlayer('E', 'tall', 'below', { mse: true, goal: 6, autoplay: true, io: true });
+makePlayer('F', 'tall', 'below', { src: 'feed-480x854-h264.mp4', io: true });
+makePlayer('G', 'tall', 'below', { src: 'feed-480x854-vp9.webm', autoplay: true });        // VP9, autoplay attr, not paused off screen
+makePlayer('H', 'tall', 'below', { mse: true, goal: 2, callPlay: true });                  // MSE, play() at load, 2 s buffer goal, not IO
+
+var timeline = [
+  [16, 'scroll down 1000', function () { window.scrollTo(0, 1000); }],
+  [32, 'scroll up', function () { window.scrollTo(0, 0); }],
+  [44, 'scroll down 600', function () { window.scrollTo(0, 600); }],
+  [52, 'scroll down 1000', function () { window.scrollTo(0, 1000); }],
+  [66, 'B seek 20, H seek 25', function () { players.B.v.currentTime = 20; players.H.v.currentTime = 25; }],
+  [72, 'scroll up', function () { window.scrollTo(0, 0); }],
+  [80, 'C pause, D pause', function () { players.C.v.pause(); players.D.v.pause(); }],
+  [84, 'C play, D play', function () { doPlay(players.C, 'page'); doPlay(players.D, 'page'); }],
+];
+timeline.forEach(function (e) { setTimeout(function () { say('at ' + now().toFixed(1) + ': ' + e[1]); e[2](); }, e[0] * 1000); });
+
+// Models R, B, P, V every 250 ms; the bug check over the last 2 s.
+setInterval(function () {
+  var t = performance.now();
+  Object.keys(players).forEach(function (n) {
+    var p = players[n], v = p.v;
+    if (v.currentTime !== p.lastCt) { p.lastCt = v.currentTime; p.lastMove = t; }
+    var run = !v.paused && !v.ended;
+    p.on = { E: p.E, T: p.T, R: run && v.readyState < 3, B: run && ahead(v) < 0.3, P: run && t - p.lastMove > 1000,
+      V: run && (!p.rvfcSincePlay || t - p.lastRvfc > 1000) };
+    p.hist.push({ t: t, ct: v.currentTime, dur: v.duration || 0 });
+    while (p.hist.length && t - p.hist[0].t > 2000) p.hist.shift();
+    var h0 = p.hist[0], moved = v.currentTime - h0.ct;
+    if (moved < 0) moved += h0.dur; // looped
+    var playing = p.visible && t - h0.t > 1700 && moved > 1.0;
+    if (playing) p.playingSamples++;
+    MODELS.forEach(function (m) {
+      if (playing && p.on[m]) {
+        p.spinTotal[m] += 0.25;
+        if (++p.onPlaying[m] === 8) {
+          p.spinEvents[m]++;
+          say('SPIN ' + n + ' ' + m + ' on for 2 s over a playing video: ct=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + ' p=' + (v.paused ? 1 : 0) +
+            ' ahead=' + ahead(v).toFixed(1) + ' rvfc=' + p.rvfc + ' buf=' + ranges(v.buffered));
+        }
+      } else p.onPlaying[m] = 0;
+    });
+    p.label.textContent = MODELS.filter(function (m) { return p.on[m]; }).join('');
+  });
+}, 250);
+
+setInterval(function () {
+  var line = 't=' + now().toFixed(0);
+  Object.keys(players).forEach(function (n) {
+    var p = players[n], v = p.v, q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+    line += ' ' + n + ':' + v.currentTime.toFixed(1) + '/r' + v.readyState + (v.paused ? '/P' : '') + (p.visible ? '/V' : '') + '/f' + q.totalVideoFrames + '-' + q.droppedVideoFrames +
+      '/v' + p.rvfc + '/' + (MODELS.filter(function (m) { return p.on[m]; }).join('') || '-');
+  });
+  say(line);
+}, 2000);
+
+setTimeout(function () {
+  var out = [];
+  Object.keys(players).forEach(function (n) {
+    var p = players[n], q = p.v.getVideoPlaybackQuality ? p.v.getVideoPlaybackQuality() : {};
+    out.push(n + ' (' + p.kind + '): playing-visible ' + (p.playingSamples / 4).toFixed(1) + ' s; spinner over it ' +
+      MODELS.map(function (m) { return m + ' ' + p.spinTotal[m].toFixed(1) + ' s/' + p.spinEvents[m]; }).join(' ') +
+      '; play() ok ' + p.playOk + ' rejected ' + p.playFail + '; rVFC ' + p.rvfc + '; frames ' + q.totalVideoFrames + '-' + q.droppedVideoFrames +
+      '; timeupdates ' + p.counts.timeupdate + ', events ' + p.events);
+  });
+  say('DONE ' + out.join('; '));
+}, totalSecs * 1000);
+</script>
+</body></html>

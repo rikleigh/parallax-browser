@@ -895,3 +895,37 @@ port.
   frames when they first play. The HSTS console check was not run: FTP
   downloads fell to 1-2.3 MB/s even after an idle gap (7-8 normally), so
   console work stopped there.
+- **Feed pages: spinners over playing videos, and the resume freeze
+  (2026-11-01, patch 0036, checked on the console by log;
+  port/webkit/README.md, *Feeds: spinners over playing videos*).** With
+  decoding healthy, some feed videos still kept the page's spinner up
+  while they played. A synthetic feed (`test/media/feed-players.html`: MSE
+  and progressive players, muted autoplay through the attribute and
+  play(), IntersectionObserver play/pause, six spinner models computed
+  from standard signals) found four faults in what the page reads:
+  `requestVideoFrameCallback` never called back (frames were only counted
+  on the accelerated path, not with the hole-punch sink or CPU painting);
+  `readyState` stuck at 2 while playing after a loop, a seek or WebKit's
+  off-screen suspend/resume (a buffering change held back during an async
+  state change was dropped, and an old one was "delayed" again by every
+  later state change), so `waiting` came and `playing` never did; looping
+  MSE videos stuck in `seeking` (the MSE player tore its pipeline down
+  under the loop's seek); and the page freeze over http, which a new
+  all-threads wall-time profile (`PS5WK_PROFILE=threads`) showed to be a
+  deadlock: seamless looping's non-flushing seek waits for qtdemux's pull
+  loop, which waits for bytes that only the blocked main thread delivers
+  (upstream's guard against it only works with playbin2). Fixes: count
+  frames in `triggerRepaint`; apply held-back buffering changes when the
+  state change completes, hold back only new ones; keep the MSE pipeline
+  when the ended notification started a seek; no seamless looping for
+  http(s) progressive media. The `PageConsentRequired` lines were not the
+  policy (the title allows autoplay, muted or not; no play() promise was
+  rejected): WebKit prints them when the `autoplay` attribute path has
+  nothing to do (no attribute, play() already called, already playing);
+  now printed only for a real wait. Before/after on the test page:
+  spinner-over-playing-video events 22 -> 1 (progressive WebM reports empty
+  `buffered`, open), readyState-2-while-playing samples 20 -> 0, `seeking`
+  / `seeked` 6/2 -> 11/11, PageConsentRequired lines 19 -> 0, and the page
+  ran to the end in 3 runs instead of freezing at the first resume. Console
+  steady over the round: swap out 386-392 MB (no growth), page tables back
+  to 4972 after every run.

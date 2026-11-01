@@ -1,0 +1,203 @@
+diff --git a/Source/WebCore/html/HTMLMediaElement.cpp b/Source/WebCore/html/HTMLMediaElement.cpp
+index 4875a13032..8273619a1a 100644
+--- a/Source/WebCore/html/HTMLMediaElement.cpp
++++ b/Source/WebCore/html/HTMLMediaElement.cpp
+@@ -3503,6 +3503,14 @@ void HTMLMediaElement::setReadyState(MediaPlayer::ReadyState state)
+                 scheduleEvent(eventNames().playEvent);
+                 scheduleNotifyAboutPlaying();
+             } else {
++#if defined(PS5_PAYLOAD_SDK)
++                // Without the autoplay attribute (the page calls play()), with
++                // play() already called, or already playing, there is nothing
++                // to autoplay: the "PageConsentRequired: !autoplay / !autoplaying
++                // / !paused" lines this printed for every such video were
++                // preconditions, not the policy refusing anything.
++                if (autoplay() && isAutoplaying() && paused())
++#endif
+                 ALWAYS_LOG(LOGIDENTIFIER, "Autoplay blocked with reason: ", canTransition.error());
+                 if (canTransition.error().reason == MediaPlaybackDenialReason::UserGestureRequired)
+                     setAutoplayEventPlaybackState(AutoplayEventPlaybackState::PreventedAutoplay);
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index f5a984ebc0..f54b6e9523 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -610,12 +610,14 @@ struct AsyncSeekData {
+ };
+ WEBKIT_DEFINE_ASYNC_DATA_STRUCT(AsyncSeekData);
+ 
++
+ bool MediaPlayerPrivateGStreamer::doSeek(const SeekTarget& target, float rate, bool isAsync, bool isSegment)
+ {
+     RefPtr player = m_player.get();
+     if (!player)
+         return false;
+ 
++
+     // Default values for rate >= 0.
+     MediaTime startTime = target.time, endTime = MediaTime::invalidTime();
+ 
+@@ -2503,8 +2505,15 @@ void MediaPlayerPrivateGStreamer::handleMessage(GstMessage* message)
+         } else if (gst_structure_has_name(structure, "GstCacheDownloadComplete")) {
+             GST_INFO_OBJECT(pipeline(), "Stream is fully downloaded, stopping monitoring downloading progress.");
+             m_fillTimer.stop();
++#if defined(PS5_PAYLOAD_SDK)
++            // Setting only the percentage left m_isBuffering as it was: a
++            // player still "buffering" then stayed at HaveCurrentData for good,
++            // as no buffering message comes after the download.
++            updateBufferingStatus(GST_BUFFERING_DOWNLOAD, 100.0);
++#else
+             m_bufferingPercentage = 100;
+             updateStates();
++#endif
+         } else if (gst_structure_has_name(structure, "webkit-web-src-has-eos")) {
+             GST_DEBUG_OBJECT(pipeline(), "WebKitWebSrc has EOS");
+             m_hasWebKitWebSrcSentEOS = true;
+@@ -2596,6 +2605,12 @@ void MediaPlayerPrivateGStreamer::updateBufferingStatus(GstBufferingMode mode, d
+ {
+     m_wasBuffering = m_isBuffering;
+     m_previousBufferingPercentage = m_bufferingPercentage;
++#if defined(PS5_PAYLOAD_SDK)
++    // The newest status replaces one updateStates() held back.
++    m_ps5DelayedBufferingPercentage = std::nullopt;
++    m_ps5LastBufferingMode = mode;
++    m_ps5BufferingStatusChanged = true;
++#endif
+ 
+ #ifndef GST_DISABLE_GST_DEBUG
+     auto modeString = GMallocString::unsafeAdoptFromUTF8(g_enum_to_string(GST_TYPE_BUFFERING_MODE, mode));
+@@ -3088,6 +3103,9 @@ void MediaPlayerPrivateGStreamer::updateStates()
+     auto eosState = quirksManager.eosMediaPlayerState();
+ 
+     bool shouldUpdatePlaybackState = false;
++#if defined(PS5_PAYLOAD_SDK)
++    bool bufferingStatusChanged = std::exchange(m_ps5BufferingStatusChanged, false);
++#endif
+     switch (getStateResult) {
+     case GST_STATE_CHANGE_SUCCESS: {
+         GST_DEBUG_OBJECT(pipeline(), "State: %s, pending: %s", gst_state_get_name(m_currentState), gst_state_get_name(pending));
+@@ -3099,6 +3117,20 @@ void MediaPlayerPrivateGStreamer::updateStates()
+ 
+         m_shouldResetPipeline = m_currentState <= GST_STATE_READY;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        // The async state change is done: apply the buffering change the
++        // ASYNC case below held back. It used to be dropped (the percentage
++        // was put back too), so a download that reached 100% during a seek or
++        // a resume left the player at HaveCurrentData when no further
++        // buffering message came (the download had finished): the page saw
++        // "waiting" and never "playing" while the video played.
++        if (m_ps5DelayedBufferingPercentage && m_currentState >= GST_STATE_PAUSED) {
++            double percentage = *std::exchange(m_ps5DelayedBufferingPercentage, std::nullopt);
++            updateBufferingStatus(m_ps5LastBufferingMode, percentage, false, false);
++            m_ps5BufferingStatusChanged = false;
++        }
++#endif
++
+         // Update ready and network states.
+         switch (m_currentState) {
+         case GST_STATE_NULL:
+@@ -3219,8 +3251,20 @@ void MediaPlayerPrivateGStreamer::updateStates()
+ 
+         // Delay the m_isBuffering change by returning it to its previous value. Without this, the false --> true change
+         // would go unnoticed by the code that should trigger a pause.
++#if defined(PS5_PAYLOAD_SDK)
++        // Only a change that came with this buffering update: m_wasBuffering
++        // keeps the value from before the last update, so after buffering
++        // had completed, every later async state change (a seek, a loop, a
++        // resume) "delayed" that old change again and put m_isBuffering back
++        // to true: HaveCurrentData for good once the download was done.
++        if (bufferingStatusChanged && m_wasBuffering != m_isBuffering && !m_isPaused && m_playbackRate) {
++#else
+         if (m_wasBuffering != m_isBuffering && !m_isPaused && m_playbackRate) {
++#endif
+             GST_TRACE_OBJECT(pipeline(), "[Buffering] Delaying m_isBuffering %s --> %s to force the proper change from not buffering to buffering when the async state change completes.", boolForPrinting(m_wasBuffering), boolForPrinting(m_isBuffering));
++#if defined(PS5_PAYLOAD_SDK)
++            m_ps5DelayedBufferingPercentage = m_bufferingPercentage; // applied when the change completes
++#endif
+             m_isBuffering = m_wasBuffering;
+             m_bufferingPercentage = m_previousBufferingPercentage;
+         }
+@@ -4256,6 +4300,24 @@ bool MediaPlayerPrivateGStreamer::isSeamlessSeekingEnabled() const
+         return false;
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // Seamless looping sends non-flushing SEGMENT seeks (after every flushing
++    // seek, and once at play()). A non-flushing seek waits for the demuxer's
++    // streaming thread to finish its iteration (qtdemux in pull mode:
++    // gst_pad_pause_task() on its sink pad's stream lock) while holding the
++    // pipeline's state lock. Over http that thread is often waiting for bytes
++    // from the download buffer, which webkitwebsrc only gets from the
++    // WebProcess main thread: sent from the main thread the seek never
++    // returned, sent from another thread the main thread's next seek or state
++    // change waited for the state lock. Either way the page froze (a looping
++    // progressive video resumed after WebKit's off-screen suspend, or
++    // looping). Loops over http use the flushing seek instead.
++    if (m_url.protocolIsInHTTPFamily()) {
++        GST_DEBUG_OBJECT(m_pipeline.get(), "Seamless seeking disabled for media fed by webkitwebsrc");
++        return false;
++    }
++#endif
++
+     return player->isLooping() && m_isSegmentSeekAllowed;
+ }
+ 
+@@ -4284,6 +4346,16 @@ void MediaPlayerPrivateGStreamer::triggerRepaint(GRefPtr<GstSample>&& sample)
+             isDuplicateSample = buffer == previousBuffer ? IsDuplicateSample::Yes : IsDuplicateSample::No;
+         }
+         m_sample = WTF::move(sample);
++#if defined(PS5_PAYLOAD_SDK)
++        // Only pushTextureToCompositor() (accelerated rendering) counted
++        // presented frames, so with the hole-punch sink and the CPU-painted
++        // path videoFrameMetadata() never had a new frame and
++        // requestVideoFrameCallback() callbacks never ran: players that wait
++        // for one to hide their poster or spinner kept it up over a playing
++        // video. Count each new sample here instead.
++        if (!m_canRenderingBeAccelerated && isDuplicateSample == IsDuplicateSample::No)
++            ++m_sampleCount;
++#endif
+     }
+ 
+     if (shouldTriggerResize) {
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+index 7917984815..2308c0f212 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+@@ -628,6 +628,13 @@ private:
+     bool m_isBuffering { false };
+     int m_previousBufferingPercentage { 0 };
+     int m_bufferingPercentage { 0 };
++#if defined(PS5_PAYLOAD_SDK)
++    // A buffering change that arrived during an async state change, which
++    // updateStates() undid until the change completes (see there).
++    std::optional<double> m_ps5DelayedBufferingPercentage;
++    GstBufferingMode m_ps5LastBufferingMode { GST_BUFFERING_DOWNLOAD };
++    bool m_ps5BufferingStatusChanged { false }; // since the last updateStates()
++#endif
+ 
+     bool m_hasWebKitWebSrcSentEOS { false };
+     mutable unsigned long long m_totalBytes { 0 };
+diff --git a/Source/WebCore/platform/graphics/gstreamer/mse/MediaPlayerPrivateGStreamerMSE.cpp b/Source/WebCore/platform/graphics/gstreamer/mse/MediaPlayerPrivateGStreamerMSE.cpp
+index 310d3a5223..1e745bb378 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/mse/MediaPlayerPrivateGStreamerMSE.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/mse/MediaPlayerPrivateGStreamerMSE.cpp
+@@ -449,6 +449,19 @@ void MediaPlayerPrivateGStreamerMSE::didPreroll()
+ void MediaPlayerPrivateGStreamerMSE::didEnd()
+ {
+     MediaPlayerPrivateGStreamer::didEnd();
++#if defined(PS5_PAYLOAD_SDK)
++    // A looping element seeks back to the start from the ended notification
++    // (timeChanged() at the end of didEnd() above), synchronously, on this
++    // pipeline. Tearing it down afterwards left that seek's promise
++    // unresolved: the element stayed "seeking" with currentTime held at the
++    // target for good while the pipeline rebuilt by play() played underneath
++    // (a spinner over a looping MSE video), and the decoder was reopened on
++    // every loop.
++    if (m_isSeeking || !m_isEndReached) {
++        GST_DEBUG_OBJECT(pipeline(), "A seek started from the ended notification: keeping the pipeline");
++        return;
++    }
++#endif
+     tearDown(false);
+ }
+ 

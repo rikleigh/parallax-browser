@@ -11,6 +11,9 @@
 //                             less often (down to about once a second).
 //   PS5WK_PROFILE=wall        the process's WebKit main thread only, every 2 ms
 //                             of wall time, idle or not (what it waits on)
+//   PS5WK_PROFILE=threads     every thread every tick (default 20 ms), idle or
+//                             not, weighted by wall time: where each thread
+//                             waits (hangs and lock cycles between threads)
 //   PS5WK_PROFILE=itimer      setitimer(ITIMER_PROF): the kernel signals the
 //                             thread that used the CPU. Never run on the
 //                             console: opt-in only.
@@ -101,7 +104,7 @@ typedef struct {
     char name[32];
 } thread_t;
 
-static int mode; // 0 off, 1 itimer, 2 cpu (signalled, self-timed), 3 wall
+static int mode; // 0 off, 1 itimer, 2 cpu (signalled, self-timed), 3 wall, 4 threads (all, wall time)
 static unsigned intervalUS = 2000, windowMS = 1000;
 static slot_t* ring;
 static _Atomic unsigned head, tail;
@@ -598,7 +601,8 @@ static void* writerThread(void* data)
 }
 
 // Wall mode: one thread, every tick. CPU mode: every thread not in its idle
-// backoff (the handler decides whether the tick becomes a sample).
+// backoff (the handler decides whether the tick becomes a sample). Threads
+// mode: every thread, every tick (skip stays 0: the handler never sets it).
 static void* timerThread(void* data)
 {
     (void)data;
@@ -611,7 +615,7 @@ static void* timerThread(void* data)
             atomic_fetch_add_explicit(&signalsSent, 1, memory_order_relaxed);
             continue;
         }
-        if (mode != 2)
+        if (mode != 2 && mode != 4)
             return NULL;
         for (unsigned i = 0; i < THREADS; i++) {
             thread_t* t = &threads[i];
@@ -646,11 +650,13 @@ void ps5wk_profiler_start(const char* tag)
         return;
     if (!strcmp(on, "wall"))
         mode = 3;
+    else if (!strcmp(on, "threads"))
+        mode = 4;
     else if (!strcmp(on, "itimer"))
         mode = 1;
     else
         mode = 2; // 1, cpu
-    intervalUS = mode == 1 ? 1000 : 2000;
+    intervalUS = mode == 1 ? 1000 : mode == 4 ? 20000 : 2000;
     if (getenv("PS5WK_PROFILE_US") && atoi(getenv("PS5WK_PROFILE_US")) >= 500)
         intervalUS = (unsigned)atoi(getenv("PS5WK_PROFILE_US"));
     if (getenv("PS5WK_PROFILE_WINDOW_MS") && atoi(getenv("PS5WK_PROFILE_WINDOW_MS")) >= 100)
@@ -686,7 +692,7 @@ void ps5wk_profiler_start(const char* tag)
     FILE* f = fopen(path, "w");
     if (f) {
         fprintf(f, "# ps5prof 3 tag=%s pid=%d start_ms=%.0f mode=%s interval_us=%u window_ms=%u marker=%lx text=%lx-%lx llint=%lx-%lx unwind=%s\n", tag,
-            (int)getpid(), startMS, mode == 1 ? "itimer" : mode == 2 ? "cpu" : "wall", intervalUS, windowMS,
+            (int)getpid(), startMS, mode == 1 ? "itimer" : mode == 2 ? "cpu" : mode == 4 ? "threads" : "wall", intervalUS, windowMS,
             (unsigned long)((uintptr_t)ps5wk_profiler_start - base), (unsigned long)(textStart - base), (unsigned long)(textEnd - base),
             (unsigned long)(llintStart ? llintStart - base : 0), (unsigned long)(llintEnd ? llintEnd - base : 0), unwindReady ? "cfi" : "none");
         fclose(f);
@@ -714,6 +720,6 @@ void ps5wk_profiler_start(const char* tag)
     if (mode != 1)
         startTimer();
     fprintf(stderr, "[profiler] %s sampling, tick %u us (%s unwinding, %zu FDEs) -> %s\n",
-        mode == 1 ? "CPU-time (itimer)" : mode == 2 ? "CPU-weighted (threads signalled, self-timed)" : "main-thread wall-time", intervalUS,
+        mode == 1 ? "CPU-time (itimer)" : mode == 2 ? "CPU-weighted (threads signalled, self-timed)" : mode == 4 ? "all threads, wall-time" : "main-thread wall-time", intervalUS,
         unwindReady ? "CFI" : "no", unwindInfo.count, path);
 }

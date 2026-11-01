@@ -334,6 +334,7 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0033-ps5-hlsdemux2 | PS5 only: HLS through adaptivedemux2's `hlsdemux2` when `WEBKIT_GST_ENABLE_HLS_SUPPORT=1` (upstream always demotes it: it downloads with its own libsoup, which a sandboxed media process can't; the PS5 WebProcess can), the only HLS demuxer playbin3 takes; webkitwebsrc adds the page's User-Agent to its http-headers event (the NetworkProcess adds it to the real request), which hlsdemux2 uses for its own requests |
 | 0034-ps5-network-cache-and-dns | PS5 only (see *Locks, malloc and networking* below): the disk cache writes each body once, straight to the record's blob file, and counts it (0013 wrote `Blobs/<hash>` and copied it in full, and the copies were counted nowhere, so the cache never shrank); DocumentBrowser's disk cache is desktop-sized (1 GB with 16 GB free; was 75 MB); typed DNS lookups (libsoup's IPv4-only/IPv6-only) are answered from a prefetched Default answer, filtered by family, and "not found" when it has no address of that family |
 | 0035-ps5-profiling | PS5 only (see *Profiling* below): JIT counters for the profiler and the `[mem]` line (`ps5wk_jit_counts`: compiles by tier and outcome, compile ms, refused executable allocations, the executable-memory pressure multiplier); every executable allocation noted with the tier of the compiling thread (`ps5wk_jit_tier(pc)`); WTF threads named with `pthread_set_name_np` |
+| 0036-ps5-media-state | PS5 only (see *Feeds: spinners over playing videos* below): `requestVideoFrameCallback` works with the hole-punch sink and CPU painting (presented frames were only counted on the accelerated path, so callbacks never ran); a buffering change that arrives during an async state change is applied when it completes (it was dropped, leaving the player at HaveCurrentData once the download was done), an older one is no longer "delayed" again by every later seek, loop or resume, and the download-complete message runs the normal buffering update; seamless looping (non-flushing SEGMENT seeks) is off for http(s) progressive media, whose qtdemux pull loop waits for bytes only the main thread delivers (the page froze when a looping video resumed from WebKit's off-screen suspend); the MSE player keeps its pipeline when the ended notification started a loop seek (it tore it down under the seek: "seeking" for good); the "Autoplay blocked ... PageConsentRequired" line is only logged for an element that has the autoplay attribute and is still waiting to autoplay |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -406,7 +407,7 @@ decoding, sound, the link server, the home page) can be changed on the
 | `/data/ps5webkit/audio-selftest` | title: open a port at start, 0.1 s of silence, leave it open (`RESULT ps5browser audio-selftest`) |
 | `[ps5audio]` lines | per stream: `sceAudioOutGetPortState` when the port opens and after 2 s (output bits, channels, volume, reroute count), failed `sceAudioOutOpen`/`SetVolume` calls, and at close the samples' peak and RMS and the count of failed `sceAudioOutOutput` calls (is the WebProcess sending silence? is the port refusing data?) |
 | `child.env`: `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_VP9=0`, `PS5WK_MEDIA_AV1=1`, `GST_DEBUG=...` | WebProcess decoding, codec advertising, GStreamer logs |
-| `child.env`: `PS5WK_PROFILE=1` | sampling profiler, every thread of both children weighted by CPU time (`=wall`: the main thread by wall time; `apps/common/profiler.c`, see *Profiling*); `test/prof/prof-run.sh` runs pages, `test/prof.sh` summarizes the newest profiles |
+| `child.env`: `PS5WK_PROFILE=1` | sampling profiler, every thread of both children weighted by CPU time (`=wall`: the main thread by wall time; `=threads`: every thread every 20 ms by wall time, idle or not, for hangs between threads; `apps/common/profiler.c`, see *Profiling*); `test/prof/prof-run.sh` runs pages, `test/prof.sh` summarizes the newest profiles |
 | `child.env`: `PS5WK_CPU_LOG=0` | turn off the `[cpu] webN: x cores` lines (every 5 s while above 0.3 cores) |
 | `[render]` lines (WebProcess, every 5 s while rendering at least 5 updates) | rendering updates per second; total time per update (avg, p50, p95, max); the update phase (style, layout, rAF, JavaScript); paint (avg, p95, max; Mpx painted per update, updates painted in bands, threads, time spent copying the last frame forward, async rasters); `copy` (the rest: frame hand-off); `frame done` (frame sent until the UIProcess presented it, vsync included); updates followed by the idle gap |
 | `child.env`: `PS5WK_RENDER_LOG=0` / `1` (default) / `2` / `3` | `[render]` lines off; every 5 s; also one `[render1]` line per update (`test/paint/paint-ab-summary.py` reads them); also every scroll and the rects painted |
@@ -1066,7 +1067,9 @@ at least half visible. Log-only title runs (same timeline):
 
 What the test also found (open, not caused by the decoder slots; also
 before the fix and with software decoding):
-- **The page froze when players resumed** in all 3 runs served over http
+- **The page froze when players resumed** (found and fixed the same day:
+  seamless looping's non-flushing seek, see *Feeds: spinners over playing
+  videos*) in all 3 runs served over http
   (never from file://), at a scroll that suspended some players and resumed
   others: the WebProcess main thread stopped (`0 page uploads`, no more
   `FEED` lines, the title had to end the WebProcess). A wall-clock profile
@@ -1090,6 +1093,109 @@ before the fix and with software decoding):
   decoders, flexible memory would be at about 10 H.264 decoders (WebKit keeps
   a suspended MSE player's decoder: a long feed accumulates them; past the
   limit new videos fall back to software at the accept-caps DOPEN).
+
+**Feeds: spinners over playing videos, and the resume freeze (found and
+fixed 2026-11-01, patch 0036).** On a feed of autoplaying muted videos (the
+owner's session, `tv19.log`: decoding healthy, 0 take-backs, 30-35
+pictures/s) some videos kept the page's loading spinner on top while they
+played, and the log had ~30 `Autoplay blocked with reason:
+PageConsentRequired` lines. A page decides its spinner from what it reads:
+media events, `readyState`, `buffered`, `currentTime` progress, play()
+promises and `requestVideoFrameCallback`. Several of those were wrong:
+- **`requestVideoFrameCallback` never called back.** Only the accelerated
+  path (`pushTextureToCompositor`) counted presented frames; with
+  `ps5videosink` (hole punch) and with CPU painting the count stayed 0, so
+  `videoFrameMetadata()` never had a new frame and every callback stayed
+  pending. Players that hide their poster/spinner on the first frame
+  callback, or show it while callbacks stop, kept it up. Each new sample
+  is now counted in `triggerRepaint`.
+- **`readyState` stuck at HAVE_CURRENT_DATA (2) while playing**, so the
+  page got `waiting` and never `playing`: progressive players after a loop,
+  after a seek, and after WebKit's off-screen suspend/resume (muted videos
+  outside the viewport). `updateStates()` "delays" a buffering change that
+  arrives during an async state change by putting `m_isBuffering` back,
+  expecting a later buffering message; (a) a download that reached 100%
+  during the resume seek sent no further message, so the change was lost
+  for good, and (b) `m_wasBuffering` keeps the value from before the last
+  update, so after buffering had completed, every later async state change
+  (each loop or seek) "delayed" that old change again. Now only a change
+  that came with the current buffering update is held back, it is applied
+  when the state change completes, and the download-complete message runs
+  the normal buffering update.
+- **MSE loops stuck in `seeking`.** At the end of a looping MSE video the
+  element seeks to 0 from the ended notification, synchronously, and then
+  the MSE player's `didEnd()` tore the pipeline down under that seek: the
+  seek never completed (no `seeked`, `currentTime` held at 0 for good)
+  while the pipeline rebuilt by play() played underneath, and the title's
+  decoder was reopened on every loop. The pipeline is now kept when the
+  ended notification started a seek.
+- **The page freeze** (previous section, all http runs): a wall-time profile
+  of every thread (`PS5WK_PROFILE=threads`, new) showed the WebProcess main
+  thread in `gst_qtdemux_handle_src_event` -> `gst_pad_pause_task` (a
+  *non-flushing* seek waiting for qtdemux's streaming thread), qtdemux's
+  pull loop in `gst_download_buffer_wait_for_data`, and webkitwebsrc's
+  threads waiting for data, which WebKit's loader only delivers on the main
+  thread: a deadlock. The non-flushing seek is upstream's seamless looping
+  (a SEGMENT seek after every flushing seek and at play(), for looping
+  videos), here after the resume seek. Upstream disables on-disk buffering
+  for looping media for this reason (gstreamer#3129), but only through
+  playbin's flag, which playbin3 ignores (WebKit sets urisourcebin's own
+  `download` property). Sending the SEGMENT seek from a GStreamer thread
+  instead only moved the hang: that thread held the pipeline's state lock
+  while it waited, and the main thread's next seek waited for that lock.
+  Seamless looping is now off for http(s) progressive media (loops use the
+  flushing seek); MSE and local files keep it.
+- **The `PageConsentRequired` lines were not the policy.** The title's
+  website policy is `WEBKIT_AUTOPLAY_ALLOW` (since Milestone 2; ps5wk-shot
+  too): muted and unmuted autoplay are allowed, the test page's unmuted
+  autoplay played and no play() promise was rejected in any run. WebKit
+  prints that line from `setReadyState` when an element reaches
+  HAVE_ENOUGH_DATA and the `autoplay` *attribute* path has nothing to do:
+  `!autoplay` (no autoplay attribute: the page calls play()), `!autoplaying`
+  (play() was already called), `!paused` (already playing). It needs
+  HAVE_ENOUGH_DATA, so it cannot explain videos that never got a source
+  (the product page in *Profiling*: `readyState` 0, a page-side decision).
+  The line is now printed only for an element that has the attribute and is
+  still waiting to autoplay. Policy kept: ALLOW (a TV browser, pad input
+  isn't always on the video; desktop browsers allow muted autoplay and
+  Safari's "stop media with sound" would break YouTube's autoplay).
+
+Test: `test/media/feed-players.html` (clips from `make-media.sh`: `feed-*`),
+served with `tools/serve-media.py --port 8774 --page
+port/webkit/test/media/feed-players.html`. Eight feed players: MSE ones
+that append one fragment at a time up to a buffer goal (2, 4, 6, 30 s, as
+hls.js/dash.js) and progressive ones (H.264, VP9), muted autoplay through
+the `autoplay` attribute and through play(), IntersectionObserver
+play/pause at 50% visibility (some players not paused by the page, so WebKit
+suspends them off screen), scrolls, pause/play, seeks, loops. Every player
+computes six spinner models from standard signals only (E events, T
+video.js-style, R readyState, B buffered ahead, P currentTime progress, V
+frame callbacks) and logs every media event, play() results, a state line
+every 2 s and `FP SPIN <player> <model>` when a model's spinner stays on
+for 2 s over a visible video whose currentTime advances. Desktop Chrome: 0
+SPIN, all play() resolved. Log-only title runs (same page; the "before"
+build is the start of this round):
+
+| | before | after (clean run, no debug logging) |
+| --- | --- | --- |
+| `FP SPIN` (spinner on 2 s over a playing video) | 22: 16 frame callbacks (`v0`: no callback at all), 3 events, 3 readyState | 1: progressive WebM `buffered` empty (below) |
+| state samples with readyState 2 while visible and playing | 20 | 0 |
+| `seeking` / `seeked` events | 6 / 2 (MSE loops never finished) | 11 / 11 |
+| play() rejected / `PageConsentRequired` lines | 0 / 19 | 0 / 0 |
+| page | froze at t=72 (resume scroll), WebProcess ended by the title | ran to the end (96 s), in 3 runs |
+
+Found in the test page itself on the way: its MSE pump called
+`endOfStream()` while the other SourceBuffer was still appending; the next
+`appendBuffer()` reopened the MediaSource (as the spec says), `sourceopen`
+fired again and added SourceBuffers, and the video track, already told
+"all samples enqueued", froze while the audio clock ran on (also once a
+MediaError 4 "Failed to push buffer" at start). Fixed in the page; WebKit
+cannot revive a GStreamer stream that got EOS before such a reopen (rare:
+players don't append after `endOfStream()`). Still open: progressive WebM
+over http reports empty `buffered` while playing (WebKit turns download
+buffering off for WebM and the stream-mode buffering query gives no
+ranges); the ~41 frames dropped when a progressive clip first played
+(previous section) were 0-3 per player in the last runs, not looked into.
 
 Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
 matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
@@ -1895,7 +2001,10 @@ browsing no faster, so this round measured before changing anything.
   another thread returns the *calling* thread's time, hence the reading
   inside the handler (`CLOCK_THREAD_CPUTIME_ID` of the calling thread is
   right). `PS5WK_PROFILE=wall`: the main thread every 2 ms, idle or not
-  (what it waits on; slows the page down noticeably). `PS5WK_PROFILE=itimer`
+  (what it waits on; slows the page down noticeably). `PS5WK_PROFILE=threads`
+  (2026-11-01): every thread every 20 ms by wall time, idle or not (`PS5WK_PROFILE_US`
+  changes the tick): where each thread waits, for hangs between threads (it
+  found the resume-from-suspend freeze below). `PS5WK_PROFILE=itimer`
   (`setitimer(ITIMER_PROF)`) exists but has never run on the console.
 - **Unwinding** (`apps/common/ps5unwind.c`): the executable's own
   `.eh_frame_hdr`/`.eh_frame` (DWARF CFI) in the signal handler, every stack
@@ -2157,6 +2266,14 @@ a ping every 5 s, a health check before each round):
   2.3 MB/s, then 1.4-1.7, after a 60 s idle gap (8 MB/s after a gap on
   earlier days), with pings up to 250-311 ms while a download ran; uploads
   10-14 MB/s. Console work stopped there (the HSTS check was not run).
+- **2026-11-01, after the owner's reboot** (the spinner round: 6 log-only
+  title runs of 100-160 s, 4 uploads of the 129 MB child into the title
+  folder, klogsrv re-sent (136 KB)): swap out 385.9-392.4 MB the whole time
+  (389 at the start: no growth), page tables up to 6286 during a run and
+  back to 4972-4974 after each, pings 11 ms average (404 ms max, during
+  transfers; 0 lost), no panic. FTP: 8 MB uploads 11-13 MB/s, the 129 MB
+  child 6.6-8.4 MB/s, downloads 2 MB/s right after a transfer and 4 MB/s
+  (a 4.6 MB file) after 60 s idle.
 - Mitigation in the tooling: `run-shot.sh SHOT_REMOTE=<path>` (prof-run.sh
   uses it by default) uploads ps5wk-shot once over FTP and starts it from
   the console's disk through `test/shotrelay` (a small payload that sends
