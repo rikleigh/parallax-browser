@@ -145,6 +145,10 @@ struct Decoder {
     unsigned windowCalls { 0 };
     int firstRC { 0 };
 
+    // What this decoder counts against the decoder budget (openHardware).
+    bool budgeted { false };
+    double budgetDirectMB { 0 }, budgetFlexibleMB { 0 };
+
     Decoder()
     {
         g_mutex_init(&lock);
@@ -1032,6 +1036,212 @@ static void* decoderThread(void* data)
     return nullptr;
 }
 
+// ---------------------------------------------------------------- budget
+//
+// Decoder admission (COMPOSITING-PLAN.md, M6). A feed that starts 60 muted
+// autoplay videos at once opened 170 decoders: 5.1-7.7 GB of direct memory
+// at the load (VP9 decoders are opened at 3840x2160 for adaptive streams:
+// 535 MB each plus 12 x 12 MB output buffers), flexible memory down to 5 MB,
+// then MapNamedFlexibleMemory failures. WebKit suspends the off-screen ones
+// (closing their decoders) only once it knows they are off screen. Now:
+// - At most `decoders` hardware decoders at once, their memory (decoder +
+//   output buffers, as measured at open) within `direct` MB, and opening
+//   one must leave `reserve` MB of flexible memory free.
+// - A DOPEN over budget waits up to `wait` ms for decoders to close (the
+//   off-screen videos WebKit is suspending), then is refused: the proxy
+//   falls back to software decoding for that pipeline run only (decodebin3
+//   drops its decoder at PAUSED -> READY, so a suspended video that comes
+//   back asks again).
+// - VP9 decoders are sized to the stream (at least 1920x1088); 4K headroom
+//   only for streams above 1080p and while it fits in half the budget. A
+//   stream that later grows past its decoder reopens it (the proxy drains
+//   first).
+// /data/ps5webkit/vdec-budget (read at each DOPEN) overrides, e.g.
+// "decoders=8 direct=2048 reserve=64 wait=500 vp9headroom=1".
+
+extern "C" double ps5wk_title_direct_mb(void) __attribute__((weak)); // titlemem.c (the title only)
+extern "C" int sceKernelAvailableFlexibleMemorySize(size_t*) __attribute__((weak));
+
+struct BudgetLimits {
+    unsigned decoders { 8 };
+    double directMB { 2048 };
+    double reserveMB { 64 };
+    int waitMS { 500 };
+    int vp9Headroom { 1 }; // 0: never 4K headroom, 1: streams above 1080p, 2: every VP9 stream
+};
+
+struct Cost {
+    double directMB { 0 }, flexibleMB { 0 };
+};
+
+static GMutex budgetLock;
+// Guarded by budgetLock: what the open decoders (and opens in progress) count.
+static unsigned budgetDecoders;
+static double budgetDirectMB, budgetPendingFlexibleMB;
+static unsigned budgetPeakDecoders;
+static double budgetPeakDirectMB;
+static uint64_t budgetRefused, budgetWaited, budgetSmallVP9;
+static std::map<uint64_t, Cost> measuredCosts; // (codec, depth, size) -> cost measured at open
+// Opens one at a time, so the memory measured around one is its own.
+static GMutex openLock;
+
+static BudgetLimits readBudgetLimits()
+{
+    BudgetLimits limits;
+    FILE* f = fopen("/data/ps5webkit/vdec-budget", "r");
+    if (!f)
+        return limits;
+    char word[64];
+    while (fscanf(f, "%63s", word) == 1) {
+        unsigned u;
+        double v;
+        int i;
+        if (sscanf(word, "decoders=%u", &u) == 1)
+            limits.decoders = u;
+        else if (sscanf(word, "direct=%lf", &v) == 1)
+            limits.directMB = v;
+        else if (sscanf(word, "reserve=%lf", &v) == 1)
+            limits.reserveMB = v;
+        else if (sscanf(word, "wait=%d", &i) == 1)
+            limits.waitMS = std::max(0, i);
+        else if (sscanf(word, "vp9headroom=%d", &i) == 1)
+            limits.vp9Headroom = i;
+    }
+    fclose(f);
+    return limits;
+}
+
+static double flexibleFreeMB()
+{
+    size_t size = 0;
+    if (!sceKernelAvailableFlexibleMemorySize || sceKernelAvailableFlexibleMemorySize(&size))
+        return 1e9; // unknown: no flexible limit
+    return size / 1048576.0;
+}
+
+static double directInUseMB()
+{
+    return ps5wk_title_direct_mb ? ps5wk_title_direct_mb() : -1;
+}
+
+static uint64_t costKey(unsigned codec, unsigned depth, int width, int height)
+{
+    return static_cast<uint64_t>(codec) << 56 | static_cast<uint64_t>(depth) << 48 | static_cast<uint64_t>(width & 0xffffff) << 24 | (height & 0xffffff);
+}
+
+// Measured at an earlier open of the same codec and size, else scaled from
+// what Videodec2 took in the logged runs (README, Step 2b): H.264 1920x1088
+// 70 MB + 12 x 3.2 MB direct, 24 MB flexible; VP9 3840x2160 535 + 12 x 12 MB,
+// 13 MB; HEVC 3840x2160 337 + 12 x 12 MB (10-bit 512 + 9 x 24), 77 MB.
+static Cost estimateCost(unsigned codec, unsigned depth, int width, int height)
+{
+    g_mutex_lock(&budgetLock);
+    auto it = measuredCosts.find(costKey(codec, depth, width, height));
+    bool known = it != measuredCosts.end();
+    Cost cost = known ? it->second : Cost { };
+    g_mutex_unlock(&budgetLock);
+    if (known)
+        return cost;
+    double area = static_cast<double>(width) * height;
+    double refArea = 3840.0 * 2160;
+    if (codec == PS5WK_VCODEC_H264) {
+        refArea = 1920.0 * 1088;
+        cost = { 110, 24 };
+    } else if (codec == PS5WK_VCODEC_VP9)
+        cost = { 680, 13 };
+    else
+        cost = depth > 8 ? Cost { 730, 77 } : Cost { 480, 77 };
+    double scale = area / refArea;
+    cost.directMB *= std::max(0.25, scale);
+    cost.flexibleMB *= std::max(0.35, scale);
+    return cost;
+}
+
+// Reserves `cost` for `d`, waiting up to limits.waitMS for room. False:
+// over budget (why says how).
+static bool admit(Decoder& d, const BudgetLimits& limits, const Cost& cost, char* why, size_t whySize)
+{
+    int64_t start = nowUS(), deadline = start + static_cast<int64_t>(limits.waitMS) * 1000;
+    bool waited = false;
+    for (;;) {
+        double flexible = flexibleFreeMB();
+        g_mutex_lock(&budgetLock);
+        bool countOK = budgetDecoders < limits.decoders;
+        bool directOK = budgetDirectMB + cost.directMB <= limits.directMB;
+        bool flexibleOK = flexible - budgetPendingFlexibleMB - cost.flexibleMB >= limits.reserveMB;
+        if (countOK && directOK && flexibleOK) {
+            budgetDecoders++;
+            budgetDirectMB += cost.directMB;
+            budgetPendingFlexibleMB += cost.flexibleMB;
+            budgetPeakDecoders = std::max(budgetPeakDecoders, budgetDecoders);
+            budgetPeakDirectMB = std::max(budgetPeakDirectMB, budgetDirectMB);
+            budgetWaited += waited;
+            g_mutex_unlock(&budgetLock);
+            d.budgeted = true;
+            d.budgetDirectMB = cost.directMB;
+            d.budgetFlexibleMB = cost.flexibleMB;
+            if (waited)
+                DLOG("decoder for pid %d: waited %.0f ms for the decoder budget", d.pid, (nowUS() - start) / 1000.0);
+            return true;
+        }
+        if (nowUS() >= deadline) {
+            budgetRefused++;
+            snprintf(why, whySize, "%s%s%s (%u/%u decoders, %.0f + %.0f of %.0f MB direct, flexible %.0f MB free, %.0f needed + %.0f kept)",
+                countOK ? "" : "decoders", !directOK ? (countOK ? "direct memory" : ", direct memory") : "",
+                !flexibleOK ? (countOK && directOK ? "flexible memory" : ", flexible memory") : "", budgetDecoders, limits.decoders,
+                budgetDirectMB, cost.directMB, limits.directMB, flexible - budgetPendingFlexibleMB, cost.flexibleMB, limits.reserveMB);
+            g_mutex_unlock(&budgetLock);
+            return false;
+        }
+        g_mutex_unlock(&budgetLock);
+        waited = true;
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, nullptr);
+    }
+}
+
+// The open finished (measured: the decoder's real cost) or failed.
+static void settleBudget(Decoder& d, const Cost* measured)
+{
+    if (!d.budgeted)
+        return;
+    g_mutex_lock(&budgetLock);
+    budgetPendingFlexibleMB -= d.budgetFlexibleMB;
+    if (!measured) {
+        budgetDecoders--;
+        budgetDirectMB -= d.budgetDirectMB;
+        d.budgeted = false;
+    } else {
+        budgetDirectMB += measured->directMB - d.budgetDirectMB;
+        budgetPeakDirectMB = std::max(budgetPeakDirectMB, budgetDirectMB);
+        d.budgetDirectMB = measured->directMB;
+        d.budgetFlexibleMB = measured->flexibleMB;
+    }
+    g_mutex_unlock(&budgetLock);
+}
+
+static void releaseBudget(Decoder& d)
+{
+    if (!d.budgeted)
+        return;
+    g_mutex_lock(&budgetLock);
+    budgetDecoders--;
+    budgetDirectMB = std::max(0.0, budgetDirectMB - d.budgetDirectMB);
+    g_mutex_unlock(&budgetLock);
+    d.budgeted = false;
+}
+
+static std::string budgetSummary()
+{
+    char line[200];
+    g_mutex_lock(&budgetLock);
+    snprintf(line, sizeof line, "budget %u decoders, %.0f MB (peak %u, %.0f MB; %llu refused, %llu waited, %llu VP9 sized to the stream)", budgetDecoders,
+        budgetDirectMB, budgetPeakDecoders, budgetPeakDirectMB, (unsigned long long)budgetRefused, (unsigned long long)budgetWaited,
+        (unsigned long long)budgetSmallVP9);
+    g_mutex_unlock(&budgetLock);
+    return line;
+}
+
 // ---------------------------------------------------------------- open/close
 
 static void freeSlots(Decoder& d)
@@ -1061,6 +1271,7 @@ static void closeHardware(Decoder& d)
     d.hw = nullptr;
     // Buffers go back on the renderer's thread, after the frame in flight.
     freeSlots(d);
+    releaseBudget(d);
 }
 
 static unsigned openDecoders()
@@ -1122,17 +1333,6 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
             return 2;
         }
     }
-    // Room for adaptive streams: VP9 is cheap at 4K (13 MB), H.264 up to
-    // 1080p costs 24 MB; HEVC is sized as asked.
-    int openWidth = width, openHeight = height;
-    if (codec == PS5WK_VCODEC_VP9 && openWidth * openHeight < 3840 * 2160) {
-        openWidth = std::max(openWidth, 3840);
-        openHeight = std::max(openHeight, 2160);
-    } else if (codec == PS5WK_VCODEC_H264 && openWidth * openHeight < 1920 * 1088) {
-        openWidth = std::max(openWidth, 1920);
-        openHeight = std::max(openHeight, 1088);
-    }
-
     // Same decoder again (caps renegotiated, e.g. a resolution switch): keep
     // it if it covers the new size. (The proxy drained it first, which
     // resets the hardware; a new SPS in band resets it too, see processAU.)
@@ -1145,20 +1345,66 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
         closeHardware(*d);
     }
 
+    // Room for adaptive streams. VP9 is cheap at 4K in flexible memory (13
+    // MB) but not in direct memory (535 MB + 12 x 12 MB output buffers, for
+    // a 480x854 feed clip too), so a VP9 stream up to 1080p gets a
+    // 1920x1088 decoder (a later switch above it reopens the decoder; the
+    // proxy drains first), and one above 1080p 3840x2160 while that fits in
+    // half the budget (vp9headroom=2: 4K for every VP9 stream, the old way).
+    // H.264 up to 1080p costs 24 MB flexible; HEVC is sized as asked.
+    BudgetLimits limits = readBudgetLimits();
+    int openWidth = width, openHeight = height;
+    if (codec == PS5WK_VCODEC_VP9 && openWidth * openHeight < 3840 * 2160) {
+        Cost headroom = estimateCost(codec, depth, std::max(openWidth, 3840), std::max(openHeight, 2160));
+        g_mutex_lock(&budgetLock);
+        bool big = limits.vp9Headroom >= 2 || openWidth * openHeight > 1920 * 1088;
+        bool roomy = big && limits.vp9Headroom && budgetDirectMB + headroom.directMB <= limits.directMB / 2;
+        if (!roomy)
+            budgetSmallVP9++;
+        g_mutex_unlock(&budgetLock);
+        if (roomy) {
+            openWidth = std::max(openWidth, 3840);
+            openHeight = std::max(openHeight, 2160);
+        } else if (openWidth * openHeight <= 1920 * 1088) {
+            openWidth = std::max(openWidth, 1920);
+            openHeight = std::max(openHeight, 1088);
+        }
+    } else if (codec == PS5WK_VCODEC_H264 && openWidth * openHeight < 1920 * 1088) {
+        openWidth = std::max(openWidth, 1920);
+        openHeight = std::max(openHeight, 1088);
+    }
+
+    const char* names[] = { "?", "H.264", "HEVC", "?", "VP9" };
+    const char* codecName = names[codec < 5 ? codec : 0];
+    char why[240] = "";
+    if (!admit(*d, limits, estimateCost(codec, depth, openWidth, openHeight), why, sizeof why)) {
+        DLOG("decoder for pid %d: %s %dx%d (stream %dx%d) refused, over the decoder budget after %d ms: %s; software decoding for this stream",
+            d->pid, codecName, openWidth, openHeight, width, height, limits.waitMS, why);
+        return 5;
+    }
+
     char error[200] = "";
     size_t frameBytes = 0, frameAlign = 0;
     void* hw = nullptr;
     int64_t start = nowUS();
+    g_mutex_lock(&openLock);
+    double flexibleBefore = flexibleFreeMB(), directBefore = directInUseMB();
     // Another decoder may still be closing (switching videos): wait for it
     // rather than fall back to software.
     for (int attempt = 0; attempt < 30; attempt++) {
         hw = backend->open(codec, profile, depth, openWidth, openHeight, &frameBytes, &frameAlign, error, sizeof error);
         if (hw || !openDecoders())
             break;
+        g_mutex_unlock(&openLock);
         struct timespec ts = { 0, 100 * 1000 * 1000 };
         nanosleep(&ts, nullptr);
+        g_mutex_lock(&openLock);
+        flexibleBefore = flexibleFreeMB();
+        directBefore = directInUseMB();
     }
     if (!hw) {
+        g_mutex_unlock(&openLock);
+        settleBudget(*d, nullptr);
         DLOG("decoder for pid %d: codec 0x%x profile %u %u-bit %dx%d: open failed (%s)", d->pid, codec, profile, depth, openWidth,
             openHeight, error);
         return 2;
@@ -1179,11 +1425,33 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
         slots.push_back(s);
     }
     if (slots.size() < 4) {
+        g_mutex_unlock(&openLock);
         for (auto& s : slots)
             provider.free(s.glBuffer, s.map, s.bytes);
         backend->close(hw);
+        settleBudget(*d, nullptr);
         return 3;
     }
+    // What this decoder really costs (decoder + output buffers), for the
+    // budget and the next estimate of this codec and size.
+    Cost measured { directBefore >= 0 ? directInUseMB() - directBefore : 0, flexibleBefore - flexibleFreeMB() };
+    g_mutex_unlock(&openLock);
+    size_t slotBytes = 0;
+    for (auto& s : slots)
+        slotBytes += s.bytes;
+    // No measurement (payload), or another decoder's buffers were freed
+    // meanwhile (the renderer frees them at the top of a frame): the
+    // estimate, and never less than the output buffers.
+    bool reliable = directBefore >= 0 && measured.directMB > slotBytes / 1048576.0 && measured.flexibleMB >= 0;
+    if (!reliable)
+        measured.directMB = std::max(estimateCost(codec, depth, openWidth, openHeight).directMB, slotBytes / 1048576.0);
+    measured.flexibleMB = std::max(0.0, measured.flexibleMB);
+    if (reliable) {
+        g_mutex_lock(&budgetLock);
+        measuredCosts[costKey(codec, depth, openWidth, openHeight)] = measured;
+        g_mutex_unlock(&budgetLock);
+    }
+    settleBudget(*d, &measured);
     d->hw = hw;
     d->codec = codec;
     d->profile = profile;
@@ -1220,10 +1488,9 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
         return 4;
     }
     d->threadStarted = true;
-    const char* names[] = { "?", "H.264", "HEVC", "?", "VP9" };
-    DLOG("decoder %u for pid %d: %s profile %u, %u-bit, %dx%d (stream %dx%d), up in %.0f ms; %zu output buffers of %.1f MB",
-        d->id, d->pid, names[codec < 5 ? codec : 0], profile, depth, openWidth, openHeight, width, height, openMS, d->slots.size(),
-        (frameBytes + frameAlign) / 1048576.0);
+    DLOG("decoder %u for pid %d: %s profile %u, %u-bit, %dx%d (stream %dx%d), up in %.0f ms; %zu output buffers of %.1f MB; costs %.0f MB direct, %.1f MB flexible; %s",
+        d->id, d->pid, codecName, profile, depth, openWidth, openHeight, width, height, openMS, d->slots.size(),
+        (frameBytes + frameAlign) / 1048576.0, d->budgetDirectMB, d->budgetFlexibleMB, budgetSummary().c_str());
     return 0;
 }
 
@@ -1341,7 +1608,11 @@ done:
             (unsigned long long)d->formatChanges, (unsigned long long)d->recoveries, (unsigned long long)preleases,
             (unsigned long long)d->longWaits, (unsigned long long)lost);
     }
+    uint32_t closedID = d->id;
+    bool hadDecoder = d->budgeted;
     closeHardware(*d);
+    if (hadDecoder)
+        DLOG("decoder %u released: %s", closedID, budgetSummary().c_str());
     d->fd = -1;
 }
 
