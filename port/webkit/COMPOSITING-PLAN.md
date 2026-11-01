@@ -968,3 +968,158 @@ for 20 s and up for 10 s):
 - The CPU fallback lasts for the WebProcess's life (one WebProcess serves
   every navigation), not for one page.
 - The owner's TV check of the decoder budget on real feeds.
+
+## TV test 2 fixes (2026-11-01)
+
+The owner's second TV session in WC mode (build 20261101-191505, `tv22.log`)
+reported scrolling that "starts off feeling quicker but starts to feel
+slow" and a lock-up on a video feed after which other sites felt slow.
+
+### Frame pacing
+
+**What the TV numbers were.** The `[present]`, `[render] wc` and `[wc]`
+lines on the MDN home page read 21-32 updates/s and 25-31 presents/s, but
+the first two are 5 s windows and the stick was released and moved again
+within them: the 1 s `[wc]` lines of the same minutes reach 52-57 updates/s
+in seconds of steady scrolling, and `frame done` of 12-16 ms only happens
+when updates come one per vsync (an update that finds no flip pending is
+presented in 2-4 ms: 4.2 ms in the session's idle window). Pages with video
+or many layers were really slower: YouTube 8-44 updates/s with scene paints
+of 13-27 ms (624 layers), reddit 8-44 with the WebProcess busy.
+
+**Instrumentation** (kept; all cheap):
+- `[present] render: apply, video, scene, draw` after each `[present]` line
+  (PS5Renderer: where the render thread's time goes; draw includes the wait
+  for the previous swap's flip).
+- `[wc] ... update in the title: queued, applied to swap, swap to reply`:
+  an update from the main thread receiving it to its reply running on the
+  main thread (the reply hop is 0.01-0.02 ms; queued 0.3-0.8 ms on light
+  pages, 2-7 ms on reddit).
+- `[render] wc ... reply to next update, waiting at the reply, started by
+  the idle timer; tile wait` (DrawingAreaWC: the WebProcess's part of a
+  cycle). `[render1]` (PS5WK_RENDER_LOG=2) adds timestamped reply/start/sent.
+- `/data/ps5webkit/wc-frame-log`: a `[frame]` line per render-thread frame
+  (started N ms after the last swap, apply, video, scene, draw, swap) and per
+  presented update (queued at, applied, swap); `test/paint/interval.html`, a
+  timer-driven box.
+
+**Findings** (log-only runs, `pad-scroll-test` = the owner's stick as wheel
+events every 8 ms):
+- The swap returns at once; the next frame's first draw waits for that
+  swap's flip: 11-13 ms when the frame starts right after the swap, 0.1-0.2
+  ms when it starts 20 ms or more later (`[frame]` lines). So the title
+  paces updates to the display by itself.
+- With an update waiting at every reply (stick held, or a rAF loop) the old
+  code already ran at 60/s on MDN, Wikipedia, `layers.html` (and 57 on BBC).
+- Frames that ran without an update (video playing, the pointer, M3's
+  accelerated animations) started right after the swap or 10 ms after it
+  with video, before the WebProcess's update for that vsync arrived; the
+  update then waited for the next frame, and a scene that took more than
+  ~6 ms to paint missed its vsync because the video loop started 10 ms
+  late. M3 had fixed this only while animating.
+- DrawingAreaWC's idle refresh timer fired a full frame after a reply even
+  when a refresh was asked for just after it (an update requested by a
+  wheel event or timer that came in then).
+- TextureMapper drew every tile of every layer each frame, including WC's
+  coverage margin and a feed's layers below the fold.
+
+**Fixes** (src-wc 95e259c204, 80573f3544, 8f6597b8f5; outer repo 7ddf170):
+- DrawingAreaWC: the first refresh asked for after a reply fires at once
+  (once per reply; `PS5WK_WC_REFRESH_NOW=0` = old).
+- PS5WCHost: any frame that applied no update while one is expected waits
+  for it until 6 ms before the frame is due (`/data/ps5webkit/wc-wait-old`
+  = M3 behaviour; the same flag restores the 10 ms below).
+- PS5Renderer: with video, frames start 2 ms after the swap (was 10 ms).
+- TextureMapperSparseBackingStore: tiles outside the clip bounds are not
+  drawn (affine transforms; `/data/ps5webkit/wc-no-cull` draws all).
+- Not done: answering an update when it is applied instead of after the
+  swap (pipelining). With the reply after the swap the WebProcess has most
+  of a frame, and rAF ticks stay one per vsync; an early reply can tick rAF
+  twice within a few ms when a frame starts late.
+
+**Measured**, same binary, flags for "old" (stick at 0.3, 4 s down/up, 2 s
+still; one-vsync share = consecutive presented updates one vsync apart
+within bursts; updates/s = 1 s `[wc]` windows with updates):
+
+| page | old: one-vsync / updates/s / scene ms | new: one-vsync / updates/s / scene ms |
+| --- | --- | --- |
+| MDN home | 99 % / 47.6 / 2.0 | 99 % / 49.7 / 1.5 |
+| YouTube home (232 layers) | 84 % / 23.3 / 9.1 | 97 % / 49.2 / 7.6 |
+| reddit front page | 94 % / 34.2 / 6.6 | 83 % / 33.3 / 7.3 (content differs per load; WebProcess update 3.9 ms, frame done 16-17 ms in both) |
+
+With the stick held and a rAF counter on the page (`test-onload.js`; an
+update is then waiting at every reply), old vs new on the same pages:
+
+| page | updates/s old / new | frame done ms old / new | scene paint ms old / new | rAF/s new (max) |
+| --- | --- | --- | --- | --- |
+| MDN docs page | 59.9 / 59.9 | 13.9 / 13.9 | 3.2 / 2.3 | 59.9 (60.2) |
+| Wikipedia article | 59.9 / 59.9 | 14.5 / 14.5 | 2.3 / 1.5 | 59.9 (60.0) |
+| BBC News | 57.3 / 57.1 | 14.5 / 14.5 | 6.6 / 5.7 | 57.7 (60.0) |
+| reddit front page | 21.4 / 20.4 | 60.3 / 29.3 | 5.0 / 5.6 | 23.1 (60.0) |
+| `layers.html` | 59.9 / 59.9 | 15.8 / 15.8 | 5.4 / 3.6 | 59.9 (60.0) |
+
+- reddit is bound by its WebProcess (rendering updates of 16-18 ms with
+  script, tile wait 10-16 ms, the reply queued behind main-thread work);
+  the title's part of an update is 18 ms (queued 7, applied to swap 10).
+- `wcfeed.html` (492 layers, 55 videos playing): 57-59 updates/s, scene
+  paint 9.6 ms; `test/paint/interval.html` 50 ticks and 50 frames shown/s
+  in both modes.
+
+### The video feed lock-up
+
+**What the log shows.** In `tv22.log` the WebProcess sent no update for
+about 75 s on reddit (the `[render] wc` window of 79.7 s holds 154 updates,
+which must have come in bursts at both ends; the `[wc]` window of 77.7 s
+starts with 44), then 41 updates in the second before the owner navigated
+away. The missing `[cpu] web4` lines mean only that the WebProcess used
+less than 0.3 cores (`ps5wk-child.cpp` logs only above that), i.e. it was
+waiting, not computing. A main-thread timer (`MediaSource::streamingTimerFired`)
+logged at about the start of the gap, the navigation's `load started`
+came from the WebProcess, and its media teardown ran at once after it.
+
+**The video path was not holding it.** The hypothesis that the title only
+consumes frames of streams whose layer is drawn is wrong for this code:
+`PS5VideoServer::consume` runs over every stream in every render-thread
+frame (`PS5Renderer::threadMain`), the loop wakes for queued frames
+(`nextDeadline`), every chosen frame is converted in `handleVideo` whatever
+draws it, and pinned pictures go back after the swap (`presented`). The
+held slots in the log belong to the WebProcess: decoder 10 (an MSE player
+with audio) made 14 pictures; the proxy read 5 (4 given back unrendered,
+1 prerolled into the sink: "stop after 1 frames sent"), the other 9 were
+unread on the socket because the decoder's streaming thread sat in
+`finish_frame` pushing into the prerolled, PAUSED sink, and the title's
+audio stream for that player played 0.0 s in 84.8 s. That is a player
+that prerolled and never started playing (the same pattern as YouTube's
+preview player at line 431 and reddit's decoder 2: 1 frame sent, 5
+pictures, 4 given back), which the decoder's "every output slot held"
+line describes; it blocks nothing on the WebProcess main thread (the
+title's serve loop never stops reading, the proxy's waits end on flush,
+stop and a 9 s stall timeout).
+
+**Reproduction** (log-only, new build, `PS5WK_PROFILE=threads` in
+child.env to have where every thread waits if it happened): reddit front
+page scrolled for 4 min (6 s down, 6 s up, 3 s still), `wcfeed.html` (60
+s: the harness moves on after 60 s because the page never reports its load
+finished) and `test/media/feed.html` (whole timeline, `FEED DONE`, 0
+stuck): updates never stopped (1 s `[wc]` windows 7-60 updates on reddit,
+57-59 on `wcfeed.html`), no WebProcess crash, decoders opened and closed
+(206 decoder lines on reddit, budget back to 0 at the end). The stall did
+not reproduce, so there is no thread dump of it. The earlier "WebProcess
+stall with 60 videos" was the flexible-memory exhaustion state that M6's
+decoder budget now prevents.
+
+**Afterwards.** In `tv22.log` everything was released at the navigation
+(decoder budget back to 0 decoders / 0 MB, title direct memory 671 MB,
+flexible 281 MB, GL textures 24 MB on the next page). The pages after it
+ran as the ones before it (old.reddit 16 updates/s, MDN 25-32/s in 5 s
+windows; YouTube and BBC before the stall 17-40/s): the same 5 s-window
+numbers as above, not a degraded state. In run 9 MDN after the two media
+pages ran at 60 updates/s in scrolling seconds with 1.5 ms scene paints,
+as on a fresh title.
+
+**Open:** what kept the WebProcess from updating for ~75 s on the TV is
+unknown (waiting, not busy; not the video path by the evidence above).
+If it comes back: `PS5WK_PROFILE=threads` in child.env shows where every
+thread waits; a main-thread watchdog in ps5wk-child that logs the main
+thread's stack after N s without a run-loop turn would catch it in a
+normal session.
