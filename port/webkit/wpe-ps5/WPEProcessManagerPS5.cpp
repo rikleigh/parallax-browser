@@ -21,6 +21,7 @@
 #include "PS5LaunchProtocol.h"
 #include "WPEPS5Private.h"
 #include <arpa/inet.h>
+#include <algorithm>
 #include <dirent.h>
 #include <climits>
 #include <cstring>
@@ -36,6 +37,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <wtf/HashMap.h>
+#include <wtf/Vector.h>
 #include <wtf/glib/GRefPtr.h>
 #include <wtf/glib/WTFGType.h>
 #include <string>
@@ -319,13 +321,34 @@ static void handleConnection(WPEProcessManagerPS5* manager, int client)
 // The title is ended with SIGKILL (and payload harnesses often are), so the
 // sockets and status files named after a pid in PS5WK_LAUNCH_DIR stay
 // behind; the directory is a small tmpfs and binding failed with ENOSPC
-// after a few hundred. Remove those whose process is gone.
+// after a few dozen. Remove those whose process is gone. kill(pid, 0) alone
+// can't tell: title pids are small and get reused by other system processes
+// (and a title may get EPERM for any pid), so a pid only counts as alive if
+// one of its sockets still has a listener.
+static bool socketHasListener(const std::string& path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return true;
+    struct sockaddr_un address { };
+    address.sun_family = AF_UNIX;
+    g_strlcpy(address.sun_path, path.c_str(), sizeof(address.sun_path));
+    bool listening = !connect(fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address))
+        || (errno != ECONNREFUSED && errno != ENOENT);
+    close(fd);
+    return listening;
+}
+
 static void removeStaleRuntimeFiles()
 {
     DIR* dir = opendir(PS5WK_LAUNCH_DIR);
     if (!dir)
         return;
-    unsigned removed = 0;
+    struct PidFiles {
+        Vector<std::string> files;
+        Vector<std::string> sockets;
+    };
+    HashMap<int, PidFiles> byPid;
     while (struct dirent* entry = readdir(dir)) {
         const char* name = entry->d_name;
         int pid = 0;
@@ -344,16 +367,32 @@ static void removeStaleRuntimeFiles()
         if (strcmp(end, prefix == 6 ? "" : ".sock"))
             continue;
         pid = static_cast<int>(value);
-        // Only a process that is known to be gone (EPERM: alive, another uid).
-        if (pid == getpid() || !kill(pid, 0) || errno != ESRCH)
+        if (pid == getpid())
             continue;
         std::string path = std::string(PS5WK_LAUNCH_DIR "/") + name;
-        if (!unlink(path.c_str()))
-            removed++;
+        auto& files = byPid.add(pid, PidFiles { }).iterator->value;
+        if (prefix != 6)
+            files.sockets.append(path);
+        files.files.append(std::move(path));
     }
     closedir(dir);
-    if (removed)
-        PS5_LOG("[ps5-launch] removed %u stale files from %s", removed, PS5WK_LAUNCH_DIR);
+    unsigned removed = 0, kept = 0;
+    for (auto& [pid, files] : byPid) {
+        // Gone for sure (ESRCH), or no socket of it answers. A pid with only
+        // a status file has no UIProcess listening either.
+        bool gone = (kill(pid, 0) && errno == ESRCH)
+            || std::none_of(files.sockets.begin(), files.sockets.end(), socketHasListener);
+        if (!gone) {
+            kept += files.files.size();
+            continue;
+        }
+        for (auto& path : files.files) {
+            if (!unlink(path.c_str()))
+                removed++;
+        }
+    }
+    if (removed || kept)
+        PS5_LOG("[ps5-launch] removed %u stale files from %s, kept %u of live processes", removed, PS5WK_LAUNCH_DIR, kept);
 }
 
 static bool bindListener(WPEProcessManagerPS5* manager)
