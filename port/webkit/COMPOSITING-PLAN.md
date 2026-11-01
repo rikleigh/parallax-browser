@@ -1123,3 +1123,121 @@ If it comes back: `PS5WK_PROFILE=threads` in child.env shows where every
 thread waits; a main-thread watchdog in ps5wk-child that logs the main
 thread's stack after N s without a run-loop turn would catch it in a
 normal session.
+
+### Sticky header one scroll step behind (WC)
+
+Owner: "the sticky header isn't quite right: when scrolling I can see the
+content behind the header and sometimes it gets pushed slightly off screen".
+
+**Cause** (`src-wc` b235085eb2 and edfee43cea, `LocalFrameView.cpp`, PS5 only): on a
+main-thread scroll, `ScrollView::scrollTo` runs `completeUpdatesAfterScrollTo`
+(layer positions, `scrollContents`, the OnScroll compositing update), and only
+then `LocalFrameView::scrollTo` calls `scrollPositionChanged`, which moves the
+scrolled contents layer, the layout viewport (`updateLayoutViewport`) and,
+through M2's `setViewportConstrainedObjectsNeedLayout`, the sticky offsets.
+Upstream that function relaid out every sticky renderer, so the rendering
+update ran a layout and an AfterLayout compositing update with fresh
+offsets. M2 replaced the relayout with a layer position walk, which leaves no
+layout behind: the only compositing update of the step was the OnScroll one,
+which ran before the offsets changed. A composited sticky layer (M3) was
+therefore placed with the previous step's offset while the page moved by
+the current one: one wheel event (7-35 px with the pad's 8 ms ticks) up off
+the screen while scrolling down, page content showing above it while
+scrolling up, and left there when scrolling stopped at the end of the page.
+Pages hid it when anything else caused a layout each step (a fixed element:
+M2 gives composited fixed elements an out-of-flow movement layout; scroll
+listeners that change the DOM), which is why `sticky.html` (fixed footer,
+scrollY counter) and the docs pages never showed it, and why the stopped
+captures of M3 matched.
+
+**Fix:** while a `LocalFrameView::scrollTo` of a composited-scrolling frame
+runs, `updateCompositingLayersAfterScrolling` is held back and run once at
+the end, after the layout viewport and layer positions are current (one
+OnScroll update per step, as before, just later; with a fixed element the
+update bails because a layout is pending, and the AfterLayout update does it).
+`PS5WK_WC_STICKY_SYNC=0` (child.env) = old order. Follow-up (edfee43cea):
+when that update bails for a pending layout, the root is marked for a
+requirements traversal so the AfterLayout update still recomputes overlap
+for the new scroll position, as the OnScroll update always did.
+
+**Test knob:** `/data/ps5webkit/pad-scroll-test` (`WPEDisplayPS5.cpp`) scrolls
+like the owner's right stick (one precise wheel event per 8 ms pad tick) in
+cycles and captures mid-scroll (`pad-NNN-down|up.ppm`), e.g.
+`delay=9 secs=2.5 ry=0.2 pause=1 shots=4`. `sticky.html?quiet` has no scroll
+listener.
+
+**Measured** (pad-scroll-test, 960x540 captures, header strip matched against
+a capture at rest; offsets in capture rows = 2 px):
+
+| page, pad deflection | old order | fixed |
+| --- | --- | --- |
+| docs front page (sticky header, nothing else changes per step), ry 0.2 (7 px per event, ~875 px/s) | 45 of 45 mid-scroll captures off: -4 rows scrolling down (header pushed up 8 px), +3/+4 scrolling up (page above it) | 45 of 45 at 0 |
+| same, ry 0.8 (28 px per event), stopped at the end of the page | header 18 px off the top until the next scroll | at 0 |
+| docs article page, ry 0.2 | 60 of 60 at 0 (a layout each step hides it) | 55 of 55 at 0 |
+| `sticky.html?quiet`, ry 0.8 | header, headings, fixed footer at 0 (the fixed footer's layout hides it) | at 0 |
+
+Fixed elements were never off (they get a layout per step).
+
+### Thumbnails slower to show in WC mode (not reproduced)
+
+Owner: "the video thumbnails on youtube are now taking much longer to load
+than they did without gpu". `tv22.log` had 232 layers on the video site's
+home page growing to 624-643 after scrolling, `raster` up to 221 ms/s and
+2-40 updates/s.
+
+**Measured** (build 20261101-202621 and -205943, the same binary for both
+paths, compositing flag on/off; `debug-screenshot` with the new
+`series=<ms>x<count>` content, captures from each test URL's load start;
+"filled" = share of the content area that is image-like):
+
+| page | WC: thumbnails visible | CPU path |
+| --- | --- | --- |
+| `test/paint/images.html` (120 synthetic 640x360 JPEGs, `loading=lazy`), first load (includes the WebProcess start) | 9 of 12 at 1.93 s, 12 at 2.18 s | 6 at 2.0 s, 7 at 2.26-2.76 s, 12 at 3.01 s |
+| same, `?layers` (a composited layer per card), images in the HTTP cache | 12 of 12 in the first capture (250 ms) | same |
+| a channel's videos grid | filled 19 % at 4.5 s, 41 % at 4.76 s | 40 % at 4.26 s |
+| a search results page | 13 % at 4.26 s, 38 % at 4.51 s | 24 % at 4.76 s (more at 5 s) |
+| channel grid scrolled by script (24 px per 16 ms tick from load + 2 s) | every row drawn in the mid-scroll captures; got 4960 px down in 6 s | every row drawn; 3928 px |
+| search page, same scroll | same | same |
+
+The thumbnails show up together with the rest of the page in both
+modes, within ±0.5 s, and WC got further in the scrolled runs. The
+`[render]` lines put the time in the WebProcess's style/layout/script
+during the load on both paths (search page: 53-60 ms per rendering update
+for the first 5 s, WC and CPU alike), not in tiles or decoding. The
+console's profile gets an empty home page ("Try searching"), so the
+owner's home feed with recommendations couldn't be loaded; the feed-like
+pages above were used instead.
+
+Ruled out on the way, each by measurement with an A/B build: the
+asynchronous decode that a layer's first paint asks for
+(`RenderLayerBacking::paintContents` adds `DefaultAsynchronousImageDecode`
+while `repaintCount() == 0`; with that off the scrolled-feed timeline was
+the same); composited sticky elements (`PS5WK_WC_STICKY=0`: still 819 and
+775 layers on the two pages); and limiting the overlap extent of sticky
+and fixed layers to one view, since overlap is recomputed on each main-thread
+scroll step anyway (903 layers instead of 961). Those knobs were not kept.
+
+**What the layers are** (`PS5WK_WC_LAYER_LOG=1`, search page): most of the
+775-961 layers are the site's touch-feedback overlays (the
+`ytSpecTouchFeedbackShapeStroke/Fill` and `yt-interaction` stroke/fill
+divs, two or three in every button and card) plus the guide entries. They
+cost scene paint time in the title: 7.4-7.6 ms per frame with the
+scissor-box tile culling (8f6597b8f5), 10.8 ms before it. That is
+render-thread time per frame, not a delay for images. Why those divs are
+composited (overlap with a composited ancestor or sibling, or the site's
+own `will-change`) wasn't worked out.
+
+**Open:** the owner's case is not reproduced. Things to check on the TV:
+whether the slow thumbnails are on the home feed only (recommendations,
+signed in) or also on search and channel pages; whether it gets better with
+the pacing fixes above (the old ~30 updates/s cap delayed every new image by up to a frame
+as well); a `series=500x30` capture on the TV build would time it.
+
+**Tools added:** `test/paint/images.html` (`?lazy=0`, `?io` (IntersectionObserver
+lazy loading), `?layers`, `?n=`, `?v=` (cache-busting); logs `IMG <i> loaded`,
+`IMG-VIEWPORT`, `IMG-SLOTS`), `test/paint/make-images.py <dir>` (synthetic
+thumbnails, served with `tools/serve-media.py --port 8775 --page
+port/webkit/test/paint/images.html <dir>`), the screenshot series
+(`ps5browser.c`). Note: the title's clean-up of `/data/ps5webkit/shots` at
+start leaves files behind (old captures were still there in later runs), so
+name lists should come from the run's log.
