@@ -413,3 +413,124 @@ still reference ImageBuffer snapshots only, other live data (e.g. software
 video frames painted into tiles) is held by reference; the arena never
 shrinks below one chunk while a page is open; no cap on how long an async
 batch may take before the update goes (a 60 ms batch delays that frame).
+
+## M3 results (2026-11-01)
+
+Changes (`toolchain/wpe-webkit/src-wc`, branch `ps5-wc`):
+- **Composited sticky without coordinated scrolling** (4e0fe1c13e,
+  `RenderLayerCompositor::requiresCompositingForPosition`, PS5 only): a
+  sticky element with no other overflow ancestor gets its own layer when its
+  frame scrolls composited (the RenderView's layer draws content), as sticky
+  elements in composited overflow scrollers already did. M2's per-step
+  layer position + geometry update then moves the layer on the main thread
+  instead of repainting the element at its old and new place.
+  `PS5WK_WC_STICKY=0` (child.env) = old behaviour. Fixed elements were
+  already composited (`acceleratedCompositingForFixedPosition` follows AC in
+  `DrawingAreaWC::updatePreferences`; fixed elements always form a stacking
+  context; only out-of-view, empty or non-view-container ones stay painted).
+- **Accelerated transform/opacity animations** (fea93260ac and follow-up):
+  `GraphicsLayerWC::addAnimation/pauseAnimation/removeAnimation/
+  transformRelatedPropertyDidChange` for opacity, translate, rotate, scale,
+  transform (forwards, rate 1, as GraphicsLayerCoordinated; filters stay on
+  the main thread). A layer's animations go whole in `WCLayerUpdateInfo`
+  (`WCLayerChange::Animations`, `WCAnimations`: keyframes with timing
+  functions, duration, iterations, direction, fill, start time, pause state,
+  the non-animated transform parts; ~140 lines incl. serialization).
+  `WCScene::apply` builds TextureMapperAnimations, `WCScene::paint` runs them
+  at the frame's display time. `PS5WCHost` paints every frame while they
+  run; such a frame waits (until 6 ms before it is due) for the update the
+  WebProcess sends after its last reply, otherwise rendering updates drop to
+  30/s (measured: 30.0 updates/s and rAF 30/s before that wait). Layers under
+  a running transform animation are tiled whole (≤ 4 Mpx) so they don't move
+  out of their tiles. `PS5WK_WC_ANIMATIONS=0` = main-thread animations.
+  Size: ~330 lines in all.
+- Tests (`port/webkit/test/paint/`): `sticky.html` (sticky header, sticky
+  sidebar with its own overflow, sticky headings, sticky table header in an
+  overflow scroller that follows the page scroll, fixed footer),
+  `animations.html` (`?auto`: CSS animations, a CSS transition, Web
+  Animations, a rAF-driven box, a 2600 px strip sliding in a 1340 px clip;
+  6 s idle, 6 s with the main thread blocked 100 ms every 300 ms, 6 s idle),
+  `scroll-to.js` (stop at 1520 px for captures), `shot-diff.py` (CPU vs WC
+  captures), `title-anim-summary.py`.
+
+**Sticky, measured** (title, log-only, same build, `scroll-raf.js` as in M2,
+`PS5WK_RENDER_LOG=2`; off = `PS5WK_WC_STICKY=0`). Mpx painted per rendering
+update during the 10 s scroll:
+
+| page | sticky | Mpx/update avg | p50 | updates ≥ 0.5 Mpx | main thread ms avg / p95 | layers | GL textures median / max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `sticky.html` | off | 0.190 | 0.180 | 42 of 599 | 4.3 / 17.0 | 41-43 | 34.5 / 49.8 MB |
+| | on | 0.103 | 0.030 | 43 of 600 | 2.1 / 12.8 | 49 | 35.6 / 49.8 MB |
+| Wikipedia article | off | 0.640 | 0.410 | 64 of 569 | 6.4 / 24.9 | 10 | 30.5 / 34.2 MB |
+| | on | 0.360 | 0.020 | 68 of 587 | 3.1 / 21.4 | 16 | 28.2 / 35.7 MB |
+| MDN docs page | off | 0.296 | 0.320 | 10 of 597 | 10.0 / 14.1 | 81-94 | 32.3 / 38.1 MB |
+| | on | 0.041 | 0.020 | 11 of 600 | 5.5 / 7.4 | 99 | 33.4 / 39.2 MB |
+
+- Ordinary steps now paint 0.02-0.03 Mpx: the scrollbar layer (0.02) and,
+  on `sticky.html`, the footer's own scrollY counter. What is left of the
+  average is tile-row crossings (the ≥ 0.5 Mpx steps, unchanged: M5).
+- Presents 58.8-60/s and rAF ≤ 60/s with sticky on (Wikipedia 56.9 → 58.8).
+- No layer explosion: +6 to +18 layers, GL textures within ±2 MB.
+- **Correctness:** CPU path vs WC (sticky on), `scroll-to.js` (stopped at
+  1520 px), captures at +2 s and +10 s, `shot-diff.py`: `sticky.html`
+  0.00 % at both (sticky header, sidebar, headings, the table header inside
+  the scrolled overflow box and the fixed footer all in place),
+  `layers.html` 0.00 % after the scroll (1.07 % before it: M1's 3D box),
+  MDN 0.00 % after the scroll (ad bar before it), Wikipedia 20-22 %: the
+  donation banner was served to the CPU run only and shifted the article;
+  the sticky contents column and appearance panel are identical.
+
+**Animations, measured** (`animations.html?auto`, `title-anim-summary.py`;
+main thread = `PS5WK_WC_ANIMATIONS=0`, i.e. M2's state: the main thread
+steps the animations and sets layer transform/opacity each frame). Per
+phase; "busy" = the main thread blocked 100 ms every 300 ms:
+
+| animations | phase | rendering updates/s | main thread ms/update avg / p95 | Mpx/update | scene paints/s (animation-only) | longest gap between painted frames | page rAF/s, longest rAF gap |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| main thread | idle | 59.7 | 1.6 / 2.1 | 0.028 | 59.7 (0) | (one paint per update) | 59.7, 54 ms |
+| | busy | 46.7 | 1.6 / 2.3 | 0.024 | 47.2 (0) | ~117 ms (every 300 ms) | 46.7, 116 ms |
+| accelerated (first version) | idle | 30.0 | 1.5 / 2.3 | 0.035 | 59.7 (29.8) | 17.7-19.7 ms | 30.0, 54 ms |
+| | busy | 23.3 | 1.4 / 2.2 | 0.027 | 60.0 (36.5) | 17.6-18.9 ms | 23.3, 118 ms |
+| accelerated (final) | idle | 59.5 | 1.5 / 2.0 | 0.028 | 59.5 (0) | 16.8 ms after the first second | 59.5, 59 ms |
+| | busy | 40.7 | 1.4 / 2.1 | 0.024 | 60.0 (19.2) | **16.8 ms** | 40.7, 117 ms |
+| | idle2 | 60.0 | 1.4 / 2.0 | 0.023 | 60.0 (0) | 16.8 ms | 60.0, 18 ms |
+
+- Main-thread animations already repaint nothing in WC: they have their own
+  layers and each frame only changes layer properties. The 0.023-0.028 Mpx
+  per update is the page's rAF-driven box (a 2D `style.transform` without a
+  layer, repainted at old and new place), on both paths.
+- What acceleration buys is smoothness under load: with the main thread
+  blocked, CSS animations, the transition and the Web Animation keep moving
+  at 60 frames/s without a missed vsync (longest gap between painted frames
+  16.8 ms), where the main-thread path freezes them for ~117 ms every 300 ms.
+  The rAF-driven box still freezes (only the main thread can move it).
+- "First version": the host painted animation frames right after each swap,
+  before the WebProcess's next update arrived, so every update waited one
+  extra frame (30 updates/s). The final version waits for it (≤ 6 ms before
+  the frame is due): 59.5-60 updates/s again, "waited for" in 56-60 of 60
+  frames/s when idle. Animation time = the frame's display time.
+- The longest gap in the first second (34-73 ms) is the first use of new
+  shader programs and the strip's tiles; captures (`debug-screenshot`) add a
+  ~120 ms stall each, so animation runs are made without them.
+- Correctness: WC captures of `animations.html` show every box and the
+  sliding strip fully drawn where it has moved into what was clipped at the
+  start (whole-layer tiling for animated layers).
+- Memory: 19-23 layers, GL textures 16.1-17.4 MB on this page.
+
+**Left for later / plan changes:**
+- Scrolling is still main-thread: composited sticky and fixed layers move
+  in each scroll step's rendering update (no repaint, but a commit per
+  step). Async scrolling in the scene (scroll offset + sticky/fixed
+  constraints applied in `WCScene`) is the next step if JS-heavy pages make
+  scrolling stutter; the animation path (scene-side state, a frame waits
+  for the update) is the model for it.
+- Sticky elements inside overflow that is not a composited scroller (e.g.
+  `overflow: hidden` ancestors), and in frames that don't scroll
+  composited, stay painted (they don't move with the page scroll anyway).
+- Not accelerated: filter animations, reverse directions and playback
+  rates ≠ 1 (as GraphicsLayerCoordinated), animated layers over 4 Mpx
+  (normal coverage), scroll-driven animations.
+- Tile-row crossings (≥ 0.5 Mpx steps, 15-34 ms) dominate what scrolling
+  still paints: M5.
+- The title abort seen in the owner's TV test after these builds was the
+  BitmapTexturePool release timer (fixed separately, 7d09449da9).
