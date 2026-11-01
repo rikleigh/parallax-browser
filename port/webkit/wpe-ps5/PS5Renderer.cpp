@@ -19,6 +19,7 @@
 #include "config.h"
 #include "PS5Renderer.h"
 
+#include "PS5GLBench.h"
 #include "PS5Text.h"
 #include "PS5VideoDecoder.h"
 #include "PS5VideoServer.h"
@@ -424,6 +425,7 @@ bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
     g_message("[wpe-ps5] PS5Renderer: EGL %s, GL %s, %dx%d, render thread; page %s", eglQueryString(display, EGL_VERSION),
         reinterpret_cast<const char*>(glGetString(GL_VERSION)), m_width, m_height,
         m_pageAsTexture ? "as a texture (glTexSubImage2D)" : "in a persistent GL buffer");
+    ps5GLBenchMaybeRun(m_width, m_height); // spike S1a, /data/ps5webkit/glbench only
     return true;
 }
 

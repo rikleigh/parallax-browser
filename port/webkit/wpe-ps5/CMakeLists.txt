@@ -1,6 +1,7 @@
 # PS5 WPE Platform backend (port/webkit/wpe-ps5, linked into the tree as
 # Source/WebKit/WPEPlatform/wpe/ps5 by port/webkit/build.sh).
 set(WPEPlatformPS5_SOURCES
+    ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5GLBench.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5Renderer.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5RendererVR.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5Text.cpp
