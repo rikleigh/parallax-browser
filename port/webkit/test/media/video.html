@@ -21,6 +21,12 @@ body.geometry #clip{position:relative;width:900px;height:420px;overflow:hidden;b
 body.geometry video{width:1280px;height:720px;margin:-150px 0 0 -190px}
 #label{display:none}
 body.geometry #label{display:block;position:absolute;left:40px;top:40px;padding:14px 20px;background:rgba(0,0,0,.55);color:#fff;font:28px sans-serif;border-radius:10px}
+/* ?test=transform: the video turned and scaled, at 60% opacity over a
+   striped background, with the label on top (composited video layer:
+   transform, opacity, z-order). */
+body.transform #clip{position:relative;width:1280px;height:720px;margin:20px 0 0 160px;background:repeating-linear-gradient(45deg,#c03030 0 40px,#3060c0 40px 80px)}
+body.transform video{transform:rotate(-6deg) scale(.8);opacity:.6}
+body.transform #label{display:block;position:absolute;left:60px;top:60px;padding:14px 20px;background:rgba(0,0,0,.55);color:#fff;font:28px sans-serif;border-radius:10px}
 </style></head><body>
 <h1>Video test</h1>
 <ul>
@@ -32,6 +38,7 @@ body.geometry #label{display:block;position:absolute;left:40px;top:40px;padding:
 <li><a href="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube: Big Buck Bunny 60 fps</a></li>
 <li><a href="https://www.youtube.com/watch?v=jNQXAC9IVRw">YouTube: Me at the zoo</a></li>
 <li><a href="?src=media/sync-1080p30-h264.mp4&amp;test=geometry">Clipped, overlaid, scrolling (1080p30)</a></li>
+<li><a href="?src=media/sync-1080p30-h264.mp4&amp;test=transform">Turned, scaled, translucent (1080p30)</a></li>
 <li><a href="https://www.youtube.com/watch?v=eRsGyueVLvQ">YouTube: Sintel (1080p24)</a></li>
 <li><a href="?src=media/hls-ts/master.m3u8&amp;type=application/x-mpegURL">HLS: H.264 + AAC, TS, 2 variants</a></li>
 <li><a href="?src=media/hls-fmp4/master.m3u8&amp;type=application/vnd.apple.mpegurl">HLS: HEVC + AAC, fMP4, 2 variants</a></li>
@@ -46,6 +53,24 @@ if (params.get('test') === 'geometry') {
   document.body.className = 'geometry';
   var down = false;
   setInterval(function () { down = !down; window.scrollTo(0, down ? 160 : 0); console.log('GEOMETRY scrolled to ' + window.scrollY); }, 3000);
+}
+if (params.get('test') === 'transform')
+  document.body.className = 'transform';
+// ?test=fullscreen: the video goes fullscreen 3 s after it starts playing.
+if (params.get('test') === 'fullscreen') {
+  v.addEventListener('playing', function () {
+    setTimeout(function () {
+      var r = v.requestFullscreen ? v.requestFullscreen() : (v.webkitEnterFullscreen && v.webkitEnterFullscreen());
+      console.log('FULLSCREEN requested');
+      if (r && r.then) r.then(function () { console.log('FULLSCREEN ok'); }, function (e) { console.log('FULLSCREEN failed: ' + e.name + ' ' + e.message); });
+    }, 3000);
+  }, { once: true });
+}
+// requestVideoFrameCallback: presented frames as the page sees them.
+var rvfc = 0, rvfcFrames = 0;
+if (v.requestVideoFrameCallback) {
+  var onFrame = function (now, meta) { rvfc++; rvfcFrames = meta.presentedFrames; v.requestVideoFrameCallback(onFrame); };
+  v.requestVideoFrameCallback(onFrame);
 }
 var last = null, fps = 0, log = [];
 if (src && params.get('type')) {
@@ -69,7 +94,7 @@ window.ps5wkVideoStats = function () {
   var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
   return { src: src, t: +v.currentTime.toFixed(2), dur: +(v.duration || 0).toFixed(1), size: v.videoWidth + 'x' + v.videoHeight,
     total: q.totalVideoFrames, dropped: q.droppedVideoFrames, fps: +fps.toFixed(1), paused: v.paused, muted: v.muted,
-    volume: v.volume, ready: v.readyState, events: log.slice(-12).join(' ') };
+    volume: v.volume, ready: v.readyState, rvfc: rvfc, presented: rvfcFrames, events: log.slice(-12).join(' ') };
 };
 setInterval(function () {
   if (!src) return;
