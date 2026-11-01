@@ -835,6 +835,37 @@ port.
   - Tooling fixes: elfldr briefly refuses loopback connections (ECONNREFUSED)
     under back-to-back launches; the process manager now retries for 10 s.
     On 13.60 another thread's CPU clock reads as the caller's.
-  - Next (not done): a larger JIT pool A/B (hours), HSTS writes only on real
-    changes (hours), 60 Hz pacing (hours), composited fixed/sticky layers or
-    GPU painting for scrolling (days to weeks).
+  - Next (not done): 60 Hz pacing (hours), composited fixed/sticky layers or
+    GPU painting for scrolling (days to weeks). The JIT pool and the HSTS
+    writes were done on 2026-11-01 (next item).
+- **JIT pool and HSTS writes (2026-11-01, harness only; README, *JIT pool
+  and HSTS writes*).**
+  - **HSTS**: a libsoup deps patch writes the HSTS database only on real
+    policy changes (new host, removal, includeSubDomains, expiry moved by
+    more than a day or half the max-age), and keeps the in-memory policy
+    current. HSTS code on the NetworkProcess main thread during a The Verge
+    load: 26% of its CPU before (1 run; 12.5% of wall time in a wall-clock
+    run), 0.0-0.6% after (7 runs). Storing and http->https upgrades after a
+    restart are not checked on the console yet (`test/net/hsts-test.sh`).
+  - **JIT pool**: 256 MB per WebProcess (was 128 MB;
+    `/data/ps5webkit/no-bigjitpool` restores it). A reservation costs one
+    CPU page table per 2 MB at mmap time, touched or not (+64 for 256 MB,
+    +192 for 512 MB, against 128 MB), and no real memory beyond the code
+    written. Over 2 runs per size on YouTube search and channel pages and
+    The Verge, the tier-up multiplier fell (channel x1.49 -> x1.22 -> x1.10,
+    The Verge x1.22 -> x1.10 -> x1.05 for 128/256/512 MB), but main-thread
+    CPU, load times and memory moved only within run-to-run noise. 256 MB
+    takes most of the threshold inflation away for a third of 512 MB's
+    page-table cost. Low confidence; tier-up threshold options not tried.
+  - **Console health, open**: two console crashes are unexplained (one
+    during a 129 MB ps5wk-shot send to elfldr, one overnight after stalled
+    129 MB sends while the link ran at 0.1-0.5 MB/s). Since then: swap
+    grows with our runs and doesn't come back when idle (0 -> 382 MB over 9
+    runs, 418 MB after 18; idle system RSS 1194 -> ~600 MB), the prime
+    suspect; elfldr keeps ~145 of 160 MB FMEM after taking a 129 MB ELF;
+    FTP downloads run at ~2.5 MB/s right after another transfer and 8 MB/s
+    after an idle gap (a timing effect, also on a fresh boot); page tables
+    and the kernel's BUDGET_FD_FILE count return to their floor after every
+    run. The harness now uploads ps5wk-shot once and starts it from the
+    console's disk (`test/shotrelay`), so no large payload is sent from the
+    Mac to elfldr.

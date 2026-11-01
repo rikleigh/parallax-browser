@@ -254,6 +254,7 @@ static void setupEnvironment(const char* launchPath)
 //   PS5WK_JIT=dfg       + DFG
 //   PS5WK_JIT=1 / ftl   + FTL (all tiers, the default)
 // JSC_* variables (JSC options, e.g. JSC_useFTLJIT=false) in child.env win.
+static constexpr unsigned ps5wkJITPoolMB = 256;
 static void configureJIT()
 {
     const char* knob = getenv("PS5WK_JIT");
@@ -270,10 +271,32 @@ static void configureJIT()
     setenv("JSC_numberOfBaselineCompilerThreads", "1", 0);
     setenv("JSC_numberOfDFGCompilerThreads", "1", 0);
     setenv("JSC_numberOfFTLCompilerThreads", "1", 0);
+    // The executable pool: JSC multiplies every tier-up threshold by
+    // available / (available - used), with available = 3/4 of the pool, and
+    // YouTube writes 30-40 MB of code into the 128 MB that patch 0030
+    // reserves (thresholds x1.5-1.9). A bigger pool costs one CPU page table
+    // per 2 MB reserved, touched or not (test/memprobe/rwxprobe.c: +64 for
+    // 256 MB), and real memory only for the code JSC writes. 256 MB took
+    // the multiplier to x1.1-1.5; 512 MB (x1.05-1.2) showed no further
+    // gain in main-thread CPU or load time in the harness (README, JIT).
+    // /data/ps5webkit/no-bigjitpool keeps 128 MB;
+    // JSC_jitMemoryReservationSize=<bytes> in child.env sets any size.
+    char pool[96] = "none";
+    const char* size = getenv("JSC_jitMemoryReservationSize");
+    if (!off && size)
+        snprintf(pool, sizeof pool, "%.0f MB (JSC_jitMemoryReservationSize)", strtod(size, nullptr) / 1048576);
+    else if (!off && !access("/data/ps5webkit/no-bigjitpool", F_OK))
+        snprintf(pool, sizeof pool, "128 MB (no-bigjitpool)");
+    else if (!off) {
+        char bytes[32];
+        snprintf(bytes, sizeof bytes, "%llu", (unsigned long long)ps5wkJITPoolMB << 20);
+        setenv("JSC_jitMemoryReservationSize", bytes, 0);
+        snprintf(pool, sizeof pool, "%u MB (/data/ps5webkit/no-bigjitpool: 128 MB)", ps5wkJITPoolMB);
+    }
     const char* dfg = getenv("JSC_useDFGJIT");
     const char* ftl = getenv("JSC_useFTLJIT");
-    LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s)", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),
-        dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "", ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "");
+    LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s), executable pool %s", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),
+        dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "", ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "", pool);
 }
 
 // Asks the title's video server what it decodes in hardware (HELLO with

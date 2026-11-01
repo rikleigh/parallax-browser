@@ -1407,8 +1407,13 @@ So the UIProcess title, ps5wk-shot and the NetworkProcess stay on the LLInt
 without any change of their own. `ps5wk-child` turns the JIT on for
 WebProcesses (`PS5WK_JIT`, see *Knobs*; the log says `JIT: on (...)`).
 
-- **Pool:** 128 MB reserved per WebProcess (upstream x86_64: 1 GB, about 512
-  page tables). `JSC_jitMemoryReservationSize=<bytes>` in child.env changes it.
+- **Pool:** 256 MB reserved per WebProcess since 2026-11-01 (ps5wk-child;
+  patch 0030's own default stays 128 MB; upstream x86_64: 1 GB). Each 2 MB
+  reserved costs one CPU page table whether touched or not, so 256 MB is
+  +64 against 128 MB. `/data/ps5webkit/no-bigjitpool` keeps 128 MB,
+  `JSC_jitMemoryReservationSize=<bytes>` in child.env sets any size; the
+  `JIT:` log line names the pool and where it came from. See *JIT pool and
+  HSTS writes*.
 - **WebAssembly** is compiled in, because B3 (the FTL backend) doesn't build
   without it upstream (`B3WasmStruct*`), and `ENABLE_WEBASSEMBLY_BBQJIT` alone
   didn't compile either. It is off at run time (`useWasm=false`, no fast
@@ -1902,7 +1907,8 @@ of the run):
   updates/s in the harness. Without accelerated compositing every
   transform/opacity change is a CPU repaint.
 
-**Ranked bottlenecks and fixes** (not done yet; effort is a rough guess):
+**Ranked bottlenecks and fixes** (not done yet, apart from the pool and the
+HSTS writes, see *JIT pool and HSTS writes*; effort is a rough guess):
 
 1. **JavaScript on the main thread** (YouTube, news sites: 55-60% of a busy
    main thread). Cheapest lever first: a larger JIT pool
@@ -1929,6 +1935,119 @@ of the run):
    load trigger. Effort: a day.
 6. Platform taxes (libpas page construction, emulated TLS, clock reads):
    1-3% each, later.
+
+## JIT pool and HSTS writes (2026-11-01)
+
+The two cheap items from *Profiling*. Harness only (ps5wk-shot, log-only,
+`test/prof/prof-run.sh` with `PS5WK_MEM_LOG=5`, summarized by
+`test/prof/ab-summary.py`); runs over the internet, cold cache, 1920x1080.
+
+**HSTS writes (deps patch `libsoup/0001-hsts-db-write-only-real-policy-changes.patch`).**
+libsoup's `SoupHSTSEnforcerDB` wrote an SQLite transaction (journal
+created, written, deleted) on the NetworkProcess main thread for every
+response with `Strict-Transport-Security`, because each one moves the
+policy's expiry by the seconds since the last. The patch remembers what the
+database holds per host and writes only real changes: a new host, a removed
+policy (max-age=0 or expired), includeSubDomains changed, or the expiry
+moved by more than a day (or by half the max-age when that is shorter, so
+short policies are still renewed). The in-memory policy is always the
+current one, so enforcement is unchanged; after a restart a policy can
+expire at most that much earlier. Rows read at startup are no longer
+written back either (upstream rewrote every row).
+
+| The Verge /tech, NetworkProcess main thread | runs | HSTS code | share |
+| --- | --- | --- | --- |
+| before (05dffa6 build, CPU profile) | 1 | 0.48 s of 1.84 s CPU | 26% |
+| before (wall-clock profile) | 1 | 3.43 s of 27.4 s | 12.5% |
+| after (CPU profile) | 7 | 0.00-0.01 s of 1.4-2.5 s CPU | 0.0-0.6% (median 0.4%) |
+
+Persistence and enforcement were **not yet checked on the console** (the
+console runs were stopped, see *Console health*): `test/net/hsts-test.sh`
+does it in four ps5wk-shot runs against hsts.badssl.com (HSTS over https,
+plain http without a redirect): the policy is stored, the row is not
+rewritten by a later response in a new NetworkProcess, http:// commits as
+https:// after a restart, and a control without a policy stays http.
+
+**JIT pool (ps5wk-child: 256 MB; `/data/ps5webkit/no-bigjitpool` keeps
+128 MB).** JSC multiplies every tier-up threshold by
+`available / (available - used)` with `available` = 3/4 of the pool (on
+PS5 the pool is one anonymous RWX mapping managed by JSC's MetaAllocator,
+not the libpas JIT heap). What the pool costs (`test/memprobe/rwxprobe.c`
+and the kernel's `page table CPU` count): **one CPU page table per 2 MB
+reserved, at mmap time, touched or not** (128 MB +64, 256 MB +128, 512 MB
++256, 1 GB +512; writing 48 MB into it added none; munmap gave them back).
+Real memory is only the code pages JSC writes (and they stay resident:
+decommit doesn't free on PS5).
+
+A/B, 2 interleaved rounds, so **2 runs per page and size** (medians; ranges
+in brackets where the runs differed):
+
+| page | pool | threshold multiplier | main-thread CPU | process CPU | load finished | JIT code | libpas committed | peak rss |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| YouTube search | 128 MB | x1.65 (1.56-1.73) | 10.8 s (10.2-11.4) | 14.9 s | 13 s (9.6-16.3) | 36 MB (32-41) | 644 MB | 594 MB |
+| | 256 MB | x1.49 | 13.8 s (12.0-15.6) | 19.8 s | 17 s | 62 MB (61-63) | 718 MB | 681 MB |
+| | 512 MB | x1.21 | 11.9 s (11.6-12.1) | 17.1 s | 16 s | 34 MB (32-35) | 587 MB | 552 MB |
+| YouTube channel | 128 MB | x1.49 | 7.3 s | 9.4 s | 9.3 s | 31 MB | 545 MB | 495 MB |
+| | 256 MB | x1.22 | 7.1 s | 9.2 s | 9.6 s | 34 MB | 543 MB | 507 MB |
+| | 512 MB | x1.10 | 7.8 s | 10.5 s | 9.9 s | 34 MB | 560 MB | 506 MB |
+| The Verge /tech | 128 MB | x1.22 | 17.7 s | 28.5 s | 15.8 s (13.8-17.9) | 17 MB | 706 MB | 672 MB |
+| | 256 MB | x1.10 | 17.2 s | 27.6 s | 14.6 s | 18 MB | 691 MB | 664 MB |
+| | 512 MB | x1.05 | 17.0 s | 27.5 s | 13.3 s | 17 MB | 681 MB | 646 MB |
+
+- The multiplier falls as the formula predicts. Everything else is within
+  run-to-run noise with two runs: The Verge's CPU drifts down 4% from 128
+  to 512 MB; on the YouTube channel 512 MB compiled more (DFG 929 against
+  743, FTL 16 against 5) and used 7% more CPU; YouTube search differs more
+  between its own runs (the results page changes from load to load) than
+  between sizes, and wrote 61-63 MB of code at 256 MB in both runs
+  (unexplained; 32-41 MB at the other sizes). No real-memory cost showed:
+  JIT code, libpas committed and peak rss are the same within noise.
+- **Default: 256 MB.** It takes most of the threshold inflation away
+  (YouTube channel x1.49 -> x1.22, The Verge x1.22 -> x1.10) for +64 page
+  tables per WebProcess against 512 MB's +192, and 512 MB showed no
+  further gain. **How sure:** low. This rests on 2 runs per configuration,
+  the mechanism (lower thresholds) is measured, a speedup is not. Tier-up
+  threshold options (`JSC_thresholdFor*`) were not tried. More rounds were
+  stopped for the console's health (below).
+
+**Console health (open issue).** Two console crashes are not explained:
+one during a 129 MB ps5wk-shot send to elfldr (an earlier session), and one
+overnight 2026-10-31/11-01 at an unknown time after ~01:05, following
+stalled 129 MB sends between 00:40 and 00:50; the console was found off and
+repaired its database on boot. Measured since (klogsrv with Mac timestamps,
+a ping every 5 s, a health check before each round):
+- **Last night's link**: from ~00:40 FTP ran at ~0.12 MB/s down and
+  ~0.5 MB/s up and elfldr took the 129 MB ps5wk-shot at a trickle (the
+  Mac's send queue stood full for 10+ minutes; pings up to 1 s while
+  sending, 5 ms idle). The owner's ps5upload sends multi-GB files without
+  problems, so a big transfer alone is an unlikely cause.
+- **Swap grows with our runs and doesn't come back**: SceShellCore's
+  `swap out` went 0 -> 18 MB after the first run, 382 MB after 9 runs (about
+  +20 MB per run), stayed at 378-380 MB after 6 minutes idle, and reached
+  418 MB after 9 more (+4 MB per run). Idle system RSS fell from 1194 to
+  551-617 MB: system processes are pushed out while a WebProcess holds
+  ~0.7-1 GB, and their pages stay out until touched. Swap and memory
+  pressure are the main suspect for the crashes.
+- **elfldr keeps ~145 MB after a big ELF**: its FMEM stood at 145.2 of
+  159.9 MB for the whole session after receiving ps5wk-shot over loopback
+  (268 of 301 MB while receiving it); a freshly started elfldr has 4.1 of
+  18.6 MB.
+- **FTP downloads**: 8 MB/s after an idle gap, ~2.5 MB/s for a download
+  started right after another transfer, also on a fresh boot (8.4, 3.4,
+  2.6 MB/s back to back; 8.2 after 30 s idle). The apparent session-long
+  slowdown from 8 to 2.4 MB/s was this timing effect, not the console
+  degrading. Uploads 12-15 MB/s and idle pings 4-6 ms throughout.
+- Not climbing: page tables peak at 6000-6400 during a run and return to
+  4928-4951 after each; the kernel's `fdescfree(), but remain
+  BUDGET_FD_FILE (ret=N)` warning at every process exit is a system-wide
+  count that falls back to the same floor (403, 413 after an elfldr
+  restart) after every run, so it is not a leak; no processes were left
+  over after any run.
+- Mitigation in the tooling: `run-shot.sh SHOT_REMOTE=<path>` (prof-run.sh
+  uses it by default) uploads ps5wk-shot once over FTP and starts it from
+  the console's disk through `test/shotrelay` (a small payload that sends
+  it to the local elfldr, as the title sends its children), so no large
+  payload goes from the Mac to elfldr any more.
 
 ## JSC `Date` (FEASIBILITY §8 item 5)
 

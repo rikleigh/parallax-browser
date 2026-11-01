@@ -9,7 +9,11 @@
 #   TEMPS="cold warm" SETTLE=12 SCROLL=1 DIAG=1 PROFILE=1 EXTRA_ENV="PS5WK_JIT=0" prof-run.sh <url>
 #
 # cold = a new, empty cache directory; warm = the same cache again. PROFILE:
-# 1 (CPU time, every thread) or wall (main thread). Take the console lock first.
+# 1 (CPU time, every thread) or wall (main thread). TAG=<name> is appended to
+# the run names (an A/B configuration; ab-summary.py groups by it). BLD=<build
+# dir> runs another build's ps5wk-child and ps5wk-shot. IDLE_PAYLOADS=<n>:
+# payloads that may stay running between runs (default 1, the ps probe; 2
+# with klogsrv). Take the console lock first.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -19,6 +23,8 @@ TEMPS="${TEMPS:-cold warm}"
 SETTLE="${SETTLE:-10}"
 PROFILE="${PROFILE:-1}"
 export CHILD_REMOTE="${CHILD_REMOTE:-/data/ps5webkit/prof/ps5wk-child.elf}"
+# ps5wk-shot is started from the console's disk (run-shot.sh SHOT_REMOTE).
+export SHOT_REMOTE="${SHOT_REMOTE-/data/ps5webkit/prof/ps5wk-shot.elf}"
 export SHOT_OUT="${SHOT_OUT:-$ROOT/toolchain/wpe-webkit/shots-prof/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$SHOT_OUT"
 js="$SHOT_OUT/page.js"
@@ -36,9 +42,11 @@ curl -s --ftp-create-dirs -T "$js" "$FTP/data/ps5webkit/shot/prof-page.js"
 # The child once, then a pause: let the console settle after a big transfer.
 . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
 mkdir -p "$SHOT_OUT/stripped"
-prospero-strip -o "$SHOT_OUT/stripped/ps5wk-child.elf" "$ROOT/toolchain/wpe-webkit/build/bin/ps5wk-child"
+prospero-strip -o "$SHOT_OUT/stripped/ps5wk-child.elf" "${BLD:-$ROOT/toolchain/wpe-webkit/build}/bin/ps5wk-child"
+prospero-strip -o "$SHOT_OUT/stripped/ps5wk-shot.elf" "${BLD:-$ROOT/toolchain/wpe-webkit/build}/bin/ps5wk-shot"
 if [[ -z ${SKIP_UPLOAD:-} ]]; then
     curl -s --ftp-create-dirs -T "$SHOT_OUT/stripped/ps5wk-child.elf" "$FTP$CHILD_REMOTE"
+    [[ -n $SHOT_REMOTE ]] && curl -s --ftp-create-dirs -T "$SHOT_OUT/stripped/ps5wk-shot.elf" "$FTP$SHOT_REMOTE"
     sleep 5
 fi
 # Wait (up to 60 s) until elfldr has no payload running but the ps probe
@@ -51,7 +59,7 @@ waitidle() {
         out="$({ cat "$ROOT/port/webkit/test/ps/ps.elf"; echo; } | socat -t 10 - "TCP:$PS5_HOST:$PS5_PORT" 2>/dev/null || true)"
         local elfldr; elfldr="$(echo "$out" | awk '$NF=="accept" && /elfldr/ {print $2}')"
         local busy; busy="$(echo "$out" | awk -v e="$elfldr" '$1=="pid" && $4==e' | wc -l | tr -d ' ')"
-        if [[ -n $elfldr && $busy -le 1 ]]; then
+        if [[ -n $elfldr && $busy -le ${IDLE_PAYLOADS:-1} ]]; then
             sleep 12 # a payload sent within seconds of the last one found elfldr refusing its child launches
             return 0
         fi

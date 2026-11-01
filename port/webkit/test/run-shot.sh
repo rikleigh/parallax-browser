@@ -11,6 +11,9 @@
 # BLD=<build dir>; CHILD_REMOTE=<path on the console> uploads the child there
 # and passes child=<path> (a second build next to the shared one, e.g.
 # CHILD_REMOTE=/data/ps5webkit/jit/ps5wk-child.elf); SHOT_OUT=<dir> for logs.
+# SHOT_REMOTE=<path on the console>: ps5wk-shot is uploaded there (FTP, unless
+# SKIP_UPLOAD) and started from there by test/shotrelay (a small payload that
+# sends it to the local elfldr), instead of sending 129 MB to elfldr each run.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -44,8 +47,19 @@ if [[ -z ${SKIP_UPLOAD:-} ]]; then
     curl -s --ftp-create-dirs -T "$OUTD/stripped/ps5wk-child.elf" "$FTP$CHILD_REMOTE"
 fi
 
+PAYLOAD="$OUTD/stripped/ps5wk-shot.elf"
+PREFIX=
+if [[ -n ${SHOT_REMOTE:-} ]]; then
+    prospero-clang -O2 -o "$OUTD/stripped/shotrelay.elf" "$HERE/shotrelay/shotrelay.c"
+    if [[ -z ${SKIP_UPLOAD:-} ]]; then
+        echo "==> uploading ps5wk-shot.elf to $SHOT_REMOTE (FTP)"
+        curl -s --ftp-create-dirs -T "$OUTD/stripped/ps5wk-shot.elf" "$FTP$SHOT_REMOTE"
+    fi
+    PAYLOAD="$OUTD/stripped/shotrelay.elf"
+    PREFIX="$SHOT_REMOTE "
+fi
 echo "==> ps5wk-shot $URL (timeout $TIMEOUT s)" | tee "$LOG"
-{ cat "$OUTD/stripped/ps5wk-shot.elf"; printf 'url=%s timeout=%s child=%s %s %s\n' "$URL" "$TIMEOUT" "$CHILD_REMOTE" "${SHOT_ARGS:-}" "${SHOT_DEBUG:+debug=$SHOT_DEBUG}"; } |
+{ cat "$PAYLOAD"; printf '%surl=%s timeout=%s child=%s %s %s\n' "$PREFIX" "$URL" "$TIMEOUT" "$CHILD_REMOTE" "${SHOT_ARGS:-}" "${SHOT_DEBUG:+debug=$SHOT_DEBUG}"; } |
     socat -t $((TIMEOUT + 60)) -T $((TIMEOUT + 60)) - "TCP:$PS5_HOST:$PS5_PORT" 2>&1 | tee -a "$LOG" | grep -v '^THUMB ' || true
 
 grep '^THUMB ' "$LOG" | cut -c7- | tr -d '\n' | base64 -D > "$OUTD/$STAMP.ppm" 2>/dev/null || true
