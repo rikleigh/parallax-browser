@@ -25,6 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
+#include <dirent.h>
+#include <map>
+#include <string>
 #include <new>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -186,6 +189,58 @@ static int rendezvous(const char* path, unsigned long long processIdentifier)
     return fd;
 }
 
+// The title is ended with SIGKILL, so its pid-named sockets and status files
+// (ui/audio/video-<pid>.sock, webmem-<pid>) stay in PS5WK_LAUNCH_DIR, a small
+// tmpfs: after ~14 launches the title's bind failed with ENOSPC. The title
+// itself can't list the directory (EPERM), so each new payload removes the
+// files of UIProcesses whose ui socket no longer has a listener.
+static void removeStaleRuntimeFiles(int uiPid)
+{
+    DIR* dir = opendir(PS5WK_LAUNCH_DIR);
+    if (!dir) {
+        LOG("stale files: cannot list %s: errno %d", PS5WK_LAUNCH_DIR, errno);
+        return;
+    }
+    auto uiAlive = [](int pid) {
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (fd < 0)
+            return true;
+        struct sockaddr_un address { };
+        address.sun_family = AF_UNIX;
+        snprintf(address.sun_path, sizeof(address.sun_path), PS5WK_LAUNCH_DIR "/ui-%d.sock", pid);
+        bool alive = !connect(fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address))
+            || (errno != ECONNREFUSED && errno != ENOENT);
+        close(fd);
+        return alive;
+    };
+    std::map<int, bool> alive;
+    unsigned removed = 0, failed = 0;
+    int unlinkError = 0;
+    while (struct dirent* entry = readdir(dir)) {
+        const char* name = entry->d_name;
+        int pid = 0, length = 0;
+        if ((sscanf(name, "ui-%d.sock%n", &pid, &length) != 1 && sscanf(name, "audio-%d.sock%n", &pid, &length) != 1
+            && sscanf(name, "video-%d.sock%n", &pid, &length) != 1 && sscanf(name, "webmem-%d%n", &pid, &length) != 1)
+            || name[length] || pid <= 0 || pid == uiPid)
+            continue;
+        auto it = alive.find(pid);
+        if (it == alive.end())
+            it = alive.emplace(pid, uiAlive(pid)).first;
+        if (it->second)
+            continue;
+        std::string path = std::string(PS5WK_LAUNCH_DIR "/") + name;
+        if (!unlink(path.c_str()))
+            removed++;
+        else {
+            failed++;
+            unlinkError = errno;
+        }
+    }
+    closedir(dir);
+    if (removed || failed)
+        LOG("stale files: removed %u from %s, %u not removed (errno %d)", removed, PS5WK_LAUNCH_DIR, failed, unlinkError);
+}
+
 static void setupEnvironment(const char* launchPath)
 {
     // elfldr payloads start with an empty environment.
@@ -243,6 +298,7 @@ static void setupEnvironment(const char* launchPath)
         char file[64];
         snprintf(file, sizeof(file), "/data/ps5webkit/child-%d.env", uiPid);
         readEnvFile(file);
+        removeStaleRuntimeFiles(uiPid);
     }
 }
 

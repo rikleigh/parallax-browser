@@ -343,7 +343,9 @@ static void removeStaleRuntimeFiles()
 {
     DIR* dir = opendir(PS5WK_LAUNCH_DIR);
     if (!dir) {
-        g_warning("[ps5-launch] cannot list %s: errno %d", PS5WK_LAUNCH_DIR, errno);
+        // A title gets EPERM here; ps5wk-child cleans up instead.
+        if (errno != EPERM)
+            g_warning("[ps5-launch] cannot list %s: errno %d", PS5WK_LAUNCH_DIR, errno);
         return;
     }
     unsigned entries = 0;
