@@ -26,6 +26,10 @@ body.geometry #label{display:block;position:absolute;left:40px;top:40px;padding:
    transform, opacity, z-order). */
 body.transform #clip{position:relative;width:1280px;height:720px;margin:20px 0 0 160px;background:repeating-linear-gradient(45deg,#c03030 0 40px,#3060c0 40px 80px)}
 body.transform video{transform:rotate(-6deg) scale(.8);opacity:.6}
+/* ?test=fill: the video fixed over the whole viewport, as the fullscreen
+   UA style puts it (requestFullscreen needs a user gesture: not in
+   log-only runs). */
+body.fill video{position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:5;object-fit:contain}
 body.transform #label{display:block;position:absolute;left:60px;top:60px;padding:14px 20px;background:rgba(0,0,0,.55);color:#fff;font:28px sans-serif;border-radius:10px}
 </style></head><body>
 <h1>Video test</h1>
@@ -54,8 +58,8 @@ if (params.get('test') === 'geometry') {
   var down = false;
   setInterval(function () { down = !down; window.scrollTo(0, down ? 160 : 0); console.log('GEOMETRY scrolled to ' + window.scrollY); }, 3000);
 }
-if (params.get('test') === 'transform')
-  document.body.className = 'transform';
+if (params.get('test') === 'transform' || params.get('test') === 'fill')
+  document.body.className = params.get('test');
 // ?test=fullscreen: the video goes fullscreen 3 s after it starts playing.
 if (params.get('test') === 'fullscreen') {
   v.addEventListener('playing', function () {
