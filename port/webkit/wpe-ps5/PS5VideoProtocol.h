@@ -66,10 +66,16 @@
  *             reset the decoder (seek)
  *   DDRAIN    epoch: decode what is queued and empty the decoder's
  *             pipeline, then DRAINED (end of stream)
- *   PRELEASE  token: a picture the proxy won't output (its frame is gone)
+ *   PRELEASE  token: the WebProcess gives that picture back: the proxy
+ *             won't output it (its frame is gone, clipped or late), or its
+ *             placeholder buffer was freed before the sink handed it to the
+ *             title (dropped, flushed or never rendered, wherever in the
+ *             pipeline). A picture sent in PICTURE is the WebProcess's until
+ *             then, or until the sink names it in a FRAME, a DFLUSH or the
+ *             connection closes: the title never takes it back by itself.
  * WebProcess -> title (sink connection):
  *   RDROP     decoder, token: a placeholder the sink dropped without
- *             rendering (late); its picture goes back to the decoder
+ *             rendering (no longer sent: the buffer's PRELEASE covers it)
  * title -> WebProcess (decoder connection):
  *   PICTURE   key, token, epoch, width/height (coded), pitch, bit_depth: a
  *             decoded picture, in display order. status != 0: no picture
@@ -123,13 +129,17 @@ enum {
 #define PS5WK_VCODEC_10BIT 0x100u /* HELLO_ACK: 10-bit HEVC/VP9 too */
 #define PS5WK_VAU_KEYFRAME 1u
 
-/* The placeholder buffer's memory (ps5vdecproxy -> ps5videosink). */
+/* The placeholder buffer's memory (ps5vdecproxy -> ps5videosink, inside the
+ * WebProcess only). handed_over: set (atomically) by the sink once a FRAME
+ * naming the picture reached the title, which then gives it back itself;
+ * when the memory is freed without it, the proxy sends PRELEASE. */
 #define PS5WK_REMOTE_MAGIC 0x52355350u /* "PS5R" */
 struct ps5wk_remote_picture {
     uint32_t magic;
     uint32_t decoder;
     uint32_t token;
     uint32_t epoch;
+    int32_t handed_over;
 };
 
 enum {

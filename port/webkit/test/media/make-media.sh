@@ -19,6 +19,9 @@
 #                           5 s each, AAC with the beeps, 20 s; switch-h264.m2ts the same in MPEG-TS
 #   preview-*.mp4           hover previews for preview.html: 380x222/440x248 H.264 High with
 #                           B-frames, no audio, 6 s, with and without the VUI reorder limits
+#   feed-*                  for feed.html (several players at once): 480x854 and 854x480 H.264
+#                           Main 3.1 with B-frames + AAC and 480x854 VP9 + Opus, 30 s; the
+#                           480x854 clip as fragmented MP4, video and audio apart (MSE)
 #   sound-test.m4a          audio only (no video decoder involved): a 440 Hz tone with a
 #                           1760 Hz beep at the start of every second, AAC-LC stereo, 60 s
 #   hls-ts/master.m3u8      HLS (as a VR site serves): 640x360 and 1280x720 H.264 + AAC
@@ -200,6 +203,33 @@ hls_vr() {
 }
 hls_vr
 
+# A feed of small videos (test/media/feed.html: several players open at
+# once, autoplaying, paused, seeking, scrolled and removed, as social feeds
+# run them): 480x854 and 854x480 H.264 Main level 3.1 with B-frames (VUI
+# reorder 2) and AAC, a keyframe every 2 s, 30 s, progressive MP4; a VP9 +
+# Opus WebM; and the 480x854 clip as fragmented MP4, video and audio apart,
+# for the page's MSE players (two SourceBuffers, as DASH players use them).
+feed() { # <name> <WxH>
+    local name=$1 size=$2 fs
+    [ -s "$OUT/$name" ] && { echo "  $name (exists)"; return; }
+    fs=$(( ${size%x*} / 5 ))
+    $FF -f lavfi -i "testsrc2=size=$size:rate=30" -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000" \
+        -filter_complex "[0:v]drawtext=fontfile=$FONT:fontsize=$fs:fontcolor=white:box=1:boxcolor=black@0.6:x=(w-tw)/2:y=(h-th)/2:text='%{eif\:t\:d}.%{eif\:mod(n\,30)\:d\:2}',drawbox=x=0:y=0:w=iw/8:h=ih/8:color=white:t=fill:enable='lt(mod(t\,1)\,0.1)',drawtext=fontfile=$FONT:fontsize=$((fs/3)):fontcolor=yellow:x=10:y=h-th-10:text='$name'[v];[1:a]volume=0.25,aformat=channel_layouts=stereo[a]" \
+        -map "[v]" -map "[a]" -t 30 \
+        $( [ "${name##*.}" = webm ] && echo "-c:v libvpx-vp9 -deadline realtime -cpu-used 8 -g 60 -b:v 800k -c:a libopus -b:a 64k" \
+            || echo "-c:v libx264 -profile:v main -level:v 3.1 -preset veryfast -pix_fmt yuv420p -bf 2 -g 60 -keyint_min 60 -sc_threshold 0 -b:v 1M -c:a aac -b:a 96k -movflags +faststart" ) \
+        "$OUT/$name"
+    echo "  $name ($(du -h "$OUT/$name" | cut -f1))"
+}
+feed feed-480x854-h264.mp4 480x854
+feed feed-854x480-h264.mp4 854x480
+feed feed-480x854-vp9.webm 480x854
+if [ ! -s "$OUT/feed-mse-480x854-video.mp4" ]; then
+    $FF -i "$OUT/feed-480x854-h264.mp4" -an -c copy -movflags frag_keyframe+empty_moov+default_base_moof "$OUT/feed-mse-480x854-video.mp4"
+    $FF -i "$OUT/feed-480x854-h264.mp4" -vn -c copy -frag_duration 2000000 -movflags empty_moov+default_base_moof "$OUT/feed-mse-480x854-audio.mp4"
+    echo "  feed-mse-480x854-video.mp4, feed-mse-480x854-audio.mp4"
+fi
+
 if [ "${1:-}" = --upload ]; then
     FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
     for f in "$OUT"/*.mp4 "$OUT"/*.webm "$OUT"/*.m4a "$OUT"/*.m2ts; do
@@ -212,6 +242,7 @@ if [ "${1:-}" = --upload ]; then
     done
     curl -s --ftp-create-dirs -T "$HERE/video.html" "$FTP/data/ps5webkit/video.html"
     curl -s --ftp-create-dirs -T "$HERE/preview.html" "$FTP/data/ps5webkit/preview.html"
+    curl -s --ftp-create-dirs -T "$HERE/feed.html" "$FTP/data/ps5webkit/feed.html"
     curl -s --ftp-create-dirs -T "$ROOT/port/webkit/runtime/start.html" "$FTP/data/ps5webkit/start.html"
     echo "uploaded to /data/ps5webkit/media/, video.html, start.html"
 fi

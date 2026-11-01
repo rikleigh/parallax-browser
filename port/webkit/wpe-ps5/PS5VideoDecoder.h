@@ -102,9 +102,11 @@ bool available();
 void serve(int fd, int pid, int streamID);
 
 // Consumer side (PS5VideoServer): a REMOTE frame's picture. pin() keeps it
-// (and its buffer) for drawing; release() gives the slot back. Pictures of
-// that decoder before token that nobody pinned are released too (the sink
-// drops late frames without telling anybody).
+// (and its buffer) for drawing; release() gives that picture's slot back
+// (wasPinned: it was presented; older pictures of that decoder still held
+// then were lost on the way and go back too, a safety net). The WebProcess
+// gives back what it doesn't hand to the title (PRELEASE: the proxy's drops
+// and every placeholder buffer freed unrendered).
 bool pin(uint32_t decoder, uint32_t token, PS5VideoPicture&);
 void release(uint32_t decoder, uint32_t token, bool wasPinned);
 

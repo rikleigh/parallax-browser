@@ -1,0 +1,192 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Feed test</title>
+<!-- Several videos at once, as social feeds run them: autoplaying muted
+     players, one left paused after preroll, an unmuted autoplay (which the
+     browser may block: paused after preroll too), MSE players with separate
+     video and audio SourceBuffers, a player that seeks into the middle of a
+     GOP as soon as it has metadata, players below the fold that are scrolled
+     in and out, paused and resumed, removed from the page and added again.
+     Clips from test/media/make-media.sh (feed-*), nothing third-party.
+     Served over http next to the clips (MSE from a file:// page fails with
+     MediaError 4):
+       tools/serve-media.py --port 8773 --page port/webkit/test/media/feed.html
+       then http://<mac>:8773/feed.html   (?media=<base URL>, ?secs=<n>)
+     WebKit suspends muted videos outside the viewport (non-MSE: pipeline to
+     NULL, resumed with a seek; MSE: PAUSED), so a player only counts as
+     stuck while it is at least half visible. Logs FEED lines every 2 s (per
+     player: current time, readyState, P = paused, V = visible, frames
+     shown-dropped), FEED STUCK when a visible player that should play didn't
+     advance for 4 s, and FEED DONE with the totals. -->
+<style>
+body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:24px 40px;height:2600px}
+h1{font-weight:600;font-size:28px;margin:0 0 8px}
+.row{display:flex;gap:24px;align-items:flex-start;margin-bottom:24px}
+.card{position:relative;background:#2d3a52;border-radius:8px;overflow:hidden}
+.card video{display:block;width:100%;height:100%;object-fit:contain;background:#000}
+.card b{position:absolute;left:8px;top:6px;font:18px monospace;color:#ffd060;text-shadow:0 0 4px #000}
+.tall{width:270px;height:480px}.wide{width:480px;height:270px}
+#below{position:absolute;top:1500px;left:40px}
+#tick{font:22px monospace;margin:4px 0 12px}
+#log{font:16px monospace;color:#c8f0c8;white-space:pre;position:fixed;right:24px;top:24px;width:560px;height:520px;overflow:hidden;background:#000a}
+</style></head><body>
+<h1>Feed test</h1>
+<div id="tick">0</div>
+<div class="row" id="top"></div>
+<div class="row" id="below"></div>
+<div id="log"></div>
+<script>
+var params = new URLSearchParams(location.search);
+var mediaBase = params.get('media') || (location.protocol === 'file:' ? 'media/' : '');
+var mseBase = params.get('mse') || mediaBase;
+var totalSecs = +(params.get('secs') || 100);
+var logEl = document.getElementById('log'), t0 = performance.now(), ticks = 0;
+function now() { return (performance.now() - t0) / 1000; }
+function say(s) { console.log('FEED ' + s); logEl.textContent = (s + '\n' + logEl.textContent).slice(0, 4000); }
+setInterval(function () { document.getElementById('tick').textContent = 'page alive ' + (++ticks); }, 100);
+
+var players = {}; // name -> { v, card, shouldPlay, visible, last, stuckTicks, advanced, ... }
+var seen = new IntersectionObserver(function (entries) {
+  entries.forEach(function (e) { if (e.target.player) e.target.player.visible = e.intersectionRatio >= 0.5; });
+}, { threshold: [0, 0.5, 1] });
+function card(name, cls, where) {
+  var c = document.createElement('div');
+  c.className = 'card ' + cls;
+  c.innerHTML = '<b>' + name + '</b>';
+  document.getElementById(where).appendChild(c);
+  return c;
+}
+function track(name, v, c, shouldPlay) {
+  var p = { v: v, card: c, shouldPlay: shouldPlay, visible: false, wasVisible: false, last: -1, stuckTicks: 0, stuckEvents: 0, advanced: 0,
+    visibleTicks: 0, events: [] };
+  c.player = p;
+  seen.observe(c);
+  ['playing', 'waiting', 'stalled', 'error', 'seeking', 'seeked', 'pause', 'play'].forEach(function (e) {
+    v.addEventListener(e, function () { p.events.push(e + '@' + now().toFixed(1)); if (e === 'error') say(name + ' MediaError ' + (v.error && v.error.code)); });
+  });
+  players[name] = p;
+  return p;
+}
+function progressive(name, src, cls, where, opts) {
+  var c = card(name, cls, where), v = document.createElement('video');
+  v.playsInline = true;
+  v.loop = true;
+  v.muted = !!opts.muted;
+  v.preload = 'auto';
+  if (opts.autoplay) v.autoplay = true;
+  if (opts.seekTo) v.addEventListener('loadedmetadata', function once() { v.removeEventListener('loadedmetadata', once); v.currentTime = opts.seekTo; });
+  v.src = mediaBase + src;
+  c.appendChild(v);
+  return track(name, v, c, !!opts.autoplay && (opts.muted || opts.mayPlay));
+}
+function mse(name, where) {
+  var c = card(name, 'tall', where), v = document.createElement('video');
+  v.playsInline = true; v.muted = true; v.loop = true; v.autoplay = true;
+  var ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  c.appendChild(v);
+  var p = track(name, v, c, true);
+  ms.addEventListener('sourceopen', function () {
+    var parts = [['video/mp4; codecs="avc1.4D401F"', 'feed-mse-480x854-video.mp4'], ['audio/mp4; codecs="mp4a.40.2"', 'feed-mse-480x854-audio.mp4']];
+    var done = 0;
+    parts.forEach(function (part) {
+      var sb = ms.addSourceBuffer(part[0]);
+      fetch(mseBase + part[1]).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); }).then(function (data) {
+        var offset = 0, chunk = 128 * 1024;
+        // As a player does: keep a few seconds buffered ahead, append more as playback goes on.
+        function more() {
+          if (ms.readyState !== 'open' || sb.updating) return;
+          var ahead = sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) - v.currentTime : 0;
+          if (offset >= data.byteLength) {
+            if (++done === parts.length && ms.readyState === 'open') ms.endOfStream();
+            return;
+          }
+          if (ahead > 6 && offset) { setTimeout(more, 500); return; }
+          var piece = data.slice(offset, Math.min(offset + chunk, data.byteLength));
+          offset += piece.byteLength;
+          sb.appendBuffer(piece);
+        }
+        sb.addEventListener('updateend', more);
+        more();
+      }).catch(function (e) { say(name + ' MSE fetch of ' + mseBase + part[1] + ' failed: ' + e); });
+    });
+  });
+  return p;
+}
+function removePlayer(name) {
+  var p = players[name];
+  if (!p) return;
+  var t = performance.now();
+  p.v.pause(); p.v.removeAttribute('src'); p.v.load(); seen.unobserve(p.card); p.card.remove();
+  say(name + ' removed in ' + Math.round(performance.now() - t) + ' ms');
+  delete players[name];
+  finished.push(summary(name, p));
+}
+function summary(name, p) {
+  var q = p.v.getVideoPlaybackQuality ? p.v.getVideoPlaybackQuality() : {};
+  return name + ' stuck ' + p.stuckEvents + ' (' + (p.stuckTotal || 0) + ' of ' + p.visibleTicks + ' visible ticks), advanced ' + p.advanced.toFixed(1) +
+    ' s while visible, frames ' + q.totalVideoFrames + '-' + q.droppedVideoFrames;
+}
+var finished = [];
+
+// t = 0: four players on screen, two below the fold.
+progressive('A', 'feed-480x854-h264.mp4', 'tall', 'top', { autoplay: true, muted: true });
+progressive('B', 'feed-854x480-h264.mp4', 'wide', 'top', {});            // preload only: paused after preroll
+mse('C', 'top');
+progressive('D', 'feed-480x854-h264.mp4', 'tall', 'top', { autoplay: true, mayPlay: true }); // unmuted autoplay: may be blocked
+progressive('E', 'feed-480x854-h264.mp4', 'tall', 'below', { autoplay: true, muted: true, seekTo: 1.5 }); // mid-GOP start, off screen
+progressive('F', 'feed-480x854-vp9.webm', 'tall', 'below', { autoplay: true, muted: true });
+mse('M', 'below');                                                      // MSE below the fold: suspended to PAUSED
+
+var timeline = [
+  [8, 'B play', function () { players.B.v.muted = true; players.B.v.play(); players.B.shouldPlay = true; }],
+  [12, 'scroll down 1000', function () { window.scrollTo(0, 1000); }],
+  [18, 'C pause', function () { players.C.v.pause(); players.C.shouldPlay = false; }],
+  [22, 'scroll up', function () { window.scrollTo(0, 0); }],
+  [24, 'C play', function () { players.C.v.play(); players.C.shouldPlay = true; }],
+  [28, 'A removed, G (MSE) added', function () { removePlayer('A'); mse('G', 'top'); }],
+  [34, 'B pause', function () { players.B.v.pause(); players.B.shouldPlay = false; }],
+  [38, 'scroll down 700', function () { window.scrollTo(0, 700); }],
+  [40, 'B play', function () { players.B.v.play(); players.B.shouldPlay = true; }],
+  [44, 'C seek 10', function () { players.C.v.currentTime = 10; }],
+  [48, 'scroll up', function () { window.scrollTo(0, 0); }],
+  [50, 'E removed, H (seeks to 1.5) added', function () { removePlayer('E'); progressive('H', 'feed-854x480-h264.mp4', 'wide', 'top', { autoplay: true, muted: true, seekTo: 1.5 }); }],
+  [56, 'scroll down 1000', function () { window.scrollTo(0, 1000); }],
+  [62, 'scroll up', function () { window.scrollTo(0, 0); }],
+  [64, 'F pause', function () { players.F.v.pause(); players.F.shouldPlay = false; }],
+  [68, 'F play', function () { players.F.v.play(); players.F.shouldPlay = true; }],
+  [72, 'scroll down 1000', function () { window.scrollTo(0, 1000); }],
+  [78, 'scroll up', function () { window.scrollTo(0, 0); }],
+  [84, 'scroll down 1000', function () { window.scrollTo(0, 1000); }],
+  [90, 'scroll up', function () { window.scrollTo(0, 0); }],
+];
+timeline.forEach(function (e) { setTimeout(function () { say('at ' + now().toFixed(1) + ': ' + e[1]); e[2](); }, e[0] * 1000); });
+
+setInterval(function () {
+  var line = 't=' + now().toFixed(0);
+  Object.keys(players).forEach(function (name) {
+    var p = players[name], v = p.v, q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+    var moved = p.last < 0 ? 0 : v.currentTime - p.last;
+    if (moved < 0) moved += v.duration || 0; // looped
+    // Judged only over a whole tick in view (a resume from WebKit's suspend reopens the pipeline and seeks).
+    var should = p.shouldPlay && !v.paused && !v.seeking && p.last >= 0 && p.visible && p.wasVisible;
+    if (should) {
+      p.visibleTicks++;
+      if (moved > 0.1) p.advanced += Math.min(moved, 4);
+    }
+    if (should && moved < 0.2) {
+      p.stuckTotal = (p.stuckTotal || 0) + 1;
+      if (++p.stuckTicks === 2) { p.stuckEvents++; say('STUCK ' + name + ' at ' + v.currentTime.toFixed(2) + ' ready ' + v.readyState + ' events ' + p.events.slice(-6).join(' ')); }
+    } else p.stuckTicks = 0;
+    p.last = v.currentTime;
+    p.wasVisible = p.visible;
+    line += ' ' + name + ':' + v.currentTime.toFixed(1) + '/r' + v.readyState + (v.paused ? '/P' : '') + (p.visible ? '/V' : '') + '/f' + q.totalVideoFrames + '-' + q.droppedVideoFrames;
+  });
+  say(line);
+}, 2000);
+
+setTimeout(function () {
+  var all = finished.concat(Object.keys(players).map(function (n) { return summary(n, players[n]); }));
+  say('DONE ' + all.join('; '));
+}, totalSecs * 1000);
+</script>
+</body></html>

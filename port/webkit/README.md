@@ -851,12 +851,14 @@ planned below, with these details:
   number, plus bit 62 for VP9 hidden frames (superframes split here), so
   alt-ref pictures are dropped by pts, not by call order (Spike 9's
   off-by-one). H.264/HEVC parameter sets are cached and put back in front
-  of the first keyframe after a reset. Flush = `vdec2_renew`. Slots come
-  back when the consumer has presented the picture (pinned while drawn,
-  released after the swap), when a later picture of the same decoder is
-  consumed (the sink dropped this one), on PRELEASE/RDROP/flush, or, as a
-  safety net, the oldest unpinned one after 1.5 s without a free slot (a
-  frame skipped after a long pause at worst, never a stall).
+  of the first keyframe after a reset. Flush = `vdec2_renew`. A picture
+  sent to the WebProcess is the WebProcess's until it comes back: when
+  the consumer has presented it (pinned while drawn, released after the
+  swap) or skipped it, on PRELEASE (the proxy's drops, and every
+  placeholder buffer freed before the sink handed it over), on a flush, or
+  when the connection closes. The title never takes one back by itself
+  (until 2026-11-01 it did after 1.5 s without a free slot: see *Feeds
+  with several videos* below).
   Decoders are opened at 3840x2160 for VP9 (13 MB of flexible memory) and
   at least 1920x1088 for H.264, so YouTube's resolution switches within
   that keep the decoder; pipeline depth 4 up to 4K, 2 above (8K: 139 MB of
@@ -987,6 +989,107 @@ without the SPS's VUI reorder limits (`strip-vui-restriction.py`), each
 removed after 2.5 s; `PREVIEW` lines give the frames shown and how long the
 removal took. The level 2.0 clip (DPB 7) is the control that should play
 even with the old limit.
+
+**Feeds with several videos: stalled decoders (found and fixed
+2026-11-01).** On a feed page with several autoplaying videos (the owner's
+session, `tv18.log`), some videos spun forever or crawled, and the title
+logged `no free output slot for 1.5 s: took back 6 pictures` 34 times over
+24 decoders (19 over 15 the session before), 0 decode errors. Who held the
+pictures: the title decodes ahead into 12 output slots and keeps each
+picture until the WebProcess gives it back. A video that is not playing
+legitimately holds them: a paused or prerolled player (preload, an autoplay
+that waits, a player resumed later) has 1 picture in the sink's preroll, 3
+in playsink's `vqueue`, 1 in the decoder's blocked push and the rest
+decoded but unread in the proxy's socket (it reads replies only while it
+handles input); WebKit also suspends muted videos outside the viewport
+(`managePlayerSuspend`: non-MSE pipelines to NULL, resumed with a seek; MSE
+players to PAUSED, decoder kept). With up to 32 access units in flight the
+decoder filled all 12 slots and waited, and after 1.5 s the safety net
+**took back the older half of pictures the WebProcess still owned**,
+decoded more into them, and again every 1.5-2 s. When the player then ran,
+its frames named pictures that had been overwritten: the title skipped
+them (a frozen start, then a jump: 19-65 frames dropped per resumed
+player), and the decoder had thrown away whole runs of pictures. Each
+round also sent 6 more replies into the unread socket. The safety net
+existed because pictures used to be dropped without a release (QoS, TV
+test 2026-10-28). Now:
+- **Ownership instead of a timeout**: a picture is the WebProcess's from
+  PICTURE until the sink hands it to the title (FRAME) or it is given back;
+  the decoder simply waits for a slot (one log line after 10 s: `every
+  output slot held for 10 s ... the video is paused or hidden`).
+- **Every unrendered picture is given back by its buffer**: the proxy's
+  placeholder is now memory with a free callback; freed before the sink
+  sent its FRAME (dropped anywhere downstream, flushed, never rendered,
+  pipeline torn down) it sends PRELEASE from whichever thread frees it,
+  through a refcounted connection object (sends under its lock, so a
+  release never lands inside an AU, and a new connection after a restart
+  gets a new object: old placeholders can't release a new decoder's
+  pictures). The sink sets `handed_over` when its FRAME went out, and no
+  longer sends the preroll picture a second time when the same buffer is
+  rendered on PLAYING (the title had shown it and freed its slot). RDROP is
+  no longer sent.
+- **Releases are exact**: PRELEASE and a skipped frame free exactly that
+  picture (they used to free every older unpinned one too, which could free
+  pictures still queued in front of a late one); only a presented picture
+  still frees older held ones of its decoder, counted as `lost without a
+  release` (0 in every run since).
+- The title's decoder connection never waits on its AU queue any more (the
+  PRELEASEs that free slots come on that socket; the proxy bounds the
+  queue at 32), and the proxy's reply waits retry after a signal (a
+  profiler run showed `poll` interrupted by SIGPROF making the title
+  "unable" to decode: 8 videos fell back to software).
+- Logs: `decoder N from pid P closed: ...; K PRELEASEs, W waits of 10 s for
+  a slot, L pictures lost without a release`, the stats line's `lost
+  without a release`, the proxy's `given back unrendered`, the sink's
+  `preroll frames not sent again`.
+
+Test: `test/media/feed.html` (clips from `make-media.sh`: `feed-*`, 480x854
+and 854x480 H.264 Main 3.1 with B-frames and AAC, VP9 + Opus, fragmented
+MP4 for MSE), served with `tools/serve-media.py --port 8773 --page
+port/webkit/test/media/feed.html` (now with byte ranges; MSE from a file://
+page fails with MediaError 4). Seven players: autoplaying muted, one left
+paused after preroll then played, an unmuted autoplay, two MSE players
+(video and audio SourceBuffers, appending a few seconds ahead), one seeking
+into the middle of a GOP at load, a VP9 one, players below the fold;
+scrolled in and out, paused and resumed, removed and added, an MSE seek
+while suspended. `FEED` lines every 2 s, `FEED STUCK` only while a player is
+at least half visible. Log-only title runs (same timeline):
+
+| | before (2 runs: file://, http) | after (3 runs: http, file://, http with the wall profiler) |
+| --- | --- | --- |
+| `took back` / `no free output slot` lines | 10 and 15 (60 and 90 pictures) | 0, 0, 0 |
+| frames dropped in the first 2 s by players resumed from a paused preroll (hidden at load, then scrolled in: E, F, M) | 19, 25, 19 | 0, 0, 0 in every run |
+| the MSE player M after 16 s suspended (PAUSED) | 2 more dropped | 1 |
+| decoders in steady play | 30.0 pictures/s | 30.0 pictures/s, 7/12 slots held |
+| pictures lost without a release / PRELEASEs | (not counted) | 0 / 211-572 per run |
+| visible players stuck | B once, when played from its preroll (2-4 s, see below) | the same |
+
+What the test also found (open, not caused by the decoder slots; also
+before the fix and with software decoding):
+- **The page froze when players resumed** in all 3 runs served over http
+  (never from file://), at a scroll that suspended some players and resumed
+  others: the WebProcess main thread stopped (`0 page uploads`, no more
+  `FEED` lines, the title had to end the WebProcess). A wall-clock profile
+  (`PS5WK_PROFILE=wall`) shows it in WebKit's resume-from-suspend seek
+  (`MediaPlayerPrivateGStreamer::updateStates` -> `doSeek` -> seek event
+  -> `gst_qtdemux_handle_src_event` -> waiting for qtdemux's sink-pad
+  stream lock): qtdemux's streaming thread doesn't let go, presumably
+  blocked on data from webkitwebsrc, which needs the main thread. Not seen
+  in the owner's session (its page kept painting). Next: a CPU-mode
+  profile can't show idle threads; a stack dump of every thread is needed.
+- **Every progressive A/V clip drops ~41 frames (1.4 s) when it first
+  plays** (A, B, D; MSE players don't), before and after the fix; a player
+  played from preroll (B) stands still for 2-4 s first. Looks like the
+  audio clock at start; not looked into yet.
+- **Memory per decoder**: H.264 decoders are opened at 1920x1088 (24 MB of
+  the title's ~283 MB free flexible memory, 70 MB direct plus 12 x 3.2 MB
+  output buffers: 3 decoders took direct memory in use from 589 to 916 MB),
+  VP9 at 3840x2160 (13 MB flexible, 535 MB direct plus 12 x 12 MB: three
+  VP9 and one H.264 decoder reached 1845 MB in the owner's session). No
+  allocation failed; the direct memory budget wasn't the limit at 3-4
+  decoders, flexible memory would be at about 10 H.264 decoders (WebKit keeps
+  a suspended MSE player's decoder: a long feed accumulates them; past the
+  limit new videos fall back to software at the accept-caps DOPEN).
 
 Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
 matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
@@ -1966,7 +2069,10 @@ console runs were stopped, see *Console health*): `test/net/hsts-test.sh`
 does it in four ps5wk-shot runs against hsts.badssl.com (HSTS over https,
 plain http without a redirect): the policy is stored, the row is not
 rewritten by a later response in a new NetworkProcess, http:// commits as
-https:// after a restart, and a control without a policy stays http.
+https:// after a restart, and a control without a policy stays http. Still
+not run (2026-11-01: console work stopped when FTP downloads slowed to
+1-2.3 MB/s); the script now starts ps5wk-shot from the console's disk
+(`SHOT_REMOTE`, as `prof-run.sh`), it used to send it to elfldr each run.
 
 **JIT pool (ps5wk-child: 256 MB; `/data/ps5webkit/no-bigjitpool` keeps
 128 MB).** JSC multiplies every tier-up threshold by
@@ -2043,6 +2149,14 @@ a ping every 5 s, a health check before each round):
   count that falls back to the same floor (403, 413 after an elfldr
   restart) after every run, so it is not a leak; no processes were left
   over after any run.
+- **2026-11-01** (the feed round, 6 log-only title runs and the uploads
+  of two builds): swap out stayed at 463-480 MB (it was 859 MB while the
+  owner's session ran, 480 MB after it), page tables back at 4950-4966 after
+  every run, pings 4-6 ms idle. FTP downloads fell during the round: 5-6
+  MB/s right after an upload at 08:39 and 09:30, 1 MB/s at 10:03, and
+  2.3 MB/s, then 1.4-1.7, after a 60 s idle gap (8 MB/s after a gap on
+  earlier days), with pings up to 250-311 ms while a download ran; uploads
+  10-14 MB/s. Console work stopped there (the HSTS check was not run).
 - Mitigation in the tooling: `run-shot.sh SHOT_REMOTE=<path>` (prof-run.sh
   uses it by default) uploads ps5wk-shot once over FTP and starts it from
   the console's disk through `test/shotrelay` (a small payload that sends

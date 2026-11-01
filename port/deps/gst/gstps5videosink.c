@@ -16,7 +16,12 @@
  * - Hardware decoding (step 2b): buffers from ps5vdecproxy
  *   (video/x-raw(memory:PS5Remote)) name a picture the title decoded
  *   itself; they go out as REMOTE frames (decoder id + token), with no
- *   shared memory at all.
+ *   shared memory at all. A FRAME hands the picture to the title (the
+ *   placeholder's handed_over flag); a placeholder freed without one gives
+ *   its picture back by itself (ps5vdecproxy), so drops anywhere are safe.
+ *   Each picture goes out once: the preroll frame is not sent again when
+ *   the same buffer is rendered on PLAYING (the title already showed it and
+ *   gave its slot back).
  * - Formats: I420 and NV12 (what avdec_* produce for 8-bit 4:2:0; playsink
  *   converts anything else). Planes are copied into the slot with 64-byte
  *   aligned strides; the title converts YUV to RGB on the GPU.
@@ -87,9 +92,7 @@ struct _GstPs5VideoSink {
     guint format, colorimetry;
     gboolean remote; /* ps5vdecproxy's placeholders */
     gint64 default_max_lateness;
-    guint64 remote_sent, remote_dropped;
-    struct ps5wk_remote_picture prepared; /* the last placeholder prepare() saw */
-    gboolean prepared_pending;            /* ... and not rendered yet */
+    guint64 remote_sent, remote_repeated;
     guint stride[3], offset[3];
     gsize frame_bytes;
 
@@ -355,7 +358,7 @@ static gboolean ps5_start(GstBaseSink *bsink)
     self->connect_failed = FALSE;
     connect_locked(self);
     self->have_offset = FALSE;
-    self->sent = self->no_slot = 0;
+    self->sent = self->no_slot = self->remote_sent = self->remote_repeated = 0;
     g_mutex_unlock(&self->lock);
     return TRUE;
 }
@@ -366,8 +369,8 @@ static gboolean ps5_stop(GstBaseSink *bsink)
     g_mutex_lock(&self->lock);
     if (self->sent)
         g_printerr("[ps5videosink] %p: stop after %" G_GUINT64_FORMAT " frames sent (title: %u shown, %u dropped; %" G_GUINT64_FORMAT
-                   " without a free slot; %" G_GUINT64_FORMAT " hardware-decoded, %" G_GUINT64_FORMAT " of them dropped here as late)\n",
-            (void *)self, self->sent, self->title_displayed, self->title_dropped, self->no_slot, self->remote_sent, self->remote_dropped);
+                   " without a free slot; %" G_GUINT64_FORMAT " hardware-decoded, %" G_GUINT64_FORMAT " preroll frames not sent again)\n",
+            (void *)self, self->sent, self->title_displayed, self->title_dropped, self->no_slot, self->remote_sent, self->remote_repeated);
     disconnect_locked(self);
     g_mutex_unlock(&self->lock);
     return TRUE;
@@ -383,12 +386,11 @@ static gboolean ps5_set_caps(GstBaseSink *bsink, GstCaps *caps)
     guint ch = (h + 1) / 2, cw = (w + 1) / 2;
     GstCapsFeatures *features = gst_caps_get_features(caps, 0);
     gboolean remote = features && gst_caps_features_contains(features, "memory:PS5Remote");
-    /* Hardware-decoded frames are never dropped here: GstBaseSink drops a
-     * late buffer before prepare() and render(), so the title never learnt
-     * that its picture was gone, and a burst of late frames (YouTube under
-     * load, TV test 2026-10-28) left every decoder slot held: playback stuck.
-     * The title shows the newest due frame at each vsync and gives the
-     * skipped ones back, so late frames are dropped there instead. */
+    /* Hardware-decoded frames are not dropped here: the title shows the
+     * newest due frame at each vsync and gives the skipped ones back, so
+     * late frames are dropped there. (A drop here used to strand the
+     * picture's decoder slot, TV test 2026-10-28; since 2026-11-01 a freed
+     * placeholder gives its picture back by itself, so it would be safe.) */
     gst_base_sink_set_max_lateness(bsink, remote ? -1 : self->default_max_lateness);
     g_mutex_lock(&self->lock);
     self->info = info;
@@ -527,15 +529,27 @@ static GstFlowReturn show(GstPs5VideoSink *self, GstBuffer *buffer, gboolean pre
     connect_locked(self);
     if (self->remote) {
         read_releases_locked(self, 0);
-        struct ps5wk_remote_picture remote;
-        if (self->fd >= 0 && gst_buffer_extract(buffer, 0, &remote, sizeof remote) == sizeof remote && remote.magic == PS5WK_REMOTE_MAGIC) {
+        /* The placeholder's own memory (ps5vdecproxy's): handed_over is set
+         * here once the title has the picture. */
+        GstMemory *mem = gst_buffer_n_memory(buffer) == 1 ? gst_buffer_peek_memory(buffer, 0) : NULL;
+        GstMapInfo map;
+        struct ps5wk_remote_picture *remote = NULL;
+        if (mem && gst_memory_map(mem, &map, GST_MAP_READ)) {
+            if (map.size >= sizeof *remote && ((const struct ps5wk_remote_picture *)map.data)->magic == PS5WK_REMOTE_MAGIC)
+                remote = (struct ps5wk_remote_picture *)map.data;
+            else
+                gst_memory_unmap(mem, &map);
+        }
+        if (remote && g_atomic_int_get(&remote->handed_over))
+            self->remote_repeated++; /* the preroll frame, rendered again on PLAYING: the title showed it already */
+        else if (remote && self->fd >= 0) {
             struct ps5wk_video_msg msg;
             memset(&msg, 0, sizeof msg);
             msg.type = PS5WK_VMSG_FRAME;
             msg.format = PS5WK_VFMT_REMOTE;
-            msg.ps5wk_decoder = remote.decoder;
-            msg.ps5wk_token = remote.token;
-            msg.generation = remote.epoch;
+            msg.ps5wk_decoder = remote->decoder;
+            msg.ps5wk_token = remote->token;
+            msg.generation = remote->epoch;
             msg.width = GST_VIDEO_INFO_WIDTH(&self->info);
             msg.height = GST_VIDEO_INFO_HEIGHT(&self->info);
             msg.colorimetry = self->colorimetry;
@@ -548,13 +562,14 @@ static GstFlowReturn show(GstPs5VideoSink *self, GstBuffer *buffer, gboolean pre
                     self->lead_min_us = lead;
                 self->lead_count++;
             }
-            if (self->prepared_pending && self->prepared.token == remote.token)
-                self->prepared_pending = FALSE;
             if (!send_msg(self, &msg, -1)) {
+                g_atomic_int_set(&remote->handed_over, 1); /* the title gives it back now */
                 self->sent++;
                 self->remote_sent++;
             }
         }
+        if (remote)
+            gst_memory_unmap(mem, &map);
         maybe_log(self);
     } else if (self->fd >= 0 && ensure_shm_locked(self, self->frame_bytes)) {
         read_releases_locked(self, 0);
@@ -614,34 +629,6 @@ static GstFlowReturn ps5_preroll(GstBaseSink *bsink, GstBuffer *buffer)
     return show(GST_PS5_VIDEO_SINK(bsink), buffer, TRUE);
 }
 
-/* A placeholder that got as far as prepare() but was never rendered goes
- * back to the title's decoder. (GstBaseSink drops late buffers *before*
- * prepare(); that case is handled by not dropping hardware-decoded frames
- * at all: max-lateness -1 in set_caps.) */
-static GstFlowReturn ps5_prepare(GstBaseSink *bsink, GstBuffer *buffer)
-{
-    GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
-    if (!self->remote)
-        return GST_FLOW_OK;
-    struct ps5wk_remote_picture remote;
-    if (gst_buffer_extract(buffer, 0, &remote, sizeof remote) != sizeof remote || remote.magic != PS5WK_REMOTE_MAGIC)
-        return GST_FLOW_OK;
-    g_mutex_lock(&self->lock);
-    if (self->prepared_pending && self->prepared.token != remote.token) {
-        struct ps5wk_video_msg msg;
-        memset(&msg, 0, sizeof msg);
-        msg.type = PS5WK_VMSG_RDROP;
-        msg.ps5wk_decoder = self->prepared.decoder;
-        msg.ps5wk_token = self->prepared.token;
-        send_msg(self, &msg, -1);
-        self->remote_dropped++;
-    }
-    self->prepared = remote;
-    self->prepared_pending = TRUE;
-    g_mutex_unlock(&self->lock);
-    return GST_FLOW_OK;
-}
-
 static gboolean ps5_unlock(GstBaseSink *bsink)
 {
     GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
@@ -660,7 +647,6 @@ static gboolean ps5_event(GstBaseSink *bsink, GstEvent *event)
     GstPs5VideoSink *self = GST_PS5_VIDEO_SINK(bsink);
     if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
         g_mutex_lock(&self->lock);
-        self->prepared_pending = FALSE; /* the title's flush took them back */
         struct ps5wk_video_msg msg;
         memset(&msg, 0, sizeof msg);
         msg.type = PS5WK_VMSG_FLUSH;
@@ -754,7 +740,6 @@ static void gst_ps5_video_sink_class_init(GstPs5VideoSinkClass *klass)
     bsink_class->event = ps5_event;
     bsink_class->propose_allocation = ps5_propose_allocation;
     bsink_class->get_times = ps5_get_times;
-    bsink_class->prepare = ps5_prepare;
 }
 
 static gboolean plugin_init(GstPlugin *plugin)

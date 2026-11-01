@@ -136,8 +136,9 @@ struct Decoder {
     uint32_t injectCorruptKey { 0 }, injectTruncateKey { 0 };
 
     // Stats (decoder thread).
-    uint64_t aus { 0 }, pictures { 0 }, hidden { 0 }, errors { 0 }, skipped { 0 }, noPTS { 0 }, reclaimed { 0 };
+    uint64_t aus { 0 }, pictures { 0 }, hidden { 0 }, errors { 0 }, skipped { 0 }, noPTS { 0 }, longWaits { 0 };
     uint64_t recoveries { 0 }, flagged { 0 };
+    uint64_t lostPictures { 0 }; // guarded by lock: held pictures older than one presented (never released)
     int64_t windowStartUS { 0 };
     uint64_t windowAUs { 0 }, windowPictures { 0 };
     double windowCallMS { 0 }, windowCallMaxMS { 0 }, windowSlotWaitMS { 0 };
@@ -557,42 +558,32 @@ static bool vp9Shown(const uint8_t* p, size_t n)
 
 // ---------------------------------------------------------------- decoding
 
-// A free slot, waiting for one (the consumer releases them); -1 when the
-// decoder is closing or resetting.
+// A free slot, waiting for one; -1 when the decoder is closing or resetting.
+//
+// A picture handed to the WebProcess (PICTURE) is the WebProcess's until it
+// gives it back: ps5vdecproxy releases pictures it won't output (PRELEASE),
+// every placeholder buffer that is freed before ps5videosink got it to the
+// title releases its picture (PRELEASE, from wherever GStreamer frees it),
+// and pictures the sink did hand over come back from the consumer once
+// presented or skipped. A flush (DFLUSH) or the connection closing takes
+// back everything. So no free slot just means that the pictures decoded
+// ahead are waiting: a paused, prerolled or hidden (suspended) video holds
+// up to the vqueue and sink's buffers plus the pictures it hasn't read yet,
+// and the decoder waits until the video plays, flushes or closes. (Until
+// 2026-11-01 a 1.5 s timeout took back the older half of the held pictures
+// here. They were still the WebProcess's: when the video played, its frames
+// named pictures that had been overwritten, the title skipped them, and the
+// decoder had thrown away whole runs of pictures, 6 every 1.5-2 s while a
+// feed's paused and hidden players waited.)
 static int waitFreeSlot(Decoder& d)
 {
     int64_t start = nowUS();
     g_mutex_lock(&d.lock);
     int found = -1;
-    unsigned waits = 0;
-    int64_t lastReclaim = start;
+    bool reported = false;
     for (;;) {
         if (d.closing || d.resetPending)
             break;
-        // Safety net: a picture handed out but dropped on its way to the
-        // screen without anybody telling us would hold its slot forever.
-        // After 1.5 s without a free slot, take back the oldest one nobody
-        // is drawing (worst case: a frame skipped after a long pause).
-        int64_t now = g_get_monotonic_time();
-        // The older half of the pictures nobody is drawing goes back at
-        // once (one at a time only crawled at ~1 picture per second).
-        if (now - start > 1500000 && now - lastReclaim > 500000) {
-            std::vector<Slot*> held;
-            for (auto& s : d.slots) {
-                if (s.state == Slot::Held && !s.pinned)
-                    held.push_back(&s);
-            }
-            std::sort(held.begin(), held.end(), [](Slot* a, Slot* b) { return a->token < b->token; });
-            size_t count = std::max<size_t>(1, held.size() / 2);
-            for (size_t i = 0; i < count && i < held.size(); i++)
-                held[i]->state = Slot::Free;
-            if (!held.empty()) {
-                d.reclaimed += std::min(count, held.size());
-                DLOG("decoder %u: no free output slot for %.1f s: took back %zu pictures from %u (%llu so far)", d.id, (now - start) / 1e6,
-                    std::min(count, held.size()), held[0]->token, (unsigned long long)d.reclaimed);
-            }
-            lastReclaim = now;
-        }
         for (size_t i = 0; i < d.slots.size(); i++) {
             if (d.slots[i].state == Slot::Free) {
                 found = static_cast<int>(i);
@@ -603,15 +594,19 @@ static int waitFreeSlot(Decoder& d)
             d.slots[found].state = Slot::Decoding;
             break;
         }
-        g_cond_wait_until(&d.cond, &d.lock, g_get_monotonic_time() + 500000);
-        if (++waits == 20) {
+        if (!reported && nowUS() - start > 10000000) {
+            reported = true;
             unsigned held = 0, pinned = 0;
             for (auto& s : d.slots) {
                 held += s.state == Slot::Held;
                 pinned += s.pinned;
             }
-            DLOG("decoder %u: no free output slot for 10 s (%u held, %u pinned)", d.id, held, pinned);
+            d.longWaits++;
+            DLOG("decoder %u: every output slot held for 10 s (%u held, %u being drawn; %zu AUs queued): the video is paused or hidden, "
+                 "decoding goes on when it plays, flushes or closes",
+                d.id, held, pinned, d.queue.size());
         }
+        g_cond_wait_until(&d.cond, &d.lock, g_get_monotonic_time() + 1000000);
     }
     g_mutex_unlock(&d.lock);
     d.windowSlotWaitMS += (nowUS() - start) / 1000.0;
@@ -712,20 +707,22 @@ static void logStats(Decoder& d)
     if (d.windowAUs || d.windowPictures) {
         unsigned held = 0, pinned = 0;
         size_t queued;
+        uint64_t lost;
         g_mutex_lock(&d.lock);
         for (auto& s : d.slots) {
             held += s.state == Slot::Held;
             pinned += s.pinned;
         }
         queued = d.queue.size();
+        lost = d.lostPictures;
         g_mutex_unlock(&d.lock);
         DLOG("decoder %u (pid %d): %.1f AUs/s in, %.1f pictures/s out; decode call %.2f ms avg %.2f max, waited %.0f ms for slots; "
              "%u/%zu slots held (%u pinned), %zu AUs queued; so far %llu pictures, %llu hidden, %llu errors, %llu skipped, %llu without pts, "
-             "%llu resets after errors, %llu flagged",
+             "%llu resets after errors, %llu flagged, %llu lost without a release",
             d.id, d.pid, d.windowAUs / seconds, d.windowPictures / seconds, d.windowCalls ? d.windowCallMS / d.windowCalls : 0.0,
             d.windowCallMaxMS, d.windowSlotWaitMS, held, d.slots.size(), pinned, queued, (unsigned long long)d.pictures,
             (unsigned long long)d.hidden, (unsigned long long)d.errors, (unsigned long long)d.skipped, (unsigned long long)d.noPTS,
-            (unsigned long long)d.recoveries, (unsigned long long)d.flagged);
+            (unsigned long long)d.recoveries, (unsigned long long)d.flagged, (unsigned long long)lost);
     }
     d.windowStartUS = now;
     d.windowAUs = d.windowPictures = 0;
@@ -1252,7 +1249,7 @@ void serve(int fd, int pid, int streamID)
     d->pid = pid;
     d->streamID = streamID;
     ps5wk_video_msg msg;
-    uint64_t auBytes = 0, refused = 0;
+    uint64_t auBytes = 0, refused = 0, preleases = 0;
     while (readFully(fd, &msg, sizeof msg)) {
         switch (msg.type) {
         case PS5WK_VMSG_DOPEN: {
@@ -1283,18 +1280,17 @@ void serve(int fd, int pid, int streamID)
             au.flags = msg.ps5wk_flags;
             au.ptsNS = msg.pts_ns;
             g_mutex_lock(&d->lock);
-            bool accept = d->hw && au.epoch == d->epoch;
+            // Bounded by the proxy (at most 32 frames in flight). Never wait
+            // here: the PRELEASEs that free output slots come on this socket.
+            bool accept = d->hw && au.epoch == d->epoch && d->queue.size() < 256;
             if (accept) {
-                // Bounded: the proxy waits for pictures, so this stays short.
-                while (d->queue.size() >= 64 && !d->closing)
-                    g_cond_wait_until(&d->cond, &d->lock, g_get_monotonic_time() + 100000);
                 d->queue.push_back(std::move(au));
                 g_cond_broadcast(&d->cond);
             }
             g_mutex_unlock(&d->lock);
             if (!accept) {
                 if (!refused++)
-                    DLOG("decoder %u: AU refused (epoch %u, decoder at %u%s)", d->id, msg.ps5wk_epoch, d->epoch, d->hw ? "" : ", no decoder");
+                    DLOG("decoder %u: AU refused (epoch %u, decoder at %u%s)", d->id, msg.ps5wk_epoch, d->epoch, !d->hw ? ", no decoder" : au.epoch == d->epoch ? ", 256 AUs queued" : "");
                 sendRefused(*d, msg.ps5wk_key, msg.ps5wk_epoch);
             }
             break;
@@ -1326,6 +1322,7 @@ void serve(int fd, int pid, int streamID)
             g_mutex_unlock(&d->lock);
             break;
         case PS5WK_VMSG_PRELEASE:
+            preleases++;
             release(d->id, msg.ps5wk_token, false);
             break;
         default:
@@ -1334,10 +1331,15 @@ void serve(int fd, int pid, int streamID)
     }
 done:
     if (d->id || d->aus) { // a connection that never opened a decoder (no hardware) says nothing
-        DLOG("decoder %u from pid %d closed: %llu AUs (%.1f MB), %llu pictures, %llu hidden, %llu errors (first rc 0x%08x), %llu skipped before a keyframe, %llu refused, %llu format changes, %llu resets after errors",
+        g_mutex_lock(&d->lock);
+        uint64_t lost = d->lostPictures;
+        g_mutex_unlock(&d->lock);
+        DLOG("decoder %u from pid %d closed: %llu AUs (%.1f MB), %llu pictures, %llu hidden, %llu errors (first rc 0x%08x), %llu skipped before a keyframe, %llu refused, %llu format changes, %llu resets after errors; "
+             "%llu PRELEASEs, %llu waits of 10 s for a slot, %llu pictures lost without a release",
             d->id, pid, (unsigned long long)d->aus, auBytes / 1048576.0, (unsigned long long)d->pictures, (unsigned long long)d->hidden,
             (unsigned long long)d->errors, static_cast<unsigned>(d->firstRC), (unsigned long long)d->skipped, (unsigned long long)refused,
-            (unsigned long long)d->formatChanges, (unsigned long long)d->recoveries);
+            (unsigned long long)d->formatChanges, (unsigned long long)d->recoveries, (unsigned long long)preleases,
+            (unsigned long long)d->longWaits, (unsigned long long)lost);
     }
     closeHardware(*d);
     d->fd = -1;
@@ -1379,13 +1381,17 @@ void release(uint32_t decoder, uint32_t token, bool wasPinned)
     for (auto& s : d->slots) {
         if (s.state != Slot::Held)
             continue;
-        // This picture, and older ones nobody showed (dropped by the sink's
-        // QoS before they reached us).
-        if (s.token == token || (s.token < token && !s.pinned)) {
-            if (s.token == token && s.pinned && !wasPinned)
+        if (s.token == token) {
+            if (s.pinned && !wasPinned)
                 continue; // being drawn: released after the swap
             s.state = Slot::Free;
             s.pinned = false;
+        } else if (wasPinned && s.token < token && !s.pinned) {
+            // Presented: tokens follow display order and the sink renders in
+            // order, so an older picture still held here was lost on the way
+            // without a release (a safety net: every path releases now).
+            s.state = Slot::Free;
+            d->lostPictures++;
         }
     }
     g_cond_broadcast(&d->cond);

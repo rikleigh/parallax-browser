@@ -7,7 +7,10 @@ Then on the PS5: file:///data/ps5webkit/video.html?src=http://<mac>:8771/hls-ts/
 Each request is logged with its User-Agent and Range, so a run shows who
 fetched what: WebKit's NetworkProcess (webkitwebsrc, the browser's user
 agent) or something else. HLS content types are set explicitly (Python's
-table has no .m4s), and every response allows cross-origin use.
+table has no .m4s), and every response allows cross-origin use. Byte ranges
+are served (206), so progressive MP4s can seek. --page <file> also serves
+that file at /<its name> (a test page next to the media, e.g.
+port/webkit/test/media/feed.html: its MSE players need http).
 """
 import argparse
 import functools
@@ -28,6 +31,42 @@ TYPES = {
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive (responses carry Content-Length)
+    pages = {}  # "/name" -> path
+
+    def translate_path(self, path):
+        page = self.pages.get(path.split("?", 1)[0])
+        return page or super().translate_path(path)
+
+    def send_head(self):
+        # "Range: bytes=a-b" on a file: 206 with that part (players seek in MP4s).
+        rng = self.headers.get("Range", "")
+        path = self.translate_path(self.path)
+        if not rng.startswith("bytes=") or not os.path.isfile(path):
+            return super().send_head()
+        size = os.path.getsize(path)
+        first, _, last = rng[6:].split(",")[0].partition("-")
+        try:
+            if first:
+                start, end = int(first), int(last) if last else size - 1
+            else:
+                start, end = max(0, size - int(last)), size - 1
+        except ValueError:
+            return super().send_head()
+        end = min(end, size - 1)
+        if start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % size)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        f = open(path, "rb")
+        f.seek(start)
+        self.send_response(206)
+        self.send_header("Content-Type", self.guess_type(path))
+        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        return _Part(f, end - start + 1)
 
     def guess_type(self, path):
         return TYPES.get(os.path.splitext(path)[1].lower()) or super().guess_type(path)
@@ -35,6 +74,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
 
     def log_message(self, fmt, *args):
@@ -48,12 +88,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         sys.stdout.flush()
 
 
+class _Part:
+    """A file object that reads at most n bytes (copyfile stops there)."""
+
+    def __init__(self, f, n):
+        self.f, self.n = f, n
+
+    def read(self, size=-1):
+        if self.n <= 0:
+            return b""
+        data = self.f.read(self.n if size < 0 else min(size, self.n))
+        self.n -= len(data)
+        return data
+
+    def close(self):
+        self.f.close()
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8771)
+    ap.add_argument("--page", action="append", default=[], help="also serve this file at /<its name>")
     ap.add_argument("dir", nargs="?", default=os.path.join(root, "toolchain/wpe-webkit/media"))
     a = ap.parse_args()
+    Handler.pages = {"/" + os.path.basename(p): os.path.abspath(p) for p in a.page}
     server = http.server.ThreadingHTTPServer(("", a.port), functools.partial(Handler, directory=a.dir))
     print("serving %s on port %d" % (a.dir, a.port), flush=True)
     server.serve_forever()

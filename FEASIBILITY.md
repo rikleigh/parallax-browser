@@ -869,3 +869,29 @@ port.
     run. The harness now uploads ps5wk-shot once and starts it from the
     console's disk (`test/shotrelay`), so no large payload is sent from the
     Mac to elfldr.
+- **Feed pages: decoders stalled by paused and hidden videos (2026-11-01,
+  checked on the console by log; port/webkit/README.md, *Feeds with several
+  videos*).** On a feed with several autoplaying videos some spun forever or
+  crawled, and the title took back 6 decoded pictures every 1.5-2 s (34
+  times over 24 decoders in the owner's session, 0 decode errors). The
+  pictures were legitimately held: a paused, prerolled or hidden player
+  (WebKit suspends muted videos outside the viewport: non-MSE to NULL, MSE
+  to PAUSED with its decoder) keeps its sink's preroll, playsink's queue and
+  decoded-but-unread pictures, and the title's 1.5 s safety net took back
+  pictures the WebProcess still owned, so resumed players showed a frozen
+  start and dropped 19-65 frames while the decoder threw runs of pictures
+  away. Now a picture is the WebProcess's until the sink hands it to the
+  title or it is given back, and every unrendered placeholder buffer gives
+  its picture back when GStreamer frees it (wherever that happens), so the
+  timeout is gone; releases free exactly one picture; the proxy's reply
+  waits survive signals. A synthetic feed page (`test/media/feed.html`,
+  seven players: MSE and progressive, paused, seeking, scrolled, removed):
+  0 take-backs (10 and 15 before), 0 frames dropped by players resumed from
+  a paused preroll (19, 25, 19 before), 0 pictures lost without a release.
+  Found by the same page, still open: the WebProcess main thread hung in
+  WebKit's resume-from-suspend seek (qtdemux's stream lock) in all three
+  runs served over http, before and after the fix and with software
+  decoding (not in the owner's session); progressive A/V clips drop ~41
+  frames when they first play. The HSTS console check was not run: FTP
+  downloads fell to 1-2.3 MB/s even after an idle gap (7-8 normally), so
+  console work stopped there.
