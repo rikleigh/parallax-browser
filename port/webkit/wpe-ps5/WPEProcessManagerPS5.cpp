@@ -342,14 +342,18 @@ static bool socketHasListener(const std::string& path)
 static void removeStaleRuntimeFiles()
 {
     DIR* dir = opendir(PS5WK_LAUNCH_DIR);
-    if (!dir)
+    if (!dir) {
+        g_warning("[ps5-launch] cannot list %s: errno %d", PS5WK_LAUNCH_DIR, errno);
         return;
+    }
+    unsigned entries = 0;
     struct PidFiles {
         Vector<std::string> files;
         Vector<std::string> sockets;
     };
     HashMap<int, PidFiles> byPid;
     while (struct dirent* entry = readdir(dir)) {
+        entries++;
         const char* name = entry->d_name;
         int pid = 0;
         const char* dash = strrchr(name, '-');
@@ -376,7 +380,8 @@ static void removeStaleRuntimeFiles()
         files.files.append(std::move(path));
     }
     closedir(dir);
-    unsigned removed = 0, kept = 0;
+    unsigned removed = 0, kept = 0, failed = 0;
+    int unlinkError = 0;
     for (auto& [pid, files] : byPid) {
         // Gone for sure (ESRCH), or no socket of it answers. A pid with only
         // a status file has no UIProcess listening either.
@@ -389,10 +394,14 @@ static void removeStaleRuntimeFiles()
         for (auto& path : files.files) {
             if (!unlink(path.c_str()))
                 removed++;
+            else {
+                failed++;
+                unlinkError = errno;
+            }
         }
     }
-    if (removed || kept)
-        PS5_LOG("[ps5-launch] removed %u stale files from %s, kept %u of live processes", removed, PS5WK_LAUNCH_DIR, kept);
+    PS5_LOG("[ps5-launch] %s: %u entries, removed %u stale files, kept %u of live processes, %u not removed (errno %d)",
+        PS5WK_LAUNCH_DIR, entries, removed, kept, failed, unlinkError);
 }
 
 static bool bindListener(WPEProcessManagerPS5* manager)
