@@ -330,6 +330,19 @@ static unsigned unwind(uintptr_t pc, uintptr_t sp, uintptr_t fp, uintptr_t lo, u
     return n;
 }
 
+// The interrupted frame of a signal context, unwound. Async-signal-safe.
+static unsigned contextUnwind(const void* context, thread_t* t, uintptr_t* out)
+{
+    // PS5 ucontext: FreeBSD's mcontext at +0x40 (crashguard.c): rip +0xe0,
+    // rsp +0xf8, rbp +0x88.
+    const uintptr_t* words = (const uintptr_t*)context;
+    uintptr_t pc = words[0xe0 / 8], sp = words[0xf8 / 8], fp = words[0x88 / 8];
+    uintptr_t lo = sp, hi = (sp + 4096) & ~(uintptr_t)4095; // without known bounds: sp's page
+    if (t && atomic_load_explicit(&t->ready, memory_order_acquire) && sp >= t->lo && sp < t->hi)
+        hi = t->hi;
+    return unwind(pc, sp, fp, lo, hi, out);
+}
+
 static void onProf(int sig, siginfo_t* info, void* context)
 {
     (void)sig;
@@ -375,14 +388,7 @@ static void onProf(int sig, siginfo_t* info, void* context)
     slot_t* s = &ring[h & (RING - 1)];
     s->thread = self;
     s->weightUS = weightUS;
-    // PS5 ucontext: FreeBSD's mcontext at +0x40 (crashguard.c): rip +0xe0,
-    // rsp +0xf8, rbp +0x88.
-    const uintptr_t* words = (const uintptr_t*)context;
-    uintptr_t pc = words[0xe0 / 8], sp = words[0xf8 / 8], fp = words[0x88 / 8];
-    uintptr_t lo = sp, hi = (sp + 4096) & ~(uintptr_t)4095; // without known bounds: sp's page
-    if (t && atomic_load_explicit(&t->ready, memory_order_acquire) && sp >= t->lo && sp < t->hi)
-        hi = t->hi;
-    s->n = (unsigned short)unwind(pc, sp, fp, lo, hi, s->pc);
+    s->n = (unsigned short)contextUnwind(context, t, s->pc);
     s->flags = 0;
     atomic_fetch_add_explicit(&samplesTaken, 1, memory_order_relaxed);
     atomic_store_explicit(&s->seq, h + 1, memory_order_release);
@@ -643,6 +649,99 @@ static void startTimer(void)
         pthread_detach(thread);
 }
 
+// Backtraces for the main-thread watchdog (watchdog.c), with or without
+// PS5WK_PROFILE: the same unwinder, thread table and frame notation.
+int ps5wk_backtrace_init(void)
+{
+    static int done;
+    if (done)
+        return unwindReady ? 0 : -1;
+    done = 1;
+    base = (uintptr_t)&__ehdr_start;
+    if (&__eh_frame_hdr_start && !ps5unwind_init(&unwindInfo, &__eh_frame_hdr_start, &__eh_frame_start ? &__eh_frame_start : NULL,
+            &__eh_frame_end ? &__eh_frame_end : NULL))
+        unwindReady = 1;
+    textStart = unwindReady ? unwindInfo.textStart : base;
+    textEnd = unwindReady ? unwindInfo.textEnd : base;
+    if (llintPCRangeStart && llintPCRangeEnd) {
+        llintStart = (uintptr_t)llintPCRangeStart;
+        llintEnd = (uintptr_t)llintPCRangeEnd;
+    }
+    return unwindReady ? 0 : -1;
+}
+
+unsigned ps5wk_backtrace_context(const void* ucontext, uintptr_t* out)
+{
+    return contextUnwind(ucontext, findThread((uintptr_t)pthread_self()), out);
+}
+
+void ps5wk_backtrace_refresh_jit(void)
+{
+    if (ps5wk_jit_memory) {
+        void *start = NULL, *end = NULL;
+        ps5wk_jit_memory(&start, &end, NULL, NULL);
+        atomic_store(&jitStart, (uintptr_t)start);
+        atomic_store(&jitEnd, (uintptr_t)end);
+    }
+}
+
+size_t ps5wk_backtrace_format(char* buffer, size_t size, const uintptr_t* pcs, unsigned n)
+{
+    size_t used = 0;
+    if (size)
+        buffer[0] = 0;
+    uintptr_t js = atomic_load(&jitStart), je = atomic_load(&jitEnd);
+    for (unsigned k = 0; k < n && used + 24 < size; k++) {
+        uintptr_t pc = pcs[k];
+        int written;
+        if (pc >= textStart && pc < textEnd)
+            written = snprintf(buffer + used, size - used, " %lx", (unsigned long)(pc - base));
+        else if (pc >= js && pc < je) {
+            // Uncached: the profiler's cache belongs to its writer thread.
+            int tier = ps5wk_jit_tier ? ps5wk_jit_tier((const void*)pc) : -1;
+            written = tier >= 0 ? snprintf(buffer + used, size - used, " j%d", tier) : snprintf(buffer + used, size - used, " j");
+        } else
+            written = snprintf(buffer + used, size - used, " x%lx", (unsigned long)pc);
+        if (written < 0)
+            break;
+        used += (size_t)written;
+    }
+    return used < size ? used : size - 1;
+}
+
+unsigned ps5wk_profiler_threads(uintptr_t* keys, unsigned* indices, unsigned max)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < THREADS && n < max; i++) {
+        thread_t* t = &threads[i];
+        uintptr_t key = atomic_load_explicit(&t->key, memory_order_acquire);
+        if (!key || t->exited || t->own || !atomic_load_explicit(&t->ready, memory_order_acquire))
+            continue;
+        keys[n] = key;
+        indices[n] = i;
+        n++;
+    }
+    return n;
+}
+
+int ps5wk_profiler_thread_index(uintptr_t key)
+{
+    thread_t* t = findThread(key);
+    return t ? (int)(t - threads) : -1;
+}
+
+void ps5wk_profiler_own_thread(void)
+{
+    markOwnThread();
+}
+
+void ps5wk_profiler_register_self(void)
+{
+    thread_t* self = insertThread((uintptr_t)pthread_self());
+    if (self && !atomic_load(&self->ready))
+        fillThread(self);
+}
+
 void ps5wk_profiler_start(const char* tag)
 {
     const char* on = getenv("PS5WK_PROFILE");
@@ -661,16 +760,7 @@ void ps5wk_profiler_start(const char* tag)
         intervalUS = (unsigned)atoi(getenv("PS5WK_PROFILE_US"));
     if (getenv("PS5WK_PROFILE_WINDOW_MS") && atoi(getenv("PS5WK_PROFILE_WINDOW_MS")) >= 100)
         windowMS = (unsigned)atoi(getenv("PS5WK_PROFILE_WINDOW_MS"));
-    base = (uintptr_t)&__ehdr_start;
-    if (&__eh_frame_hdr_start && !ps5unwind_init(&unwindInfo, &__eh_frame_hdr_start, &__eh_frame_start ? &__eh_frame_start : NULL,
-            &__eh_frame_end ? &__eh_frame_end : NULL))
-        unwindReady = 1;
-    textStart = unwindReady ? unwindInfo.textStart : base;
-    textEnd = unwindReady ? unwindInfo.textEnd : base;
-    if (llintPCRangeStart && llintPCRangeEnd) {
-        llintStart = (uintptr_t)llintPCRangeStart;
-        llintEnd = (uintptr_t)llintPCRangeEnd;
-    }
+    ps5wk_backtrace_init();
     ring = (slot_t*)mmap(NULL, sizeof(slot_t) * RING, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     fold = (folded_t*)mmap(NULL, sizeof(folded_t) * FOLD, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (ring == MAP_FAILED || fold == MAP_FAILED) {
@@ -680,9 +770,7 @@ void ps5wk_profiler_start(const char* tag)
     }
     // The calling thread (WebKit's main thread) and its stack.
     wallTarget = pthread_self();
-    thread_t* self = insertThread((uintptr_t)wallTarget);
-    if (self && !atomic_load(&self->ready))
-        fillThread(self);
+    ps5wk_profiler_register_self();
     startMS = nowMS();
     const char* dir = getenv("PS5WK_PROFILE_DIR");
     if (!dir || !*dir)

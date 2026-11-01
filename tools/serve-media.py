@@ -10,11 +10,13 @@ agent) or something else. HLS content types are set explicitly (Python's
 table has no .m4s), and every response allows cross-origin use. Byte ranges
 are served (206), so progressive MP4s can seek. --page <file> also serves
 that file at /<its name> (a test page next to the media, e.g.
-port/webkit/test/media/feed.html: its MSE players need http).
+port/webkit/test/media/feed.html: its MSE players need http). /slow?ms=<n>
+answers after n ms (a slow endpoint: port/webkit/test/paint/stall.html?xhr).
 """
 import argparse
 import functools
 import http.server
+import io
 import os
 import sys
 import time
@@ -38,6 +40,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return page or super().translate_path(path)
 
     def send_head(self):
+        if self.path.startswith("/slow"):
+            ms = 0
+            for kv in self.path.partition("?")[2].split("&"):
+                if kv.startswith("ms="):
+                    ms = int(kv[3:] or 0)
+            time.sleep(min(ms, 120000) / 1000.0)
+            body = ("slow %d ms\n" % ms).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return io.BytesIO(body)
         # "Range: bytes=a-b" on a file: 206 with that part (players seek in MP4s).
         rng = self.headers.get("Range", "")
         path = self.translate_path(self.path)

@@ -1,0 +1,50 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>main thread stall test</title>
+<!-- Blocks the WebProcess's main thread on purpose, to check the watchdog
+     (apps/common/watchdog.c, PS5WK_WATCHDOG_S): a report with backtraces
+     ~3 s in, then a "recovered" line.
+       ?busy        a busy JavaScript loop (default 6 s)
+       ?xhr         a synchronous XMLHttpRequest to /slow?ms=<ms> on the
+                    page's server (tools/serve-media.py answers it late):
+                    the main thread waits for the NetworkProcess
+       &ms=<n>      how long (default 6000)
+       &delay=<n>   ms after load before it starts (default 2000)
+     Serve with: tools/serve-media.py --port 8776 --page port/webkit/test/paint/stall.html
+     then open http://<mac>:8776/stall.html?busy -->
+<style>
+body { margin: 40px; font: 28px/1.4 sans-serif; background: #10202f; color: #e8eef5; }
+#clock { font-size: 64px; font-variant-numeric: tabular-nums; }
+</style></head>
+<body>
+<h1>main thread stall test</h1>
+<p id="what"></p>
+<div id="clock">0.0</div>
+<p id="log"></p>
+<script>
+const q = new URLSearchParams(location.search);
+const mode = q.has('xhr') ? 'xhr' : 'busy';
+const ms = +(q.get('ms') || 6000), delay = +(q.get('delay') || 2000);
+const what = document.getElementById('what'), clock = document.getElementById('clock'), log = document.getElementById('log');
+what.textContent = `${mode}: blocks the main thread for ${ms} ms, ${delay} ms after load`;
+const t0 = performance.now();
+setInterval(() => { clock.textContent = ((performance.now() - t0) / 1000).toFixed(1); }, 100);
+function say(text) { console.log('STALL ' + text); log.textContent += text + ' '; }
+function stall() {
+    const start = performance.now();
+    say(`start ${mode}`);
+    if (mode === 'busy') {
+        let x = 0;
+        while (performance.now() - start < ms)
+            for (let i = 0; i < 10000; i++)
+                x = (x * 31 + i) | 0;
+        window.sink = x;
+    } else {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', '/slow?ms=' + ms + '&t=' + Date.now(), false);
+        try { xhr.send(); say(`status ${xhr.status}`); } catch (e) { say('error ' + e); }
+    }
+    say(`end after ${Math.round(performance.now() - start)} ms`);
+}
+addEventListener('load', () => setTimeout(stall, delay));
+</script>
+</body></html>

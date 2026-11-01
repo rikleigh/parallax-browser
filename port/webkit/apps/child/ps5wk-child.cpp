@@ -14,6 +14,7 @@
 #include "PS5VideoProtocol.h"
 #include "../common/crashguard.h"
 #include "../common/profiler.h"
+#include "../common/watchdog.h"
 #include "../common/ps5locks.h"
 
 #include <errno.h>
@@ -647,7 +648,11 @@ static void* runWebKit(void* data)
     auto* args = static_cast<MainArgs*>(data);
     // PS5WK_PROFILE: both processes (files <tag>-<pid>.prof, e.g. web3-812.prof).
     ps5wk_profiler_start(args->tag);
+    // PS5WK_WATCHDOG_S (default 3 s, 0 off): logs where this thread is when
+    // its run loop stops turning (apps/common/watchdog.c).
+    ps5wk_watchdog_start(args->tag);
     args->result = args->network ? WebKit::NetworkProcessMain(args->argc, args->argv) : WebKit::WebProcessMain(args->argc, args->argv);
+    ps5wk_watchdog_stop();
     return nullptr;
 }
 
