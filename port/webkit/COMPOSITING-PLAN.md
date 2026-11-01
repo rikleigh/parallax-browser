@@ -1241,3 +1241,87 @@ port/webkit/test/paint/images.html <dir>`), the screenshot series
 (`ps5browser.c`). Note: the title's clean-up of `/data/ps5webkit/shots` at
 start leaves files behind (old captures were still there in later runs), so
 name lists should come from the run's log.
+
+### Main-thread watchdog (ps5wk-child)
+
+The TV session also had a WebProcess that sent no updates for ~75 s while
+mostly idle and then recovered by itself; it never reproduced in log-only
+runs. To catch it next time in normal browsing, both child processes now
+run a watchdog (`apps/common/watchdog.c`, on by default):
+
+- **Heartbeat:** a GLib timeout on the default main context (WebKit's main
+  RunLoop), `G_PRIORITY_HIGH`, every 250 ms, stores the time and the main
+  thread's own CPU clock.
+- **Watchdog thread:** wakes once a second. When the main thread has not
+  turned for `PS5WK_WATCHDOG_S` seconds (child.env; default 3, `0` off), it
+  sends the main thread `SIGVTALRM` (unused by WebKit, JSC, GLib and the
+  profiler's `SIGPROF`); the handler unwinds the interrupted stack with the
+  profiler's unwinder (CFI + rbp chains through LLInt/JIT, `profiler.c`
+  `ps5wk_backtrace_context`) into a static buffer and reads its own CPU
+  clock. Then every other thread the crash guard's trampoline registered,
+  once per stall. Every ~10 s while it lasts: the main thread again. Then a
+  "recovered" line. Works with `PS5WK_PROFILE` off or on (checked with
+  `threads`). If the whole process was stopped (rest mode: the watchdog
+  itself did not run for > 3 s), that time is not counted.
+- **Cost:** 4 timer dispatches/s on the main thread and 1 wake-up/s of the
+  helper; idle WebProcess 0.00 cores with it on and off (`PS5WK_CPU_LOG=all`,
+  60 s each). The watchdog takes no WebKit or GLib lock (the main thread may
+  hold one) and writes its lines with `write(2)`.
+
+**The lines** (title log, prefixed `[web<N>]`/`[network<N>]`):
+
+```
+[watchdog web4] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding)
+[watchdog web4] main thread stalled: no run loop turn for 3.9 s, its CPU +3.8 s (busy); backtraces follow
+[watchdog web4] bt main t756 cpu 3895 ms: j3 f7b2c4 30295fe 318083d 16d02e2 ... 2d38cc5 2c1e5a 2d57 4c1e
+[watchdog web4] bt t95 JIT_Worklist_Helper_Thread cpu 3 ms: x800001dfc 2d3cfcb 2caa9df e5f8 2c82f2a ...
+[watchdog web4] bt t324 PS5Paint cpu 1 ms: same as t262
+[watchdog web4] bt t437 gmain: no answer to the signal
+[watchdog web4] 16 other threads (9 distinct stacks, 1 silent)
+[watchdog web4] main thread still stalled after 14.2 s, its CPU +13.8 s (busy)
+[watchdog web4] bt main t194 cpu 13924 ms: j3 f7b2c4 ...
+[watchdog web4] main thread recovered: stalled 15.0 s, its CPU +14.6 s (busy)
+```
+
+- `its CPU +x s`: what the main thread used since its last turn. **busy**
+  (over half the wall time: JavaScript, layout, painting) or **waiting** (a
+  lock, a sync IPC reply, I/O).
+- Frames, innermost first, in the profiler's notation: hex offsets in the
+  unstripped ELF (`toolchain/wpe-webkit/titles/debug/<build>/ps5wk-child`
+  for the title that ran), `j<tier>` JIT code (0 thunks/ICs/regexp,
+  1 Baseline, 2 DFG, 3 FTL), `x<hex>` absolute addresses in other modules
+  (libkernel/libc: the system call it waits in). `t<n>` is the thread's slot
+  in the profiler's table; `cpu` that thread's CPU so far.
+- `gmain` (GLib's worker) blocks all signals and never answers (costs
+  200 ms of the report).
+- **Symbolize:** `port/webkit/test/prof/watchdog-sym.py [--elf <ps5wk-child>] <log>`
+  (default ELF: the newest in `titles/debug/`) prints each `bt` line with
+  its frames (inlined frames expanded, `--no-inlines` for one line per
+  frame). By hand: `llvm-addr2line -f -C -i -e <ps5wk-child> 0x<offset>`,
+  with offset - 1 for every frame after the first (return addresses).
+
+**Checked on the console** (title, build 20261101-213700, log-only):
+`test/paint/stall.html` served by `tools/serve-media.py --port 8776 --page
+port/webkit/test/paint/stall.html` (which now also answers `/slow?ms=<n>`
+late):
+
+- `?busy` (a 6 s JavaScript loop from a `setTimeout`): report at 3.9 s,
+  `its CPU +3.8 s (busy)`, main thread `j3` (FTL code) <- `vmEntryToJavaScript`
+  <- `JSC::Interpreter::executeCall` <- `JSC::profiledCall` <-
+  `WebCore::ScheduledAction::execute` <- `DOMTimer::fired` <-
+  `ThreadTimers::sharedTimerFiredInternal` <- `RunLoop` timer <-
+  `g_main_context_dispatch` <- `RunLoop::run`; recovered: stalled 6.0 s.
+- `?xhr` (a synchronous XHR answered after 6 s): report at 3.9 s,
+  `its CPU +0.0 s (waiting)`, main thread in libkernel <-
+  `ThreadCondition::timedWait` <- `ParkingLot::parkConditionallyImpl` <-
+  `BinarySemaphore::waitUntil` <- `IPC::Connection::waitForSyncReply` <-
+  `sendSync<NetworkConnectionToWebProcess::PerformSynchronousLoad>` <-
+  `WebLoaderStrategy::loadResourceSynchronously` <- ... <-
+  `XMLHttpRequest::send` <- `jsXMLHttpRequestPrototypeFunction_send` <- LLInt
+  <- the same timer path; recovered: stalled 6.1 s. The NetworkProcess's
+  main thread kept turning (no report there).
+- `?busy&ms=15000` with `PS5WK_PROFILE=threads`: report at 3.9 s, the
+  10 s repeat at 14.2 s with the same stack, recovered at 15.0 s; the
+  profiler's file was written as usual.
+- Ordinary browsing (Wikipedia, Hacker News, GitHub, BBC News, each
+  scrolled down and up by `scroll.js`): no watchdog lines besides "on".
