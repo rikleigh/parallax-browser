@@ -26,6 +26,12 @@
  * fakevdec=1: the video server advertises a fake hardware decoder (empty
  * pictures in display order), so ps5vdecproxy and REMOTE frames run in
  * payload-only tests (Videodec2 itself only works in the title).
+ * compositing=1: the page is composited (WC builds only) into a null scene
+ * host that counts layers, tiles and painted megapixels per update and
+ * presents at 60 Hz ([wc-null] line per second; no pixels, so the paint
+ * result is INFO). compositing=0: the CPU path even if the flag file
+ * /data/ps5webkit/compositing is there. Default: the CPU path (this
+ * payload has no GL scene host).
  * Output goes back on the elfldr connection.
  */
 #include <errno.h>
@@ -58,6 +64,10 @@ static char jsFile[256];
 static char onloadFile[256];
 static char framePath[256]; /* frame=<path>: write the last frame there (PPM) */
 static char childEnvFile[64]; /* childenv=: this run's children's env file, removed at exit */
+static int compositing; /* compositing=1: the null WC scene host */
+/* In WC builds of WebKit only (DrawingAreaProxyWCPS5.cpp, PS5WCNullHost.cpp). */
+void ps5wk_compositing_set_override(int mode) __attribute__((weak));
+void ps5wk_wc_null_host_install(void) __attribute__((weak));
 /* Stress mode: cycle=<file of URLs> rounds=<n> dwell=<s>: load each URL in
  * turn (dwell seconds after it finished or failed), rounds times, counting
  * load failures and WebProcess terminations (RESULT ps5wk-shot stress). */
@@ -144,6 +154,8 @@ static void readArguments(void)
             setenv("PS5WK_FAKE_VDEC_DELAY_MS", token + 14, 1); /* ms per access unit: a decoder too slow for the stream */
         else if (!strncmp(token, "fakevdec=", 9))
             setenv("PS5WK_FAKE_VDEC", token + 9, 1); /* 1: the fake title decoder (ps5vdecproxy plumbing without Videodec2) */
+        else if (!strncmp(token, "compositing=", 12))
+            compositing = atoi(token + 12) ? 1 : -1;
         else if (!strncmp(token, "debug=", 6))
             setenv("WEBKIT_DEBUG", token + 6, 1); // also reaches the NetworkProcess (creation parameters)
     }
@@ -175,6 +187,12 @@ static void onBufferRendered(WPEView* view, WPEBuffer* buffer, gpointer data)
 
 static void report(void)
 {
+    if (!lastPixels && compositing > 0) {
+        printf("RESULT ps5wk-shot paint INFO composited into the null scene host: no pixels (load %s; [wc-null] lines)\n",
+            loadFinishedTime ? "finished" : "not finished");
+        fflush(stdout);
+        return;
+    }
     if (!lastPixels) {
         RESULT("paint", FALSE, "no frame painted within %d s (load %s)", timeoutSeconds, loadFinishedTime ? "finished" : "not finished");
         return;
@@ -484,6 +502,19 @@ int main(void)
         RESULT("setup", FALSE, "headless display: %s", error ? error->message : "?");
         return 1;
     }
+
+    /* Before the first page: the compositing switch is read when a page
+     * gets its WebProcess. Without GL here, only the null host can show it. */
+    if (compositing > 0 && !ps5wk_compositing_set_override) {
+        RESULT("setup", FALSE, "compositing=1: this WebKit is built without the WC compositor");
+        return 1;
+    }
+    if (compositing > 0) {
+        ps5wk_wc_null_host_install();
+        ps5wk_compositing_set_override(1);
+        printf("compositing: on, null scene host\n");
+    } else if (ps5wk_compositing_set_override)
+        ps5wk_compositing_set_override(0); /* no GL host in this payload */
 
     /* As in the browser title: no page cache, one process per page. */
     webkit_web_context_set_cache_model(webkit_web_context_get_default(), WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
