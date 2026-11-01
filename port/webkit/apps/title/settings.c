@@ -8,7 +8,9 @@
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
  *   flag files (no-hwdec, audio-silent, push-off): present = that feature
- *     off; the title reads them when it starts.
+ *     off; the title reads them when it starts. Opt-in flag files
+ *     (compositing): present = that feature on; WebKit in the title reads
+ *     it whenever a page gets a new WebProcess.
  *   home-url.txt: the page the browser opens when it starts.
  * Each setting says what applies it: a page restart (a new WebProcess), a
  * browser restart (the title) or nothing. The values in use are remembered
@@ -27,7 +29,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef enum { KIND_ENV, KIND_FLAG, KIND_FILE } SettingKind;
+typedef enum { KIND_ENV, KIND_FLAG, KIND_FLAG_ON, KIND_FILE } SettingKind;
 typedef enum { TYPE_CHOICE, TYPE_BOOL, TYPE_NUMBER, TYPE_TEXT } SettingType;
 
 typedef struct {
@@ -46,7 +48,8 @@ typedef struct {
 
 /* Semantics and defaults: ps5wk-child.cpp (JIT, memory limit), patches
  * 0032 (painting, scrolling), 0031 (decommit), 0017 (hole punch), 0016
- * (VP9), titlevdec.c (no-hwdec), ps5browser.c (the rest). */
+ * (VP9), titlevdec.c (no-hwdec), DrawingAreaProxyWCPS5.cpp in WebKit
+ * (compositing, WC builds only), ps5browser.c (the rest). */
 static const Setting settings[] = {
     { "jit", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
         "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes.",
@@ -66,6 +69,9 @@ static const Setting settings[] = {
         "Video is drawn straight to the screen beneath the page, which is smoother. Off paints every frame into the page.", NULL, 0, 0 },
     { "media_vp9", KIND_ENV, TYPE_BOOL, "PS5WK_MEDIA_VP9", "1", PS5WK_SETTINGS_PAGE, "Offer VP9 video",
         "Lets sites such as YouTube send VP9. Off makes YouTube send H.264 instead.", NULL, 0, 0 },
+    { "compositing", KIND_FLAG_ON, TYPE_BOOL, "compositing", "0", PS5WK_SETTINGS_PAGE, "GPU compositing (experimental)",
+        "Puts pages together on the GPU, in layers. Off draws pages on the CPU, as before. Needs a browser built with the compositor.",
+        NULL, 0, 0 },
     { "hwdec", KIND_FLAG, TYPE_BOOL, "no-hwdec", "1", PS5WK_SETTINGS_BROWSER, "Hardware video decoding",
         "The PS5's video decoder plays H.264, HEVC and VP9, up to 8K. Off decodes in software (1080p at most).", NULL, 0, 0 },
     { "sound", KIND_FLAG, TYPE_BOOL, "audio-silent", "1", PS5WK_SETTINGS_BROWSER, "Sound",
@@ -145,11 +151,11 @@ static char* envValue(const char* contents, const char* key)
  * their canonical names, numbers and text as written. */
 static char* currentValue(const Setting* s, const char* env)
 {
-    if (s->kind == KIND_FLAG) {
+    if (s->kind == KIND_FLAG || s->kind == KIND_FLAG_ON) {
         char* path = pathFor(s->name);
         gboolean present = fileExists(path);
         g_free(path);
-        return g_strdup(present ? "0" : "1");
+        return g_strdup(present == (s->kind == KIND_FLAG_ON) ? "1" : "0");
     }
     if (s->kind == KIND_FILE) {
         char* path = pathFor(s->name);
@@ -274,7 +280,7 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append(out, ",\"inUse\":");
         appendJSONString(out, s->scope && applied[i] ? applied[i] : value);
         g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\",\"key\":", scopeName(s->scope),
-            waiting ? "true" : "false", s->kind == KIND_ENV ? "page" : "browser");
+            waiting ? "true" : "false", s->kind == KIND_ENV || s->kind == KIND_FLAG_ON ? "page" : "browser");
         appendJSONString(out, s->name);
         g_string_append(out, ",\"label\":");
         appendJSONString(out, s->label);
@@ -597,8 +603,9 @@ gboolean ps5wk_settings_update(const char* body, gboolean json, char** message, 
             g_string_append_printf(envDone, "%s%s", envDone->len ? ", " : "", s->label);
             envScopes |= s->scope;
             continue;
-        } else if (s->kind == KIND_FLAG) {
-            if (!strcmp(values[i], "0")) { /* the file turns the feature off */
+        } else if (s->kind == KIND_FLAG || s->kind == KIND_FLAG_ON) {
+            /* KIND_FLAG: the file turns the feature off; KIND_FLAG_ON: on */
+            if (!strcmp(values[i], s->kind == KIND_FLAG ? "0" : "1")) {
                 int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 ok = fd >= 0;
                 if (ok) {
