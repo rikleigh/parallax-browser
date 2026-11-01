@@ -21,6 +21,8 @@
 #
 # Env: JOBS (default ncpu), FRESH_SRC=1, JIT=0 (configure without the JIT), NINJA_TARGETS="...", NINJA_FLAGS="-k 0",
 #      DEBUG_FLAGS (default -gline-tables-only; -g0 for the smallest build)
+#      WC=1 (configure with the WC compositor next to coordinated graphics:
+#      USE_TEXTURE_MAPPER + USE_GRAPHICS_LAYER_WC; COMPOSITING-PLAN.md; default off)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,6 +155,9 @@ WEBKIT_OPTIONS=(
     -DLD_PACK_RELATIVE_RELOCS=OFF
     -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF -DCLANGD_AUTO_SETUP=OFF -DCMAKE_VERBOSE_MAKEFILE=OFF
 )
+if [ "${WC:-0}" = 1 ]; then
+    WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=ON -DUSE_GRAPHICS_LAYER_WC=ON)
+fi
 
 step_configure() {
     log "configure $BLD"
