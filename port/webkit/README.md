@@ -447,8 +447,13 @@ title's free flexible memory stayed at 279 MB and its direct memory went
 with the page shown, as before); the wind-down saved 6 tabs, the next start
 restored them (tab 4 shown) and opened the start link in a 7th; a form
 result tab showed *This page came from a form* on every return, with
-nothing posted. Not checked yet: the pad on the TV (focus, pointer, repeat,
-the keyboard from the address field), GPU compositing off.
+nothing posted. With GPU compositing off (`no-compositing`) the menu draws
+the same over the CPU-painted page, and the start page showed its
+*Bookmarks* and *Most visited* (start-data.js is loaded with a fresh query:
+the WebProcess's memory cache kept the first copy). The open menu costs the
+title ~16 MB of heap (its canvas and the copy on its way to the renderer),
+given back when it closes. Not checked yet: the pad on the TV (focus,
+pointer, repeat, the keyboard from the address field).
 
 ## Build
 

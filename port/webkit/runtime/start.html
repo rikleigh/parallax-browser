@@ -14,11 +14,16 @@ a span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 <h1>PS5 WebKit</h1>
 <div id="mine"></div>
 <!-- Bookmarks and most visited pages: start-data.js is written by the
-     browser (browserdata.c) next to this file; web pages can't read it. -->
-<script src="start-data.js"></script>
+     browser (browserdata.c) next to this file; web pages can't read it.
+     Loaded with a fresh query each time: the WebProcess's memory cache
+     would otherwise keep the first copy. -->
 <script>
 (function () {
-    var data = window.ps5wkData;
+    var script = document.createElement("script");
+    script.src = "start-data.js?" + Date.now();
+    script.onload = function () { render(window.ps5wkData); };
+    document.head.append(script);
+function render(data) {
     if (!data)
         return;
     var mine = document.getElementById("mine");
@@ -48,6 +53,7 @@ a span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         h.textContent = "Links";
         mine.append(h);
     }
+}
 })();
 </script>
 <ul>
