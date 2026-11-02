@@ -35,7 +35,7 @@ def summarize(path):
     stuck = stuck_run = stuck_longest = 0
     sub_moves = snaps = zero_lead = 0
     last_sub_moves = 0
-    cap_trips = sum(1 for l in lines if "over the" in l and "cap: tiles for the visible rect only" in l)
+    cap_trips = sum(1 for l in lines if "over the" in l and "tiles for the visible rect only" in l)
     cap_restores = sum(1 for l in lines if "normal tile coverage again" in l)
     car_backs = sum(1 for l in lines if "CAR-BACK" in l)
     car_settles = {}

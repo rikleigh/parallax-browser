@@ -2317,10 +2317,49 @@ The gesture-end timer now also runs with `snap=0`, so the set empties there too.
   On the owner's run-1 log: 13 stuck seconds (longest run 7, plus the
   low-input seconds around them), 2 cap trips.
 
-**Not measured yet (needs console time).** a) `wc-gl-cap` 64 +
-`scrolljank.html?heavy=1` + fast pad-scroll-test, flag `stickframe=1`:
-expect cap trips with no stuck seconds and "sent on" > 0. b)
-`carousel.html?relayout` with `rx=0.5`, with and without `overflow=1`:
-expect snapped settles and no CAR-BACK (before the fix it should show
-CAR-BACK and settles near the start). c) The product page's gallery
-under `pad-scroll-test`.
+**Texture pool near the cap (src-wc 85fdae9903).** In the first console run
+of the fix, scrolling went on at reduced coverage (60 moving frames/s, 2
+steps sent on at zero lead), but the title's GL textures kept rising: 77,
+70, 83, 73, 106 MB against a 64 MB cap. 4.6 s after the reduction the page
+went to the CPU path, which reloads it in a new WebProcess. Before the fix
+the lock-up let the memory fall, because nothing moved. The tiles are not
+the cause: TextureMapper's tiles are freed with their layer's tile. The cause
+is `BitmapTexturePool`, which keeps unused intermediate surfaces for 3 s
+(opacity cards: a new size on every scroll step) and is limited only at
+80 MB. From 60 % of the cap, or with coverage reduced, unused pool textures
+now go after 50 ms (`BitmapTexturePool::setReleaseQuickly`, from
+`checkGLMemory`). The `[wc]` per-second line and the cap lines show the
+pool's MB. New flag token `gesturenodes=0`: the title never sends the gesture
+nodes (the old behaviour), for A/B.
+
+**Results** (log-only PPSA99020, build 20261102-122550-2e90eec762 with the
+pool change; `stickframe=1`; same package as the watchdog rewrite and the
+launch retry, whose `[watchdog web4] on:` line shows at every start; no
+watchdog report in any run; tile uploads 0.08-0.11 ms each):
+
+| run | before the change | after |
+| --- | --- | --- |
+| `scrolljank.html?heavy=1`, `wc-gl-cap` 64, pad `secs=1.5 ry=1.0 hold=0.3 pause=1` | (owner's log: 20-35 s lock-ups after each cap trip) | first build: no lock-up, but CPU fallback 4.6 s after the trip (pool). With the pool change: GL textures stay at ~51 MB, the cap never trips; 45 moving frames/s, pad -> present 13.1 ms |
+| same, `wc-gl-cap` 44 (to force the trip) | | trip at 44.0 MB (pool 12.8 MB), reduced for the rest of the run, **0 stuck seconds**, 34 steps sent on at zero lead, 60 moving frames/s in seconds with the stick held at ry 1.0, 22-43 MB, no CPU fallback |
+| `carousel.html?relayout`, rx 0.5, `gesturenodes=0` (old) | centre carousel never leaves card 2: 6 of 12 settles at 64 px, 6 at 0; ~80 CAR-BACK per 1.5 s gesture (480 in all) | |
+| same, default | | full travel each gesture (64 -> 3384 -> 728 -> 4048 ...), 14/16 settles snapped (the other 2 at the end edge), 1 CAR-BACK per gesture (the end-of-gesture snap) |
+| same, `overflow=1` | | 11/11 snapped, same travel, 2050 events in the title |
+| product page (a big phone maker's), pad at the gallery (`test-onload.js` scrolls it to the view centre), rx 0.5, `gesturenodes=0` | media gallery (7040 px wide): 257 yanks back (>30 px against the stick) in 23 s, ~18-28 per second at times, crawling by a card at a time | |
+| same, default (twice) | | scroll container (5072 px): full travel 0 <-> 3152 every 1.5 s gesture, **1 yank in 28 s** and 1 in 30 s. The media gallery didn't appear in those page loads, so it has no "after" number |
+
+Restart checks on this package: `POST :9040/restart?scope=crash` killed the
+WebProcess, the page reloaded in web process 5 and finished loading.
+`scope=page` gave `RESULT ps5browser page-restart PASS new WebProcess
+committed` and the page loaded again. Seen in every run, and also in older
+runs in the same log: when the title winds down, "webprocess FAIL
+terminated (reason 2); reloading" and a new WebProcess is launched during
+the wind-down. That comes from the termination handler, not from this work.
+
+**For the owner on the TV:** the heavy feed with `stickframe=1`: scroll
+down, fast up, down again. It should keep scrolling. If it trips the cap,
+the log shows "over the 160 MB cap (texture pool N MB)" and coverage comes
+back after 3 s. Also the phone product page's carousels with the stick
+pushed right, with and without `overflow=1`. Not done: the white flicker
+when scrolling back up fast. With pool surfaces released near the cap and
+less lookahead, the cap should trip less often there, but the flicker
+itself needs a capture.
