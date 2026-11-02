@@ -45,6 +45,26 @@ struct PS5CompositorContext {
     unsigned (*videoTexture)(uint64_t key, int* width, int* height, uint32_t* frames);
 };
 
+// Counters for the performance overlay (PS5PerfOverlay.cpp). Totals since
+// set-up, never reset (the overlay takes differences between snapshots),
+// then values as they are now.
+struct PS5CompositorPerf {
+    uint64_t updates; // WebProcess updates applied
+    uint64_t updateApplyUS;
+    uint64_t paints; // scene paints
+    uint64_t paintUS;
+    uint64_t presents; // frames that presented updates (replies went out)
+    uint64_t tileUploads, tileUploadBytes, tileUploadUS;
+    uint64_t scrollFrames; // presented frames that moved the shown page
+    uint64_t scrollLatencies, scrollLatencyUS; // pad wheel event -> the frame that moved the page
+    uint64_t wheelEvents; // pad wheel events
+    uint64_t clampedEvents; // async scrolling stopped at the painted edge
+    double scrollLatencyMaxMS; // since the previous snapshot
+    unsigned pages, layers, videoLayers;
+    double glTextureMB;
+    bool coverageReduced; // over the GL texture cap: tiles for the visible rect only
+};
+
 class PS5CompositorClient {
 public:
     virtual ~PS5CompositorClient() = default;
@@ -72,6 +92,8 @@ public:
     // Right after the swap (or headset submit) that shows what was applied so
     // far: the GPU is done with that frame's uploads; replies may go out.
     virtual void didPresent() = 0;
+    // The overlay's counters (after setUp() succeeded); false: none.
+    virtual bool perfSnapshot(PS5CompositorPerf&) { return false; }
 };
 
 #if defined(PS5WK_WC) && PS5WK_WC

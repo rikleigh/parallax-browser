@@ -37,6 +37,12 @@
 #include <sys/user.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/queue.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netinet/tcp_var.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -643,6 +649,82 @@ static void* memLogger(void* data)
     return nullptr;
 }
 
+// The title's performance overlay (wpe-ps5/PS5PerfOverlay.cpp): one short
+// line per second with this process's CPU (cores), resident memory and
+// libpas committed memory (MB), and in the NetworkProcess the system's TCP
+// payload bytes in and out so far (the title may not read them itself).
+// The title's output relay reads these lines and keeps them out of its log.
+// PS5WK_PERF_LINES=0 turns them off.
+// Network bytes in and out so far: the TCP counters, else the interfaces'.
+static const char* networkBytes(unsigned long long& in, unsigned long long& out)
+{
+    struct tcpstat tcp;
+    size_t size = sizeof tcp;
+    if ((!sysctlbyname("net.inet.tcp.stats", &tcp, &size, nullptr, 0) || errno == ENOMEM)
+        && size >= offsetof(struct tcpstat, tcps_rcvbyte) + sizeof(tcp.tcps_rcvbyte)) {
+        in = tcp.tcps_rcvbyte;
+        out = tcp.tcps_sndbyte;
+        return "tcp";
+    }
+    struct ifaddrs* list = nullptr;
+    if (getifaddrs(&list))
+        return nullptr;
+    bool any = false;
+    in = out = 0;
+    for (struct ifaddrs* a = list; a; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_LINK || !a->ifa_data || (a->ifa_flags & IFF_LOOPBACK))
+            continue;
+        const auto* data = static_cast<const struct if_data*>(a->ifa_data);
+        in += data->ifi_ibytes;
+        out += data->ifi_obytes;
+        any = true;
+    }
+    freeifaddrs(list);
+    return any ? "if" : nullptr;
+}
+
+static void* perfReporter(void* data)
+{
+    const bool network = data;
+    bool reported = false;
+    struct rusage last;
+    getrusage(RUSAGE_SELF, &last);
+    double lastWall = nowMS();
+    for (;;) {
+        struct timespec ts { 1, 0 };
+        while (nanosleep(&ts, &ts) && errno == EINTR) { }
+        struct rusage now;
+        getrusage(RUSAGE_SELF, &now);
+        double wall = nowMS();
+        auto ms = [](const struct timeval& tv) { return tv.tv_sec * 1e3 + tv.tv_usec / 1e3; };
+        double cpu = wall > lastWall ? (ms(now.ru_utime) - ms(last.ru_utime) + ms(now.ru_stime) - ms(last.ru_stime)) / (wall - lastWall) : 0;
+        last = now;
+        lastWall = wall;
+        long rss = residentKB();
+        double mapped = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : -1;
+        double givenBack = &pas_page_malloc_ps5_decommitted_bytes && pas_page_malloc_ps5_decommitted_bytes > 0
+            ? pas_page_malloc_ps5_decommitted_bytes / 1048576.0 : 0;
+        char tcpText[64] = "";
+        if (network) {
+            unsigned long long in = 0, out = 0;
+            const char* source = networkBytes(in, out);
+            if (source)
+                snprintf(tcpText, sizeof tcpText, " %s %llu %llu", source, in, out);
+            if (!reported) {
+                int error = errno;
+                if (source)
+                    LOG("[perf] network bytes for the overlay: %s counters", strcmp(source, "tcp") ? "interface" : "TCP");
+                else
+                    LOG("[perf] network bytes for the overlay: none readable (errno %d)", error);
+                reported = true;
+            }
+        }
+        fprintf(stderr, "[perf] cpu %.3f rss %.1f pas %.1f%s\n", cpu, rss >= 0 ? rss / 1024.0 : -1.0,
+            mapped < 0 ? -1.0 : mapped > givenBack ? mapped - givenBack : 0.0, tcpText);
+    }
+    return nullptr;
+}
+
 static void* runWebKit(void* data)
 {
     auto* args = static_cast<MainArgs*>(data);
@@ -758,6 +840,12 @@ int main(int, char**)
         pthread_t memThread;
         if (!pthread_create(&memThread, nullptr, memLogger, cpuTag))
             pthread_detach(memThread);
+    }
+    const char* perfLines = getenv("PS5WK_PERF_LINES");
+    if (!(perfLines && !strcmp(perfLines, "0"))) {
+        pthread_t perfThread;
+        if (!pthread_create(&perfThread, nullptr, perfReporter, network ? &perfThread : nullptr))
+            pthread_detach(perfThread);
     }
 
     pthread_attr_t attributes;

@@ -21,6 +21,7 @@
 
 #include "PS5Compositor.h"
 #include "PS5GLBench.h"
+#include "PS5PerfOverlay.h"
 #include "PS5Text.h"
 #include "PS5VideoDecoder.h"
 #include "PS5VideoServer.h"
@@ -263,6 +264,16 @@ bool PS5Renderer::initialize(char* error, unsigned errorSize)
         return true;
     g_mutex_init(&m_lock);
     g_cond_init(&m_cond);
+    m_mainThread = pthread_self();
+    {
+        gchar* options = nullptr;
+        if (g_file_get_contents("/data/ps5webkit/perf-overlay", &options, nullptr, nullptr)) {
+            m_perfWanted = true;
+            m_perfOptions = options;
+            g_free(options);
+            ps5PerfMainThreadSampler(true);
+        }
+    }
 #if defined(PS5WK_WC) && PS5WK_WC
     if (!m_compositor)
         m_compositor = ps5wkWCCompositorClient();
@@ -505,6 +516,24 @@ void PS5Renderer::setCompositor(PS5CompositorClient* client)
         m_compositor = client;
 }
 
+void PS5Renderer::setPerfOverlay(bool on)
+{
+    ps5PerfMainThreadSampler(on);
+    g_mutex_lock(&m_lock);
+    m_perfWanted = on;
+    m_frameRequested = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+bool PS5Renderer::perfOverlay()
+{
+    g_mutex_lock(&m_lock);
+    bool on = m_perfWanted;
+    g_mutex_unlock(&m_lock);
+    return on;
+}
+
 void PS5Renderer::requestCompositorFrame()
 {
     g_mutex_lock(&m_lock);
@@ -600,7 +629,7 @@ void PS5Renderer::threadMain()
         for (;;) {
             if (m_pageJob.pending || m_frameRequested || m_compositorRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
                 break;
-            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged || m_thumbnailRequest.pending)
+            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged || m_thumbnailRequest.pending || m_perfWanted != m_perfOn)
                 break;
             int64_t now = nowUS();
             if (m_messageUntilUS && now >= m_messageUntilUS)
@@ -627,6 +656,8 @@ void PS5Renderer::threadMain()
             int64_t deadline = PS5VideoServer::nextDeadline();
             if (m_messageUntilUS)
                 deadline = std::min(deadline, m_messageUntilUS + 2000);
+            if (m_perfOn && m_perf) // the overlay's next text update
+                deadline = std::min(deadline, m_perf->nextUpdateUS() + 2000);
             if (m_thumbnails.active) // a paused video: answer at the deadline with what was taken
                 deadline = std::min(deadline, std::min(m_thumbnails.deadlineUS, m_thumbnails.taken ? m_thumbnails.stallUS : INT64_MAX) + 2000);
             if (deadline <= now + 2000)
@@ -647,15 +678,28 @@ void PS5Renderer::threadMain()
         m_drawPointerY = m_pointerY;
         capturePath = m_capturePath;
         m_capturePath = nullptr;
+        bool perfWanted = m_perfWanted;
         g_mutex_unlock(&m_lock);
+
+        if (perfWanted != m_perfOn) {
+            if (perfWanted && !m_perf)
+                m_perf = new PS5PerfOverlay(pthread_self(), m_mainThread, m_perfOptions.c_str());
+            if (m_perf)
+                m_perf->setActive(perfWanted);
+            m_perfOn = perfWanted;
+        }
 
         setUpCompositorIfWanted();
         serviceBufferRequests();
         int64_t start = nowUS();
         updateMessage(start);
         bool commitGeometry = m_job.pending;
-        if (m_job.pending)
+        double uploadMS = 0;
+        if (m_job.pending) {
+            int64_t copyStart = nowUS();
             copyPage();
+            uploadMS = std::max(0.001, (nowUS() - copyStart) / 1000.0);
+        }
         if (m_compositorReady)
             m_compositor->applyPending();
         int64_t applied = nowUS();
@@ -741,6 +785,8 @@ void PS5Renderer::threadMain()
             g_message("[frame] render t=%.1f: started %.2f ms after the last swap, apply %.2f, video %.2f, scene %.2f, draw %.2f, swap %.2f",
                 start / 1000.0, previousSwapEnd ? (start - previousSwapEnd) / 1000.0 : -1.0, (applied - start) / 1000.0, (consumed - applied) / 1000.0,
                 (painted - consumed) / 1000.0, (drawn - painted) / 1000.0, swapMS);
+        if (m_perfOn && m_perf)
+            m_perf->noteFrame({ start, applied, consumed, painted, drawn, swapStart, swapEnd, uploadMS, m_sceneTexture != 0 });
         stats.frames++;
         stats.renderMS += renderMS;
         stats.renderMaxMS = std::max(stats.renderMaxMS, renderMS);
@@ -970,6 +1016,7 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
         }
         double ms = (nowUS() - start) / 1000.0;
         stats.videoFrames++;
+        m_videoFramesConverted++;
         stats.videoMS += ms;
         stats.videoMaxMS = std::max(stats.videoMaxMS, ms);
     }
@@ -1108,6 +1155,13 @@ void PS5Renderer::drawScene()
         glBindTexture(GL_TEXTURE_2D, m_pointerTexture);
         glUniform4f(m_uRect, r[0], r[1], r[2], r[3]);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    // The performance overlay, over everything.
+    if (m_perfOn && m_perf) {
+        PS5PerfState state { m_compositorReady ? m_compositor : nullptr, m_compositor != nullptr, m_sceneTexture != 0,
+            m_pageWidth, m_pageHeight, m_pageBufferBytes, m_videoFramesConverted, m_vao };
+        m_perf->draw(m_width, m_height, state);
     }
     glDisable(GL_BLEND);
 }

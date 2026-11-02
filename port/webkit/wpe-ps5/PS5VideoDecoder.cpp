@@ -1081,6 +1081,7 @@ static double budgetDirectMB, budgetPendingFlexibleMB;
 static unsigned budgetPeakDecoders;
 static double budgetPeakDirectMB;
 static uint64_t budgetRefused, budgetWaited, budgetSmallVP9;
+static BudgetLimits budgetLastLimits; // as read at the last DOPEN (the overlay)
 static std::map<uint64_t, Cost> measuredCosts; // (codec, depth, size) -> cost measured at open
 // Opens one at a time, so the memory measured around one is its own.
 static GMutex openLock;
@@ -1166,6 +1167,7 @@ static bool admit(Decoder& d, const BudgetLimits& limits, const Cost& cost, char
     for (;;) {
         double flexible = flexibleFreeMB();
         g_mutex_lock(&budgetLock);
+        budgetLastLimits = limits;
         bool countOK = budgetDecoders < limits.decoders;
         bool directOK = budgetDirectMB + cost.directMB <= limits.directMB;
         bool flexibleOK = flexible - budgetPendingFlexibleMB - cost.flexibleMB >= limits.reserveMB;
@@ -1217,6 +1219,13 @@ static void settleBudget(Decoder& d, const Cost* measured)
         d.budgetDirectMB = measured->directMB;
         d.budgetFlexibleMB = measured->flexibleMB;
     }
+    g_mutex_unlock(&budgetLock);
+}
+
+void budget(Budget& out)
+{
+    g_mutex_lock(&budgetLock);
+    out = { budgetDecoders, budgetLastLimits.decoders, budgetDirectMB, budgetLastLimits.directMB, budgetRefused };
     g_mutex_unlock(&budgetLock);
 }
 

@@ -19,6 +19,7 @@
 #include "config.h"
 
 #include "PS5LaunchProtocol.h"
+#include "PS5PerfOverlay.h"
 #include "WPEPS5Private.h"
 #include <arpa/inet.h>
 #include <algorithm>
@@ -115,6 +116,14 @@ static bool writeAll(int fd, const void* data, size_t size)
 // previous payload has printed its first line (it is running) or 10 s, and
 // a refused spawn is retried.
 static GMutex s_uploadLock;
+
+// One line of a payload's output into our log; the performance overlay's
+// lines (PS5PerfOverlay.cpp) stay out of it.
+static void relayLine(const char* tag, const char* line)
+{
+    if (!ps5PerfNoteChildLine(tag, line))
+        fprintf(stderr, "[%s] %s\n", tag, line);
+}
 
 // Connects to elfldr and sends the ELF plus the header line. Returns the
 // connection (the payload's stdout) or -1.
@@ -232,13 +241,13 @@ static gpointer uploadThread(gpointer data)
         char* start = line;
         for (char* nl; (nl = strchr(start, '\n')); start = nl + 1) {
             *nl = 0;
-            fprintf(stderr, "[%s] %s\n", tag, start);
+            relayLine(tag, start);
         }
         used = static_cast<size_t>(line + used - start);
         memmove(line, start, used);
         if (used == sizeof(line) - 1) {
             line[used] = 0;
-            fprintf(stderr, "[%s] %s\n", tag, line);
+            relayLine(tag, line);
             used = 0;
         }
         ssize_t n = read(s, line + used, sizeof(line) - 1 - used);
@@ -250,9 +259,10 @@ static gpointer uploadThread(gpointer data)
     }
     if (used) {
         line[used] = 0;
-        fprintf(stderr, "[%s] %s\n", tag, line);
+        relayLine(tag, line);
     }
     fprintf(stderr, "[%s] (output closed after %.1f s)\n", tag, (g_get_monotonic_time() - t0) / 1e6);
+    ps5PerfChildEnded(tag);
     close(s);
     return nullptr;
 }

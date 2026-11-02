@@ -26,6 +26,7 @@
 #include <vector>
 
 class PS5CompositorClient;
+class PS5PerfOverlay;
 struct PS5VideoStream;
 struct PS5VideoFrame;
 struct PS5VRState;
@@ -86,6 +87,12 @@ public:
 
     // CPU time of the render thread so far (seconds), or -1.
     double renderThreadCPUSeconds() const;
+
+    // Performance overlay (PS5PerfOverlay.h), main thread: on or off, live.
+    // /data/ps5webkit/perf-overlay turns it on at start (its words are
+    // options: pos=tl|tr|bl|br size=<px> graph=0).
+    void setPerfOverlay(bool on);
+    bool perfOverlay();
 
     // GPU compositing (PS5Compositor.h): main thread, before the render thread
     // starts (initialize() sets the WC build's client itself). The client is
@@ -206,6 +213,9 @@ private:
     bool m_pointerVisible { false };
     double m_pointerX { 0 }, m_pointerY { 0 };
     char* m_capturePath { nullptr };
+    bool m_perfWanted { false };
+    std::string m_perfOptions; // set before the render thread starts
+    pthread_t m_mainThread { };
 
     // Render thread only.
     PS5CompositorClient* m_compositor { nullptr }; // set before the render thread starts
@@ -215,6 +225,9 @@ private:
     unsigned m_sceneTexture { 0 };
     int m_sceneWidth { 0 }, m_sceneHeight { 0 };
     PageJob m_job;
+    PS5PerfOverlay* m_perf { nullptr };
+    bool m_perfOn { false };
+    uint64_t m_videoFramesConverted { 0 };
     bool m_drawPointer { false };
     double m_drawPointerX { 0 }, m_drawPointerY { 0 };
     bool m_videoActive { false };

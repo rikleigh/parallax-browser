@@ -100,6 +100,28 @@ WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
                                                   const char    *text,
                                                   double         seconds);
 
+/* ---- Performance overlay (port/webkit/OVERLAY.md) ---- */
+
+/* Live numbers in a corner of the TV (frames, CPU, memory, compositing,
+ * scrolling, video, network). Takes effect at once. */
+WPE_API void        wpe_display_ps5_set_perf_overlay (WPEDisplayPS5 *display,
+                                                      gboolean       enabled);
+WPE_API gboolean    wpe_display_ps5_get_perf_overlay (WPEDisplayPS5 *display);
+/* Called on the main thread when the pad shortcut (L3 + R3) turned the
+ * overlay on or off (e.g. to remember it). */
+typedef void (* WPEDisplayPS5PerfOverlayCallback) (WPEDisplayPS5 *display,
+                                                   gboolean       enabled,
+                                                   gpointer       user_data);
+WPE_API void        wpe_display_ps5_set_perf_overlay_callback (WPEDisplayPS5                   *display,
+                                                               WPEDisplayPS5PerfOverlayCallback callback,
+                                                               gpointer                         user_data);
+/* A named counter (a total since start, e.g. "blocked" for the ad blocker)
+ * shown on the overlay with its rate; up to 6 names. Any thread; @display
+ * may be NULL. */
+WPE_API void        wpe_display_ps5_set_perf_counter (WPEDisplayPS5 *display,
+                                                      const char    *name,
+                                                      guint64        value);
+
 /* ---- View in VR: the playing video in the PS VR2 headset ---- */
 
 typedef enum {

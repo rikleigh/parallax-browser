@@ -21,6 +21,7 @@
 
 #include "GRefPtrWPE.h"
 
+#include "PS5PerfOverlay.h"
 #include "PS5Renderer.h"
 #include <pthread.h>
 #include <sys/resource.h>
@@ -114,6 +115,9 @@ struct _WPEDisplayPS5Private {
     gpointer buttonHandlerData { nullptr };
     uint32_t swallowedButtons { 0 };
     bool padCaptured { false };
+    bool stickChord { false }; // L3 + R3 went down together: their own keys are not sent
+    WPEDisplayPS5PerfOverlayCallback perfOverlayCallback { nullptr };
+    gpointer perfOverlayCallbackData { nullptr };
     WPEDisplayPS5VRCallback vrCallback { nullptr };
     gpointer vrCallbackData { nullptr };
     bool vrStarting { false };
@@ -128,6 +132,11 @@ WEBKIT_DEFINE_FINAL_TYPE_WITH_CODE(WPEDisplayPS5, wpe_display_ps5, WPE_TYPE_DISP
     g_io_extension_point_implement(WPE_DISPLAY_EXTENSION_POINT_NAME, g_define_type_id, "ps5", 100))
 
 static gint64 s_mainPollUS; // time the main loop spent waiting in poll (main thread)
+
+int64_t ps5wkMainLoopPollUS()
+{
+    return s_mainPollUS;
+}
 
 static double nowSeconds()
 {
@@ -573,6 +582,32 @@ static void padTick(WPEDisplayPS5* display)
             sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
     }
 
+    // L3 + R3 (both sticks pressed in): the performance overlay on or off.
+    // L3's and R3's own keys (home page, Settings) go out when the button
+    // comes back up instead of when it goes down, and not after the chord.
+    constexpr uint32_t stickButtons = PS5_PAD_L3 | PS5_PAD_R3;
+    if ((pressed & stickButtons) && (now & stickButtons) == stickButtons) {
+        priv->stickChord = true;
+        bool on = !PS5Renderer::singleton().perfOverlay();
+        PS5Renderer::singleton().setPerfOverlay(on);
+        PS5Renderer::singleton().showMessage(on ? "Performance overlay on (L3 + R3)" : "Performance overlay off", 1.5);
+        PS5_LOG("pad: L3 + R3, performance overlay %s", on ? "on" : "off");
+        if (priv->perfOverlayCallback)
+            priv->perfOverlayCallback(display, on, priv->perfOverlayCallbackData);
+    }
+    if (uint32_t stickReleased = released & stickButtons) {
+        for (const auto& mapping : keyMappings) {
+            if (!priv->stickChord && (stickReleased & mapping.button)) {
+                sendKey(view, mapping.keyval, mapping.keycode, mapping.modifiers, true);
+                sendKey(view, mapping.keyval, mapping.keycode, mapping.modifiers, false);
+            }
+        }
+        if (!(now & stickButtons))
+            priv->stickChord = false;
+    }
+    pressed &= ~stickButtons;
+    released &= ~stickButtons;
+
     // Triangle: the on-screen keyboard for the focused field.
     if ((pressed & PS5_PAD_TRIANGLE) && priv->focusedInputContext)
         wpeInputMethodContextPS5OpenKeyboard(priv->focusedInputContext);
@@ -824,6 +859,30 @@ static void setPadCaptured(WPEDisplayPS5* display, bool captured)
         wpeDisplayPS5ScheduleRedraw(display);
     }
     PS5_LOG("pad %s", captured ? "captured (View in VR)" : "back to the page");
+}
+
+void wpe_display_ps5_set_perf_overlay(WPEDisplayPS5* display, gboolean enabled)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().setPerfOverlay(enabled);
+}
+
+gboolean wpe_display_ps5_get_perf_overlay(WPEDisplayPS5* display)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return PS5Renderer::singleton().perfOverlay();
+}
+
+void wpe_display_ps5_set_perf_overlay_callback(WPEDisplayPS5* display, WPEDisplayPS5PerfOverlayCallback callback, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->perfOverlayCallback = callback;
+    display->priv->perfOverlayCallbackData = userData;
+}
+
+void wpe_display_ps5_set_perf_counter(WPEDisplayPS5*, const char* name, guint64 value)
+{
+    ps5PerfSetCounter(name, value);
 }
 
 void wpe_display_ps5_show_message(WPEDisplayPS5* display, const char* text, double seconds)

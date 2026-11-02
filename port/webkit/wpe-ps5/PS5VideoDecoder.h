@@ -118,5 +118,14 @@ struct BufferProvider {
 };
 void setBufferProvider(const BufferProvider&);
 
+// The decoder budget now (the performance overlay): open decoders and their
+// direct memory against the limits.
+struct Budget {
+    unsigned decoders, maxDecoders;
+    double directMB, maxDirectMB;
+    uint64_t refused;
+};
+void budget(Budget&);
+
 } // namespace PS5VideoDecoder
 #endif
