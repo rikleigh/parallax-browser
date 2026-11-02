@@ -539,7 +539,31 @@ static void padTick(WPEDisplayPS5* display)
 
     // While the on-screen keyboard is up, the pad belongs to it.
     if (priv->pendingText) {
-        priv->buttons = data.buttons;
+        // End what the page saw go down: X on a field opens the keyboard
+        // while X is still held (the field takes focus on the press), so
+        // its release never reached the page, which then kept the button
+        // down. The next stick move was a drag that selected text in the
+        // field and focused it again (a site's suggestion list came back
+        // after a search). Held keys get their key-up too; buttons still
+        // held when the keyboard closes stay ignored until released.
+        if (priv->buttons || priv->pointerDown) {
+            uint32_t held = priv->buttons & ~priv->swallowedButtons;
+            if (priv->pointerDown) {
+                priv->pointerDown = false;
+                GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
+                    eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
+                wpe_view_event(view, event.get());
+            } else if (held & PS5_PAD_CROSS)
+                sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
+            for (const auto& mapping : keyMappings) {
+                if ((held & mapping.button) && !(mapping.button & (PS5_PAD_L3 | PS5_PAD_R3))) // L3/R3 send at release
+                    sendKey(view, mapping.keyval, mapping.keycode, mapping.modifiers, false);
+            }
+            PS5_LOG("pad: keyboard open, released what the page saw held (buttons 0x%x)", held);
+        }
+        priv->buttons = 0;
+        priv->swallowedButtons = 0;
+        priv->stickChord = false;
         priv->ignoredButtons = data.buttons;
         priv->repeatingKey = 0;
         return;
