@@ -604,6 +604,9 @@ int ps5wk_adblock_job(const char* jobPath)
     g_object_unref(store);
     removeFiles(tmp, NULL, NULL, NULL);
     g_rmdir(tmp);
+    /* A failed compile leaves its ContentRuleList-XXXXXX behind. */
+    if (!outcome)
+        removeFiles(storeDir, "ContentRuleList-", "ContentRuleList-ubol-a", "ContentRuleList-ubol-b");
 
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
