@@ -1,0 +1,69 @@
+diff --git a/Source/WebCore/page/LocalFrameView.cpp b/Source/WebCore/page/LocalFrameView.cpp
+index 02626faa2b..eb5b8961ed 100644
+--- a/Source/WebCore/page/LocalFrameView.cpp
++++ b/Source/WebCore/page/LocalFrameView.cpp
+@@ -4078,6 +4078,25 @@ bool LocalFrameView::shouldUpdateCompositingLayersAfterScrolling() const
+     return true;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5 (WC compositor, main-thread scrolling): ScrollView::scrollTo runs the
++// OnScroll compositing update before LocalFrameView::scrollTo moves the
++// layout viewport (updateLayoutViewport -> setViewportConstrainedObjectsNeedLayout),
++// so composited sticky layers got the sticky offset of the previous scroll
++// step: a stuck header moved with the page by one step (off screen going
++// down, page showing above it going up) until the next step or layout. While
++// a LocalFrameView::scrollTo is in progress that update is held back and run
++// once the layout viewport and layer positions are current.
++// PS5WK_WC_STICKY_SYNC=0 (child.env): the old order, for A/B tests.
++static LocalFrameView* s_ps5ScrollingView;
++static bool s_ps5CompositingUpdateAfterScrollingHeld;
++static bool ps5SyncStickyAfterScrolling()
++{
++    static const bool sync = !getenv("PS5WK_WC_STICKY_SYNC") || strcmp(getenv("PS5WK_WC_STICKY_SYNC"), "0");
++    return sync;
++}
++#endif
++
+ void LocalFrameView::updateCompositingLayersAfterScrolling()
+ {
+     ASSERT(layoutContext().layoutPhase() >= LocalFrameViewLayoutContext::LayoutPhase::InPostLayout || layoutContext().layoutPhase() == LocalFrameViewLayoutContext::LayoutPhase::OutsideLayout);
+@@ -4085,6 +4104,13 @@ void LocalFrameView::updateCompositingLayersAfterScrolling()
+     if (!shouldUpdateCompositingLayersAfterScrolling())
+         return;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (s_ps5ScrollingView == this) {
++        s_ps5CompositingUpdateAfterScrollingHeld = true;
++        return;
++    }
++#endif
++
+     if (!layoutContext().isLayoutNested() && hasViewportConstrainedObjects()) {
+         if (CheckedPtr renderView = this->renderView())
+             protect(renderView->compositor())->updateCompositingLayers(CompositingUpdateType::OnScroll);
+@@ -5490,9 +5516,24 @@ IntRect LocalFrameView::windowClipRectForFrameOwner(const HTMLFrameOwnerElement*
+ void LocalFrameView::scrollTo(const ScrollPosition& newPosition)
+ {
+     IntPoint oldPosition = scrollPosition();
++#if defined(PS5_PAYLOAD_SDK)
++    // See updateCompositingLayersAfterScrolling.
++    bool holdCompositingUpdate = !s_ps5ScrollingView && usesCompositedScrolling() && ps5SyncStickyAfterScrolling();
++    if (holdCompositingUpdate) {
++        s_ps5ScrollingView = this;
++        s_ps5CompositingUpdateAfterScrollingHeld = false;
++    }
++#endif
+     ScrollView::scrollTo(newPosition);
+     if (oldPosition != scrollPosition())
+         scrollPositionChanged(oldPosition, scrollPosition());
++#if defined(PS5_PAYLOAD_SDK)
++    if (holdCompositingUpdate) {
++        s_ps5ScrollingView = nullptr;
++        if (std::exchange(s_ps5CompositingUpdateAfterScrollingHeld, false))
++            updateCompositingLayersAfterScrolling();
++    }
++#endif
+ 
+     didChangeScrollOffset();
+ }

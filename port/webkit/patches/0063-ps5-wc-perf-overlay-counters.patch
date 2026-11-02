@@ -1,0 +1,209 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 33348b165f..ea1cd298da 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -326,6 +326,7 @@ public:
+     void applyPending() final;
+     unsigned paint(int64_t displayUS, int* width, int* height) final;
+     void didPresent() final;
++    bool perfSnapshot(PS5CompositorPerf&) final;
+ 
+ private:
+     enum class State : int { NotSetUp, Ready, Failed };
+@@ -341,6 +342,7 @@ private:
+     void checkGLMemory();
+     WCScene& ensureScene(uint64_t pageID);
+     void maybeLog();
++    void takeUploadStats();
+     bool runS1b(bool verbose, IntSize viewport);
+     unsigned readbackAndCheck(const IntSize&, uint32_t* checksum, unsigned* probesOK, unsigned* probes, char* firstBad, size_t firstBadSize, const char* dumpPath = nullptr);
+ 
+@@ -399,6 +401,11 @@ private:
+         unsigned latencies { 0 };
+     } m_stats;
+     std::atomic<uint64_t> m_replyHopUS { 0 }, m_replyHopMaxUS { 0 }, m_replyHops { 0 };
++    // The performance overlay's totals (PS5Compositor.h; render thread) and
++    // the tile uploads taken from the uploader since the last [wc] line.
++    PS5CompositorPerf m_perf { };
++    double m_perfLatencyMaxMS { 0 };
++    BitmapTextureUploaderPS5::Stats m_uploadWindow;
+     bool m_frameLog { false }; // /data/ps5webkit/wc-frame-log: a [frame] line per presented update
+     bool m_sceneStats { false }; // /data/ps5webkit/wc-scene-stats: where scene paints go (AS6)
+ 
+@@ -411,6 +418,7 @@ public:
+     std::atomic<unsigned> m_asyncWheelEvents { 0 }, m_syncWheelEvents { 0 }, m_clampedWheelEvents { 0 };
+     std::atomic<unsigned> m_scrollNotes[4] { };
+     std::atomic<uint64_t> m_clampedPx { 0 };
++    std::atomic<uint64_t> m_perfWheelEvents { 0 }, m_perfClampedEvents { 0 }; // never reset (the overlay)
+     std::atomic<bool> m_coverageReduced { false };
+     Lock m_wheelListenersLock;
+     HashSet<uint64_t> m_scenesWithWheelListeners WTF_GUARDED_BY_LOCK(m_wheelListenersLock);
+@@ -681,15 +689,17 @@ void SceneHost::applyPending()
+                 m_shownPage = job.pageID;
+                 m_lastUpdate[job.pageID] = ++m_updateSerial;
+             }
+-            if (m_scrollLog && job.info->mainFrameScrollPosition && !hasScrollingTree(job.pageID)) {
++            if (job.info->mainFrameScrollPosition && !hasScrollingTree(job.pageID)) {
+                 auto position = *job.info->mainFrameScrollPosition;
+                 auto it = m_scrollPositions.find(job.pageID);
+                 if (it != m_scrollPositions.end() && it->second != position && m_shownPage == job.pageID) {
+                     double step = std::abs(position.y() - it->second.y()) + std::abs(position.x() - it->second.x());
+                     m_scrollMovedByUpdate = true;
+-                    m_scrollStats.updatesWithScroll++;
+-                    m_scrollStats.stepPx += step;
+-                    m_scrollStats.stepMaxPx = std::max(m_scrollStats.stepMaxPx, step);
++                    if (m_scrollLog) {
++                        m_scrollStats.updatesWithScroll++;
++                        m_scrollStats.stepPx += step;
++                        m_scrollStats.stepMaxPx = std::max(m_scrollStats.stepMaxPx, step);
++                    }
+                 }
+                 m_scrollPositions[job.pageID] = position;
+             }
+@@ -718,6 +728,8 @@ void SceneHost::applyPending()
+ #endif
+             job.info = nullptr; // tile bitmaps go now, on this thread
+             double ms = msSince(start);
++            m_perf.updates++;
++            m_perf.updateApplyUS += static_cast<uint64_t>(ms * 1000);
+             m_stats.updates++;
+             m_stats.applyMS += ms;
+             m_stats.applyMaxMS = std::max(m_stats.applyMaxMS, ms);
+@@ -814,6 +826,8 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+         // Accelerated animations: paint again next frame, updates or not.
+         m_animating = scene.hasRunningAnimations();
+         double ms = msSince(start);
++        m_perf.paints++;
++        m_perf.paintUS += static_cast<uint64_t>(ms * 1000);
+         m_stats.paints++;
+         m_stats.paintMS += ms;
+         m_stats.paintMaxMS = std::max(m_stats.paintMaxMS, ms);
+@@ -917,6 +931,7 @@ void SceneHost::didPresent()
+     m_expectingUpdate = !m_frameCompletions.isEmpty();
+     m_appliedThisFrame = false;
+     if (!m_frameCompletions.isEmpty()) {
++        m_perf.presents++;
+         m_stats.presents++;
+         auto now = MonotonicTime::now();
+         double present = (now - m_frameFirstAppliedAt).milliseconds();
+@@ -930,8 +945,7 @@ void SceneHost::didPresent()
+         completeOnMainThread(std::exchange(m_frameCompletions, { }));
+     }
+     maybeLog();
+-    if (m_scrollLog)
+-        noteScrollPresent();
++    noteScrollPresent();
+ #if ENABLE(ASYNC_SCROLLING)
+     if (m_scrollAnimating) {
+         if (auto requestFrame = m_requestFrame.load())
+@@ -945,13 +959,50 @@ void SceneHost::didPresent()
+         m_lastPaintDisplayUS = 0;
+ }
+ 
++// The uploader's counters into the [wc] line's window and the overlay's totals.
++void SceneHost::takeUploadStats()
++{
++    auto uploads = BitmapTextureUploaderPS5::singleton().takeStats();
++    m_uploadWindow.uploads += uploads.uploads;
++    m_uploadWindow.draws += uploads.draws;
++    m_uploadWindow.bytes += uploads.bytes;
++    m_uploadWindow.milliseconds += uploads.milliseconds;
++    m_uploadWindow.fenceWaits += uploads.fenceWaits;
++    m_uploadWindow.finishes += uploads.finishes;
++    m_perf.tileUploads += uploads.uploads;
++    m_perf.tileUploadBytes += static_cast<uint64_t>(uploads.bytes);
++    m_perf.tileUploadUS += static_cast<uint64_t>(uploads.milliseconds * 1000);
++}
++
++// Render thread (PS5PerfOverlay, twice a second while it is on).
++bool SceneHost::perfSnapshot(PS5CompositorPerf& out)
++{
++    if (m_state.load() != State::Ready)
++        return false;
++    takeUploadStats();
++    out = m_perf;
++    out.wheelEvents = m_perfWheelEvents.load();
++    out.clampedEvents = m_perfClampedEvents.load();
++    out.scrollLatencyMaxMS = std::exchange(m_perfLatencyMaxMS, 0);
++    out.pages = m_scenes.size();
++    out.layers = out.videoLayers = 0;
++    for (auto& entry : m_scenes) {
++        out.layers += entry.second->layerCount();
++        out.videoLayers += entry.second->videoLayerCount();
++    }
++    out.glTextureMB = BitmapTextureUploaderPS5::textureBytes() / 1048576.0;
++    out.coverageReduced = m_glState != GLMemoryState::Normal;
++    return true;
++}
++
+ void SceneHost::maybeLog()
+ {
+     auto now = MonotonicTime::now();
+     double seconds = (now - m_stats.start).seconds();
+     if (seconds < 1)
+         return;
+-    auto uploads = BitmapTextureUploaderPS5::singleton().takeStats();
++    takeUploadStats();
++    auto uploads = std::exchange(m_uploadWindow, { });
+     if (m_stats.updates || m_stats.paints || uploads.uploads) {
+         unsigned layers = 0;
+         for (auto& entry : m_scenes)
+@@ -1072,25 +1123,34 @@ void SceneHost::updateSubScrollerRects(WCScene& scene, uint64_t sceneID)
+ #endif
+ 
+ // Render thread, after a swap: a frame that moved the shown page ends the
+-// latency of the oldest pad input not yet shown.
++// latency of the oldest pad input not yet shown. Counted for the overlay
++// always, for the [ascroll] lines while they are on.
+ void SceneHost::noteScrollPresent()
+ {
+     bool movedByUpdate = std::exchange(m_scrollMovedByUpdate, false);
+     bool movedByTitle = std::exchange(m_scrollMovedByTitle, false);
+     if (movedByUpdate || movedByTitle) {
+-        m_scrollStats.movedFrames++;
+-        if (movedByUpdate)
+-            m_scrollStats.movedByUpdate++;
++        m_perf.scrollFrames++;
++        if (m_scrollLog) {
++            m_scrollStats.movedFrames++;
++            if (movedByUpdate)
++                m_scrollStats.movedByUpdate++;
++        }
+         int64_t oldest = m_oldestScrollInputUS.exchange(0);
+         if (oldest) {
+             double ms = (MonotonicTime::now().secondsSinceEpoch().microseconds() - oldest) / 1000.0;
+-            if (ms >= 0 && ms < 1000)
+-                m_scrollStats.latenciesMS.append(ms);
+-            else
++            if (ms >= 0 && ms < 1000) {
++                m_perf.scrollLatencies++;
++                m_perf.scrollLatencyUS += static_cast<uint64_t>(ms * 1000);
++                m_perfLatencyMaxMS = std::max(m_perfLatencyMaxMS, ms);
++                if (m_scrollLog)
++                    m_scrollStats.latenciesMS.append(ms);
++            } else if (m_scrollLog)
+                 m_scrollStats.staleInputs++;
+         }
+     }
+-    maybeLogScroll();
++    if (m_scrollLog)
++        maybeLogScroll();
+ }
+ 
+ void SceneHost::maybeLogScroll()
+@@ -1422,6 +1482,7 @@ void PS5WCHost::noteScrollClamped(float px)
+ {
+     auto& host = SceneHost::singleton();
+     host.m_clampedWheelEvents++;
++    host.m_perfClampedEvents++;
+     host.m_clampedPx += static_cast<uint64_t>(std::abs(px));
+ }
+ 
+@@ -1446,6 +1507,7 @@ void PS5WCHost::noteScrollInput(MonotonicTime eventTime)
+ {
+     auto& host = SceneHost::singleton();
+     host.m_scrollInputs++;
++    host.m_perfWheelEvents++;
+     int64_t expected = 0;
+     host.m_oldestScrollInputUS.compare_exchange_strong(expected, static_cast<int64_t>(eventTime.secondsSinceEpoch().microseconds()));
+ }

@@ -15,14 +15,22 @@
 #   toolchain/wpe-webkit/src     private clone of ref/WebKit (shared objects,
 #                                sparse checkout), branch "ps5" = 15486a0178 +
 #                                one commit per patches/*.patch
-#   toolchain/wpe-webkit/build   cmake/ninja build (Release, -gline-tables-only)
+#   toolchain/wpe-webkit/build   cmake/ninja build (Release, -gline-tables-only),
+#                                with the WC compositor (GPU compositing)
+#   toolchain/wpe-webkit/build-cpu  WC=0: the same without the compositor
+#                                (CPU painting only; logs in build-cpu/)
 #   SRC=, BLD=, LOGDIR= override these (a second worktree and build dir:
-#   git -C toolchain/wpe-webkit/src worktree add ../src-x -b x ps5)
+#   git -C toolchain/wpe-webkit/src worktree add ../src-x -b x ps5;
+#   toolchain/wpe-webkit/src-wc + build-wc are one, branch ps5-wc)
 #
 # Env: JOBS (default ncpu), FRESH_SRC=1, JIT=0 (configure without the JIT), NINJA_TARGETS="...", NINJA_FLAGS="-k 0",
 #      DEBUG_FLAGS (default -gline-tables-only; -g0 for the smallest build)
-#      WC=1 (configure with the WC compositor next to coordinated graphics:
-#      USE_TEXTURE_MAPPER + USE_GRAPHICS_LAYER_WC; COMPOSITING-PLAN.md; default off)
+#      WC=1 (default: the WC compositor next to coordinated graphics,
+#      USE_TEXTURE_MAPPER + USE_GRAPHICS_LAYER_WC; COMPOSITING-PLAN.md; the
+#      title composites by default and falls back to CPU painting at run
+#      time); WC=0 builds without it (default build dir build-cpu).
+#      `build` reconfigures first when the build dir was configured with
+#      the other WC setting.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,9 +39,15 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 WK="$ROOT/toolchain/wpe-webkit"
+WC="${WC:-1}"
 SRC="${SRC:-$WK/src}"
-LOGDIR="${LOGDIR:-$WK}"
-BLD="${BLD:-$WK/build}"
+if [ "$WC" = 1 ]; then
+    BLD="${BLD:-$WK/build}"
+    LOGDIR="${LOGDIR:-$WK}"
+else
+    BLD="${BLD:-$WK/build-cpu}"
+    LOGDIR="${LOGDIR:-$BLD}"
+fi
 WEBKIT_REF="$ROOT/ref/WebKit"
 WEBKIT_COMMIT=15486a017817cad93f25fdffeb013278866970fc
 SHIM="$HERE/shim"
@@ -138,6 +152,7 @@ WEBKIT_OPTIONS=(
     -DENABLE_WEBGL=OFF -DENABLE_WEBGPU=OFF -DENABLE_WEBXR=OFF -DENABLE_GPU_PROCESS=OFF
     -DUSE_GSTREAMER=ON -DUSE_GSTREAMER_FULL=ON -DUSE_GSTREAMER_GL=OFF -DUSE_GSTREAMER_MPEGTS=OFF
     -DENABLE_VIDEO=ON -DENABLE_MEDIA_SOURCE=ON -DENABLE_MEDIA_TELEMETRY=OFF
+    -DENABLE_MEDIA_CONTROLS_CONTEXT_MENUS=OFF -DENABLE_VIDEO_USES_ELEMENT_FULLSCREEN=OFF
     -DENABLE_WEB_AUDIO=OFF -DENABLE_MEDIA_STREAM=OFF -DENABLE_WEB_RTC=OFF
     -DENABLE_WEB_CODECS=OFF -DENABLE_MEDIA_RECORDER=OFF -DENABLE_MEDIA_SESSION=OFF
     -DENABLE_ENCRYPTED_MEDIA=OFF -DENABLE_THUNDER=OFF -DUSE_EXTERNAL_HOLEPUNCH=OFF
@@ -155,8 +170,10 @@ WEBKIT_OPTIONS=(
     -DLD_PACK_RELATIVE_RELOCS=OFF
     -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF -DCLANGD_AUTO_SETUP=OFF -DCMAKE_VERBOSE_MAKEFILE=OFF
 )
-if [ "${WC:-0}" = 1 ]; then
+if [ "$WC" = 1 ]; then
     WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=ON -DUSE_GRAPHICS_LAYER_WC=ON)
+else
+    WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=OFF -DUSE_GRAPHICS_LAYER_WC=OFF)
 fi
 
 step_configure() {
@@ -203,7 +220,20 @@ step_configure() {
 }
 
 # -------------------------------------------------------------------- build
+# The build dir's WC setting (from its CMakeCache), "" when not configured.
+configured_wc() {
+    [ -f "$BLD/build.ninja" ] && [ -f "$BLD/CMakeCache.txt" ] || return 0
+    grep -q '^USE_GRAPHICS_LAYER_WC:BOOL=ON' "$BLD/CMakeCache.txt" && echo 1 || echo 0
+}
+
 step_build() {
+    local have
+    have="$(configured_wc)"
+    if [ "$have" != "$WC" ]; then
+        log "$BLD is ${have:+configured with WC=$have}${have:-not configured}; configuring for WC=$WC"
+        [ -f "$BLD/shim/libps5shim.a" ] || step_shim
+        step_configure
+    fi
     local targets="${NINJA_TARGETS:-}"
     log "ninja -j$JOBS ${targets:-<all>}"
     local t0=$(date +%s)

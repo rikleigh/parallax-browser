@@ -1,0 +1,141 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 1ebded8ef1..9166dcdc04 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -299,7 +299,7 @@ bool WCScene::apply(WCUpdateInfo& update)
+     return m_rootLayer && m_layers.contains(*m_rootLayer);
+ }
+ 
+-void WCScene::paint(WebCore::BitmapTexture& surface)
++void WCScene::paint(WebCore::BitmapTexture& surface, std::optional<MonotonicTime> animationTime)
+ {
+     if (!m_rootLayer || !m_textureMapper || !m_context->makeContextCurrent())
+         return;
+@@ -307,7 +307,7 @@ void WCScene::paint(WebCore::BitmapTexture& surface)
+     if (!layer)
+         return;
+     auto& rootLayer = layer->texmapLayer;
+-    m_hasRunningAnimations = rootLayer.applyAnimationsRecursively(MonotonicTime::now());
++    m_hasRunningAnimations = rootLayer.applyAnimationsRecursively(animationTime.value_or(MonotonicTime::now()));
+ 
+     m_textureMapper->beginPainting(WebCore::TextureMapper::FlipY::No, &surface);
+     // The surface is reused frame after frame: start from transparent.
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index 713e9ff559..552f7c0acc 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -62,7 +62,8 @@ public:
+     // apply(): layer changes and tile uploads; false without a context or a
+     // root layer. paint(): the root layer tree into surface (cleared first).
+     bool apply(WCUpdateInfo&);
+-    void paint(WebCore::BitmapTexture& surface);
++    // animationTime: when the frame will be shown (default: now).
++    void paint(WebCore::BitmapTexture& surface, std::optional<MonotonicTime> animationTime = std::nullopt);
+     bool hasRootLayer() const { return !!m_rootLayer; }
+     WebCore::IntSize viewport() const { return m_viewport; }
+     unsigned layerCount() const { return m_layers.size(); }
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index b4dec17264..e2122ed12b 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -338,7 +338,7 @@ private:
+     bool m_dirty { false };
+     bool m_animating { false }; // the shown scene runs accelerated animations
+     bool m_expectingUpdate { false }; // replies went out at the last present
+-    MonotonicTime m_lastPaint; // while animating
++    int64_t m_lastPaintDisplayUS { 0 }; // while animating
+     Vector<CompletionHandler<void()>> m_frameCompletions;
+ 
+     struct {
+@@ -595,7 +595,9 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+         auto start = MonotonicTime::now();
+         if (!m_dirty)
+             m_stats.animationPaints++;
+-        scene.paint(*m_surface);
++        // Animations are sampled at the time the frame goes on screen, so
++        // they move evenly whenever in the frame this runs.
++        scene.paint(*m_surface, start + Seconds::fromMicroseconds(displayUS - g_get_monotonic_time()));
+         m_dirty = false;
+         // Accelerated animations: paint again next frame, updates or not.
+         m_animating = scene.hasRunningAnimations();
+@@ -603,9 +605,11 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+         m_stats.paints++;
+         m_stats.paintMS += ms;
+         m_stats.paintMaxMS = std::max(m_stats.paintMaxMS, ms);
+-        if (m_lastPaint)
+-            m_stats.paintGapMaxMS = std::max(m_stats.paintGapMaxMS, (start - m_lastPaint).milliseconds());
+-        m_lastPaint = start;
++        // Gaps between the frames painted (their display times): 16.7 ms
++        // when no vsync is missed.
++        if (m_lastPaintDisplayUS)
++            m_stats.paintGapMaxMS = std::max(m_stats.paintGapMaxMS, (displayUS - m_lastPaintDisplayUS) / 1000.0);
++        m_lastPaintDisplayUS = displayUS;
+     }
+     *width = size.width();
+     *height = size.height();
+@@ -626,7 +630,7 @@ void SceneHost::didPresent()
+         if (auto requestFrame = m_requestFrame.load())
+             requestFrame();
+     } else
+-        m_lastPaint = { };
++        m_lastPaintDisplayUS = 0;
+ }
+ 
+ void SceneHost::maybeLog()
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 74d737073d..371c36ed05 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -982,23 +982,35 @@ GraphicsLayerWC::VisibleAndCoverageRects GraphicsLayerWC::computeVisibleAndCover
+     return { clipRectForSelf, coverageRect, currentTransform };
+ }
+ 
+-void GraphicsLayerWC::recursiveCommitChanges(const TransformState& state)
++void GraphicsLayerWC::recursiveCommitChanges(const TransformState& state, bool affectedByTransformAnimation)
+ {
+     TransformState localState = state;
+ 
+     bool accumulateTransform = accumulatesTransform(*this);
+     VisibleAndCoverageRects rects = computeVisibleAndCoverageRect(localState, accumulateTransform);
++#if defined(PS5_PAYLOAD_SDK)
++    // An accelerated transform animation moves this layer (and the layers
++    // under it) in the scene without commits: tile the whole layer while it
++    // is not too big (4 Mpx), so it doesn't move out of its tiles.
++    affectedByTransformAnimation |= std::ranges::any_of(m_animations, [](auto& animation) {
++        return !animation.paused && animation.property != static_cast<uint8_t>(AnimatedProperty::Opacity);
++    });
++    if (affectedByTransformAnimation && m_size.area() <= 4e6)
++        rects.coverageRect = FloatRect(m_boundsOrigin, m_size);
++#else
++    UNUSED_PARAM(affectedByTransformAnimation);
++#endif
+     bool needsToPaint = m_tiledBacking->updateCoverageRect(rects.coverageRect);
+     if (needsToPaint)
+         noteLayerPropertyChanged(WCLayerChange::Background, DontScheduleFlush);
+ 
+     flushCompositingStateForThisLayerOnly();
+     if (auto* mask = maskLayer())
+-        static_cast<GraphicsLayerWC*>(mask)->recursiveCommitChanges(localState);
++        static_cast<GraphicsLayerWC*>(mask)->recursiveCommitChanges(localState, affectedByTransformAnimation);
+     if (auto* replica = replicaLayer())
+-        static_cast<GraphicsLayerWC*>(replica)->recursiveCommitChanges(localState);
++        static_cast<GraphicsLayerWC*>(replica)->recursiveCommitChanges(localState, affectedByTransformAnimation);
+     for (auto& child : children())
+-        static_cast<GraphicsLayerWC*>(child.ptr())->recursiveCommitChanges(localState);
++        static_cast<GraphicsLayerWC*>(child.ptr())->recursiveCommitChanges(localState, affectedByTransformAnimation);
+ }
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 156a6d31ab..7b43d47b23 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -150,7 +150,7 @@ private:
+     WebCore::TransformationMatrix transformByApplyingAnchorPoint(const WebCore::TransformationMatrix&) const;
+     WebCore::TransformationMatrix layerTransform(const WebCore::FloatPoint&, const WebCore::TransformationMatrix* = nullptr) const;
+     VisibleAndCoverageRects computeVisibleAndCoverageRect(WebCore::TransformState&, bool preserves3D) const;
+-    void recursiveCommitChanges(const WebCore::TransformState&);
++    void recursiveCommitChanges(const WebCore::TransformState&, bool affectedByTransformAnimation = false);
+ 
+     friend class WTF::DoublyLinkedListNode<GraphicsLayerWC>;
+ 

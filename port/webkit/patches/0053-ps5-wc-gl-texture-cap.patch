@@ -1,0 +1,414 @@
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+index 4d64e9dd15..c6d5dbac94 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+@@ -115,7 +115,11 @@ Ref<BitmapTexture> BitmapTexturePool::createTextureForImage(EGLImage image, cons
+ 
+ void BitmapTexturePool::releaseAllTextures()
+ {
++#if !defined(PS5_PAYLOAD_SDK)
++    // PS5: also called on the title's render thread, in the compositor's
++    // context, when its last scene goes (PS5WCHost).
+     ASSERT(isMainThread());
++#endif
+     ASSERT(GLContextWrapper::currentContext());
+     Locker locker { m_lock };
+     m_releaseUnusedTexturesTimer.stop();
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h
+index ffda579a88..1d07fbffc8 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h
+@@ -55,7 +55,7 @@ public:
+     Ref<BitmapTexture> createTextureForImage(EGLImage, const IntSize&, OptionSet<BitmapTexture::Flags>);
+ #endif
+ 
+-    void releaseAllTextures();
++    WEBCORE_EXPORT void releaseAllTextures();
+ 
+ #if USE(GRAPHICS_LAYER_WC)
+     void releaseUnusedTexturesNow() { releaseUnusedTexturesTimerFired(); }
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 33dcf270ce..759aae2321 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -14,12 +14,15 @@
+ #include "MessageSenderInlines.h"
+ #include "PS5WCHost.h"
+ #include "PS5WCNullHost.h"
++#include "ProcessTerminationReason.h"
+ #include "WCUpdateInfo.h"
+ #include "WebPageProxy.h"
++#include "WebProcessProxy.h"
+ #include "WebPreferences.h"
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <wtf/MainThread.h>
++#include <wtf/NeverDestroyed.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ namespace WebKit {
+@@ -29,6 +32,15 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(DrawingAreaProxyWCPS5);
+ // -1: the flag file decides; 0/1: set by the embedder.
+ static int s_compositingOverride = -1;
+ 
++// Main thread: the live drawing areas by scene ID (their identifier), and
++// whether the next WebProcess paints on the CPU (GL texture cap).
++static HashMap<uint64_t, DrawingAreaProxyWCPS5*>& liveDrawingAreas()
++{
++    static NeverDestroyed<HashMap<uint64_t, DrawingAreaProxyWCPS5*>> map;
++    return map;
++}
++static bool s_cpuFallbackForNextProcess;
++
+ bool DrawingAreaProxyWCPS5::compositingRequested()
+ {
+     if (s_compositingOverride >= 0)
+@@ -52,6 +64,12 @@ bool DrawingAreaProxyWCPS5::configurePreferencesForNewPage(WebPreferences& prefe
+     bool useWC = requested && hostAvailable();
+     if (requested && !useWC)
+         WTFLogAlways("[wc] compositing is on but the scene host is not available: this page paints on the CPU");
++    if (useWC && std::exchange(s_cpuFallbackForNextProcess, false)) {
++        // For this WebProcess only: the next one (page restart, crash,
++        // memory restart) composites again.
++        WTFLogAlways("[wc] this WebProcess paints on the CPU: its page went over the GL texture cap"); // NOLINT
++        useWC = false;
++    }
+ 
+     // Only touched when it changes. A change also notifies the WebProcess's
+     // existing page, if any; a new page reads it from its creation parameters.
+@@ -77,10 +95,36 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+ {
+     WTFLogAlways("[wc] page %llu: WC compositor (drawing area %llu, %s host)", static_cast<unsigned long long>(webPageProxy.identifier().toUInt64()),
+         static_cast<unsigned long long>(identifier().toUInt64()), PS5WCNullHost::isInstalled() ? "null" : "GL");
++    liveDrawingAreas().set(identifier().toUInt64(), this);
++}
++
++void DrawingAreaProxyWCPS5::glMemoryAction(uint64_t sceneID, GLMemoryAction action)
++{
++    auto* drawingArea = liveDrawingAreas().get(sceneID);
++    if (!drawingArea)
++        return; // gone meanwhile (restarted or closed)
++    RefPtr page = drawingArea->page();
++    switch (action) {
++    case GLMemoryAction::ReduceCoverage:
++    case GLMemoryAction::RestoreCoverage:
++        drawingArea->send(Messages::DrawingArea::SetTileCoverageReducedWC(action == GLMemoryAction::ReduceCoverage));
++        break;
++    case GLMemoryAction::CPUFallback:
++        if (!page)
++            return;
++        // A new WebProcess that paints on the CPU; the embedder reloads the
++        // page when its process ends (web-process-terminated), as after a crash.
++        WTFLogAlways("[wc] page %llu: ending its WebProcess, the page reloads on the CPU path", // NOLINT
++            static_cast<unsigned long long>(page->identifier().toUInt64()));
++        s_cpuFallbackForNextProcess = true;
++        protect(page->legacyMainFrameProcess())->requestTermination(ProcessTerminationReason::RequestedByClient);
++        break;
++    }
+ }
+ 
+ DrawingAreaProxyWCPS5::~DrawingAreaProxyWCPS5()
+ {
++    liveDrawingAreas().remove(identifier().toUInt64());
+     // The scene is keyed by this drawing area, not the page: a page restart
+     // makes a new proxy, and the old one may go after the new one's first update.
+     if (PS5WCNullHost::isInstalled())
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index 8573e105a7..22e3e9ce0c 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -57,6 +57,11 @@ public:
+     // whether the page should get a DrawingAreaProxyWCPS5.
+     static bool configurePreferencesForNewPage(WebPreferences&);
+ 
++    // The title's GL textures and their cap (PS5WCHost, render thread ->
++    // main thread), for the drawing area whose scene that is.
++    enum class GLMemoryAction : uint8_t { ReduceCoverage, RestoreCoverage, CPUFallback };
++    static void glMemoryAction(uint64_t sceneID, GLMemoryAction);
++
+ private:
+     DrawingAreaProxyWCPS5(WebPageProxy&, WebProcessProxy&);
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 7adba54f75..f85bffba2c 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -23,10 +23,12 @@
+ 
+ #if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+ 
++#include "DrawingAreaProxyWCPS5.h"
+ #include "WCScene.h"
+ #include "WCSceneContext.h"
+ #include "WCUpdateInfo.h"
+ #include <WebCore/BitmapTexture.h>
++#include <WebCore/BitmapTexturePool.h>
+ #include <WebCore/BitmapTextureUploaderPS5.h>
+ #include <WebCore/Color.h>
+ #include <WebCore/FilterOperation.h>
+@@ -313,6 +315,7 @@ private:
+ 
+     void fail(const char* why);
+     void completeOnMainThread(Vector<CompletionHandler<void()>>&&);
++    void checkGLMemory();
+     WCScene& ensureScene(uint64_t pageID);
+     void maybeLog();
+     bool runS1b(bool verbose, IntSize viewport);
+@@ -341,6 +344,18 @@ private:
+     int64_t m_lastPaintDisplayUS { 0 }; // while animating
+     Vector<CompletionHandler<void()>> m_frameCompletions;
+ 
++    // GL texture cap (COMPOSITING-PLAN.md, M6), render thread. Over the
++    // cap, the shown page's WebProcess keeps tiles for the visible rect
++    // only; still over it 5 s later (or far over it at once), the page goes
++    // to the CPU path in a new WebProcess.
++    enum class GLMemoryState : uint8_t { Normal, Reduced, Fallback };
++    GLMemoryState m_glState { GLMemoryState::Normal };
++    std::optional<uint64_t> m_glPage; // the scene m_glState is about
++    MonotonicTime m_glReducedAt, m_glUnderSince, m_glLoggedAt;
++    double m_glPeakMB { 0 };
++    double m_glSmoothedMB { 0 }; // ~1 s average of the per-frame value
++    unsigned m_glOverLogCount { 0 };
++
+     struct {
+         MonotonicTime start;
+         unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 }, animationPaints { 0 }, lateUpdates { 0 };
+@@ -516,7 +531,20 @@ void SceneHost::applyPending()
+     for (auto& job : jobs) {
+         if (!job.info) {
+             m_dirty = true;
+-            m_scenes.erase(job.pageID);
++            if (auto it = m_scenes.find(job.pageID); it != m_scenes.end()) {
++                // A drawing area went (page closed, WebProcess ended or
++                // crashed, page restart): its layers, tiles, video layers and
++                // texture pool go with its scene, here on the render thread.
++                unsigned layers = it->second->layerCount(), videoLayers = it->second->videoLayerCount();
++                double before = BitmapTextureUploaderPS5::textureBytes() / 1048576.0;
++                m_scenes.erase(it);
++                // The intermediate surfaces TextureMapper keeps for reuse (a
++                // global pool, otherwise released only by scene updates).
++                if (m_scenes.empty())
++                    BitmapTexturePool::singleton().releaseAllTextures();
++                WTFLogAlways("[wc] scene %llu removed: %u layers, %u video layers; GL textures %.1f -> %.1f MB, %zu scenes left", // NOLINT
++                    static_cast<unsigned long long>(job.pageID), layers, videoLayers, before, BitmapTextureUploaderPS5::textureBytes() / 1048576.0, m_scenes.size());
++            }
+             m_lastUpdate.erase(job.pageID);
+             if (m_shownPage == job.pageID) {
+                 // Show the most recently updated scene left, if any (an old
+@@ -623,9 +651,90 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     return m_surface->id();
+ }
+ 
++// GL textures (a ~1 s average): logged above 128 MB; above the 160 MB cap the page keeps
++// tiles for the visible rect only (no margin, no whole-layer tiling of
++// animated layers), and back to normal once under 96 MB for 20 s; still over
++// the cap 5 s after that (or over 240 MB at any time), the page goes to the
++// CPU path in a new WebProcess. /data/ps5webkit/wc-gl-cap (MB, read once)
++// moves the cap (the other limits follow it); 0 = no cap.
++void SceneHost::checkGLMemory()
++{
++    static const double capMB = [] {
++        double mb = 160;
++        if (FILE* file = fopen("/data/ps5webkit/wc-gl-cap", "r")) {
++            if (fscanf(file, "%lf", &mb) != 1)
++                mb = 160;
++            fclose(file);
++            WTFLogAlways("[wc] GL texture cap %.0f MB (/data/ps5webkit/wc-gl-cap)", mb); // NOLINT
++        }
++        return mb;
++    }();
++    if (capMB <= 0)
++        return;
++    const double logMB = capMB * 0.8, restoreMB = capMB * 0.6, emergencyMB = capMB * 1.5;
++    double frameMB = BitmapTextureUploaderPS5::textureBytes() / 1048576.0;
++    auto now = MonotonicTime::now();
++    if (m_glPage != m_shownPage) {
++        // Another page shown (or a new drawing area after a restart): its own state.
++        m_glPage = m_shownPage;
++        m_glState = GLMemoryState::Normal;
++        m_glPeakMB = 0;
++        m_glSmoothedMB = frameMB;
++    }
++    m_glPeakMB = std::max(m_glPeakMB, frameMB);
++    // The texture pool's intermediate surfaces come and go within frames
++    // (wcfeed.html: 49-101 MB from one second to the next): decisions go by
++    // a ~1 s average (per presented frame), logs show both.
++    m_glSmoothedMB += (frameMB - m_glSmoothedMB) * 0.02;
++    double mb = m_glSmoothedMB;
++    if (mb > logMB && (!m_glOverLogCount || now - m_glLoggedAt >= 30_s)) {
++        unsigned layers = 0;
++        for (auto& entry : m_scenes)
++            layers += entry.second->layerCount();
++        WTFLogAlways("[wc] GL textures %.1f MB (%.1f this frame), over %.0f MB (cap %.0f MB, %s; %u layers in %zu scenes; peak %.1f MB)", mb, frameMB, logMB, capMB, // NOLINT
++            m_glState == GLMemoryState::Normal ? "normal coverage" : m_glState == GLMemoryState::Reduced ? "coverage reduced" : "CPU fallback asked",
++            layers, m_scenes.size(), m_glPeakMB);
++        m_glLoggedAt = now;
++        m_glOverLogCount++;
++    }
++    if (!m_shownPage || m_glState == GLMemoryState::Fallback)
++        return;
++    uint64_t page = *m_shownPage;
++    auto post = [page](DrawingAreaProxyWCPS5::GLMemoryAction action) {
++        RunLoop::mainSingleton().dispatch([page, action] {
++            DrawingAreaProxyWCPS5::glMemoryAction(page, action);
++        });
++    };
++    if (m_glState == GLMemoryState::Normal && mb > capMB) {
++        WTFLogAlways("[wc] GL textures %.1f MB over the %.0f MB cap: tiles for the visible rect only", mb, capMB); // NOLINT
++        m_glState = GLMemoryState::Reduced;
++        m_glReducedAt = now;
++        m_glUnderSince = { };
++        post(DrawingAreaProxyWCPS5::GLMemoryAction::ReduceCoverage);
++    }
++    if (m_glState == GLMemoryState::Reduced) {
++        if ((mb > capMB && now - m_glReducedAt >= 5_s) || mb > emergencyMB) {
++            WTFLogAlways("[wc] GL textures %.1f MB still over the %.0f MB cap %.1f s after reducing coverage: this page goes to the CPU path", mb, capMB, // NOLINT
++                (now - m_glReducedAt).seconds());
++            m_glState = GLMemoryState::Fallback;
++            post(DrawingAreaProxyWCPS5::GLMemoryAction::CPUFallback);
++        } else if (mb < restoreMB) {
++            if (!m_glUnderSince)
++                m_glUnderSince = now;
++            else if (now - m_glUnderSince >= 20_s) {
++                WTFLogAlways("[wc] GL textures %.1f MB, under %.0f MB for 20 s: normal tile coverage again", mb, restoreMB); // NOLINT
++                m_glState = GLMemoryState::Normal;
++                post(DrawingAreaProxyWCPS5::GLMemoryAction::RestoreCoverage);
++            }
++        } else
++            m_glUnderSince = { };
++    }
++}
++
+ void SceneHost::didPresent()
+ {
+     BitmapTextureUploaderPS5::singleton().frameDone();
++    checkGLMemory();
+     // Replies going out now: the WebProcess will likely send its next update soon.
+     m_expectingUpdate = !m_frameCompletions.isEmpty();
+     if (!m_frameCompletions.isEmpty()) {
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.h b/Source/WebKit/WebProcess/WebPage/DrawingArea.h
+index 5662df704f..c73f5aee10 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.h
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.h
+@@ -167,6 +167,9 @@ public:
+ #endif
+ #if USE(GRAPHICS_LAYER_WC)
+     virtual void updateGeometryWC(uint64_t, WebCore::IntSize, float deviceScaleFactor, float intrinsicDeviceScaleFactor) { };
++    // PS5: the title's GL textures went over their cap (PS5WCHost): tiles
++    // only for what is visible until it says otherwise.
++    virtual void setTileCoverageReducedWC(bool) { }
+ #endif
+ 
+ #if USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER)
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in b/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in
+index 6110b083ac..3c048d6e22 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in
+@@ -55,6 +55,7 @@ messages -> DrawingArea {
+ 
+ #if USE(GRAPHICS_LAYER_WC)
+     UpdateGeometryWC(uint64_t backingStoreStateID, WebCore::IntSize viewSize, float deviceScaleFactor, float intrinsicDeviceScaleFactor)
++    SetTileCoverageReducedWC(bool reduced)
+ #endif
+ 
+ #if PLATFORM(COCOA) || PLATFORM(GTK)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index d023da2ffb..89250967c3 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -352,6 +352,17 @@ void DrawingAreaWC::updateGeometryWC(uint64_t backingStoreStateID, IntSize viewS
+     m_webPage->setSize(viewSize);
+ }
+ 
++void DrawingAreaWC::setTileCoverageReducedWC(bool reduced)
++{
++    if (!GraphicsLayerWC::setTileCoverageReduced(reduced))
++        return;
++    WTFLogAlways("[wc] tile coverage %s (the title's GL textures %s their cap)", reduced ? "reduced to the visible rect" : "back to normal", // NOLINT
++        reduced ? "went over" : "are well under");
++    // The next commit walks every layer and recomputes its coverage: tiles
++    // outside it go, and the title frees their textures.
++    triggerRenderingUpdate();
++}
++
+ void DrawingAreaWC::setNeedsDisplay()
+ {
+     m_dirtyRegion = m_webPage->bounds();
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index 40a9d50949..aecb895066 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -75,6 +75,7 @@ private:
+     bool isDrawingAreaWC() const override { return true; }
+ #endif
+     void updateGeometryWC(uint64_t, WebCore::IntSize, float deviceScaleFactor, float intrinsicDeviceScaleFactor) override;
++    void setTileCoverageReducedWC(bool) override;
+     void setRootCompositingLayer(WebCore::Frame&, WebCore::GraphicsLayer*) override;
+     void addRootFrame(WebCore::FrameIdentifier) override;
+     void attachViewOverlayGraphicsLayer(WebCore::FrameIdentifier, WebCore::GraphicsLayer*) override;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 60ea2cf4ae..40b712e0ad 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -33,6 +33,7 @@
+ #include "WCTileGrid.h"
+ #include "WCTilePainter.h"
+ #include <WebCore/GraphicsContext.h>
++#include <atomic>
+ #include <WebCore/GraphicsLayerAnimation.h>
+ #include <WebCore/GraphicsLayerFloatAnimationValue.h>
+ #include <WebCore/GraphicsLayerKeyframeValueList.h>
+@@ -174,7 +175,7 @@ public:
+         // tile row away, so scroll steps paint nothing until the view nears
+         // a new tile row, and scrolling back reuses the tiles it left.
+         IntRect coverage = enclosingIntRect(rect);
+-        if (coverage.isEmpty())
++        if (coverage.isEmpty() || GraphicsLayerWC::tileCoverageReduced())
+             return m_tileGrid.setCoverageRect(coverage);
+         int tileHeight = m_tileGrid.tilePixelSize().height();
+         int margin = std::max(tileHeight, coverage.height() / 2);
+@@ -791,6 +792,18 @@ void GraphicsLayerWC::noteLayerPropertyChanged(OptionSet<WCLayerChange> flags, S
+         client().notifyFlushRequired(this);
+ }
+ 
++static std::atomic<bool> s_tileCoverageReduced;
++
++bool GraphicsLayerWC::setTileCoverageReduced(bool reduced)
++{
++    return s_tileCoverageReduced.exchange(reduced) != reduced;
++}
++
++bool GraphicsLayerWC::tileCoverageReduced()
++{
++    return s_tileCoverageReduced.load(std::memory_order_relaxed);
++}
++
+ void GraphicsLayerWC::flushCompositingState(const FloatRect& passedVisibleRect)
+ {
+     // passedVisibleRect doesn't contain the scrollbar area. Inflate it.
+@@ -1030,7 +1043,7 @@ void GraphicsLayerWC::recursiveCommitChanges(const TransformState& state, bool a
+     affectedByTransformAnimation |= std::ranges::any_of(m_animations, [](auto& animation) {
+         return !animation.paused && animation.property != static_cast<uint8_t>(AnimatedProperty::Opacity);
+     });
+-    if (affectedByTransformAnimation && m_size.area() <= 4e6)
++    if (affectedByTransformAnimation && m_size.area() <= 4e6 && !tileCoverageReduced())
+         rects.coverageRect = FloatRect(m_boundsOrigin, m_size);
+ #else
+     UNUSED_PARAM(affectedByTransformAnimation);
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 726285437a..0cf850fdb1 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -68,6 +68,12 @@ public:
+         virtual WCTilePainter* tilePainter() { return nullptr; }
+     };
+ 
++    // PS5 (COMPOSITING-PLAN.md, M6): tiles only for the visible rect, no
++    // margin or whole-layer tiling, while the title's GL textures are over
++    // their cap. Returns whether it changed.
++    static bool setTileCoverageReduced(bool);
++    static bool tileCoverageReduced();
++
+     GraphicsLayerWC(Type layerType, WebCore::GraphicsLayerClient&, Observer&);
+     ~GraphicsLayerWC() override;
+ 

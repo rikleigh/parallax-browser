@@ -1,0 +1,126 @@
+diff --git a/Source/WebCore/platform/TextureMapper.cmake b/Source/WebCore/platform/TextureMapper.cmake
+index ac4fb68f53..86d8458b48 100644
+--- a/Source/WebCore/platform/TextureMapper.cmake
++++ b/Source/WebCore/platform/TextureMapper.cmake
+@@ -64,4 +64,14 @@ if (USE_GRAPHICS_LAYER_WC)
+ 
+         platform/graphics/wc/WCPlatformLayer.h
+     )
++    # TextureMapperSparseBackingStore paints TextureMapperTiles, which are
++    # only built above without coordinated graphics (WPE: WC next to it).
++    if (USE_COORDINATED_GRAPHICS)
++        list(APPEND WebCore_SOURCES
++            platform/graphics/texmap/TextureMapperTile.cpp
++        )
++        list(APPEND WebCore_PRIVATE_FRAMEWORK_HEADERS
++            platform/graphics/texmap/TextureMapperTile.h
++        )
++    endif ()
+ endif ()
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index 8d6561e70d..a24b61114a 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -1,17 +1,9 @@
+ list(APPEND WebKit_SOURCES
+-    GPUProcess/graphics/RemoteGraphicsContextGLWC.cpp
+-
+-    GPUProcess/graphics/wc/RemoteWCLayerTreeHost.cpp
+     GPUProcess/graphics/wc/WCContentBufferManager.cpp
+     GPUProcess/graphics/wc/WCRemoteFrameHostLayerManager.cpp
+     GPUProcess/graphics/wc/WCScene.cpp
+     GPUProcess/graphics/wc/WCSceneContext.cpp
+ 
+-    UIProcess/wc/DrawingAreaProxyWC.cpp
+-
+-    WebProcess/GPU/graphics/wc/RemoteGraphicsContextGLProxyWC.cpp
+-    WebProcess/GPU/graphics/wc/RemoteWCLayerTreeHostProxy.cpp
+-
+     WebProcess/WebPage/wc/DrawingAreaWC.cpp
+     WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+     WebProcess/WebPage/wc/WCBackingStore.cpp
+@@ -27,23 +19,45 @@ list(APPEND WebKit_PRIVATE_INCLUDE_DIRECTORIES
+     "${WEBKIT_DIR}/WebProcess/WebPage/wc"
+ )
+ 
+-list(APPEND WebKit_MESSAGES_IN_FILES
+-    GPUProcess/graphics/wc/RemoteWCLayerTreeHost
+-)
+-
+ list(APPEND WebKit_SERIALIZATION_IN_FILES
+     WebProcess/WebPage/wc/WCBackingStore.serialization.in
+     WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+ )
+ 
+-if (USE_CAIRO)
++# The layer tree host in the GPU process. Without a GPU process (WPE on PS5)
++# the scene is hosted by the UI process and DrawingAreaWC talks to it over the
++# WebProcess connection.
++if (ENABLE_GPU_PROCESS)
+     list(APPEND WebKit_SOURCES
+-        UIProcess/cairo/BackingStoreCairo.cpp
++        GPUProcess/graphics/RemoteGraphicsContextGLWC.cpp
++
++        GPUProcess/graphics/wc/RemoteWCLayerTreeHost.cpp
++
++        WebProcess/GPU/graphics/wc/RemoteGraphicsContextGLProxyWC.cpp
++        WebProcess/GPU/graphics/wc/RemoteWCLayerTreeHostProxy.cpp
++    )
++
++    list(APPEND WebKit_MESSAGES_IN_FILES
++        GPUProcess/graphics/wc/RemoteWCLayerTreeHost
+     )
+-elseif (USE_SKIA)
++endif ()
++
++# DrawingAreaProxyWC paints UpdateInfo bitmaps into a BackingStore, which the
++# GLib ports don't have (BackingStore.h); they bring their own proxy.
++if (NOT PORT STREQUAL "WPE" AND NOT PORT STREQUAL "GTK")
+     list(APPEND WebKit_SOURCES
+-        UIProcess/skia/BackingStoreSkia.cpp
++        UIProcess/wc/DrawingAreaProxyWC.cpp
+     )
++
++    if (USE_CAIRO)
++        list(APPEND WebKit_SOURCES
++            UIProcess/cairo/BackingStoreCairo.cpp
++        )
++    elseif (USE_SKIA)
++        list(APPEND WebKit_SOURCES
++            UIProcess/skia/BackingStoreSkia.cpp
++        )
++    endif ()
+ endif ()
+ 
+ if (USE_GRAPHICS_LAYER_TEXTURE_MAPPER)
+diff --git a/Source/WebKit/PlatformWPE.cmake b/Source/WebKit/PlatformWPE.cmake
+index 8a45974779..79ee6826e8 100644
+--- a/Source/WebKit/PlatformWPE.cmake
++++ b/Source/WebKit/PlatformWPE.cmake
+@@ -8,6 +8,10 @@ include(InspectorGResources.cmake)
+ include(ModernMediaControlsGResources.cmake)
+ include(Platform/Skia.cmake)
+ 
++if (USE_GRAPHICS_LAYER_WC)
++    include(Platform/WC.cmake)
++endif ()
++
+ if (ENABLE_PDFJS)
+     include(PdfJSGResources.cmake)
+ endif ()
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 86e1831a38..88dcb79cbf 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -135,9 +135,11 @@ WEBKIT_OPTION_DEFINE(USE_SYSPROF_CAPTURE "Whether to use libsysprof-capture for
+ WEBKIT_OPTION_DEFINE(USE_SYSTEM_SYSPROF_CAPTURE "Whether to use a system-provided libsysprof-capture" PRIVATE ON)
+ WEBKIT_OPTION_DEFINE(USE_SYSTEM_UNIFDEF "Whether to use a system-provided unifdef" PRIVATE ON)
+ WEBKIT_OPTION_DEFINE(USE_TEXTURE_MAPPER "Whether to use TextureMapper for compositing instead of Skia" PRIVATE OFF)
++WEBKIT_OPTION_DEFINE(USE_GRAPHICS_LAYER_WC "Whether to build the WC compositor (GraphicsLayerWC, DrawingAreaWC, WCScene) next to coordinated graphics, chosen at run time (PS5)." PRIVATE OFF)
+ 
+ WEBKIT_OPTION_DEPEND(ENABLE_DOCUMENTATION ENABLE_INTROSPECTION)
+ WEBKIT_OPTION_DEPEND(USE_SYSTEM_SYSPROF_CAPTURE USE_SYSPROF_CAPTURE)
++WEBKIT_OPTION_DEPEND(USE_GRAPHICS_LAYER_WC USE_TEXTURE_MAPPER)
+ 
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+     WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_BUBBLEWRAP_SANDBOX PUBLIC ON)

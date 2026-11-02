@@ -1,0 +1,53 @@
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
+index fcf9b18e88..360bdb5b9f 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
+@@ -28,6 +28,10 @@
+ #include "config.h"
+ #include "TextureMapperSparseBackingStore.h"
+ #include <wtf/TZoneMallocInlines.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ 
+ #if USE(GRAPHICS_LAYER_WC)
+ #include "IntRect.h"
+@@ -60,8 +64,36 @@ void TextureMapperSparseBackingStore::paintToTextureMapper(TextureMapper& textur
+ {
+     IntRect rect = { { }, m_size };
+     TransformationMatrix adjustedTransform = transform * adjustedTransformForRect(targetRect);
+-    for (auto& iterator : m_tiles)
++#if defined(PS5_PAYLOAD_SDK)
++    // Tiles outside what is drawn (the scissor box of the target) are
++    // skipped: WC keeps tiles half a view above and below the visible rect,
++    // and a long feed's layers below the fold each cost draw calls on the
++    // title's render thread every frame. Only for affine transforms (a
++    // projected tile's bounding box can be wrong behind the eye).
++    // /data/ps5webkit/wc-no-cull: draw every tile (A/B).
++    static const bool cullingOff = [] {
++        int fd = open("/data/ps5webkit/wc-no-cull", O_RDONLY);
++        if (fd < 0)
++            return false;
++        close(fd);
++        return true;
++    }();
++    const IntRect clip = textureMapper.clipBounds();
++    const bool cull = !cullingOff && adjustedTransform.isAffine();
++    if (cull && clip.isEmpty())
++        return;
++#endif
++    for (auto& iterator : m_tiles) {
++#if defined(PS5_PAYLOAD_SDK)
++        if (cull) {
++            auto bounds = adjustedTransform.mapRect(FloatRect(iterator.value->rect()));
++            bounds.inflate(1); // antialiased edges
++            if (!bounds.intersects(clip))
++                continue;
++        }
++#endif
+         iterator.value->paint(textureMapper, adjustedTransform, opacity, allTileEdgesExposed(rect, iterator.value->rect()));
++    }
+ }
+ 
+ void TextureMapperSparseBackingStore::drawBorder(TextureMapper& textureMapper, const Color& borderColor, float borderWidth, const FloatRect& targetRect, const TransformationMatrix& transform)

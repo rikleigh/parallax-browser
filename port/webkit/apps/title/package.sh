@@ -145,6 +145,7 @@ echo "imports: $(wc -l < "$W/imports.inc") functions"
 # Build id: logged by the title at start ("build <id>"); the unstripped
 # binaries of this package are kept under $OUT/debug/<id>/ (step 5).
 SRCDIR="${SRC:-$(dirname "$BLD")/$(basename "$BLD" | sed 's/^build/src/')}"
+[ -e "$SRCDIR/.git" ] || SRCDIR="$WK/src" # build-cpu: the main tree
 BUILD_ID="$(date +%Y%m%d-%H%M%S)-$(git -C "$SRCDIR" rev-parse --short=10 HEAD 2>/dev/null || echo nogit)"
 echo "build id: $BUILD_ID"
 prospero-clang -std=c11 -O2 "${TF[@]}" -fno-builtin -Wno-incompatible-library-redeclaration -I"$W" \

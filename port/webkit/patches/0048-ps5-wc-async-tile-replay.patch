@@ -1,0 +1,89 @@
+diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+index bfea532b01..e3b6b50457 100644
+--- a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+@@ -111,8 +111,9 @@ static void setPaintColor(SkPaint& paint, const Color& color)
+     paint.setColor4f(skColor, skColorSpace.get());
+ }
+ 
+-GraphicsContextSkia::GraphicsContextSkia(SkCanvas& canvas, RenderingMode renderingMode, RenderingPurpose renderingPurpose, CompletionHandler<void()>&& destroyNotify)
+-    : m_canvas(canvas)
++GraphicsContextSkia::GraphicsContextSkia(SkCanvas& canvas, RenderingMode renderingMode, RenderingPurpose renderingPurpose, CompletionHandler<void()>&& destroyNotify, IsDeferred isDeferred)
++    : GraphicsContext(isDeferred)
++    , m_canvas(canvas)
+     , m_renderingMode(renderingMode)
+     , m_renderingPurpose(renderingPurpose)
+     , m_destroyNotify(WTF::move(destroyNotify))
+diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.h b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.h
+index 0c9322fe35..79eba9efb5 100644
+--- a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.h
++++ b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.h
+@@ -50,7 +50,9 @@ struct SkiaRecordingData;
+ class WEBCORE_EXPORT GraphicsContextSkia final : public GraphicsContext {
+     friend class ImageBufferSkiaAcceleratedBackend;
+ public:
+-    GraphicsContextSkia(SkCanvas&, RenderingMode, RenderingPurpose, CompletionHandler<void()>&& = nullptr);
++    // IsDeferred::Yes: ImageBuffers are drawn from copy-on-write snapshots
++    // (for recordings replayed later, e.g. on other threads).
++    GraphicsContextSkia(SkCanvas&, RenderingMode, RenderingPurpose, CompletionHandler<void()>&& = nullptr, IsDeferred = IsDeferred::No);
+     virtual ~GraphicsContextSkia();
+ 
+     bool hasPlatformContext() const final;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+index 66b297cfc4..2140e0be32 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -79,9 +79,12 @@ static unsigned paintThreads()
+     return threads;
+ }
+ 
++// Default: the main thread records and goes on while the pool replays; the
++// update is sent when the bands are done (PS5WK_WC_PAINT_ASYNC=0: the main
++// thread takes bands too and waits).
+ static bool paintAsync()
+ {
+-    static bool enabled = envUnsigned("PS5WK_WC_PAINT_ASYNC", 0, 0, 1);
++    static bool enabled = envUnsigned("PS5WK_WC_PAINT_ASYNC", 1, 0, 1);
+     return enabled;
+ }
+ 
+@@ -406,7 +409,10 @@ Vector<WCTilePainter::Part> WCTilePainter::paintLayer(GraphicsLayerWC& layer, co
+         SkRTreeFactory rtreeFactory;
+         auto* recordingCanvas = recorder.beginRecording(SkRect::Make(SkIRect::MakeXYWH(deviceBounds.x(), deviceBounds.y(), deviceBounds.width(), deviceBounds.height())), &rtreeFactory);
+         {
+-            GraphicsContextSkia context(*recordingCanvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM);
++            // Deferred: ImageBuffers (canvases, scratch buffers) are recorded
++            // as copy-on-write snapshots, not as their live pixels, which may
++            // change before the pool replays them.
++            GraphicsContextSkia context(*recordingCanvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM, nullptr, GraphicsContext::IsDeferred::Yes);
+             context.beginRecording(GraphicsContextSkia::RecordingMode::Tile);
+             context.applyDeviceScaleFactor(deviceScaleFactor);
+             for (auto& rect : region.rects()) {
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
+index f81fee817c..d30430cb31 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
+@@ -66,9 +66,9 @@ private:
+ // process maps once) instead of a new SharedMemory per tile. A layer's dirty
+ // tiles are recorded once into an SkPicture on the main thread, and the
+ // picture is replayed into each tile's slot, in bands, on a pool of painting
+-// threads just before the update is sent (the main thread helps), or with
+-// PS5WK_WC_PAINT_ASYNC=1 while the main thread goes on (the update is sent
+-// when the bands are done). Small damage is painted directly into the arena.
++// threads while the main thread goes on; the update is sent when the bands
++// are done (PS5WK_WC_PAINT_ASYNC=0: just before the update is sent, the main
++// thread helping and waiting). Small damage is painted directly into the arena.
+ // PS5WK_WC_TILE_PAINT=0: the old path (a new ImageBuffer per tile, serial).
+ class WCTilePainter {
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(WCTilePainter);
+@@ -94,8 +94,8 @@ public:
+     void addArenaChunks(WCUpdateInfo&);
+ 
+     // Rasterizes what paintLayer recorded since the last call, then calls
+-    // send on the main thread with the slots the update holds (synchronously
+-    // unless PS5WK_WC_PAINT_ASYNC=1).
++    // send on the main thread with the slots the update holds (later, from
++    // the run loop, unless PS5WK_WC_PAINT_ASYNC=0 or nothing was recorded).
+     using SendFunction = Function<void(Ref<WCTileArenaUse>&&)>;
+     void finish(SendFunction&&);
+ 

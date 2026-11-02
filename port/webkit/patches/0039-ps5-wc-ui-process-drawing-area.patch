@@ -1,0 +1,805 @@
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index a24b61114a..7efdc0c83d 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -42,6 +42,31 @@ if (ENABLE_GPU_PROCESS)
+     )
+ endif ()
+ 
++# WPE on PS5: the scene is hosted in the UI process (the title), which gets
++# the WebProcess's updates through DrawingAreaProxyWCPS5 (UpdateWC message).
++if (PORT STREQUAL "WPE" AND NOT ENABLE_GPU_PROCESS)
++    list(APPEND WebKit_SOURCES
++        UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++        UIProcess/wpe/ps5/PS5WCNullHost.cpp
++    )
++
++    list(APPEND WebKit_PRIVATE_INCLUDE_DIRECTORIES
++        "${WEBKIT_DIR}/UIProcess/wpe/ps5"
++    )
++
++    # The scene host. TEMPORARY: a never-available stub while PS5WCHost.cpp
++    # does not exist; then just list PS5WCHost.cpp and delete the stub.
++    if (EXISTS "${WEBKIT_DIR}/UIProcess/wpe/ps5/PS5WCHost.cpp")
++        list(APPEND WebKit_SOURCES
++            UIProcess/wpe/ps5/PS5WCHost.cpp
++        )
++    else ()
++        list(APPEND WebKit_SOURCES
++            UIProcess/wpe/ps5/PS5WCHostStub.cpp
++        )
++    endif ()
++endif ()
++
+ # DrawingAreaProxyWC paints UpdateInfo bitmaps into a BackingStore, which the
+ # GLib ports don't have (BackingStore.h); they bring their own proxy.
+ if (NOT PORT STREQUAL "WPE" AND NOT PORT STREQUAL "GTK")
+diff --git a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
+index 4dcd450d60..bb6cdcdb24 100644
+--- a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
+@@ -28,6 +28,10 @@
+ 
+ #include "APIViewClient.h"
+ #include "DrawingAreaProxyCoordinatedGraphics.h"
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#include "DrawingAreaProxyWCPS5.h"
++#include "WebPreferences.h"
++#endif
+ #include "NativeWebMouseEvent.h"
+ #include "NativeWebTouchEvent.h"
+ #include "NativeWebWheelEvent.h"
+@@ -108,6 +112,24 @@ UnixFileDescriptor PageClientImpl::hostFileDescriptor()
+ 
+ Ref<DrawingAreaProxy> PageClientImpl::createDrawingAreaProxy(WebProcessProxy& webProcessProxy)
+ {
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++    // PS5: the WC compositor hosted in this process when the compositing
++    // switch is on and the scene host is up, else the CPU path. The
++    // WebProcess follows the accelerated-compositing preference
++    // (DrawingArea::create), set here before the creation parameters are.
++    Ref page = m_view.page();
++    Ref preferences = page->preferences();
++    bool useWC;
++    if (&webProcessProxy == &page->legacyMainFrameProcess())
++        useWC = DrawingAreaProxyWCPS5::configurePreferencesForNewPage(preferences);
++    else {
++        // A provisional page in another process (process swaps are off on
++        // PS5): keep the choice the running page made, the preference it sees.
++        useWC = preferences->acceleratedCompositingEnabled();
++    }
++    if (useWC)
++        return DrawingAreaProxyWCPS5::create(page, webProcessProxy);
++#endif
+     return DrawingAreaProxyCoordinatedGraphics::create(m_view.page(), webProcessProxy);
+ }
+ 
+diff --git a/Source/WebKit/UIProcess/API/wpe/WPEWebViewLegacy.cpp b/Source/WebKit/UIProcess/API/wpe/WPEWebViewLegacy.cpp
+index 576abe9a52..347c231039 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WPEWebViewLegacy.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WPEWebViewLegacy.cpp
+@@ -418,7 +418,12 @@ void ViewLegacy::callAfterNextPresentationUpdate(CompletionHandler<void()>&& cal
+     if (!m_pageProxy->drawingArea())
+         return callback();
+ 
+-    downcast<DrawingAreaProxyCoordinatedGraphics>(*m_pageProxy->drawingArea()).dispatchAfterEnsuringDrawing(WTF::move(callback));
++    // Not a coordinated-graphics proxy on PS5 with the WC compositor.
++    RefPtr drawingArea = dynamicDowncast<DrawingAreaProxyCoordinatedGraphics>(*m_pageProxy->drawingArea());
++    if (!drawingArea)
++        return callback();
++
++    drawingArea->dispatchAfterEnsuringDrawing(WTF::move(callback));
+ }
+ 
+ #if USE(ATK)
+diff --git a/Source/WebKit/UIProcess/DrawingAreaProxy.h b/Source/WebKit/UIProcess/DrawingAreaProxy.h
+index 40e88c88fe..3fa271ce63 100644
+--- a/Source/WebKit/UIProcess/DrawingAreaProxy.h
++++ b/Source/WebKit/UIProcess/DrawingAreaProxy.h
+@@ -66,6 +66,9 @@ class WebProcessProxy;
+ #if !PLATFORM(WPE) && !PLATFORM(GTK) && (USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER))
+ struct UpdateInfo;
+ #endif
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++struct WCUpdateInfo;
++#endif
+ 
+ class DrawingAreaProxy : public IPC::MessageReceiver, public IPC::MessageSender, public Identified<DrawingAreaIdentifier>, public CanMakeCheckedPtr<DrawingAreaProxy> {
+     WTF_MAKE_TZONE_ALLOCATED(DrawingAreaProxy);
+@@ -80,6 +83,9 @@ public:
+ 
+     virtual bool isRemoteLayerTreeDrawingAreaProxyMac() const { return false; }
+     virtual bool isDrawingAreaProxyCoordinatedGraphics() const { return false; }
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++    virtual bool isDrawingAreaProxyWCPS5() const { return false; }
++#endif
+     virtual bool isRemoteLayerTreeDrawingAreaProxyIOS() const { return false; }
+ 
+     void startReceivingMessages(WebProcessProxy&);
+@@ -181,6 +187,10 @@ private:
+     virtual void update(uint64_t /* backingStoreStateID */, UpdateInfo&&) { }
+     virtual void exitAcceleratedCompositingMode(uint64_t /* backingStoreStateID */, UpdateInfo&&) { }
+ #endif
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++    // Only DrawingAreaProxyWCPS5 shows these; anything else lets the frame complete.
++    virtual void updateWC(WCUpdateInfo&&, CompletionHandler<void()>&& completionHandler) { completionHandler(); }
++#endif
+ 
+     WeakPtr<WebPageProxy> m_webPageProxy;
+     const Ref<WebProcessProxy> m_webProcessProxy;
+diff --git a/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in b/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in
+index 558bc4dbce..2aac96e7f5 100644
+--- a/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in
++++ b/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in
+@@ -35,4 +35,10 @@ messages -> DrawingAreaProxy {
+     Update(uint64_t stateID, struct WebKit::UpdateInfo updateInfo) CanDispatchOutOfOrder
+     ExitAcceleratedCompositingMode(uint64_t backingStoreStateID, struct WebKit::UpdateInfo updateInfo)
+ #endif
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++    # WPE (PS5): a WC layer-tree update for the scene hosted in the UI process.
++    # The reply comes once the frame that shows it has been presented.
++    UpdateWC(struct WebKit::WCUpdateInfo updateInfo) -> ()
++#endif
+ }
+diff --git a/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
+index e90b9b2a46..35a872c262 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
+@@ -243,6 +243,13 @@ void WebPageProxy::callAfterNextPresentationUpdate(CompletionHandler<void()>&& c
+         if (!protectedThis)
+             return callback();
+ 
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++        // PS5 WC compositor: DrawingAreaWC replied after the title presented
++        // the frame, and the view gets no buffers to wait for.
++        if (RefPtr drawingArea = protectedThis->m_drawingArea; drawingArea && drawingArea->isDrawingAreaProxyWCPS5())
++            return callback();
++#endif
++
+         if (RefPtr pageClient = protectedThis->pageClient())
+             static_cast<PageClientImpl&>(*pageClient).callAfterNextPresentationUpdate(WTF::move(callback));
+         else
+diff --git a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+index b83d6a8a98..94d8204075 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+@@ -26,6 +26,10 @@
+ #include "config.h"
+ #include "WebPreferences.h"
+ 
++#if defined(PS5_PAYLOAD_SDK) && USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#include "DrawingAreaProxyWCPS5.h"
++#endif
++
+ namespace WebKit {
+ 
+ void WebPreferences::platformInitializeStore()
+@@ -35,8 +39,18 @@ void WebPreferences::platformInitializeStore()
+     // painted with Skia on the CPU and sent as shared memory
+     // (NonCompositedFrameRenderer + RenderTargetSHMImage).
+     setHardwareAccelerationEnabled(false);
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++    // Or composited by the WC compositor in the title (GL in the UI process
++    // only) when the compositing switch is on (opt-in). This is the first
++    // guess; PageClientImpl::createDrawingAreaProxy settles it for each new
++    // WebProcess, with the scene host's availability.
++    bool compositing = DrawingAreaProxyWCPS5::compositingRequested();
++    setAcceleratedCompositingEnabled(compositing);
++    setForceCompositingMode(compositing);
++#else
+     setAcceleratedCompositingEnabled(false);
+     setForceCompositingMode(false);
++#endif
+     setThreadedScrollingEnabled(false);
+ #else
+     setAcceleratedCompositingEnabled(true);
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+new file mode 100644
+index 0000000000..73e2e838a4
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -0,0 +1,194 @@
++/*
++ * PS5: the UI-process side of DrawingAreaWC (DrawingAreaProxyWCPS5.h).
++ * Geometry and scale handling as in UIProcess/wc/DrawingAreaProxyWC.cpp,
++ * which can't build on WPE (it paints UpdateInfo into a BackingStore).
++ */
++
++#include "config.h"
++#include "DrawingAreaProxyWCPS5.h"
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include "DrawingAreaMessages.h"
++#include "DrawingAreaProxyMessages.h"
++#include "MessageSenderInlines.h"
++#include "PS5WCHost.h"
++#include "PS5WCNullHost.h"
++#include "WCUpdateInfo.h"
++#include "WebPageProxy.h"
++#include "WebPreferences.h"
++#include <fcntl.h>
++#include <unistd.h>
++#include <wtf/MainThread.h>
++#include <wtf/TZoneMallocInlines.h>
++
++namespace WebKit {
++
++WTF_MAKE_TZONE_ALLOCATED_IMPL(DrawingAreaProxyWCPS5);
++
++// -1: the flag file decides; 0/1: set by the embedder.
++static int s_compositingOverride = -1;
++
++bool DrawingAreaProxyWCPS5::compositingRequested()
++{
++    if (s_compositingOverride >= 0)
++        return s_compositingOverride;
++    // open(), not access(): access() reports existing files as missing in a title.
++    int fd = open("/data/ps5webkit/compositing", O_RDONLY);
++    if (fd < 0)
++        return false;
++    close(fd);
++    return true;
++}
++
++bool DrawingAreaProxyWCPS5::hostAvailable()
++{
++    return PS5WCNullHost::isInstalled() || PS5WCHost::singleton().available();
++}
++
++bool DrawingAreaProxyWCPS5::configurePreferencesForNewPage(WebPreferences& preferences)
++{
++    bool requested = compositingRequested();
++    bool useWC = requested && hostAvailable();
++    if (requested && !useWC)
++        WTFLogAlways("[wc] compositing is on but the scene host is not available: this page paints on the CPU");
++
++    // Only touched when it changes. A change also notifies the WebProcess's
++    // existing page, if any; a new page reads it from its creation parameters.
++    preferences.startBatchingUpdates();
++    if (preferences.acceleratedCompositingEnabled() != useWC)
++        preferences.setAcceleratedCompositingEnabled(useWC);
++    if (preferences.forceCompositingMode() != useWC)
++        preferences.setForceCompositingMode(useWC);
++    // No async scrolling in WC (DrawingArea.h); off on PS5 either way.
++    if (preferences.threadedScrollingEnabled())
++        preferences.setThreadedScrollingEnabled(false);
++    preferences.endBatchingUpdates();
++    return useWC;
++}
++
++Ref<DrawingAreaProxyWCPS5> DrawingAreaProxyWCPS5::create(WebPageProxy& page, WebProcessProxy& webProcessProxy)
++{
++    return adoptRef(*new DrawingAreaProxyWCPS5(page, webProcessProxy));
++}
++
++DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProcessProxy& webProcessProxy)
++    : DrawingAreaProxy(webPageProxy, webProcessProxy)
++{
++    WTFLogAlways("[wc] page %llu: WC compositor (drawing area %llu, %s host)", static_cast<unsigned long long>(webPageProxy.identifier().toUInt64()),
++        static_cast<unsigned long long>(identifier().toUInt64()), PS5WCNullHost::isInstalled() ? "null" : "GL");
++}
++
++DrawingAreaProxyWCPS5::~DrawingAreaProxyWCPS5()
++{
++    // The scene is keyed by this drawing area, not the page: a page restart
++    // makes a new proxy, and the old one may go after the new one's first update.
++    if (PS5WCNullHost::isInstalled())
++        PS5WCNullHost::removePage(identifier().toUInt64());
++    else
++        PS5WCHost::singleton().removePage(identifier().toUInt64());
++}
++
++void DrawingAreaProxyWCPS5::deviceScaleFactorDidChange(CompletionHandler<void()>&& completionHandler)
++{
++    sizeDidChange();
++    completionHandler();
++}
++
++void DrawingAreaProxyWCPS5::sizeDidChange()
++{
++    sendUpdateGeometry();
++}
++
++void DrawingAreaProxyWCPS5::sendUpdateGeometry()
++{
++    // The first size is set before the WebPage exists (WebPageProxy::setDrawingArea);
++    // that message is dropped and the WebPage takes the size from its creation
++    // parameters. The state ID is only checked by the GPU-process path.
++    m_currentBackingStoreStateID++;
++    if (RefPtr page = this->page())
++        send(Messages::DrawingArea::UpdateGeometryWC(m_currentBackingStoreStateID, size(), page->deviceScaleFactor(), page->intrinsicDeviceScaleFactor()));
++}
++
++void DrawingAreaProxyWCPS5::dispatchPresentationCallbacksAfterFlushingLayers(IPC::Connection& connection, Vector<IPC::AsyncReplyID>&& callbackIDs)
++{
++    // DrawingAreaWC sends these from displayDidRefresh, i.e. after the host presented.
++    for (auto& callbackID : callbackIDs) {
++        if (auto callback = connection.takeAsyncReplyHandler(callbackID))
++            callback(nullptr, nullptr);
++    }
++}
++
++namespace {
++
++// The reply to UpdateWC. If the host drops the completion without calling
++// it, the reply is still sent (on the main thread): the WebProcess renders
++// nothing more until it gets one.
++class PresentReply {
++    WTF_MAKE_NONCOPYABLE(PresentReply);
++public:
++    explicit PresentReply(CompletionHandler<void()>&& reply)
++        : m_reply(WTF::move(reply))
++    {
++    }
++
++    PresentReply(PresentReply&& other)
++        : m_reply(std::exchange(other.m_reply, nullptr))
++    {
++    }
++
++    ~PresentReply()
++    {
++        if (!m_reply)
++            return;
++        if (isMainRunLoop())
++            m_reply();
++        else
++            RunLoop::mainSingleton().dispatch([reply = WTF::move(m_reply)]() mutable { reply(); });
++    }
++
++    void operator()()
++    {
++        if (auto reply = std::exchange(m_reply, nullptr))
++            reply();
++    }
++
++private:
++    CompletionHandler<void()> m_reply;
++};
++
++} // namespace
++
++void DrawingAreaProxyWCPS5::updateWC(WCUpdateInfo&& info, CompletionHandler<void()>&& completionHandler)
++{
++    uint64_t sceneID = identifier().toUInt64();
++    if (PS5WCNullHost::isInstalled()) {
++        PS5WCNullHost::update(sceneID, WTF::move(info), [reply = PresentReply(WTF::move(completionHandler))]() mutable {
++            reply();
++        });
++        return;
++    }
++
++    auto& host = PS5WCHost::singleton();
++    if (!host.available()) {
++        // The host went away (scene context failed after this page started):
++        // nothing to show, but the page keeps running. A page restart goes
++        // back to the CPU path.
++        completionHandler();
++        return;
++    }
++    host.update(sceneID, WTF::move(info), [reply = PresentReply(WTF::move(completionHandler))]() mutable {
++        reply();
++    });
++}
++
++} // namespace WebKit
++
++// For the embedder (ps5wk-shot): mode 1 turns compositing on, 0 off and -1
++// back to the flag file. Applies to pages that get a new WebProcess.
++extern "C" __attribute__((visibility("default"))) void ps5wk_compositing_set_override(int mode)
++{
++    WebKit::s_compositingOverride = mode < 0 ? -1 : !!mode;
++}
++
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+new file mode 100644
+index 0000000000..ba0fd6e867
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -0,0 +1,81 @@
++/*
++ * PS5: the UI-process side of DrawingAreaWC when the WC scene is hosted in
++ * the title (no GPU process). See port/webkit/COMPOSITING-PLAN.md.
++ *
++ * The WebProcess sends each layer-tree update (Messages::DrawingAreaProxy::
++ * UpdateWC); this proxy hands it to the scene host (PS5WCHost, or the null
++ * host of the GL-free harness) and replies once the host has presented it.
++ * One update is in flight per page (DrawingAreaWC waits for the reply), so
++ * the reply paces rendering updates and rAF to the display.
++ *
++ * Which drawing area a page gets is decided here, in the UI process, and
++ * carried to the WebProcess by the accelerated-compositing preference
++ * (DrawingArea::create picks DrawingAreaWC exactly when it is on):
++ * configurePreferencesForNewPage() sets the preference from the switch and
++ * the host's availability before the page's creation parameters are built.
++ */
++
++#pragma once
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include "DrawingAreaProxy.h"
++#include <wtf/RefCounted.h>
++#include <wtf/TZoneMalloc.h>
++
++namespace WebKit {
++
++class WebPreferences;
++struct WCUpdateInfo;
++
++class DrawingAreaProxyWCPS5 final : public DrawingAreaProxy, public RefCounted<DrawingAreaProxyWCPS5> {
++    WTF_MAKE_TZONE_ALLOCATED(DrawingAreaProxyWCPS5);
++    WTF_MAKE_NONCOPYABLE(DrawingAreaProxyWCPS5);
++    WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(DrawingAreaProxyWCPS5);
++public:
++    static Ref<DrawingAreaProxyWCPS5> create(WebPageProxy&, WebProcessProxy&);
++    virtual ~DrawingAreaProxyWCPS5();
++
++    void ref() const final { RefCounted::ref(); }
++    void deref() const final { RefCounted::deref(); }
++    bool isDrawingAreaProxyWCPS5() const final { return true; }
++
++    // The run-time switch (opt-in): the flag file /data/ps5webkit/compositing,
++    // unless the embedder overrode it (ps5wk_compositing_set_override). Read
++    // each time a page gets a new WebProcess, so it applies on page restart.
++    static bool compositingRequested();
++
++    // A scene host is ready: PS5WCHost, or the null host if one is installed.
++    static bool hostAvailable();
++
++    // Before a page's drawing area and creation parameters are made for a
++    // new WebProcess: accelerated compositing and forced compositing on
++    // exactly when compositing is requested and a host is available, so the
++    // WebProcess picks the drawing area this process will create. Returns
++    // whether the page should get a DrawingAreaProxyWCPS5.
++    static bool configurePreferencesForNewPage(WebPreferences&);
++
++private:
++    DrawingAreaProxyWCPS5(WebPageProxy&, WebProcessProxy&);
++
++    // DrawingAreaProxy
++    void deviceScaleFactorDidChange(CompletionHandler<void()>&&) override;
++    void sizeDidChange() override;
++    bool shouldSendWheelEventsToEventDispatcher() const final { return true; }
++    void dispatchPresentationCallbacksAfterFlushingLayers(IPC::Connection&, Vector<IPC::AsyncReplyID>&&) override;
++
++    // Message handlers
++    void updateWC(WCUpdateInfo&&, CompletionHandler<void()>&&) override;
++
++    void sendUpdateGeometry();
++
++    uint64_t m_currentBackingStoreStateID { 0 };
++};
++
++} // namespace WebKit
++
++SPECIALIZE_TYPE_TRAITS_BEGIN(WebKit::DrawingAreaProxyWCPS5)
++    static bool isType(const WebKit::DrawingAreaProxy& proxy) { return proxy.isDrawingAreaProxyWCPS5(); }
++SPECIALIZE_TYPE_TRAITS_END()
++
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+new file mode 100644
+index 0000000000..971870f4d3
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -0,0 +1,45 @@
++/*
++ * PS5: the WC compositor host inside the title (UIProcess).
++ *
++ * DrawingAreaWC in the WebProcess sends each layer-tree update to its
++ * DrawingAreaProxyWCPS5, which hands it here. The host applies updates and
++ * paints the scene with TextureMapper on PS5Renderer's render thread, in
++ * PS5Renderer's own GL context, into a texture that PS5Renderer draws where
++ * the CPU-painted page goes otherwise. See port/webkit/COMPOSITING-PLAN.md.
++ *
++ * Threading: update()/removePage() are called on the main thread. The
++ * didPresent completion is called on the main thread after the swap that
++ * first shows the update (that pacing is what keeps rendering updates and
++ * rAF at the display rate).
++ */
++
++#pragma once
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include <wtf/CompletionHandler.h>
++#include <wtf/Noncopyable.h>
++
++namespace WebKit {
++
++struct WCUpdateInfo;
++
++class PS5WCHost {
++    WTF_MAKE_NONCOPYABLE(PS5WCHost);
++public:
++    static PS5WCHost& singleton();
++
++    // False until the render thread has set up the scene context, and for
++    // good if that failed (the caller then falls back to the CPU path).
++    bool available() const;
++
++    void update(uint64_t pageID, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent);
++    void removePage(uint64_t pageID);
++
++private:
++    PS5WCHost();
++};
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHostStub.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHostStub.cpp
+new file mode 100644
+index 0000000000..232c9f39c9
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHostStub.cpp
+@@ -0,0 +1,46 @@
++/*
++ * TEMPORARY STUB: delete this file (and its block in Platform/WC.cmake) once
++ * PS5WCHost.cpp, the real scene host, is in the tree. WC.cmake builds it
++ * only while PS5WCHost.cpp does not exist.
++ *
++ * Never available, so pages stay on the CPU path (or use the null host of
++ * the GL-free harness); an update that arrives anyway completes on the next
++ * run-loop turn without being shown.
++ */
++
++#include "config.h"
++#include "PS5WCHost.h"
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include <wtf/RunLoop.h>
++
++namespace WebKit {
++
++PS5WCHost& PS5WCHost::singleton()
++{
++    static PS5WCHost* host = new PS5WCHost;
++    return *host;
++}
++
++PS5WCHost::PS5WCHost() = default;
++
++bool PS5WCHost::available() const
++{
++    return false;
++}
++
++void PS5WCHost::update(uint64_t, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent)
++{
++    RunLoop::mainSingleton().dispatch([didPresent = WTF::move(didPresent)]() mutable {
++        didPresent();
++    });
++}
++
++void PS5WCHost::removePage(uint64_t)
++{
++}
++
++} // namespace WebKit
++
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp
+new file mode 100644
+index 0000000000..aeab1265a4
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp
+@@ -0,0 +1,143 @@
++/*
++ * PS5: the null WC scene host for the GL-free harness (PS5WCNullHost.h).
++ */
++
++#include "config.h"
++#include "PS5WCNullHost.h"
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include "WCUpdateInfo.h"
++#include <wtf/HashMap.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/RunLoop.h>
++#include <wtf/Vector.h>
++
++namespace WebKit {
++namespace PS5WCNullHost {
++
++namespace {
++
++class Host {
++public:
++    Host()
++        : m_vsync(RunLoop::mainSingleton(), "PS5WCNullHost::vsync"_s, [this] { vsync(); }) // never destroyed
++    {
++    }
++
++    void update(uint64_t pageID, WCUpdateInfo&& info, CompletionHandler<void()>&& didPresent)
++    {
++        auto& live = m_liveLayers.add(pageID, 0).iterator->value;
++        live += info.addedLayers.size();
++        live -= std::min<size_t>(live, info.removedLayers.size());
++
++        m_updates++;
++        m_changedLayers += info.changedLayers.size();
++        for (auto& layer : info.changedLayers) {
++            if (!layer.changes.contains(WCLayerChange::Background))
++                continue;
++            for (auto& tile : layer.background.tileUpdates) {
++                if (tile.willRemove)
++                    continue;
++                m_tiles++;
++                m_paintedPixels += static_cast<uint64_t>(tile.dirtyRect.width()) * tile.dirtyRect.height();
++            }
++        }
++        // The update (and the tile bitmaps it maps) is dropped here.
++
++        m_pending.append(WTF::move(didPresent));
++        if (!m_vsync.isActive())
++            m_vsync.startRepeating(1_s / 60);
++    }
++
++    void removePage(uint64_t pageID)
++    {
++        m_liveLayers.remove(pageID);
++    }
++
++private:
++    // One display refresh: every update received since the last one is "presented".
++    void vsync()
++    {
++        auto pending = std::exchange(m_pending, { });
++        for (auto& didPresent : pending)
++            didPresent();
++        if (pending.isEmpty()) {
++            if (++m_idleTicks > 60) {
++                m_vsync.stop(); // Started again by the next update.
++                m_idleTicks = 0;
++            }
++        } else {
++            m_idleTicks = 0;
++            m_presents++;
++        }
++
++        auto now = MonotonicTime::now();
++        if (!m_periodStart)
++            m_periodStart = now;
++        if (now - m_periodStart < 1_s)
++            return;
++        if (m_updates) {
++            size_t liveLayers = 0;
++            for (auto count : m_liveLayers.values())
++                liveLayers += count;
++            WTFLogAlways("[wc-null] %.1fs: %u updates, %u presents, %llu layer changes, %zu live layers in %u page%s, %llu tiles, %.2f Mpx painted",
++                (now - m_periodStart).seconds(), m_updates, m_presents, static_cast<unsigned long long>(m_changedLayers), liveLayers,
++                m_liveLayers.size(), m_liveLayers.size() == 1 ? "" : "s", static_cast<unsigned long long>(m_tiles), m_paintedPixels / 1e6);
++        }
++        m_periodStart = now;
++        m_updates = 0;
++        m_presents = 0;
++        m_changedLayers = 0;
++        m_tiles = 0;
++        m_paintedPixels = 0;
++    }
++
++    RunLoop::Timer m_vsync;
++    Vector<CompletionHandler<void()>> m_pending;
++    HashMap<uint64_t, size_t> m_liveLayers;
++    unsigned m_idleTicks { 0 };
++    MonotonicTime m_periodStart;
++    unsigned m_updates { 0 };
++    unsigned m_presents { 0 };
++    uint64_t m_changedLayers { 0 };
++    uint64_t m_tiles { 0 };
++    uint64_t m_paintedPixels { 0 };
++};
++
++bool s_installed;
++
++Host& host()
++{
++    static NeverDestroyed<Host> host;
++    return host;
++}
++
++} // namespace
++
++bool isInstalled()
++{
++    return s_installed;
++}
++
++void update(uint64_t pageID, WCUpdateInfo&& info, CompletionHandler<void()>&& didPresent)
++{
++    host().update(pageID, WTF::move(info), WTF::move(didPresent));
++}
++
++void removePage(uint64_t pageID)
++{
++    host().removePage(pageID);
++}
++
++} // namespace PS5WCNullHost
++} // namespace WebKit
++
++// For the embedder (ps5wk-shot), before the first page is created.
++extern "C" __attribute__((visibility("default"))) void ps5wk_wc_null_host_install(void)
++{
++    WebKit::PS5WCNullHost::s_installed = true;
++}
++
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h
+new file mode 100644
+index 0000000000..8e64f75a05
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h
+@@ -0,0 +1,31 @@
++/*
++ * PS5: a scene host without GL, for the GL-free harness (ps5wk-shot). It
++ * takes the place of PS5WCHost once installed (ps5wk_wc_null_host_install,
++ * before the first page), counts what each update carries (layers, tiles,
++ * painted megapixels), drops the bitmaps and completes updates at 60 Hz,
++ * as a display would. One "[wc-null]" line per second while updates come.
++ *
++ * Main thread only.
++ */
++
++#pragma once
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include <wtf/CompletionHandler.h>
++
++namespace WebKit {
++
++struct WCUpdateInfo;
++
++namespace PS5WCNullHost {
++
++bool isInstalled();
++void update(uint64_t pageID, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent);
++void removePage(uint64_t pageID);
++
++} // namespace PS5WCNullHost
++
++} // namespace WebKit
++
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 45d8c6fb9a..c42378095d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -318,18 +318,16 @@ void DrawingAreaWC::sendUpdateAC()
+             });
+         });
+ #else
+-        // M1: send the update to the scene host in the UI process
+-        // (Messages::DrawingAreaProxy::UpdateWC) and call displayDidRefresh()
+-        // from its reply. Until then the update is dropped and the frame
+-        // completes at once, so nothing is shown and nothing waits.
+-        auto droppedUpdateInfo = std::exchange(m_updateInfo, { });
+-        UNUSED_VARIABLE(droppedUpdateInfo);
+-        if (willCallDisplayDidRefresh) {
+-            RunLoop::mainSingleton().dispatch([weakThis = WeakPtr(*this)] {
+-                if (RefPtr protectedThis = weakThis.get())
+-                    protectedThis->displayDidRefresh();
+-            });
+-        }
++        // WPE (PS5): the scene is hosted by the UI process (DrawingAreaProxyWCPS5,
++        // PS5WCHost). Its reply comes after the swap that presents this update,
++        // so with one update in flight (m_waitDidUpdate) rendering updates and
++        // rAF follow the display. The reply also comes (empty) if the message
++        // is cancelled, e.g. the UI-side proxy went away.
++        Ref { m_webPage.get() }->sendWithAsyncReply(Messages::DrawingAreaProxy::UpdateWC(std::exchange(m_updateInfo, { })), [weakThis = WeakPtr(*this), willCallDisplayDidRefresh] {
++            RefPtr protectedThis = weakThis.get();
++            if (protectedThis && willCallDisplayDidRefresh)
++                protectedThis->displayDidRefresh();
++        }, m_identifier.toUInt64());
+ #endif
+     }
+ }

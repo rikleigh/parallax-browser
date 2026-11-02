@@ -1,0 +1,147 @@
+diff --git a/Source/WebCore/page/LocalFrameView.cpp b/Source/WebCore/page/LocalFrameView.cpp
+index 9da95cb5ee..02626faa2b 100644
+--- a/Source/WebCore/page/LocalFrameView.cpp
++++ b/Source/WebCore/page/LocalFrameView.cpp
+@@ -3054,6 +3054,14 @@ bool LocalFrameView::scrollContentsFastPath(const IntSize& scrollDelta, const In
+             continue;
+         if (renderer->isComposited())
+             continue;
++#if defined(PS5_PAYLOAD_SDK)
++        // A sticky renderer that moves is repainted by the layer position
++        // update (setViewportConstrainedObjectsNeedLayout); one that doesn't
++        // (not stuck) needs nothing. Repainting old and new rects here
++        // repainted every sticky element in the document on every step.
++        if (isCompositedContentLayer && renderer->isStickilyPositioned())
++            continue;
++#endif
+ 
+         // Fixed items should always have layers.
+         ASSERT(renderer->hasLayer());
+@@ -3818,6 +3826,50 @@ void LocalFrameView::setViewportConstrainedObjectsNeedLayout()
+     if (!hasViewportConstrainedObjects())
+         return;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 (WC compositor, no async scrolling): the layout viewport moves on
++    // every scroll step, and a full relayout of a fixed or sticky renderer
++    // repaints all of it (LayoutRepainter: selfNeedsLayout means a full
++    // repaint; for a tall sticky column that is the whole column) although
++    // only its position changes. Sticky renderers only need their layer
++    // position (the sticky offset is computed there; a moved non-composited
++    // one is repainted at its old and new place by the layer position
++    // update) and a geometry update; composited fixed renderers get an
++    // out-of-flow movement layout (no repaint for composited layers).
++    // Only with composited scrolling: the CPU path blits the view on scroll
++    // and needs scrollContentsFastPath's old+new repaint of sticky content.
++    bool compositedScrolling = usesCompositedScrolling();
++    bool requestLayerPositions = false;
++    for (CheckedRef renderer : *m_viewportConstrainedObjects) {
++        auto* layer = renderer->hasLayer() ? downcast<RenderBoxModelObject>(renderer).layer() : nullptr;
++        bool composited = layer && layer->isComposited() && !layer->backing()->paintsIntoCompositedAncestor();
++        if (compositedScrolling && layer && renderer->isStickilyPositioned()) {
++            // Layer positions update incrementally: mark this subtree.
++            layer->setSelfAndDescendantsNeedPositionUpdate();
++            requestLayerPositions = true;
++        }
++        else if (compositedScrolling && composited && renderer->isOutOfFlowPositioned())
++            renderer->setNeedsOutOfFlowMovementLayout(nullptr);
++        else
++            renderer->setNeedsLayout();
++        if (layer)
++            layer->setNeedsCompositingGeometryUpdate();
++    }
++    if (requestLayerPositions) {
++        // As LocalFrameViewLayoutContext's in-place SVG transform updates:
++        // run the position walk now (the layout viewport just moved) unless
++        // a layout is pending anyway, which then runs it with fresh geometry.
++        auto& layoutContext = this->layoutContext();
++        if (!layoutContext.isInLayout()) {
++            bool deferToLayoutPass = layoutContext.needsLayout();
++            layoutContext.requestUpdateLayerPositions();
++            if (!deferToLayoutPass)
++                layoutContext.flushUpdateLayerPositions();
++            if (RefPtr page = m_frame->page())
++                page->scheduleRenderingUpdate({ RenderingUpdateStep::LayerFlush });
++        }
++    }
++#else
+     for (CheckedRef renderer : *m_viewportConstrainedObjects) {
+         renderer->setNeedsLayout();
+         if (renderer->hasLayer()) {
+@@ -3825,6 +3877,7 @@ void LocalFrameView::setViewportConstrainedObjectsNeedLayout()
+             layer->setNeedsCompositingGeometryUpdate();
+         }
+     }
++#endif
+ }
+ 
+ void LocalFrameView::didChangeScrollOffset()
+diff --git a/Source/WebCore/platform/adwaita/ScrollbarThemeAdwaita.cpp b/Source/WebCore/platform/adwaita/ScrollbarThemeAdwaita.cpp
+index dd4409073c..56502ffc99 100644
+--- a/Source/WebCore/platform/adwaita/ScrollbarThemeAdwaita.cpp
++++ b/Source/WebCore/platform/adwaita/ScrollbarThemeAdwaita.cpp
+@@ -110,10 +110,12 @@ bool ScrollbarThemeAdwaita::paint(Scrollbar& scrollbar, GraphicsContext& graphic
+ {
+ #if USE(COORDINATED_GRAPHICS_ASYNC_SCROLLBAR)
+     if (auto scrollableArea = protect(scrollbar.scrollableArea())) {
+-        if (scrollableArea->usesCompositedScrolling()) {
+-            // Painting is done by ScrollerCoordinated in the scrolling thread.
++        // Painting is done by ScrollerCoordinated in the scrolling thread,
++        // unless the controller paints scrollbars into their layers (WPE on
++        // PS5 with the WC compositor: no scrolling thread, the generic
++        // controller; WebChromeClient::ensureScrollbarsController).
++        if (scrollableArea->usesCompositedScrolling() && !scrollableArea->scrollbarsController().shouldDrawIntoScrollbarLayer(scrollbar))
+             return true;
+-        }
+     }
+ #endif
+ 
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.cpp b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+index 050888b29e..69af282e19 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -4171,6 +4171,23 @@ bool RenderLayerCompositor::requiresCompositingForPosition(RenderLayerModelObjec
+         // be the replica's layer while `renderer` is the sticky renderer being reflected. Ask about the sticky
+         // renderer's own layer; for every other caller this is the layer we were passed.
+         CheckedPtr stickyLayer = renderer.layer();
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5 (WC compositor, no coordinated scrolling): a sticky element
++        // that sticks to a frame scrolled by moving its composited contents
++        // gets its own layer too. The main thread moves the layer on every
++        // scroll step (LocalFrameView::setViewportConstrainedObjectsNeedLayout:
++        // layer position and geometry update) instead of repainting the
++        // element at its old and new place. Sticky elements inside other
++        // overflow (not composited scrolling) stay as they are.
++        // PS5WK_WC_STICKY=0 (child.env): the old behaviour, for A/B tests.
++        static const bool compositeSticky = !getenv("PS5WK_WC_STICKY") || strcmp(getenv("PS5WK_WC_STICKY"), "0");
++        if (compositeSticky && stickyLayer && !stickyLayer->enclosingOverflowClipLayer(ExcludeSelf)) {
++            // As LocalFrameView::usesCompositedScrolling().
++            auto* viewBacking = m_renderView.layer() ? m_renderView.layer()->backing() : nullptr;
++            if (viewBacking && viewBacking->graphicsLayer()->drawsContent())
++                return true;
++        }
++#endif
+         return stickyLayer && isAsyncScrollableStickyLayer(*stickyLayer);
+     }
+ 
+diff --git a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+index 64ca477de2..8b74b1675b 100644
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+@@ -1647,7 +1647,15 @@ void WebChromeClient::ensureScrollbarsController(Page& corePage, ScrollableArea&
+         area.setScrollbarsController(makeUnique<RemoteScrollbarsController>(area, corePage.scrollingCoordinator()));
+ #endif
+ #elif USE(COORDINATED_GRAPHICS_ASYNC_SCROLLBAR)
+-    if (area.usesCompositedScrolling()) {
++    bool usesAsyncScrollbars = area.usesCompositedScrolling();
++#if USE(GRAPHICS_LAYER_WC)
++    // WPE (PS5): DrawingAreaWC has no scrolling thread to draw scrollbars
++    // (ScrollbarsControllerCoordinated leaves their layers empty): the
++    // generic controller paints them into their GraphicsLayers.
++    if (RefPtr drawingArea = page->drawingArea(); drawingArea && drawingArea->isDrawingAreaWC())
++        usesAsyncScrollbars = false;
++#endif
++    if (usesAsyncScrollbars) {
+         if (!currentScrollbarsController || !is<ScrollbarsControllerCoordinated>(currentScrollbarsController))
+             area.setScrollbarsController(makeUnique<ScrollbarsControllerCoordinated>(area, corePage.scrollingCoordinator()));
+     } else {

@@ -1,0 +1,1360 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index cab88c4bc7..1c6b9bdfe8 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -164,11 +164,9 @@ bool WCScene::apply(WCUpdateInfo& update)
+                     if (tileUpdate.willRemove)
+                         backingStore.removeTile(tileUpdate.index);
+                     else {
+-                        auto bitmap = tileUpdate.backingStore.bitmap();
+-                        if (bitmap) {
+-                            if (RefPtr image = WebCore::NativeImage::create(bitmap->createPlatformImage(WebCore::BackingStoreCopy::DontCopyBackingStore)))
+-                                backingStore.updateContents(tileUpdate.index, *image, tileUpdate.dirtyRect);
+-                        }
++                        // A bitmap, or a slot of the WebProcess's tile arena.
++                        if (RefPtr image = tileUpdate.backingStore.createNativeImage())
++                            backingStore.updateContents(tileUpdate.index, *image, tileUpdate.dirtyRect);
+                     }
+                 }
+             } else {
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index 8917e88b8c..61103d732f 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -9,6 +9,7 @@ list(APPEND WebKit_SOURCES
+     WebProcess/WebPage/wc/WCBackingStore.cpp
+     WebProcess/WebPage/wc/WCLayerFactory.cpp
+     WebProcess/WebPage/wc/WCTileGrid.cpp
++    WebProcess/WebPage/wc/WCTilePainter.cpp
+ )
+ 
+ list(APPEND WebKit_PRIVATE_INCLUDE_DIRECTORIES
+diff --git a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+index b4f1ff531b..ab9c845a46 100644
+--- a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
++++ b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+@@ -437,6 +437,7 @@
+     [Legacy] StructureParam WebKit::WebHitTestResultData.getImageSharedMemoryHandle()
+     [Legacy] StructureParam WebKit::WebCompiledContentRuleListData.createDataHandle()
+     [Legacy] StructureParam WebKit::WebJSBufferData.sharedMemoryHandle()
++    [NeedsReview] StructureParam WebKit::WCTileArenaChunk.createHandle()
+ }
+ 
+ [UnsafeWrapper] Vector<WebCore::SharedMemory::Handle> {
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 73e2e838a4..33dcf270ce 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -159,9 +159,45 @@ private:
+ 
+ } // namespace
+ 
++void DrawingAreaProxyWCPS5::resolveTileArena(WCUpdateInfo& info)
++{
++    using ChunkMap = decltype(m_tileArenaChunks);
++    for (auto& chunk : info.tileArenaChunks) {
++        if (!ChunkMap::isValidKey(chunk.id()))
++            continue;
++        if (auto* memory = chunk.memory())
++            m_tileArenaChunks.set(chunk.id(), Ref { *memory });
++        else {
++            WTFLogAlways("[wc] tile arena chunk %llu could not be mapped", static_cast<unsigned long long>(chunk.id())); // NOLINT
++            m_tileArenaChunks.remove(chunk.id());
++        }
++    }
++    info.tileArenaChunks.clear();
++    for (auto& layer : info.changedLayers) {
++        for (auto& tile : layer.background.tileUpdates) {
++            auto& slot = tile.backingStore.arenaSlot();
++            if (!slot)
++                continue;
++            RefPtr<WebCore::SharedMemory> memory;
++            if (ChunkMap::isValidKey(slot->chunk))
++                memory = m_tileArenaChunks.get(slot->chunk);
++            if (memory && slot->fits(memory->size()))
++                tile.backingStore.setArenaMemory(WTF::move(memory));
++            else if (!m_badTileArenaSlots++)
++                WTFLogAlways("[wc] tile arena slot in chunk %llu (offset %llu, %dx%d) is not mapped or out of range: tile skipped", // NOLINT
++                    static_cast<unsigned long long>(slot->chunk), static_cast<unsigned long long>(slot->offset), slot->size.width(), slot->size.height());
++        }
++    }
++    for (auto id : info.removedTileArenaChunks) {
++        if (ChunkMap::isValidKey(id))
++            m_tileArenaChunks.remove(id);
++    }
++}
++
+ void DrawingAreaProxyWCPS5::updateWC(WCUpdateInfo&& info, CompletionHandler<void()>&& completionHandler)
+ {
+     uint64_t sceneID = identifier().toUInt64();
++    resolveTileArena(info);
+     if (PS5WCNullHost::isInstalled()) {
+         PS5WCNullHost::update(sceneID, WTF::move(info), [reply = PresentReply(WTF::move(completionHandler))]() mutable {
+             reply();
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index ba0fd6e867..8573e105a7 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -20,6 +20,8 @@
+ #if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+ 
+ #include "DrawingAreaProxy.h"
++#include <WebCore/SharedMemory.h>
++#include <wtf/HashMap.h>
+ #include <wtf/RefCounted.h>
+ #include <wtf/TZoneMalloc.h>
+ 
+@@ -68,8 +70,13 @@ private:
+     void updateWC(WCUpdateInfo&&, CompletionHandler<void()>&&) override;
+ 
+     void sendUpdateGeometry();
++    // The WebProcess's tile arena (WCTilePainter.h): chunks mapped once,
++    // attached to the tiles that use them.
++    void resolveTileArena(WCUpdateInfo&);
+ 
+     uint64_t m_currentBackingStoreStateID { 0 };
++    HashMap<uint64_t, Ref<WebCore::SharedMemory>> m_tileArenaChunks;
++    unsigned m_badTileArenaSlots { 0 };
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 6650622e59..d023da2ffb 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -82,6 +82,9 @@ struct WCRenderStats {
+     double updateMS { 0 }, megapixels { 0 }, frameDoneMS { 0 };
+     unsigned tiles { 0 }, frameDones { 0 }, monitorFires { 0 }, idleFires { 0 };
+     MonotonicTime windowStart;
++    // WCTilePainter (deltas of wcTilePaintStats over the window).
++    WCTilePaintStats painterStart;
++    bool havePainterStart { false };
+ 
+     static float percentile(Vector<float>& values, double fraction)
+     {
+@@ -91,17 +94,24 @@ struct WCRenderStats {
+         return values[std::min<size_t>(values.size() - 1, static_cast<size_t>(fraction * values.size()))];
+     }
+ 
+-    void add(MonotonicTime end, double total, double update, double paint, double pixels, unsigned tileCount)
++    void add(MonotonicTime end, double total, double update, double paint, double pixels, unsigned tileCount, const WCTilePaintStats& before)
+     {
+         if (!windowStart)
+             windowStart = end;
++        if (!havePainterStart) {
++            painterStart = before;
++            havePainterStart = true;
++        }
+         totalMS.append(total);
+         paintMS.append(paint);
+         updateMS += update;
+         megapixels += pixels / 1e6;
+         tiles += tileCount;
+-        if (wcRenderLog() >= 2)
+-            WTFLogAlways("[render1] %.1f ms: update %.1f, paint %.1f (%.2f Mpx, %u tiles), copy %.1f", total, update, paint, pixels / 1e6, tileCount, std::max(0.0, total - update - paint)); // NOLINT
++        if (wcRenderLog() >= 2) {
++            auto& now = wcTilePaintStats();
++            WTFLogAlways("[render1] %.1f ms: update %.1f, paint %.1f (%.2f Mpx, %u tiles), copy %.1f; record %.1f (%.2f Mpx), raster %.1f (%u items), shm %u, old way %u", total, update, paint, pixels / 1e6, tileCount, std::max(0.0, total - update - paint), // NOLINT
++                now.recordMS - before.recordMS, (now.recordedPixels - before.recordedPixels) / 1e6, now.rasterMS - before.rasterMS, now.rasterItems - before.rasterItems, now.shmAllocations - before.shmAllocations, now.arenaFallbacks - before.arenaFallbacks);
++        }
+         if (end - windowStart < 5_s)
+             return;
+         unsigned count = totalMS.size();
+@@ -116,7 +126,13 @@ struct WCRenderStats {
+                 count, seconds, count / seconds, total / count, percentile(totalMS, 0.5), percentile(totalMS, 0.95), percentile(totalMS, 1),
+                 updateMS / count, paint / count, percentile(paintMS, 0.95), megapixels / count, static_cast<double>(tiles) / count,
+                 frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires);
++            auto& now = wcTilePaintStats();
++            WTFLogAlways("[render] wc tiles: record %.1f ms/s (%.2f Mpx/s), raster %.1f ms/s wall (%.2f Mpx/s, %u items, %u async), shm allocations %.1f/s, old way %u", // NOLINT
++                (now.recordMS - painterStart.recordMS) / seconds, (now.recordedPixels - painterStart.recordedPixels) / 1e6 / seconds,
++                (now.rasterMS - painterStart.rasterMS) / seconds, (now.rasterPixels - painterStart.rasterPixels) / 1e6 / seconds, now.rasterItems - painterStart.rasterItems,
++                now.asyncBatches - painterStart.asyncBatches, (now.shmAllocations - painterStart.shmAllocations) / seconds, now.arenaFallbacks - painterStart.arenaFallbacks);
+         }
++        painterStart = wcTilePaintStats();
+         totalMS.shrink(0);
+         paintMS.shrink(0);
+         updateMS = megapixels = frameDoneMS = 0;
+@@ -235,6 +251,10 @@ DrawingAreaWC::DrawingAreaWC(WebPage& webPage, const WebPageCreationParameters&
+     , m_idleDisplayRefreshTimer(*this, &DrawingAreaWC::idleDisplayRefreshTimerFired)
+ #endif
+ {
++#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++    if (WCTilePainter::isEnabled())
++        m_tilePainter = makeUnique<WCTilePainter>();
++#endif
+ }
+ 
+ DrawingAreaWC::~DrawingAreaWC()
+@@ -447,16 +467,18 @@ void DrawingAreaWC::updateRendering()
+ #if defined(PS5_PAYLOAD_SDK)
+     if (compositing) {
+         auto end = MonotonicTime::now();
+-        m_lastUpdateSent = end;
+         auto& paint = wcTilePaintStats();
+         wcRenderStats().add(end, (end - start).milliseconds(), (updated - start).milliseconds() - paintInUpdate,
+-            paint.milliseconds - paintBefore.milliseconds, static_cast<double>(paint.pixels - paintBefore.pixels), paint.tiles - paintBefore.tiles);
++            paint.milliseconds - paintBefore.milliseconds, static_cast<double>(paint.pixels - paintBefore.pixels), paint.tiles - paintBefore.tiles, paintBefore);
+     }
+ #endif
+ }
+ 
+ void DrawingAreaWC::sendUpdateAC()
+ {
++#if !ENABLE(GPU_PROCESS)
++    Vector<PendingUpdate> updates;
++#endif
+     bool didProcessMainFrame = false;
+     Borrow rootLayers = m_rootLayers;
+     for (size_t i = 0; i < rootLayers->size(); i++) {
+@@ -508,19 +530,54 @@ void DrawingAreaWC::sendUpdateAC()
+             });
+         });
+ #else
+-        // WPE (PS5): the scene is hosted by the UI process (DrawingAreaProxyWCPS5,
+-        // PS5WCHost). Its reply comes after the swap that presents this update,
+-        // so with one update in flight (m_waitDidUpdate) rendering updates and
+-        // rAF follow the display. The reply also comes (empty) if the message
+-        // is cancelled, e.g. the UI-side proxy went away.
+-        Ref { m_webPage.get() }->sendWithAsyncReply(Messages::DrawingAreaProxy::UpdateWC(std::exchange(m_updateInfo, { })), [weakThis = WeakPtr(*this), willCallDisplayDidRefresh] {
+-            RefPtr protectedThis = weakThis.get();
+-            if (protectedThis && willCallDisplayDidRefresh)
+-                protectedThis->displayDidRefresh();
+-        }, m_identifier.toUInt64());
++        updates.append({ std::exchange(m_updateInfo, { }), willCallDisplayDidRefresh });
++#endif
++    }
++#if !ENABLE(GPU_PROCESS)
++    sendUpdatesWC(WTF::move(updates));
++#endif
++}
++
++#if !ENABLE(GPU_PROCESS)
++void DrawingAreaWC::sendUpdatesWC(Vector<PendingUpdate>&& updates)
++{
++    // WPE (PS5): the scene is hosted by the UI process (DrawingAreaProxyWCPS5,
++    // PS5WCHost). Its reply comes after the swap that presents this update,
++    // so with one update in flight (m_waitDidUpdate) rendering updates and
++    // rAF follow the display. The reply also comes (empty) if the message
++    // is cancelled, e.g. the UI-side proxy went away. Tiles in the shared
++    // arena (WCTilePainter) are painted by then and their slots are free
++    // again when every reply has come.
++    auto send = [weakThis = WeakPtr(*this), updates = WTF::move(updates)](RefPtr<WCTileArenaUse>&& arenaUse) mutable {
++        RefPtr protectedThis = weakThis.get();
++        if (!protectedThis)
++            return;
++#if USE(SKIA)
++        if (protectedThis->m_tilePainter && !updates.isEmpty())
++            protectedThis->m_tilePainter->addArenaChunks(updates[0].info);
++#endif
++        for (auto& update : updates) {
++            Ref { protectedThis->m_webPage.get() }->sendWithAsyncReply(Messages::DrawingAreaProxy::UpdateWC(WTF::move(update.info)), [weakThis, willCallDisplayDidRefresh = update.willCallDisplayDidRefresh, arenaUse] {
++                RefPtr protectedThis = weakThis.get();
++                if (protectedThis && willCallDisplayDidRefresh)
++                    protectedThis->displayDidRefresh();
++            }, protectedThis->m_identifier.toUInt64());
++        }
++#if defined(PS5_PAYLOAD_SDK)
++        protectedThis->m_lastUpdateSent = MonotonicTime::now();
+ #endif
++    };
++#if USE(SKIA)
++    if (m_tilePainter) {
++        m_tilePainter->finish([send = WTF::move(send)](Ref<WCTileArenaUse>&& arenaUse) mutable {
++            send(WTF::move(arenaUse));
++        });
++        return;
+     }
++#endif
++    send(nullptr);
+ }
++#endif
+ 
+ void DrawingAreaWC::updateRootLayerDeviceScaleFactor(WebCore::GraphicsLayer& layer)
+ {
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index 069658a28e..40a9d50949 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -33,6 +33,7 @@
+ #include "RemoteWCLayerTreeHostProxy.h"
+ #endif
+ #include "WCLayerFactory.h"
++#include "WCTilePainter.h"
+ #include <WebCore/DisplayRefreshMonitor.h>
+ #include <WebCore/GraphicsLayerFactory.h>
+ #include <WebCore/Timer.h>
+@@ -95,11 +96,21 @@ private:
+     void graphicsLayerRemoved(GraphicsLayerWC&) override;
+     void commitLayerUpdateInfo(WCLayerUpdateInfo&&) override;
+     RefPtr<WebCore::ImageBuffer> createImageBuffer(WebCore::FloatSize, float deviceScaleFactor) override;
++#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++    WCTilePainter* tilePainter() override { return m_tilePainter.get(); }
++#endif
+ 
+     bool isCompositingMode();
+     void updateRendering();
+     void sendUpdateAC();
+     void sendUpdateNonAC();
++#if !ENABLE(GPU_PROCESS)
++    struct PendingUpdate {
++        WCUpdateInfo info;
++        bool willCallDisplayDidRefresh;
++    };
++    void sendUpdatesWC(Vector<PendingUpdate>&&);
++#endif
+     void updateRootLayers();
+     void updateRootLayerDeviceScaleFactor(WebCore::GraphicsLayer&);
+ 
+@@ -137,6 +148,9 @@ private:
+     MonotonicTime m_lastDisplayRefresh;
+     bool m_inSynchronousDisplayDidRefresh { false };
+ #endif
++#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++    std::unique_ptr<WCTilePainter> m_tilePainter; // null: PS5WK_WC_TILE_PAINT=0
++#endif
+ #if defined(PS5_PAYLOAD_SDK)
+     MonotonicTime m_lastUpdateSent;
+ #endif
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 4f54987c13..70e1545653 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -31,6 +31,7 @@
+ 
+ #include "WCPlatformLayerGCGL.h"
+ #include "WCTileGrid.h"
++#include "WCTilePainter.h"
+ #include <WebCore/GraphicsContext.h>
+ #include <WebCore/TransformState.h>
+ #include <wtf/MonotonicTime.h>
+@@ -59,6 +60,15 @@ WCTilePaintStats& wcTilePaintStats()
+ }
+ #endif
+ 
++#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++using WCTilePart = WCTilePainter::Part;
++#else
++struct WCTilePart {
++    WCTileGrid::TileIndex index;
++    IntRect rect;
++};
++#endif
++
+ class WCTiledBacking final : public TiledBacking {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(WCTiledBacking);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(WCTiledBacking);
+@@ -66,9 +76,38 @@ public:
+     WCTiledBacking(GraphicsLayerWC& owner)
+         : m_owner(owner) { }
+ 
++    // The old way: a new ImageBuffer (and SharedMemory) per part, painted here.
++    void paintPartIntoImageBuffer(const WCTileGrid::TileIndex& index, const IntRect& dirtyRect, WCLayerUpdateInfo& update)
++    {
++        float deviceScaleFactor = m_owner.deviceScaleFactor();
++        WCTileUpdate partUpdate;
++        partUpdate.index = index;
++        IntRect scaledDirtyRect = dirtyRect;
++        scaledDirtyRect.scale(deviceScaleFactor);
++        partUpdate.dirtyRect = scaledDirtyRect;
++#if defined(PS5_PAYLOAD_SDK)
++        auto paintStart = MonotonicTime::now();
++#endif
++        auto image = m_owner.createImageBuffer(dirtyRect.size(), deviceScaleFactor);
++        auto& context = image->context();
++        context.translate(-dirtyRect.x(), -dirtyRect.y());
++        m_owner.paintGraphicsLayerContents(context, dirtyRect);
++        image->flushDrawingContextAsync();
++#if defined(PS5_PAYLOAD_SDK)
++        auto& stats = wcTilePaintStats();
++        stats.tiles++;
++        stats.shmAllocations++;
++        stats.pixels += static_cast<uint64_t>(scaledDirtyRect.width()) * scaledDirtyRect.height();
++        stats.milliseconds += (MonotonicTime::now() - paintStart).milliseconds();
++#endif
++        partUpdate.backingStore.setImageBuffer(WTF::move(image));
++        update.background.tileUpdates.append(WTF::move(partUpdate));
++    }
++
+     bool paintAndFlush(WCLayerUpdateInfo& update)
+     {
+         bool repainted = false;
++        Vector<WCTilePart> parts;
+         for (auto& index : m_tileGrid.takePendingRemovals()) {
+             WCTileUpdate tileUpdate;
+             tileUpdate.index = index;
+@@ -87,30 +126,22 @@ public:
+             if (!tile.hasDirtyRect())
+                 continue;
+             repainted = true;
+-            float deviceScaleFactor = m_owner.deviceScaleFactor();
+-            for (auto& dirtyRect : tile.rectsToPaint()) {
+-                WCTileUpdate partUpdate;
+-                partUpdate.index = entry.key;
+-                IntRect scaledDirtyRect = dirtyRect;
+-                scaledDirtyRect.scale(deviceScaleFactor);
+-                partUpdate.dirtyRect = scaledDirtyRect;
+-#if defined(PS5_PAYLOAD_SDK)
+-                auto paintStart = MonotonicTime::now();
+-#endif
+-                auto image = m_owner.createImageBuffer(dirtyRect.size(), deviceScaleFactor);
+-                auto& context = image->context();
+-                context.translate(-dirtyRect.x(), -dirtyRect.y());
+-                m_owner.paintGraphicsLayerContents(context, dirtyRect);
+-                image->flushDrawingContextAsync();
++            for (auto& dirtyRect : tile.rectsToPaint())
++                parts.append({ entry.key, dirtyRect });
++        }
++        if (!parts.isEmpty()) {
++#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++            // PS5 (WCTilePainter.h): into the shared tile arena, recorded once
++            // and replayed on the painting threads.
++            if (auto* painter = m_owner.m_observer ? m_owner.m_observer->tilePainter() : nullptr) {
++                parts = painter->paintLayer(m_owner, parts, m_owner.deviceScaleFactor(), update.background.tileUpdates);
+ #if defined(PS5_PAYLOAD_SDK)
+-                auto& stats = wcTilePaintStats();
+-                stats.tiles++;
+-                stats.pixels += static_cast<uint64_t>(scaledDirtyRect.width()) * scaledDirtyRect.height();
+-                stats.milliseconds += (MonotonicTime::now() - paintStart).milliseconds();
++                wcTilePaintStats().arenaFallbacks += parts.size();
+ #endif
+-                partUpdate.backingStore.setImageBuffer(WTF::move(image));
+-                update.background.tileUpdates.append(WTF::move(partUpdate));
+             }
++#endif
++            for (auto& part : parts)
++                paintPartIntoImageBuffer(part.index, part.rect, update);
+         }
+         m_tileGrid.clearDirtyRects();
+         return repainted;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index e324fe4a91..aaa37cedab 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -37,13 +37,23 @@ class TransformState;
+ 
+ namespace WebKit {
+ class WCTiledBacking;
++class WCTilePainter;
+ 
+ #if defined(PS5_PAYLOAD_SDK)
+-// Tiles painted on the main thread since DrawingAreaWC last took them ([render] lines).
++// Tiles painted since DrawingAreaWC last took them ([render] lines).
+ struct WCTilePaintStats {
+     unsigned tiles { 0 };
+     uint64_t pixels { 0 };
+-    double milliseconds { 0 };
++    double milliseconds { 0 }; // main thread: painting, recording, waiting for the pool
++    // WCTilePainter: recording, replay on the pool (wall clock), shared memory.
++    double recordMS { 0 };
++    uint64_t recordedPixels { 0 };
++    double rasterMS { 0 };
++    unsigned rasterItems { 0 };
++    uint64_t rasterPixels { 0 };
++    unsigned asyncBatches { 0 };
++    unsigned shmAllocations { 0 }; // tile ImageBuffers and arena chunks
++    unsigned arenaFallbacks { 0 }; // parts painted the old way (arena full)
+ };
+ WCTilePaintStats& wcTilePaintStats();
+ #endif
+@@ -55,6 +65,7 @@ public:
+         virtual void graphicsLayerRemoved(GraphicsLayerWC&) = 0;
+         virtual void commitLayerUpdateInfo(WCLayerUpdateInfo&&) = 0;
+         virtual RefPtr<WebCore::ImageBuffer> createImageBuffer(WebCore::FloatSize, float deviceScaleFactor) = 0;
++        virtual WCTilePainter* tilePainter() { return nullptr; }
+     };
+ 
+     GraphicsLayerWC(Type layerType, WebCore::GraphicsLayerClient&, Observer&);
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp
+index 3bc7965238..e857537d5b 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp
+@@ -29,14 +29,47 @@
+ #if USE(GRAPHICS_LAYER_WC)
+ 
+ #include "ImageBufferBackendHandleSharing.h"
++#include <WebCore/NativeImage.h>
+ #include <WebCore/ShareableBitmap.h>
+ #include <wtf/TZoneMallocInlines.h>
++#if USE(SKIA)
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkImage.h>
++#include <skia/core/SkPixmap.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#endif
+ 
+ namespace WebKit {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(WCBackingStore);
+ 
+-WCBackingStore::WCBackingStore(std::optional<ImageBufferBackendHandle>&& handle)
++bool WCTileArenaSlot::fits(size_t chunkSize) const
++{
++    if (size.isEmpty() || size.width() > 8192 || size.height() > 8192)
++        return false;
++    uint64_t minimumBytesPerRow = static_cast<uint64_t>(size.width()) * 4;
++    if (bytesPerRow < minimumBytesPerRow)
++        return false;
++    uint64_t bytes = static_cast<uint64_t>(bytesPerRow) * (size.height() - 1) + minimumBytesPerRow;
++    return offset <= chunkSize && bytes <= chunkSize - offset;
++}
++
++WCTileArenaChunk::WCTileArenaChunk(uint64_t id, std::optional<WebCore::SharedMemoryHandle>&& handle)
++    : m_id(id)
++{
++    if (handle)
++        m_memory = WebCore::SharedMemory::map(WTF::move(*handle), WebCore::SharedMemory::Protection::ReadOnly);
++}
++
++std::optional<WebCore::SharedMemoryHandle> WCTileArenaChunk::createHandle() const
++{
++    if (!m_memory)
++        return std::nullopt;
++    return m_memory->createHandle(WebCore::SharedMemory::Protection::ReadOnly);
++}
++
++WCBackingStore::WCBackingStore(std::optional<ImageBufferBackendHandle>&& handle, std::optional<WCTileArenaSlot>&& arenaSlot)
++    : m_arenaSlot(WTF::move(arenaSlot))
+ {
+     if (auto* imageHandle = handle ? std::get_if<WebCore::ShareableBitmap::Handle>(&*handle) : nullptr)
+         m_bitmap = WebCore::ShareableBitmap::create(WTF::move(*imageHandle));
+@@ -54,6 +87,25 @@ std::optional<ImageBufferBackendHandle> WCBackingStore::handle() const
+     return dynamicDowncast<ImageBufferBackendHandleSharing>(*sharing)->createBackendHandle();
+ }
+ 
++RefPtr<WebCore::NativeImage> WCBackingStore::createNativeImage() const
++{
++    if (m_bitmap)
++        return WebCore::NativeImage::create(m_bitmap->createPlatformImage(WebCore::BackingStoreCopy::DontCopyBackingStore));
++#if USE(SKIA)
++    if (m_arenaSlot && m_arenaMemory && m_arenaSlot->fits(m_arenaMemory->size())) {
++        auto info = SkImageInfo::MakeN32Premul(m_arenaSlot->size.width(), m_arenaSlot->size.height());
++        SkPixmap pixmap(info, m_arenaMemory->span().subspan(m_arenaSlot->offset).data(), m_arenaSlot->bytesPerRow);
++        RefPtr memory = m_arenaMemory;
++        auto image = SkImages::RasterFromPixmap(pixmap, [](const void*, void* context) {
++            static_cast<WebCore::SharedMemory*>(context)->deref();
++        }, memory.leakRef());
++        if (image)
++            return WebCore::NativeImage::create(WTF::move(image));
++    }
++#endif
++    return nullptr;
++}
++
+ } // namespace WebKit
+ 
+ #endif // USE(GRAPHICS_LAYER_WC)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h
+index 182a7c5b31..ef518900d1 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h
+@@ -29,10 +29,50 @@
+ 
+ #include "ImageBufferBackendHandle.h"
+ #include <WebCore/ImageBuffer.h>
++#include <WebCore/IntSize.h>
++#include <WebCore/SharedMemory.h>
+ #include <wtf/TZoneMalloc.h>
+ 
++namespace WebCore {
++class NativeImage;
++}
++
+ namespace WebKit {
+ 
++// A tile's pixels in the WebProcess's tile arena (WCTilePainter.h): premultiplied
++// BGRA rows at offset in the shared-memory chunk with this id, which the UI
++// process maps once (WCTileArenaChunk in WCUpdateInfo) and keeps mapped.
++struct WCTileArenaSlot {
++    uint64_t chunk { 0 };
++    uint64_t offset { 0 };
++    uint32_t bytesPerRow { 0 };
++    WebCore::IntSize size;
++
++    bool fits(size_t chunkSize) const;
++};
++
++// One chunk of a WebProcess's tile arena, sent once to each drawing-area
++// proxy. Encoding makes a read-only handle; decoding maps it.
++class WCTileArenaChunk {
++public:
++    WCTileArenaChunk(uint64_t id, Ref<WebCore::SharedMemory>&& memory)
++        : m_id(id)
++        , m_memory(WTF::move(memory))
++    {
++    }
++    uint64_t id() const { return m_id; }
++    WebCore::SharedMemory* memory() const { return m_memory.get(); }
++
++private:
++    friend struct IPC::ArgumentCoder<WCTileArenaChunk>;
++
++    WCTileArenaChunk(uint64_t id, std::optional<WebCore::SharedMemoryHandle>&&);
++    std::optional<WebCore::SharedMemoryHandle> createHandle() const;
++
++    uint64_t m_id { 0 };
++    RefPtr<WebCore::SharedMemory> m_memory;
++};
++
+ class WCBackingStore {
+     WTF_MAKE_TZONE_ALLOCATED(WCBackingStore);
+ public:
+@@ -43,14 +83,26 @@ public:
+     // In-process producers (the PS5 compositor's synthetic test scene).
+     void setBitmap(RefPtr<WebCore::ShareableBitmap>&& bitmap) { m_bitmap = WTF::move(bitmap); }
+ 
++    // Tile arena (WebProcess: the slot it painted; UI process: the slot and
++    // its chunk's mapping, attached by the drawing-area proxy).
++    const std::optional<WCTileArenaSlot>& arenaSlot() const { return m_arenaSlot; }
++    void setArenaSlot(const WCTileArenaSlot& slot) { m_arenaSlot = slot; }
++    void setArenaMemory(RefPtr<WebCore::SharedMemory>&& memory) { m_arenaMemory = WTF::move(memory); }
++
++    // The pixels to upload: the bitmap, or the arena slot (no copy; the
++    // image keeps the chunk mapped).
++    RefPtr<WebCore::NativeImage> createNativeImage() const;
++
+ private:
+     friend struct IPC::ArgumentCoder<WCBackingStore>;
+ 
+-    WCBackingStore(std::optional<ImageBufferBackendHandle>&&);
++    WCBackingStore(std::optional<ImageBufferBackendHandle>&&, std::optional<WCTileArenaSlot>&&);
+     std::optional<ImageBufferBackendHandle> handle() const;
+ 
+     RefPtr<WebCore::ImageBuffer> m_imageBuffer;
+     RefPtr<WebCore::ShareableBitmap> m_bitmap;
++    std::optional<WCTileArenaSlot> m_arenaSlot;
++    RefPtr<WebCore::SharedMemory> m_arenaMemory;
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.serialization.in b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.serialization.in
+index 55add213de..c62d6ba772 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.serialization.in
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.serialization.in
+@@ -22,8 +22,23 @@
+ 
+ #if USE(GRAPHICS_LAYER_WC)
+ 
++header: "WCBackingStore.h"
++
++[CustomHeader] struct WebKit::WCTileArenaSlot {
++    uint64_t chunk;
++    uint64_t offset;
++    uint32_t bytesPerRow;
++    WebCore::IntSize size;
++}
++
++[CustomHeader] class WebKit::WCTileArenaChunk {
++    uint64_t id();
++    std::optional<WebCore::SharedMemoryHandle> createHandle();
++}
++
+ class WebKit::WCBackingStore {
+     std::optional<WebKit::ImageBufferBackendHandle> handle();
++    std::optional<WebKit::WCTileArenaSlot> arenaSlot();
+ }
+ 
+ #endif
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+new file mode 100644
+index 0000000000..66b297cfc4
+--- /dev/null
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -0,0 +1,554 @@
++/*
++ * Copyright (C) 2026 ps5webkit contributors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "WCTilePainter.h"
++
++#if USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
++
++#include "GraphicsLayerWC.h"
++#include "WCBackingStore.h"
++#include "WCUpdateInfo.h"
++#include <WebCore/ColorSpace.h>
++#include <WebCore/FontRenderOptions.h>
++#include <WebCore/GraphicsContextSkia.h>
++#include <WebCore/GraphicsContextStateSaver.h>
++#include <WebCore/Region.h>
++#include <WebCore/SharedMemory.h>
++#include <map>
++#include <wtf/Condition.h>
++#include <wtf/Lock.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/RunLoop.h>
++#include <wtf/WorkerPool.h>
++#include <wtf/text/StringToIntegerConversion.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkBBHFactory.h>
++#include <skia/core/SkCanvas.h>
++#include <skia/core/SkColorSpace.h>
++#include <skia/core/SkPicture.h>
++#include <skia/core/SkPictureRecorder.h>
++#include <skia/core/SkSurface.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++
++namespace WebKit {
++using namespace WebCore;
++
++static unsigned envUnsigned(const char* name, unsigned fallback, unsigned minimum, unsigned maximum)
++{
++    const char* text = getenv(name);
++    if (!text || !*text)
++        return fallback;
++    auto value = parseInteger<unsigned>(StringView::fromLatin1(text));
++    return value ? std::clamp(*value, minimum, maximum) : fallback;
++}
++
++bool WCTilePainter::isEnabled()
++{
++    static bool enabled = envUnsigned("PS5WK_WC_TILE_PAINT", 1, 0, 1);
++    return enabled;
++}
++
++// The same knob as the CPU path's band painting (0032): threads that replay,
++// the main thread included unless asynchronous.
++static unsigned paintThreads()
++{
++    static unsigned threads = envUnsigned("PS5WK_PAINT_THREADS", 4, 1, 8);
++    return threads;
++}
++
++static bool paintAsync()
++{
++    static bool enabled = envUnsigned("PS5WK_WC_PAINT_ASYNC", 0, 0, 1);
++    return enabled;
++}
++
++// A layer whose dirty parts are smaller than this is painted directly into
++// the arena on the main thread (recording would cost more than it saves).
++static uint64_t recordMinPixels()
++{
++    static uint64_t pixels = envUnsigned("PS5WK_WC_RECORD_MIN_PX", 65536, 0, 1u << 30);
++    return pixels;
++}
++
++static WorkerPool& paintPool()
++{
++    static NeverDestroyed<Ref<WorkerPool>> pool = WorkerPool::create("WCPaint"_s, std::max(1u, paintThreads() - (paintAsync() ? 0 : 1)));
++    return pool.get();
++}
++
++static sk_sp<SkColorSpace> tileColorSpace()
++{
++    // As ImageBufferShareableBitmapBackend's bitmaps (ColorSpace::SRGB()).
++    return ColorSpace::SRGB().platformColorSpace();
++}
++
++// ---- The arena ----
++
++// Chunks of shared memory, mapped once here and once in the UI process
++// (each 2 MB of a mapping costs a page table, so chunks are few and large).
++// A slot is any 64-byte aligned range; first fit. Main thread only.
++class WCTileArena {
++public:
++    static WCTileArena& singleton()
++    {
++        static NeverDestroyed<WCTileArena> arena;
++        return arena.get();
++    }
++
++    struct Slot {
++        WCTileArenaSlot slot;
++        uint8_t* pixels;
++    };
++    std::optional<Slot> allocate(const IntSize&, WCTileArenaUse&);
++    void release(const Vector<WCTileArenaUse::Allocation>&);
++
++    template<typename Functor> void forEachChunk(const Functor& functor) const
++    {
++        for (auto& chunk : m_chunks)
++            functor(chunk->id, chunk->memory.get());
++    }
++    bool hasChunk(uint64_t id) const
++    {
++        return m_chunks.containsIf([&](auto& chunk) { return chunk->id == id; });
++    }
++
++    WCTileArena()
++        : m_trimTimer(Ref { RunLoop::mainSingleton() }, "WCTileArena::trim"_s, [this] { trim(); }) // never destroyed
++    {
++    }
++
++private:
++    struct Chunk {
++        WTF_DEPRECATED_MAKE_STRUCT_FAST_ALLOCATED(Chunk);
++        uint64_t id;
++        Ref<SharedMemory> memory;
++        std::map<uint64_t, uint64_t> free; // offset -> size
++        uint64_t used { 0 };
++        MonotonicTime lastAllocation;
++    };
++    static std::optional<uint64_t> allocateIn(Chunk&, uint64_t size);
++    bool addChunk(uint64_t minimumSize);
++    void trim();
++
++    Vector<std::unique_ptr<Chunk>> m_chunks;
++    uint64_t m_nextChunkID { 1 };
++    uint64_t m_totalSize { 0 };
++    RunLoop::Timer m_trimTimer;
++};
++
++static uint64_t arenaChunkSize()
++{
++    static uint64_t bytes = static_cast<uint64_t>(envUnsigned("PS5WK_WC_ARENA_CHUNK_MB", 8, 2, 64)) << 20;
++    return bytes;
++}
++
++static uint64_t arenaMaxSize()
++{
++    static uint64_t bytes = static_cast<uint64_t>(envUnsigned("PS5WK_WC_ARENA_MB", 64, 8, 512)) << 20;
++    return bytes;
++}
++
++std::optional<uint64_t> WCTileArena::allocateIn(Chunk& chunk, uint64_t size)
++{
++    for (auto it = chunk.free.begin(); it != chunk.free.end(); ++it) {
++        if (it->second < size)
++            continue;
++        uint64_t offset = it->first;
++        uint64_t left = it->second - size;
++        chunk.free.erase(it);
++        if (left)
++            chunk.free.emplace(offset + size, left);
++        chunk.used += size;
++        chunk.lastAllocation = MonotonicTime::now();
++        return offset;
++    }
++    return std::nullopt;
++}
++
++bool WCTileArena::addChunk(uint64_t minimumSize)
++{
++    uint64_t size = std::max(arenaChunkSize(), (minimumSize + (2 << 20) - 1) & ~static_cast<uint64_t>((2 << 20) - 1));
++    if (m_totalSize + size > arenaMaxSize())
++        return false;
++    RefPtr memory = SharedMemory::allocate(size);
++#if defined(PS5_PAYLOAD_SDK)
++    wcTilePaintStats().shmAllocations++;
++#endif
++    if (!memory)
++        return false;
++    auto chunk = makeUnique<Chunk>(Chunk { m_nextChunkID++, memory.releaseNonNull(), { }, 0, { } });
++    chunk->free.emplace(0, size);
++    m_totalSize += size;
++#if defined(PS5_PAYLOAD_SDK)
++    WTFLogAlways("[wc] tile arena: chunk %llu of %.0f MB (%.0f MB in %zu chunks)", static_cast<unsigned long long>(chunk->id), size / 1048576.0, m_totalSize / 1048576.0, m_chunks.size() + 1); // NOLINT
++#endif
++    m_chunks.append(WTF::move(chunk));
++    return true;
++}
++
++std::optional<WCTileArena::Slot> WCTileArena::allocate(const IntSize& size, WCTileArenaUse& use)
++{
++    if (size.isEmpty())
++        return std::nullopt;
++    uint32_t bytesPerRow = static_cast<uint32_t>(size.width()) * 4;
++    uint64_t bytes = (static_cast<uint64_t>(bytesPerRow) * size.height() + 63) & ~static_cast<uint64_t>(63);
++    for (int attempt = 0; attempt < 2; attempt++) {
++        for (auto& chunk : m_chunks) {
++            if (auto offset = allocateIn(*chunk, bytes)) {
++                use.add({ chunk->id, *offset, bytes });
++                return Slot { { chunk->id, *offset, bytesPerRow, size }, chunk->memory->mutableSpan().subspan(*offset).data() };
++            }
++        }
++        if (attempt || !addChunk(bytes))
++            break;
++    }
++    return std::nullopt;
++}
++
++void WCTileArena::release(const Vector<WCTileArenaUse::Allocation>& allocations)
++{
++    for (auto& allocation : allocations) {
++        auto index = m_chunks.findIf([&](auto& chunk) { return chunk->id == allocation.chunk; });
++        if (index == notFound)
++            continue;
++        auto& chunk = *m_chunks[index];
++        chunk.used -= std::min(chunk.used, allocation.size);
++        auto it = chunk.free.emplace(allocation.offset, allocation.size).first;
++        // Coalesce with the neighbours.
++        if (auto next = std::next(it); next != chunk.free.end() && it->first + it->second == next->first) {
++            it->second += next->second;
++            chunk.free.erase(next);
++        }
++        if (it != chunk.free.begin()) {
++            auto previous = std::prev(it);
++            if (previous->first + previous->second == it->first) {
++                previous->second += it->second;
++                chunk.free.erase(it);
++            }
++        }
++    }
++    if (m_chunks.size() > 1 && !m_trimTimer.isActive())
++        m_trimTimer.startOneShot(5_s);
++}
++
++// Chunks beyond the first go when they have been empty and unused for 5 s
++// (a page load or a big repaint needs more than scrolling does).
++void WCTileArena::trim()
++{
++    auto now = MonotonicTime::now();
++    bool keptSpare = false;
++    for (size_t i = m_chunks.size(); i-- > 1;) {
++        auto& chunk = *m_chunks[i];
++        if (chunk.used) {
++            keptSpare = true;
++            continue;
++        }
++        if (now - chunk.lastAllocation < 5_s) {
++            keptSpare = true;
++            continue;
++        }
++        m_totalSize -= chunk.memory->size();
++#if defined(PS5_PAYLOAD_SDK)
++        WTFLogAlways("[wc] tile arena: chunk %llu released (%.0f MB in %zu chunks)", static_cast<unsigned long long>(chunk.id), m_totalSize / 1048576.0, m_chunks.size() - 1); // NOLINT
++#endif
++        m_chunks.removeAt(i);
++    }
++    if (keptSpare)
++        m_trimTimer.startOneShot(5_s);
++}
++
++WCTileArenaUse::~WCTileArenaUse()
++{
++    if (m_allocations.isEmpty())
++        return;
++    if (isMainRunLoop()) {
++        WCTileArena::singleton().release(m_allocations);
++        return;
++    }
++    RunLoop::mainSingleton().dispatch([allocations = WTF::move(m_allocations)] {
++        WCTileArena::singleton().release(allocations);
++    });
++}
++
++// ---- Recording and replay ----
++
++struct RasterItem {
++    sk_sp<SkPicture> picture;
++    uint8_t* pixels; // the part's slot
++    uint32_t bytesPerRow;
++    IntRect deviceRect; // the part, in the layer's device pixels
++    int y0, y1; // rows of the part this item paints
++};
++
++class WCTilePainter::Batch : public ThreadSafeRefCounted<Batch> {
++public:
++    static Ref<Batch> create() { return adoptRef(*new Batch); }
++
++    Ref<WCTileArenaUse> use { WCTileArenaUse::create() };
++    Vector<RasterItem> items;
++    uint64_t pixels { 0 };
++
++    // Raster.
++    SkSurfaceProps props { FontRenderOptions::singleton().createSurfaceProps() };
++    std::atomic<unsigned> nextItem { 0 };
++    std::atomic<unsigned> itemsLeft { 0 };
++    MonotonicTime start;
++    SendFunction send;
++
++    void runItems()
++    {
++        for (unsigned index; (index = nextItem.fetch_add(1, std::memory_order_relaxed)) < items.size();)
++            paint(items[index]);
++    }
++
++    void paint(const RasterItem& item) const
++    {
++        int rows = item.y1 - item.y0;
++        auto info = SkImageInfo::MakeN32Premul(item.deviceRect.width(), rows, tileColorSpace());
++        auto canvas = SkCanvas::MakeRasterDirect(info, item.pixels + static_cast<size_t>(item.y0) * item.bytesPerRow, item.bytesPerRow, &props);
++        if (!canvas)
++            return;
++        canvas->clear(SK_ColorTRANSPARENT);
++        canvas->translate(-item.deviceRect.x(), -(item.deviceRect.y() + item.y0));
++        item.picture->playback(canvas.get());
++    }
++
++private:
++    Batch() = default;
++};
++
++WCTilePainter::WCTilePainter()
++    : m_batch(Batch::create())
++{
++}
++
++WCTilePainter::~WCTilePainter() = default;
++
++static void paintDirect(GraphicsLayerWC& layer, const IntRect& layerRect, const IntSize& deviceSize, float deviceScaleFactor, uint8_t* pixels, uint32_t bytesPerRow)
++{
++    // As the old path's ImageBuffer (ImageBufferShareableBitmapBackend,
++    // ShareableBitmap::createGraphicsContext).
++    auto info = SkImageInfo::MakeN32Premul(deviceSize.width(), deviceSize.height(), tileColorSpace());
++    SkSurfaceProps props = FontRenderOptions::singleton().createSurfaceProps();
++    auto surface = SkSurfaces::WrapPixels(info, pixels, bytesPerRow, &props);
++    if (!surface)
++        return;
++    auto* canvas = surface->getCanvas();
++    canvas->clear(SK_ColorTRANSPARENT);
++    GraphicsContextSkia context(*canvas, RenderingMode::Unaccelerated, RenderingPurpose::ShareableSnapshot);
++    context.applyDeviceScaleFactor(deviceScaleFactor);
++    context.translate(-layerRect.x(), -layerRect.y());
++    layer.paintGraphicsLayerContents(context, layerRect);
++}
++
++Vector<WCTilePainter::Part> WCTilePainter::paintLayer(GraphicsLayerWC& layer, const Vector<Part>& parts, float deviceScaleFactor, Vector<WCTileUpdate>& tileUpdates)
++{
++    auto start = MonotonicTime::now();
++    auto& arena = WCTileArena::singleton();
++    Vector<Part> unplaced;
++
++    struct Placed {
++        const Part* part;
++        IntRect deviceRect;
++        WCTileArena::Slot slot;
++    };
++    Vector<Placed> placed;
++    uint64_t pixels = 0;
++    IntRect deviceBounds;
++    Region region; // layer coordinates
++    for (auto& part : parts) {
++        IntRect deviceRect = part.rect;
++        deviceRect.scale(deviceScaleFactor);
++        if (deviceRect.isEmpty())
++            continue;
++        auto slot = arena.allocate(deviceRect.size(), m_batch->use.get());
++        if (!slot) {
++            unplaced.append(part);
++            continue;
++        }
++        placed.append({ &part, deviceRect, *slot });
++        pixels += static_cast<uint64_t>(deviceRect.width()) * deviceRect.height();
++        deviceBounds.unite(deviceRect);
++        region.unite(part.rect);
++    }
++    if (placed.isEmpty())
++        return unplaced;
++
++    sk_sp<SkPicture> picture;
++    double recordMS = 0;
++    if (paintThreads() > 1 && pixels >= recordMinPixels()) {
++        // Recorded in the layer's device pixels, with a bounding box
++        // hierarchy so each band's replay visits only its own operations.
++        SkPictureRecorder recorder;
++        SkRTreeFactory rtreeFactory;
++        auto* recordingCanvas = recorder.beginRecording(SkRect::Make(SkIRect::MakeXYWH(deviceBounds.x(), deviceBounds.y(), deviceBounds.width(), deviceBounds.height())), &rtreeFactory);
++        {
++            GraphicsContextSkia context(*recordingCanvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM);
++            context.beginRecording(GraphicsContextSkia::RecordingMode::Tile);
++            context.applyDeviceScaleFactor(deviceScaleFactor);
++            for (auto& rect : region.rects()) {
++                GraphicsContextStateSaver saver(context);
++                context.clip(FloatRect(rect));
++                layer.paintGraphicsLayerContents(context, rect);
++            }
++            context.endRecording();
++        }
++        picture = recorder.finishRecordingAsPicture();
++        recordMS = (MonotonicTime::now() - start).milliseconds();
++    }
++
++    for (auto& entry : placed) {
++        auto& slot = entry.slot;
++        if (picture) {
++            // Bands of at least 64 rows (16k pixels), so the pool's threads
++            // share an expensive tile.
++            int width = entry.deviceRect.width();
++            int height = entry.deviceRect.height();
++            int bandRows = std::max(64, 16384 / std::max(1, width));
++            for (int y0 = 0; y0 < height; y0 += bandRows)
++                m_batch->items.append({ picture, slot.pixels, slot.slot.bytesPerRow, entry.deviceRect, y0, std::min(height, y0 + bandRows) });
++            m_batch->pixels += static_cast<uint64_t>(width) * height;
++        } else
++            paintDirect(layer, entry.part->rect, entry.deviceRect.size(), deviceScaleFactor, slot.pixels, slot.slot.bytesPerRow);
++
++        WCTileUpdate tileUpdate;
++        tileUpdate.index = entry.part->index;
++        tileUpdate.dirtyRect = entry.deviceRect;
++        tileUpdate.backingStore.setArenaSlot(slot.slot);
++        tileUpdates.append(WTF::move(tileUpdate));
++    }
++
++#if defined(PS5_PAYLOAD_SDK)
++    auto& stats = wcTilePaintStats();
++    stats.tiles += placed.size();
++    stats.pixels += pixels;
++    stats.milliseconds += (MonotonicTime::now() - start).milliseconds();
++    stats.recordMS += recordMS;
++    if (picture)
++        stats.recordedPixels += pixels;
++#else
++    UNUSED_VARIABLE(recordMS);
++#endif
++    return unplaced;
++}
++
++void WCTilePainter::addArenaChunks(WCUpdateInfo& info)
++{
++    auto& arena = WCTileArena::singleton();
++    Vector<uint64_t> removed;
++    for (auto id : m_chunksSent) {
++        if (!arena.hasChunk(id))
++            removed.append(id);
++    }
++    for (auto id : removed) {
++        m_chunksSent.remove(id);
++        info.removedTileArenaChunks.append(id);
++    }
++    arena.forEachChunk([&](uint64_t id, SharedMemory& memory) {
++        if (m_chunksSent.add(id).isNewEntry)
++            info.tileArenaChunks.append(WCTileArenaChunk { id, Ref { memory } });
++    });
++}
++
++void WCTilePainter::finish(SendFunction&& send)
++{
++    Ref batch = std::exchange(m_batch, Batch::create()).releaseNonNull();
++    if (batch->items.isEmpty()) {
++        send(WTF::move(batch->use));
++        return;
++    }
++
++    batch->start = MonotonicTime::now();
++    unsigned itemCount = batch->items.size();
++#if defined(PS5_PAYLOAD_SDK)
++    auto& stats = wcTilePaintStats();
++    stats.rasterItems += itemCount;
++    stats.rasterPixels += batch->pixels;
++#endif
++
++    if (!paintAsync()) {
++        // The main thread takes items too and waits for the helpers (they
++        // only touch the batch, which they keep alive).
++        struct Shared : ThreadSafeRefCounted<Shared> {
++            Lock lock;
++            Condition condition;
++            unsigned helpersDone WTF_GUARDED_BY_LOCK(lock) { 0 };
++        };
++        Ref shared = adoptRef(*new Shared);
++        unsigned helpers = std::min(paintThreads() - 1, itemCount - 1);
++        for (unsigned i = 0; i < helpers; i++) {
++            paintPool().postTask([batch, shared] {
++                batch->runItems();
++                Locker locker { shared->lock };
++                shared->helpersDone++;
++                shared->condition.notifyAll();
++            });
++        }
++        batch->runItems();
++        {
++            Locker locker { shared->lock };
++            while (shared->helpersDone < helpers)
++                shared->condition.wait(shared->lock);
++        }
++        double ms = (MonotonicTime::now() - batch->start).milliseconds();
++        batch->items.clear(); // the pictures go here, on the main thread
++#if defined(PS5_PAYLOAD_SDK)
++        stats.rasterMS += ms;
++        stats.milliseconds += ms; // the main thread waited for it
++#else
++        UNUSED_VARIABLE(ms);
++#endif
++        send(WTF::move(batch->use));
++        return;
++    }
++
++    // Asynchronous: pool threads take the items; the last one done hands the
++    // update back to the main thread, which sends it.
++    batch->send = WTF::move(send);
++    batch->itemsLeft = itemCount;
++    for (unsigned i = 0; i < std::min(paintThreads(), itemCount); i++) {
++        paintPool().postTask([batch] {
++            for (unsigned index; (index = batch->nextItem.fetch_add(1, std::memory_order_relaxed)) < batch->items.size();) {
++                batch->paint(batch->items[index]);
++                if (batch->itemsLeft.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++                    RunLoop::mainSingleton().dispatch([batch] {
++#if defined(PS5_PAYLOAD_SDK)
++                        wcTilePaintStats().rasterMS += (MonotonicTime::now() - batch->start).milliseconds();
++                        wcTilePaintStats().asyncBatches++;
++#endif
++                        batch->items.clear(); // the pictures go here, on the main thread
++                        auto send = std::exchange(batch->send, nullptr);
++                        send(Ref { batch->use });
++                    });
++                }
++            }
++        });
++    }
++}
++
++} // namespace WebKit
++
++#endif // USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
+new file mode 100644
+index 0000000000..f81fee817c
+--- /dev/null
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (C) 2026 ps5webkit contributors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#pragma once
++
++#if USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
++
++#include <WebCore/IntRect.h>
++#include <WebCore/TextureMapperSparseBackingStore.h>
++#include <wtf/Function.h>
++#include <wtf/HashSet.h>
++#include <wtf/ThreadSafeRefCounted.h>
++#include <wtf/Vector.h>
++
++namespace WebKit {
++
++class GraphicsLayerWC;
++struct WCTileArenaSlot;
++struct WCTileUpdate;
++struct WCUpdateInfo;
++
++// The arena slots one update's tiles were painted into. They are free again
++// when the last reference goes: the update's reply, which the UI process
++// sends after the present, long after it uploaded them.
++class WCTileArenaUse : public ThreadSafeRefCounted<WCTileArenaUse> {
++public:
++    static Ref<WCTileArenaUse> create() { return adoptRef(*new WCTileArenaUse); }
++    ~WCTileArenaUse();
++
++    struct Allocation {
++        uint64_t chunk;
++        uint64_t offset;
++        uint64_t size;
++    };
++    void add(const Allocation& allocation) { m_allocations.append(allocation); }
++    bool isEmpty() const { return m_allocations.isEmpty(); }
++
++private:
++    WCTileArenaUse() = default;
++    Vector<Allocation> m_allocations;
++};
++
++// PS5 (COMPOSITING-PLAN.md, M5): the tiles of a rendering update are painted
++// into a persistent shared-memory arena (one per WebProcess, in chunks the UI
++// process maps once) instead of a new SharedMemory per tile. A layer's dirty
++// tiles are recorded once into an SkPicture on the main thread, and the
++// picture is replayed into each tile's slot, in bands, on a pool of painting
++// threads just before the update is sent (the main thread helps), or with
++// PS5WK_WC_PAINT_ASYNC=1 while the main thread goes on (the update is sent
++// when the bands are done). Small damage is painted directly into the arena.
++// PS5WK_WC_TILE_PAINT=0: the old path (a new ImageBuffer per tile, serial).
++class WCTilePainter {
++    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(WCTilePainter);
++    WTF_MAKE_NONCOPYABLE(WCTilePainter);
++public:
++    WCTilePainter();
++    ~WCTilePainter();
++
++    static bool isEnabled();
++
++    struct Part {
++        WebCore::TextureMapperSparseBackingStore::TileIndex index;
++        WebCore::IntRect rect; // layer coordinates
++    };
++    // Main thread, while the layer tree is flushed: paints the parts into
++    // arena slots (or records them for the pool) and appends one tile
++    // update per part. Returns the parts that found no slot (arena full):
++    // the caller paints those the old way.
++    Vector<Part> paintLayer(GraphicsLayerWC&, const Vector<Part>&, float deviceScaleFactor, Vector<WCTileUpdate>&);
++
++    // Before the update is sent: the arena chunks this drawing area's proxy
++    // doesn't have yet (and those freed since) go with the first update.
++    void addArenaChunks(WCUpdateInfo&);
++
++    // Rasterizes what paintLayer recorded since the last call, then calls
++    // send on the main thread with the slots the update holds (synchronously
++    // unless PS5WK_WC_PAINT_ASYNC=1).
++    using SendFunction = Function<void(Ref<WCTileArenaUse>&&)>;
++    void finish(SendFunction&&);
++
++private:
++    class Batch;
++    RefPtr<Batch> m_batch;
++    HashSet<uint64_t, DefaultHash<uint64_t>, WTF::UnsignedWithZeroKeyHashTraits<uint64_t>> m_chunksSent;
++};
++
++} // namespace WebKit
++
++#endif // USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+index cf0ba75b7b..df4d29df47 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+@@ -128,6 +128,10 @@ struct WCUpdateInfo {
+     Vector<WebCore::PlatformLayerIdentifier> addedLayers;
+     Vector<WebCore::PlatformLayerIdentifier> removedLayers;
+     Vector<WCLayerUpdateInfo> changedLayers;
++    // Tile arena chunks (WCTilePainter.h): mapped by the receiver before the
++    // tiles of this update are read; removed ones are unmapped after it.
++    Vector<WCTileArenaChunk> tileArenaChunks;
++    Vector<uint64_t> removedTileArenaChunks;
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+index 9337647fa7..bd5b4f052b 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+@@ -116,6 +116,8 @@ struct WebKit::WCUpdateInfo {
+     Vector<WebCore::PlatformLayerIdentifier> addedLayers;
+     Vector<WebCore::PlatformLayerIdentifier> removedLayers;
+     Vector<WebKit::WCLayerUpdateInfo> changedLayers;
++    Vector<WebKit::WCTileArenaChunk> tileArenaChunks;
++    Vector<uint64_t> removedTileArenaChunks;
+ }
+ 
+ #endif

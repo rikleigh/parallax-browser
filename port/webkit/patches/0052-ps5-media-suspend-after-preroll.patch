@@ -1,0 +1,77 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index 7657d7ce4e..7bc2338cad 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -3335,7 +3335,55 @@ void MediaPlayerPrivateGStreamer::updateStates()
+             doSeek(SeekTarget { resumedPosition }, m_playbackRate);
+         }
+     }
++
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 (COMPOSITING-PLAN.md, M6): managePlayerSuspend() suspends a muted
++    // video outside the viewport only if its pipeline is already above the
++    // suspend state; a player made off screen (a feed's videos at load) is
++    // marked suspended at NULL, and its preroll then goes ahead anyway
++    // (changePipelineState holds back only PLAYING): every such video kept a
++    // hardware decoder and its output buffers open while paused off screen
++    // (60 videos: 5.1 GB of the title's direct memory at the load). Once
++    // prerolled (metadata, first frame and the ready states delivered), it
++    // now goes to the suspend state as a video that scrolled away does, and
++    // resumes the same way when it comes into view. PS5WK_MEDIA_SUSPEND_PREROLLED=0
++    // (child.env) = the old behaviour.
++    static const bool suspendPrerolled = g_strcmp0(g_getenv("PS5WK_MEDIA_SUSPEND_PREROLLED"), "0");
++    if (suspendPrerolled && getStateResult == GST_STATE_CHANGE_SUCCESS && m_currentState == GST_STATE_PAUSED && pending == GST_STATE_VOID_PENDING && isSuspended()
++        && suspendTargetState() < GST_STATE_PAUSED && !m_ps5SuspendAfterPrerollScheduled) {
++        m_ps5SuspendAfterPrerollScheduled = true;
++        RunLoop::mainSingleton().dispatch([weakThis = ThreadSafeWeakPtr { *this }] {
++            if (RefPtr self = weakThis.get()) {
++                self->m_ps5SuspendAfterPrerollScheduled = false;
++                self->ps5SuspendAfterPreroll();
++            }
++        });
++    }
++#endif
++}
++
++#if defined(PS5_PAYLOAD_SDK)
++void MediaPlayerPrivateGStreamer::ps5SuspendAfterPreroll()
++{
++    if (!m_pipeline || !isSuspended() || suspendTargetState() >= GST_STATE_PAUSED || m_isSeeking || m_isSeekPending
++        || m_ongoingReturnFromSuspendedState != GST_STATE_VOID_PENDING || m_didErrorOccur)
++        return;
++    GstState currentState, pendingState;
++    if (gst_element_get_state(m_pipeline.get(), &currentState, &pendingState, 0) != GST_STATE_CHANGE_SUCCESS || currentState != GST_STATE_PAUSED
++        || pendingState != GST_STATE_VOID_PENDING)
++        return;
++    // A play() made while suspended is already saved in m_stateToResume.
++    if (m_stateToResume == GST_STATE_VOID_PENDING || m_stateToResume < GST_STATE_PAUSED)
++        m_stateToResume = GST_STATE_PAUSED;
++    auto position = playbackPosition();
++    m_positionToResume = position.isValid() && position > MediaTime::zeroTime() ? position : MediaTime::invalidTime();
++    static unsigned count;
++    g_printerr("[media] player %p: prerolled while muted and off screen: to %s until it is in view (%u so far)\n", static_cast<void*>(this),
++        gst_state_get_name(suspendTargetState()), ++count);
++    gst_element_set_state(m_pipeline.get(), suspendTargetState());
++    m_isPipelinePlaying = false;
+ }
++#endif
+ 
+ void MediaPlayerPrivateGStreamer::mediaLocationChanged(GstMessage* message)
+ {
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+index f51ed27f6d..ede3db9dae 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+@@ -542,6 +542,12 @@ private:
+ 
+     void managePlayerSuspend();
+     virtual GstState suspendTargetState() const { return GST_STATE_NULL; }
++#if defined(PS5_PAYLOAD_SDK)
++    // A suspended (muted, off-screen) player that prerolled anyway goes to
++    // its suspend state: see updateStates().
++    void ps5SuspendAfterPreroll();
++    bool m_ps5SuspendAfterPrerollScheduled { false };
++#endif
+ 
+     void createGSTPlayBin(const URL&);
+ 

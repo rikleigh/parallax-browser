@@ -1,0 +1,429 @@
+diff --git a/Source/WebCore/platform/graphics/MediaPlayerPrivate.h b/Source/WebCore/platform/graphics/MediaPlayerPrivate.h
+index 6cc48cff5d..aa2acac845 100644
+--- a/Source/WebCore/platform/graphics/MediaPlayerPrivate.h
++++ b/Source/WebCore/platform/graphics/MediaPlayerPrivate.h
+@@ -301,6 +301,12 @@ public:
+     virtual void setPlatformLayerBufferProxy(Ref<CoordinatedPlatformLayerBufferProxy>&&);
+     virtual RefPtr<CoordinatedPlatformLayerBufferProxy> platformLayerBufferProxy() const;
+ #endif
++#if defined(PS5_PAYLOAD_SDK)
++    // GPU compositing (DrawingAreaWC): the stream key the player's
++    // ps5videosink sends the browser title, which draws that stream's frames
++    // as the video layer's contents. 0: none.
++    virtual uint64_t ps5VideoStreamKey() const { return 0; }
++#endif
+ #endif
+ 
+     virtual String languageOfPrimaryAudioTrack() const { return emptyString(); }
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index f54b6e9523..7657d7ce4e 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -4353,7 +4353,9 @@ void MediaPlayerPrivateGStreamer::triggerRepaint(GRefPtr<GstSample>&& sample)
+         // requestVideoFrameCallback() callbacks never ran: players that wait
+         // for one to hide their poster or spinner kept it up over a playing
+         // video. Count each new sample here instead.
+-        if (!m_canRenderingBeAccelerated && isDuplicateSample == IsDuplicateSample::No)
++        // With ps5videosink this holds with accelerated compositing too
++        // (the title draws the frames; pushTextureToCompositor() never runs).
++        if ((m_ps5HolePunch || !m_canRenderingBeAccelerated) && isDuplicateSample == IsDuplicateSample::No)
+             ++m_sampleCount;
+ #endif
+     }
+@@ -4728,11 +4730,20 @@ void MediaPlayerPrivateGStreamer::paint(GraphicsContext& context, const FloatRec
+     if (!m_pageIsVisible || isSuspended())
+         return;
+ 
+-    if (m_ps5HolePunch && ps5PunchHole(context, rect))
++    // With accelerated compositing the video is a layer whose contents the
++    // title draws (ps5VideoStreamKey()); paint() then only runs for
++    // snapshots and flattening, which get the frame itself, never a hole.
++    RefPtr player = m_player.get();
++    if (m_ps5HolePunch && !(player && player->acceleratedCompositingEnabled()) && ps5PunchHole(context, rect))
+         return;
+     paintVideoFrame(context, rect);
+ }
+ 
++uint64_t MediaPlayerPrivateGStreamer::ps5VideoStreamKey() const
++{
++    return m_ps5HolePunch ? m_ps5StreamKey : 0;
++}
++
+ void MediaPlayerPrivateGStreamer::paintCurrentFrameInContext(GraphicsContext& context, const FloatRect& rect)
+ {
+     if (context.paintingDisabled() || isSuspended())
+@@ -5000,6 +5011,16 @@ GstElement* MediaPlayerPrivateGStreamer::createVideoSink()
+             g_signal_connect(pad.get(), "notify::caps", G_CALLBACK(+[](GstPad* videoSinkPad, GParamSpec*, MediaPlayerPrivateGStreamer* player) {
+                 player->videoSinkCapsChanged(videoSinkPad);
+             }), this);
++            // GPU compositing: the video's layer shows the title's frames of
++            // the stream with this key (GraphicsLayerWC::setContentsToMediaPlayer).
++            // An older sink has no key: the layer stays empty.
++            if (g_object_class_find_property(G_OBJECT_GET_CLASS(m_videoSink.get()), "stream-key")) {
++                guint64 key = 0;
++                g_object_get(m_videoSink.get(), "stream-key", &key, nullptr);
++                m_ps5StreamKey = key;
++            }
++            if (m_ps5StreamKey && player && player->acceleratedCompositingEnabled())
++                player->renderingModeChanged(); // the layer asks for the key again
+         }
+     }
+ #endif
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+index 2308c0f212..f51ed27f6d 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.h
+@@ -205,6 +205,9 @@ public:
+     void setPlatformLayerBufferProxy(Ref<CoordinatedPlatformLayerBufferProxy>&&) override;
+     RefPtr<CoordinatedPlatformLayerBufferProxy> platformLayerBufferProxy() const override;
+ #endif
++#if defined(PS5_PAYLOAD_SDK)
++    uint64_t ps5VideoStreamKey() const final;
++#endif
+ 
+ #if ENABLE(ENCRYPTED_MEDIA)
+     void cdmInstanceAttached(CDMInstance&) final;
+@@ -445,6 +448,7 @@ protected:
+     bool m_isUsingFallbackVideoSink { false };
+ #if defined(PS5_PAYLOAD_SDK)
+     bool m_ps5HolePunch { false }; // frames go to the title (ps5videosink), the page only gets a hole
++    uint64_t m_ps5StreamKey { 0 }; // ps5videosink's "stream-key": the composited video layer's contents in the title
+ #endif
+     bool m_canRenderingBeAccelerated { false };
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 9166dcdc04..948aca69bc 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -52,6 +52,55 @@ namespace WebKit {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(WCScene);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5 video layers: the contents are a ps5videosink stream's frames, which
++// the title's renderer converts to an RGBA texture each time one is due
++// (PS5Renderer::handleVideo); the stream is named by the key its sink sent
++// in HELLO (GraphicsLayerWC::setContentsToMediaPlayer). Drawn with the
++// layer's transform, clip and opacity like any contents layer.
++static WCScene::VideoTextureFunction s_videoTexture;
++
++void WCScene::setVideoTextureFunction(VideoTextureFunction function)
++{
++    s_videoTexture = function;
++}
++
++class WCScene::VideoLayer final : public WebCore::TextureMapperPlatformLayer {
++    WTF_MAKE_TZONE_ALLOCATED_INLINE(WCScene::VideoLayer);
++public:
++    VideoLayer(uint64_t key, unsigned& count)
++        : key(key)
++        , m_count(count)
++    {
++        m_count++;
++    }
++    ~VideoLayer() { m_count--; }
++
++    // What the stream has now: its texture (0: no frame) and how many
++    // frames were converted into it.
++    unsigned current(uint32_t* frames) const
++    {
++        int width = 0, height = 0;
++        *frames = 0;
++        return s_videoTexture ? s_videoTexture(key, &width, &height, frames) : 0;
++    }
++
++    void paintToTextureMapper(WebCore::TextureMapper& textureMapper, const WebCore::FloatRect& target, const WebCore::TransformationMatrix& modelViewMatrix, float opacity) override
++    {
++        uint32_t frames;
++        if (unsigned texture = current(&frames))
++            textureMapper.drawTexture(texture, { }, target, modelViewMatrix, opacity); // row 0 = the picture's top, as tiles
++    }
++
++    const uint64_t key;
++    unsigned seenTexture { 0 };
++    uint32_t seenFrames { 0 };
++
++private:
++    unsigned& m_count;
++};
++#endif
++
+ struct WCScene::Layer final : public WCContentBuffer::Client {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(WCScene::Layer);
+ public:
+@@ -71,6 +120,9 @@ public:
+         texmapLayer.setContentsLayer(nullptr);
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    std::unique_ptr<VideoLayer> videoLayer; // texmapLayer's contents layer; destroyed after it
++#endif
+     WebCore::TextureMapperLayer texmapLayer;
+     std::unique_ptr<WebCore::TextureMapperSparseBackingStore> backingStore;
+     std::unique_ptr<WebCore::TextureMapperLayer> backdropLayer;
+@@ -257,7 +309,27 @@ bool WCScene::apply(WCUpdateInfo& update)
+             layer->backdropLayer->setPosition(layerUpdate.backdropFiltersRect.rect().location());
+             layer->texmapLayer.setBackdropFiltersRect(layerUpdate.backdropFiltersRect);
+         }
++#if defined(PS5_PAYLOAD_SDK)
+         if (layerUpdate.changes & WCLayerChange::PlatformLayer) {
++            if (uint64_t key = layerUpdate.platformLayer.videoStreamKey) {
++                if (layer->contentBuffer) {
++                    layer->contentBuffer->setClient(nullptr);
++                    layer->contentBuffer = nullptr;
++                }
++                if (!layer->videoLayer || layer->videoLayer->key != key) {
++                    layer->texmapLayer.setContentsLayer(nullptr);
++                    layer->videoLayer = makeUnique<VideoLayer>(key, m_videoLayerCount);
++                }
++                layer->texmapLayer.setContentsLayer(layer->videoLayer.get());
++            } else if (layer->videoLayer) {
++                layer->texmapLayer.setContentsLayer(nullptr);
++                layer->videoLayer = nullptr;
++            }
++        }
++        if (layerUpdate.changes & WCLayerChange::PlatformLayer && !layerUpdate.platformLayer.videoStreamKey) {
++#else
++        if (layerUpdate.changes & WCLayerChange::PlatformLayer) {
++#endif
+             if (!layerUpdate.platformLayer.hasLayer) {
+                 if (layer->contentBuffer) {
+                     layer->contentBuffer->setClient(nullptr);
+@@ -319,8 +391,34 @@ void WCScene::paint(WebCore::BitmapTexture& surface, std::optional<MonotonicTime
+ #endif
+     rootLayer.paint(*m_textureMapper);
+     m_textureMapper->endPainting();
++#if defined(PS5_PAYLOAD_SDK)
++    // The video frames this paint showed (videoLayersNeedPaint).
++    if (m_videoLayerCount) {
++        for (auto& entry : m_layers) {
++            if (auto& video = entry.value->videoLayer)
++                video->seenTexture = video->current(&video->seenFrames);
++        }
++    }
++#endif
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++bool WCScene::videoLayersNeedPaint() const
++{
++    if (!m_videoLayerCount)
++        return false;
++    for (auto& entry : m_layers) {
++        if (auto& video = entry.value->videoLayer) {
++            uint32_t frames;
++            unsigned texture = video->current(&frames);
++            if (texture != video->seenTexture || frames != video->seenFrames)
++                return true;
++        }
++    }
++    return false;
++}
++#endif
++
+ std::optional<UpdateInfo> WCScene::update(WCUpdateInfo&& update)
+ {
+     if (!apply(update))
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index 552f7c0acc..081579fd1d 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -69,9 +69,25 @@ public:
+     unsigned layerCount() const { return m_layers.size(); }
+     // Did the last paint() run animations that go on (paint again next frame)?
+     bool hasRunningAnimations() const { return m_hasRunningAnimations; }
++#if defined(PS5_PAYLOAD_SDK)
++    // Video layers (WCLayerUpdateInfo::PlatformLayerChanges::videoStreamKey):
++    // the title's converted frames of a ps5videosink stream. The function
++    // (render thread, set once) returns the stream's RGBA texture (row 0 =
++    // top) or 0, and the count of frames converted into it so far.
++    using VideoTextureFunction = unsigned (*)(uint64_t key, int* width, int* height, uint32_t* frames);
++    static void setVideoTextureFunction(VideoTextureFunction);
++    // A video layer's stream has a frame the last paint() did not show
++    // (video plays at its own rate, without updates from the WebProcess).
++    bool videoLayersNeedPaint() const;
++    unsigned videoLayerCount() const { return m_videoLayerCount; }
++#endif
+ 
+ private:
+     struct Layer;
++#if defined(PS5_PAYLOAD_SDK)
++    class VideoLayer;
++    unsigned m_videoLayerCount { 0 };
++#endif
+     using LayerMap = HashMap<WebCore::PlatformLayerIdentifier, std::unique_ptr<Layer>>;
+ 
+     WebCore::ProcessIdentifier m_webProcessIdentifier;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index e2122ed12b..7adba54f75 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -344,6 +344,7 @@ private:
+     struct {
+         MonotonicTime start;
+         unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 }, animationPaints { 0 }, lateUpdates { 0 };
++        unsigned videoPaints { 0 }; // for new video frames only
+         double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 }, paintGapMaxMS { 0 };
+     } m_stats;
+ 
+@@ -465,6 +466,8 @@ bool SceneHost::setUp(const PS5CompositorContext& context)
+     // one alive so they outlive the self-test's scene and any page's.
+     m_programHolder = TextureMapper::create();
+     BitmapTextureUploaderPS5::singleton().initialize();
++    // Video layers draw the renderer's converted frames (M4).
++    WCScene::setVideoTextureFunction(context.videoTexture);
+ 
+     // S1b: always a small check (a page that can't composite must stay on
+     // the CPU path); the full measurement in test mode.
+@@ -591,9 +594,13 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+         m_surface = BitmapTexture::create(size, { BitmapTexture::Flags::SupportsAlpha });
+         m_dirty = true;
+     }
+-    if (m_dirty || m_animating) {
++    // Video layers: a new frame of their stream (no update needed).
++    bool videoFrame = !m_dirty && !m_animating && scene.videoLayersNeedPaint();
++    if (videoFrame)
++        m_stats.videoPaints++;
++    if (m_dirty || m_animating || videoFrame) {
+         auto start = MonotonicTime::now();
+-        if (!m_dirty)
++        if (!m_dirty && !videoFrame)
+             m_stats.animationPaints++;
+         // Animations are sampled at the time the frame goes on screen, so
+         // they move evenly whenever in the frame this runs.
+@@ -652,6 +659,11 @@ void SceneHost::maybeLog()
+             uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
+             m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS, m_stats.animationPaints, m_stats.paintGapMaxMS, m_stats.lateUpdates,
+             BitmapTextureUploaderPS5::textureBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion);
++        unsigned videoLayers = 0;
++        for (auto& entry : m_scenes)
++            videoLayers += entry.second->videoLayerCount();
++        if (videoLayers || m_stats.videoPaints)
++            WTFLogAlways("[wc] %.1f s: %u video layers, %u paints for video frames only", seconds, videoLayers, m_stats.videoPaints); // NOLINT
+     }
+     auto start = now;
+     m_stats = { };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 371c36ed05..60ea2cf4ae 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -37,6 +37,10 @@
+ #include <WebCore/GraphicsLayerFloatAnimationValue.h>
+ #include <WebCore/GraphicsLayerKeyframeValueList.h>
+ #include <WebCore/GraphicsLayerTransformAnimationValue.h>
++#if ENABLE(VIDEO) && defined(PS5_PAYLOAD_SDK)
++#include <WebCore/MediaPlayer.h>
++#include <WebCore/MediaPlayerPrivate.h>
++#endif
+ #include <WebCore/TransformState.h>
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/text/MakeString.h>
+@@ -526,8 +530,16 @@ void GraphicsLayerWC::setContentsToPlatformLayer(PlatformLayer* platformLayer, C
+     m_hasContentsDisplayDelegate = false;
+ #if USE(COORDINATED_GRAPHICS)
+     // WPE (PS5): PlatformLayer is a CoordinatedPlatformLayer here, which the WC
+-    // scene can't show. M4: video (and later WebGL) layers for WC.
++    // scene can't show. Video goes through setContentsToMediaPlayer (a stream
++    // key); WebGL layers for WC are for later.
+     platformLayer = nullptr;
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_videoStreamKey) {
++        // Other contents replace the video.
++        m_videoStreamKey = 0;
++        noteLayerPropertyChanged(WCLayerChange::PlatformLayer);
++    }
+ #endif
+     if (m_platformLayer == platformLayer)
+         return;
+@@ -557,8 +569,28 @@ void GraphicsLayerWC::setContentsDisplayDelegate(RefPtr<WebCore::GraphicsLayerCo
+     m_hasContentsDisplayDelegate = !!platformLayer;
+ }
+ 
++#if ENABLE(VIDEO) && defined(PS5_PAYLOAD_SDK)
++void GraphicsLayerWC::setContentsToMediaPlayer(WebCore::MediaPlayer* player, ContentsLayerPurpose)
++{
++    // ps5videosink sends each frame to the title with this key (HELLO); the
++    // scene binds the layer's contents to that stream's converted frames
++    // (WCScene, PS5 video layer). No key (no sink yet, an older sink): the
++    // player asks for this again (renderingModeChanged) when it has one.
++    auto* playerPrivate = player ? player->playerPrivate() : nullptr;
++    uint64_t key = playerPrivate ? playerPrivate->ps5VideoStreamKey() : 0;
++    if (key == m_videoStreamKey)
++        return;
++    m_videoStreamKey = key;
++    noteLayerPropertyChanged(WCLayerChange::PlatformLayer);
++}
++#endif
++
+ bool GraphicsLayerWC::usesContentsLayer() const
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_videoStreamKey)
++        return true;
++#endif
+     return m_platformLayer;
+ }
+ 
+@@ -866,6 +898,9 @@ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+ #if ENABLE(WEBGL)
+         if (m_platformLayer)
+             update.platformLayer.identifiers = static_cast<WCPlatformLayerGCGL*>(m_platformLayer)->takeContentBufferIdentifiers();
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++        update.platformLayer.videoStreamKey = m_videoStreamKey;
+ #endif
+     }
+     if (update.changes & WCLayerChange::RemoteFrame)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 7b43d47b23..726285437a 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -110,6 +110,11 @@ public:
+     void setContentsToPlatformLayer(PlatformLayer*, ContentsLayerPurpose) override;
+     void setContentsToPlatformLayerHost(WebCore::LayerHostingContextIdentifier) override;
+     void setContentsDisplayDelegate(RefPtr<WebCore::GraphicsLayerContentsDisplayDelegate>&&, ContentsLayerPurpose) override;
++#if ENABLE(VIDEO) && defined(PS5_PAYLOAD_SDK)
++    // Video: the title draws the frames of the player's ps5videosink stream
++    // (its key) as this layer's contents.
++    void setContentsToMediaPlayer(WebCore::MediaPlayer*, ContentsLayerPurpose) override;
++#endif
+     bool canDirectlyCompositeNativeImage() const override { return false; }
+     bool usesContentsLayer() const override;
+     bool hasContentsDisplayDelegate() const override { return m_hasContentsDisplayDelegate; }
+@@ -163,6 +168,9 @@ private:
+     Observer* m_observer;
+     const std::unique_ptr<WCTiledBacking> m_tiledBacking;
+     PlatformLayer* m_platformLayer { nullptr };
++#if defined(PS5_PAYLOAD_SDK)
++    uint64_t m_videoStreamKey { 0 }; // setContentsToMediaPlayer
++#endif
+     bool m_hasContentsDisplayDelegate { false };
+     Markable<WebCore::LayerHostingContextIdentifier> m_hostIdentifier;
+     WebCore::Color m_solidColor;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+index d9ec1b0589..20fd0e78e9 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+@@ -154,6 +154,9 @@ struct WCLayerUpdateInfo {
+     struct PlatformLayerChanges {
+         bool hasLayer;
+         Vector<WCContentBufferIdentifier> identifiers;
++        // PS5: the contents are this ps5videosink stream's frames (0: none),
++        // drawn by the title (GraphicsLayerWC::setContentsToMediaPlayer).
++        uint64_t videoStreamKey { 0 };
+     } platformLayer { };
+ 
+     Markable<WebCore::LayerHostingContextIdentifier> hostIdentifier { };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+index e050f92625..54dc8c6655 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+@@ -105,6 +105,7 @@ header: "WCUpdateInfo.h"
+ [Nested] struct WebKit::WCLayerUpdateInfo::PlatformLayerChanges {
+     bool hasLayer;
+     Vector<WebKit::WCContentBufferIdentifier> identifiers;
++    uint64_t videoStreamKey;
+ }
+ 
+ [CustomHeader] struct WebKit::WCLayerUpdateInfo {

@@ -1,0 +1,640 @@
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp
+index a88b9fdf24..6615f685a5 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp
+@@ -22,6 +22,12 @@
+ #include "config.h"
+ #include "TextureMapper.h"
+ 
++#include "TextureMapperLayer.h"
++#include <fcntl.h>
++#include <unistd.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/Scope.h>
++
+ #if USE(TEXTURE_MAPPER)
+ 
+ #include "BitmapTexturePool.h"
+@@ -888,18 +894,60 @@ void TextureMapper::drawEdgeTriangles(TextureMapperShaderProgram& program)
+     glBindBuffer(GL_ARRAY_BUFFER, 0);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// The PS5 GL driver defers and batches only GL_TRIANGLES draws (its
++// multidraw eligibility check); a quad drawn as a triangle fan cost ~70 us of
++// render-thread CPU, submitted on its own, against ~29 us as two triangles
++// (COMPOSITING-PLAN.md, AS6). /data/ps5webkit/wc-fan-draws: fans (A/B).
++static bool ps5QuadsAsTriangles()
++{
++    static const bool enabled = [] {
++        int fd = open("/data/ps5webkit/wc-fan-draws", O_RDONLY);
++        if (fd < 0)
++            return true;
++        close(fd);
++        return false;
++    }();
++    return enabled;
++}
++#endif
++
+ void TextureMapper::drawUnitRect(TextureMapperShaderProgram& program, GLenum drawingMode)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (drawingMode == GL_TRIANGLE_FAN && ps5QuadsAsTriangles()) {
++        static const GLfloat unitRectTriangles[] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
++        GLuint vbo = data().getStaticVBO(GL_ARRAY_BUFFER, sizeof(GLfloat) * 12, unitRectTriangles);
++        glBindBuffer(GL_ARRAY_BUFFER, vbo);
++        glVertexAttribPointer(program.vertexLocation(), 2, GL_FLOAT, false, 0, 0);
++        auto drawStart = MonotonicTime::now();
++        glDrawArrays(GL_TRIANGLES, 0, 6);
++        TextureMapperLayer::ps5PaintStats().drawArraysMS += (MonotonicTime::now() - drawStart).milliseconds();
++        glBindBuffer(GL_ARRAY_BUFFER, 0);
++        return;
++    }
++#endif
+     static const GLfloat unitRect[] = { 0, 0, 1, 0, 1, 1, 0, 1 };
+     GLuint vbo = data().getStaticVBO(GL_ARRAY_BUFFER, sizeof(GLfloat) * 8, unitRect);
+     glBindBuffer(GL_ARRAY_BUFFER, vbo);
+     glVertexAttribPointer(program.vertexLocation(), 2, GL_FLOAT, false, 0, 0);
++#if defined(PS5_PAYLOAD_SDK)
++    auto drawStart = MonotonicTime::now();
++#endif
+     glDrawArrays(drawingMode, 0, 4);
++#if defined(PS5_PAYLOAD_SDK)
++    TextureMapperLayer::ps5PaintStats().drawArraysMS += (MonotonicTime::now() - drawStart).milliseconds();
++#endif
+     glBindBuffer(GL_ARRAY_BUFFER, 0);
+ }
+ 
+ void TextureMapper::draw(const FloatRect& rect, const TransformationMatrix& modelViewMatrix, TextureMapperShaderProgram& program, GLenum drawingMode, OptionSet<TextureMapperFlags> flags)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    TextureMapperLayer::ps5PaintStats().draws++;
++    if (flags.contains(TextureMapperFlags::ShouldAntialias))
++        TextureMapperLayer::ps5PaintStats().antialiasedDraws++;
++#endif
+     TransformationMatrix matrix(modelViewMatrix);
+     matrix.multiply(TransformationMatrix::rectToRect(FloatRect(0, 0, 1, 1), rect));
+ 
+@@ -930,6 +978,12 @@ void TextureMapper::draw(const FloatRect& rect, const TransformationMatrix& mode
+ 
+ void TextureMapper::drawTexturedQuadWithProgram(TextureMapperShaderProgram& program, const Vector<std::pair<GLuint, GLuint> >& texturesAndSamplers, OptionSet<TextureMapperFlags> flags, const FloatRect& rect, const TransformationMatrix& modelViewMatrix, float opacity)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    auto quadStart = MonotonicTime::now();
++    auto quadScope = makeScopeExit([&] {
++        TextureMapperLayer::ps5PaintStats().texturedQuadMS += (MonotonicTime::now() - quadStart).milliseconds();
++    });
++#endif
+     glUseProgram(program.programID());
+ 
+     bool repeatWrap = m_wrapMode == WrapMode::Repeat && GLContext::current()->glExtensions().OES_texture_npot;
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
+index 2e8c38a1ee..761854b63d 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
+@@ -28,6 +28,7 @@
+ #include "TextureMapper.h"
+ #include "TextureMapperLayer3DRenderingContext.h"
+ #include <wtf/MathExtras.h>
++#include <wtf/MonotonicTime.h>
+ #include <wtf/Scope.h>
+ #include <wtf/SetForScope.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -352,6 +353,14 @@ void TextureMapperLayer::computeTransformsRecursive(ComputeTransformData& data)
+ #endif
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++TextureMapperLayer::PS5PaintStats& TextureMapperLayer::ps5PaintStats()
++{
++    static PS5PaintStats stats;
++    return stats;
++}
++#endif
++
+ void TextureMapperLayer::prepareForPainting(TextureMapper& textureMapper)
+ {
+     processDescendantLayersFlatteningRequirements();
+@@ -363,12 +372,24 @@ void TextureMapperLayer::prepareForPainting(TextureMapper& textureMapper)
+ 
+ void TextureMapperLayer::paint(TextureMapper& textureMapper)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    auto start = MonotonicTime::now();
++#endif
+ #if !ENABLE(DAMAGE_TRACKING)
+     prepareForPainting(textureMapper);
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++    auto prepared = MonotonicTime::now();
+ #endif
+     TextureMapperPaintOptions options(textureMapper);
+     options.surface = textureMapper.currentSurface();
+     paintRecursive(options);
++#if defined(PS5_PAYLOAD_SDK)
++    auto& stats = ps5PaintStats();
++    stats.paints++;
++    stats.prepareMS += (prepared - start).milliseconds();
++    stats.paintMS += (MonotonicTime::now() - prepared).milliseconds();
++#endif
+ 
+     destroyFlattenedDescendantLayers();
+ }
+@@ -578,6 +599,9 @@ void TextureMapperLayer::paintSelf(TextureMapperPaintOptions& options)
+     auto targetRect = layerRect();
+     if (targetRect.isEmpty())
+         return;
++#if defined(PS5_PAYLOAD_SDK)
++    ps5PaintStats().selfPaints++;
++#endif
+ 
+     // We apply the following transform to compensate for painting into a surface, and then apply the offset so that the painting fits in the target rect.
+     TransformationMatrix transform;
+@@ -932,6 +956,9 @@ IntRect transformedBoundingBox(const TransformationMatrix& transform, FloatRect
+ 
+ void TextureMapperLayer::computeOverlapRegions(ComputeOverlapRegionData& data, const TransformationMatrix& accumulatedReplicaTransform, bool includesReplica)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    ps5PaintStats().overlapComputations++;
++#endif
+     if (!m_state.visible || !m_state.contentsVisible)
+         return;
+ 
+@@ -978,6 +1005,9 @@ void TextureMapperLayer::computeOverlapRegions(ComputeOverlapRegionData& data, c
+ 
+ void TextureMapperLayer::paintUsingOverlapRegions(TextureMapperPaintOptions& options)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    ps5PaintStats().blendLayers++;
++#endif
+     Region overlapRegion;
+     Region nonOverlapRegion;
+     auto mode = ComputeOverlapRegionMode::Intersection;
+@@ -1142,6 +1172,10 @@ static void commitSurface(TextureMapperPaintOptions& options, BitmapTexture& sur
+ 
+ void TextureMapperLayer::paintWithIntermediateSurface(TextureMapperPaintOptions& options, const IntRect& rect)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    ps5PaintStats().surfaces++;
++    ps5PaintStats().surfacePixels += static_cast<uint64_t>(rect.width()) * rect.height();
++#endif
+     auto surface = BitmapTexturePool::singleton().acquireTexture(rect.size(), { BitmapTexture::Flags::SupportsAlpha });
+     {
+         SetForScope scopedSurface(options.surface, surface.ptr());
+@@ -1158,6 +1192,10 @@ void TextureMapperLayer::paintWithIntermediateSurface(TextureMapperPaintOptions&
+ 
+ void TextureMapperLayer::paintSelfAndChildrenWithIntermediateSurface(TextureMapperPaintOptions& options, const IntRect& rect)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    ps5PaintStats().surfaces++;
++    ps5PaintStats().surfacePixels += static_cast<uint64_t>(rect.width()) * rect.height();
++#endif
+     auto surface = BitmapTexturePool::singleton().acquireTexture(rect.size(), { BitmapTexture::Flags::SupportsAlpha });
+     {
+         SetForScope scopedSurface(options.surface, surface.ptr());
+@@ -1196,8 +1234,30 @@ void TextureMapperLayer::paintSelfChildrenReplicaFilterAndMask(TextureMapperPain
+ 
+ void TextureMapperLayer::paintRecursive(TextureMapperPaintOptions& options)
+ {
+-    if (!isVisible())
++#if defined(PS5_PAYLOAD_SDK)
++    auto& stats = ps5PaintStats();
++    stats.visits++;
++#endif
++    if (!isVisible()) {
++#if defined(PS5_PAYLOAD_SDK)
++        stats.invisible++;
++#endif
+         return;
++    }
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_layerTransforms.combined.isAffine() && options.transform.isAffine()) {
++        TransformationMatrix toSurface;
++        toSurface.translate(options.offset.width(), options.offset.height());
++        toSurface.multiply(options.transform);
++        toSurface.multiply(m_layerTransforms.combined);
++        auto bounds = toSurface.mapRect(layerRect());
++        if (!bounds.intersects(options.textureMapper.clipBounds())) {
++            stats.offscreen++;
++            if (m_children.isEmpty())
++                stats.offscreenSubtrees++;
++        }
++    }
++#endif
+ 
+     SetForScope scopedOpacity(options.opacity, options.opacity * m_currentOpacity);
+ 
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
+index 4e5270b0bc..a6f655308e 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
+@@ -127,6 +127,22 @@ public:
+ 
+     FloatRect effectiveLayerRect() const;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // Where a scene paint goes (COMPOSITING-PLAN.md, AS6), render thread only.
++    struct PS5PaintStats {
++        unsigned visits { 0 }, invisible { 0 }, offscreen { 0 }, offscreenSubtrees { 0 };
++        unsigned selfPaints { 0 }, blendLayers { 0 }, overlapComputations { 0 }, surfaces { 0 };
++        uint64_t surfacePixels { 0 };
++        unsigned clips { 0 };
++        unsigned tilesDrawn { 0 }, tilesCulled { 0 };
++        unsigned draws { 0 }, antialiasedDraws { 0 };
++        double drawArraysMS { 0 }, texturedQuadMS { 0 };
++        double prepareMS { 0 }, paintMS { 0 };
++        unsigned paints { 0 };
++    };
++    WEBCORE_EXPORT static PS5PaintStats& ps5PaintStats();
++#endif
++
+ private:
+     TextureMapperLayer& backdropRootLayer() const
+     {
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
+index 360bdb5b9f..d90155d71a 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
+@@ -27,6 +27,8 @@
+ 
+ #include "config.h"
+ #include "TextureMapperSparseBackingStore.h"
++
++#include "TextureMapperLayer.h"
+ #include <wtf/TZoneMallocInlines.h>
+ #if defined(PS5_PAYLOAD_SDK)
+ #include <fcntl.h>
+@@ -88,9 +90,12 @@ void TextureMapperSparseBackingStore::paintToTextureMapper(TextureMapper& textur
+         if (cull) {
+             auto bounds = adjustedTransform.mapRect(FloatRect(iterator.value->rect()));
+             bounds.inflate(1); // antialiased edges
+-            if (!bounds.intersects(clip))
++            if (!bounds.intersects(clip)) {
++                TextureMapperLayer::ps5PaintStats().tilesCulled++;
+                 continue;
++            }
+         }
++        TextureMapperLayer::ps5PaintStats().tilesDrawn++;
+ #endif
+         iterator.value->paint(textureMapper, adjustedTransform, opacity, allTileEdgesExposed(rect, iterator.value->rect()));
+     }
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index d0f7d43b46..c8f178a55d 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -126,6 +126,8 @@ public:
+     // update from the WebProcess that sets them clears these).
+     std::optional<WebCore::FloatPoint> scrollingPosition;
+     std::optional<WebCore::FloatPoint> scrollingBoundsOrigin;
++    bool hiddenForScrolling { false };
++    float webProcessOpacity { 1 };
+ #endif
+     WebCore::TextureMapperLayer texmapLayer;
+     std::unique_ptr<WebCore::TextureMapperSparseBackingStore> backingStore;
+@@ -292,8 +294,14 @@ bool WCScene::apply(WCUpdateInfo& update)
+             layer->texmapLayer.setShowRepaintCounter(layerUpdate.showRepaintCounter);
+         if (layerUpdate.changes & WCLayerChange::RepaintCount)
+             layer->texmapLayer.setRepaintCount(layerUpdate.repaintCount);
+-        if (layerUpdate.changes & WCLayerChange::Opacity)
++        if (layerUpdate.changes & WCLayerChange::Opacity) {
++#if defined(PS5_PAYLOAD_SDK)
++            layer->webProcessOpacity = layerUpdate.opacity;
++            layer->texmapLayer.setOpacity(layer->hiddenForScrolling ? 0 : layerUpdate.opacity);
++#else
+             layer->texmapLayer.setOpacity(layerUpdate.opacity);
++#endif
++        }
+         if (layerUpdate.changes & WCLayerChange::Transform)
+             layer->texmapLayer.setTransform(layerUpdate.transform);
+         if (layerUpdate.changes & WCLayerChange::ChildrenTransform)
+@@ -399,7 +407,13 @@ void WCScene::paint(WebCore::BitmapTexture& surface, std::optional<MonotonicTime
+     glClear(GL_COLOR_BUFFER_BIT);
+ #if ENABLE(DAMAGE_TRACKING)
+     // With damage tracking, paint() leaves the layer transforms to the caller.
++#if defined(PS5_PAYLOAD_SDK)
++    auto prepareStart = MonotonicTime::now();
++#endif
+     rootLayer.prepareForPainting(*m_textureMapper);
++#if defined(PS5_PAYLOAD_SDK)
++    WebCore::TextureMapperLayer::ps5PaintStats().prepareMS += (MonotonicTime::now() - prepareStart).milliseconds();
++#endif
+ #endif
+     rootLayer.paint(*m_textureMapper);
+     m_textureMapper->endPainting();
+@@ -434,6 +448,16 @@ bool WCScene::setScrollingLayerPosition(WebCore::PlatformLayerIdentifier id, std
+     return changed;
+ }
+ 
++bool WCScene::setLayerHiddenForScrolling(WebCore::PlatformLayerIdentifier id, bool hidden)
++{
++    auto* layer = m_layers.get(id);
++    if (!layer || layer->hiddenForScrolling == hidden)
++        return false;
++    layer->hiddenForScrolling = hidden;
++    layer->texmapLayer.setOpacity(hidden ? 0 : layer->webProcessOpacity);
++    return true;
++}
++
+ std::optional<WebCore::FloatRect> WCScene::layerRectOnSurface(WebCore::PlatformLayerIdentifier id) const
+ {
+     auto* layer = m_layers.get(id);
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index e275529347..710926ff86 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -84,6 +84,10 @@ public:
+     // puts a layer (after apply(), before paint(); apply() may reset it).
+     // False if the scene has no such layer or nothing changed.
+     bool setScrollingLayerPosition(WebCore::PlatformLayerIdentifier, std::optional<WebCore::FloatPoint> position, std::optional<WebCore::FloatPoint> boundsOrigin);
++    // Async scrolling: a layer drawn by the WebProcess at its own (older)
++    // scroll position, e.g. the frame's scrollbar thumb, hidden while the
++    // title is ahead. True if that changed anything.
++    bool setLayerHiddenForScrolling(WebCore::PlatformLayerIdentifier, bool hidden);
+     // A layer's bounds on the surface as of the last paint().
+     std::optional<WebCore::FloatRect> layerRectOnSurface(WebCore::PlatformLayerIdentifier) const;
+ #endif
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index ab4edf2fa2..1bbfafb5b5 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -313,6 +313,7 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+         m_scrollingTree->setCheckerboardPx(asyncScrollingOption("checkerboard", 0));
+         m_scrollingTree->setFrameLockedStick(asyncScrollingOption("stickframe", 0) > 0);
+         m_scrollingTree->setAsyncSubScrollers(asyncScrollingOption("overflow", 0) > 0);
++        m_scrollingTree->setHideLaggingScrollbar(asyncScrollingOption("thumb", 1) > 0);
+         if (asyncScrollingOption("earlyreply", 1) > 0) {
+             Locker locker { earlyReplyLock() };
+             earlyReplyScenes().add(identifier().toUInt64());
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 131f9f5e91..8b52fa19ce 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -43,6 +43,7 @@
+ #include <WebCore/ProcessIdentifier.h>
+ #include <WebCore/ShareableBitmap.h>
+ #include <WebCore/TextureMapper.h>
++#include <WebCore/TextureMapperLayer.h>
+ #include <WebCore/TextureMapperGLHeaders.h>
+ #include <WebCore/TextureMapperShaderProgram.h>
+ #include <algorithm>
+@@ -399,6 +400,7 @@ private:
+     } m_stats;
+     std::atomic<uint64_t> m_replyHopUS { 0 }, m_replyHopMaxUS { 0 }, m_replyHops { 0 };
+     bool m_frameLog { false }; // /data/ps5webkit/wc-frame-log: a [frame] line per presented update
++    bool m_sceneStats { false }; // /data/ps5webkit/wc-scene-stats: where scene paints go (AS6)
+ 
+ public:
+     // Async scrolling measurements (COMPOSITING-PLAN.md, AS0): the oldest
+@@ -437,6 +439,7 @@ private:
+         unsigned staleInputs { 0 }; // over 1 s old when a frame moved: not counted
+         unsigned commits { 0 };
+         unsigned titleSteps { 0 };
++        unsigned scrollbarToggles { 0 };
+         double titleStepPx { 0 }, titleStepSquares { 0 };
+         double leadMaxPx { 0 }, leadPx { 0 };
+         unsigned leadSamples { 0 };
+@@ -587,6 +590,7 @@ bool SceneHost::setUp(const PS5CompositorContext& context)
+     {
+         struct stat st;
+         m_frameLog = !stat("/data/ps5webkit/wc-frame-log", &st);
++        m_sceneStats = !stat("/data/ps5webkit/wc-scene-stats", &st);
+         m_waitOnlyWhileAnimating = !stat("/data/ps5webkit/wc-wait-old", &st);
+         m_scrollLog = !stat("/data/ps5webkit/wc-scroll-log", &st) || !stat("/data/ps5webkit/wc-async-scroll", &st);
+         m_scrollStats.start = MonotonicTime::now();
+@@ -966,6 +970,18 @@ void SceneHost::maybeLog()
+         unsigned videoLayers = 0;
+         for (auto& entry : m_scenes)
+             videoLayers += entry.second->videoLayerCount();
++        if (m_sceneStats) {
++            auto& paint = TextureMapperLayer::ps5PaintStats();
++            if (paint.paints) {
++                double n = paint.paints;
++                WTFLogAlways("[wc] scene per paint: %.2f ms prepare, %.2f ms paint; layers visited %.0f (invisible %.0f, off screen %.0f of which leaves %.0f), " // NOLINT
++                    "self paints %.0f, blending layers %.0f (overlap computations %.0f), surfaces %.1f (%.2f Mpx), tiles drawn %.0f culled %.0f, draws %.0f (%.0f antialiased): %.2f ms in textured quads, %.2f ms in glDrawArrays",
++                    paint.prepareMS / n, paint.paintMS / n, paint.visits / n, paint.invisible / n, paint.offscreen / n, paint.offscreenSubtrees / n,
++                    paint.selfPaints / n, paint.blendLayers / n, paint.overlapComputations / n, paint.surfaces / n, paint.surfacePixels / n / 1e6,
++                    paint.tilesDrawn / n, paint.tilesCulled / n, paint.draws / n, paint.antialiasedDraws / n, paint.texturedQuadMS / n, paint.drawArraysMS / n);
++            }
++            paint = { };
++        }
+         if (m_stats.earlyReplies)
+             WTFLogAlways("[wc] %.1f s: %u updates answered when applied (async scrolling)", seconds, m_stats.earlyReplies); // NOLINT
+         if (videoLayers || m_stats.videoPaints)
+@@ -1025,6 +1041,16 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
+             m_scrollStats.leadPx += lead;
+             m_scrollStats.leadSamples++;
+             m_scrollStats.leadMaxPx = std::max(m_scrollStats.leadMaxPx, lead);
++            // The WebProcess paints the scrollbar thumb at its own position:
++            // hidden while the title is clearly ahead, back once it caught up.
++            if (tree->hideLaggingScrollbar()) {
++                if (auto scrollbar = tree->rootVerticalScrollbarLayer()) {
++                    if (scene.setLayerHiddenForScrolling(*scrollbar, lead > 24)) {
++                        changed = true;
++                        m_scrollStats.scrollbarToggles++;
++                    }
++                }
++            }
+         }
+     }
+     return changed;
+@@ -1079,10 +1105,10 @@ void SceneHost::maybeLogScroll()
+     double stepDeviation = m_scrollStats.titleSteps ? std::sqrt(std::max(0.0, m_scrollStats.titleStepSquares / m_scrollStats.titleSteps - stepAverage * stepAverage)) : 0.0;
+     if (asyncEvents || syncEvents || m_scrollStats.commits) {
+         WTFLogAlways("[ascroll] %.1f s: wheel events in the title %u, sent to the WebProcess first %u; clamped at the painted edge %u (%llu px); " // NOLINT
+-            "lead over the WebProcess %.0f px avg, %.0f max; %u tree commits; per-frame step %.1f px avg, sd %.1f",
++            "lead over the WebProcess %.0f px avg, %.0f max; %u tree commits; per-frame step %.1f px avg, sd %.1f; scrollbar hidden/shown %u",
+             seconds, asyncEvents, syncEvents, clampedEvents, static_cast<unsigned long long>(clampedPx),
+             m_scrollStats.leadSamples ? m_scrollStats.leadPx / m_scrollStats.leadSamples : 0.0, m_scrollStats.leadMaxPx, m_scrollStats.commits,
+-            stepAverage, stepDeviation);
++            stepAverage, stepDeviation, m_scrollStats.scrollbarToggles);
+     }
+     if (m_scrollStats.movedFrames || inputs) {
+         auto& latencies = m_scrollStats.latenciesMS;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index 531371741c..cf668f191d 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -123,6 +123,8 @@ private:
+             m_contentShadowLayer = frameStateNode->contentShadowLayer().layerID();
+         if (!isRootNode())
+             wcTree(scrollingTree().get()).setSubScrollerLayer(scrollingNodeID(), scrollContainerLayer().layerID());
++        else if (frameStateNode->hasChangedProperty(ScrollingStateNode::Property::VerticalScrollbarLayer))
++            wcTree(scrollingTree().get()).setRootVerticalScrollbarLayer(frameStateNode->verticalScrollbarLayer().layerID());
+         delegate().updateFromStateNode(*frameStateNode);
+         return true;
+     }
+@@ -616,6 +618,12 @@ std::optional<WheelEventHandlingResult> PS5WCScrollingTree::handleWheelEventForS
+     return handleWheelEventWithNode(wheelEvent, { WheelEventProcessingSteps::AsyncScrolling }, node.get(), EventTargeting::Propagate);
+ }
+ 
++std::optional<PlatformLayerIdentifier> PS5WCScrollingTree::rootVerticalScrollbarLayer()
++{
++    Locker locker { treeLock() };
++    return m_rootVerticalScrollbarLayer;
++}
++
+ bool PS5WCScrollingTree::rootHasSynchronousScrollingReasons()
+ {
+     Locker locker { treeLock() };
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+index 5e4cae774a..fb6729fcf3 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+@@ -102,9 +102,15 @@ public:
+     // Per-frame scroll steps (px) of the root, for the [ascroll] line.
+     struct StepStats { unsigned frames { 0 }; double sum { 0 }, sumSquares { 0 }; };
+ 
++    // The root frame's vertical scrollbar layer, if composited.
++    std::optional<WebCore::PlatformLayerIdentifier> rootVerticalScrollbarLayer();
++    void setHideLaggingScrollbar(bool on) { m_hideLaggingScrollbar = on; }
++    bool hideLaggingScrollbar() const { return m_hideLaggingScrollbar; }
++
+     // From the nodes, with the tree lock held.
+     void setLayerPosition(std::optional<WebCore::PlatformLayerIdentifier>, WebCore::FloatPoint);
+     void setLayerBoundsOrigin(std::optional<WebCore::PlatformLayerIdentifier>, WebCore::FloatPoint);
++    void setRootVerticalScrollbarLayer(std::optional<WebCore::PlatformLayerIdentifier> layer) { m_rootVerticalScrollbarLayer = layer; }
+     void setSubScrollerLayer(WebCore::ScrollingNodeID, std::optional<WebCore::PlatformLayerIdentifier>);
+     void removeSubScrollerLayer(WebCore::ScrollingNodeID);
+ 
+@@ -135,6 +141,8 @@ private:
+     std::atomic<unsigned> m_titleScrolls { 0 };
+     std::atomic<float> m_checkerboardPx { 0 };
+     bool m_frameLockedStick { false };
++    bool m_hideLaggingScrollbar { true };
++    std::optional<WebCore::PlatformLayerIdentifier> m_rootVerticalScrollbarLayer; // tree lock
+     Lock m_stickLock;
+     std::optional<WebCore::PlatformWheelEvent> m_stickEvent WTF_GUARDED_BY_LOCK(m_stickLock); // the newest, as a template
+     WebCore::FloatSize m_stickPending WTF_GUARDED_BY_LOCK(m_stickLock); // queued, not applied yet
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp
+index e857537d5b..4322046847 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.cpp
+@@ -26,6 +26,8 @@
+ #include "config.h"
+ #include "WCBackingStore.h"
+ 
++#include <wtf/MonotonicTime.h>
++
+ #if USE(GRAPHICS_LAYER_WC)
+ 
+ #include "ImageBufferBackendHandleSharing.h"
+@@ -57,8 +59,17 @@ bool WCTileArenaSlot::fits(size_t chunkSize) const
+ WCTileArenaChunk::WCTileArenaChunk(uint64_t id, std::optional<WebCore::SharedMemoryHandle>&& handle)
+     : m_id(id)
+ {
+-    if (handle)
+-        m_memory = WebCore::SharedMemory::map(WTF::move(*handle), WebCore::SharedMemory::Protection::ReadOnly);
++    if (!handle)
++        return;
++#if defined(PS5_PAYLOAD_SDK)
++    auto start = MonotonicTime::now();
++#endif
++    m_memory = WebCore::SharedMemory::map(WTF::move(*handle), WebCore::SharedMemory::Protection::ReadOnly);
++#if defined(PS5_PAYLOAD_SDK)
++    // The tile-arena stall hunt (COMPOSITING-PLAN.md): how long the
++    // receiving side's map of a new chunk takes.
++    WTFLogAlways("[wc] tile arena chunk %llu mapped in %.2f ms", static_cast<unsigned long long>(id), (MonotonicTime::now() - start).milliseconds()); // NOLINT
++#endif
+ }
+ 
+ std::optional<WebCore::SharedMemoryHandle> WCTileArenaChunk::createHandle() const
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+index 2140e0be32..bb53aab7fe 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -42,6 +42,7 @@
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/RunLoop.h>
++#include <wtf/Threading.h>
+ #include <wtf/WorkerPool.h>
+ #include <wtf/text/StringToIntegerConversion.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+@@ -155,6 +156,12 @@ private:
+     static std::optional<uint64_t> allocateIn(Chunk&, uint64_t size);
+     bool addChunk(uint64_t minimumSize);
+     void trim();
++#if defined(PS5_PAYLOAD_SDK)
++    void prepareSpare();
++    Lock m_spareLock;
++    RefPtr<SharedMemory> m_spare WTF_GUARDED_BY_LOCK(m_spareLock);
++    bool m_spareInFlight WTF_GUARDED_BY_LOCK(m_spareLock) { false };
++#endif
+ 
+     Vector<std::unique_ptr<Chunk>> m_chunks;
+     uint64_t m_nextChunkID { 1 };
+@@ -196,7 +203,24 @@ bool WCTileArena::addChunk(uint64_t minimumSize)
+     uint64_t size = std::max(arenaChunkSize(), (minimumSize + (2 << 20) - 1) & ~static_cast<uint64_t>((2 << 20) - 1));
+     if (m_totalSize + size > arenaMaxSize())
+         return false;
+-    RefPtr memory = SharedMemory::allocate(size);
++    RefPtr<SharedMemory> memory;
++    const char* how = "allocated";
++    auto start = MonotonicTime::now();
++#if defined(PS5_PAYLOAD_SDK)
++    // A chunk made ahead of time on a background thread, if one is ready
++    // and big enough (the allocation itself can take long on the console).
++    {
++        Locker locker { m_spareLock };
++        if (m_spare && m_spare->size() >= size) {
++            memory = WTF::move(m_spare);
++            size = memory->size();
++            how = "taken from the spare";
++        }
++    }
++#endif
++    if (!memory)
++        memory = SharedMemory::allocate(size);
++    double ms = (MonotonicTime::now() - start).milliseconds();
+ #if defined(PS5_PAYLOAD_SDK)
+     wcTilePaintStats().shmAllocations++;
+ #endif
+@@ -206,12 +230,46 @@ bool WCTileArena::addChunk(uint64_t minimumSize)
+     chunk->free.emplace(0, size);
+     m_totalSize += size;
+ #if defined(PS5_PAYLOAD_SDK)
+-    WTFLogAlways("[wc] tile arena: chunk %llu of %.0f MB (%.0f MB in %zu chunks)", static_cast<unsigned long long>(chunk->id), size / 1048576.0, m_totalSize / 1048576.0, m_chunks.size() + 1); // NOLINT
++    WTFLogAlways("[wc] tile arena: chunk %llu of %.0f MB (%.0f MB in %zu chunks), %s in %.2f ms on the main thread", // NOLINT
++        static_cast<unsigned long long>(chunk->id), size / 1048576.0, m_totalSize / 1048576.0, m_chunks.size() + 1, how, ms);
+ #endif
+     m_chunks.append(WTF::move(chunk));
++#if defined(PS5_PAYLOAD_SDK)
++    prepareSpare();
++#endif
+     return true;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// After a chunk was added (the page needs more than it had): make the next
++// one on a background thread, if the arena may still grow, so that a later
++// burst of tiles doesn't wait for shm_open/ftruncate/mmap on the main thread.
++// Off by default (PS5WK_WC_ARENA_SPARE=1 turns it on): measured at 0.02 ms
++// for an 8 MB chunk on the console, the allocation is not what stalls.
++void WCTileArena::prepareSpare()
++{
++    static const bool enabled = envUnsigned("PS5WK_WC_ARENA_SPARE", 0, 0, 1);
++    uint64_t size = arenaChunkSize();
++    if (!enabled || m_totalSize + size > arenaMaxSize())
++        return;
++    {
++        Locker locker { m_spareLock };
++        if (m_spare || m_spareInFlight)
++            return;
++        m_spareInFlight = true;
++    }
++    Thread::create("WCTileArenaSpare"_s, [this, size] {
++        auto start = MonotonicTime::now();
++        RefPtr memory = SharedMemory::allocate(size);
++        double ms = (MonotonicTime::now() - start).milliseconds();
++        Locker locker { m_spareLock };
++        m_spare = WTF::move(memory);
++        m_spareInFlight = false;
++        WTFLogAlways("[wc] tile arena: spare chunk of %.0f MB made in %.2f ms (background)", size / 1048576.0, ms); // NOLINT
++    })->detach();
++}
++#endif
++
+ std::optional<WCTileArena::Slot> WCTileArena::allocate(const IntSize& size, WCTileArenaUse& use)
+ {
+     if (size.isEmpty())

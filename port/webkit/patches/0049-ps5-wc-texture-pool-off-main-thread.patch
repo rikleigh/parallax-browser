@@ -1,0 +1,30 @@
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+index c5258e7106..4d64e9dd15 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+@@ -192,7 +192,7 @@ void BitmapTexturePool::releaseUnusedTexturesTimerFired()
+     if (GLContextWrapper::currentContext())
+         releaseTexturesIfNeeded();
+ #if !PLATFORM(WIN)
+-    else if (auto* context = PlatformDisplay::sharedDisplay().sharingGLContext()) {
++    else if (auto* display = PlatformDisplay::sharedDisplayIfExists(); auto* context = display ? display->sharingGLContext() : nullptr) {
+         GLContext::ScopedGLContextCurrent scopedCurrent(*context);
+         releaseTexturesIfNeeded();
+     }
+@@ -216,6 +216,16 @@ void BitmapTexturePool::enterLimitExceededModeIfNeeded()
+         m_onLimitExceededMode = true;
+         m_releaseUnusedSecondsTolerance = s_releaseUnusedSecondsToleranceOnLimitExceeded;
+         m_releaseUnusedTexturesTimerInterval = s_releaseUnusedTexturesTimerIntervalOnLimitExceeded;
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS) && defined(PS5_PAYLOAD_SDK)
++        // No main-thread timer on PS5 (see scheduleReleaseUnusedTextures): the
++        // next WCScene update releases with the shorter tolerance. The timer
++        // ran on the title's main thread without a GL context and aborted in
++        // PlatformDisplay::sharedDisplay() (the title has no shared display).
++        static unsigned entered;
++        if (!entered++ || !(entered % 100))
++            WTFLogAlways("[wc] texture pool over its %zu MB limit: %.1f MB in %zu textures; released after 50 ms unused until below (limit reached %u times)", s_poolSizeLimitInBytes >> 20, m_poolSizeInBytes / 1048576.0, m_textures.size(), entered); // NOLINT
++        return;
++#endif
+         m_releaseUnusedTexturesTimer.startOneShot(0_s);
+     }
+ }

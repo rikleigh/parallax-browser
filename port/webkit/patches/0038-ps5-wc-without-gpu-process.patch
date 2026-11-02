@@ -1,0 +1,489 @@
+diff --git a/Source/WebCore/platform/graphics/egl/GLContext.cpp b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+index 6b748ca402..e612650d57 100644
+--- a/Source/WebCore/platform/graphics/egl/GLContext.cpp
++++ b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+@@ -26,6 +26,7 @@
+ #include <wtf/StringPrintStream.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/Vector.h>
++#include <string>
+ #include <wtf/text/StringToIntegerConversion.h>
+ 
+ #if USE(LIBEPOXY)
+@@ -42,6 +43,29 @@ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(GLContext);
+ 
++// The current context's extensions as one space-separated list. Core profiles
++// (desktop GL 3.2+, e.g. the PS5's GL 4.6) have no GL_EXTENSIONS string:
++// glGetString(GL_EXTENSIONS) is an error there and returns null.
++static std::string currentGLExtensionsString()
++{
++    if (auto* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS)))
++        return extensions;
++    std::string result;
++#if USE(LIBEPOXY)
++    glGetError(); // GL_INVALID_ENUM from the query above.
++    GLint count = 0;
++    glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++    for (GLint i = 0; i < count; ++i) {
++        if (auto* extension = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i))) {
++            if (!result.empty())
++                result += ' ';
++            result += extension;
++        }
++    }
++#endif
++    return result;
++}
++
+ const char* GLContext::errorString(int statusCode)
+ {
+     static_assert(sizeof(int) >= sizeof(EGLint), "EGLint must not be wider than int");
+@@ -380,7 +404,8 @@ static void logGLDebugMessage(GLenum source, GLenum type, GLuint identifier, GLe
+ 
+ bool GLContext::enableDebugLogging()
+ {
+-    const char* glExtensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
++    auto glExtensionsString = currentGLExtensionsString();
++    const char* glExtensions = glExtensionsString.c_str();
+     const bool backtraceOnError = LOG_CHANNEL(GLContext).level >= WTFLogLevel::Debug;
+ 
+ #if USE(LIBEPOXY)
+@@ -638,7 +663,8 @@ const GLContext::GLExtensions& GLContext::glExtensions() const
+ {
+     static std::once_flag flag;
+     std::call_once(flag, [this] {
+-        const char* extensionsString = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
++        auto extensions = currentGLExtensionsString();
++        const char* extensionsString = extensions.c_str();
+         m_glExtensions.OES_texture_npot = isExtensionSupported(extensionsString, "GL_OES_texture_npot");
+         m_glExtensions.EXT_unpack_subimage = isExtensionSupported(extensionsString, "GL_EXT_unpack_subimage");
+         m_glExtensions.APPLE_sync = isExtensionSupported(extensionsString, "GL_APPLE_sync");
+diff --git a/Source/WebKit/Shared/UpdateInfo.h b/Source/WebKit/Shared/UpdateInfo.h
+index f0a58d8902..4a555dfc24 100644
+--- a/Source/WebKit/Shared/UpdateInfo.h
++++ b/Source/WebKit/Shared/UpdateInfo.h
+@@ -25,7 +25,7 @@
+ 
+ #pragma once
+ 
+-#if !PLATFORM(WPE) && !PLATFORM(GTK) && (USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER))
++#if (!PLATFORM(WPE) && !PLATFORM(GTK) && (USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER))) || USE(GRAPHICS_LAYER_WC)
+ 
+ #include <WebCore/IntRect.h>
+ #include <WebCore/ShareableBitmap.h>
+diff --git a/Source/WebKit/Shared/UpdateInfo.serialization.in b/Source/WebKit/Shared/UpdateInfo.serialization.in
+index 6f5dc4210b..97e020aa8f 100644
+--- a/Source/WebKit/Shared/UpdateInfo.serialization.in
++++ b/Source/WebKit/Shared/UpdateInfo.serialization.in
+@@ -20,7 +20,7 @@
+ # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
+-#if !PLATFORM(WPE) && !PLATFORM(GTK) && (USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER))
++#if (!PLATFORM(WPE) && !PLATFORM(GTK) && (USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER))) || USE(GRAPHICS_LAYER_WC)
+ 
+ [RValue] struct WebKit::UpdateInfo {
+     WebCore::IntSize viewSize;
+diff --git a/Source/WebKit/Shared/WebCoreArgumentCoders.serialization.in b/Source/WebKit/Shared/WebCoreArgumentCoders.serialization.in
+index 6337acf1c0..9fca78f9c4 100644
+--- a/Source/WebKit/Shared/WebCoreArgumentCoders.serialization.in
++++ b/Source/WebKit/Shared/WebCoreArgumentCoders.serialization.in
+@@ -5875,11 +5875,11 @@ struct WebCore::KeypressCommand {
+ }
+ #endif
+ 
+-#if !USE(COORDINATED_GRAPHICS)
++#if !USE(COORDINATED_GRAPHICS) || USE(GRAPHICS_LAYER_WC)
+ class WebCore::FilterOperations {
+     Vector<Ref<WebCore::FilterOperation>> m_operations;
+ }
+-#endif // !USE(COORDINATED_GRAPHICS)
++#endif // !USE(COORDINATED_GRAPHICS) || USE(GRAPHICS_LAYER_WC)
+ 
+ header: <WebCore/Filter.h>
+ [CustomHeader, AdditionalEncoder=StreamConnectionEncoder] struct WebCore::FilterGeometry {
+@@ -6180,7 +6180,7 @@ header: <WebCore/SharedBuffer.h>
+     Ref<WebCore::FragmentedSharedBuffer> asFragmentedSharedBuffer();
+ };
+ 
+-#if !USE(COORDINATED_GRAPHICS)
++#if !USE(COORDINATED_GRAPHICS) || USE(GRAPHICS_LAYER_WC)
+ [RefCounted] class WebCore::FilterOperation subclasses {
+     WebCore::BasicColorMatrixFilterOperation
+     WebCore::BasicComponentTransferFilterOperation
+@@ -6212,7 +6212,7 @@ header: <WebCore/SharedBuffer.h>
+ [CustomHeader, RefCounted] class WebCore::PassthroughFilterOperation {
+     [NotSerialized] WebCore::FilterOperation::Type type();
+ };
+-#endif // !USE(COORDINATED_GRAPHICS)
++#endif // !USE(COORDINATED_GRAPHICS) || USE(GRAPHICS_LAYER_WC)
+ 
+ [AdditionalEncoder=StreamConnectionEncoder, RefCounted] class WebCore::FilterEffect subclasses {
+     WebCore::FEBlend
+diff --git a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.h b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.h
+index 877183e998..ed2b0ee804 100644
+--- a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.h
++++ b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.h
+@@ -199,6 +199,12 @@ private:
+ 
+     RefPtr<ViewSnapshot> takeViewSnapshot(std::optional<WebCore::IntRect>&&) override;
+ 
++#if USE(GRAPHICS_LAYER_WC)
++    // M1: the WC scene is hosted in this process and paints into the title's
++    // own GL frame, never read back.
++    bool usesOffscreenRendering() const override { return false; }
++#endif
++
+     WKWPE::View& m_view;
+     DefaultUndoController m_undoController;
+ #if ENABLE(FULLSCREEN_API)
+diff --git a/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.h b/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.h
+index 0cbd69c83e..4280f58f9a 100644
+--- a/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.h
++++ b/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.h
+@@ -53,6 +53,7 @@ public:
+ 
+     void ref() const final { RefCounted::ref(); }
+     void deref() const final { RefCounted::deref(); }
++    bool isDrawingAreaProxyCoordinatedGraphics() const final { return true; }
+ 
+ #if !PLATFORM(WPE) && !PLATFORM(GTK)
+     void paint(PlatformPaintContextPtr, const WebCore::IntRect&, WebCore::Region& unpaintedRegion);
+@@ -148,4 +149,8 @@ template<typename T> struct IsDeprecatedTimerSmartPointerException;
+ template<> struct IsDeprecatedTimerSmartPointerException<WebKit::DrawingAreaProxyCoordinatedGraphics::DrawingMonitor> : std::true_type { };
+ }
+ 
+-SPECIALIZE_TYPE_TRAITS_DRAWING_AREA_PROXY(DrawingAreaProxyCoordinatedGraphics, DrawingAreaType::CoordinatedGraphics)
++// Not SPECIALIZE_TYPE_TRAITS_DRAWING_AREA_PROXY: without TILED_CA_DRAWING_AREA it
++// accepts any proxy, and WPE (PS5) can also have a WC proxy.
++SPECIALIZE_TYPE_TRAITS_BEGIN(WebKit::DrawingAreaProxyCoordinatedGraphics)
++    static bool isType(const WebKit::DrawingAreaProxy& proxy) { return proxy.isDrawingAreaProxyCoordinatedGraphics(); }
++SPECIALIZE_TYPE_TRAITS_END()
+diff --git a/Source/WebKit/UIProcess/DrawingAreaProxy.h b/Source/WebKit/UIProcess/DrawingAreaProxy.h
+index 2f259f2e63..40e88c88fe 100644
+--- a/Source/WebKit/UIProcess/DrawingAreaProxy.h
++++ b/Source/WebKit/UIProcess/DrawingAreaProxy.h
+@@ -79,6 +79,7 @@ public:
+ #endif
+ 
+     virtual bool isRemoteLayerTreeDrawingAreaProxyMac() const { return false; }
++    virtual bool isDrawingAreaProxyCoordinatedGraphics() const { return false; }
+     virtual bool isRemoteLayerTreeDrawingAreaProxyIOS() const { return false; }
+ 
+     void startReceivingMessages(WebProcessProxy&);
+diff --git a/Source/WebKit/UIProcess/WebPageProxy.cpp b/Source/WebKit/UIProcess/WebPageProxy.cpp
+index ea19b39600..f498036aa0 100644
+--- a/Source/WebKit/UIProcess/WebPageProxy.cpp
++++ b/Source/WebKit/UIProcess/WebPageProxy.cpp
+@@ -19018,7 +19018,10 @@ void WebPageProxy::callAfterNextPresentationUpdate(CompletionHandler<void()>&& c
+             protect(drawingArea())->addOutstandingPresentationUpdateCallback(protect(process->connection()), *callbackID);
+     }
+ #elif USE(COORDINATED_GRAPHICS)
+-    downcast<DrawingAreaProxyCoordinatedGraphics>(*m_drawingArea).dispatchAfterEnsuringDrawing(WTF::move(callback));
++    if (RefPtr drawingArea = dynamicDowncast<DrawingAreaProxyCoordinatedGraphics>(*m_drawingArea))
++        drawingArea->dispatchAfterEnsuringDrawing(WTF::move(callback));
++    else
++        callback();
+ #else
+     callback();
+ #endif
+diff --git a/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
+index baa5e7fb60..e90b9b2a46 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
+@@ -76,6 +76,14 @@ WPEView* WebPageProxy::wpeView() const
+ }
+ #endif
+ 
++#if USE(GRAPHICS_LAYER_WC)
++uint64_t WebPageProxy::viewWidget()
++{
++    // A native window handle is only used by the GPU process's WC host.
++    return 0;
++}
++#endif
++
+ void WebPageProxy::bindAccessibilityTree(const String& plugID)
+ {
+     RefPtr pageClient = this->pageClient();
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp b/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp
+index 5ac78eb588..026883617c 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp
+@@ -54,6 +54,9 @@
+ #if USE(GRAPHICS_LAYER_WC)
+ #include "DrawingAreaWC.h"
+ #endif
++#if USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS)
++#include "WebPreferencesKeys.h"
++#endif
+ 
+ namespace WebKit {
+ using namespace WebCore;
+@@ -75,6 +78,12 @@ RefPtr<DrawingArea> DrawingArea::create(WebPage& webPage, const WebPageCreationP
+     return RemoteLayerTreeDrawingAreaMac::create(webPage, parameters);
+ #elif PLATFORM(IOS_FAMILY)
+     return RemoteLayerTreeDrawingArea::create(webPage, parameters);
++#elif USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS)
++    // WPE (PS5): the WC compositor only with accelerated compositing on (off
++    // by default on PS5, WebPreferencesWPE.cpp); otherwise the CPU path.
++    if (parameters.store.getBoolValueForKey(WebPreferencesKey::acceleratedCompositingEnabledKey()))
++        return DrawingAreaWC::create(webPage, parameters);
++    return DrawingAreaCoordinatedGraphics::create(webPage, parameters);
+ #elif USE(GRAPHICS_LAYER_WC)
+     return DrawingAreaWC::create(webPage, parameters);
+ #elif USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER)
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.h b/Source/WebKit/WebProcess/WebPage/DrawingArea.h
+index 425fa3050e..5662df704f 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.h
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.h
+@@ -179,6 +179,11 @@ public:
+     virtual void releaseMemory(WTF::Critical) { }
+ #endif
+ 
++#if USE(COORDINATED_GRAPHICS) && USE(GRAPHICS_LAYER_WC)
++    // WPE (PS5): DrawingAreaWC or DrawingAreaCoordinatedGraphics, chosen at run time.
++    virtual bool isDrawingAreaWC() const { return false; }
++#endif
++
+ #if PLATFORM(WPE) && ENABLE(WPE_PLATFORM) && (USE(GBM) || OS(ANDROID))
+     virtual void preferredBufferFormatsDidChange() { }
+ #endif
+diff --git a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+index 1f1184064a..b1c6d95172 100644
+--- a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+@@ -349,6 +349,13 @@ void WebPage::getRenderProcessInfo(CompletionHandler<void(RenderProcessInfo&&)>&
+     info.memoryMappedGPUBufferSupported = MemoryMappedGPUBuffer::isSupported();
+ #endif // USE(GBM)
+ 
++#if USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS)
++    // DrawingAreaWC has no GL in this process.
++    if (m_drawingArea && m_drawingArea->isDrawingAreaWC()) {
++        completionHandler(WTF::move(info));
++        return;
++    }
++#endif
+     static_cast<DrawingAreaCoordinatedGraphics*>(m_drawingArea.get())->fillGLInformation(WTF::move(info), WTF::move(completionHandler));
+ }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index c0c6a216fb..45d8c6fb9a 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -32,8 +32,10 @@
+ #include "GraphicsLayerWC.h"
+ #include "ImageBufferShareableBitmapBackend.h"
+ #include "MessageSenderInlines.h"
++#if ENABLE(GPU_PROCESS)
+ #include "RemoteRenderingBackendProxy.h"
+ #include "RemoteWCLayerTreeHostProxy.h"
++#endif
+ #include "UpdateInfo.h"
+ #include "WebFrame.h"
+ #include "WebPage.h"
+@@ -54,7 +56,9 @@ using namespace WebCore;
+ 
+ DrawingAreaWC::DrawingAreaWC(WebPage& webPage, const WebPageCreationParameters& parameters)
+     : DrawingArea(parameters.drawingAreaIdentifier, webPage)
++#if ENABLE(GPU_PROCESS)
+     , m_remoteWCLayerTreeHostProxy(makeUniqueWithoutRefCountedCheck<RemoteWCLayerTreeHostProxy>(webPage, parameters.usesOffscreenRendering))
++#endif
+     , m_layerFactory(*this)
+     , m_updateRenderingTimer(*this, &DrawingAreaWC::updateRendering)
+     , m_commitQueue(WorkQueue::create("DrawingAreaWC CommitQueue"_s))
+@@ -122,7 +126,14 @@ void DrawingAreaWC::updatePreferences(const WebPreferencesStore& store)
+ {
+     Settings& settings = m_webPage->corePage()->settings();
+     settings.setAcceleratedCompositingForFixedPositionEnabled(settings.acceleratedCompositingEnabled());
++#if ENABLE(GPU_PROCESS)
+     settings.setForceCompositingMode(store.getBoolValueForKey(WebPreferencesKey::siteIsolationEnabledKey()));
++#else
++    // PS5: no non-composited path without a GPU process (sendUpdateNonAC), and
++    // this drawing area only exists with accelerated compositing on.
++    UNUSED_PARAM(store);
++    settings.setForceCompositingMode(true);
++#endif
+ }
+ 
+ bool DrawingAreaWC::shouldUseTiledBackingForFrameView(const WebCore::LocalFrameView& frameView) const
+@@ -285,6 +296,7 @@ void DrawingAreaWC::sendUpdateAC()
+         if (rootLayer.viewOverlayRootLayer)
+             rootLayer.viewOverlayRootLayer->flushCompositingState(visibleRect);
+ 
++#if ENABLE(GPU_PROCESS)
+         auto fence = m_webPage->ensureRemoteRenderingBackendProxy().flushImageBuffers();
+ 
+         m_commitQueue->dispatch([this, weakThis = WeakPtr(*this), stateID = m_backingStoreStateID, updateInfo = std::exchange(m_updateInfo, { }), fence = WTF::move(fence), willCallDisplayDidRefresh]() mutable {
+@@ -305,6 +317,20 @@ void DrawingAreaWC::sendUpdateAC()
+                 });
+             });
+         });
++#else
++        // M1: send the update to the scene host in the UI process
++        // (Messages::DrawingAreaProxy::UpdateWC) and call displayDidRefresh()
++        // from its reply. Until then the update is dropped and the frame
++        // completes at once, so nothing is shown and nothing waits.
++        auto droppedUpdateInfo = std::exchange(m_updateInfo, { });
++        UNUSED_VARIABLE(droppedUpdateInfo);
++        if (willCallDisplayDidRefresh) {
++            RunLoop::mainSingleton().dispatch([weakThis = WeakPtr(*this)] {
++                if (RefPtr protectedThis = weakThis.get())
++                    protectedThis->displayDidRefresh();
++            });
++        }
++#endif
+     }
+ }
+ 
+@@ -336,6 +362,16 @@ static bool shouldPaintBoundsRect(const IntRect& bounds, const Vector<IntRect, 1
+ 
+ void DrawingAreaWC::sendUpdateNonAC()
+ {
++#if !ENABLE(GPU_PROCESS)
++    // Messages::DrawingAreaProxy::Update (UpdateInfo bitmaps) only exists for
++    // the UI-side BackingStore of Win/PlayStation. Without a GPU process
++    // compositing is forced on (updatePreferences), so this only runs before
++    // the first root layer.
++    m_dirtyRegion = { };
++    m_scrollRect = { };
++    m_scrollOffset = { };
++    displayDidRefresh();
++#else
+     if (m_dirtyRegion.isEmpty()) {
+         displayDidRefresh();
+         return;
+@@ -390,6 +426,7 @@ void DrawingAreaWC::sendUpdateNonAC()
+             send(Messages::DrawingAreaProxy::Update(stateID, WTF::move(updateInfo)));
+         });
+     });
++#endif // !ENABLE(GPU_PROCESS)
+ }
+ 
+ void DrawingAreaWC::graphicsLayerAdded(GraphicsLayerWC& layer)
+@@ -411,8 +448,10 @@ void DrawingAreaWC::commitLayerUpdateInfo(WCLayerUpdateInfo&& info)
+ 
+ RefPtr<ImageBuffer> DrawingAreaWC::createImageBuffer(FloatSize size, float deviceScaleFactor)
+ {
++#if ENABLE(GPU_PROCESS)
+     if (WebProcess::singleton().shouldUseRemoteRenderingFor(RenderingPurpose::DOM))
+         return Ref { m_webPage.get() }->ensureRemoteRenderingBackendProxy().createImageBuffer(size, RenderingMode::Unaccelerated, RenderingPurpose::DOM, deviceScaleFactor, ColorSpace::SRGB(), { PixelFormat::BGRA8 });
++#endif
+     return ImageBuffer::create<ImageBufferShareableBitmapBackend>(size, deviceScaleFactor, ColorSpace::SRGB(), { PixelFormat::BGRA8 }, RenderingPurpose::DOM, { });
+ }
+ 
+@@ -421,6 +460,9 @@ void DrawingAreaWC::displayDidRefresh(MonotonicTime)
+     m_waitDidUpdate = false;
+     didCompleteRenderingUpdateDisplay();
+     didCompleteRenderingFrame();
++#if PLATFORM(GTK) || PLATFORM(WPE)
++    dispatchPendingCallbacksAfterEnsuringDrawing();
++#endif
+     if (m_forceRepaintCompletionHandler) {
+         if (m_isForceRepaintCompletionHandlerDeferred)
+             m_isForceRepaintCompletionHandlerDeferred = false;
+@@ -433,6 +475,21 @@ void DrawingAreaWC::displayDidRefresh(MonotonicTime)
+     }
+ }
+ 
++#if PLATFORM(GTK) || PLATFORM(WPE)
++void DrawingAreaWC::dispatchAfterEnsuringDrawing(IPC::AsyncReplyID callbackID)
++{
++    m_pendingAfterDrawCallbackIDs.append(callbackID);
++    triggerRenderingUpdate();
++}
++
++void DrawingAreaWC::dispatchPendingCallbacksAfterEnsuringDrawing()
++{
++    if (m_pendingAfterDrawCallbackIDs.isEmpty())
++        return;
++    send(Messages::DrawingAreaProxy::DispatchPresentationCallbacksAfterFlushingLayers(std::exchange(m_pendingAfterDrawCallbackIDs, { })));
++}
++#endif
++
+ DrawingAreaWC::RootLayerInfo* DrawingAreaWC::rootLayerInfoWithFrameIdentifier(WebCore::FrameIdentifier frameID)
+ {
+     auto index = m_rootLayers.findIf([&] (const auto& layer) {
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index c8a852c440..491a1d255d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -29,7 +29,9 @@
+ 
+ #include "DrawingArea.h"
+ #include "GraphicsLayerWC.h"
++#if ENABLE(GPU_PROCESS)
+ #include "RemoteWCLayerTreeHostProxy.h"
++#endif
+ #include "WCLayerFactory.h"
+ #include <WebCore/GraphicsLayerFactory.h>
+ #include <WebCore/Timer.h>
+@@ -60,8 +62,15 @@ private:
+     bool enterAcceleratedCompositingModeIfNeeded() override { return false; }
+     void setLayerTreeStateIsFrozen(bool) override;
+     bool layerTreeStateIsFrozen() const override { return m_isRenderingSuspended; }
+-#if USE(GRAPHICS_LAYER_TEXTURE_MAPPER)    
++#if USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER)
+     void updateGeometry(const WebCore::IntSize&, CompletionHandler<void()>&&) override { }
++#endif
++#if PLATFORM(GTK) || PLATFORM(WPE)
++    void dispatchPendingCallbacksAfterEnsuringDrawing() override;
++    void dispatchAfterEnsuringDrawing(IPC::AsyncReplyID) override;
++#endif
++#if USE(COORDINATED_GRAPHICS)
++    bool isDrawingAreaWC() const override { return true; }
+ #endif
+     void updateGeometryWC(uint64_t, WebCore::IntSize, float deviceScaleFactor, float intrinsicDeviceScaleFactor) override;
+     void setRootCompositingLayer(WebCore::Frame&, WebCore::GraphicsLayer*) override;
+@@ -92,7 +101,9 @@ private:
+     RootLayerInfo* rootLayerInfoWithFrameIdentifier(WebCore::FrameIdentifier);
+ 
+     WebCore::GraphicsLayerClient m_rootLayerClient;
++#if ENABLE(GPU_PROCESS)
+     const std::unique_ptr<RemoteWCLayerTreeHostProxy> m_remoteWCLayerTreeHostProxy;
++#endif
+     WCLayerFactory m_layerFactory;
+     DoublyLinkedList<GraphicsLayerWC> m_liveGraphicsLayers;
+     WebCore::Timer m_updateRenderingTimer;
+@@ -109,6 +120,9 @@ private:
+     WebCore::IntRect m_scrollRect;
+     WebCore::IntSize m_scrollOffset;
+     CompletionHandler<void()> m_forceRepaintCompletionHandler;
++#if PLATFORM(GTK) || PLATFORM(WPE)
++    Vector<IPC::AsyncReplyID> m_pendingAfterDrawCallbackIDs;
++#endif
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 9d57b16185..6a9e3c2aed 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -425,6 +425,11 @@ void GraphicsLayerWC::setContentsToSolidColor(const Color& color)
+ void GraphicsLayerWC::setContentsToPlatformLayer(PlatformLayer* platformLayer, ContentsLayerPurpose)
+ {
+     m_hasContentsDisplayDelegate = false;
++#if USE(COORDINATED_GRAPHICS)
++    // WPE (PS5): PlatformLayer is a CoordinatedPlatformLayer here, which the WC
++    // scene can't show. M4: video (and later WebGL) layers for WC.
++    platformLayer = nullptr;
++#endif
+     if (m_platformLayer == platformLayer)
+         return;
+     m_platformLayer = platformLayer;
+@@ -442,7 +447,13 @@ void GraphicsLayerWC::setContentsToPlatformLayerHost(WebCore::LayerHostingContex
+ 
+ void GraphicsLayerWC::setContentsDisplayDelegate(RefPtr<WebCore::GraphicsLayerContentsDisplayDelegate>&& displayDelegate, ContentsLayerPurpose purpose)
+ {
++#if USE(COORDINATED_GRAPHICS)
++    // Coordinated-graphics delegates have no platformLayer(); see setContentsToPlatformLayer.
++    UNUSED_PARAM(displayDelegate);
++    PlatformLayer* platformLayer = nullptr;
++#else
+     auto platformLayer = displayDelegate ? displayDelegate->platformLayer() : nullptr;
++#endif
+     setContentsToPlatformLayer(platformLayer, purpose);
+     m_hasContentsDisplayDelegate = !!platformLayer;
+ }

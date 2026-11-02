@@ -1,0 +1,514 @@
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.cpp b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+index 69af282e19..9d8c0b7b96 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -1053,6 +1053,10 @@ static std::optional<ScrollingNodeID> frameHostingNodeForFrame(LocalFrame& frame
+ }
+ 
+ // Returns true on a successful update.
++#if defined(PS5_PAYLOAD_SDK)
++static void ps5LogScrolledLayerCompositing(const RenderLayerCompositor&, const RenderLayer& root);
++#endif
++
+ bool RenderLayerCompositor::updateCompositingLayers(CompositingUpdateType updateType, RenderLayer* updateRootArg)
+ {
+     LOG_WITH_STREAM(Compositing, stream << "RenderLayerCompositor " << this << " [" << m_renderView.frameView() << "] updateCompositingLayers " << updateType << " contentLayersCount " << m_contentLayersCount);
+@@ -1207,6 +1211,10 @@ bool RenderLayerCompositor::updateCompositingLayers(CompositingUpdateType update
+     // FIXME: Only do if dirty.
+     updateRootLayerPosition();
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    ps5LogScrolledLayerCompositing(*this, rootRenderLayer());
++#endif
++
+ #if ENABLE(TREE_DEBUGGING)
+     if (compositingLogEnabled()) {
+         LOG(Compositing, "RenderLayerCompositor::updateCompositingLayers - post");
+@@ -3602,6 +3610,60 @@ static ASCIILiteral compositingReasonToString(CompositingReason reason)
+     return ""_s;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5WK_WC_LAYER_LOG=2 (child.env): after each compositing update, one line
++// per layer inside a composited scroller whose compositing state changed
++// (composited or not, why, and whether it paints into a shared backing),
++// to find content that paints into a backing which doesn't move with its
++// scroller.
++static void ps5LogScrolledLayerCompositing(const RenderLayerCompositor& compositor, const RenderLayer& root)
++{
++    static const bool enabled = [] {
++        const char* value = getenv("PS5WK_WC_LAYER_LOG");
++        return value && strchr(value, '2');
++    }();
++    if (!enabled)
++        return;
++    static NeverDestroyed<HashMap<const RenderLayer*, String>> lastState;
++    Function<void(const RenderLayer&)> visit = [&](const RenderLayer& layer) {
++        if (layer.hasCompositedScrollingAncestor()) {
++            StringBuilder state;
++            if (layer.isComposited()) {
++                state.append("composited ("_s);
++                bool first = true;
++                for (auto reason : compositor.reasonsForCompositing(layer)) {
++                    state.append(first ? ""_s : ", "_s, compositingReasonToString(reason));
++                    first = false;
++                }
++                state.append(')');
++                if (layer.backing()->paintsIntoCompositedAncestor())
++                    state.append(" paints into ancestor"_s);
++                auto& graphicsLayer = *layer.backing()->graphicsLayer();
++                state.append(" draws "_s, graphicsLayer.drawsContent() ? 1 : 0, " visible "_s, graphicsLayer.contentsAreVisible() ? 1 : 0,
++                    " at "_s, static_cast<int>(graphicsLayer.position().x()), ',', static_cast<int>(graphicsLayer.position().y()),
++                    " size "_s, static_cast<int>(graphicsLayer.size().width()), 'x', static_cast<int>(graphicsLayer.size().height()),
++                    " parent "_s, graphicsLayer.parent() ? graphicsLayer.parent()->name() : "none"_str);
++                if (auto* parentLayer = graphicsLayer.parent())
++                    state.append(" (origin "_s, static_cast<int>(parentLayer->boundsOrigin().x()), ',', static_cast<int>(parentLayer->boundsOrigin().y()), ')');
++            } else if (auto* provider = layer.backingProviderLayer())
++                state.append("shares the backing of "_s, provider->name());
++            else
++                state.append("not composited"_s);
++            if (auto* parent = layer.paintOrderParent())
++                state.append("; paint-order parent "_s, parent->name());
++            auto& entry = lastState.get().add(&layer, String()).iterator->value;
++            if (entry != state.toString()) {
++                entry = state.toString();
++                WTFLogAlways("[wc-cl] %s: %s", layer.name().utf8().data(), entry.utf8().data()); // NOLINT
++            }
++        }
++        for (auto* child = layer.firstChild(); child; child = child->nextSibling())
++            visit(*child);
++    };
++    visit(root);
++}
++#endif
++
+ #if !LOG_DISABLED
+ ASCIILiteral RenderLayerCompositor::logOneReasonForCompositing(const RenderLayer& layer)
+ {
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 746d670b57..cf0124339b 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -271,8 +271,12 @@ void DrawingAreaProxyWCPS5::wheelEventReceived()
+         return;
+     if (!m_wheelGestureEndTimer)
+         m_wheelGestureEndTimer = makeUnique<RunLoop::Timer>(RunLoop::mainSingleton(), "DrawingAreaProxyWCPS5::wheelGestureEnd"_s, [this] { wheelGestureEndTimerFired(); }); // owned by this
+-    // The pad sends one every 8 ms while the stick is held.
+-    m_wheelGestureEndTimer->startOneShot(100_ms);
++    // The pad sends one every 8 ms while the stick is held, so a pause this
++    // long (40 ms by default, "gestureend=<ms>") means it let go. A snapping
++    // node glides on from there (PS5WCScrollingTree::startSnapGlide): the
++    // shorter the pause, the less it stands still before the glide; a
++    // stick event during the glide takes over again.
++    m_wheelGestureEndTimer->startOneShot(m_wheelGestureEndDelay);
+ }
+ 
+ void DrawingAreaProxyWCPS5::wheelGestureEndTimerFired()
+@@ -361,6 +365,8 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+         m_scrollingTree->setHideLaggingScrollbar(asyncScrollingOption("thumb", 1) > 0);
+         m_scrollingTree->setUnconsumedToWebProcess(asyncScrollingOption("unconsumed", 1) > 0);
+         m_scrollingTree->setSnapAfterWheel(asyncScrollingOption("snap", 1) > 0);
++        m_scrollingTree->setSnapGlide(asyncScrollingOption("glide", 1) > 0);
++        m_wheelGestureEndDelay = Seconds::fromMilliseconds(std::clamp(asyncScrollingOption("gestureend", 40), 20.f, 500.f));
+         m_scrollingTree->setReportGestureNodes(asyncScrollingOption("gesturenodes", 1) > 0);
+         if (asyncScrollingOption("earlyreply", 1) > 0) {
+             Locker locker { earlyReplyLock() };
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index fd52ae5659..22949477e6 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -120,6 +120,7 @@ private:
+ 
+     RefPtr<PS5WCScrollingTree> m_scrollingTree;
+     std::unique_ptr<RunLoop::Timer> m_wheelGestureEndTimer;
++    Seconds m_wheelGestureEndDelay { 40_ms };
+     MonotonicTime m_lastUnconsumedLog;
+     bool m_waitingForScrollUpdateReply { false };
+     bool m_domWheelEventInFlight { false };
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index 67ce5f2efb..077af35d1a 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -128,6 +128,34 @@ public:
+         return ScrollableArea::scrollPositionFromOffset(snapped, origin);
+     }
+ 
++    // The end of a stick gesture without ScrollingEffectsController's own
++    // snap, which would wait for the gesture end timer and then run a short
++    // ease-in-out from a standstill to the snap position nearest the stop
++    // (the tree glides the node instead: PS5WCScrollingTree::wheelGestureDidEnd).
++    void endWheelGesture(const PlatformWheelEvent& endEvent)
++    {
++        updateUserScrollInProgressForEvent(endEvent);
++        updateSnapScrollState();
++    }
++
++    std::pair<FloatPoint, FloatPoint> scrollLimits() const { return { minimumScrollPosition(), maximumScrollPosition() }; }
++
++    // The snap position nearest to where the node would come to rest
++    // (`projected`, clamped to the scroll range): what Chrome picks for the
++    // end of a fling ("end position" selection). Snap-stop and proximity are
++    // WebKit's (LayoutScrollSnapOffsetsInfo): with proximity and no snap
++    // position near, the projected position itself.
++    FloatPoint snapPositionNear(FloatPoint projected) const
++    {
++        auto origin = toFloatSize(scrollOrigin());
++        auto offset = ScrollableArea::scrollOffsetFromPosition(projected.constrainedBetween(minimumScrollPosition(), maximumScrollPosition()), origin);
++        FloatPoint snapped {
++            m_scrollController.adjustedScrollDestination(ScrollEventAxis::Horizontal, offset, 0, std::nullopt),
++            m_scrollController.adjustedScrollDestination(ScrollEventAxis::Vertical, offset, 0, std::nullopt)
++        };
++        return ScrollableArea::scrollPositionFromOffset(snapped, origin);
++    }
++
+ private:
+     bool scrollAnimationEnabled() const final { return true; }
+ 
+@@ -164,6 +192,9 @@ private:
+ 
+ public:
+     FloatPoint snappedDestination(FloatPoint current, FloatPoint destination) const { return delegate().snappedDestination(current, destination); }
++    void endWheelGesture(const PlatformWheelEvent& endEvent) { delegate().endWheelGesture(endEvent); }
++    FloatPoint snapPositionNear(FloatPoint projected) const { return delegate().snapPositionNear(projected); }
++    std::pair<FloatPoint, FloatPoint> scrollLimits() const { return delegate().scrollLimits(); }
+ 
+ private:
+     bool commitStateBeforeChildren(const ScrollingStateNode& stateNode) final
+@@ -256,6 +287,9 @@ private:
+ 
+ public:
+     FloatPoint snappedDestination(FloatPoint current, FloatPoint destination) const { return delegate().snappedDestination(current, destination); }
++    void endWheelGesture(const PlatformWheelEvent& endEvent) { delegate().endWheelGesture(endEvent); }
++    FloatPoint snapPositionNear(FloatPoint projected) const { return delegate().snapPositionNear(projected); }
++    std::pair<FloatPoint, FloatPoint> scrollLimits() const { return delegate().scrollLimits(); }
+ 
+ private:
+     bool commitStateBeforeChildren(const ScrollingStateNode& stateNode) final
+@@ -404,6 +438,25 @@ private:
+     std::optional<PlatformLayerIdentifier> m_layer;
+ };
+ 
++// Calls `function` with the node as its WC class (the frame and overflow
++// nodes share WCScrollingNodeDelegate's helpers); false for other nodes.
++template<typename Function>
++bool withWCScrollingNode(ScrollingTreeScrollingNode& node, Function&& function)
++{
++    switch (node.nodeType()) {
++    case ScrollingNodeType::MainFrame:
++    case ScrollingNodeType::Subframe:
++        function(static_cast<FrameScrollingNodeWC&>(node));
++        return true;
++    case ScrollingNodeType::Overflow:
++    case ScrollingNodeType::PluginScrolling:
++        function(static_cast<OverflowScrollingNodeWC&>(node));
++        return true;
++    default:
++        return false;
++    }
++}
++
+ } // namespace
+ 
+ PS5WCScrollingTree::PS5WCScrollingTree(uint64_t sceneID)
+@@ -479,6 +532,7 @@ void PS5WCScrollingTree::serviceAnimations(MonotonicTime time)
+     {
+         Locker locker { treeLock() };
+         serviceScrollAnimations(time);
++        serviceSnapGlide(time);
+         gestureNodesChanged = pruneTitleGestureNodes();
+     }
+     if (gestureNodesChanged)
+@@ -488,6 +542,8 @@ void PS5WCScrollingTree::serviceAnimations(MonotonicTime time)
+ 
+ bool PS5WCScrollingTree::hasActiveAnimations()
+ {
++    if (m_snapGlideActive.load())
++        return true;
+     if (m_frameLockedStick) {
+         Locker locker { m_stickLock };
+         if (!m_stickPending.isZero())
+@@ -652,12 +708,20 @@ bool PS5WCScrollingTree::wheelGestureDidEnd()
+         auto event = std::exchange(m_wheelScrolledEvent, std::nullopt);
+         RefPtr node = nodeID && event && m_snapAfterWheel ? dynamicDowncast<ScrollingTreeScrollingNode>(nodeForID(*nodeID)) : nullptr;
+         if (node && !node->snapOffsetsInfo().isEmpty()) {
+-            // ScrollingEffectsController: the gesture is over, the node is
+-            // snapping, so it animates to the nearest snap position.
+-            WheelGestureEndEvent endEvent { *event };
+-            handleWheelEventWithNode(endEvent, { WheelEventProcessingSteps::AsyncScrolling }, node.get(), EventTargeting::NodeOnly);
+-            snapped = true;
++            if (m_snapGlide) {
++                // Carry the stick's speed into a glide onto the snap position
++                // nearest where that speed would have taken it.
++                snapped = startSnapGlide(*node, *event);
++            } else {
++                // "glide=0": ScrollingEffectsController's snap (the gesture is
++                // over, so it animates to the snap position nearest the stop).
++                WheelGestureEndEvent endEvent { *event };
++                handleWheelEventWithNode(endEvent, { WheelEventProcessingSteps::AsyncScrolling }, node.get(), EventTargeting::NodeOnly);
++                snapped = true;
++            }
+         }
++        m_wheelTrail.clear();
++        m_wheelTrailNode = std::nullopt;
+         // The WebProcess may resnap these nodes after its layouts again,
+         // except one still animating to its snap position here (until that
+         // animation ends: serviceAnimations).
+@@ -674,12 +738,116 @@ bool PS5WCScrollingTree::wheelGestureDidEnd()
+     return true;
+ }
+ 
++// The stick's speed when it let go: the node's movement over the last
++// 100 ms of wheel-driven scrolling (tree lock held).
++FloatSize PS5WCScrollingTree::releaseVelocity(ScrollingNodeID nodeID) const
++{
++    if (m_wheelTrailNode != nodeID || m_wheelTrail.size() < 2)
++        return { };
++    auto& last = m_wheelTrail.last();
++    const WheelTrailPoint* first = nullptr;
++    for (auto& point : m_wheelTrail) {
++        if (last.time - point.time <= 100_ms) {
++            first = &point;
++            break;
++        }
++    }
++    if (!first)
++        return { };
++    double seconds = (last.time - first->time).seconds();
++    if (seconds < 0.016)
++        return { };
++    return (last.position - first->position) * static_cast<float>(1 / seconds);
++}
++
++// Tree lock held. The gesture is over (ScrollingEffectsController is told,
++// without its own snap animation) and the node glides on from its current
++// position and speed to the snap position nearest where that speed would
++// take it in kGlideProjection, as browsers end a touchpad fling on a snap
++// container: no stop before the snap, no jump, no snapping back from a
++// standstill. False if there is nothing to glide (resting on a snap position).
++bool PS5WCScrollingTree::startSnapGlide(ScrollingTreeScrollingNode& node, const PlatformWheelEvent& lastEvent)
++{
++    constexpr float kGlideProjection = 0.2f; // s of the release speed
++    WheelGestureEndEvent endEvent { lastEvent };
++    auto velocity = releaseVelocity(node.scrollingNodeID());
++    auto current = node.currentScrollPosition();
++    auto target = current;
++    if (!withWCScrollingNode(node, [&](auto& wcNode) {
++        wcNode.endWheelGesture(endEvent);
++        // No speed against a limit the node already sits at.
++        auto [minimum, maximum] = wcNode.scrollLimits();
++        if ((current.x() <= minimum.x() && velocity.width() < 0) || (current.x() >= maximum.x() && velocity.width() > 0))
++            velocity.setWidth(0);
++        if ((current.y() <= minimum.y() && velocity.height() < 0) || (current.y() >= maximum.y() && velocity.height() > 0))
++            velocity.setHeight(0);
++        target = wcNode.snapPositionNear(current + velocity * kGlideProjection);
++    }))
++        return false;
++    auto distance = target - current;
++    if (distance.diagonalLength() < 0.5f)
++        return false;
++    // Duration: decelerating evenly from the release speed onto the target
++    // takes 2 x distance / speed (the curve below is then exactly that);
++    // kept to 0.25-0.7 s. Against the motion, or from rest: 0.4 s.
++    bool mainAxisX = std::abs(distance.width()) >= std::abs(distance.height());
++    float mainDistance = mainAxisX ? distance.width() : distance.height();
++    float mainSpeed = mainAxisX ? velocity.width() : velocity.height();
++    double duration = 0.4;
++    if (mainSpeed && (mainSpeed > 0) == (mainDistance > 0))
++        duration = std::clamp(2.0 * mainDistance / mainSpeed, 0.25, 0.7);
++    m_snapGlideState = SnapGlide { node.scrollingNodeID(), MonotonicTime { }, Seconds(duration), current, target, velocity, current };
++    m_snapGlideActive = true;
++    WTFLogAlways("[ascroll] glide node %llu: %.0f,%.0f at %.0f,%.0f px/s -> snap %.0f,%.0f in %.0f ms", // NOLINT
++        static_cast<unsigned long long>(node.scrollingNodeID().object().toUInt64()), current.x(), current.y(), velocity.width(), velocity.height(),
++        target.x(), target.y(), duration * 1000);
++    return true;
++}
++
++// Render thread, tree lock held: the glide's position at the frame's
++// display time. Per axis a cubic Hermite curve from the start position at
++// the release speed to the target at rest: with the default duration an
++// even deceleration (D (2s - s^2)); shorter or longer ones ease in or
++// overshoot a little and come back, without a jump in speed.
++void PS5WCScrollingTree::serviceSnapGlide(MonotonicTime time)
++{
++    if (!m_snapGlideState)
++        return;
++    auto& glide = *m_snapGlideState;
++    RefPtr node = dynamicDowncast<ScrollingTreeScrollingNode>(nodeForID(glide.nodeID));
++    // Gone, or moved by something else (a programmatic scroll, a commit).
++    if (!node || (node->currentScrollPosition() - glide.last).diagonalLength() > 2) {
++        m_snapGlideState = std::nullopt;
++        m_snapGlideActive = false;
++        return;
++    }
++    // The curve starts one frame before the first frame it moves: its first
++    // step is one frame of the release speed, not a catch-up jump for the
++    // time since the gesture ended.
++    if (!glide.start)
++        glide.start = time - 16667_us;
++    double duration = glide.duration.seconds();
++    double t = std::clamp((time - glide.start).seconds() / duration, 0.0, 1.0);
++    auto axis = [&](float from, float target, float speed) {
++        double s2 = t * t, s3 = s2 * t;
++        return static_cast<float>(from + (target - from) * (3 * s2 - 2 * s3) + speed * duration * (s3 - 2 * s2 + t));
++    };
++    bool done = t >= 1;
++    FloatPoint position = done ? glide.target : FloatPoint { axis(glide.from.x(), glide.target.x(), glide.velocity.width()), axis(glide.from.y(), glide.target.y(), glide.velocity.height()) };
++    node->scrollTo(position, ScrollType::User, ScrollClamping::Clamped);
++    glide.last = node->currentScrollPosition();
++    if (done) {
++        m_snapGlideState = std::nullopt;
++        m_snapGlideActive = false;
++    }
++}
++
+ // Tree lock held: drops the nodes whose gesture ended and that no longer
+ // animate (a snap). True if the set changed.
+ bool PS5WCScrollingTree::pruneTitleGestureNodes()
+ {
+     bool removed = m_titleGestureNodes.removeIf([&](auto& entry) {
+-        return entry.value && !isScrollAnimationInProgressForNode(entry.key);
++        return entry.value && !isScrollAnimationInProgressForNode(entry.key) && !(m_snapGlideState && m_snapGlideState->nodeID == entry.key);
+     });
+     if (removed)
+         m_titleGestureNodesChanged = true;
+@@ -869,6 +1037,19 @@ void PS5WCScrollingTree::scrollingTreeNodeDidScroll(ScrollingTreeScrollingNode&
+     if (t_wheelEvent) {
+         m_wheelScrolledNode = node.scrollingNodeID();
+         m_wheelScrolledEvent = *t_wheelEvent;
++        // The stick moving again takes over from a glide.
++        if (m_snapGlideState) {
++            m_snapGlideState = std::nullopt;
++            m_snapGlideActive = false;
++        }
++        if (m_wheelTrailNode != node.scrollingNodeID()) {
++            m_wheelTrail.clear();
++            m_wheelTrailNode = node.scrollingNodeID();
++        }
++        auto now = MonotonicTime::now();
++        m_wheelTrail.append({ now, node.currentScrollPosition() });
++        while (m_wheelTrail.size() > 2 && now - m_wheelTrail.first().time > 250_ms)
++            m_wheelTrail.removeFirst();
+         // In a gesture here: the WebProcess must not resnap it after a
+         // layout meanwhile (its isUserScrollInProgress is false otherwise).
+         auto add = m_titleGestureNodes.add(node.scrollingNodeID(), false);
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+index a17c78a0a3..97d32ee8d9 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+@@ -25,6 +25,7 @@
+ #include <WebCore/PlatformLayerIdentifier.h>
+ #include <WebCore/PlatformWheelEvent.h>
+ #include <WebCore/ScrollingTree.h>
++#include <wtf/Deque.h>
+ #include <wtf/HashMap.h>
+ #include <wtf/Lock.h>
+ 
+@@ -109,9 +110,10 @@ public:
+     // The pad's stick sends precise wheel deltas without an end phase, so
+     // ScrollingEffectsController never learns that the gesture is over and
+     // never settles a CSS scroll-snap container on a snap position. Main
+-    // thread, once no wheel event has come for a while: an end-of-gesture
+-    // event for the last node a wheel event scrolled, if it snaps (no fling:
+-    // the controller skips kinetic scrolling for snapping nodes). False if
++    // thread, once no wheel event has come for a while: the gesture ends for
++    // the last node a wheel event scrolled and, if it snaps, it glides on
++    // from its release speed onto a snap position (startSnapGlide; "glide=0":
++    // ScrollingEffectsController's end-of-gesture snap). False if
+     // frame-locked deltas are still queued (try again later).
+     bool wheelGestureDidEnd();
+     // Nodes in a wheel gesture in this tree (scrolled by the stick, or
+@@ -125,6 +127,10 @@ public:
+     // "gesturenodes=0" in the flag file: never sent (the old behaviour, for A/B).
+     void setReportGestureNodes(bool on) { m_reportGestureNodes = on; }
+     void setSnapAfterWheel(bool on) { m_snapAfterWheel = on; }
++    // "glide=0" in the flag file: at the end of a stick gesture a snapping
++    // node gets ScrollingEffectsController's snap (from a standstill, to the
++    // snap position nearest the stop) instead of the glide (startSnapGlide).
++    void setSnapGlide(bool on) { m_snapGlide = on; }
+     bool snapAfterWheel() const { return m_snapAfterWheel; }
+ 
+     // Never scroll past the tiles the WebProcess has painted: the event's
+@@ -172,6 +178,9 @@ private:
+     void layerPositionsChanged();
+     bool pruneTitleGestureNodes();
+     void applyFrameLockedScroll(MonotonicTime displayTime);
++    WebCore::FloatSize releaseVelocity(WebCore::ScrollingNodeID) const;
++    bool startSnapGlide(WebCore::ScrollingTreeScrollingNode&, const WebCore::PlatformWheelEvent& lastEvent);
++    void serviceSnapGlide(MonotonicTime);
+     WebCore::WheelEventHandlingResult handleWheelEventWithNodeNotingScroll(const WebCore::PlatformWheelEvent&, OptionSet<WebCore::WheelEventProcessingSteps>, WebCore::ScrollingTreeNode*, WebCore::EventTargeting);
+ 
+     const uint64_t m_sceneID;
+@@ -192,6 +201,26 @@ private:
+     // The last node a wheel event scrolled, and that event (tree lock).
+     std::optional<WebCore::ScrollingNodeID> m_wheelScrolledNode;
+     std::optional<WebCore::PlatformWheelEvent> m_wheelScrolledEvent;
++    // Where the node the stick scrolls was over the last 250 ms (tree lock),
++    // for the speed it glides on with when the stick lets go.
++    struct WheelTrailPoint {
++        MonotonicTime time;
++        WebCore::FloatPoint position;
++    };
++    Deque<WheelTrailPoint, 64> m_wheelTrail;
++    std::optional<WebCore::ScrollingNodeID> m_wheelTrailNode;
++    bool m_snapGlide { true };
++    struct SnapGlide {
++        WebCore::ScrollingNodeID nodeID;
++        MonotonicTime start; // set by its first frame
++        Seconds duration;
++        WebCore::FloatPoint from;
++        WebCore::FloatPoint target;
++        WebCore::FloatSize velocity; // px/s at the start
++        WebCore::FloatPoint last; // where the glide put the node
++    };
++    std::optional<SnapGlide> m_snapGlideState; // tree lock
++    std::atomic<bool> m_snapGlideActive { false };
+     // Node -> its gesture ended (it may still be snapping); tree lock.
+     HashMap<WebCore::ScrollingNodeID, bool> m_titleGestureNodes;
+     bool m_titleGestureNodesChanged { false };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 002d8ff765..5ca8eaf5c1 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -531,6 +531,17 @@ void GraphicsLayerWC::setContentsVisible(bool value)
+         return;
+     GraphicsLayer::setContentsVisible(value);
+     noteLayerPropertyChanged(WCLayerChange::ContentsVisible);
++    // The backing store is sent as drawsContent() && contentsAreVisible(), so
++    // the scene drops it at the next Background change while the contents
++    // are hidden (visibility: hidden), and these tiles were never sent again:
++    // a composited layer hidden while it scrolled into view and then shown
++    // (a gallery's staggered fade-in) stayed blank. As setDrawsContent: the
++    // scene drops the store now, and every tile is repainted when it shows.
++    if (drawsContent()) {
++        if (value)
++            m_tiledBacking->setDirtyRect({ { }, m_size });
++        noteLayerPropertyChanged(WCLayerChange::Background);
++    }
+ }
+ 
+ void GraphicsLayerWC::setBackfaceVisibility(bool value)
+@@ -1136,6 +1147,24 @@ GraphicsLayerWC::VisibleAndCoverageRects GraphicsLayerWC::computeVisibleAndCover
+     if (quad && !mapWasClamped && !applyWasClamped)
+         coverageRect = (*quad).boundingBox();
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // Children are placed relative to the bounds origin. The masksToBounds
++    // reset above maps the visible rect into their space (clipRectForSelf
++    // starts at the bounds origin); a layer that doesn't clip must do it
++    // too. Such a layer is the "scrolling proxy" WebKit puts above content
++    // inside an overflow scroller whose paint-order parent is outside it
++    // (gallery items with their own stacking context): its bounds origin is
++    // the scroll offset. Without this its children's tile coverage was
++    // computed as if the scroller were at 0, so items that came into view by
++    // scrolling never painted (a carousel's last cards stayed empty).
++    // GraphicsLayerCA gives such small layers one backing store, not tiles.
++    if (!masksToBounds() && !boundsOrigin.isZero()) {
++        TransformationMatrix childrenToLayer;
++        childrenToLayer.translate(-boundsOrigin.x(), -boundsOrigin.y());
++        state.applyTransform(childrenToLayer, accumulation);
++    }
++#endif
++
+     return { clipRectForSelf, coverageRect, currentTransform };
+ }
+ 

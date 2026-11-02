@@ -1,0 +1,20 @@
+diff --git a/Source/WebCore/page/LocalFrameView.cpp b/Source/WebCore/page/LocalFrameView.cpp
+index eb5b8961ed..b4468c93dd 100644
+--- a/Source/WebCore/page/LocalFrameView.cpp
++++ b/Source/WebCore/page/LocalFrameView.cpp
+@@ -5530,8 +5530,14 @@ void LocalFrameView::scrollTo(const ScrollPosition& newPosition)
+ #if defined(PS5_PAYLOAD_SDK)
+     if (holdCompositingUpdate) {
+         s_ps5ScrollingView = nullptr;
+-        if (std::exchange(s_ps5CompositingUpdateAfterScrollingHeld, false))
++        if (std::exchange(s_ps5CompositingUpdateAfterScrollingHeld, false)) {
++            // With a layout pending (fixed elements) the OnScroll update
++            // bails; the AfterLayout one must still recompute overlap for the
++            // new scroll position, as the OnScroll update would have.
++            if (CheckedPtr renderView = this->renderView(); renderView && renderView->layer() && layoutContext().needsLayout())
++                renderView->layer()->setDescendantsNeedCompositingRequirementsTraversal();
+             updateCompositingLayersAfterScrolling();
++        }
+     }
+ #endif
+ 

@@ -1,0 +1,150 @@
+diff --git a/Source/WebCore/platform/graphics/BitmapImageSource.cpp b/Source/WebCore/platform/graphics/BitmapImageSource.cpp
+index 0d81101841..2db6b50a18 100644
+--- a/Source/WebCore/platform/graphics/BitmapImageSource.cpp
++++ b/Source/WebCore/platform/graphics/BitmapImageSource.cpp
+@@ -34,9 +34,62 @@
+ #include "ImageFrameAnimator.h"
+ #include "ImageObserver.h"
+ #include "Logging.h"
++#if defined(PS5_PAYLOAD_SDK)
++#include <wtf/MainThread.h>
++#include <wtf/MonotonicTime.h>
++#endif
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// "[render] image decodes" (every 5 s while images are decoded): frames decoded
++// synchronously on the main thread (in painting), asynchronous requests and
++// their results, and large decoded frames destroyed (memory cache pruning).
++enum class PS5DecodeEvent : uint8_t { Synchronous, AsyncRequest, AsyncDone, AsyncFailed, LargeFramesDestroyed, MetadataSkipped };
++static void ps5NoteImageDecode(PS5DecodeEvent event, bool large, double milliseconds = 0)
++{
++    static MonotonicTime windowStart;
++    static unsigned syncCount, largeCount, asyncCount, asyncDone, asyncFailed, destroyed, metadataSkipped;
++    static double syncMS, largeMS, maxMS;
++    auto now = MonotonicTime::now();
++    if (!windowStart)
++        windowStart = now;
++    switch (event) {
++    case PS5DecodeEvent::Synchronous:
++        syncCount++;
++        syncMS += milliseconds;
++        maxMS = std::max(maxMS, milliseconds);
++        if (large) {
++            largeCount++;
++            largeMS += milliseconds;
++        }
++        break;
++    case PS5DecodeEvent::AsyncRequest:
++        asyncCount++;
++        break;
++    case PS5DecodeEvent::AsyncDone:
++        asyncDone++;
++        break;
++    case PS5DecodeEvent::AsyncFailed:
++        asyncFailed++;
++        break;
++    case PS5DecodeEvent::LargeFramesDestroyed:
++        destroyed++;
++        break;
++    case PS5DecodeEvent::MetadataSkipped:
++        metadataSkipped++;
++        break;
++    }
++    if (now - windowStart < 5_s)
++        return;
++    WTFLogAlways("[render] image decodes: %u on the main thread (%.1f ms, max %.1f; %u large images %.1f ms), %u asynchronous requests (%u done, %u failed), %u large images' frames destroyed, %u metadata reads skipped while decoding, in %.1f s", // NOLINT
++        syncCount, syncMS, maxMS, largeCount, largeMS, asyncCount, asyncDone, asyncFailed, destroyed, metadataSkipped, (now - windowStart).seconds());
++    windowStart = now;
++    syncCount = largeCount = asyncCount = asyncDone = asyncFailed = destroyed = metadataSkipped = 0;
++    syncMS = largeMS = maxMS = 0;
++}
++#endif
++
+ Ref<BitmapImageSource> BitmapImageSource::create(BitmapImage& bitmapImage, AlphaOption alphaOption, GammaAndColorProfileOption gammaAndColorProfileOption)
+ {
+     return adoptRef(*new BitmapImageSource(bitmapImage, alphaOption, gammaAndColorProfileOption));
+@@ -142,6 +195,10 @@ void BitmapImageSource::destroyDecodedFrames(bool destroyAll)
+         decodedSize += m_frames[index].clearImage();
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (decodedSize && isLargeForDecoding())
++        ps5NoteImageDecode(PS5DecodeEvent::LargeFramesDestroyed, true);
++#endif
+     decodedSizeReset(decodedSize);
+ }
+ 
+@@ -455,12 +512,18 @@ void BitmapImageSource::imageFrameDecodeAtIndexHasFinished(unsigned index, Subsa
+     if (!nativeImage || !m_decoder) {
+         LOG(Images, "BitmapImageSource::%s - %p - url: %s. Frame at index = %d has failed.", __FUNCTION__, this, sourceUTF8(), index);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        ps5NoteImageDecode(PS5DecodeEvent::AsyncFailed, isLargeForDecoding());
++#endif
+         destroyNativeImageAtIndex(index, options.decodingDestination());
+         imageFrameDecodeAtIndexHasFinished(index, animatingState, DecodingStatus::Invalid);
+     } else {
+         LOG(Images, "BitmapImageSource::%s - %p - url: %s. Frame at index = %d has been decoded.", __FUNCTION__, this, sourceUTF8(), index);
+ 
+         cacheNativeImageAtIndex(index, subsamplingLevel, options, nativeImage.releaseNonNull());
++#if defined(PS5_PAYLOAD_SDK)
++        ps5NoteImageDecode(PS5DecodeEvent::AsyncDone, isLargeForDecoding());
++#endif
+ 
+         if (frameAtIndex(index).isComplete())
+             ++m_decodeCountForTesting;
+@@ -560,6 +623,26 @@ const ImageFrame& BitmapImageSource::frameAtIndexCacheIfNeeded(unsigned index, c
+     if (frame.isComplete() && subsamplingLevelValue == frame.subsamplingLevel())
+         return frame;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // While this image's frame is being decoded on its decoding queue, the
++    // decoder's lock is held for the whole decode (ScalableImageDecoder), and
++    // fetching the metadata here would block the main thread until it ends:
++    // 50-300 ms per large PNG, seconds when a painting pass asks for several
++    // (COMPOSITING-PLAN.md, "Large images on the main thread"). The frame counts as not decoded
++    // yet; the decode's completion caches the metadata and repaints.
++    // PS5WK_DECODE_METADATA_WAIT=1 (child.env): wait, as upstream.
++    // Not isLargeForDecoding() here: it asks for size(), whose metadata comes
++    // through this function, and recursed until the stack overflowed.
++    static const bool waitForMetadata = [] {
++        const char* value = getenv("PS5WK_DECODE_METADATA_WAIT");
++        return value && !strcmp(value, "1");
++    }();
++    if (!waitForMetadata && !isDecodingWorkQueueIdle() && isMainThread()) {
++        ps5NoteImageDecode(PS5DecodeEvent::MetadataSkipped, false);
++        return frame;
++    }
++#endif
++
+     destroyNativeImageAtIndex(index);
+ 
+     // Retrieve the metadata from ImageDecoder if the ImageFrame isn't complete.
+@@ -575,6 +658,10 @@ DecodingStatus BitmapImageSource::requestNativeImageAtIndex(unsigned index, Subs
+     LOG(Images, "BitmapImageSource::%s - %p - url: %s. Decoding for frame at index = %d will be requested.", __FUNCTION__, this, sourceUTF8(), index);
+ 
+     protect(workQueue())->dispatch({ index, subsamplingLevel, animatingState, options });
++#if defined(PS5_PAYLOAD_SDK)
++    if (isMainThread())
++        ps5NoteImageDecode(PS5DecodeEvent::AsyncRequest, isLargeForDecoding());
++#endif
+ 
+     if (m_clearDecoderAfterAsyncFrameRequestForTesting)
+         resetData();
+@@ -624,7 +711,14 @@ std::expected<Ref<NativeImage>, DecodingStatus> BitmapImageSource::nativeImageAt
+     else {
+         auto decodingOptions = DecodingOptions { DecodingMode::Synchronous, decodingDestination };
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        auto decodeStart = MonotonicTime::now();
++#endif
+         auto result = protect(m_decoder)->createNativeImageAtIndex(index, subsamplingLevel, decodingOptions);
++#if defined(PS5_PAYLOAD_SDK)
++        if (isMainThread())
++            ps5NoteImageDecode(PS5DecodeEvent::Synchronous, isLargeForDecoding(), (MonotonicTime::now() - decodeStart).milliseconds());
++#endif
+         if (!result)
+             return makeUnexpected(DecodingStatus::Invalid);
+ 

@@ -1,0 +1,780 @@
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+index c6d5dbac94..865a6dc538 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+@@ -131,6 +131,23 @@ void BitmapTexturePool::releaseAllTextures()
+     exitLimitExceededModeIfNeeded();
+ }
+ 
++#if USE(GRAPHICS_LAYER_WC)
++void BitmapTexturePool::setReleaseQuickly(bool quickly)
++{
++    Locker locker { m_lock };
++    if (m_releaseQuickly == quickly)
++        return;
++    m_releaseQuickly = quickly;
++    m_releaseUnusedSecondsTolerance = quickly || m_onLimitExceededMode ? s_releaseUnusedSecondsToleranceOnLimitExceeded : s_releaseUnusedSecondsTolerance;
++}
++
++uint64_t BitmapTexturePool::sizeInBytes()
++{
++    Locker locker { m_lock };
++    return m_poolSizeInBytes;
++}
++#endif
++
+ void BitmapTexturePool::scheduleReleaseUnusedTextures()
+ {
+     assertIsHeld(m_lock);
+@@ -244,7 +261,11 @@ void BitmapTexturePool::exitLimitExceededModeIfNeeded()
+     // exit the limit exceeded mode and set the default values for interval and tolerance again.
+     if (m_poolSizeInBytes <= s_poolSizeLimitInBytes) {
+         m_onLimitExceededMode = false;
++#if USE(GRAPHICS_LAYER_WC)
++        m_releaseUnusedSecondsTolerance = m_releaseQuickly ? s_releaseUnusedSecondsToleranceOnLimitExceeded : s_releaseUnusedSecondsTolerance;
++#else
+         m_releaseUnusedSecondsTolerance = s_releaseUnusedSecondsTolerance;
++#endif
+         m_releaseUnusedTexturesTimerInterval = s_releaseUnusedTexturesTimerInterval;
+     }
+ }
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h
+index 1d07fbffc8..98a157c0e9 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.h
+@@ -59,6 +59,11 @@ public:
+ 
+ #if USE(GRAPHICS_LAYER_WC)
+     void releaseUnusedTexturesNow() { releaseUnusedTexturesTimerFired(); }
++    // PS5: while the title's GL textures are near their cap, unused textures
++    // go after 50 ms (as over the pool's own size limit), not 3 s: a fast
++    // scroll makes intermediate surfaces of a new size every step.
++    WEBCORE_EXPORT void setReleaseQuickly(bool);
++    WEBCORE_EXPORT uint64_t sizeInBytes();
+ #endif
+ 
+ private:
+@@ -90,6 +95,9 @@ private:
+     RunLoop::Timer m_releaseUnusedTexturesTimer WTF_GUARDED_BY_LOCK(m_lock);
+     uint64_t m_poolSizeInBytes WTF_GUARDED_BY_LOCK(m_lock) { 0 };
+     bool m_onLimitExceededMode WTF_GUARDED_BY_LOCK(m_lock) { false };
++#if USE(GRAPHICS_LAYER_WC)
++    bool m_releaseQuickly WTF_GUARDED_BY_LOCK(m_lock) { false };
++#endif
+     Seconds m_releaseUnusedSecondsTolerance WTF_GUARDED_BY_LOCK(m_lock);
+     Seconds m_releaseUnusedTexturesTimerInterval WTF_GUARDED_BY_LOCK(m_lock);
+ };
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index efe49e3af9..746d670b57 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -144,15 +144,18 @@ void DrawingAreaProxyWCPS5::sendScrollUpdatesNow()
+     if (!m_scrollingTree || m_waitingForScrollUpdateReply)
+         return;
+     auto updates = m_scrollingTree->takePendingScrollUpdates();
+-    if (updates.isEmpty())
++    // Nodes in a wheel gesture here (or snapping after one), when that
++    // changed: the WebProcess holds back its resnap-after-layout for them.
++    auto gestureNodes = m_scrollingTree->takeTitleGestureNodesIfChanged();
++    if (updates.isEmpty() && !gestureNodes)
+         return;
+     m_waitingForScrollUpdateReply = true;
+-    sendWithAsyncReply(Messages::DrawingArea::ScrollUpdatesWC(WTF::move(updates), m_scrollingTree->scrollVelocity()), [sceneID = identifier().toUInt64()] {
++    sendWithAsyncReply(Messages::DrawingArea::ScrollUpdatesWC(WTF::move(updates), m_scrollingTree->scrollVelocity(), PS5WCHost::lookaheadScale(), WTF::move(gestureNodes)), [sceneID = identifier().toUInt64()] {
+         RefPtr protectedThis = liveDrawingAreas().get(sceneID);
+         if (!protectedThis)
+             return;
+         protectedThis->m_waitingForScrollUpdateReply = false;
+-        if (protectedThis->m_scrollingTree && protectedThis->m_scrollingTree->hasPendingScrollUpdates())
++        if (protectedThis->m_scrollingTree && (protectedThis->m_scrollingTree->hasPendingScrollUpdates() || protectedThis->m_scrollingTree->titleGestureNodesChanged()))
+             protectedThis->sendScrollUpdatesNow();
+     });
+ }
+@@ -262,7 +265,9 @@ void DrawingAreaProxyWCPS5::wheelEventHandlingCompleted(const WebCore::PlatformW
+ 
+ void DrawingAreaProxyWCPS5::wheelEventReceived()
+ {
+-    if (!m_scrollingTree || !m_scrollingTree->snapAfterWheel())
++    // Also without snapping: the gesture's end tells the WebProcess the
++    // user scroll is over (PS5WCScrollingTree::wheelGestureDidEnd).
++    if (!m_scrollingTree)
+         return;
+     if (!m_wheelGestureEndTimer)
+         m_wheelGestureEndTimer = makeUnique<RunLoop::Timer>(RunLoop::mainSingleton(), "DrawingAreaProxyWCPS5::wheelGestureEnd"_s, [this] { wheelGestureEndTimerFired(); }); // owned by this
+@@ -356,6 +361,7 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+         m_scrollingTree->setHideLaggingScrollbar(asyncScrollingOption("thumb", 1) > 0);
+         m_scrollingTree->setUnconsumedToWebProcess(asyncScrollingOption("unconsumed", 1) > 0);
+         m_scrollingTree->setSnapAfterWheel(asyncScrollingOption("snap", 1) > 0);
++        m_scrollingTree->setReportGestureNodes(asyncScrollingOption("gesturenodes", 1) > 0);
+         if (asyncScrollingOption("earlyreply", 1) > 0) {
+             Locker locker { earlyReplyLock() };
+             earlyReplyScenes().add(identifier().toUInt64());
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index ea1cd298da..a5dd65d8ac 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -382,7 +382,11 @@ private:
+     enum class GLMemoryState : uint8_t { Normal, Reduced, Fallback };
+     GLMemoryState m_glState { GLMemoryState::Normal };
+     std::optional<uint64_t> m_glPage; // the scene m_glState is about
+-    MonotonicTime m_glReducedAt, m_glUnderSince, m_glLoggedAt;
++    MonotonicTime m_glReducedAt, m_glUnderSince, m_glLoggedAt, m_glRestoredAt;
++    // How long under the restore level before coverage is normal again:
++    // 3 s, doubled (up to 20 s) each time the cap trips again within a
++    // minute of a restore.
++    Seconds m_glRestoreAfter { 3_s };
+     double m_glPeakMB { 0 };
+     double m_glSmoothedMB { 0 }; // ~1 s average of the per-frame value
+     unsigned m_glOverLogCount { 0 };
+@@ -416,10 +420,11 @@ public:
+     std::atomic<int64_t> m_oldestScrollInputUS { 0 };
+     std::atomic<unsigned> m_scrollInputs { 0 };
+     std::atomic<unsigned> m_asyncWheelEvents { 0 }, m_syncWheelEvents { 0 }, m_clampedWheelEvents { 0 };
+-    std::atomic<unsigned> m_scrollNotes[4] { };
++    std::atomic<unsigned> m_scrollNotes[5] { };
+     std::atomic<uint64_t> m_clampedPx { 0 };
+     std::atomic<uint64_t> m_perfWheelEvents { 0 }, m_perfClampedEvents { 0 }; // never reset (the overlay)
+     std::atomic<bool> m_coverageReduced { false };
++    std::atomic<float> m_lookaheadScale { 1 };
+     Lock m_wheelListenersLock;
+     HashSet<uint64_t> m_scenesWithWheelListeners WTF_GUARDED_BY_LOCK(m_wheelListenersLock);
+ private:
+@@ -843,8 +848,11 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+ }
+ 
+ // GL textures (a ~1 s average): logged above 128 MB; above the 160 MB cap the page keeps
+-// tiles for the visible rect only (no margin, no whole-layer tiling of
+-// animated layers), and back to normal once under 96 MB for 20 s; still over
++// tiles for the visible rect only (plus one tile row in the scroll direction;
++// no other margin, no whole-layer tiling of animated layers), and back to
++// normal once under 96 MB for 3 s (doubling up to 20 s if the cap trips
++// again within a minute of a restore). Between 112 and 144 MB the tiles
++// ahead of a scroll shrink to nothing (lookaheadScale). Still over
+ // the cap 5 s after that (or over 240 MB at any time), the page goes to the
+ // CPU path in a new WebProcess. /data/ps5webkit/wc-gl-cap (MB, read once)
+ // moves the cap (the other limits follow it); 0 = no cap.
+@@ -871,6 +879,8 @@ void SceneHost::checkGLMemory()
+         m_glState = GLMemoryState::Normal;
+         m_glPeakMB = 0;
+         m_glSmoothedMB = frameMB;
++        m_glRestoreAfter = 3_s;
++        m_glRestoredAt = { };
+     }
+     m_glPeakMB = std::max(m_glPeakMB, frameMB);
+     // The texture pool's intermediate surfaces come and go within frames
+@@ -878,11 +888,15 @@ void SceneHost::checkGLMemory()
+     // a ~1 s average (per presented frame), logs show both.
+     m_glSmoothedMB += (frameMB - m_glSmoothedMB) * 0.02;
+     double mb = m_glSmoothedMB;
++    m_lookaheadScale = static_cast<float>(std::clamp((capMB * 0.9 - mb) / (capMB * 0.2), 0.0, 1.0));
++    // Near the cap, the texture pool's unused surfaces go after 50 ms, not 3 s.
++    BitmapTexturePool::singleton().setReleaseQuickly(mb > restoreMB || m_glState != GLMemoryState::Normal);
+     if (mb > logMB && (!m_glOverLogCount || now - m_glLoggedAt >= 30_s)) {
+         unsigned layers = 0;
+         for (auto& entry : m_scenes)
+             layers += entry.second->layerCount();
+-        WTFLogAlways("[wc] GL textures %.1f MB (%.1f this frame), over %.0f MB (cap %.0f MB, %s; %u layers in %zu scenes; peak %.1f MB)", mb, frameMB, logMB, capMB, // NOLINT
++        WTFLogAlways("[wc] GL textures %.1f MB (%.1f this frame; texture pool %.1f MB), over %.0f MB (cap %.0f MB, %s; %u layers in %zu scenes; peak %.1f MB)", mb, frameMB, // NOLINT
++            BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, logMB, capMB,
+             m_glState == GLMemoryState::Normal ? "normal coverage" : m_glState == GLMemoryState::Reduced ? "coverage reduced" : "CPU fallback asked",
+             layers, m_scenes.size(), m_glPeakMB);
+         m_glLoggedAt = now;
+@@ -897,7 +911,12 @@ void SceneHost::checkGLMemory()
+         });
+     };
+     if (m_glState == GLMemoryState::Normal && mb > capMB) {
+-        WTFLogAlways("[wc] GL textures %.1f MB over the %.0f MB cap: tiles for the visible rect only", mb, capMB); // NOLINT
++        if (m_glRestoredAt && now - m_glRestoredAt < 60_s)
++            m_glRestoreAfter = std::min(m_glRestoreAfter * 2, 20_s);
++        else
++            m_glRestoreAfter = 3_s;
++        WTFLogAlways("[wc] GL textures %.1f MB over the %.0f MB cap (texture pool %.1f MB): tiles for the visible rect only (back after %.0f s under %.0f MB)", mb, capMB, // NOLINT
++            BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, m_glRestoreAfter.seconds(), restoreMB);
+         m_glState = GLMemoryState::Reduced;
+         m_glReducedAt = now;
+         m_glUnderSince = { };
+@@ -905,16 +924,17 @@ void SceneHost::checkGLMemory()
+     }
+     if (m_glState == GLMemoryState::Reduced) {
+         if ((mb > capMB && now - m_glReducedAt >= 5_s) || mb > emergencyMB) {
+-            WTFLogAlways("[wc] GL textures %.1f MB still over the %.0f MB cap %.1f s after reducing coverage: this page goes to the CPU path", mb, capMB, // NOLINT
+-                (now - m_glReducedAt).seconds());
++            WTFLogAlways("[wc] GL textures %.1f MB still over the %.0f MB cap %.1f s after reducing coverage (texture pool %.1f MB): this page goes to the CPU path", mb, capMB, // NOLINT
++                (now - m_glReducedAt).seconds(), BitmapTexturePool::singleton().sizeInBytes() / 1048576.0);
+             m_glState = GLMemoryState::Fallback;
+             post(DrawingAreaProxyWCPS5::GLMemoryAction::CPUFallback);
+         } else if (mb < restoreMB) {
+             if (!m_glUnderSince)
+                 m_glUnderSince = now;
+-            else if (now - m_glUnderSince >= 20_s) {
+-                WTFLogAlways("[wc] GL textures %.1f MB, under %.0f MB for 20 s: normal tile coverage again", mb, restoreMB); // NOLINT
++            else if (now - m_glUnderSince >= m_glRestoreAfter) {
++                WTFLogAlways("[wc] GL textures %.1f MB, under %.0f MB for %.0f s: normal tile coverage again", mb, restoreMB, m_glRestoreAfter.seconds()); // NOLINT
+                 m_glState = GLMemoryState::Normal;
++                m_glRestoredAt = now;
+                 post(DrawingAreaProxyWCPS5::GLMemoryAction::RestoreCoverage);
+             }
+         } else
+@@ -1010,13 +1030,13 @@ void SceneHost::maybeLog()
+         auto programs = TextureMapperShaderProgram::compileStats();
+         uint64_t hops = m_replyHops.exchange(0), hopUS = m_replyHopUS.exchange(0), hopMaxUS = m_replyHopMaxUS.exchange(0);
+         WTFLogAlways("[wc] %.1f s: %u updates (apply %.2f ms avg, %.1f max; %u unchanged), %u presents; %zu pages, %u layers; tiles uploaded %u (%u draws, %.1f MB, %.2f ms, %.3f ms per upload, %u fence waits, %u finishes); " // NOLINT
+-            "%u paints (%.2f ms avg, %.1f max; %u for animations only, longest gap %.1f ms, %u waited for); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s); "
++            "%u paints (%.2f ms avg, %.1f max; %u for animations only, longest gap %.1f ms, %u waited for); GL textures %.1f MB (pool %.1f); programs %u (%.0f ms, %u failed, GLSL %s); "
+             "update in the title: queued %.2f ms avg %.1f max, applied to swap %.2f avg %.1f max, swap to reply %.2f avg %.1f max",
+             seconds, m_stats.updates, m_stats.updates ? m_stats.applyMS / m_stats.updates : 0.0, m_stats.applyMaxMS, m_stats.unchanged, m_stats.presents,
+             m_scenes.size(), layers, uploads.uploads, uploads.draws, uploads.bytes / 1048576.0, uploads.milliseconds,
+             uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
+             m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS, m_stats.animationPaints, m_stats.paintGapMaxMS, m_stats.lateUpdates,
+-            BitmapTextureUploaderPS5::textureBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion,
++            BitmapTextureUploaderPS5::textureBytes() / 1048576.0, BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion,
+             m_stats.latencies ? m_stats.queuedMS / m_stats.latencies : 0.0, m_stats.queuedMaxMS, m_stats.presents ? m_stats.presentMS / m_stats.presents : 0.0,
+             m_stats.presentMaxMS, hops ? hopUS / 1000.0 / hops : 0.0, hopMaxUS / 1000.0);
+         unsigned videoLayers = 0;
+@@ -1163,15 +1183,17 @@ void SceneHost::maybeLogScroll()
+     unsigned asyncEvents = m_asyncWheelEvents.exchange(0), syncEvents = m_syncWheelEvents.exchange(0), clampedEvents = m_clampedWheelEvents.exchange(0);
+     uint64_t clampedPx = m_clampedPx.exchange(0);
+     unsigned rootCouldNot = m_scrollNotes[0].exchange(0), stepsNotTaken = m_scrollNotes[1].exchange(0), subScrollerSteps = m_scrollNotes[2].exchange(0), snaps = m_scrollNotes[3].exchange(0);
++    unsigned zeroLead = m_scrollNotes[4].exchange(0);
+     double stepAverage = m_scrollStats.titleSteps ? m_scrollStats.titleStepPx / m_scrollStats.titleSteps : 0.0;
+     double stepDeviation = m_scrollStats.titleSteps ? std::sqrt(std::max(0.0, m_scrollStats.titleStepSquares / m_scrollStats.titleSteps - stepAverage * stepAverage)) : 0.0;
+     if (asyncEvents || syncEvents || m_scrollStats.commits) {
+         WTFLogAlways("[ascroll] %.1f s: wheel events in the title %u, sent to the WebProcess first %u; clamped at the painted edge %u (%llu px); " // NOLINT
+             "lead over the WebProcess %.0f px avg, %.0f max; %u tree commits; per-frame step %.1f px avg, sd %.1f; scrollbar hidden/shown %u; "
+-            "root could not take %u (to the WebProcess), frame steps nothing took %u; sub-scroller moves in the title %u; snaps after wheel %u",
++            "root could not take %u (to the WebProcess), frame steps nothing took %u; sub-scroller moves in the title %u; snaps after wheel %u; "
++            "clamped with zero lead (sent on) %u; lookahead %.2f",
+             seconds, asyncEvents, syncEvents, clampedEvents, static_cast<unsigned long long>(clampedPx),
+             m_scrollStats.leadSamples ? m_scrollStats.leadPx / m_scrollStats.leadSamples : 0.0, m_scrollStats.leadMaxPx, m_scrollStats.commits,
+-            stepAverage, stepDeviation, m_scrollStats.scrollbarToggles, rootCouldNot, stepsNotTaken, subScrollerSteps, snaps);
++            stepAverage, stepDeviation, m_scrollStats.scrollbarToggles, rootCouldNot, stepsNotTaken, subScrollerSteps, snaps, zeroLead, m_lookaheadScale.load());
+     }
+     if (m_scrollStats.movedFrames || inputs) {
+         auto& latencies = m_scrollStats.latenciesMS;
+@@ -1498,6 +1520,11 @@ bool PS5WCHost::tileCoverageReduced()
+     return SceneHost::singleton().m_coverageReduced.load();
+ }
+ 
++float PS5WCHost::lookaheadScale()
++{
++    return SceneHost::singleton().m_lookaheadScale.load();
++}
++
+ void PS5WCHost::requestFrame()
+ {
+     SceneHost::singleton().requestFrameNow();
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+index 1e6b7f6a0e..d1ccdee112 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -47,13 +47,19 @@ public:
+     static void noteScrollClamped(float px);
+     // Any thread, for the [ascroll] line: events the root couldn't take (sent
+     // to the WebProcess), frame-locked steps nothing took, moves of
+-    // sub-scrollers in the title, snaps started at the end of a wheel gesture.
+-    enum class ScrollNote : uint8_t { RootCouldNotScroll, FrameStepNotTaken, SubScrollerStep, SnapAfterWheel };
++    // sub-scrollers in the title, snaps started at the end of a wheel gesture,
++    // steps held at the painted edge with no lead over the WebProcess that
++    // still moved (so the WebProcess hears of them and paints further on).
++    enum class ScrollNote : uint8_t { RootCouldNotScroll, FrameStepNotTaken, SubScrollerStep, SnapAfterWheel, ZeroLeadSentOn };
+     static void noteScrollEvent(ScrollNote);
+     // Whether the scene's page has wheel listeners (from its last main frame update).
+     static bool sceneHasWheelEventListeners(uint64_t sceneID);
+     // The shown page keeps tiles for the visible rect only (GL texture cap).
+     static bool tileCoverageReduced();
++    // How far the WebProcess may make tiles ahead in the scroll direction
++    // (0-1): less as the title's GL textures near their cap, so a fast
++    // scroll's burst of new tiles doesn't push them over it.
++    static float lookaheadScale();
+     // Any thread: a frame soon (the scrolling tree moved something).
+     static void requestFrame();
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index c1c016ab50..67ce5f2efb 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -475,10 +475,14 @@ void PS5WCScrollingTree::serviceAnimations(MonotonicTime time)
+ {
+     if (m_frameLockedStick)
+         applyFrameLockedScroll(time);
++    bool gestureNodesChanged;
+     {
+         Locker locker { treeLock() };
+         serviceScrollAnimations(time);
++        gestureNodesChanged = pruneTitleGestureNodes();
+     }
++    if (gestureNodesChanged)
++        didAddPendingScrollUpdate();
+     applyLayerPositions();
+ }
+ 
+@@ -498,20 +502,35 @@ PlatformWheelEvent PS5WCScrollingTree::clampAtPaintedEdge(const PlatformWheelEve
+     auto webProcessPosition = this->webProcessScrollPosition();
+     if (!rootPosition || !webProcessPosition)
+         return wheelEvent;
+-    // The margins the WebProcess reported with that update (its coverage,
+-    // further ahead in the scroll direction: GraphicsLayerWC::coverageMargins).
++    // The margins the WebProcess reported with that update: how far its
++    // tiles reach past the viewport (tile-aligned; with reduced coverage at
++    // the GL cap, the visible rect plus a row in the scroll direction:
++    // GraphicsLayerWC::coverageMargins). They describe that update's tiles,
++    // so they hold whatever this side currently thinks of the cap.
+     auto [above, below] = webProcessPaintedMargins();
+     bool reduced = PS5WCHost::tileCoverageReduced();
+     float checkerboard = m_checkerboardPx.load();
+-    float limitAbove = (reduced ? 0 : above) + checkerboard, limitBelow = (reduced ? 0 : below) + checkerboard;
+-    float limitX = (reduced ? 0.f : 512.f) + checkerboard;
++    float limitAbove = above + checkerboard, limitBelow = below + checkerboard;
++    float limitX = (reduced ? alwaysPaintedPx : 512.f) + checkerboard;
+     auto delta = wheelEvent.delta();
++    // Never deadlock: with no lead the title always moves at least as far as
++    // every update paints (GraphicsLayerWC::flushCompositingState inflates the
++    // visible rect by 20 px), so the WebProcess hears of the new position,
++    // scrolls and paints further on. A limit of 0 here (reduced coverage
++    // used to report 0) held every step with the title and the WebProcess at
++    // the same position, so nothing ever told the WebProcess to scroll: the
++    // 2026-11-02 TV log's 20 s lock-ups after the GL cap.
+     auto clampAxis = [&](float current, float webProcess, float d, float limitBefore, float limitAfter) {
+         float wanted = current - d;
+-        float low = std::min(webProcess - limitBefore, current), high = std::max(webProcess + limitAfter, current);
++        float low = std::min(webProcess - std::max(limitBefore, alwaysPaintedPx), current);
++        float high = std::max(webProcess + std::max(limitAfter, alwaysPaintedPx), current);
+         float allowed = std::clamp(wanted, low, high);
+-        if (allowed != wanted)
++        if (allowed != wanted) {
+             PS5WCHost::noteScrollClamped(wanted - allowed);
++            float lead = wanted > current ? current - webProcess : webProcess - current;
++            if (lead < 1 && allowed != current)
++                PS5WCHost::noteScrollEvent(PS5WCHost::ScrollNote::ZeroLeadSentOn);
++        }
+         return current - allowed;
+     };
+     FloatSize clamped { clampAxis(rootPosition->x(), webProcessPosition->x(), delta.width(), limitX, limitX), clampAxis(rootPosition->y(), webProcessPosition->y(), delta.height(), limitAbove, limitBelow) };
+@@ -625,25 +644,62 @@ bool PS5WCScrollingTree::wheelGestureDidEnd()
+         if (!m_stickPending.isZero())
+             return false;
+     }
++    bool snapped = false;
++    bool gestureNodesChanged;
+     {
+         Locker locker { treeLock() };
+         auto nodeID = std::exchange(m_wheelScrolledNode, std::nullopt);
+         auto event = std::exchange(m_wheelScrolledEvent, std::nullopt);
+-        if (!nodeID || !event || !m_snapAfterWheel)
+-            return true;
+-        RefPtr node = dynamicDowncast<ScrollingTreeScrollingNode>(nodeForID(*nodeID));
+-        if (!node || node->snapOffsetsInfo().isEmpty())
+-            return true;
+-        // ScrollingEffectsController: the gesture is over, the node is
+-        // snapping, so it animates to the nearest snap position.
+-        WheelGestureEndEvent endEvent { *event };
+-        handleWheelEventWithNode(endEvent, { WheelEventProcessingSteps::AsyncScrolling }, node.get(), EventTargeting::NodeOnly);
+-    }
++        RefPtr node = nodeID && event && m_snapAfterWheel ? dynamicDowncast<ScrollingTreeScrollingNode>(nodeForID(*nodeID)) : nullptr;
++        if (node && !node->snapOffsetsInfo().isEmpty()) {
++            // ScrollingEffectsController: the gesture is over, the node is
++            // snapping, so it animates to the nearest snap position.
++            WheelGestureEndEvent endEvent { *event };
++            handleWheelEventWithNode(endEvent, { WheelEventProcessingSteps::AsyncScrolling }, node.get(), EventTargeting::NodeOnly);
++            snapped = true;
++        }
++        // The WebProcess may resnap these nodes after its layouts again,
++        // except one still animating to its snap position here (until that
++        // animation ends: serviceAnimations).
++        for (auto& entry : m_titleGestureNodes)
++            entry.value = true;
++        gestureNodesChanged = pruneTitleGestureNodes();
++    }
++    if (gestureNodesChanged)
++        didAddPendingScrollUpdate();
++    if (!snapped)
++        return true;
+     PS5WCHost::noteScrollEvent(PS5WCHost::ScrollNote::SnapAfterWheel);
+     PS5WCHost::requestFrame();
+     return true;
+ }
+ 
++// Tree lock held: drops the nodes whose gesture ended and that no longer
++// animate (a snap). True if the set changed.
++bool PS5WCScrollingTree::pruneTitleGestureNodes()
++{
++    bool removed = m_titleGestureNodes.removeIf([&](auto& entry) {
++        return entry.value && !isScrollAnimationInProgressForNode(entry.key);
++    });
++    if (removed)
++        m_titleGestureNodesChanged = true;
++    return removed;
++}
++
++std::optional<Vector<ScrollingNodeID>> PS5WCScrollingTree::takeTitleGestureNodesIfChanged()
++{
++    Locker locker { treeLock() };
++    if (!std::exchange(m_titleGestureNodesChanged, false) || !m_reportGestureNodes)
++        return std::nullopt;
++    return copyToVector(m_titleGestureNodes.keys());
++}
++
++bool PS5WCScrollingTree::titleGestureNodesChanged()
++{
++    Locker locker { treeLock() };
++    return m_titleGestureNodesChanged && m_reportGestureNodes;
++}
++
+ void PS5WCScrollingTree::setLayerPosition(std::optional<PlatformLayerIdentifier> layer, FloatPoint position)
+ {
+     if (!layer)
+@@ -813,6 +869,13 @@ void PS5WCScrollingTree::scrollingTreeNodeDidScroll(ScrollingTreeScrollingNode&
+     if (t_wheelEvent) {
+         m_wheelScrolledNode = node.scrollingNodeID();
+         m_wheelScrolledEvent = *t_wheelEvent;
++        // In a gesture here: the WebProcess must not resnap it after a
++        // layout meanwhile (its isUserScrollInProgress is false otherwise).
++        auto add = m_titleGestureNodes.add(node.scrollingNodeID(), false);
++        if (add.isNewEntry)
++            m_titleGestureNodesChanged = true;
++        else
++            add.iterator->value = false;
+     }
+     // The layers move in the next frame (serviceAnimations): ask for it now
+     // (a wheel event on the main thread; the render thread is already in one).
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+index 6014276c24..a17c78a0a3 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+@@ -114,12 +114,25 @@ public:
+     // the controller skips kinetic scrolling for snapping nodes). False if
+     // frame-locked deltas are still queued (try again later).
+     bool wheelGestureDidEnd();
++    // Nodes in a wheel gesture in this tree (scrolled by the stick, or
++    // still snapping after it), for the WebProcess, which otherwise doesn't
++    // know a user scroll is in progress and snaps a scroll-snap container
++    // back to its current snap position after every layout (a carousel then
++    // judders in place under the stick). The set, if it changed since the
++    // last call (sent with the next ScrollUpdatesWC).
++    std::optional<Vector<WebCore::ScrollingNodeID>> takeTitleGestureNodesIfChanged();
++    bool titleGestureNodesChanged();
++    // "gesturenodes=0" in the flag file: never sent (the old behaviour, for A/B).
++    void setReportGestureNodes(bool on) { m_reportGestureNodes = on; }
+     void setSnapAfterWheel(bool on) { m_snapAfterWheel = on; }
+     bool snapAfterWheel() const { return m_snapAfterWheel; }
+ 
+     // Never scroll past the tiles the WebProcess has painted: the event's
+     // delta, shortened if it would (main or render thread).
+     WebCore::PlatformWheelEvent clampAtPaintedEdge(const WebCore::PlatformWheelEvent&);
++    // What every WebProcess update paints past the viewport, whatever its
++    // coverage (GraphicsLayerWC::flushCompositingState's inflation).
++    static constexpr float alwaysPaintedPx = 20;
+     void setCheckerboardPx(float px) { m_checkerboardPx = px; }
+ 
+     // Frame-locked stick (AS5, "stickframe=1" in the flag file): pad wheel
+@@ -157,6 +170,7 @@ private:
+     WebCore::RequestsScrollHandling scrollingTreeNodeRequestsScroll(WebCore::ScrollingNodeID, const WebCore::RequestedScrollData&) final;
+ 
+     void layerPositionsChanged();
++    bool pruneTitleGestureNodes();
+     void applyFrameLockedScroll(MonotonicTime displayTime);
+     WebCore::WheelEventHandlingResult handleWheelEventWithNodeNotingScroll(const WebCore::PlatformWheelEvent&, OptionSet<WebCore::WheelEventProcessingSteps>, WebCore::ScrollingTreeNode*, WebCore::EventTargeting);
+ 
+@@ -178,6 +192,10 @@ private:
+     // The last node a wheel event scrolled, and that event (tree lock).
+     std::optional<WebCore::ScrollingNodeID> m_wheelScrolledNode;
+     std::optional<WebCore::PlatformWheelEvent> m_wheelScrolledEvent;
++    // Node -> its gesture ended (it may still be snapping); tree lock.
++    HashMap<WebCore::ScrollingNodeID, bool> m_titleGestureNodes;
++    bool m_titleGestureNodesChanged { false };
++    bool m_reportGestureNodes { true };
+     bool m_hideLaggingScrollbar { true };
+     std::optional<WebCore::PlatformLayerIdentifier> m_rootVerticalScrollbarLayer; // tree lock
+     Lock m_stickLock;
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.h b/Source/WebKit/WebProcess/WebPage/DrawingArea.h
+index f4724eaaaf..7d56526d8f 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.h
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.h
+@@ -172,7 +172,7 @@ public:
+     virtual void setTileCoverageReducedWC(bool) { }
+ #if ENABLE(ASYNC_SCROLLING)
+     // PS5 async scrolling: where the title's scrolling tree scrolled to.
+-    virtual void scrollUpdatesWC(Vector<WebCore::ScrollUpdate>&&, WebCore::FloatSize, CompletionHandler<void()>&& completionHandler) { completionHandler(); }
++    virtual void scrollUpdatesWC(Vector<WebCore::ScrollUpdate>&&, WebCore::FloatSize, float, std::optional<Vector<WebCore::ScrollingNodeID>>&&, CompletionHandler<void()>&& completionHandler) { completionHandler(); }
+ #endif
+ #endif
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in b/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in
+index 0a1b4e880e..c50c610963 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.messages.in
+@@ -57,7 +57,7 @@ messages -> DrawingArea {
+     UpdateGeometryWC(uint64_t backingStoreStateID, WebCore::IntSize viewSize, float deviceScaleFactor, float intrinsicDeviceScaleFactor)
+     SetTileCoverageReducedWC(bool reduced)
+ #if ENABLE(ASYNC_SCROLLING)
+-    ScrollUpdatesWC(Vector<WebCore::ScrollUpdate> updates, WebCore::FloatSize velocity) -> ()
++    ScrollUpdatesWC(Vector<WebCore::ScrollUpdate> updates, WebCore::FloatSize velocity, float lookaheadScale, std::optional<Vector<WebCore::ScrollingNodeID>> nodesInTitleGesture) -> ()
+ #endif
+ #endif
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index dfb4b9e8d0..950bb1301d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -408,11 +408,18 @@ void DrawingAreaWC::setTileCoverageReducedWC(bool reduced)
+ }
+ 
+ #if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
+-void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize velocity, CompletionHandler<void()>&& completionHandler)
+-{
+-    GraphicsLayerWC::setScrollVelocity(velocity);
+-    if (auto* scrollingCoordinator = WCScrollingCoordinator::forPage(m_webPage.get()))
++void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize velocity, float lookaheadScale, std::optional<Vector<ScrollingNodeID>>&& nodesInTitleGesture, CompletionHandler<void()>&& completionHandler)
++{
++    GraphicsLayerWC::setScrollVelocity(velocity, lookaheadScale);
++    if (auto* scrollingCoordinator = WCScrollingCoordinator::forPage(m_webPage.get())) {
++        // Nodes that start a gesture count as user-scrolled before their new
++        // positions apply; nodes whose gesture ended, only after.
++        if (nodesInTitleGesture)
++            scrollingCoordinator->addNodesInTitleGesture(*nodesInTitleGesture);
+         scrollingCoordinator->applyScrollUpdatesFromTitle(WTF::move(updates));
++        if (nodesInTitleGesture)
++            scrollingCoordinator->setNodesInTitleGesture(WTF::move(*nodesInTitleGesture));
++    }
+     completionHandler();
+ }
+ #endif
+@@ -601,7 +608,7 @@ void DrawingAreaWC::sendUpdateAC()
+                     m_updateInfo.scrollingTransaction = scrollingCoordinator->buildTransaction(rootLayer.frameID);
+                     // How far the frame's tiles reach beyond the viewport (the
+                     // title scrolls no further ahead of this update).
+-                    std::tie(m_updateInfo.paintedAbove, m_updateInfo.paintedBelow) = GraphicsLayerWC::coverageMargins(size.height());
++                    std::tie(m_updateInfo.paintedAbove, m_updateInfo.paintedBelow) = GraphicsLayerWC::coverageMargins(size.height(), m_updateInfo.mainFrameScrollPosition ? static_cast<int>(m_updateInfo.mainFrameScrollPosition->y()) : 0);
+                     if (RefPtr document = localFrame->document())
+                         m_updateInfo.hasWheelEventListeners = document->hasWheelEventHandlers();
+                 }
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index 4eb3f10419..65c58880a6 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -80,7 +80,7 @@ private:
+     // PS5 async scrolling (COMPOSITING-PLAN.md): offered always; WebPage only
+     // turns it on when the title enabled threaded scrolling for this page.
+     bool supportsAsyncScrolling() const override { return true; }
+-    void scrollUpdatesWC(Vector<WebCore::ScrollUpdate>&&, WebCore::FloatSize velocity, CompletionHandler<void()>&&) override;
++    void scrollUpdatesWC(Vector<WebCore::ScrollUpdate>&&, WebCore::FloatSize velocity, float lookaheadScale, std::optional<Vector<WebCore::ScrollingNodeID>>&& nodesInTitleGesture, CompletionHandler<void()>&&) override;
+ #endif
+     void setRootCompositingLayer(WebCore::Frame&, WebCore::GraphicsLayer*) override;
+     void addRootFrame(WebCore::FrameIdentifier) override;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index f0dc2c2817..002d8ff765 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -81,6 +81,7 @@ struct WCTilePart {
+ 
+ #if defined(PS5_PAYLOAD_SDK)
+ static int scrollAhead(int visibleHeight);
++static void reducedCoverageRow(WebCore::IntRect&, int tileHeight);
+ #endif
+ 
+ class WCTiledBacking final : public TiledBacking {
+@@ -180,9 +181,16 @@ public:
+         // tile row away, so scroll steps paint nothing until the view nears
+         // a new tile row, and scrolling back reuses the tiles it left.
+         IntRect coverage = enclosingIntRect(rect);
+-        if (coverage.isEmpty() || GraphicsLayerWC::tileCoverageReduced())
++        if (coverage.isEmpty())
+             return m_tileGrid.setCoverageRect(coverage);
+         int tileHeight = m_tileGrid.tilePixelSize().height();
++        if (GraphicsLayerWC::tileCoverageReduced()) {
++            // Over the GL cap: the visible rect, and one tile row more in the
++            // direction the page last scrolled, so async scrolling still has
++            // painted rows to move into (coverageMargins reports them).
++            reducedCoverageRow(coverage, tileHeight);
++            return m_tileGrid.setCoverageRect(coverage);
++        }
+         int margin = std::max(tileHeight, coverage.height() / 2);
+         IntRect keep = coverage;
+         coverage.inflateY(margin);
+@@ -813,12 +821,31 @@ static std::atomic<bool> s_tileCoverageReduced;
+ static Lock s_scrollVelocityLock;
+ static FloatSize s_scrollVelocity WTF_GUARDED_BY_LOCK(s_scrollVelocityLock);
+ static MonotonicTime s_scrollVelocityTime WTF_GUARDED_BY_LOCK(s_scrollVelocityLock);
++static std::atomic<float> s_lookaheadScale { 1 };
++// The last vertical scroll direction (1 down, -1 up, 0 none yet); kept
++// after the velocity goes stale, for reduced coverage's extra row.
++static std::atomic<int> s_scrollDirection { 0 };
+ 
+-void GraphicsLayerWC::setScrollVelocity(FloatSize velocity)
++void GraphicsLayerWC::setScrollVelocity(FloatSize velocity, float lookaheadScale)
+ {
+     Locker locker { s_scrollVelocityLock };
+     s_scrollVelocity = velocity;
+     s_scrollVelocityTime = MonotonicTime::now();
++    s_lookaheadScale = std::clamp(lookaheadScale, 0.f, 1.f);
++    if (std::abs(velocity.height()) > 30)
++        s_scrollDirection = velocity.height() > 0 ? 1 : -1;
++}
++
++// Reduced coverage: one tile row more in the last scroll direction.
++static void reducedCoverageRow(IntRect& coverage, int tileHeight)
++{
++    int direction = s_scrollDirection.load();
++    if (direction > 0)
++        coverage.setHeight(coverage.height() + tileHeight);
++    else if (direction < 0) {
++        coverage.setY(coverage.y() - tileHeight);
++        coverage.setHeight(coverage.height() + tileHeight);
++    }
+ }
+ 
+ FloatSize GraphicsLayerWC::scrollVelocity()
+@@ -841,22 +868,38 @@ static int scrollAhead(int visibleHeight)
+     if (GraphicsLayerWC::tileCoverageReduced() || visibleHeight <= 0)
+         return 0;
+     double velocity = GraphicsLayerWC::scrollVelocity().height();
+-    double ahead = std::min(std::abs(velocity) * lookahead, 2.0 * visibleHeight);
++    double ahead = std::min(std::abs(velocity) * lookahead, 2.0 * visibleHeight) * s_lookaheadScale.load();
+     if (ahead < 64)
+         return 0;
+     return velocity > 0 ? static_cast<int>(ahead) : -static_cast<int>(ahead);
+ }
+ 
+-std::pair<int, int> GraphicsLayerWC::coverageMargins(int viewportHeight)
++std::pair<int, int> GraphicsLayerWC::coverageMargins(int viewportHeight, int scrollY)
+ {
+-    if (tileCoverageReduced())
+-        return { 0, 0 };
+     // As WCTiledBacking::updateCoverageRect for the frame's contents layer
+-    // (its visible rect is the viewport inflated by 20 px).
+-    int height = viewportHeight + 40;
+-    int margin = std::max(512, height / 2) + 20;
+-    int ahead = scrollAhead(height);
+-    return { margin + std::max(0, -ahead), margin + std::max(0, ahead) };
++    // (its visible rect is the viewport inflated by 20 px). With reduced
++    // coverage that is the 20 px plus the row in the scroll direction: it
++    // used to be 0, and the title then held every scroll step at the
++    // viewport edge without ever telling the WebProcess to scroll.
++    // (Tiles reach further, to their 512 px row edges, but where the rows
++    // start depends on the layer's origin: not counted.)
++    constexpr int tileHeight = 512;
++    IntRect coverage { 0, scrollY - 20, 1, viewportHeight + 40 };
++    if (tileCoverageReduced())
++        reducedCoverageRow(coverage, tileHeight);
++    else {
++        int margin = std::max(tileHeight, coverage.height() / 2);
++        coverage.inflateY(margin);
++        if (int ahead = scrollAhead(coverage.height() - 2 * margin)) {
++            if (ahead > 0)
++                coverage.setHeight(coverage.height() + ahead);
++            else {
++                coverage.setY(coverage.y() + ahead);
++                coverage.setHeight(coverage.height() - ahead);
++            }
++        }
++    }
++    return { scrollY - coverage.y(), coverage.maxY() - (scrollY + viewportHeight) };
+ }
+ #endif
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 471ab24426..a71d198934 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -68,18 +68,21 @@ public:
+         virtual WCTilePainter* tilePainter() { return nullptr; }
+     };
+ 
+-    // PS5 (COMPOSITING-PLAN.md, M6): tiles only for the visible rect, no
+-    // margin or whole-layer tiling, while the title's GL textures are over
+-    // their cap. Returns whether it changed.
++    // PS5 (COMPOSITING-PLAN.md, M6): tiles only for the visible rect (plus
++    // one tile row in the last scroll direction), no other margin or
++    // whole-layer tiling, while the title's GL textures are over their cap.
++    // Returns whether it changed.
+     static bool setTileCoverageReduced(bool);
+     static bool tileCoverageReduced();
+     // PS5 async scrolling (COMPOSITING-PLAN.md, AS3): the title's scroll
+     // velocity (px/s, y > 0 scrolling down), valid for 250 ms after it came;
+-    // tiles are made further ahead in that direction. coverageMargins: how
+-    // far beyond the viewport (height h) the frame's tiles reach, above and below.
+-    static void setScrollVelocity(WebCore::FloatSize);
++    // tiles are made further ahead in that direction, scaled by
++    // lookaheadScale (0-1: the title's GL textures near their cap).
++    // coverageMargins: how far beyond the viewport (height h, at scroll
++    // position y) the frame's tiles reach, above and below (tile-aligned).
++    static void setScrollVelocity(WebCore::FloatSize, float lookaheadScale = 1);
+     static WebCore::FloatSize scrollVelocity();
+-    static std::pair<int, int> coverageMargins(int viewportHeight);
++    static std::pair<int, int> coverageMargins(int viewportHeight, int scrollY);
+ 
+     GraphicsLayerWC(Type layerType, WebCore::GraphicsLayerClient&, Observer&);
+     ~GraphicsLayerWC() override;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp
+index 52ea7ced95..76f95c0a0c 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp
+@@ -141,6 +141,25 @@ void WCScrollingCoordinator::scrollUpdateForNode(ScrollUpdate&& update)
+     applyScrollUpdate(WTF::move(update), ScrollType::User, ViewportRectStability::Stable);
+ }
+ 
++void WCScrollingCoordinator::addNodesInTitleGesture(const Vector<ScrollingNodeID>& nodes)
++{
++    for (auto nodeID : nodes)
++        m_nodesInTitleGesture.add(nodeID);
++}
++
++void WCScrollingCoordinator::setNodesInTitleGesture(Vector<ScrollingNodeID>&& nodes)
++{
++    HashSet<ScrollingNodeID> set;
++    for (auto nodeID : nodes)
++        set.add(nodeID);
++    m_nodesInTitleGesture = WTF::move(set);
++}
++
++bool WCScrollingCoordinator::isUserScrollInProgress(std::optional<ScrollingNodeID> nodeID) const
++{
++    return nodeID && m_nodesInTitleGesture.contains(*nodeID);
++}
++
+ void WCScrollingCoordinator::startMonitoringWheelEvents(bool clearLatchingState)
+ {
+     if (clearLatchingState)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h
+index 487653ce15..42062d29aa 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h
+@@ -24,6 +24,7 @@
+ #include <WebCore/AsyncScrollingCoordinator.h>
+ #include <WebCore/ScrollingCoordinatorTypes.h>
+ #include <wtf/HashMap.h>
++#include <wtf/HashSet.h>
+ #include <wtf/TZoneMalloc.h>
+ #include <wtf/WeakPtr.h>
+ 
+@@ -53,6 +54,13 @@ public:
+ 
+     // From the title (DrawingArea::ScrollUpdatesWC).
+     void applyScrollUpdatesFromTitle(Vector<WebCore::ScrollUpdate>&&);
++    // The nodes in a wheel gesture in the title (or snapping after one), as
++    // RemoteScrollingCoordinator's user-scroll nodes: while a node is in it,
++    // this side doesn't resnap it after a layout (ScrollableArea::resnapAfterLayout
++    // checks isUserScrollInProgress), which would pull a scroll-snap carousel
++    // back to its snap position under the stick.
++    void addNodesInTitleGesture(const Vector<WebCore::ScrollingNodeID>&);
++    void setNodesInTitleGesture(Vector<WebCore::ScrollingNodeID>&&);
+ 
+     struct NodeAndGestureState {
+         std::optional<WebCore::ScrollingNodeID> wheelGestureNode;
+@@ -74,6 +82,8 @@ private:
+     void startMonitoringWheelEvents(bool clearLatchingState) final;
+     // AsyncScrollingCoordinator's version talks to a local tree (there is none here).
+     void setScrollPinningBehavior(WebCore::ScrollPinningBehavior) final { }
++    // AsyncScrollingCoordinator's versions ask a local tree (none here).
++    bool isUserScrollInProgress(std::optional<WebCore::ScrollingNodeID>) const final;
+ 
+     void scrollUpdateForNode(WebCore::ScrollUpdate&&);
+ 
+@@ -87,6 +97,7 @@ private:
+     HashMap<WebCore::ScrollingNodeID, PendingScrollResponseInfo> m_scrollRequestsPendingResponse;
+     NodeAndGestureState m_currentWheelGestureInfo;
+     bool m_clearScrollLatchingInNextTransaction { false };
++    HashSet<WebCore::ScrollingNodeID> m_nodesInTitleGesture;
+ };
+ 
+ } // namespace WebKit

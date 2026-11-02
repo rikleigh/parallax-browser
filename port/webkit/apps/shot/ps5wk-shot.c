@@ -29,9 +29,9 @@
  * compositing=1: the page is composited (WC builds only) into a null scene
  * host that counts layers, tiles and painted megapixels per update and
  * presents at 60 Hz ([wc-null] line per second; no pixels, so the paint
- * result is INFO). compositing=0: the CPU path even if the flag file
- * /data/ps5webkit/compositing is there. Default: the CPU path (this
- * payload has no GL scene host).
+ * result is INFO). compositing=0: the CPU path, although the title
+ * composites by default. Default: the CPU path (this payload has no GL
+ * scene host).
  * Output goes back on the elfldr connection.
  */
 #include <errno.h>

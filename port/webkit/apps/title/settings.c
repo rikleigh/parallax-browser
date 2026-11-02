@@ -7,10 +7,11 @@
  *     when it starts): rewritten with every other line (comments, JSC_*,
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
- *   flag files (no-hwdec, audio-silent, push-off, adblock-off): present = that feature
- *     off; the title reads them when it starts. Opt-in flag files
- *     (compositing): present = that feature on; WebKit in the title reads
- *     it whenever a page gets a new WebProcess.
+ *   flag files (no-hwdec, audio-silent, push-off, adblock-off,
+ *     no-compositing): present = that feature off; the title reads them
+ *     when it starts (no-compositing: WebKit in the title reads it whenever
+ *     a page gets a new WebProcess). Opt-in flag files (perf-overlay):
+ *     present = that feature on.
  *   home-url.txt: the page the browser opens when it starts.
  * Each setting says what applies it: a page restart (a new WebProcess), a
  * browser restart (the title) or nothing. The values in use are remembered
@@ -72,8 +73,8 @@ static const Setting settings[] = {
         "Video is drawn straight to the screen beneath the page, which is smoother. Off paints every frame into the page.", NULL, 0, 0 },
     { "media_vp9", KIND_ENV, TYPE_BOOL, "PS5WK_MEDIA_VP9", "1", PS5WK_SETTINGS_PAGE, "Offer VP9 video",
         "Lets sites such as YouTube send VP9. Off makes YouTube send H.264 instead.", NULL, 0, 0 },
-    { "compositing", KIND_FLAG_ON, TYPE_BOOL, "compositing", "0", PS5WK_SETTINGS_PAGE, "GPU compositing (experimental)",
-        "Puts pages together on the GPU, in layers. Off draws pages on the CPU, as before. Needs a browser built with the compositor.",
+    { "compositing", KIND_FLAG, TYPE_BOOL, "no-compositing", "1", PS5WK_SETTINGS_PAGE, "GPU compositing",
+        "Puts pages together on the GPU, in layers, and scrolls them on the GPU. Off draws pages on the CPU, as before; try it if a page looks wrong.",
         NULL, 0, 0 },
     { "hwdec", KIND_FLAG, TYPE_BOOL, "no-hwdec", "1", PS5WK_SETTINGS_BROWSER, "Hardware video decoding",
         "The PS5's video decoder plays H.264, HEVC and VP9, up to 8K. Off decodes in software (1080p at most).", NULL, 0, 0 },
@@ -289,7 +290,7 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append(out, ",\"inUse\":");
         appendJSONString(out, s->scope && applied[i] ? applied[i] : value);
         g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\",\"key\":", scopeName(s->scope),
-            waiting ? "true" : "false", s->kind == KIND_ENV || (s->kind == KIND_FLAG_ON && s->scope == PS5WK_SETTINGS_PAGE) ? "page" : "browser");
+            waiting ? "true" : "false", s->kind == KIND_ENV || s->scope == PS5WK_SETTINGS_PAGE ? "page" : "browser");
         appendJSONString(out, s->name);
         g_string_append(out, ",\"label\":");
         appendJSONString(out, s->label);

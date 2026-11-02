@@ -1,0 +1,511 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 3a73b2c43a..ab4edf2fa2 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -21,6 +21,7 @@
+ #if ENABLE(ASYNC_SCROLLING)
+ #include "PS5WCScrollingTree.h"
+ #include <WebCore/PlatformWheelEvent.h>
++#include <wtf/HashSet.h>
+ #include <wtf/Lock.h>
+ #endif
+ #include "WebPageProxy.h"
+@@ -112,6 +113,24 @@ RefPtr<PS5WCScrollingTree> DrawingAreaProxyWCPS5::scrollingTreeForScene(uint64_t
+     return it->value.ptr();
+ }
+ 
++static Lock& earlyReplyLock()
++{
++    static Lock lock;
++    return lock;
++}
++
++static HashSet<uint64_t>& earlyReplyScenes()
++{
++    static NeverDestroyed<HashSet<uint64_t>> set;
++    return set;
++}
++
++bool DrawingAreaProxyWCPS5::earlyReplyForScene(uint64_t sceneID)
++{
++    Locker locker { earlyReplyLock() };
++    return earlyReplyScenes().contains(sceneID);
++}
++
+ void DrawingAreaProxyWCPS5::sendScrollUpdates(uint64_t sceneID)
+ {
+     if (auto* drawingArea = liveDrawingAreas().get(sceneID))
+@@ -155,10 +174,28 @@ bool DrawingAreaProxyWCPS5::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
+ 
+     auto platformWheelEvent = platform(wheelEvent.get());
+     OptionSet<WebCore::WheelEventProcessingSteps> steps;
+-    if (m_scrollingTree->pointIsInSubScroller(platformWheelEvent.position()) || m_scrollingTree->rootHasSynchronousScrollingReasons())
++    auto subScroller = m_scrollingTree->subScrollerAtPoint(platformWheelEvent.position());
++    if (m_scrollingTree->rootHasSynchronousScrollingReasons())
+         steps = { WebCore::WheelEventProcessingSteps::SynchronousScrolling, WebCore::WheelEventProcessingSteps::BlockingDOMEventDispatch };
+     else
+         steps = m_scrollingTree->determineWheelEventProcessing(platformWheelEvent);
++    if (subScroller && steps.contains(WebCore::WheelEventProcessingSteps::AsyncScrolling)) {
++        // Over an overflow box or iframe: its node scrolls here with
++        // overflow=1 (AS4), else the WebProcess's hit test picks the node.
++        std::optional<WebCore::WheelEventHandlingResult> result;
++        if (m_scrollingTree->asyncSubScrollers()) {
++            m_scrollingTree->willProcessWheelEvent();
++            result = m_scrollingTree->handleWheelEventForSubScroller(platformWheelEvent, *subScroller);
++        }
++        if (result) {
++            PS5WCHost::noteWheelEventRouting(true);
++            if (PS5WCHost::sceneHasWheelEventListeners(identifier().toUInt64()))
++                dispatchWheelEventToDOM(wheelEvent.copyRef());
++            page->continueWheelEventHandling(WTF::move(wheelEvent), { { }, result->wasHandled }, std::nullopt);
++            return true;
++        }
++        steps = { WebCore::WheelEventProcessingSteps::SynchronousScrolling, WebCore::WheelEventProcessingSteps::BlockingDOMEventDispatch };
++    }
+ 
+     if (!steps.contains(WebCore::WheelEventProcessingSteps::AsyncScrolling)) {
+         PS5WCHost::noteWheelEventRouting(false);
+@@ -166,35 +203,18 @@ bool DrawingAreaProxyWCPS5::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
+         return true;
+     }
+ 
+-    // Never past what is painted: the WebProcess has tiles for its visible
+-    // rect plus max(one tile row, half the view) (GraphicsLayerWC's coverage
+-    // margin; none while coverage is reduced) around its own scroll position.
+-    // Scrolling stops at that edge until it catches up (checkerboard=<px> in
+-    // the flag file lets it go that much further, showing the background).
+-    if (auto rootPosition = m_scrollingTree->rootScrollPosition()) {
+-        if (auto webProcessPosition = m_scrollingTree->webProcessScrollPosition()) {
+-            // The margins the WebProcess reported with that update (its
+-            // coverage, more ahead in the scroll direction since AS3).
+-            auto [above, below] = m_scrollingTree->webProcessPaintedMargins();
+-            if (PS5WCHost::tileCoverageReduced())
+-                above = below = 0;
+-            float limitAbove = above + m_checkerboardPx, limitBelow = below + m_checkerboardPx;
+-            float limitX = (PS5WCHost::tileCoverageReduced() ? 0.f : 512.f) + m_checkerboardPx;
+-            auto delta = platformWheelEvent.delta();
+-            auto clampAxis = [&](float current, float webProcess, float d, float limitBefore, float limitAfter) {
+-                float wanted = current - d;
+-                float low = std::min(webProcess - limitBefore, current), high = std::max(webProcess + limitAfter, current);
+-                float allowed = std::clamp(wanted, low, high);
+-                if (allowed != wanted)
+-                    PS5WCHost::noteScrollClamped(wanted - allowed);
+-                return current - allowed;
+-            };
+-            WebCore::FloatSize clamped { clampAxis(rootPosition->x(), webProcessPosition->x(), delta.width(), limitX, limitX), clampAxis(rootPosition->y(), webProcessPosition->y(), delta.height(), limitAbove, limitBelow) };
+-            if (clamped != delta)
+-                platformWheelEvent = platformWheelEvent.copyWithDeltaAndVelocity(clamped, platformWheelEvent.scrollingVelocity());
+-        }
++    // Frame-locked stick (AS5, stick=frame): the tree applies the deltas on
++    // the render thread at the frames' display times instead.
++    if (m_scrollingTree->frameLockedStick()) {
++        m_scrollingTree->queueFrameLockedScroll(platformWheelEvent);
++        PS5WCHost::noteWheelEventRouting(true);
++        if (PS5WCHost::sceneHasWheelEventListeners(identifier().toUInt64()))
++            dispatchWheelEventToDOM(wheelEvent.copyRef());
++        page->continueWheelEventHandling(WTF::move(wheelEvent), { { }, true }, std::nullopt);
++        return true;
+     }
+ 
++    platformWheelEvent = m_scrollingTree->clampAtPaintedEdge(platformWheelEvent);
+     m_scrollingTree->willProcessWheelEvent();
+     auto result = m_scrollingTree->handleWheelEvent(platformWheelEvent, steps);
+     PS5WCHost::noteWheelEventRouting(true);
+@@ -290,7 +310,13 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+ #if ENABLE(ASYNC_SCROLLING)
+     if (protect(webPageProxy.preferences())->threadedScrollingEnabled() && !PS5WCNullHost::isInstalled()) {
+         m_scrollingTree = PS5WCScrollingTree::create(identifier().toUInt64());
+-        m_checkerboardPx = asyncScrollingOption("checkerboard", 0);
++        m_scrollingTree->setCheckerboardPx(asyncScrollingOption("checkerboard", 0));
++        m_scrollingTree->setFrameLockedStick(asyncScrollingOption("stickframe", 0) > 0);
++        m_scrollingTree->setAsyncSubScrollers(asyncScrollingOption("overflow", 0) > 0);
++        if (asyncScrollingOption("earlyreply", 1) > 0) {
++            Locker locker { earlyReplyLock() };
++            earlyReplyScenes().add(identifier().toUInt64());
++        }
+         Locker locker { scrollingTreesLock() };
+         scrollingTrees().set(identifier().toUInt64(), *m_scrollingTree);
+         WTFLogAlways("[ascroll] drawing area %llu: async scrolling (the title's scrolling tree)", static_cast<unsigned long long>(identifier().toUInt64())); // NOLINT
+@@ -329,6 +355,8 @@ DrawingAreaProxyWCPS5::~DrawingAreaProxyWCPS5()
+     if (m_scrollingTree) {
+         Locker locker { scrollingTreesLock() };
+         scrollingTrees().remove(identifier().toUInt64());
++        Locker earlyLocker { earlyReplyLock() };
++        earlyReplyScenes().remove(identifier().toUInt64());
+     }
+ #endif
+     // The scene is keyed by this drawing area, not the page: a page restart
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index b0936e1f03..3c26852c0a 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -77,6 +77,8 @@ public:
+     static RefPtr<PS5WCScrollingTree> scrollingTreeForScene(uint64_t sceneID);
+     // Main thread: send the tree's pending scroll updates to the WebProcess.
+     static void sendScrollUpdates(uint64_t sceneID);
++    // Any thread: answer the scene's updates when applied, not after the swap.
++    static bool earlyReplyForScene(uint64_t sceneID);
+ 
+     bool hasScrollingTree() const { return !!m_scrollingTree; }
+     // WebPageProxy::handleWheelEvent: true if the event is taken here.
+@@ -114,7 +116,6 @@ private:
+     bool m_waitingForScrollUpdateReply { false };
+     bool m_domWheelEventInFlight { false };
+     RefPtr<WebWheelEvent> m_pendingDOMWheelEvent;
+-    float m_checkerboardPx { 0 };
+ #endif
+     uint64_t m_currentBackingStoreStateID { 0 };
+     HashMap<uint64_t, Ref<WebCore::SharedMemory>> m_tileArenaChunks;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index aac8b2760d..131f9f5e91 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -388,6 +388,7 @@ private:
+         MonotonicTime start;
+         unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 }, animationPaints { 0 }, lateUpdates { 0 };
+         unsigned videoPaints { 0 }; // for new video frames only
++        unsigned earlyReplies { 0 }; // async scrolling: replied when applied
+         double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 }, paintGapMaxMS { 0 };
+         // Where an update's time goes in the title: queued (the main thread
+         // got it) until applied on the render thread, applied until the swap
+@@ -435,6 +436,8 @@ private:
+         Vector<double> latenciesMS;
+         unsigned staleInputs { 0 }; // over 1 s old when a frame moved: not counted
+         unsigned commits { 0 };
++        unsigned titleSteps { 0 };
++        double titleStepPx { 0 }, titleStepSquares { 0 };
+         double leadMaxPx { 0 }, leadPx { 0 };
+         unsigned leadSamples { 0 };
+     } m_scrollStats;
+@@ -726,6 +729,20 @@ void SceneHost::applyPending()
+             double queued = (MonotonicTime::now() - job.queuedAt).milliseconds();
+             m_stats.queuedMS += queued;
+             m_stats.queuedMaxMS = std::max(m_stats.queuedMaxMS, queued);
++#if ENABLE(ASYNC_SCROLLING)
++            // Async scrolling: the title paints every frame of a scroll on its
++            // own, so an update that waited for the next swap would hold the
++            // WebProcess back a frame or more ("frame done" 24 ms against 4
++            // on a busy page). Its tiles are copied by now (the arena slots are
++            // free); reply at once. "earlyreply=0" in the flag file: after the swap.
++            if (DrawingAreaProxyWCPS5::earlyReplyForScene(job.pageID)) {
++                m_stats.earlyReplies++;
++                Vector<CompletionHandler<void()>> handlers;
++                handlers.append(WTF::move(job.didPresent));
++                completeOnMainThread(WTF::move(handlers));
++                continue;
++            }
++#endif
+             m_appliedThisFrame = true;
+             m_frameCompletions.append(WTF::move(job.didPresent));
+         }
+@@ -949,6 +966,8 @@ void SceneHost::maybeLog()
+         unsigned videoLayers = 0;
+         for (auto& entry : m_scenes)
+             videoLayers += entry.second->videoLayerCount();
++        if (m_stats.earlyReplies)
++            WTFLogAlways("[wc] %.1f s: %u updates answered when applied (async scrolling)", seconds, m_stats.earlyReplies); // NOLINT
+         if (videoLayers || m_stats.videoPaints)
+             WTFLogAlways("[wc] %.1f s: %u video layers, %u paints for video frames only", seconds, videoLayers, m_stats.videoPaints); // NOLINT
+     }
+@@ -993,8 +1012,13 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
+             m_treeVelocity = { };
+         m_lastTreePositionUS = displayUS;
+         tree->setScrollVelocity(m_treeVelocity);
+-        if (m_lastPaintedTreePosition && *m_lastPaintedTreePosition != *position)
++        if (m_lastPaintedTreePosition && *m_lastPaintedTreePosition != *position) {
+             m_scrollMovedByTitle = true;
++            double step = std::abs(position->y() - m_lastPaintedTreePosition->y());
++            m_scrollStats.titleSteps++;
++            m_scrollStats.titleStepPx += step;
++            m_scrollStats.titleStepSquares += step * step;
++        }
+         m_lastPaintedTreePosition = *position;
+         if (auto webProcessPosition = tree->webProcessScrollPosition()) {
+             double lead = std::abs(position->y() - webProcessPosition->y());
+@@ -1011,10 +1035,10 @@ void SceneHost::updateSubScrollerRects(WCScene& scene, uint64_t sceneID)
+     auto tree = DrawingAreaProxyWCPS5::scrollingTreeForScene(sceneID);
+     if (!tree)
+         return;
+-    Vector<FloatRect> rects;
+-    for (auto id : tree->subScrollerLayers()) {
+-        if (auto rect = scene.layerRectOnSurface(id))
+-            rects.append(*rect);
++    Vector<std::pair<ScrollingNodeID, FloatRect>> rects;
++    for (auto [nodeID, layerID] : tree->subScrollerLayers()) {
++        if (auto rect = scene.layerRectOnSurface(layerID))
++            rects.append({ nodeID, *rect });
+     }
+     tree->setSubScrollerRects(WTF::move(rects));
+ }
+@@ -1051,11 +1075,14 @@ void SceneHost::maybeLogScroll()
+     unsigned inputs = m_scrollInputs.exchange(0);
+     unsigned asyncEvents = m_asyncWheelEvents.exchange(0), syncEvents = m_syncWheelEvents.exchange(0), clampedEvents = m_clampedWheelEvents.exchange(0);
+     uint64_t clampedPx = m_clampedPx.exchange(0);
++    double stepAverage = m_scrollStats.titleSteps ? m_scrollStats.titleStepPx / m_scrollStats.titleSteps : 0.0;
++    double stepDeviation = m_scrollStats.titleSteps ? std::sqrt(std::max(0.0, m_scrollStats.titleStepSquares / m_scrollStats.titleSteps - stepAverage * stepAverage)) : 0.0;
+     if (asyncEvents || syncEvents || m_scrollStats.commits) {
+         WTFLogAlways("[ascroll] %.1f s: wheel events in the title %u, sent to the WebProcess first %u; clamped at the painted edge %u (%llu px); " // NOLINT
+-            "lead over the WebProcess %.0f px avg, %.0f max; %u tree commits",
++            "lead over the WebProcess %.0f px avg, %.0f max; %u tree commits; per-frame step %.1f px avg, sd %.1f",
+             seconds, asyncEvents, syncEvents, clampedEvents, static_cast<unsigned long long>(clampedPx),
+-            m_scrollStats.leadSamples ? m_scrollStats.leadPx / m_scrollStats.leadSamples : 0.0, m_scrollStats.leadMaxPx, m_scrollStats.commits);
++            m_scrollStats.leadSamples ? m_scrollStats.leadPx / m_scrollStats.leadSamples : 0.0, m_scrollStats.leadMaxPx, m_scrollStats.commits,
++            stepAverage, stepDeviation);
+     }
+     if (m_scrollStats.movedFrames || inputs) {
+         auto& latencies = m_scrollStats.latenciesMS;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index 1d7f343870..531371741c 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -39,6 +39,7 @@
+ #include <WebCore/ScrollingTreeStickyNode.h>
+ #include <WebCore/ThreadedScrollingTreeScrollingNodeDelegate.h>
+ #include <wtf/RunLoop.h>
++#include <algorithm>
+ #include <wtf/SetForScope.h>
+ 
+ namespace WebKit {
+@@ -406,6 +407,8 @@ bool PS5WCScrollingTree::copyLayerPositionsIfChanged(LayerPositions& positions,
+ // tree only marks them on a scroll: ScrollingTree::scrollingTreeNodeDidScroll).
+ void PS5WCScrollingTree::serviceAnimations(MonotonicTime time)
+ {
++    if (m_frameLockedStick)
++        applyFrameLockedScroll(time);
+     {
+         Locker locker { treeLock() };
+         serviceScrollAnimations(time);
+@@ -415,9 +418,87 @@ void PS5WCScrollingTree::serviceAnimations(MonotonicTime time)
+ 
+ bool PS5WCScrollingTree::hasActiveAnimations()
+ {
++    if (m_frameLockedStick) {
++        Locker locker { m_stickLock };
++        if (!m_stickPending.isZero())
++            return true;
++    }
+     return hasNodeWithActiveScrollAnimations();
+ }
+ 
++PlatformWheelEvent PS5WCScrollingTree::clampAtPaintedEdge(const PlatformWheelEvent& wheelEvent)
++{
++    auto rootPosition = this->rootScrollPosition();
++    auto webProcessPosition = this->webProcessScrollPosition();
++    if (!rootPosition || !webProcessPosition)
++        return wheelEvent;
++    // The margins the WebProcess reported with that update (its coverage,
++    // further ahead in the scroll direction: GraphicsLayerWC::coverageMargins).
++    auto [above, below] = webProcessPaintedMargins();
++    bool reduced = PS5WCHost::tileCoverageReduced();
++    float checkerboard = m_checkerboardPx.load();
++    float limitAbove = (reduced ? 0 : above) + checkerboard, limitBelow = (reduced ? 0 : below) + checkerboard;
++    float limitX = (reduced ? 0.f : 512.f) + checkerboard;
++    auto delta = wheelEvent.delta();
++    auto clampAxis = [&](float current, float webProcess, float d, float limitBefore, float limitAfter) {
++        float wanted = current - d;
++        float low = std::min(webProcess - limitBefore, current), high = std::max(webProcess + limitAfter, current);
++        float allowed = std::clamp(wanted, low, high);
++        if (allowed != wanted)
++            PS5WCHost::noteScrollClamped(wanted - allowed);
++        return current - allowed;
++    };
++    FloatSize clamped { clampAxis(rootPosition->x(), webProcessPosition->x(), delta.width(), limitX, limitX), clampAxis(rootPosition->y(), webProcessPosition->y(), delta.height(), limitAbove, limitBelow) };
++    if (clamped == delta)
++        return wheelEvent;
++    return wheelEvent.copyWithDeltaAndVelocity(clamped, wheelEvent.scrollingVelocity());
++}
++
++void PS5WCScrollingTree::queueFrameLockedScroll(const PlatformWheelEvent& wheelEvent)
++{
++    {
++        Locker locker { m_stickLock };
++        auto now = MonotonicTime::now();
++        double interval = std::clamp((now - m_stickLastEvent).seconds(), 0.004, 0.033);
++        bool resumed = (now - m_stickLastEvent).seconds() > 0.05;
++        FloatSize instant = wheelEvent.delta() * static_cast<float>(1 / interval);
++        m_stickVelocity = resumed ? instant : m_stickVelocity * 0.5f + instant * 0.5f;
++        m_stickPending += wheelEvent.delta();
++        m_stickLastEvent = now;
++        m_stickEvent = wheelEvent;
++    }
++    PS5WCHost::requestFrame();
++}
++
++// Render thread, at the start of a frame: move by velocity x frame interval,
++// within what is queued (and all of it once the stick has stopped), catching
++// up if more than ~3 frames' worth is waiting.
++void PS5WCScrollingTree::applyFrameLockedScroll(MonotonicTime displayTime)
++{
++    std::optional<PlatformWheelEvent> event;
++    {
++        Locker locker { m_stickLock };
++        double dt = m_stickLastFrame ? std::clamp((displayTime - m_stickLastFrame).seconds(), 0.0, 0.05) : 1 / 60.0;
++        m_stickLastFrame = displayTime;
++        if (m_stickPending.isZero() || !m_stickEvent)
++            return;
++        bool stopped = (MonotonicTime::now() - m_stickLastEvent).seconds() > 0.03;
++        auto axis = [&](float pending, float velocity) {
++            if (stopped || !velocity || (pending > 0) != (velocity > 0))
++                return pending;
++            float step = velocity * static_cast<float>(dt);
++            if (std::abs(pending) > 3 * std::abs(step))
++                step = pending - 2 * step;
++            return std::abs(step) > std::abs(pending) ? pending : step;
++        };
++        FloatSize step { axis(m_stickPending.width(), m_stickVelocity.width()), axis(m_stickPending.height(), m_stickVelocity.height()) };
++        m_stickPending -= step;
++        event = m_stickEvent->copyWithDeltaAndVelocity(step, m_stickVelocity);
++    }
++    willProcessWheelEvent();
++    handleWheelEvent(clampAtPaintedEdge(*event), { WheelEventProcessingSteps::AsyncScrolling });
++}
++
+ void PS5WCScrollingTree::setLayerPosition(std::optional<PlatformLayerIdentifier> layer, FloatPoint position)
+ {
+     if (!layer)
+@@ -458,13 +539,16 @@ void PS5WCScrollingTree::removeSubScrollerLayer(ScrollingNodeID nodeID)
+     m_subScrollerLayers.remove(nodeID);
+ }
+ 
+-Vector<PlatformLayerIdentifier> PS5WCScrollingTree::subScrollerLayers()
++Vector<std::pair<ScrollingNodeID, PlatformLayerIdentifier>> PS5WCScrollingTree::subScrollerLayers()
+ {
+     Locker locker { treeLock() };
+-    return copyToVector(m_subScrollerLayers.values());
++    Vector<std::pair<ScrollingNodeID, PlatformLayerIdentifier>> layers;
++    for (auto& entry : m_subScrollerLayers)
++        layers.append({ entry.key, entry.value });
++    return layers;
+ }
+ 
+-void PS5WCScrollingTree::setSubScrollerRects(Vector<FloatRect>&& rects)
++void PS5WCScrollingTree::setSubScrollerRects(Vector<std::pair<ScrollingNodeID, FloatRect>>&& rects)
+ {
+     Locker locker { m_routingLock };
+     m_subScrollerRects = WTF::move(rects);
+@@ -506,14 +590,30 @@ std::optional<FloatPoint> PS5WCScrollingTree::webProcessScrollPosition()
+     return m_webProcessScrollPosition;
+ }
+ 
+-bool PS5WCScrollingTree::pointIsInSubScroller(FloatPoint point)
++std::optional<ScrollingNodeID> PS5WCScrollingTree::subScrollerAtPoint(FloatPoint point)
+ {
+     Locker locker { m_routingLock };
+-    for (auto& rect : m_subScrollerRects) {
+-        if (rect.contains(point))
+-            return true;
++    std::optional<ScrollingNodeID> found;
++    float foundArea = 0;
++    for (auto& [nodeID, rect] : m_subScrollerRects) {
++        if (!rect.contains(point))
++            continue;
++        float area = rect.width() * rect.height();
++        if (!found || area < foundArea) {
++            found = nodeID;
++            foundArea = area;
++        }
+     }
+-    return false;
++    return found;
++}
++
++std::optional<WheelEventHandlingResult> PS5WCScrollingTree::handleWheelEventForSubScroller(const PlatformWheelEvent& wheelEvent, ScrollingNodeID nodeID)
++{
++    Locker locker { treeLock() };
++    RefPtr node = dynamicDowncast<ScrollingTreeScrollingNode>(nodeForID(nodeID));
++    if (!node || node->hasSynchronousScrollingReasons())
++        return std::nullopt;
++    return handleWheelEventWithNode(wheelEvent, { WheelEventProcessingSteps::AsyncScrolling }, node.get(), EventTargeting::Propagate);
+ }
+ 
+ bool PS5WCScrollingTree::rootHasSynchronousScrollingReasons()
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+index e92a540d69..5e4cae774a 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+@@ -23,6 +23,7 @@
+ #include <WebCore/FloatPoint.h>
+ #include <WebCore/FloatRect.h>
+ #include <WebCore/PlatformLayerIdentifier.h>
++#include <WebCore/PlatformWheelEvent.h>
+ #include <WebCore/ScrollingTree.h>
+ #include <wtf/HashMap.h>
+ #include <wtf/Lock.h>
+@@ -60,8 +61,8 @@ public:
+     bool hasActiveAnimations();
+     // Sub-scrollers' container layers (overflow, subframes), for the
+     // main thread's routing: their rects on the scene surface after a paint.
+-    Vector<WebCore::PlatformLayerIdentifier> subScrollerLayers();
+-    void setSubScrollerRects(Vector<WebCore::FloatRect>&&);
++    Vector<std::pair<WebCore::ScrollingNodeID, WebCore::PlatformLayerIdentifier>> subScrollerLayers();
++    void setSubScrollerRects(Vector<std::pair<WebCore::ScrollingNodeID, WebCore::FloatRect>>&&);
+     // The WebProcess's main frame scroll position in its last applied update.
+     void setWebProcessScrollPosition(WebCore::FloatPoint);
+     // How far its tiles reach beyond the viewport at that update (above, below).
+@@ -70,7 +71,14 @@ public:
+     void setScrollVelocity(WebCore::FloatSize);
+ 
+     // Main thread.
+-    bool pointIsInSubScroller(WebCore::FloatPoint);
++    // The innermost (smallest) sub-scroller whose rect holds the point.
++    std::optional<WebCore::ScrollingNodeID> subScrollerAtPoint(WebCore::FloatPoint);
++    // AS4 ("overflow=1"): scroll that node here, chaining to its ancestors at
++    // its limits, unless it has synchronous scrolling reasons (then unhandled
++    // with SynchronousScrolling).
++    void setAsyncSubScrollers(bool on) { m_asyncSubScrollers = on; }
++    bool asyncSubScrollers() const { return m_asyncSubScrollers; }
++    std::optional<WebCore::WheelEventHandlingResult> handleWheelEventForSubScroller(const WebCore::PlatformWheelEvent&, WebCore::ScrollingNodeID);
+     bool rootHasSynchronousScrollingReasons();
+     std::optional<WebCore::FloatPoint> rootScrollPosition();
+     std::optional<WebCore::FloatPoint> webProcessScrollPosition();
+@@ -79,6 +87,21 @@ public:
+     WebCore::WheelEventHandlingResult handleWheelEventAfterDefaultHandling(const WebCore::PlatformWheelEvent&, std::optional<WebCore::ScrollingNodeID>, std::optional<WebCore::WheelScrollGestureState>);
+     unsigned takeTitleScrolls() { return m_titleScrolls.exchange(0); }
+ 
++    // Never scroll past the tiles the WebProcess has painted: the event's
++    // delta, shortened if it would (main or render thread).
++    WebCore::PlatformWheelEvent clampAtPaintedEdge(const WebCore::PlatformWheelEvent&);
++    void setCheckerboardPx(float px) { m_checkerboardPx = px; }
++
++    // Frame-locked stick (AS5, "stickframe=1" in the flag file): pad wheel
++    // events (main thread) become a velocity the render thread integrates
++    // at each frame's display time, so every frame moves by the same amount
++    // (125 Hz pad ticks over 60 Hz frames otherwise give 2 or 3 ticks a frame).
++    void setFrameLockedStick(bool on) { m_frameLockedStick = on; }
++    bool frameLockedStick() const { return m_frameLockedStick; }
++    void queueFrameLockedScroll(const WebCore::PlatformWheelEvent&);
++    // Per-frame scroll steps (px) of the root, for the [ascroll] line.
++    struct StepStats { unsigned frames { 0 }; double sum { 0 }, sumSquares { 0 }; };
++
+     // From the nodes, with the tree lock held.
+     void setLayerPosition(std::optional<WebCore::PlatformLayerIdentifier>, WebCore::FloatPoint);
+     void setLayerBoundsOrigin(std::optional<WebCore::PlatformLayerIdentifier>, WebCore::FloatPoint);
+@@ -97,17 +120,27 @@ private:
+     void didAddPendingScrollUpdate() final;
+ 
+     void layerPositionsChanged();
++    void applyFrameLockedScroll(MonotonicTime displayTime);
+ 
+     const uint64_t m_sceneID;
+     LayerPositions m_layerPositions; // tree lock
+     uint64_t m_layerPositionsVersion { 0 }; // tree lock
+     HashMap<WebCore::ScrollingNodeID, WebCore::PlatformLayerIdentifier> m_subScrollerLayers; // tree lock
+     Lock m_routingLock;
+-    Vector<WebCore::FloatRect> m_subScrollerRects WTF_GUARDED_BY_LOCK(m_routingLock);
++    Vector<std::pair<WebCore::ScrollingNodeID, WebCore::FloatRect>> m_subScrollerRects WTF_GUARDED_BY_LOCK(m_routingLock);
++    bool m_asyncSubScrollers { false };
+     std::optional<WebCore::FloatPoint> m_webProcessScrollPosition WTF_GUARDED_BY_LOCK(m_routingLock);
+     std::pair<int, int> m_webProcessPaintedMargins WTF_GUARDED_BY_LOCK(m_routingLock) { 512, 512 };
+     WebCore::FloatSize m_scrollVelocity WTF_GUARDED_BY_LOCK(m_routingLock);
+     std::atomic<unsigned> m_titleScrolls { 0 };
++    std::atomic<float> m_checkerboardPx { 0 };
++    bool m_frameLockedStick { false };
++    Lock m_stickLock;
++    std::optional<WebCore::PlatformWheelEvent> m_stickEvent WTF_GUARDED_BY_LOCK(m_stickLock); // the newest, as a template
++    WebCore::FloatSize m_stickPending WTF_GUARDED_BY_LOCK(m_stickLock); // queued, not applied yet
++    WebCore::FloatSize m_stickVelocity WTF_GUARDED_BY_LOCK(m_stickLock); // px/s, smoothed
++    MonotonicTime m_stickLastEvent WTF_GUARDED_BY_LOCK(m_stickLock);
++    MonotonicTime m_stickLastFrame; // render thread
+ };
+ 
+ } // namespace WebKit

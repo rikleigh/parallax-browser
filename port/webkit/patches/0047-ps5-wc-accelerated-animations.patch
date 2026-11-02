@@ -1,0 +1,514 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 1c6b9bdfe8..1ebded8ef1 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -35,6 +35,10 @@
+ #include "WCSceneContext.h"
+ #include "WCUpdateInfo.h"
+ #include <WebCore/BitmapTexturePool.h>
++#include <WebCore/GraphicsLayerAnimation.h>
++#include <WebCore/GraphicsLayerFloatAnimationValue.h>
++#include <WebCore/GraphicsLayerKeyframeValueList.h>
++#include <WebCore/GraphicsLayerTransformAnimationValue.h>
+ #include <WebCore/NativeImage.h>
+ #include <WebCore/ShareableBitmap.h>
+ #include <WebCore/TextureMapper.h>
+@@ -74,6 +78,43 @@ public:
+     Markable<WebCore::LayerHostingContextIdentifier> hostIdentifier;
+ };
+ 
++// Accelerated animations sent by GraphicsLayerWC::addAnimation (WCUpdateInfo.h).
++static WebCore::TextureMapperAnimations textureMapperAnimations(const WCAnimations& update)
++{
++    using namespace WebCore;
++    TextureMapperAnimations animations;
++    animations.setTranslate(update.translate);
++    animations.setRotate(update.rotate);
++    animations.setScale(update.scale);
++    animations.setTransform(update.transform);
++    for (auto& animation : update.animations) {
++        auto property = static_cast<AnimatedProperty>(animation.property);
++        bool isOpacity = property == AnimatedProperty::Opacity;
++        if (!isOpacity && property != AnimatedProperty::Translate && property != AnimatedProperty::Rotate
++            && property != AnimatedProperty::Scale && property != AnimatedProperty::Transform)
++            continue;
++        if (animation.keyframes.size() < 2 || animation.direction > static_cast<uint8_t>(GraphicsLayerAnimation::Direction::AlternateReverse))
++            continue;
++        GraphicsLayerKeyframeValueList keyframes(property);
++        for (auto& keyframe : animation.keyframes) {
++            if (isOpacity)
++                keyframes.insert(makeUnique<GraphicsLayerFloatAnimationValue>(keyframe.keyTime, keyframe.opacity, keyframe.timingFunction.get()));
++            else
++                keyframes.insert(makeUnique<GraphicsLayerTransformAnimationValue>(keyframe.keyTime, keyframe.transform, keyframe.timingFunction.get()));
++        }
++        auto parameters = GraphicsLayerAnimation::create();
++        parameters->setDuration(animation.duration);
++        parameters->setIterationCount(animation.iterationCount);
++        parameters->setDirection(static_cast<GraphicsLayerAnimation::Direction>(animation.direction));
++        parameters->setFillMode(animation.fillsForwards ? GraphicsLayerAnimation::FillMode::Forwards : GraphicsLayerAnimation::FillMode::None);
++        parameters->setTimingFunction(animation.timingFunction ? RefPtr { animation.timingFunction } : RefPtr<TimingFunction> { LinearTimingFunction::create() });
++        parameters->setDefaultTimingFunctionForKeyframes(RefPtr { animation.defaultTimingFunctionForKeyframes });
++        animations.add(TextureMapperAnimation(animation.name, keyframes, parameters.get(), animation.startTime, animation.pauseTime,
++            animation.paused ? TextureMapperAnimation::State::Paused : TextureMapperAnimation::State::Playing));
++    }
++    return animations;
++}
++
+ void WCScene::initialize(WCSceneContext& context)
+ {
+     // The creation of the TextureMapper needs an active OpenGL context.
+@@ -236,6 +277,8 @@ bool WCScene::apply(WCUpdateInfo& update)
+                 }
+             }
+         }
++        if (layerUpdate.changes & WCLayerChange::Animations)
++            layer->texmapLayer.setAnimations(textureMapperAnimations(layerUpdate.animations));
+         if (layerUpdate.changes & WCLayerChange::RemoteFrame) {
+             if (layerUpdate.hostIdentifier) {
+                 auto platformLayer = WCRemoteFrameHostLayerManager::singleton().acquireRemoteFrameHostLayer(*layerUpdate.hostIdentifier, m_webProcessIdentifier);
+@@ -264,7 +307,7 @@ void WCScene::paint(WebCore::BitmapTexture& surface)
+     if (!layer)
+         return;
+     auto& rootLayer = layer->texmapLayer;
+-    rootLayer.applyAnimationsRecursively(MonotonicTime::now());
++    m_hasRunningAnimations = rootLayer.applyAnimationsRecursively(MonotonicTime::now());
+ 
+     m_textureMapper->beginPainting(WebCore::TextureMapper::FlipY::No, &surface);
+     // The surface is reused frame after frame: start from transparent.
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index c61bc48946..713e9ff559 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -66,6 +66,8 @@ public:
+     bool hasRootLayer() const { return !!m_rootLayer; }
+     WebCore::IntSize viewport() const { return m_viewport; }
+     unsigned layerCount() const { return m_layers.size(); }
++    // Did the last paint() run animations that go on (paint again next frame)?
++    bool hasRunningAnimations() const { return m_hasRunningAnimations; }
+ 
+ private:
+     struct Layer;
+@@ -79,6 +81,7 @@ private:
+     Markable<WebCore::PlatformLayerIdentifier> m_rootLayer;
+     WebCore::IntSize m_viewport;
+     bool m_usesOffscreenRendering;
++    bool m_hasRunningAnimations { false };
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index aa51bc69f4..b4dec17264 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -336,12 +336,15 @@ private:
+     uint64_t m_updateSerial { 0 };
+     RefPtr<BitmapTexture> m_surface;
+     bool m_dirty { false };
++    bool m_animating { false }; // the shown scene runs accelerated animations
++    bool m_expectingUpdate { false }; // replies went out at the last present
++    MonotonicTime m_lastPaint; // while animating
+     Vector<CompletionHandler<void()>> m_frameCompletions;
+ 
+     struct {
+         MonotonicTime start;
+-        unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 };
+-        double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 };
++        unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 }, animationPaints { 0 }, lateUpdates { 0 };
++        double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 }, paintGapMaxMS { 0 };
+     } m_stats;
+ 
+     // Test driver (main thread).
+@@ -383,6 +386,7 @@ void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, C
+         if (m_state.load() != State::Failed) {
+             m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent) });
+             queued = true;
++            m_stateChanged.notifyAll(); // a frame waiting for this update (paint)
+         }
+     }
+     if (!queued) {
+@@ -553,9 +557,27 @@ void SceneHost::applyPending()
+     }
+ }
+ 
+-unsigned SceneHost::paint(int64_t, int* width, int* height)
++unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+ {
+     *width = *height = 0;
++    // Accelerated animations keep this thread drawing every frame, and a
++    // frame starts right after the last swap, before the WebProcess has
++    // answered that swap's replies with its next update; applied one frame
++    // later, rendering updates (and rAF) would run at 30/s. Wait for it
++    // until 6 ms before the frame is due (the wait ends at the update).
++    if (m_animating && m_expectingUpdate && !hasPending()) {
++        int64_t waitUS = std::min<int64_t>(displayUS - 6000 - g_get_monotonic_time(), 10000);
++        if (waitUS > 0) {
++            Locker locker { m_lock };
++            m_stateChanged.waitFor(m_lock, Seconds::fromMicroseconds(waitUS), [&] {
++                return !m_queue.isEmpty();
++            });
++        }
++        if (hasPending()) {
++            m_stats.lateUpdates++;
++            applyPending();
++        }
++    }
+     if (!m_shownPage)
+         return 0;
+     auto it = m_scenes.find(*m_shownPage);
+@@ -569,14 +591,21 @@ unsigned SceneHost::paint(int64_t, int* width, int* height)
+         m_surface = BitmapTexture::create(size, { BitmapTexture::Flags::SupportsAlpha });
+         m_dirty = true;
+     }
+-    if (m_dirty) {
++    if (m_dirty || m_animating) {
+         auto start = MonotonicTime::now();
++        if (!m_dirty)
++            m_stats.animationPaints++;
+         scene.paint(*m_surface);
+         m_dirty = false;
++        // Accelerated animations: paint again next frame, updates or not.
++        m_animating = scene.hasRunningAnimations();
+         double ms = msSince(start);
+         m_stats.paints++;
+         m_stats.paintMS += ms;
+         m_stats.paintMaxMS = std::max(m_stats.paintMaxMS, ms);
++        if (m_lastPaint)
++            m_stats.paintGapMaxMS = std::max(m_stats.paintGapMaxMS, (start - m_lastPaint).milliseconds());
++        m_lastPaint = start;
+     }
+     *width = size.width();
+     *height = size.height();
+@@ -586,11 +615,18 @@ unsigned SceneHost::paint(int64_t, int* width, int* height)
+ void SceneHost::didPresent()
+ {
+     BitmapTextureUploaderPS5::singleton().frameDone();
++    // Replies going out now: the WebProcess will likely send its next update soon.
++    m_expectingUpdate = !m_frameCompletions.isEmpty();
+     if (!m_frameCompletions.isEmpty()) {
+         m_stats.presents++;
+         completeOnMainThread(std::exchange(m_frameCompletions, { }));
+     }
+     maybeLog();
++    if (m_animating) {
++        if (auto requestFrame = m_requestFrame.load())
++            requestFrame();
++    } else
++        m_lastPaint = { };
+ }
+ 
+ void SceneHost::maybeLog()
+@@ -606,11 +642,11 @@ void SceneHost::maybeLog()
+             layers += entry.second->layerCount();
+         auto programs = TextureMapperShaderProgram::compileStats();
+         WTFLogAlways("[wc] %.1f s: %u updates (apply %.2f ms avg, %.1f max; %u unchanged), %u presents; %zu pages, %u layers; tiles uploaded %u (%u draws, %.1f MB, %.2f ms, %.3f ms per upload, %u fence waits, %u finishes); " // NOLINT
+-            "%u paints (%.2f ms avg, %.1f max); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s)",
++            "%u paints (%.2f ms avg, %.1f max; %u for animations only, longest gap %.1f ms, %u waited for); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s)",
+             seconds, m_stats.updates, m_stats.updates ? m_stats.applyMS / m_stats.updates : 0.0, m_stats.applyMaxMS, m_stats.unchanged, m_stats.presents,
+             m_scenes.size(), layers, uploads.uploads, uploads.draws, uploads.bytes / 1048576.0, uploads.milliseconds,
+             uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
+-            m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS,
++            m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS, m_stats.animationPaints, m_stats.paintGapMaxMS, m_stats.lateUpdates,
+             BitmapTextureUploaderPS5::textureBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion);
+     }
+     auto start = now;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 70e1545653..74d737073d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -33,6 +33,10 @@
+ #include "WCTileGrid.h"
+ #include "WCTilePainter.h"
+ #include <WebCore/GraphicsContext.h>
++#include <WebCore/GraphicsLayerAnimation.h>
++#include <WebCore/GraphicsLayerFloatAnimationValue.h>
++#include <WebCore/GraphicsLayerKeyframeValueList.h>
++#include <WebCore/GraphicsLayerTransformAnimationValue.h>
+ #include <WebCore/TransformState.h>
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/text/MakeString.h>
+@@ -626,6 +630,123 @@ void GraphicsLayerWC::setBackdropFiltersRect(const FloatRoundedRect& backdropFil
+     noteLayerPropertyChanged(WCLayerChange::BackdropFiltersRect);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Accelerated animations (COMPOSITING-PLAN.md, M3): kept here as WCAnimations
++// and sent whole whenever they change; the scene (WCScene) runs them as
++// TextureMapperAnimations every frame, so they don't need the main thread.
++bool GraphicsLayerWC::addAnimation(const GraphicsLayerKeyframeValueList& valueList, const GraphicsLayerAnimation* animation, const String& animationName, double timeOffset)
++{
++    ASSERT(!animationName.isEmpty());
++    // PS5WK_WC_ANIMATIONS=0 (child.env): the main thread steps them, for A/B tests.
++    static const bool enabled = !getenv("PS5WK_WC_ANIMATIONS") || strcmp(getenv("PS5WK_WC_ANIMATIONS"), "0");
++    if (!enabled || !animation || animation->isZeroDuration() || valueList.size() < 2)
++        return false;
++    // As GraphicsLayerCoordinated: TextureMapperAnimation runs forwards at rate 1.
++    if (animation->playbackRate() != 1 || !animation->directionIsForwards())
++        return false;
++    auto property = valueList.property();
++    bool isOpacity = property == AnimatedProperty::Opacity;
++    if (!isOpacity && property != AnimatedProperty::Translate && property != AnimatedProperty::Rotate
++        && property != AnimatedProperty::Scale && property != AnimatedProperty::Transform)
++        return false; // filters stay on the main thread
++
++    WCAnimation newAnimation;
++    newAnimation.name = animationName;
++    newAnimation.property = static_cast<uint8_t>(property);
++    for (size_t i = 0; i < valueList.size(); ++i) {
++        auto& value = valueList.at(i);
++        WCAnimationKeyframe keyframe;
++        keyframe.keyTime = value.keyTime();
++        if (auto* timingFunction = value.timingFunction())
++            keyframe.timingFunction = timingFunction->clone();
++        if (isOpacity)
++            keyframe.opacity = static_cast<const GraphicsLayerFloatAnimationValue&>(value).value();
++        else
++            keyframe.transform = static_cast<const GraphicsLayerTransformAnimationValue&>(value).value().clone();
++        newAnimation.keyframes.append(WTF::move(keyframe));
++    }
++    if (auto timingFunction = animation->timingFunction())
++        newAnimation.timingFunction = timingFunction->clone();
++    if (auto timingFunction = animation->defaultTimingFunctionForKeyframes())
++        newAnimation.defaultTimingFunctionForKeyframes = timingFunction->clone();
++    newAnimation.duration = animation->duration().value_or(0);
++    newAnimation.iterationCount = animation->iterationCount();
++    newAnimation.direction = static_cast<uint8_t>(animation->direction());
++    newAnimation.fillsForwards = animation->fillsForwards();
++    newAnimation.startTime = MonotonicTime::now() - Seconds(timeOffset);
++
++    // Resuming a paused animation adds it again.
++    m_animations.removeAllMatching([&](auto& existing) {
++        return existing.name == animationName && existing.property == newAnimation.property;
++    });
++    m_animations.append(WTF::move(newAnimation));
++    noteLayerPropertyChanged(WCLayerChange::Animations);
++    return true;
++}
++
++void GraphicsLayerWC::pauseAnimation(const String& animationName, double timeOffset)
++{
++    for (auto& animation : m_animations) {
++        if (animation.name == animationName) {
++            animation.paused = true;
++            animation.pauseTime = Seconds(timeOffset);
++        }
++    }
++    noteLayerPropertyChanged(WCLayerChange::Animations);
++}
++
++void GraphicsLayerWC::removeAnimation(const String& animationName, std::optional<AnimatedProperty> property)
++{
++    bool removed = m_animations.removeAllMatching([&](auto& animation) {
++        return animation.name == animationName && (!property || animation.property == static_cast<uint8_t>(*property));
++    });
++    if (removed)
++        noteLayerPropertyChanged(WCLayerChange::Animations);
++}
++
++void GraphicsLayerWC::transformRelatedPropertyDidChange()
++{
++    // The non-animated transform parts go with the animations.
++    bool hasTransformAnimation = std::ranges::any_of(m_animations, [](auto& animation) {
++        return animation.property != static_cast<uint8_t>(AnimatedProperty::Opacity);
++    });
++    if (hasTransformAnimation)
++        noteLayerPropertyChanged(WCLayerChange::Animations);
++}
++
++Vector<GraphicsLayer::AcceleratedAnimationForTesting> GraphicsLayerWC::acceleratedAnimationsForTesting() const
++{
++    return WTF::map(m_animations, [](auto& animation) {
++        return AcceleratedAnimationForTesting { animatedPropertyIDAsString(static_cast<AnimatedProperty>(animation.property)), animation.paused ? 0.0 : 1.0, false, false };
++    });
++}
++
++// A copy that shares no reference-counted objects with this layer's (the
++// update may be serialized and freed off the main thread).
++static WCAnimation isolatedCopy(const WCAnimation& animation)
++{
++    auto copyTimingFunction = [](const RefPtr<TimingFunction>& function) -> RefPtr<TimingFunction> {
++        return function ? RefPtr<TimingFunction> { function->clone() } : nullptr;
++    };
++    WCAnimation copy;
++    copy.name = animation.name.isolatedCopy();
++    copy.property = animation.property;
++    copy.keyframes = WTF::map(animation.keyframes, [&](auto& keyframe) {
++        return WCAnimationKeyframe { keyframe.keyTime, copyTimingFunction(keyframe.timingFunction), keyframe.opacity, keyframe.transform.clone(), { } };
++    });
++    copy.timingFunction = copyTimingFunction(animation.timingFunction);
++    copy.defaultTimingFunctionForKeyframes = copyTimingFunction(animation.defaultTimingFunctionForKeyframes);
++    copy.duration = animation.duration;
++    copy.iterationCount = animation.iterationCount;
++    copy.direction = animation.direction;
++    copy.fillsForwards = animation.fillsForwards;
++    copy.startTime = animation.startTime;
++    copy.pauseTime = animation.pauseTime;
++    copy.paused = animation.paused;
++    return copy;
++}
++#endif
++
+ void GraphicsLayerWC::noteLayerPropertyChanged(OptionSet<WCLayerChange> flags, ScheduleFlushOrNot scheduleFlush)
+ {
+     if (beingDestroyed())
+@@ -749,6 +870,17 @@ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+     }
+     if (update.changes & WCLayerChange::RemoteFrame)
+         update.hostIdentifier = m_hostIdentifier;
++#if defined(PS5_PAYLOAD_SDK)
++    if (update.changes & WCLayerChange::Animations) {
++        update.animations.animations = WTF::map(m_animations, [](auto& animation) {
++            return isolatedCopy(animation);
++        });
++        update.animations.translate = client().transformMatrixForProperty(AnimatedProperty::Translate);
++        update.animations.rotate = client().transformMatrixForProperty(AnimatedProperty::Rotate);
++        update.animations.scale = client().transformMatrixForProperty(AnimatedProperty::Scale);
++        update.animations.transform = client().transformMatrixForProperty(AnimatedProperty::Transform);
++    }
++#endif
+     m_observer->commitLayerUpdateInfo(WTF::move(update));
+ }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index aaa37cedab..156a6d31ab 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -123,6 +123,14 @@ public:
+     void flushCompositingStateForThisLayerOnly() override;
+     WebCore::TiledBacking* tiledBacking() const override;
+     void setShadowPath(const WebCore::Path&) override { }
++#if defined(PS5_PAYLOAD_SDK)
++    // Accelerated animations: the scene runs them (WCUpdateInfo animations).
++    bool addAnimation(const WebCore::GraphicsLayerKeyframeValueList&, const WebCore::GraphicsLayerAnimation*, const String&, double) override;
++    void pauseAnimation(const String&, double) override;
++    void removeAnimation(const String&, std::optional<WebCore::AnimatedProperty>) override;
++    void transformRelatedPropertyDidChange() override;
++    Vector<AcceleratedAnimationForTesting> acceleratedAnimationsForTesting() const override;
++#endif
+ 
+ protected:
+     friend WCTiledBacking;
+@@ -160,6 +168,9 @@ private:
+     WebCore::Color m_solidColor;
+     WebCore::Color m_debugBorderColor;
+     OptionSet<WCLayerChange> m_uncommittedChanges;
++#if defined(PS5_PAYLOAD_SDK)
++    Vector<WCAnimation> m_animations;
++#endif
+     float m_debugBorderWidth { 0 };
+ };
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+index df4d29df47..d9ec1b0589 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+@@ -31,6 +31,8 @@
+ #include "WCContentBufferIdentifier.h"
+ #include <WebCore/GraphicsLayer.h>
+ #include <WebCore/TextureMapperSparseBackingStore.h>
++#include <WebCore/TimingFunction.h>
++#include <WebCore/TransformOperations.h>
+ #include <optional>
+ #include <wtf/OptionSet.h>
+ 
+@@ -73,6 +75,42 @@ enum class WCLayerChange : uint32_t {
+     ContentsClippingRect         = 1 << 26,
+     PlatformLayer                = 1 << 27,
+     RemoteFrame                  = 1 << 28,
++    Animations                   = 1 << 29,
++};
++
++// Accelerated animations (PS5, COMPOSITING-PLAN.md M3): what the scene needs
++// to run a layer's transform, opacity and filter animations on its own,
++// every frame, as TextureMapperAnimations (GraphicsLayerWC::addAnimation).
++struct WCAnimationKeyframe {
++    double keyTime { 0 };
++    RefPtr<WebCore::TimingFunction> timingFunction;
++    float opacity { 0 }; // AnimatedProperty::Opacity
++    WebCore::TransformOperations transform; // Translate, Rotate, Scale, Transform
++    WebCore::FilterOperations filters; // Filter, WebkitBackdropFilter
++};
++
++struct WCAnimation {
++    String name;
++    uint8_t property { 0 }; // WebCore::AnimatedProperty
++    Vector<WCAnimationKeyframe> keyframes;
++    RefPtr<WebCore::TimingFunction> timingFunction;
++    RefPtr<WebCore::TimingFunction> defaultTimingFunctionForKeyframes;
++    double duration { 0 };
++    double iterationCount { 1 };
++    uint8_t direction { 0 }; // WebCore::GraphicsLayerAnimation::Direction
++    bool fillsForwards { false };
++    MonotonicTime startTime;
++    Seconds pauseTime;
++    bool paused { false };
++};
++
++struct WCAnimations {
++    Vector<WCAnimation> animations;
++    // The layer's non-animated transform parts (TextureMapperAnimations::apply).
++    WebCore::TransformationMatrix translate;
++    WebCore::TransformationMatrix rotate;
++    WebCore::TransformationMatrix scale;
++    WebCore::TransformationMatrix transform;
+ };
+ 
+ struct WCLayerUpdateInfo {
+@@ -119,6 +157,7 @@ struct WCLayerUpdateInfo {
+     } platformLayer { };
+ 
+     Markable<WebCore::LayerHostingContextIdentifier> hostIdentifier { };
++    WCAnimations animations { };
+ };
+ 
+ struct WCUpdateInfo {
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+index bd5b4f052b..e050f92625 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+@@ -61,6 +61,38 @@ header: "WCUpdateInfo.h"
+     ContentsClippingRect,
+     PlatformLayer,
+     RemoteFrame,
++    Animations,
++}
++
++[CustomHeader] struct WebKit::WCAnimationKeyframe {
++    double keyTime;
++    RefPtr<WebCore::TimingFunction> timingFunction;
++    float opacity;
++    WebCore::TransformOperations transform;
++    WebCore::FilterOperations filters;
++}
++
++[CustomHeader] struct WebKit::WCAnimation {
++    String name;
++    uint8_t property;
++    Vector<WebKit::WCAnimationKeyframe> keyframes;
++    RefPtr<WebCore::TimingFunction> timingFunction;
++    RefPtr<WebCore::TimingFunction> defaultTimingFunctionForKeyframes;
++    double duration;
++    double iterationCount;
++    uint8_t direction;
++    bool fillsForwards;
++    MonotonicTime startTime;
++    Seconds pauseTime;
++    bool paused;
++}
++
++[CustomHeader] struct WebKit::WCAnimations {
++    Vector<WebKit::WCAnimation> animations;
++    WebCore::TransformationMatrix translate;
++    WebCore::TransformationMatrix rotate;
++    WebCore::TransformationMatrix scale;
++    WebCore::TransformationMatrix transform;
+ }
+ 
+ [Nested] struct WebKit::WCLayerUpdateInfo::BackgroundChanges {
+@@ -107,6 +139,7 @@ header: "WCUpdateInfo.h"
+     [OptionalTupleBit=WebKit::WCLayerChange::ContentsClippingRect] WebCore::FloatRoundedRect contentsClippingRect;
+     [OptionalTupleBit=WebKit::WCLayerChange::PlatformLayer] WebKit::WCLayerUpdateInfo::PlatformLayerChanges platformLayer;
+     [OptionalTupleBit=WebKit::WCLayerChange::RemoteFrame] Markable<WebCore::LayerHostingContextIdentifier> hostIdentifier;
++    [OptionalTupleBit=WebKit::WCLayerChange::Animations] WebKit::WCAnimations animations;
+ }
+ 
+ struct WebKit::WCUpdateInfo {

@@ -1,0 +1,251 @@
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+index 3007f8a4a5..c5258e7106 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+@@ -130,6 +130,13 @@ void BitmapTexturePool::releaseAllTextures()
+ void BitmapTexturePool::scheduleReleaseUnusedTextures()
+ {
+     assertIsHeld(m_lock);
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS) && defined(PS5_PAYLOAD_SDK)
++    // The PS5 compositor runs TextureMapper on the title's render thread, in
++    // a context no other thread may use; WCScene releases unused textures
++    // there on every update (TextureMapper::releaseUnusedTexturesNow). The
++    // main-thread timer would reach for PlatformDisplay's sharing context.
++    return;
++#endif
+     if (m_releaseUnusedTexturesTimer.isActive())
+         return;
+ 
+diff --git a/Source/WebCore/platform/graphics/egl/GLContext.cpp b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+index e612650d57..c2c3c3c565 100644
+--- a/Source/WebCore/platform/graphics/egl/GLContext.cpp
++++ b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+@@ -670,6 +670,14 @@ const GLContext::GLExtensions& GLContext::glExtensions() const
+         m_glExtensions.APPLE_sync = isExtensionSupported(extensionsString, "GL_APPLE_sync");
+         m_glExtensions.OES_packed_depth_stencil = isExtensionSupported(extensionsString, "GL_OES_packed_depth_stencil");
+         m_glExtensions.EXT_YUV_target = isExtensionSupported(extensionsString, "GL_EXT_YUV_target");
++#if USE(LIBEPOXY)
++        // Desktop GL 3.0+ has these in core (no GLES extension names in its list).
++        if (epoxy_is_desktop_gl() && version() >= 300) {
++            m_glExtensions.OES_texture_npot = true;
++            m_glExtensions.EXT_unpack_subimage = true;
++            m_glExtensions.OES_packed_depth_stencil = true;
++        }
++#endif
+ #if USE(VULKAN)
+         m_glExtensions.EXT_memory_object = isExtensionSupported(extensionsString, "GL_EXT_memory_object");
+ #endif
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp
+index aed0573e9f..a88b9fdf24 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapper.cpp
+@@ -70,6 +70,10 @@ public:
+     TextureMapper::FlipY flipY { TextureMapper::FlipY::No };
+     GLint previousProgram { 0 };
+     GLint previousVAO { 0 };
++    // Core profiles (desktop GL 3.2+: the PS5's GL 4.6) have no default vertex
++    // array object: glVertexAttribPointer needs one bound while painting.
++    GLuint vao { 0 };
++    bool needsVAO { false };
+     GLint targetFrameBuffer { 0 };
+     bool didModifyStencil { false };
+     GLint previousScissorState { 0 };
+@@ -135,6 +139,11 @@ TextureMapperGLData::TextureMapperGLData(void* platformContext)
+ 
+ TextureMapperGLData::~TextureMapperGLData()
+ {
++#if USE(LIBEPOXY)
++    if (vao)
++        glDeleteVertexArrays(1, &vao);
++#endif
++
+     for (auto& entry : m_vbos)
+         glDeleteBuffers(1, &entry.value);
+ 
+@@ -234,6 +243,15 @@ ClipStack& TextureMapper::clipStack()
+ void TextureMapper::beginPainting(FlipY flipY, BitmapTexture* surface)
+ {
+     glGetIntegerv(GL_CURRENT_PROGRAM, &data().previousProgram);
++#if USE(LIBEPOXY)
++    data().needsVAO = epoxy_is_desktop_gl();
++    if (data().needsVAO) {
++        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &data().previousVAO);
++        if (!data().vao)
++            glGenVertexArrays(1, &data().vao);
++        glBindVertexArray(data().vao);
++    }
++#endif
+     data().previousScissorState = glIsEnabled(GL_SCISSOR_TEST);
+     data().previousDepthState = glIsEnabled(GL_DEPTH_TEST);
+     glDepthFunc(GL_LEQUAL);
+@@ -256,6 +274,10 @@ void TextureMapper::endPainting()
+     }
+ 
+     glUseProgram(data().previousProgram);
++#if USE(LIBEPOXY)
++    if (data().needsVAO)
++        glBindVertexArray(data().previousVAO);
++#endif
+ 
+     glScissor(data().previousScissor[0], data().previousScissor[1], data().previousScissor[2], data().previousScissor[3]);
+     if (data().previousScissorState)
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.cpp
+index 9cc95ada9f..a56832d14f 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.cpp
+@@ -26,10 +26,31 @@
+ 
+ #include "GLContext.h"
+ #include "Logging.h"
++#include "TextureMapperGLHeaders.h"
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <wtf/MonotonicTime.h>
+ #include <wtf/text/StringBuilder.h>
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++static TextureMapperShaderProgram::CompileStats s_compileStats;
++// The PS5's desktop GL 4.6 core context should take GLSL ES 3.00 (GL 4.3
++// includes ARB_ES3_compatibility). If it refuses a program, every program is
++// built with a desktop header instead; the templates only need __VERSION__ >= 300.
++static bool s_useDesktopGLSL { false };
++
++TextureMapperShaderProgram::CompileStats TextureMapperShaderProgram::compileStats()
++{
++    auto stats = s_compileStats;
++    stats.glslVersion = s_useDesktopGLSL ? "330 core" : "300 es";
++    return stats;
++}
++#endif
++
+ static inline bool compositingLogEnabled()
+ {
+ #if !LOG_DISABLED
+@@ -726,10 +747,26 @@ Ref<TextureMapperShaderProgram> TextureMapperShaderProgram::create(TextureMapper
+     SET_APPLIER_FROM_OPTIONS(RoundedRectClip);
+     SET_APPLIER_FROM_OPTIONS(Premultiply);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    auto startTime = MonotonicTime::now();
++    if (!s_useDesktopGLSL && epoxy_is_desktop_gl()) {
++        static const bool forced = getenv("PS5WK_TEXMAP_GLSL") && !strcmp(getenv("PS5WK_TEXMAP_GLSL"), "core");
++        s_useDesktopGLSL = forced;
++    }
++    const bool desktopGLSL = s_useDesktopGLSL;
++    auto versionDirective = [&] {
++        return desktopGLSL ? unsafeSpan(GLSL_DIRECTIVE(version 330 core)) : unsafeSpan(GLSL_DIRECTIVE(version 300 es));
++    };
++#else
++    auto versionDirective = [] {
++        return unsafeSpan(GLSL_DIRECTIVE(version 300 es));
++    };
++#endif
++
+     StringBuilder vertexShaderBuilder;
+ 
+     if (glVersion >= 300) {
+-        vertexShaderBuilder.append(unsafeSpan(GLSL_DIRECTIVE(version 300 es)));
++        vertexShaderBuilder.append(versionDirective());
+         vertexShaderBuilder.append(unsafeSpan(ES3_COMPATIBILITY_VERTEX));
+     }
+ 
+@@ -745,7 +782,7 @@ Ref<TextureMapperShaderProgram> TextureMapperShaderProgram::create(TextureMapper
+     StringBuilder fragmentShaderBuilder;
+ 
+     if (glVersion >= 300) {
+-        fragmentShaderBuilder.append(unsafeSpan(GLSL_DIRECTIVE(version 300 es)));
++        fragmentShaderBuilder.append(versionDirective());
+         fragmentShaderBuilder.append(unsafeSpan(ES3_COMPATIBILITY_FRAGMENT));
+     }
+ 
+@@ -781,7 +818,22 @@ Ref<TextureMapperShaderProgram> TextureMapperShaderProgram::create(TextureMapper
+     else
+         fragmentShaderBuilder.append(unsafeSpan(fragmentTemplateYUVToRGBNoop));
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    Ref program = adoptRef(*new TextureMapperShaderProgram(vertexShaderBuilder.toString(), fragmentShaderBuilder.toString()));
++    s_compileStats.programs++;
++    s_compileStats.milliseconds += (MonotonicTime::now() - startTime).milliseconds();
++    if (!program->linked()) {
++        s_compileStats.failures++;
++        if (!desktopGLSL && epoxy_is_desktop_gl()) {
++            WTFLogAlways("[texmap] GLSL ES 3.00 program refused on desktop GL: building programs with #version 330 core"); // NOLINT
++            s_useDesktopGLSL = true;
++            return create(options);
++        }
++    }
++    return program;
++#else
+     return adoptRef(*new TextureMapperShaderProgram(vertexShaderBuilder.toString(), fragmentShaderBuilder.toString()));
++#endif
+ }
+ 
+ #if !LOG_DISABLED
+@@ -841,6 +893,27 @@ TextureMapperShaderProgram::TextureMapperShaderProgram(const String& vertex, con
+     glAttachShader(m_id, m_fragmentShader);
+     glLinkProgram(m_id);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    GLint vertexOK = 0, fragmentOK = 0, linkOK = 0;
++    glGetShaderiv(m_vertexShader, GL_COMPILE_STATUS, &vertexOK);
++    glGetShaderiv(m_fragmentShader, GL_COMPILE_STATUS, &fragmentOK);
++    glGetProgramiv(m_id, GL_LINK_STATUS, &linkOK);
++    m_linked = vertexOK && fragmentOK && linkOK;
++    if (!m_linked) {
++        auto infoLog = [](GLuint object, bool isProgram) {
++            std::array<GLchar, 1024> buffer { };
++            GLsizei length = 0;
++            if (isProgram)
++                glGetProgramInfoLog(object, buffer.size() - 1, &length, buffer.data());
++            else
++                glGetShaderInfoLog(object, buffer.size() - 1, &length, buffer.data());
++            return std::string(buffer.data(), std::max(length, 0));
++        };
++        WTFLogAlways("[texmap] shader program failed: vertex %d fragment %d link %d; vertex log: %s; fragment log: %s; program log: %s", // NOLINT
++            vertexOK, fragmentOK, linkOK, infoLog(m_vertexShader, false).c_str(), infoLog(m_fragmentShader, false).c_str(), infoLog(m_id, true).c_str());
++    }
++#endif
++
+     if (!compositingLogEnabled() || glGetError() == GL_NO_ERROR)
+         return;
+ 
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.h b/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.h
+index f4510ce250..8962e10e3b 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperShaderProgram.h
+@@ -133,8 +133,23 @@ public:
+ 
+     void setMatrix(GLuint, const TransformationMatrix&);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // The PS5 compositor's log: programs built so far, how many failed to
++    // compile or link, wall time spent compiling and linking, and the GLSL
++    // version directive in use ("300 es", or "330 core" if the desktop GL
++    // context refused GLSL ES).
++    struct CompileStats {
++        unsigned programs { 0 };
++        unsigned failures { 0 };
++        double milliseconds { 0 };
++        const char* glslVersion { "" };
++    };
++    WEBCORE_EXPORT static CompileStats compileStats();
++#endif
++
+ private:
+     TextureMapperShaderProgram(const String& vertexShaderSource, const String& fragmentShaderSource);
++    bool linked() const { return m_linked; }
+ 
+     GLuint m_vertexShader;
+     GLuint m_fragmentShader;
+@@ -143,6 +158,7 @@ private:
+     GLuint getLocation(VariableID, ASCIILiteral, VariableType);
+ 
+     GLuint m_id;
++    bool m_linked { true };
+     HashMap<VariableID, GLuint, IntHash<VariableID>, WTF::StrongEnumHashTraits<VariableID>> m_variables;
+ };
+ 

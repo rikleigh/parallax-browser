@@ -1,0 +1,408 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index cf0124339b..9716c1a226 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -131,6 +131,18 @@ bool DrawingAreaProxyWCPS5::earlyReplyForScene(uint64_t sceneID)
+     return earlyReplyScenes().contains(sceneID);
+ }
+ 
++static HashSet<uint64_t>& syncScenes()
++{
++    static NeverDestroyed<HashSet<uint64_t>> set;
++    return set;
++}
++
++bool DrawingAreaProxyWCPS5::syncForScene(uint64_t sceneID)
++{
++    Locker locker { earlyReplyLock() };
++    return syncScenes().contains(sceneID);
++}
++
+ void DrawingAreaProxyWCPS5::sendScrollUpdates(uint64_t sceneID)
+ {
+     if (auto* drawingArea = liveDrawingAreas().get(sceneID))
+@@ -371,6 +383,11 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+         if (asyncScrollingOption("earlyreply", 1) > 0) {
+             Locker locker { earlyReplyLock() };
+             earlyReplyScenes().add(identifier().toUInt64());
++            // Frames of a title scroll wait for the WebProcess's update at
++            // their scroll position ("sync=0": they don't; PS5WCHost).
++            if (asyncScrollingOption("sync", 1) > 0)
++                syncScenes().add(identifier().toUInt64());
++            PS5WCHost::setSyncReserveMS(asyncScrollingOption("syncreserve", 5));
+         }
+         Locker locker { scrollingTreesLock() };
+         scrollingTrees().set(identifier().toUInt64(), *m_scrollingTree);
+@@ -412,6 +429,7 @@ DrawingAreaProxyWCPS5::~DrawingAreaProxyWCPS5()
+         scrollingTrees().remove(identifier().toUInt64());
+         Locker earlyLocker { earlyReplyLock() };
+         earlyReplyScenes().remove(identifier().toUInt64());
++        syncScenes().remove(identifier().toUInt64());
+     }
+ #endif
+     // The scene is keyed by this drawing area, not the page: a page restart
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index 22949477e6..4a0b4bd53e 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -80,6 +80,10 @@ public:
+     static void sendScrollUpdates(uint64_t sceneID);
+     // Any thread: answer the scene's updates when applied, not after the swap.
+     static bool earlyReplyForScene(uint64_t sceneID);
++    // Any thread: a frame that scrolls the scene's root in the title waits
++    // (briefly) for the WebProcess's update made at that scroll position,
++    // so scroll-linked content moves with the page (early replies only).
++    static bool syncForScene(uint64_t sceneID);
+ 
+     bool hasScrollingTree() const { return !!m_scrollingTree; }
+     // WebPageProxy::handleWheelEvent: true if the event is taken here.
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index a5dd65d8ac..36c99a8188 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -437,7 +437,24 @@ private:
+     int64_t m_lastTreePositionUS { 0 };
+     FloatSize m_treeVelocity;
+     bool m_scrollAnimating { false };
+-    bool applyScrollingTree(WCScene&, uint64_t sceneID, int64_t displayUS);
++    // serviceTree false: the tree was serviced for this frame already
++    // (syncWithWebProcess); only its positions go into the scene.
++    bool applyScrollingTree(WCScene&, uint64_t sceneID, int64_t displayUS, bool serviceTree = true);
++    // Scroll-linked content (COMPOSITING-PLAN.md, "Scroll-linked animations
++    // under async scrolling"): a frame that moves the root in the title
++    // sends that position to the WebProcess before the replies that start
++    // its next rendering update, and waits (until shortly before the frame
++    // must be painted) for the update made at it, so that what the page
++    // positions from scrollY (rAF, scroll events, IntersectionObserver,
++    // scroll-driven animations) moves with the page instead of a frame
++    // behind. Replies to early-answered updates are held until then
++    // (m_heldReplies). DrawingAreaProxyWCPS5::syncForScene ("sync=0" off).
++    void syncWithWebProcess(uint64_t sceneID, int64_t displayUS);
++    void releaseHeldReplies();
++    Vector<CompletionHandler<void()>> m_heldReplies;
++    bool m_syncRanThisFrame { false };
++    bool m_treeServicedThisFrame { false };
++    double m_paintEstimateMS { 3 }; // scene paint, smoothed
+     void updateSubScrollerRects(WCScene&, uint64_t sceneID);
+ #endif
+     bool m_scrollMovedByTitle { false }; // this frame
+@@ -457,6 +474,11 @@ private:
+         double titleStepPx { 0 }, titleStepSquares { 0 };
+         double leadMaxPx { 0 }, leadPx { 0 };
+         unsigned leadSamples { 0 };
++        // Frames the title moved the root: content made at that position
++        // (lead under 1 px) or behind it; sync waits and how they ended.
++        unsigned movingFrames { 0 }, contentInStep { 0 };
++        unsigned syncWaits { 0 }, syncInTime { 0 }, syncStale { 0 }, syncMissed { 0 }, syncAlready { 0 };
++        double syncWaitMS { 0 }, syncWaitMaxMS { 0 };
+     } m_scrollStats;
+     void noteScrollPresent();
+     void maybeLogScroll();
+@@ -759,6 +781,13 @@ void SceneHost::applyPending()
+             // free); reply at once. "earlyreply=0" in the flag file: after the swap.
+             if (DrawingAreaProxyWCPS5::earlyReplyForScene(job.pageID)) {
+                 m_stats.earlyReplies++;
++                // Sync: held until this frame's scroll position has gone
++                // out (syncWithWebProcess), so the WebProcess's next
++                // rendering update is made at it.
++                if (DrawingAreaProxyWCPS5::syncForScene(job.pageID)) {
++                    m_heldReplies.append(WTF::move(job.didPresent));
++                    continue;
++                }
+                 Vector<CompletionHandler<void()>> handlers;
+                 handlers.append(WTF::move(job.didPresent));
+                 completeOnMainThread(WTF::move(handlers));
+@@ -798,6 +827,12 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     }
+     if (!m_shownPage)
+         return 0;
++#if ENABLE(ASYNC_SCROLLING)
++    m_treeServicedThisFrame = false;
++    syncWithWebProcess(*m_shownPage, displayUS);
++    if (!m_shownPage)
++        return 0;
++#endif
+     auto it = m_scenes.find(*m_shownPage);
+     if (it == m_scenes.end() || !it->second->hasRootLayer())
+         return 0;
+@@ -806,7 +841,7 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     if (size.isEmpty())
+         return 0;
+ #if ENABLE(ASYNC_SCROLLING)
+-    if (applyScrollingTree(scene, *m_shownPage, displayUS))
++    if (applyScrollingTree(scene, *m_shownPage, displayUS, !m_treeServicedThisFrame))
+         m_dirty = true;
+ #endif
+     if (!m_surface || m_surface->size() != size) {
+@@ -831,6 +866,7 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+         // Accelerated animations: paint again next frame, updates or not.
+         m_animating = scene.hasRunningAnimations();
+         double ms = msSince(start);
++        m_paintEstimateMS += (std::min(ms, 30.0) - m_paintEstimateMS) * 0.1;
+         m_perf.paints++;
+         m_perf.paintUS += static_cast<uint64_t>(ms * 1000);
+         m_stats.paints++;
+@@ -944,6 +980,18 @@ void SceneHost::checkGLMemory()
+ 
+ void SceneHost::didPresent()
+ {
++#if ENABLE(ASYNC_SCROLLING)
++    // Replies held by a frame that didn't sync (no paint: VR, no scene
++    // shown) go now. Those an in-frame sync held (the update made at this
++    // frame's position) go with the next frame's position, which runs at
++    // once.
++    if (!std::exchange(m_syncRanThisFrame, false))
++        releaseHeldReplies();
++    else if (!m_heldReplies.isEmpty()) {
++        if (auto requestFrame = m_requestFrame.load())
++            requestFrame();
++    }
++#endif
+     BitmapTextureUploaderPS5::singleton().frameDone();
+     checkGLMemory();
+     m_coverageReduced = m_glState != GLMemoryState::Normal;
+@@ -1068,7 +1116,7 @@ void SceneHost::maybeLog()
+ // Render thread, before a paint: the scrolling tree's animations at the
+ // frame's display time, then its layer positions into the scene (again after
+ // every update, which may have reset them). True if the scene changed.
+-bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t displayUS)
++bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t displayUS, bool serviceTree)
+ {
+     auto tree = DrawingAreaProxyWCPS5::scrollingTreeForScene(sceneID);
+     if (!tree) {
+@@ -1081,7 +1129,8 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
+         m_treePositions.clear();
+         m_lastPaintedTreePosition = std::nullopt;
+     }
+-    tree->serviceAnimations(MonotonicTime::now() + Seconds::fromMicroseconds(displayUS - g_get_monotonic_time()));
++    if (serviceTree)
++        tree->serviceAnimations(MonotonicTime::now() + Seconds::fromMicroseconds(displayUS - g_get_monotonic_time()));
+     m_scrollAnimating = tree->hasActiveAnimations();
+     tree->copyLayerPositionsIfChanged(m_treePositions, m_treePositionsVersion);
+     bool changed = false;
+@@ -1108,8 +1157,14 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
+             m_scrollStats.titleStepSquares += step * step;
+         }
+         m_lastPaintedTreePosition = *position;
++        bool moved = m_scrollMovedByTitle;
+         if (auto webProcessPosition = tree->webProcessScrollPosition()) {
+             double lead = std::abs(position->y() - webProcessPosition->y());
++            if (moved) {
++                m_scrollStats.movingFrames++;
++                if (lead < 1 && std::abs(position->x() - webProcessPosition->x()) < 1)
++                    m_scrollStats.contentInStep++;
++            }
+             m_scrollStats.leadPx += lead;
+             m_scrollStats.leadSamples++;
+             m_scrollStats.leadMaxPx = std::max(m_scrollStats.leadMaxPx, lead);
+@@ -1128,6 +1183,85 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
+     return changed;
+ }
+ 
++static std::atomic<float> s_syncReserveMS { 5 }; // PS5WCHost::setSyncReserveMS
++
++void SceneHost::releaseHeldReplies()
++{
++    if (!m_heldReplies.isEmpty())
++        completeOnMainThread(std::exchange(m_heldReplies, { }));
++}
++
++static bool samePosition(FloatPoint a, FloatPoint b)
++{
++    // The WebProcess's frame view has integer scroll positions; the title's
++    // frame-locked steps have fractions.
++    return std::abs(a.x() - b.x()) < 1 && std::abs(a.y() - b.y()) < 1;
++}
++
++void SceneHost::syncWithWebProcess(uint64_t sceneID, int64_t displayUS)
++{
++    m_syncRanThisFrame = true;
++    auto tree = DrawingAreaProxyWCPS5::scrollingTreeForScene(sceneID);
++    if (!tree || !DrawingAreaProxyWCPS5::syncForScene(sceneID)) {
++        releaseHeldReplies();
++        return;
++    }
++    // This frame's scroll positions: the tree posts them to the main thread,
++    // which sends them on (ScrollUpdatesWC). The replies go after them on the
++    // same queue and connection, so the rendering update they start sees
++    // this frame's position.
++    tree->serviceAnimations(MonotonicTime::now() + Seconds::fromMicroseconds(displayUS - g_get_monotonic_time()));
++    m_treeServicedThisFrame = true;
++    releaseHeldReplies();
++
++    auto target = tree->rootScrollPosition();
++    if (!target || m_treePositionsScene != sceneID || !m_lastPaintedTreePosition || samePosition(*m_lastPaintedTreePosition, *target))
++        return; // the root doesn't move this frame: nothing to keep in step
++    if (auto webProcess = tree->webProcessScrollPosition(); webProcess && samePosition(*webProcess, *target)) {
++        m_scrollStats.syncAlready++;
++        return;
++    }
++    // Wait for it until the scene must be painted to make the vsync.
++    double reserveMS = s_syncReserveMS.load();
++    int64_t deadlineUS = displayUS - static_cast<int64_t>(std::max(reserveMS, m_paintEstimateMS + reserveMS - 3) * 1000);
++    int64_t startUS = g_get_monotonic_time();
++    if (deadlineUS - startUS <= 500)
++        return;
++    m_scrollStats.syncWaits++;
++    bool inTime = false;
++    for (;;) {
++        int64_t waitUS = std::min<int64_t>(deadlineUS - g_get_monotonic_time(), 14000);
++        if (waitUS > 0 && !hasPending()) {
++            Locker locker { m_lock };
++            m_stateChanged.waitFor(m_lock, Seconds::fromMicroseconds(waitUS), [&] {
++                return !m_queue.isEmpty();
++            });
++        }
++        if (!hasPending())
++            break;
++        applyPending();
++        auto webProcess = tree->webProcessScrollPosition();
++        if (webProcess && samePosition(*webProcess, *target)) {
++            // Its reply stays held: it goes with the next frame's position.
++            inTime = true;
++            break;
++        }
++        // An update made before this position came: answer it, so the
++        // WebProcess makes the next one at the position it has now.
++        m_scrollStats.syncStale++;
++        releaseHeldReplies();
++        if (!m_shownPage || *m_shownPage != sceneID)
++            break;
++    }
++    double waitedMS = (g_get_monotonic_time() - startUS) / 1000.0;
++    m_scrollStats.syncWaitMS += waitedMS;
++    m_scrollStats.syncWaitMaxMS = std::max(m_scrollStats.syncWaitMaxMS, waitedMS);
++    if (inTime)
++        m_scrollStats.syncInTime++;
++    else
++        m_scrollStats.syncMissed++;
++}
++
+ void SceneHost::updateSubScrollerRects(WCScene& scene, uint64_t sceneID)
+ {
+     auto tree = DrawingAreaProxyWCPS5::scrollingTreeForScene(sceneID);
+@@ -1195,6 +1329,13 @@ void SceneHost::maybeLogScroll()
+             m_scrollStats.leadSamples ? m_scrollStats.leadPx / m_scrollStats.leadSamples : 0.0, m_scrollStats.leadMaxPx, m_scrollStats.commits,
+             stepAverage, stepDeviation, m_scrollStats.scrollbarToggles, rootCouldNot, stepsNotTaken, subScrollerSteps, snaps, zeroLead, m_lookaheadScale.load());
+     }
++    if (m_scrollStats.movingFrames || m_scrollStats.syncWaits) {
++        WTFLogAlways("[ascroll] %.1f s sync: %u frames moved the root in the title, content made at that position in %u (%u behind); " // NOLINT
++            "waited for the WebProcess in %u frames (%.1f ms avg, %.1f max): its update came in time %u, missed %u, stale updates first %u; already there %u",
++            seconds, m_scrollStats.movingFrames, m_scrollStats.contentInStep, m_scrollStats.movingFrames - m_scrollStats.contentInStep,
++            m_scrollStats.syncWaits, m_scrollStats.syncWaits ? m_scrollStats.syncWaitMS / m_scrollStats.syncWaits : 0.0, m_scrollStats.syncWaitMaxMS,
++            m_scrollStats.syncInTime, m_scrollStats.syncMissed, m_scrollStats.syncStale, m_scrollStats.syncAlready);
++    }
+     if (m_scrollStats.movedFrames || inputs) {
+         auto& latencies = m_scrollStats.latenciesMS;
+         std::sort(latencies.begin(), latencies.end());
+@@ -1495,6 +1636,13 @@ void PS5WCHost::noteWheelEventRouting(bool async)
+         host.m_syncWheelEvents++;
+ }
+ 
++#if ENABLE(ASYNC_SCROLLING)
++void PS5WCHost::setSyncReserveMS(float value)
++{
++    s_syncReserveMS = std::clamp(value, 3.f, 14.f);
++}
++#endif
++
+ void PS5WCHost::noteScrollEvent(ScrollNote note)
+ {
+     SceneHost::singleton().m_scrollNotes[static_cast<unsigned>(note)]++;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+index d1ccdee112..25579d17b2 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -62,6 +62,11 @@ public:
+     static float lookaheadScale();
+     // Any thread: a frame soon (the scrolling tree moved something).
+     static void requestFrame();
++    // How long before a frame is due its scene paint must start, at least,
++    // when the frame waits for the WebProcess's update at its scroll
++    // position (ms; "syncreserve=" in the flag file, default 5; the wait also
++    // leaves the smoothed scene paint time + reserve - 3).
++    static void setSyncReserveMS(float);
+ 
+ private:
+     PS5WCHost();
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index 077af35d1a..343141c453 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -619,6 +619,11 @@ void PS5WCScrollingTree::applyFrameLockedScroll(MonotonicTime displayTime)
+     std::optional<PlatformWheelEvent> event;
+     {
+         Locker locker { m_stickLock };
++        // Once per frame: a second service for the same frame (its display
++        // time computed again, a few us apart) would see dt ~0 and take
++        // everything queued as catch-up.
++        if (m_stickLastFrame && displayTime - m_stickLastFrame < 4_ms)
++            return;
+         double dt = m_stickLastFrame ? std::clamp((displayTime - m_stickLastFrame).seconds(), 0.0, 0.05) : 1 / 60.0;
+         m_stickLastFrame = displayTime;
+         if (m_stickPending.isZero() || !m_stickEvent)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 950bb1301d..e498a9c45e 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -93,6 +93,9 @@ struct WCRenderStats {
+     // until it was sent (asynchronous tile painting).
+     double replyGapMS { 0 }, replyGapMaxMS { 0 }, tileWaitMS { 0 };
+     unsigned replyGaps { 0 }, waitingAtReply { 0 }, idleStarted { 0 }, tileWaits { 0 };
++    // Async scrolling: title scroll updates (ScrollUpdatesWC), and those
++    // that came with nothing in flight and fired the refresh at once.
++    unsigned scrollUpdates { 0 }, scrollFires { 0 };
+     MonotonicTime windowStart;
+     // WCTilePainter (deltas of wcTilePaintStats over the window).
+     WCTilePaintStats painterStart;
+@@ -140,6 +143,8 @@ struct WCRenderStats {
+                 updateMS / count, paint / count, percentile(paintMS, 0.95), megapixels / count, static_cast<double>(tiles) / count,
+                 frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires,
+                 replyGaps ? replyGapMS / replyGaps : 0.0, replyGapMaxMS, waitingAtReply, replyGaps, idleStarted, tileWaits ? tileWaitMS / tileWaits : 0.0);
++            if (scrollUpdates)
++                WTFLogAlways("[render] wc scroll: %u title scroll updates (%.1f/s), %u fired the refresh at once (nothing in flight)", scrollUpdates, scrollUpdates / seconds, scrollFires); // NOLINT
+             auto& now = wcTilePaintStats();
+             WTFLogAlways("[render] wc tiles: record %.1f ms/s (%.2f Mpx/s), raster %.1f ms/s wall (%.2f Mpx/s, %u items, %u async), shm allocations %.1f/s, old way %u", // NOLINT
+                 (now.recordMS - painterStart.recordMS) / seconds, (now.recordedPixels - painterStart.recordedPixels) / 1e6 / seconds,
+@@ -153,6 +158,7 @@ struct WCRenderStats {
+         tiles = frameDones = monitorFires = idleFires = 0;
+         replyGapMS = replyGapMaxMS = tileWaitMS = 0;
+         replyGaps = waitingAtReply = idleStarted = tileWaits = 0;
++        scrollUpdates = scrollFires = 0;
+         windowStart = end;
+     }
+ };
+@@ -411,6 +417,7 @@ void DrawingAreaWC::setTileCoverageReducedWC(bool reduced)
+ void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize velocity, float lookaheadScale, std::optional<Vector<ScrollingNodeID>>&& nodesInTitleGesture, CompletionHandler<void()>&& completionHandler)
+ {
+     GraphicsLayerWC::setScrollVelocity(velocity, lookaheadScale);
++    bool moved = !updates.isEmpty();
+     if (auto* scrollingCoordinator = WCScrollingCoordinator::forPage(m_webPage.get())) {
+         // Nodes that start a gesture count as user-scrolled before their new
+         // positions apply; nodes whose gesture ended, only after.
+@@ -421,6 +428,25 @@ void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize ve
+             scrollingCoordinator->setNodesInTitleGesture(WTF::move(*nodesInTitleGesture));
+     }
+     completionHandler();
++    if (!moved)
++        return;
++#if defined(PS5_PAYLOAD_SDK)
++    wcRenderStats().scrollUpdates++;
++#endif
++    // The title sends a frame's scroll position as that frame starts, ahead
++    // of the replies that start the next rendering update (PS5WCHost sync),
++    // and waits for the update made at it. With nothing in flight there is
++    // no reply to come: the position is the frame's tick, so the rendering
++    // update (rAF, scroll events, IntersectionObserver at the new position)
++    // starts now rather than at the idle refresh timer, whose phase isn't the
++    // title's. Not twice within half a frame (sub-scroller steps arrive at
++    // the pad's 125 Hz).
++    if (!m_waitDidUpdate && !m_isRenderingSuspended && MonotonicTime::now() - m_lastDisplayRefresh >= 8_ms) {
++#if defined(PS5_PAYLOAD_SDK)
++        wcRenderStats().scrollFires++;
++#endif
++        fireDisplayRefreshMonitor();
++    }
+ }
+ #endif
+ 

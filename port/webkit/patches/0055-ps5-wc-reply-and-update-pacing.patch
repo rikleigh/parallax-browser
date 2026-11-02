@@ -1,0 +1,385 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index f85bffba2c..b586436df9 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -311,6 +311,7 @@ private:
+         uint64_t pageID { 0 };
+         std::unique_ptr<WCUpdateInfo> info; // null: remove the page
+         CompletionHandler<void()> didPresent;
++        MonotonicTime queuedAt;
+     };
+ 
+     void fail(const char* why);
+@@ -341,8 +342,14 @@ private:
+     bool m_dirty { false };
+     bool m_animating { false }; // the shown scene runs accelerated animations
+     bool m_expectingUpdate { false }; // replies went out at the last present
++    bool m_appliedThisFrame { false }; // an update with a reply was applied since the last present
++    // Frame pacing (TV test 2): a frame that applied no update while one is
++    // expected waits for it (/data/ps5webkit/wc-wait-old: only while
++    // accelerated animations run, as before).
++    bool m_waitOnlyWhileAnimating { false };
+     int64_t m_lastPaintDisplayUS { 0 }; // while animating
+     Vector<CompletionHandler<void()>> m_frameCompletions;
++    MonotonicTime m_frameFirstQueuedAt, m_frameFirstAppliedAt; // of the updates in m_frameCompletions
+ 
+     // GL texture cap (COMPOSITING-PLAN.md, M6), render thread. Over the
+     // cap, the shown page's WebProcess keeps tiles for the visible rect
+@@ -361,7 +368,16 @@ private:
+         unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 }, animationPaints { 0 }, lateUpdates { 0 };
+         unsigned videoPaints { 0 }; // for new video frames only
+         double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 }, paintGapMaxMS { 0 };
++        // Where an update's time goes in the title: queued (the main thread
++        // got it) until applied on the render thread, applied until the swap
++        // returned, then until its reply ran on the main thread (replyHop*,
++        // written there).
++        double queuedMS { 0 }, queuedMaxMS { 0 }, presentMS { 0 }, presentMaxMS { 0 };
++        unsigned latencies { 0 };
+     } m_stats;
++    std::atomic<uint64_t> m_replyHopUS { 0 }, m_replyHopMaxUS { 0 }, m_replyHops { 0 };
++    bool m_frameLog { false }; // /data/ps5webkit/wc-frame-log: a [frame] line per presented update
++
+ 
+     // Test driver (main thread).
+     std::unique_ptr<SyntheticScene> m_testScene;
+@@ -400,7 +416,7 @@ void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, C
+     {
+         Locker locker { m_lock };
+         if (m_state.load() != State::Failed) {
+-            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent) });
++            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent), MonotonicTime::now() });
+             queued = true;
+             m_stateChanged.notifyAll(); // a frame waiting for this update (paint)
+         }
+@@ -421,11 +437,19 @@ void SceneHost::completeOnMainThread(Vector<CompletionHandler<void()>>&& handler
+ {
+     if (handlers.isEmpty())
+         return;
+-    RunLoop::mainSingleton().dispatch([handlers = WTF::move(handlers)]() mutable {
++    RunLoop::mainSingleton().dispatch([this, handlers = WTF::move(handlers), dispatchedAt = MonotonicTime::now()]() mutable {
++        auto now = MonotonicTime::now();
++        uint64_t hop = static_cast<uint64_t>(std::max(0.0, (now - dispatchedAt).microseconds()));
++        m_replyHopUS += hop;
++        m_replyHops++;
++        if (hop > m_replyHopMaxUS.load())
++            m_replyHopMaxUS = hop;
+         for (auto& handler : handlers) {
+             if (handler)
+                 handler();
+         }
++        if (m_frameLog)
++            WTFLogAlways("[frame] t=%.1f replies sent (%zu), %.2f ms after the swap", now.secondsSinceEpoch().milliseconds(), handlers.size(), hop / 1000.0); // NOLINT
+     });
+ }
+ 
+@@ -494,6 +518,14 @@ bool SceneHost::setUp(const PS5CompositorContext& context)
+     }
+ 
+     m_stats.start = MonotonicTime::now();
++    {
++        struct stat st;
++        m_frameLog = !stat("/data/ps5webkit/wc-frame-log", &st);
++        m_waitOnlyWhileAnimating = !stat("/data/ps5webkit/wc-wait-old", &st);
++        if (m_waitOnlyWhileAnimating || m_frameLog)
++            WTFLogAlways("[wc] frame pacing:%s%s", m_waitOnlyWhileAnimating ? " frames wait for an update only while animating (wc-wait-old)" : "", // NOLINT
++                m_frameLog ? " [frame] lines (wc-frame-log)" : "");
++    }
+     {
+         Locker locker { m_lock };
+         m_state = State::Ready;
+@@ -583,8 +615,17 @@ void SceneHost::applyPending()
+             else
+                 m_stats.unchanged++;
+         }
+-        if (job.didPresent)
++        if (job.didPresent) {
++            if (m_frameCompletions.isEmpty()) {
++                m_frameFirstQueuedAt = job.queuedAt;
++                m_frameFirstAppliedAt = MonotonicTime::now();
++            }
++            double queued = (MonotonicTime::now() - job.queuedAt).milliseconds();
++            m_stats.queuedMS += queued;
++            m_stats.queuedMaxMS = std::max(m_stats.queuedMaxMS, queued);
++            m_appliedThisFrame = true;
+             m_frameCompletions.append(WTF::move(job.didPresent));
++        }
+     }
+ }
+ 
+@@ -596,7 +637,11 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     // answered that swap's replies with its next update; applied one frame
+     // later, rendering updates (and rAF) would run at 30/s. Wait for it
+     // until 6 ms before the frame is due (the wait ends at the update).
+-    if (m_animating && m_expectingUpdate && !hasPending()) {
++    // Frames that run without an update (video playing, animations, the
++    // pointer) start in the same way: wait for the update unless this
++    // frame applied one already.
++    bool mayWait = m_waitOnlyWhileAnimating ? m_animating : !m_appliedThisFrame;
++    if (mayWait && m_expectingUpdate && !hasPending()) {
+         int64_t waitUS = std::min<int64_t>(displayUS - 6000 - g_get_monotonic_time(), 10000);
+         if (waitUS > 0) {
+             Locker locker { m_lock };
+@@ -737,8 +782,18 @@ void SceneHost::didPresent()
+     checkGLMemory();
+     // Replies going out now: the WebProcess will likely send its next update soon.
+     m_expectingUpdate = !m_frameCompletions.isEmpty();
++    m_appliedThisFrame = false;
+     if (!m_frameCompletions.isEmpty()) {
+         m_stats.presents++;
++        auto now = MonotonicTime::now();
++        double present = (now - m_frameFirstAppliedAt).milliseconds();
++        m_stats.presentMS += present;
++        m_stats.presentMaxMS = std::max(m_stats.presentMaxMS, present);
++        m_stats.latencies += m_frameCompletions.size();
++        if (m_frameLog)
++            WTFLogAlways("[frame] t=%.1f presented %zu update(s): queued at t=%.1f, applied %.2f ms later, swap returned %.2f ms after that", // NOLINT
++                now.secondsSinceEpoch().milliseconds(), m_frameCompletions.size(), m_frameFirstQueuedAt.secondsSinceEpoch().milliseconds(),
++                (m_frameFirstAppliedAt - m_frameFirstQueuedAt).milliseconds(), present);
+         completeOnMainThread(std::exchange(m_frameCompletions, { }));
+     }
+     maybeLog();
+@@ -761,13 +816,17 @@ void SceneHost::maybeLog()
+         for (auto& entry : m_scenes)
+             layers += entry.second->layerCount();
+         auto programs = TextureMapperShaderProgram::compileStats();
++        uint64_t hops = m_replyHops.exchange(0), hopUS = m_replyHopUS.exchange(0), hopMaxUS = m_replyHopMaxUS.exchange(0);
+         WTFLogAlways("[wc] %.1f s: %u updates (apply %.2f ms avg, %.1f max; %u unchanged), %u presents; %zu pages, %u layers; tiles uploaded %u (%u draws, %.1f MB, %.2f ms, %.3f ms per upload, %u fence waits, %u finishes); " // NOLINT
+-            "%u paints (%.2f ms avg, %.1f max; %u for animations only, longest gap %.1f ms, %u waited for); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s)",
++            "%u paints (%.2f ms avg, %.1f max; %u for animations only, longest gap %.1f ms, %u waited for); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s); "
++            "update in the title: queued %.2f ms avg %.1f max, applied to swap %.2f avg %.1f max, swap to reply %.2f avg %.1f max",
+             seconds, m_stats.updates, m_stats.updates ? m_stats.applyMS / m_stats.updates : 0.0, m_stats.applyMaxMS, m_stats.unchanged, m_stats.presents,
+             m_scenes.size(), layers, uploads.uploads, uploads.draws, uploads.bytes / 1048576.0, uploads.milliseconds,
+             uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
+             m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS, m_stats.animationPaints, m_stats.paintGapMaxMS, m_stats.lateUpdates,
+-            BitmapTextureUploaderPS5::textureBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion);
++            BitmapTextureUploaderPS5::textureBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion,
++            m_stats.latencies ? m_stats.queuedMS / m_stats.latencies : 0.0, m_stats.queuedMaxMS, m_stats.presents ? m_stats.presentMS / m_stats.presents : 0.0,
++            m_stats.presentMaxMS, hops ? hopUS / 1000.0 / hops : 0.0, hopMaxUS / 1000.0);
+         unsigned videoLayers = 0;
+         for (auto& entry : m_scenes)
+             videoLayers += entry.second->videoLayerCount();
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 89250967c3..976c9e6bc6 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -81,6 +81,13 @@ struct WCRenderStats {
+     Vector<float> totalMS, paintMS;
+     double updateMS { 0 }, megapixels { 0 }, frameDoneMS { 0 };
+     unsigned tiles { 0 }, frameDones { 0 }, monitorFires { 0 }, idleFires { 0 };
++    // From a reply to the next update's start (the WebProcess's part of a
++    // frame cycle: frame done + this + the update + tile wait = one cycle),
++    // how many of those updates were already waiting at the reply, and how
++    // many the idle refresh timer started; tile wait = the update's end
++    // until it was sent (asynchronous tile painting).
++    double replyGapMS { 0 }, replyGapMaxMS { 0 }, tileWaitMS { 0 };
++    unsigned replyGaps { 0 }, waitingAtReply { 0 }, idleStarted { 0 }, tileWaits { 0 };
+     MonotonicTime windowStart;
+     // WCTilePainter (deltas of wcTilePaintStats over the window).
+     WCTilePaintStats painterStart;
+@@ -122,10 +129,12 @@ struct WCRenderStats {
+                 total += value;
+             for (auto value : paintMS)
+                 paint += value;
+-            WTFLogAlways("[render] wc: %u updates in %.1f s (%.1f/s), %.1f ms average, p50 %.1f, p95 %.1f, %.1f ms max; update %.1f avg; paint %.1f avg %.1f p95 (%.2f Mpx, %.1f tiles avg); frame done %.1f ms avg; rAF clock %.1f/s (%u idle)", // NOLINT
++            WTFLogAlways("[render] wc: %u updates in %.1f s (%.1f/s), %.1f ms average, p50 %.1f, p95 %.1f, %.1f ms max; update %.1f avg; paint %.1f avg %.1f p95 (%.2f Mpx, %.1f tiles avg); frame done %.1f ms avg; rAF clock %.1f/s (%u idle); " // NOLINT
++                "reply to next update %.1f ms avg %.1f max (%u of %u waiting at the reply, %u started by the idle timer); tile wait %.1f ms avg",
+                 count, seconds, count / seconds, total / count, percentile(totalMS, 0.5), percentile(totalMS, 0.95), percentile(totalMS, 1),
+                 updateMS / count, paint / count, percentile(paintMS, 0.95), megapixels / count, static_cast<double>(tiles) / count,
+-                frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires);
++                frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires,
++                replyGaps ? replyGapMS / replyGaps : 0.0, replyGapMaxMS, waitingAtReply, replyGaps, idleStarted, tileWaits ? tileWaitMS / tileWaits : 0.0);
+             auto& now = wcTilePaintStats();
+             WTFLogAlways("[render] wc tiles: record %.1f ms/s (%.2f Mpx/s), raster %.1f ms/s wall (%.2f Mpx/s, %u items, %u async), shm allocations %.1f/s, old way %u", // NOLINT
+                 (now.recordMS - painterStart.recordMS) / seconds, (now.recordedPixels - painterStart.recordedPixels) / 1e6 / seconds,
+@@ -137,6 +146,8 @@ struct WCRenderStats {
+         paintMS.shrink(0);
+         updateMS = megapixels = frameDoneMS = 0;
+         tiles = frameDones = monitorFires = idleFires = 0;
++        replyGapMS = replyGapMaxMS = tileWaitMS = 0;
++        replyGaps = waitingAtReply = idleStarted = tileWaits = 0;
+         windowStart = end;
+     }
+ };
+@@ -182,10 +193,10 @@ private:
+         RefPtr drawingArea = m_drawingArea.get();
+         if (!drawingArea)
+             return false; // RenderingUpdateScheduler falls back to its timer
+-        if (!m_active) {
+-            m_active = true;
+-            drawingArea->displayRefreshMonitorStarted();
+-        }
++        // Called whenever a client asks for the next refresh (and it isn't
++        // scheduled yet), not only when the monitor starts.
++        m_active = true;
++        drawingArea->displayRefreshMonitorStarted();
+         return true;
+     }
+ 
+@@ -202,13 +213,39 @@ RefPtr<DisplayRefreshMonitor> DrawingAreaWC::createDisplayRefreshMonitor(Platfor
+     return m_displayRefreshMonitor;
+ }
+ 
++// Whether a refresh asked for after a reply (nothing in flight) fires at
++// once (the default) or a frame after the reply (the M2 behaviour,
++// PS5WK_WC_REFRESH_NOW=0). An update asked for just after a reply (a wheel
++// event or a timer that came in then) started a full frame later and was
++// shown a frame later than it could be; and with a frame of the title's
++// already under way for video or animations, it missed that frame too. The
++// title still paces updates to the display: its frame's first draw waits
++// for the previous swap's flip, and the reply goes after the swap.
++static bool refreshAtOnceAfterReply()
++{
++    static const bool atOnce = [] {
++        const char* text = getenv("PS5WK_WC_REFRESH_NOW");
++        return !text || strcmp(text, "0");
++    }();
++    return atOnce;
++}
++
+ void DrawingAreaWC::displayRefreshMonitorStarted()
+ {
+     // Called with the monitor's lock held: only start a timer here. With an
+     // update in flight its reply fires the monitor.
+-    if (m_waitDidUpdate || m_idleDisplayRefreshTimer.isActive())
++    if (m_waitDidUpdate)
+         return;
+     auto delay = std::max(0_s, m_lastDisplayRefresh + Seconds(1.0 / FullSpeedFramesPerSecond) - MonotonicTime::now());
++    // Right after a reply: at once (only once per reply, so a client that
++    // asks again from its callback ticks at 60 Hz).
++    if (m_lastDisplayRefreshWasReply && refreshAtOnceAfterReply())
++        delay = 0_s;
++    if (m_idleDisplayRefreshTimer.isActive()) {
++        if (m_idleDisplayRefreshTimer.nextFireInterval() <= delay)
++            return;
++        m_idleDisplayRefreshTimer.stop();
++    }
+     m_idleDisplayRefreshTimer.startOneShot(delay);
+ }
+ 
+@@ -218,6 +255,7 @@ void DrawingAreaWC::idleDisplayRefreshTimerFired()
+         return;
+ #if defined(PS5_PAYLOAD_SDK)
+     wcRenderStats().idleFires++;
++    SetForScope inIdleFire(m_inIdleDisplayRefresh, true);
+ #endif
+     fireDisplayRefreshMonitor();
+ }
+@@ -228,6 +266,7 @@ void DrawingAreaWC::fireDisplayRefreshMonitor()
+     if (!monitor || !monitor->isActive())
+         return;
+     m_lastDisplayRefresh = MonotonicTime::now();
++    m_lastDisplayRefreshWasReply = m_firingForReply;
+ #if defined(PS5_PAYLOAD_SDK)
+     wcRenderStats().monitorFires++;
+ #endif
+@@ -420,6 +459,12 @@ void DrawingAreaWC::updateRenderingWithForcedRepaintAsync(WebPage&, CompletionHa
+ 
+ void DrawingAreaWC::triggerRenderingUpdate()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_inIdleDisplayRefresh && !m_waitDidUpdate)
++        m_updateStartedByIdleTimer = true;
++    if (m_firingForReply && !m_waitDidUpdate)
++        m_updateWaitingAtReply = true; // asked for before the reply, started by it
++#endif
+     if (m_isRenderingSuspended || m_waitDidUpdate) {
+         m_hasDeferredRenderingUpdate = true;
+         return;
+@@ -455,6 +500,20 @@ void DrawingAreaWC::updateRendering()
+ #if defined(PS5_PAYLOAD_SDK)
+     auto start = MonotonicTime::now();
+     auto paintBefore = wcTilePaintStats();
++    if (m_lastReply) {
++        auto& stats = wcRenderStats();
++        double gap = (start - m_lastReply).milliseconds();
++        stats.replyGaps++;
++        stats.replyGapMS += gap;
++        stats.replyGapMaxMS = std::max(stats.replyGapMaxMS, gap);
++        stats.waitingAtReply += m_updateWaitingAtReply;
++        stats.idleStarted += m_updateStartedByIdleTimer;
++        if (wcRenderLog() >= 2)
++            WTFLogAlways("[render1] t=%.1f start, %.1f ms after the reply%s%s", start.secondsSinceEpoch().milliseconds(), gap, // NOLINT
++                m_updateWaitingAtReply ? " (waiting at the reply)" : "", m_updateStartedByIdleTimer ? " (idle timer)" : "");
++        m_lastReply = { };
++    }
++    m_updateWaitingAtReply = m_updateStartedByIdleTimer = false;
+ #endif
+     Ref webPage = m_webPage.get();
+     webPage->updateRendering();
+@@ -470,6 +529,9 @@ void DrawingAreaWC::updateRendering()
+ 
+     willStartRenderingUpdateDisplay();
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    m_lastUpdateEnd = MonotonicTime::now();
++#endif
+     bool compositing = isCompositingMode();
+     if (compositing)
+         sendUpdateAC();
+@@ -576,6 +638,13 @@ void DrawingAreaWC::sendUpdatesWC(Vector<PendingUpdate>&& updates)
+         }
+ #if defined(PS5_PAYLOAD_SDK)
+         protectedThis->m_lastUpdateSent = MonotonicTime::now();
++        if (protectedThis->m_lastUpdateEnd) {
++            auto& stats = wcRenderStats();
++            stats.tileWaits++;
++            stats.tileWaitMS += (protectedThis->m_lastUpdateSent - protectedThis->m_lastUpdateEnd).milliseconds();
++            if (wcRenderLog() >= 2)
++                WTFLogAlways("[render1] t=%.1f sent", protectedThis->m_lastUpdateSent.secondsSinceEpoch().milliseconds()); // NOLINT
++        }
+ #endif
+     };
+ #if USE(SKIA)
+@@ -716,6 +785,15 @@ RefPtr<ImageBuffer> DrawingAreaWC::createImageBuffer(FloatSize size, float devic
+ 
+ void DrawingAreaWC::displayDidRefresh(MonotonicTime)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_waitDidUpdate && !m_inSynchronousDisplayDidRefresh) {
++        m_lastReply = MonotonicTime::now();
++        m_updateWaitingAtReply = m_hasDeferredRenderingUpdate;
++        m_updateStartedByIdleTimer = false;
++        if (wcRenderLog() >= 2)
++            WTFLogAlways("[render1] t=%.1f reply", m_lastReply.secondsSinceEpoch().milliseconds()); // NOLINT
++    }
++#endif
+     m_waitDidUpdate = false;
+     didCompleteRenderingUpdateDisplay();
+     didCompleteRenderingFrame();
+@@ -743,8 +821,10 @@ void DrawingAreaWC::displayDidRefresh(MonotonicTime)
+     if (m_inSynchronousDisplayDidRefresh) {
+         if (m_displayRefreshMonitor && m_displayRefreshMonitor->isActive() && !m_idleDisplayRefreshTimer.isActive())
+             m_idleDisplayRefreshTimer.startOneShot(std::max(0_s, m_lastDisplayRefresh + Seconds(1.0 / FullSpeedFramesPerSecond) - MonotonicTime::now()));
+-    } else
++    } else {
++        SetForScope forReply(m_firingForReply, true);
+         fireDisplayRefreshMonitor();
++    }
+ #endif
+ }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index aecb895066..d1197c9fad 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -147,6 +147,8 @@ private:
+     RefPtr<DisplayRefreshMonitorWC> m_displayRefreshMonitor; // detached in ~DrawingAreaWC
+     WebCore::Timer m_idleDisplayRefreshTimer;
+     MonotonicTime m_lastDisplayRefresh;
++    bool m_lastDisplayRefreshWasReply { false }; // the last monitor fire came from a reply
++    bool m_firingForReply { false };
+     bool m_inSynchronousDisplayDidRefresh { false };
+ #endif
+ #if USE(SKIA) && !ENABLE(GPU_PROCESS)
+@@ -154,6 +156,11 @@ private:
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+     MonotonicTime m_lastUpdateSent;
++    MonotonicTime m_lastUpdateEnd; // updateRendering done, before the tiles are
++    MonotonicTime m_lastReply; // the last reply, until the next update starts
++    bool m_updateWaitingAtReply { false };
++    bool m_updateStartedByIdleTimer { false };
++    bool m_inIdleDisplayRefresh { false };
+ #endif
+ #if PLATFORM(GTK) || PLATFORM(WPE)
+     Vector<IPC::AsyncReplyID> m_pendingAfterDrawCallbackIDs;

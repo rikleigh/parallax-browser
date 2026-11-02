@@ -1,0 +1,1168 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index cbca2078f0..cab88c4bc7 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -91,15 +91,17 @@ WCScene::WCScene(WebCore::ProcessIdentifier webProcessIdentifier, bool usesOffsc
+ 
+ WCScene::~WCScene()
+ {
+-    if (!m_context->makeContextCurrent())
++    if (!m_context || !m_context->makeContextCurrent())
+         return;
++    // The layers' tiles are GL textures too.
++    m_layers.clear();
+     m_textureMapper = nullptr;
+ }
+ 
+-std::optional<UpdateInfo> WCScene::update(WCUpdateInfo&& update)
++bool WCScene::apply(WCUpdateInfo& update)
+ {
+-    if (!m_context->makeContextCurrent())
+-        return std::nullopt;
++    if (!m_context || !m_textureMapper || !m_context->makeContextCurrent())
++        return false;
+     m_textureMapper->releaseUnusedTexturesNow();
+ 
+     for (auto id : update.addedLayers) {
+@@ -251,6 +253,38 @@ std::optional<UpdateInfo> WCScene::update(WCUpdateInfo&& update)
+     for (auto id : update.removedLayers)
+         m_layers.remove(id);
+ 
++    m_rootLayer = update.rootLayer;
++    m_viewport = update.viewport;
++    return m_rootLayer && m_layers.contains(*m_rootLayer);
++}
++
++void WCScene::paint(WebCore::BitmapTexture& surface)
++{
++    if (!m_rootLayer || !m_textureMapper || !m_context->makeContextCurrent())
++        return;
++    auto* layer = m_layers.get(*m_rootLayer);
++    if (!layer)
++        return;
++    auto& rootLayer = layer->texmapLayer;
++    rootLayer.applyAnimationsRecursively(MonotonicTime::now());
++
++    m_textureMapper->beginPainting(WebCore::TextureMapper::FlipY::No, &surface);
++    // The surface is reused frame after frame: start from transparent.
++    glClearColor(0, 0, 0, 0);
++    glClear(GL_COLOR_BUFFER_BIT);
++#if ENABLE(DAMAGE_TRACKING)
++    // With damage tracking, paint() leaves the layer transforms to the caller.
++    rootLayer.prepareForPainting(*m_textureMapper);
++#endif
++    rootLayer.paint(*m_textureMapper);
++    m_textureMapper->endPainting();
++}
++
++std::optional<UpdateInfo> WCScene::update(WCUpdateInfo&& update)
++{
++    if (!apply(update))
++        return std::nullopt;
++
+     auto rootLayer = &m_layers.get(*update.rootLayer)->texmapLayer;
+     rootLayer->applyAnimationsRecursively(MonotonicTime::now());
+ 
+@@ -272,6 +306,9 @@ std::optional<UpdateInfo> WCScene::update(WCUpdateInfo&& update)
+         glViewport(0, 0, update.viewport.width(), update.viewport.height());
+ 
+     m_textureMapper->beginPainting(WebCore::TextureMapper::FlipY::No, surface);
++#if ENABLE(DAMAGE_TRACKING)
++    rootLayer->prepareForPainting(*m_textureMapper);
++#endif
+     rootLayer->paint(*m_textureMapper);
+     if (showFPS)
+         m_fpsCounter.updateFPSAndDisplay(*m_textureMapper);
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index a54c0da621..c61bc48946 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -36,6 +36,7 @@
+ #include <wtf/TZoneMalloc.h>
+ 
+ namespace WebCore {
++class BitmapTexture;
+ class TextureMapper;
+ class TextureMapperLayer;
+ class TextureMapperPlatformLayer;
+@@ -55,6 +56,17 @@ public:
+     void initialize(WCSceneContext&);
+     std::optional<UpdateInfo> update(WCUpdateInfo&&);
+ 
++    // update() in two halves, for a host that paints the scene into its own
++    // target on its own schedule (PS5: the title's render thread draws the
++    // surface where the CPU page goes, then swaps; no readback).
++    // apply(): layer changes and tile uploads; false without a context or a
++    // root layer. paint(): the root layer tree into surface (cleared first).
++    bool apply(WCUpdateInfo&);
++    void paint(WebCore::BitmapTexture& surface);
++    bool hasRootLayer() const { return !!m_rootLayer; }
++    WebCore::IntSize viewport() const { return m_viewport; }
++    unsigned layerCount() const { return m_layers.size(); }
++
+ private:
+     struct Layer;
+     using LayerMap = HashMap<WebCore::PlatformLayerIdentifier, std::unique_ptr<Layer>>;
+@@ -64,6 +76,8 @@ private:
+     std::unique_ptr<WebCore::TextureMapper> m_textureMapper;
+     WebCore::TextureMapperFPSCounter m_fpsCounter;
+     LayerMap m_layers;
++    Markable<WebCore::PlatformLayerIdentifier> m_rootLayer;
++    WebCore::IntSize m_viewport;
+     bool m_usesOffscreenRendering;
+ };
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.cpp
+index c93e34087d..1477b06dd1 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.cpp
+@@ -42,10 +42,17 @@ WCSceneContext::WCSceneContext(uint64_t nativeWindow)
+ {
+ }
+ 
++WCSceneContext::WCSceneContext(WebCore::GLContext& borrowedContext)
++    : m_borrowedContext(&borrowedContext)
++{
++}
++
+ WCSceneContext::~WCSceneContext() = default;
+ 
+ bool WCSceneContext::makeContextCurrent()
+ {
++    if (m_borrowedContext)
++        return m_borrowedContext->makeContextCurrent();
+     if (!m_glContext)
+         return false;
+     return m_glContext->makeContextCurrent();
+@@ -58,7 +65,8 @@ std::unique_ptr<WebCore::TextureMapper> WCSceneContext::createTextureMapper()
+ 
+ void WCSceneContext::swapBuffers()
+ {
+-    m_glContext->swapBuffers();
++    if (m_glContext)
++        m_glContext->swapBuffers();
+ }
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.h b/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.h
+index 4bbcd3dea9..7ed808a0bd 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCSceneContext.h
+@@ -40,6 +40,10 @@ class WCSceneContext {
+     WTF_MAKE_TZONE_ALLOCATED(WCSceneContext);
+ public:
+     explicit WCSceneContext(uint64_t nativeWindow);
++    // A context someone else owns (PS5: the title renderer's EGL context,
++    // adopted by a GLContext that is never destroyed). swapBuffers() is then
++    // the owner's business.
++    explicit WCSceneContext(WebCore::GLContext& borrowedContext);
+     ~WCSceneContext();
+ 
+     bool makeContextCurrent();
+@@ -48,6 +52,7 @@ public:
+ 
+ private:
+     const std::unique_ptr<WebCore::GLContext> m_glContext;
++    WebCore::GLContext* m_borrowedContext { nullptr };
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index 7efdc0c83d..8917e88b8c 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -54,17 +54,10 @@ if (PORT STREQUAL "WPE" AND NOT ENABLE_GPU_PROCESS)
+         "${WEBKIT_DIR}/UIProcess/wpe/ps5"
+     )
+ 
+-    # The scene host. TEMPORARY: a never-available stub while PS5WCHost.cpp
+-    # does not exist; then just list PS5WCHost.cpp and delete the stub.
+-    if (EXISTS "${WEBKIT_DIR}/UIProcess/wpe/ps5/PS5WCHost.cpp")
+-        list(APPEND WebKit_SOURCES
+-            UIProcess/wpe/ps5/PS5WCHost.cpp
+-        )
+-    else ()
+-        list(APPEND WebKit_SOURCES
+-            UIProcess/wpe/ps5/PS5WCHostStub.cpp
+-        )
+-    endif ()
++    # The scene host (TextureMapper on the title's render thread).
++    list(APPEND WebKit_SOURCES
++        UIProcess/wpe/ps5/PS5WCHost.cpp
++    )
+ endif ()
+ 
+ # DrawingAreaProxyWC paints UpdateInfo bitmaps into a BackingStore, which the
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+new file mode 100644
+index 0000000000..9dc2c04bda
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -0,0 +1,902 @@
++/*
++ * PS5: the WC compositor host inside the title (PS5WCHost.h).
++ *
++ * Main thread: update()/removePage() queue work and ask PS5Renderer for a
++ * frame. Render thread (PS5CompositorClient, port/webkit/wpe-ps5/
++ * PS5Compositor.h): in PS5Renderer's own GL context, adopted by a WebCore
++ * GLContext that is never destroyed, each frame applies the queued updates
++ * (WCScene::apply: layer changes, tile uploads through
++ * BitmapTextureUploaderPS5), paints the shown page's layer tree into the
++ * scene texture (WCScene::paint), which PS5Renderer draws where the CPU page
++ * goes; after the swap, the updates applied in that frame complete on the
++ * main thread.
++ *
++ * Test mode (/data/ps5webkit/wctest, log-only): spike S1b at set-up (the
++ * TextureMapper programs WCScene uses, a test layer tree painted and read
++ * back, tile uploads through the PS5 path and glTexSubImage2D), then a
++ * synthetic animated scene fed through update() for 20 s, as the drawing-area
++ * proxy would.
++ */
++
++#include "config.h"
++#include "PS5WCHost.h"
++
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++
++#include "WCScene.h"
++#include "WCSceneContext.h"
++#include "WCUpdateInfo.h"
++#include <WebCore/BitmapTexture.h>
++#include <WebCore/BitmapTextureUploaderPS5.h>
++#include <WebCore/Color.h>
++#include <WebCore/FilterOperation.h>
++#include <WebCore/FilterOperations.h>
++#include <WebCore/FloatRoundedRect.h>
++#include <WebCore/GLContext.h>
++#include <WebCore/GLDisplay.h>
++#include <WebCore/ProcessIdentifier.h>
++#include <WebCore/ShareableBitmap.h>
++#include <WebCore/TextureMapper.h>
++#include <WebCore/TextureMapperGLHeaders.h>
++#include <WebCore/TextureMapperShaderProgram.h>
++#include <atomic>
++#include <memory>
++#include <sys/stat.h>
++#include <unordered_map>
++#include <wpe/ps5/PS5Compositor.h>
++#include <glib.h>
++#include <wtf/Condition.h>
++#include <wtf/Deque.h>
++#include <wtf/Lock.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/RunLoop.h>
++#include <wtf/Vector.h>
++
++namespace WebKit {
++using namespace WebCore;
++
++namespace {
++
++constexpr const char* testFlagPath = "/data/ps5webkit/wctest";
++
++bool testModeRequested()
++{
++    struct stat st;
++    return !stat(testFlagPath, &st);
++}
++
++double msSince(MonotonicTime start)
++{
++    return (MonotonicTime::now() - start).milliseconds();
++}
++
++// ---- A synthetic layer tree, as DrawingAreaWC would send it ----
++
++// Premultiplied BGRA (Skia's N32), opaque; R = seed so a B/R mix-up shows.
++uint32_t patternPixel(unsigned seed, int x, int y)
++{
++    uint8_t b = static_cast<uint8_t>(x * 7 + (y >> 3));
++    uint8_t g = static_cast<uint8_t>(y * 5 + (x >> 4));
++    uint8_t r = static_cast<uint8_t>(seed * 37 + ((x ^ y) & 0x3f));
++    return b | (g << 8) | (r << 16) | (0xffu << 24);
++}
++
++RefPtr<ShareableBitmap> patternBitmap(unsigned seed, const IntRect& rect)
++{
++    auto bitmap = ShareableBitmap::create({ rect.size() });
++    if (!bitmap)
++        return nullptr;
++    auto span = bitmap->mutableSpan();
++    const size_t stride = bitmap->bytesPerRow();
++    for (int y = 0; y < rect.height(); ++y) {
++        auto* row = reinterpret_cast<uint32_t*>(span.data() + y * stride);
++        for (int x = 0; x < rect.width(); ++x)
++            row[x] = patternPixel(seed, rect.x() + x, rect.y() + y);
++    }
++    return bitmap;
++}
++
++class SyntheticScene {
++public:
++    explicit SyntheticScene(IntSize viewport)
++        : m_viewport(viewport)
++    {
++        auto process = Process::identifier();
++        for (unsigned i = 0; i < LayerCount; ++i)
++            m_ids.append(PlatformLayerIdentifier { ObjectIdentifier<PlatformLayerIdentifierType>::generate(), process });
++    }
++
++    enum Layer : unsigned { Root, Background, Solid, Card, CardChild, Clip, ClipChild, Blurred, Gray, LayerCount };
++    static constexpr IntPoint solidPosition { 100, 100 };
++    static constexpr IntSize solidSize { 300, 200 };
++    static constexpr IntPoint clipPosition { 1300, 100 };
++    static constexpr IntSize clipSize { 400, 300 };
++    static constexpr float clipRadius = 60;
++    static constexpr IntPoint cardPosition { 650, 150 };
++
++    WCUpdateInfo initial(bool* ok)
++    {
++        WCUpdateInfo info;
++        info.viewport = m_viewport;
++        info.rootLayer = m_ids[Root];
++        for (auto& id : m_ids)
++            info.addedLayers.append(id);
++
++        auto layer = [&](Layer which, FloatPoint position, FloatSize size) -> WCLayerUpdateInfo& {
++            WCLayerUpdateInfo update { m_ids[which] };
++            update.changes = { WCLayerChange::Position, WCLayerChange::AnchorPoint, WCLayerChange::Size, WCLayerChange::Opacity,
++                WCLayerChange::ContentsVisible, WCLayerChange::Transform, WCLayerChange::Background };
++            update.position = position;
++            update.anchorPoint = { 0, 0, 0 };
++            update.size = size;
++            update.opacity = 1;
++            update.contentsVisible = true;
++            update.background.color = Color { }; // none
++            update.background.hasBackingStore = false;
++            info.changedLayers.append(WTF::move(update));
++            return info.changedLayers.last();
++        };
++
++        auto& root = layer(Root, { }, m_viewport);
++        root.changes.add(WCLayerChange::Children);
++        root.children = { m_ids[Background], m_ids[Solid], m_ids[Card], m_ids[Clip], m_ids[Blurred], m_ids[Gray] };
++
++        bool allTiles = true;
++        auto& background = layer(Background, { }, m_viewport);
++        allTiles &= addTiles(background, Background, m_viewport);
++
++        auto& solid = layer(Solid, solidPosition, solidSize);
++        solid.background.color = Color(SRGBA<uint8_t> { 0, 200, 0, 255 });
++        solid.opacity = 0.5f;
++
++        auto& card = layer(Card, cardPosition, { 512, 512 });
++        card.anchorPoint = { 0.5f, 0.5f, 0 };
++        card.transform = TransformationMatrix().rotate(10);
++        card.changes.add({ WCLayerChange::Children, WCLayerChange::MasksToBounds });
++        card.masksToBounds = true; // rotated: a stencil clip for its child
++        card.children = { m_ids[CardChild] };
++        allTiles &= addTiles(card, Card, { 512, 512 });
++        auto& cardChild = layer(CardChild, { 350, 350 }, { 300, 300 });
++        cardChild.background.color = Color(SRGBA<uint8_t> { 220, 40, 40, 255 });
++
++        auto& clip = layer(Clip, clipPosition, clipSize);
++        clip.changes.add({ WCLayerChange::Children, WCLayerChange::ContentsRectClipsDescendants, WCLayerChange::ContentsClippingRect });
++        clip.contentsRectClipsDescendants = true;
++        clip.contentsClippingRect = FloatRoundedRect(FloatRect { { }, clipSize }, CornerRadii(clipRadius, clipRadius, clipRadius, clipRadius));
++        clip.children = { m_ids[ClipChild] };
++        auto& clipChild = layer(ClipChild, { -50, -50 }, { 512, 512 });
++        allTiles &= addTiles(clipChild, ClipChild, { 512, 512 });
++
++        auto& blurred = layer(Blurred, { 100, 600 }, { 384, 256 });
++        blurred.changes.add(WCLayerChange::Filters);
++        Vector<Ref<FilterOperation>> blur;
++        blur.append(BlurFilterOperation::create(6));
++        blurred.filters = FilterOperations { WTF::move(blur) };
++        allTiles &= addTiles(blurred, Blurred, { 384, 256 });
++
++        auto& gray = layer(Gray, { 600, 700 }, { 384, 256 });
++        gray.changes.add(WCLayerChange::Filters);
++        Vector<Ref<FilterOperation>> grayscale;
++        grayscale.append(BasicColorMatrixFilterOperation::create(1, FilterOperation::Type::Grayscale));
++        gray.filters = FilterOperations { WTF::move(grayscale) };
++        allTiles &= addTiles(gray, Gray, { 384, 256 });
++
++        if (ok)
++            *ok = allTiles;
++        return info;
++    }
++
++    // One animation step: the card turns, the solid layer's opacity breathes,
++    // a 200x200 patch of the background is repainted every frame (straddling
++    // two tiles: one bitmap, two tile updates, the second at a source offset)
++    // and four whole background tiles every 30th frame.
++    WCUpdateInfo next(unsigned frame)
++    {
++        WCUpdateInfo info;
++        info.viewport = m_viewport;
++        info.rootLayer = m_ids[Root];
++
++        WCLayerUpdateInfo card { m_ids[Card] };
++        card.changes = WCLayerChange::Transform;
++        card.transform = TransformationMatrix().rotate(10 + 2.0 * frame);
++        info.changedLayers.append(WTF::move(card));
++
++        WCLayerUpdateInfo solid { m_ids[Solid] };
++        solid.changes = WCLayerChange::Opacity;
++        solid.opacity = 0.5f + 0.4f * std::sin(frame * 0.1f);
++        info.changedLayers.append(WTF::move(solid));
++
++        WCLayerUpdateInfo background { m_ids[Background] };
++        background.changes = WCLayerChange::Background;
++        background.background.hasBackingStore = true;
++        background.background.backingStoreSize = m_viewport;
++        IntRect patch { 412 + static_cast<int>(frame % 50), 700, 200, 200 };
++        auto patchBitmap = patternBitmap(Background + frame, patch);
++        for (int column = 0; column < 2; ++column) {
++            WCTileUpdate tile;
++            tile.index = { column, 1 };
++            tile.dirtyRect = patch;
++            tile.backingStore.setBitmap(RefPtr { patchBitmap });
++            background.background.tileUpdates.append(WTF::move(tile));
++        }
++        if (!(frame % 30)) {
++            for (int i = 0; i < 4; ++i) {
++                IntRect rect { i * 512, 0, std::min(512, m_viewport.width() - i * 512), std::min(512, m_viewport.height()) };
++                WCTileUpdate tile;
++                tile.index = { i, 0 };
++                tile.dirtyRect = rect;
++                tile.backingStore.setBitmap(patternBitmap(Background + frame / 30, rect));
++                background.background.tileUpdates.append(WTF::move(tile));
++            }
++        }
++        info.changedLayers.append(WTF::move(background));
++        return info;
++    }
++
++    // Every tile of one layer again (upload benchmark).
++    WCUpdateInfo retile(Layer which, IntSize size, unsigned seed)
++    {
++        WCUpdateInfo info;
++        info.viewport = m_viewport;
++        info.rootLayer = m_ids[Root];
++        WCLayerUpdateInfo update { m_ids[which] };
++        update.changes = WCLayerChange::Background;
++        addTiles(update, seed, size);
++        info.changedLayers.append(WTF::move(update));
++        return info;
++    }
++
++    IntSize viewport() const { return m_viewport; }
++
++private:
++    bool addTiles(WCLayerUpdateInfo& update, unsigned seed, IntSize size)
++    {
++        update.changes.add(WCLayerChange::Background);
++        update.background.hasBackingStore = true;
++        update.background.backingStoreSize = size;
++        bool ok = true;
++        for (int y = 0; y < size.height(); y += 512) {
++            for (int x = 0; x < size.width(); x += 512) {
++                IntRect rect { x, y, std::min(512, size.width() - x), std::min(512, size.height() - y) };
++                WCTileUpdate tile;
++                tile.index = { x / 512, y / 512 };
++                tile.dirtyRect = rect;
++                auto bitmap = patternBitmap(seed, rect);
++                ok &= !!bitmap;
++                tile.backingStore.setBitmap(WTF::move(bitmap));
++                update.background.tileUpdates.append(WTF::move(tile));
++            }
++        }
++        return ok;
++    }
++
++    IntSize m_viewport;
++    Vector<PlatformLayerIdentifier> m_ids;
++};
++
++// ---- The host ----
++
++class SceneHost final : public PS5CompositorClient {
++public:
++    static SceneHost& singleton()
++    {
++        static SceneHost* host = new SceneHost; // never destroyed
++        return *host;
++    }
++
++    // Main thread.
++    bool available()
++    {
++        ensureSetUp();
++        return m_state.load() == State::Ready;
++    }
++    void ensureSetUp();
++    void enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&&, CompletionHandler<void()>&&);
++    void startTestDriver();
++
++    // PS5CompositorClient.
++    void attach(void (*requestFrame)()) final { m_requestFrame = requestFrame; } // main thread, early
++    bool wantsSetUp() final { return m_setUpWanted.load(); }
++    bool setUp(const PS5CompositorContext&) final;
++    bool hasPending() final;
++    void applyPending() final;
++    unsigned paint(int64_t displayUS, int* width, int* height) final;
++    void didPresent() final;
++
++private:
++    enum class State : int { NotSetUp, Ready, Failed };
++    struct Job {
++        uint64_t pageID { 0 };
++        std::unique_ptr<WCUpdateInfo> info; // null: remove the page
++        CompletionHandler<void()> didPresent;
++    };
++
++    void fail(const char* why);
++    void completeOnMainThread(Vector<CompletionHandler<void()>>&&);
++    WCScene& ensureScene(uint64_t pageID);
++    void maybeLog();
++    bool runS1b(bool verbose, IntSize viewport);
++    unsigned readbackAndCheck(const IntSize&, uint32_t* checksum, unsigned* probesOK, unsigned* probes, char* firstBad, size_t firstBadSize, const char* dumpPath = nullptr);
++
++    Lock m_lock;
++    Condition m_stateChanged;
++    Deque<Job> m_queue WTF_GUARDED_BY_LOCK(m_lock);
++    std::atomic<State> m_state { State::NotSetUp };
++    std::atomic<bool> m_setUpWanted { false };
++    std::atomic<void (*)()> m_requestFrame { nullptr };
++    bool m_testMode { testModeRequested() };
++
++    // Render thread.
++    GLContext* m_glContext { nullptr }; // PS5Renderer's context, adopted; never destroyed
++    std::unique_ptr<WCSceneContext> m_sceneContext;
++    std::unique_ptr<TextureMapper> m_programHolder;
++    std::unordered_map<uint64_t, std::unique_ptr<WCScene>> m_scenes;
++    std::optional<uint64_t> m_shownPage; // the most recently updated scene
++    std::unordered_map<uint64_t, uint64_t> m_lastUpdate;
++    uint64_t m_updateSerial { 0 };
++    RefPtr<BitmapTexture> m_surface;
++    bool m_dirty { false };
++    Vector<CompletionHandler<void()>> m_frameCompletions;
++
++    struct {
++        MonotonicTime start;
++        unsigned updates { 0 }, paints { 0 }, presents { 0 };
++        double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 };
++    } m_stats;
++
++    // Test driver (main thread).
++    std::unique_ptr<SyntheticScene> m_testScene;
++    unsigned m_testFrame { 0 };
++    MonotonicTime m_testStart;
++    unsigned m_testCompleted { 0 };
++};
++
++constexpr uint64_t testPageID = 0x7e57000000000001ull;
++
++// The render thread sets the compositor up when asked, the first time the
++// main thread wants to know whether pages can composite (WebKit is up by
++// then); the main thread waits for it, so the answer is final.
++void SceneHost::ensureSetUp()
++{
++    if (m_state.load() != State::NotSetUp)
++        return;
++    auto requestFrame = m_requestFrame.load();
++    if (!requestFrame)
++        return; // No PS5Renderer in this process (the GL-free harness).
++    auto start = MonotonicTime::now();
++    m_setUpWanted = true;
++    requestFrame();
++    Locker locker { m_lock };
++    m_stateChanged.waitFor(m_lock, 10_s, [&] {
++        return m_state.load() != State::NotSetUp;
++    });
++    WTFLogAlways("[wc] main thread waited %.1f ms for the compositor's set-up: %s", msSince(start), // NOLINT
++        m_state.load() == State::Ready ? "ready" : m_state.load() == State::Failed ? "failed" : "STILL PENDING after 10 s");
++}
++
++void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, CompletionHandler<void()>&& didPresent)
++{
++    ensureSetUp();
++    bool queued = false;
++    {
++        Locker locker { m_lock };
++        if (m_state.load() != State::Failed) {
++            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent) });
++            queued = true;
++        }
++    }
++    if (!queued) {
++        // Nothing will show it; don't stall the WebProcess.
++        RunLoop::mainSingleton().dispatch([didPresent = WTF::move(didPresent)]() mutable {
++            if (didPresent)
++                didPresent();
++        });
++        return;
++    }
++    if (auto requestFrame = m_requestFrame.load())
++        requestFrame();
++}
++
++void SceneHost::completeOnMainThread(Vector<CompletionHandler<void()>>&& handlers)
++{
++    if (handlers.isEmpty())
++        return;
++    RunLoop::mainSingleton().dispatch([handlers = WTF::move(handlers)]() mutable {
++        for (auto& handler : handlers) {
++            if (handler)
++                handler();
++        }
++    });
++}
++
++void SceneHost::fail(const char* why)
++{
++    WTFLogAlways("[wc] GPU compositor unavailable: %s; pages stay on the CPU path", why); // NOLINT
++    Deque<Job> jobs;
++    {
++        Locker locker { m_lock };
++        m_state = State::Failed;
++        jobs = std::exchange(m_queue, { });
++        m_stateChanged.notifyAll();
++    }
++    Vector<CompletionHandler<void()>> handlers;
++    for (auto& job : jobs)
++        handlers.append(WTF::move(job.didPresent));
++    completeOnMainThread(WTF::move(handlers));
++}
++
++bool SceneHost::setUp(const PS5CompositorContext& context)
++{
++    auto start = MonotonicTime::now();
++    auto display = GLDisplay::create(context.eglDisplay);
++    if (!display) {
++        fail("GLDisplay::create failed");
++        return false;
++    }
++    // Both live as long as the title: the EGL display and context are PS5Renderer's.
++    auto* glDisplay = display.leakRef();
++    m_glContext = new GLContext(*glDisplay, context.eglContext, context.eglSurface, context.eglConfig);
++    if (!m_glContext->makeContextCurrent() || GLContext::current() != m_glContext) {
++        fail("the adopted context did not become current");
++        return false;
++    }
++    while (glGetError() != GL_NO_ERROR) { }
++
++    // What WebCore sees of the context (GLContext::glExtensions() falls back
++    // to glGetStringi on core profiles).
++    GLint extensionCount = 0;
++    glGetIntegerv(GL_NUM_EXTENSIONS, &extensionCount);
++    const bool nullExtensionString = !glGetString(GL_EXTENSIONS);
++    while (glGetError() != GL_NO_ERROR) { }
++    auto& extensions = m_glContext->glExtensions();
++    GLint maxTextureSize = 0;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
++    WTFLogAlways("[wc] context: GL %s (WebCore version %u, %s), %d extensions (GL_EXTENSIONS string %s), npot %d unpack_subimage %d packed_depth_stencil %d YUV_target %d, max texture %d", // NOLINT
++        reinterpret_cast<const char*>(glGetString(GL_VERSION)), m_glContext->version(), epoxy_is_desktop_gl() ? "desktop" : "GLES",
++        extensionCount, nullExtensionString ? "null: glGetStringi" : "present", extensions.OES_texture_npot, extensions.EXT_unpack_subimage,
++        extensions.OES_packed_depth_stencil, extensions.EXT_YUV_target, maxTextureSize);
++
++    m_sceneContext = makeUnique<WCSceneContext>(*m_glContext);
++    // Compiled programs belong to the context's TextureMappers together: keep
++    // one alive so they outlive the self-test's scene and any page's.
++    m_programHolder = TextureMapper::create();
++    BitmapTextureUploaderPS5::singleton().initialize();
++
++    // S1b: always a small check (a page that can't composite must stay on
++    // the CPU path); the full measurement in test mode.
++    bool ok = runS1b(m_testMode, m_testMode ? IntSize { context.width, context.height } : IntSize { 1920, 1080 });
++    while (glGetError() != GL_NO_ERROR) { }
++    if (!ok) {
++        fail("the S1b self-test failed");
++        return false;
++    }
++
++    m_stats.start = MonotonicTime::now();
++    {
++        Locker locker { m_lock };
++        m_state = State::Ready;
++        m_stateChanged.notifyAll();
++    }
++    WTFLogAlways("[wc] GPU compositor ready in %.1f ms%s", msSince(start), m_testMode ? " (test mode: synthetic scene for 20 s)" : ""); // NOLINT
++    if (hasPending())
++        context.requestFrame();
++    return true;
++}
++
++bool SceneHost::hasPending()
++{
++    Locker locker { m_lock };
++    return !m_queue.isEmpty();
++}
++
++WCScene& SceneHost::ensureScene(uint64_t pageID)
++{
++    auto& scene = m_scenes[pageID];
++    if (!scene) {
++        scene = makeUnique<WCScene>(Process::identifier(), false);
++        scene->initialize(*m_sceneContext);
++    }
++    return *scene;
++}
++
++void SceneHost::applyPending()
++{
++    Deque<Job> jobs;
++    {
++        Locker locker { m_lock };
++        jobs = std::exchange(m_queue, { });
++    }
++    for (auto& job : jobs) {
++        if (!job.info) {
++            m_scenes.erase(job.pageID);
++            m_lastUpdate.erase(job.pageID);
++            if (m_shownPage == job.pageID) {
++                // Show the most recently updated scene left, if any (an old
++                // drawing area can go after its successor's first update).
++                m_shownPage = std::nullopt;
++                uint64_t newest = 0;
++                for (auto& entry : m_lastUpdate) {
++                    if (entry.second > newest && m_scenes.count(entry.first) && m_scenes[entry.first]->hasRootLayer()) {
++                        newest = entry.second;
++                        m_shownPage = entry.first;
++                    }
++                }
++                if (!m_shownPage)
++                    m_surface = nullptr;
++            }
++        } else {
++            auto start = MonotonicTime::now();
++            auto& scene = ensureScene(job.pageID);
++            if (scene.apply(*job.info)) {
++                m_shownPage = job.pageID;
++                m_lastUpdate[job.pageID] = ++m_updateSerial;
++            }
++            job.info = nullptr; // tile bitmaps go now, on this thread
++            double ms = msSince(start);
++            m_stats.updates++;
++            m_stats.applyMS += ms;
++            m_stats.applyMaxMS = std::max(m_stats.applyMaxMS, ms);
++        }
++        m_dirty = true;
++        if (job.didPresent)
++            m_frameCompletions.append(WTF::move(job.didPresent));
++    }
++}
++
++unsigned SceneHost::paint(int64_t, int* width, int* height)
++{
++    *width = *height = 0;
++    if (!m_shownPage)
++        return 0;
++    auto it = m_scenes.find(*m_shownPage);
++    if (it == m_scenes.end() || !it->second->hasRootLayer())
++        return 0;
++    auto& scene = *it->second;
++    IntSize size = scene.viewport();
++    if (size.isEmpty())
++        return 0;
++    if (!m_surface || m_surface->size() != size) {
++        m_surface = BitmapTexture::create(size, { BitmapTexture::Flags::SupportsAlpha });
++        m_dirty = true;
++    }
++    if (m_dirty) {
++        auto start = MonotonicTime::now();
++        scene.paint(*m_surface);
++        m_dirty = false;
++        double ms = msSince(start);
++        m_stats.paints++;
++        m_stats.paintMS += ms;
++        m_stats.paintMaxMS = std::max(m_stats.paintMaxMS, ms);
++    }
++    *width = size.width();
++    *height = size.height();
++    return m_surface->id();
++}
++
++void SceneHost::didPresent()
++{
++    BitmapTextureUploaderPS5::singleton().frameDone();
++    if (!m_frameCompletions.isEmpty()) {
++        m_stats.presents++;
++        completeOnMainThread(std::exchange(m_frameCompletions, { }));
++    }
++    maybeLog();
++}
++
++void SceneHost::maybeLog()
++{
++    auto now = MonotonicTime::now();
++    double seconds = (now - m_stats.start).seconds();
++    if (seconds < 1)
++        return;
++    auto uploads = BitmapTextureUploaderPS5::singleton().takeStats();
++    if (m_stats.updates || m_stats.paints || uploads.uploads) {
++        unsigned layers = 0;
++        for (auto& entry : m_scenes)
++            layers += entry.second->layerCount();
++        auto programs = TextureMapperShaderProgram::compileStats();
++        WTFLogAlways("[wc] %.1f s: %u updates (apply %.2f ms avg, %.1f max), %u presents; %zu pages, %u layers; tiles uploaded %u (%u draws, %.1f MB, %.2f ms, %.3f ms per upload, %u fence waits, %u finishes); " // NOLINT
++            "%u paints (%.2f ms avg, %.1f max); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s)",
++            seconds, m_stats.updates, m_stats.updates ? m_stats.applyMS / m_stats.updates : 0.0, m_stats.applyMaxMS, m_stats.presents,
++            m_scenes.size(), layers, uploads.uploads, uploads.draws, uploads.bytes / 1048576.0, uploads.milliseconds,
++            uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
++            m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS,
++            BitmapTextureUploaderPS5::textureBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion);
++    }
++    auto start = now;
++    m_stats = { };
++    m_stats.start = start;
++}
++
++// Reads the scene texture back (row 0 = top of the page) and checks probe
++// pixels against what the synthetic scene must show there.
++unsigned SceneHost::readbackAndCheck(const IntSize& size, uint32_t* checksum, unsigned* probesOK, unsigned* probes, char* firstBad, size_t firstBadSize, const char* dumpPath)
++{
++    Vector<uint8_t> pixels(static_cast<size_t>(size.width()) * size.height() * 4);
++    GLuint fbo = 0;
++    GLint previous = 0;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
++    glGenFramebuffers(1, &fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_surface->id(), 0);
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    glReadPixels(0, 0, size.width(), size.height(), GL_RGBA, GL_UNSIGNED_BYTE, pixels.mutableSpan().data());
++    glBindFramebuffer(GL_FRAMEBUFFER, previous);
++    glDeleteFramebuffers(1, &fbo);
++
++    uint32_t hash = 2166136261u;
++    for (auto byte : pixels)
++        hash = (hash ^ byte) * 16777619u;
++    *checksum = hash;
++
++    if (dumpPath) {
++        // Binary PPM, readback rows in order (row 0 = what the scene put at
++        // texture row 0, the top of the page), alpha dropped.
++        if (FILE* file = fopen(dumpPath, "wb")) {
++            fprintf(file, "P6\n%d %d\n255\n", size.width(), size.height());
++            Vector<uint8_t> row(size.width() * 3);
++            for (int y = 0; y < size.height(); ++y) {
++                const uint8_t* source = pixels.span().data() + static_cast<size_t>(y) * size.width() * 4;
++                for (int x = 0; x < size.width(); ++x) {
++                    row[x * 3] = source[x * 4];
++                    row[x * 3 + 1] = source[x * 4 + 1];
++                    row[x * 3 + 2] = source[x * 4 + 2];
++                }
++                fwrite(row.span().data(), 1, row.size(), file);
++            }
++            fclose(file);
++            WTFLogAlways("[wc] scene readback written to %s", dumpPath); // NOLINT
++        }
++    }
++
++    auto at = [&](int x, int y) {
++        const uint8_t* p = pixels.span().data() + (static_cast<size_t>(y) * size.width() + x) * 4;
++        return std::array<int, 4> { p[0], p[1], p[2], p[3] };
++    };
++    auto patternRGBA = [](unsigned seed, int x, int y) {
++        uint32_t v = patternPixel(seed, x, y);
++        return std::array<int, 4> { static_cast<int>((v >> 16) & 0xff), static_cast<int>((v >> 8) & 0xff), static_cast<int>(v & 0xff), 255 };
++    };
++    unsigned ok = 0, total = 0;
++    auto probe = [&](const char* what, int x, int y, std::array<int, 4> expected, int tolerance) {
++        if (x < 0 || y < 0 || x >= size.width() || y >= size.height())
++            return;
++        total++;
++        auto got = at(x, y);
++        bool good = true;
++        for (int c = 0; c < 4; ++c)
++            good &= std::abs(got[c] - expected[c]) <= tolerance;
++        if (good)
++            ok++;
++        else if (firstBad) {
++            size_t used = strlen(firstBad);
++            if (used + 1 < firstBadSize)
++                snprintf(firstBad + used, firstBadSize - used, "%s%s (%d,%d) RGBA %d,%d,%d,%d want %d,%d,%d,%d", used ? "; " : "", what, x, y, got[0], got[1], got[2], got[3], expected[0], expected[1], expected[2], expected[3]);
++        }
++    };
++    using S = SyntheticScene;
++    // Background alone, exact (bottom right; tile row 2 is partial at 1080).
++    probe("background", size.width() - 20, size.height() - 10, patternRGBA(S::Background, size.width() - 20, size.height() - 10), 0);
++    probe("background", 1100, 40, patternRGBA(S::Background, 1100, 40), 0);
++    // Green at opacity 0.5 over the background.
++    {
++        int x = S::solidPosition.x() + 150, y = S::solidPosition.y() + 100;
++        auto bg = patternRGBA(S::Background, x, y);
++        probe("solid 50%", x, y, { (bg[0] + 1) / 2, (bg[1] + 200 + 1) / 2, (bg[2] + 1) / 2, 255 }, 3);
++    }
++    // Rounded clip: the corner shows the background, the middle the child (offset -50,-50).
++    {
++        int x = S::clipPosition.x() + 4, y = S::clipPosition.y() + 4;
++        probe("rounded corner", x, y, patternRGBA(S::Background, x, y), 2);
++        int cx = S::clipPosition.x() + 200, cy = S::clipPosition.y() + 150;
++        probe("clipped child", cx, cy, patternRGBA(S::ClipChild, 250, 200), 2);
++    }
++    *probesOK = ok;
++    *probes = total;
++    return total - ok;
++}
++
++bool SceneHost::runS1b(bool verbose, IntSize viewport)
++{
++    auto glError = [] {
++        GLenum first = GL_NO_ERROR;
++        for (GLenum error; (error = glGetError()) != GL_NO_ERROR;) {
++            if (first == GL_NO_ERROR)
++                first = error;
++        }
++        return first;
++    };
++    auto finish = [] {
++        glFinish();
++    };
++    glError();
++    auto programsBefore = TextureMapperShaderProgram::compileStats();
++
++    auto t0 = MonotonicTime::now();
++    WCScene scene(Process::identifier(), false);
++    scene.initialize(*m_sceneContext);
++    double createMS = msSince(t0);
++
++    SyntheticScene synthetic(viewport);
++    bool bitmapsOK = false;
++    auto info = synthetic.initial(&bitmapsOK);
++    if (!bitmapsOK) {
++        WTFLogAlways("[wc] S1b: could not make the test tile bitmaps (shared memory)"); // NOLINT
++        return false;
++    }
++    BitmapTextureUploaderPS5::singleton().takeStats();
++    t0 = MonotonicTime::now();
++    bool applied = scene.apply(info);
++    finish();
++    double applyMS = msSince(t0);
++    auto uploadStats = BitmapTextureUploaderPS5::singleton().takeStats();
++    GLenum applyError = glError();
++
++    m_surface = BitmapTexture::create(viewport, { BitmapTexture::Flags::SupportsAlpha });
++    t0 = MonotonicTime::now();
++    scene.paint(*m_surface);
++    finish();
++    double coldMS = msSince(t0);
++    GLenum coldError = glError();
++    auto programsAfter = TextureMapperShaderProgram::compileStats();
++
++    const int warmRuns = verbose ? 20 : 3;
++    double warmCPU = 0, warmTotal = 0, warmMax = 0;
++    for (int i = 0; i < warmRuns; ++i) {
++        t0 = MonotonicTime::now();
++        scene.paint(*m_surface);
++        double cpu = msSince(t0);
++        finish();
++        double total = msSince(t0);
++        warmCPU += cpu;
++        warmTotal += total;
++        warmMax = std::max(warmMax, total);
++    }
++    GLenum warmError = glError();
++
++    uint32_t checksum = 0;
++    unsigned probesOK = 0, probes = 0;
++    char firstBad[600] = { };
++    unsigned bad = readbackAndCheck(viewport, &checksum, &probesOK, &probes, firstBad, sizeof(firstBad), verbose ? "/data/ps5webkit/wc-s1b.ppm" : nullptr);
++    GLenum readError = glError();
++
++    const bool programsOK = programsAfter.failures == programsBefore.failures || !strcmp(programsAfter.glslVersion, "330 core");
++    // Test mode goes on after wrong pixels (to see them on screen); a normal
++    // start only composites when the self-test drew the scene right.
++    const bool ok = applied && (!bad || verbose) && programsOK && coldError == GL_NO_ERROR && warmError == GL_NO_ERROR;
++    WTFLogAlways("[wc] S1b: %s %dx%d: TextureMapper %.1f ms; apply (%zu layers, %u tile uploads, %.1f MB) %.1f ms incl. GPU, uploads %.2f ms; " // NOLINT
++        "first paint %.1f ms incl. GPU (%u programs compiled in %.1f ms, %u failed, GLSL %s); warm paint %.2f ms CPU, %.2f ms incl. GPU avg, %.2f max (%d runs); "
++        "probes %u/%u%s%s; checksum %08x; GL errors apply 0x%x first paint 0x%x warm 0x%x readback 0x%x",
++        ok && !bad ? "PASS" : ok ? "WRONG PIXELS" : "FAIL", viewport.width(), viewport.height(), createMS, static_cast<size_t>(scene.layerCount()), uploadStats.uploads, uploadStats.bytes / 1048576.0,
++        applyMS, uploadStats.milliseconds, coldMS, programsAfter.programs - programsBefore.programs, programsAfter.milliseconds - programsBefore.milliseconds,
++        programsAfter.failures - programsBefore.failures, programsAfter.glslVersion, warmCPU / warmRuns, warmTotal / warmRuns, warmMax, warmRuns,
++        probesOK, probes, bad ? ", first bad: " : "", bad ? firstBad : "", checksum, applyError, coldError, warmError, readError);
++
++    if (verbose && ok) {
++        // Tile uploads inside TextureMapper: every background tile again
++        // (12 at 1080p), through the PS5 path and through glTexSubImage2D.
++        auto& uploader = BitmapTextureUploaderPS5::singleton();
++        for (int pass = 0; pass < 2; ++pass) {
++            const bool ps5Path = !pass;
++            uploader.setEnabled(ps5Path);
++            double total = 0;
++            unsigned tiles = 0;
++            for (int round = 0; round < 5; ++round) {
++                auto retile = synthetic.retile(SyntheticScene::Background, viewport, SyntheticScene::Background);
++                for (auto& layer : retile.changedLayers)
++                    tiles += layer.background.tileUpdates.size();
++                uploader.takeStats();
++                t0 = MonotonicTime::now();
++                scene.apply(retile);
++                double cpu = msSince(t0);
++                finish();
++                total += msSince(t0);
++                auto stats = uploader.takeStats();
++                if (!round || round == 4) {
++                    WTFLogAlways("[wc] S1b uploads (%s) round %d: %.2f ms CPU for %zu tiles (%.3f ms per tile, uploader %.3f ms per tile), %.2f ms incl. GPU", // NOLINT
++                        ps5Path ? "staging ring + FBO pass" : "glTexSubImage2D", round, cpu, retile.changedLayers[0].background.tileUpdates.size(),
++                        cpu / retile.changedLayers[0].background.tileUpdates.size(), stats.uploads ? stats.milliseconds / stats.uploads : 0.0, msSince(t0));
++                }
++                uploader.frameDone();
++            }
++            scene.paint(*m_surface);
++            finish();
++            uint32_t passChecksum = 0;
++            unsigned passOK = 0, passProbes = 0;
++            char passBad[600] = { };
++            unsigned passFailed = readbackAndCheck(viewport, &passChecksum, &passOK, &passProbes, passBad, sizeof(passBad));
++            WTFLogAlways("[wc] S1b uploads (%s): %u tiles, %.3f ms per tile incl. GPU; after: probes %u/%u%s%s, checksum %08x (%s the first paint's); GL error 0x%x", // NOLINT
++                ps5Path ? "staging ring + FBO pass" : "glTexSubImage2D", tiles, total / tiles, passOK, passProbes, passFailed ? ", first bad: " : "", passFailed ? passBad : "",
++                passChecksum, passChecksum == checksum ? "same as" : "DIFFERENT from", glError());
++        }
++        uploader.setEnabled(true);
++        uploader.frameDone();
++    }
++    m_surface = nullptr;
++    return ok;
++}
++
++// ---- Test driver (main thread) ----
++
++void SceneHost::startTestDriver()
++{
++    if (!available()) {
++        WTFLogAlways("RESULT ps5browser wctest FAIL (compositor not available)"); // NOLINT
++        return;
++    }
++    m_testScene = std::make_unique<SyntheticScene>(IntSize { 1920, 1080 });
++    m_testStart = MonotonicTime::now();
++    m_testFrame = 0;
++    m_testCompleted = 0;
++    bool ok = false;
++    auto info = std::make_unique<WCUpdateInfo>(m_testScene->initial(&ok));
++    WTFLogAlways("[wc] test: synthetic scene started (%zu layers)", info->addedLayers.size()); // NOLINT
++
++    // As DrawingAreaWC: one update in flight, the next after its reply.
++    struct Driver {
++        static void sendNext(SceneHost& host)
++        {
++            double seconds = (MonotonicTime::now() - host.m_testStart).seconds();
++            if (seconds >= 20) {
++                WTFLogAlways("RESULT ps5browser wctest %s: %u updates presented in %.1f s (%.1f/s)", // NOLINT
++                    host.m_testCompleted > 600 ? "PASS" : "SLOW", host.m_testCompleted, seconds, host.m_testCompleted / seconds);
++                PS5WCHost::singleton().removePage(testPageID);
++                host.m_testScene = nullptr;
++                return;
++            }
++            auto next = std::make_unique<WCUpdateInfo>(host.m_testScene->next(++host.m_testFrame));
++            host.enqueue(testPageID, WTF::move(next), [&host] {
++                host.m_testCompleted++;
++                sendNext(host);
++            });
++        }
++    };
++    enqueue(testPageID, WTF::move(info), [this] {
++        m_testCompleted++;
++        Driver::sendNext(*this);
++    });
++}
++
++} // namespace
++
++PS5WCHost& PS5WCHost::singleton()
++{
++    static PS5WCHost* host = new PS5WCHost; // never destroyed
++    return *host;
++}
++
++PS5WCHost::PS5WCHost() = default;
++
++bool PS5WCHost::available() const
++{
++    return SceneHost::singleton().available();
++}
++
++void PS5WCHost::update(uint64_t pageID, WCUpdateInfo&& info, CompletionHandler<void()>&& didPresent)
++{
++    SceneHost::singleton().enqueue(pageID, std::make_unique<WCUpdateInfo>(WTF::move(info)), WTF::move(didPresent));
++}
++
++void PS5WCHost::removePage(uint64_t pageID)
++{
++    SceneHost::singleton().enqueue(pageID, nullptr, { });
++}
++
++} // namespace WebKit
++
++// PS5Renderer's compositor (PS5Compositor.h): called on the main thread from
++// PS5Renderer::initialize(), possibly before WebKit is initialized (no
++// RunLoop yet): the test driver starts from the GLib main loop, 3 s in.
++PS5CompositorClient* ps5wkWCCompositorClient()
++{
++    auto& host = WebKit::SceneHost::singleton();
++    if (WebKit::testModeRequested()) {
++        g_timeout_add(3000, [](gpointer) -> gboolean {
++            WebKit::SceneHost::singleton().startTestDriver();
++            return G_SOURCE_REMOVE;
++        }, nullptr);
++    }
++    return &host;
++}
++
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHostStub.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHostStub.cpp
+deleted file mode 100644
+index 232c9f39c9..0000000000
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHostStub.cpp
++++ /dev/null
+@@ -1,46 +0,0 @@
+-/*
+- * TEMPORARY STUB: delete this file (and its block in Platform/WC.cmake) once
+- * PS5WCHost.cpp, the real scene host, is in the tree. WC.cmake builds it
+- * only while PS5WCHost.cpp does not exist.
+- *
+- * Never available, so pages stay on the CPU path (or use the null host of
+- * the GL-free harness); an update that arrives anyway completes on the next
+- * run-loop turn without being shown.
+- */
+-
+-#include "config.h"
+-#include "PS5WCHost.h"
+-
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+-
+-#include <wtf/RunLoop.h>
+-
+-namespace WebKit {
+-
+-PS5WCHost& PS5WCHost::singleton()
+-{
+-    static PS5WCHost* host = new PS5WCHost;
+-    return *host;
+-}
+-
+-PS5WCHost::PS5WCHost() = default;
+-
+-bool PS5WCHost::available() const
+-{
+-    return false;
+-}
+-
+-void PS5WCHost::update(uint64_t, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent)
+-{
+-    RunLoop::mainSingleton().dispatch([didPresent = WTF::move(didPresent)]() mutable {
+-        didPresent();
+-    });
+-}
+-
+-void PS5WCHost::removePage(uint64_t)
+-{
+-}
+-
+-} // namespace WebKit
+-
+-#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h
+index d615e33c2b..182a7c5b31 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCBackingStore.h
+@@ -40,6 +40,8 @@ public:
+     WebCore::ImageBuffer* imageBuffer() { return m_imageBuffer.get(); }
+     void setImageBuffer(RefPtr<WebCore::ImageBuffer>&& image) { m_imageBuffer = WTF::move(image); }
+     WebCore::ShareableBitmap* bitmap() const { return m_bitmap.get(); }
++    // In-process producers (the PS5 compositor's synthetic test scene).
++    void setBitmap(RefPtr<WebCore::ShareableBitmap>&& bitmap) { m_bitmap = WTF::move(bitmap); }
+ 
+ private:
+     friend struct IPC::ArgumentCoder<WCBackingStore>;

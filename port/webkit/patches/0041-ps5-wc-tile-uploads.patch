@@ -1,0 +1,500 @@
+diff --git a/Source/WebCore/platform/TextureMapper.cmake b/Source/WebCore/platform/TextureMapper.cmake
+index 86d8458b48..02c8d56e80 100644
+--- a/Source/WebCore/platform/TextureMapper.cmake
++++ b/Source/WebCore/platform/TextureMapper.cmake
+@@ -58,10 +58,15 @@ if (USE_GRAPHICS_LAYER_WC)
+     )
+     list(APPEND WebCore_SOURCES
+         platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
++
++        platform/graphics/egl/BitmapTextureUploaderPS5.cpp
+     )
+     list(APPEND WebCore_PRIVATE_FRAMEWORK_HEADERS
+         platform/graphics/texmap/TextureMapperSparseBackingStore.h
+ 
++        platform/graphics/egl/BitmapTextureUploaderPS5.h
++        platform/graphics/texmap/TextureMapperShaderProgram.h
++
+         platform/graphics/wc/WCPlatformLayer.h
+     )
+     # TextureMapperSparseBackingStore paints TextureMapperTiles, which are
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexture.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexture.cpp
+index 6b3597b50c..748ce04cff 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexture.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexture.cpp
+@@ -24,6 +24,9 @@
+ 
+ #include "GLContext.h"
+ #include "PlatformDisplay.h"
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++#include "BitmapTextureUploaderPS5.h"
++#endif
+ #include <wtf/HashMap.h>
+ #include <wtf/RefCounted.h>
+ #include <wtf/RefPtr.h>
+@@ -157,6 +160,9 @@ BitmapTexture::BitmapTexture(const IntSize& size, OptionSet<Flags> flags)
+     allocateTexture();
+ 
+     glBindTexture(m_renderTarget, boundTexture);
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++    BitmapTextureUploaderPS5::textureBytesChanged(static_cast<long long>(sizeInBytes()));
++#endif
+ }
+ 
+ void BitmapTexture::createTexture()
+@@ -234,6 +240,9 @@ BitmapTexture::BitmapTexture(EGLImage image, const IntSize& size, OptionSet<Flag
+ 
+ BitmapTexture::~BitmapTexture()
+ {
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++    BitmapTextureUploaderPS5::textureBytesChanged(-static_cast<long long>(sizeInBytes()));
++#endif
+     glDeleteTextures(1, &m_id);
+ 
+ #if USE(TEXTURE_MAPPER)
+@@ -275,7 +284,13 @@ void BitmapTexture::reset(const IntSize& size, OptionSet<Flags> flags)
+ 
+     if (m_size == size)
+         return;
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++    BitmapTextureUploaderPS5::textureBytesChanged(-static_cast<long long>(sizeInBytes()));
++#endif
+     m_size = size;
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++    BitmapTextureUploaderPS5::textureBytesChanged(static_cast<long long>(sizeInBytes()));
++#endif
+ 
+     determineRenderTargetAndBinding();
+ 
+@@ -307,6 +322,17 @@ void BitmapTexture::reset(const IntSize& size, OptionSet<Flags> flags)
+ 
+ void BitmapTexture::updateContents(const void* srcData, const IntRect& targetRect, const IntPoint& sourceOffset, int bytesPerLine, PixelFormat pixelFormat)
+ {
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++    // PS5 compositor: staging ring + FBO pass (BitmapTextureUploaderPS5.h).
++    // The texture then holds RGBA whatever order the source had.
++    if (m_renderTarget == GL_TEXTURE_2D && !m_flags.contains(Flags::UseBGRALayout)
++        && (pixelFormat == PixelFormat::BGRA8 || pixelFormat == PixelFormat::RGBA8)
++        && BitmapTextureUploaderPS5::singleton().upload(m_id, srcData, targetRect, sourceOffset, bytesPerLine, pixelFormat == PixelFormat::BGRA8)) {
++        m_pixelFormat = PixelFormat::RGBA8;
++        return;
++    }
++#endif
++
+     if (m_pixelFormat != pixelFormat) {
+         // Only allow pixel format changes, if the whole texture content changes.
+         ASSERT(targetRect.size() == m_size);
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTextureUploaderPS5.cpp b/Source/WebCore/platform/graphics/egl/BitmapTextureUploaderPS5.cpp
+new file mode 100644
+index 0000000000..c0d2036deb
+--- /dev/null
++++ b/Source/WebCore/platform/graphics/egl/BitmapTextureUploaderPS5.cpp
+@@ -0,0 +1,298 @@
++/*
++ * Copyright (C) 2026 ps5webkit contributors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED.
++ */
++
++#include "config.h"
++#include "BitmapTextureUploaderPS5.h"
++
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++
++#include "GLContextWrapper.h"
++#include <atomic>
++#include <cstring>
++#include <epoxy/gl.h>
++#include <string>
++#include <utility>
++#include <wtf/MonotonicTime.h>
++#include <wtf/NeverDestroyed.h>
++
++namespace WebCore {
++
++static constexpr GLuint stagingBinding = 7; // PS5Renderer uses 0 and 1
++
++static std::atomic<long long> s_textureBytes;
++
++size_t BitmapTextureUploaderPS5::textureBytes()
++{
++    return static_cast<size_t>(std::max(0LL, s_textureBytes.load(std::memory_order_relaxed)));
++}
++
++void BitmapTextureUploaderPS5::textureBytesChanged(long long delta)
++{
++    s_textureBytes.fetch_add(delta, std::memory_order_relaxed);
++}
++
++BitmapTextureUploaderPS5& BitmapTextureUploaderPS5::singleton()
++{
++    static NeverDestroyed<BitmapTextureUploaderPS5> uploader;
++    return uploader;
++}
++
++static GLuint compileShader(GLenum type, const char* source)
++{
++    GLuint shader = glCreateShader(type);
++    glShaderSource(shader, 1, &source, nullptr);
++    glCompileShader(shader);
++    GLint ok = 0;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[512] = { };
++        glGetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
++        WTFLogAlways("[texmap] upload shader failed: %s", log); // NOLINT
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++bool BitmapTextureUploaderPS5::initialize(size_t ringBytes)
++{
++    if (m_context)
++        return true;
++    if (m_failed || !GLContextWrapper::currentContext())
++        return false;
++
++    const bool desktop = epoxy_is_desktop_gl();
++    // A triangle over the viewport; the fragment's window position picks the
++    // source pixel (the viewport and scissor are the target rect).
++    const char* vertexSource = desktop ? R"(#version 430 core
++void main()
++{
++    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++)" : R"(#version 310 es
++void main()
++{
++    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++)";
++    static const char* fragmentBody = R"(
++layout(std430, binding = 7) readonly buffer Staging { uint px[]; };
++uniform ivec4 u_rect; // target x, target y, source row length in pixels, 1 = swap R and B
++out vec4 color;
++void main()
++{
++    ivec2 p = ivec2(gl_FragCoord.xy) - u_rect.xy;
++    vec4 c = unpackUnorm4x8(px[p.y * u_rect.z + p.x]);
++    color = u_rect.w != 0 ? c.zyxw : c;
++}
++)";
++    std::string fragmentSource = desktop ? "#version 430 core\n" : "#version 310 es\nprecision highp float;\nprecision highp int;\n";
++    fragmentSource += fragmentBody;
++
++    auto fail = [&](const char* why) {
++        WTFLogAlways("[texmap] PS5 tile uploads unavailable (%s, GL error 0x%x): glTexSubImage2D instead", why, glGetError()); // NOLINT
++        m_failed = true;
++        return false;
++    };
++
++    GLuint vs = compileShader(GL_VERTEX_SHADER, vertexSource);
++    GLuint fs = vs ? compileShader(GL_FRAGMENT_SHADER, fragmentSource.c_str()) : 0;
++    if (!vs || !fs) {
++        if (vs)
++            glDeleteShader(vs);
++        return fail("shader");
++    }
++    m_program = glCreateProgram();
++    glAttachShader(m_program, vs);
++    glAttachShader(m_program, fs);
++    glLinkProgram(m_program);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    GLint linked = 0;
++    glGetProgramiv(m_program, GL_LINK_STATUS, &linked);
++    if (!linked)
++        return fail("link");
++    m_rectLocation = glGetUniformLocation(m_program, "u_rect");
++
++    GLint alignment = 0;
++    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &alignment);
++    m_alignment = std::max<size_t>(256, alignment > 0 ? static_cast<size_t>(alignment) : 256);
++
++    m_size = ringBytes;
++    const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
++    GLint previousBuffer = 0;
++    glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &previousBuffer);
++    glGenBuffers(1, &m_buffer);
++    glBindBuffer(GL_COPY_WRITE_BUFFER, m_buffer);
++    glBufferStorage(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(m_size), nullptr, flags);
++    m_map = static_cast<uint8_t*>(glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, static_cast<GLsizeiptr>(m_size), flags));
++    glBindBuffer(GL_COPY_WRITE_BUFFER, previousBuffer);
++    if (!m_map)
++        return fail("staging buffer map");
++
++    glGenVertexArrays(1, &m_vao);
++    glGenFramebuffers(1, &m_fbo);
++    m_context = GLContextWrapper::currentContext();
++    WTFLogAlways("[texmap] PS5 tile uploads: %zu MB staging ring at %p, slot alignment %zu, %s", m_size >> 20, m_map, m_alignment, desktop ? "GLSL 4.30" : "GLSL ES 3.10"); // NOLINT
++    return true;
++}
++
++bool BitmapTextureUploaderPS5::isActive() const
++{
++    return m_context && m_enabled && GLContextWrapper::currentContext() == m_context;
++}
++
++size_t BitmapTextureUploaderPS5::allocate(size_t bytes)
++{
++    bytes = (bytes + m_alignment - 1) & ~(m_alignment - 1);
++    size_t position = static_cast<size_t>(m_head % m_size);
++    if (position + bytes > m_size)
++        m_head += m_size - position; // the slot can't wrap: skip to the start
++    while (m_head + bytes - m_tail > m_size) {
++        if (!m_marks.isEmpty()) {
++            auto mark = m_marks.takeFirst();
++            GLenum result = glClientWaitSync(mark.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
++            glDeleteSync(mark.fence);
++            if (result == GL_TIMEOUT_EXPIRED || result == GL_WAIT_FAILED) {
++                glFinish();
++                m_stats.finishes++;
++            }
++            m_stats.fenceWaits++;
++            m_tail = mark.head;
++        } else {
++            // All of it was uploaded since the last frame ended.
++            glFinish();
++            m_stats.finishes++;
++            m_tail = m_head;
++        }
++    }
++    size_t offset = static_cast<size_t>(m_head % m_size);
++    m_head += bytes;
++    return offset;
++}
++
++bool BitmapTextureUploaderPS5::upload(unsigned texture, const void* data, const IntRect& targetRect, const IntPoint& sourceOffset, int bytesPerLine, bool sourceIsBGRA)
++{
++    if (!isActive() || targetRect.isEmpty() || bytesPerLine <= 0 || (bytesPerLine & 3))
++        return false;
++
++    auto start = MonotonicTime::now();
++    const size_t rowBytes = static_cast<size_t>(targetRect.width()) * 4;
++    const int rowsPerDraw = std::max(1, static_cast<int>((m_size / 4) / rowBytes));
++    const uint8_t* source = static_cast<const uint8_t*>(data) + static_cast<size_t>(sourceOffset.y()) * bytesPerLine + static_cast<size_t>(sourceOffset.x()) * 4;
++
++    GLint previousFramebuffer = 0, previousProgram = 0, previousVAO = 0;
++    GLint previousViewport[4], previousScissor[4];
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
++    glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &previousVAO);
++    glGetIntegerv(GL_VIEWPORT, previousViewport);
++    glGetIntegerv(GL_SCISSOR_BOX, previousScissor);
++    GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST), blend = glIsEnabled(GL_BLEND);
++    GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST), stencilTest = glIsEnabled(GL_STENCIL_TEST);
++
++    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
++    glUseProgram(m_program);
++    glBindVertexArray(m_vao);
++    glDisable(GL_BLEND);
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_STENCIL_TEST);
++    glEnable(GL_SCISSOR_TEST);
++
++    for (int row = 0; row < targetRect.height(); row += rowsPerDraw) {
++        const int rows = std::min(rowsPerDraw, targetRect.height() - row);
++        const size_t bytes = rowBytes * rows;
++        const size_t offset = allocate(bytes);
++        uint8_t* slot = m_map + offset;
++        const uint8_t* rowSource = source + static_cast<size_t>(row) * bytesPerLine;
++        if (static_cast<size_t>(bytesPerLine) == rowBytes)
++            memcpy(slot, rowSource, bytes);
++        else {
++            for (int y = 0; y < rows; ++y)
++                memcpy(slot + y * rowBytes, rowSource + static_cast<size_t>(y) * bytesPerLine, rowBytes);
++        }
++        // Only the slot: the driver flushes the whole bound range on every draw.
++        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, stagingBinding, m_buffer, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes));
++        const int y = targetRect.y() + row;
++        glViewport(targetRect.x(), y, targetRect.width(), rows);
++        glScissor(targetRect.x(), y, targetRect.width(), rows);
++        glUniform4i(m_rectLocation, targetRect.x(), y, targetRect.width(), sourceIsBGRA ? 1 : 0);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        m_stats.draws++;
++        m_stats.bytes += bytes;
++    }
++
++    // Don't keep the texture alive through the attachment.
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, stagingBinding, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, previousFramebuffer);
++    glUseProgram(previousProgram);
++    glBindVertexArray(previousVAO);
++    glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
++    glScissor(previousScissor[0], previousScissor[1], previousScissor[2], previousScissor[3]);
++    if (!scissorTest)
++        glDisable(GL_SCISSOR_TEST);
++    if (blend)
++        glEnable(GL_BLEND);
++    if (depthTest)
++        glEnable(GL_DEPTH_TEST);
++    if (stencilTest)
++        glEnable(GL_STENCIL_TEST);
++
++    m_stats.uploads++;
++    m_stats.milliseconds += (MonotonicTime::now() - start).milliseconds();
++    return true;
++}
++
++void BitmapTextureUploaderPS5::frameDone()
++{
++    if (!isActive())
++        return;
++    // Retire what the GPU already finished, without waiting.
++    while (!m_marks.isEmpty()) {
++        GLenum result = glClientWaitSync(m_marks.first().fence, 0, 0);
++        if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED)
++            break;
++        auto mark = m_marks.takeFirst();
++        glDeleteSync(mark.fence);
++        m_tail = mark.head;
++    }
++    if (m_head == m_lastMarkHead)
++        return;
++    if (m_marks.size() >= 16) {
++        auto mark = m_marks.takeFirst();
++        glClientWaitSync(mark.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
++        glDeleteSync(mark.fence);
++        m_tail = mark.head;
++        m_stats.fenceWaits++;
++    }
++    m_marks.append({ glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), m_head });
++    m_lastMarkHead = m_head;
++}
++
++BitmapTextureUploaderPS5::Stats BitmapTextureUploaderPS5::takeStats()
++{
++    return std::exchange(m_stats, { });
++}
++
++} // namespace WebCore
++
++#endif // USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTextureUploaderPS5.h b/Source/WebCore/platform/graphics/egl/BitmapTextureUploaderPS5.h
+new file mode 100644
+index 0000000000..a4f6c562a9
+--- /dev/null
++++ b/Source/WebCore/platform/graphics/egl/BitmapTextureUploaderPS5.h
+@@ -0,0 +1,104 @@
++/*
++ * Copyright (C) 2026 ps5webkit contributors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED.
++ */
++
++#pragma once
++
++#if USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)
++
++#include "IntRect.h"
++#include <wtf/Deque.h>
++
++typedef struct __GLsync* GLsync;
++
++namespace WebCore {
++
++class GLContextWrapper;
++
++// Tile uploads for the PS5 compositor (port/webkit/COMPOSITING-PLAN.md, S1a).
++// ps5-opengl's glTexSubImage2D into a tiled RGBA8 texture scatters texels on
++// the CPU (~5 ms per 512x512 tile). Instead the rows are memcpy'd into a slot
++// of a persistent, coherent staging ring and drawn into the texture with an
++// FBO pass that reads them as a shader storage buffer and swaps B and R
++// (~0.2 ms per tile). Textures stay ordinary RGBA8 render targets.
++//
++// A slot is reused only after the GPU passed it: frameDone() (after each
++// swap or headset submit) drops a fence; a full ring waits for the oldest
++// fence (glFinish if none). Used on one thread, in one context: the one
++// initialize() ran in. Elsewhere upload() returns false and BitmapTexture
++// falls back to glTexSubImage2D.
++class BitmapTextureUploaderPS5 {
++public:
++    WEBCORE_EXPORT static BitmapTextureUploaderPS5& singleton();
++
++    // In the compositor's context. False: unavailable for good.
++    WEBCORE_EXPORT bool initialize(size_t ringBytes = 16 << 20);
++    bool isActive() const;
++    // Off: upload() declines (BitmapTexture uses glTexSubImage2D); for comparisons.
++    WEBCORE_EXPORT void setEnabled(bool enabled) { m_enabled = enabled; }
++
++    // Draws targetRect's rows (from data at sourceOffset, bytesPerLine apart)
++    // into the 2D RGBA8 texture, swapping R and B when the source is BGRA.
++    bool upload(unsigned texture, const void* data, const IntRect& targetRect, const IntPoint& sourceOffset, int bytesPerLine, bool sourceIsBGRA);
++
++    WEBCORE_EXPORT void frameDone();
++
++    struct Stats {
++        unsigned uploads { 0 }; // upload() calls
++        unsigned draws { 0 };   // FBO passes (an upload larger than a quarter of the ring takes several)
++        double bytes { 0 };
++        double milliseconds { 0 }; // CPU wall time in upload(), waits included
++        unsigned fenceWaits { 0 };
++        unsigned finishes { 0 };
++    };
++    WEBCORE_EXPORT Stats takeStats();
++
++    // Bytes held by live BitmapTextures (any thread's), for the compositor's log.
++    WEBCORE_EXPORT static size_t textureBytes();
++    static void textureBytesChanged(long long delta);
++
++private:
++    size_t allocate(size_t bytes);
++
++    GLContextWrapper* m_context { nullptr };
++    bool m_failed { false };
++    bool m_enabled { true };
++    unsigned m_buffer { 0 };
++    uint8_t* m_map { nullptr };
++    size_t m_size { 0 };
++    size_t m_alignment { 256 };
++    unsigned m_program { 0 };
++    int m_rectLocation { -1 };
++    unsigned m_vao { 0 };
++    unsigned m_fbo { 0 };
++
++    // Ring positions as running byte counts (slot = position % m_size).
++    uint64_t m_head { 0 };
++    uint64_t m_tail { 0 };
++    uint64_t m_lastMarkHead { 0 };
++    struct Mark {
++        GLsync fence;
++        uint64_t head;
++    };
++    Deque<Mark> m_marks;
++
++    Stats m_stats;
++};
++
++} // namespace WebCore
++
++#endif // USE(TEXTURE_MAPPER) && defined(PS5_PAYLOAD_SDK)

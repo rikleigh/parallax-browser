@@ -1,0 +1,162 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 9716c1a226..c617eb3490 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -55,12 +55,15 @@ bool DrawingAreaProxyWCPS5::compositingRequested()
+ {
+     if (s_compositingOverride >= 0)
+         return s_compositingOverride;
++    // On by default; /data/ps5webkit/no-compositing (Settings: GPU
++    // compositing off) turns it off. The old opt-in file "compositing" is
++    // no longer needed and changes nothing.
+     // open(), not access(): access() reports existing files as missing in a title.
+-    int fd = open("/data/ps5webkit/compositing", O_RDONLY);
++    int fd = open("/data/ps5webkit/no-compositing", O_RDONLY);
+     if (fd < 0)
+-        return false;
++        return true;
+     close(fd);
+-    return true;
++    return false;
+ }
+ 
+ #if ENABLE(ASYNC_SCROLLING)
+@@ -76,25 +79,39 @@ static HashMap<uint64_t, Ref<PS5WCScrollingTree>>& scrollingTrees()
+     return map;
+ }
+ 
+-bool DrawingAreaProxyWCPS5::asyncScrollingRequested()
++// The flag file's content, or false when there is none.
++static bool readAsyncScrollingFile(char (&buffer)[256])
+ {
++    memset(buffer, 0, sizeof(buffer));
+     int fd = open("/data/ps5webkit/wc-async-scroll", O_RDONLY);
+     if (fd < 0)
+         return false;
++    ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+     close(fd);
++    buffer[length > 0 ? length : 0] = 0;
++    return true;
++}
++
++// On by default with compositing. A wc-async-scroll file holding the word
++// "off" (or "0") turns it off; its other words are options (below).
++bool DrawingAreaProxyWCPS5::asyncScrollingRequested()
++{
++    char buffer[256];
++    if (!readAsyncScrollingFile(buffer))
++        return true;
++    for (char* token = strtok(buffer, " \t\r\n"); token; token = strtok(nullptr, " \t\r\n")) {
++        if (!strcmp(token, "off") || !strcmp(token, "0"))
++            return false;
++    }
+     return true;
+ }
+ 
+-// A number from the flag file's content ("checkerboard=200"), or fallback.
++// A number from the flag file's content ("checkerboard=200"), or fallback
++// (the default, also without a file).
+ static float asyncScrollingOption(const char* name, float fallback)
+ {
+-    int fd = open("/data/ps5webkit/wc-async-scroll", O_RDONLY);
+-    if (fd < 0)
+-        return fallback;
+-    char buffer[256] = { };
+-    ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+-    close(fd);
+-    if (length <= 0)
++    char buffer[256];
++    if (!readAsyncScrollingFile(buffer))
+         return fallback;
+     size_t nameLength = strlen(name);
+     for (char* token = strtok(buffer, " \t\r\n"); token; token = strtok(nullptr, " \t\r\n")) {
+@@ -345,8 +362,8 @@ bool DrawingAreaProxyWCPS5::configurePreferencesForNewPage(WebPreferences& prefe
+         preferences.setAcceleratedCompositingEnabled(useWC);
+     if (preferences.forceCompositingMode() != useWC)
+         preferences.setForceCompositingMode(useWC);
+-    // Async scrolling (COMPOSITING-PLAN.md): the title's scrolling tree, only
+-    // with /data/ps5webkit/wc-async-scroll; off otherwise, as before.
++    // Async scrolling (COMPOSITING-PLAN.md): the title's scrolling tree,
++    // on with compositing unless /data/ps5webkit/wc-async-scroll says "off".
+     bool asyncScrolling = false;
+ #if ENABLE(ASYNC_SCROLLING)
+     asyncScrolling = useWC && asyncScrollingRequested();
+@@ -372,7 +389,9 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+     if (protect(webPageProxy.preferences())->threadedScrollingEnabled() && !PS5WCNullHost::isInstalled()) {
+         m_scrollingTree = PS5WCScrollingTree::create(identifier().toUInt64());
+         m_scrollingTree->setCheckerboardPx(asyncScrollingOption("checkerboard", 0));
+-        m_scrollingTree->setFrameLockedStick(asyncScrollingOption("stickframe", 0) > 0);
++        // Default: the frame-locked stick (the owner's tested setting);
++        // "stickframe=0" in the flag file gives the event-driven stick.
++        m_scrollingTree->setFrameLockedStick(asyncScrollingOption("stickframe", 1) > 0);
+         m_scrollingTree->setAsyncSubScrollers(asyncScrollingOption("overflow", 0) > 0);
+         m_scrollingTree->setHideLaggingScrollbar(asyncScrollingOption("thumb", 1) > 0);
+         m_scrollingTree->setUnconsumedToWebProcess(asyncScrollingOption("unconsumed", 1) > 0);
+@@ -391,7 +410,12 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+         }
+         Locker locker { scrollingTreesLock() };
+         scrollingTrees().set(identifier().toUInt64(), *m_scrollingTree);
+-        WTFLogAlways("[ascroll] drawing area %llu: async scrolling (the title's scrolling tree)", static_cast<unsigned long long>(identifier().toUInt64())); // NOLINT
++        WTFLogAlways("[ascroll] drawing area %llu: async scrolling (the title's scrolling tree; stick %s, overflow %s, sync %s; %s)", static_cast<unsigned long long>(identifier().toUInt64()), // NOLINT
++            m_scrollingTree->frameLockedStick() ? "frame" : "events", m_scrollingTree->asyncSubScrollers() ? "on" : "off",
++            syncForScene(identifier().toUInt64()) ? "on" : "off", [] {
++                char buffer[256];
++                return readAsyncScrollingFile(buffer) ? "defaults + wc-async-scroll" : "defaults";
++            }());
+     }
+ #endif
+ }
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index 4a0b4bd53e..e677bee7ca 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -50,8 +50,8 @@ public:
+     void deref() const final { RefCounted::deref(); }
+     bool isDrawingAreaProxyWCPS5() const final { return true; }
+ 
+-    // The run-time switch (opt-in): the flag file /data/ps5webkit/compositing,
+-    // unless the embedder overrode it (ps5wk_compositing_set_override). Read
++    // The run-time switch: on unless the flag file /data/ps5webkit/no-compositing
++    // exists, or the embedder overrode it (ps5wk_compositing_set_override). Read
+     // each time a page gets a new WebProcess, so it applies on page restart.
+     static bool compositingRequested();
+ 
+@@ -71,8 +71,9 @@ public:
+     static void glMemoryAction(uint64_t sceneID, GLMemoryAction);
+ 
+ #if ENABLE(ASYNC_SCROLLING)
+-    // Async scrolling (COMPOSITING-PLAN.md): the flag file
+-    // /data/ps5webkit/wc-async-scroll, read for each new WebProcess.
++    // Async scrolling (COMPOSITING-PLAN.md): on with compositing unless the
++    // flag file /data/ps5webkit/wc-async-scroll holds "off"; its other words
++    // override the defaults. Read for each new WebProcess.
+     static bool asyncScrollingRequested();
+     // Any thread: the scrolling tree of a scene, if it has one.
+     static RefPtr<PS5WCScrollingTree> scrollingTreeForScene(uint64_t sceneID);
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 36c99a8188..c64a5f0568 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -458,7 +458,7 @@ private:
+     void updateSubScrollerRects(WCScene&, uint64_t sceneID);
+ #endif
+     bool m_scrollMovedByTitle { false }; // this frame
+-    // /data/ps5webkit/wc-scroll-log (or wc-async-scroll): [ascroll] lines.
++    // /data/ps5webkit/wc-scroll-log, or async scrolling on: [ascroll] lines.
+     bool m_scrollLog { false };
+     std::unordered_map<uint64_t, FloatPoint> m_scrollPositions; // per scene, from its updates
+     bool m_scrollMovedByUpdate { false }; // this frame
+@@ -628,7 +628,12 @@ bool SceneHost::setUp(const PS5CompositorContext& context)
+         m_frameLog = !stat("/data/ps5webkit/wc-frame-log", &st);
+         m_sceneStats = !stat("/data/ps5webkit/wc-scene-stats", &st);
+         m_waitOnlyWhileAnimating = !stat("/data/ps5webkit/wc-wait-old", &st);
+-        m_scrollLog = !stat("/data/ps5webkit/wc-scroll-log", &st) || !stat("/data/ps5webkit/wc-async-scroll", &st);
++        // With async scrolling on (the default) or wc-scroll-log: the 1 s
++        // [ascroll] summaries while a page scrolls, for TV logs.
++        m_scrollLog = !stat("/data/ps5webkit/wc-scroll-log", &st);
++#if ENABLE(ASYNC_SCROLLING)
++        m_scrollLog = m_scrollLog || DrawingAreaProxyWCPS5::asyncScrollingRequested();
++#endif
+         m_scrollStats.start = MonotonicTime::now();
+         if (m_scrollLog)
+             WTFLogAlways("[ascroll] scroll measurements on: [ascroll] lines while the page scrolls"); // NOLINT

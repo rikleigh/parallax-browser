@@ -1,0 +1,376 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 9dc2c04bda..aa51bc69f4 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -340,7 +340,7 @@ private:
+ 
+     struct {
+         MonotonicTime start;
+-        unsigned updates { 0 }, paints { 0 }, presents { 0 };
++        unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 };
+         double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 };
+     } m_stats;
+ 
+@@ -508,6 +508,7 @@ void SceneHost::applyPending()
+     }
+     for (auto& job : jobs) {
+         if (!job.info) {
++            m_dirty = true;
+             m_scenes.erase(job.pageID);
+             m_lastUpdate.erase(job.pageID);
+             if (m_shownPage == job.pageID) {
+@@ -527,6 +528,12 @@ void SceneHost::applyPending()
+         } else {
+             auto start = MonotonicTime::now();
+             auto& scene = ensureScene(job.pageID);
++            auto shownBefore = m_shownPage;
++            // An update without layer changes (a rendering update that
++            // changed nothing composited) needs no scene paint: the frame
++            // still presents and the reply still goes after the swap.
++            bool changed = !job.info->addedLayers.isEmpty() || !job.info->removedLayers.isEmpty() || !job.info->changedLayers.isEmpty()
++                || job.info->viewport != scene.viewport() || !scene.hasRootLayer();
+             if (scene.apply(*job.info)) {
+                 m_shownPage = job.pageID;
+                 m_lastUpdate[job.pageID] = ++m_updateSerial;
+@@ -536,8 +543,11 @@ void SceneHost::applyPending()
+             m_stats.updates++;
+             m_stats.applyMS += ms;
+             m_stats.applyMaxMS = std::max(m_stats.applyMaxMS, ms);
++            if (changed || m_shownPage != shownBefore)
++                m_dirty = true;
++            else
++                m_stats.unchanged++;
+         }
+-        m_dirty = true;
+         if (job.didPresent)
+             m_frameCompletions.append(WTF::move(job.didPresent));
+     }
+@@ -595,9 +605,9 @@ void SceneHost::maybeLog()
+         for (auto& entry : m_scenes)
+             layers += entry.second->layerCount();
+         auto programs = TextureMapperShaderProgram::compileStats();
+-        WTFLogAlways("[wc] %.1f s: %u updates (apply %.2f ms avg, %.1f max), %u presents; %zu pages, %u layers; tiles uploaded %u (%u draws, %.1f MB, %.2f ms, %.3f ms per upload, %u fence waits, %u finishes); " // NOLINT
++        WTFLogAlways("[wc] %.1f s: %u updates (apply %.2f ms avg, %.1f max; %u unchanged), %u presents; %zu pages, %u layers; tiles uploaded %u (%u draws, %.1f MB, %.2f ms, %.3f ms per upload, %u fence waits, %u finishes); " // NOLINT
+             "%u paints (%.2f ms avg, %.1f max); GL textures %.1f MB; programs %u (%.0f ms, %u failed, GLSL %s)",
+-            seconds, m_stats.updates, m_stats.updates ? m_stats.applyMS / m_stats.updates : 0.0, m_stats.applyMaxMS, m_stats.presents,
++            seconds, m_stats.updates, m_stats.updates ? m_stats.applyMS / m_stats.updates : 0.0, m_stats.applyMaxMS, m_stats.unchanged, m_stats.presents,
+             m_scenes.size(), layers, uploads.uploads, uploads.draws, uploads.bytes / 1048576.0, uploads.milliseconds,
+             uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
+             m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS,
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index c42378095d..6650622e59 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -43,17 +43,186 @@
+ #include "WebPageInlines.h"
+ #include "WebPreferencesKeys.h"
+ #include "WebProcess.h"
++#include <WebCore/AnimationFrameRate.h>
++#include <WebCore/DisplayUpdate.h>
+ #include <WebCore/ImageBuffer.h>
+ #include <WebCore/LocalFrame.h>
+ #include <WebCore/LocalFrameView.h>
+ #include <WebCore/Page.h>
+ #include <WebCore/Settings.h>
+ #include <wtf/Borrow.h>
++#include <wtf/NeverDestroyed.h>
+ #include <wtf/text/MakeString.h>
++#include <wtf/text/StringToIntegerConversion.h>
+ 
+ namespace WebKit {
+ using namespace WebCore;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// [render] lines for the composited path, in the CPU path's format
++// (NonCompositedFrameRenderer; test/paint/paint-ab-summary.py reads
++// [render1]): PS5WK_RENDER_LOG=0 off, 1 (default) every 5 s, 2 also one
++// [render1] line per update. "update" = style, layout, rAF and JavaScript;
++// "paint" = tiles painted on this thread; "copy" = the rest (layer commit,
++// sending the update); "frame done" = sent until the UI process presented it.
++static unsigned wcRenderLog()
++{
++    static unsigned level = [] {
++        const char* text = getenv("PS5WK_RENDER_LOG");
++        if (!text || !*text)
++            return 1u;
++        auto value = parseInteger<unsigned>(StringView::fromLatin1(text));
++        return value ? std::min(*value, 3u) : 1u;
++    }();
++    return level;
++}
++
++struct WCRenderStats {
++    Vector<float> totalMS, paintMS;
++    double updateMS { 0 }, megapixels { 0 }, frameDoneMS { 0 };
++    unsigned tiles { 0 }, frameDones { 0 }, monitorFires { 0 }, idleFires { 0 };
++    MonotonicTime windowStart;
++
++    static float percentile(Vector<float>& values, double fraction)
++    {
++        if (values.isEmpty())
++            return 0;
++        std::sort(values.begin(), values.end());
++        return values[std::min<size_t>(values.size() - 1, static_cast<size_t>(fraction * values.size()))];
++    }
++
++    void add(MonotonicTime end, double total, double update, double paint, double pixels, unsigned tileCount)
++    {
++        if (!windowStart)
++            windowStart = end;
++        totalMS.append(total);
++        paintMS.append(paint);
++        updateMS += update;
++        megapixels += pixels / 1e6;
++        tiles += tileCount;
++        if (wcRenderLog() >= 2)
++            WTFLogAlways("[render1] %.1f ms: update %.1f, paint %.1f (%.2f Mpx, %u tiles), copy %.1f", total, update, paint, pixels / 1e6, tileCount, std::max(0.0, total - update - paint)); // NOLINT
++        if (end - windowStart < 5_s)
++            return;
++        unsigned count = totalMS.size();
++        if (count >= 5 && wcRenderLog()) {
++            double seconds = (end - windowStart).seconds();
++            double total = 0, paint = 0;
++            for (auto value : totalMS)
++                total += value;
++            for (auto value : paintMS)
++                paint += value;
++            WTFLogAlways("[render] wc: %u updates in %.1f s (%.1f/s), %.1f ms average, p50 %.1f, p95 %.1f, %.1f ms max; update %.1f avg; paint %.1f avg %.1f p95 (%.2f Mpx, %.1f tiles avg); frame done %.1f ms avg; rAF clock %.1f/s (%u idle)", // NOLINT
++                count, seconds, count / seconds, total / count, percentile(totalMS, 0.5), percentile(totalMS, 0.95), percentile(totalMS, 1),
++                updateMS / count, paint / count, percentile(paintMS, 0.95), megapixels / count, static_cast<double>(tiles) / count,
++                frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires);
++        }
++        totalMS.shrink(0);
++        paintMS.shrink(0);
++        updateMS = megapixels = frameDoneMS = 0;
++        tiles = frameDones = monitorFires = idleFires = 0;
++        windowStart = end;
++    }
++};
++
++static WCRenderStats& wcRenderStats()
++{
++    static NeverDestroyed<WCRenderStats> stats; // main thread only
++    return stats.get();
++}
++#endif
++
++#if !ENABLE(GPU_PROCESS)
++class DrawingAreaWC::DisplayRefreshMonitorWC final : public DisplayRefreshMonitor {
++public:
++    static Ref<DisplayRefreshMonitorWC> create(DrawingAreaWC& drawingArea, PlatformDisplayID displayID)
++    {
++        return adoptRef(*new DisplayRefreshMonitorWC(drawingArea, displayID));
++    }
++
++    bool isActive() const { return m_active; }
++
++    void fire()
++    {
++        if (!m_active)
++            return;
++        m_update = m_update.nextUpdate();
++        displayLinkFired(m_update);
++    }
++
++    std::optional<FramesPerSecond> displayNominalFramesPerSecond() final { return FullSpeedFramesPerSecond; }
++
++private:
++    DisplayRefreshMonitorWC(DrawingAreaWC& drawingArea, PlatformDisplayID displayID)
++        : DisplayRefreshMonitor(displayID)
++        , m_drawingArea(drawingArea)
++    {
++        Locker locker { lock() };
++        setMaxUnscheduledFireCount(1);
++    }
++
++    bool startNotificationMechanism() final
++    {
++        RefPtr drawingArea = m_drawingArea.get();
++        if (!drawingArea)
++            return false; // RenderingUpdateScheduler falls back to its timer
++        if (!m_active) {
++            m_active = true;
++            drawingArea->displayRefreshMonitorStarted();
++        }
++        return true;
++    }
++
++    void stopNotificationMechanism() final { m_active = false; }
++
++    WeakPtr<DrawingAreaWC> m_drawingArea;
++    bool m_active { false };
++    DisplayUpdate m_update { 0, FullSpeedFramesPerSecond };
++};
++
++RefPtr<DisplayRefreshMonitor> DrawingAreaWC::createDisplayRefreshMonitor(PlatformDisplayID displayID)
++{
++    m_displayRefreshMonitor = DisplayRefreshMonitorWC::create(*this, displayID);
++    return m_displayRefreshMonitor;
++}
++
++void DrawingAreaWC::displayRefreshMonitorStarted()
++{
++    // Called with the monitor's lock held: only start a timer here. With an
++    // update in flight its reply fires the monitor.
++    if (m_waitDidUpdate || m_idleDisplayRefreshTimer.isActive())
++        return;
++    auto delay = std::max(0_s, m_lastDisplayRefresh + Seconds(1.0 / FullSpeedFramesPerSecond) - MonotonicTime::now());
++    m_idleDisplayRefreshTimer.startOneShot(delay);
++}
++
++void DrawingAreaWC::idleDisplayRefreshTimerFired()
++{
++    if (m_waitDidUpdate)
++        return;
++#if defined(PS5_PAYLOAD_SDK)
++    wcRenderStats().idleFires++;
++#endif
++    fireDisplayRefreshMonitor();
++}
++
++void DrawingAreaWC::fireDisplayRefreshMonitor()
++{
++    RefPtr monitor = m_displayRefreshMonitor;
++    if (!monitor || !monitor->isActive())
++        return;
++    m_lastDisplayRefresh = MonotonicTime::now();
++#if defined(PS5_PAYLOAD_SDK)
++    wcRenderStats().monitorFires++;
++#endif
++    monitor->fire();
++    // A client that didn't start a rendering update (or the scheduler
++    // rescheduling) still needs the next tick.
++    if (monitor->isActive() && !m_waitDidUpdate && !m_updateRenderingTimer.isActive() && !m_idleDisplayRefreshTimer.isActive())
++        m_idleDisplayRefreshTimer.startOneShot(Seconds(1.0 / FullSpeedFramesPerSecond));
++}
++#endif // !ENABLE(GPU_PROCESS)
++
+ DrawingAreaWC::DrawingAreaWC(WebPage& webPage, const WebPageCreationParameters& parameters)
+     : DrawingArea(parameters.drawingAreaIdentifier, webPage)
+ #if ENABLE(GPU_PROCESS)
+@@ -62,6 +231,9 @@ DrawingAreaWC::DrawingAreaWC(WebPage& webPage, const WebPageCreationParameters&
+     , m_layerFactory(*this)
+     , m_updateRenderingTimer(*this, &DrawingAreaWC::updateRendering)
+     , m_commitQueue(WorkQueue::create("DrawingAreaWC CommitQueue"_s))
++#if !ENABLE(GPU_PROCESS)
++    , m_idleDisplayRefreshTimer(*this, &DrawingAreaWC::idleDisplayRefreshTimerFired)
++#endif
+ {
+ }
+ 
+@@ -249,9 +421,17 @@ void DrawingAreaWC::updateRendering()
+     ASSERT(!m_waitDidUpdate);
+     m_waitDidUpdate = true;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    auto start = MonotonicTime::now();
++    auto paintBefore = wcTilePaintStats();
++#endif
+     Ref webPage = m_webPage.get();
+     webPage->updateRendering();
+     webPage->flushPendingEditorStateUpdate();
++#if defined(PS5_PAYLOAD_SDK)
++    auto updated = MonotonicTime::now();
++    auto paintInUpdate = wcTilePaintStats().milliseconds - paintBefore.milliseconds;
++#endif
+ 
+     OptionSet<FinalizeRenderingUpdateFlags> flags;
+     webPage->finalizeRenderingUpdate(flags);
+@@ -259,10 +439,20 @@ void DrawingAreaWC::updateRendering()
+ 
+     willStartRenderingUpdateDisplay();
+ 
+-    if (isCompositingMode())
++    bool compositing = isCompositingMode();
++    if (compositing)
+         sendUpdateAC();
+     else
+         sendUpdateNonAC();
++#if defined(PS5_PAYLOAD_SDK)
++    if (compositing) {
++        auto end = MonotonicTime::now();
++        m_lastUpdateSent = end;
++        auto& paint = wcTilePaintStats();
++        wcRenderStats().add(end, (end - start).milliseconds(), (updated - start).milliseconds() - paintInUpdate,
++            paint.milliseconds - paintBefore.milliseconds, static_cast<double>(paint.pixels - paintBefore.pixels), paint.tiles - paintBefore.tiles);
++    }
++#endif
+ }
+ 
+ void DrawingAreaWC::sendUpdateAC()
+@@ -368,6 +558,9 @@ void DrawingAreaWC::sendUpdateNonAC()
+     m_dirtyRegion = { };
+     m_scrollRect = { };
+     m_scrollOffset = { };
++    // Not a present: don't run rAF from inside this update; the monitor's
++    // idle timer ticks at 60 Hz until the first root layer.
++    SetForScope synchronous(m_inSynchronousDisplayDidRefresh, true);
+     displayDidRefresh();
+ #else
+     if (m_dirtyRegion.isEmpty()) {
+@@ -471,6 +664,20 @@ void DrawingAreaWC::displayDidRefresh(MonotonicTime)
+         m_hasDeferredRenderingUpdate = false;
+         triggerRenderingUpdate();
+     }
++#if !ENABLE(GPU_PROCESS)
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_lastUpdateSent && !m_inSynchronousDisplayDidRefresh) {
++        auto& stats = wcRenderStats();
++        stats.frameDones++;
++        stats.frameDoneMS += (MonotonicTime::now() - m_lastUpdateSent).milliseconds();
++    }
++#endif
++    if (m_inSynchronousDisplayDidRefresh) {
++        if (m_displayRefreshMonitor && m_displayRefreshMonitor->isActive() && !m_idleDisplayRefreshTimer.isActive())
++            m_idleDisplayRefreshTimer.startOneShot(std::max(0_s, m_lastDisplayRefresh + Seconds(1.0 / FullSpeedFramesPerSecond) - MonotonicTime::now()));
++    } else
++        fireDisplayRefreshMonitor();
++#endif
+ }
+ 
+ #if PLATFORM(GTK) || PLATFORM(WPE)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index 491a1d255d..069658a28e 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -33,6 +33,7 @@
+ #include "RemoteWCLayerTreeHostProxy.h"
+ #endif
+ #include "WCLayerFactory.h"
++#include <WebCore/DisplayRefreshMonitor.h>
+ #include <WebCore/GraphicsLayerFactory.h>
+ #include <WebCore/Timer.h>
+ 
+@@ -79,6 +80,16 @@ private:
+     void updatePreferences(const WebPreferencesStore&) override;
+     bool shouldUseTiledBackingForFrameView(const WebCore::LocalFrameView&) const override;
+     void displayDidRefresh(MonotonicTime = MonotonicTime::now()) override;
++#if !ENABLE(GPU_PROCESS)
++    // rAF follows the presents: a DisplayRefreshMonitor fired by each
++    // update's reply (sent after the swap that shows it), or at most at
++    // 60 Hz by a timer while no update is in flight.
++    RefPtr<WebCore::DisplayRefreshMonitor> createDisplayRefreshMonitor(WebCore::PlatformDisplayID) override;
++    class DisplayRefreshMonitorWC;
++    void displayRefreshMonitorStarted();
++    void fireDisplayRefreshMonitor();
++    void idleDisplayRefreshTimerFired();
++#endif
+     // GraphicsLayerWC::Observer
+     void graphicsLayerAdded(GraphicsLayerWC&) override;
+     void graphicsLayerRemoved(GraphicsLayerWC&) override;
+@@ -120,6 +131,15 @@ private:
+     WebCore::IntRect m_scrollRect;
+     WebCore::IntSize m_scrollOffset;
+     CompletionHandler<void()> m_forceRepaintCompletionHandler;
++#if !ENABLE(GPU_PROCESS)
++    RefPtr<DisplayRefreshMonitorWC> m_displayRefreshMonitor; // detached in ~DrawingAreaWC
++    WebCore::Timer m_idleDisplayRefreshTimer;
++    MonotonicTime m_lastDisplayRefresh;
++    bool m_inSynchronousDisplayDidRefresh { false };
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++    MonotonicTime m_lastUpdateSent;
++#endif
+ #if PLATFORM(GTK) || PLATFORM(WPE)
+     Vector<IPC::AsyncReplyID> m_pendingAfterDrawCallbackIDs;
+ #endif

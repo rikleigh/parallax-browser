@@ -1,0 +1,364 @@
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
+index ea858cb4d1..fcf9b18e88 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperSparseBackingStore.cpp
+@@ -42,7 +42,13 @@ void TextureMapperSparseBackingStore::setSize(const IntSize& size)
+     if (m_size == size)
+         return;
+     m_size = size;
+-    m_tiles.clear();
++    // The WC WebProcess keeps the tiles whose rect didn't change and sends
++    // removals (before any new tile at the same index) for the others
++    // (WCTileGrid::setSize); tiles outside the new size go here.
++    FloatRect bounds { { }, size };
++    m_tiles.removeIf([&](auto& entry) {
++        return !bounds.contains(entry.value->rect());
++    });
+ }
+ 
+ TransformationMatrix TextureMapperSparseBackingStore::adjustedTransformForRect(const FloatRect& targetRect)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 6a9e3c2aed..4f54987c13 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -33,11 +33,32 @@
+ #include "WCTileGrid.h"
+ #include <WebCore/GraphicsContext.h>
+ #include <WebCore/TransformState.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/text/MakeString.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ namespace WebKit {
+ using namespace WebCore;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5WK_WC_LAYER_LOG=1: a [wc-layer] line for every layer that painted tiles,
++// with the rects (of 2000 pixels or more) invalidated since its last paint.
++static unsigned wcLayerLog()
++{
++    static unsigned level = [] {
++        const char* text = getenv("PS5WK_WC_LAYER_LOG");
++        return text && *text >= '1' && *text <= '9' ? static_cast<unsigned>(*text - '0') : 0u;
++    }();
++    return level;
++}
++
++WCTilePaintStats& wcTilePaintStats()
++{
++    static WCTilePaintStats stats; // main thread only
++    return stats;
++}
++#endif
++
+ class WCTiledBacking final : public TiledBacking {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(WCTiledBacking);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(WCTiledBacking);
+@@ -48,6 +69,12 @@ public:
+     bool paintAndFlush(WCLayerUpdateInfo& update)
+     {
+         bool repainted = false;
++        for (auto& index : m_tileGrid.takePendingRemovals()) {
++            WCTileUpdate tileUpdate;
++            tileUpdate.index = index;
++            tileUpdate.willRemove = true;
++            update.background.tileUpdates.append(WTF::move(tileUpdate));
++        }
+         for (auto& entry : m_tileGrid.tiles()) {
+             auto& tile = *entry.value;
+             WCTileUpdate tileUpdate;
+@@ -61,17 +88,29 @@ public:
+                 continue;
+             repainted = true;
+             float deviceScaleFactor = m_owner.deviceScaleFactor();
+-            auto& dirtyRect = tile.dirtyRect();
+-            IntRect scaledDirtyRect = dirtyRect;
+-            scaledDirtyRect.scale(deviceScaleFactor);
+-            tileUpdate.dirtyRect = scaledDirtyRect;
+-            auto image = m_owner.createImageBuffer(dirtyRect.size(), deviceScaleFactor);
+-            auto& context = image->context();
+-            context.translate(-dirtyRect.x(), -dirtyRect.y());
+-            m_owner.paintGraphicsLayerContents(context, dirtyRect);
+-            image->flushDrawingContextAsync();
+-            tileUpdate.backingStore.setImageBuffer(WTF::move(image));
+-            update.background.tileUpdates.append(WTF::move(tileUpdate));
++            for (auto& dirtyRect : tile.rectsToPaint()) {
++                WCTileUpdate partUpdate;
++                partUpdate.index = entry.key;
++                IntRect scaledDirtyRect = dirtyRect;
++                scaledDirtyRect.scale(deviceScaleFactor);
++                partUpdate.dirtyRect = scaledDirtyRect;
++#if defined(PS5_PAYLOAD_SDK)
++                auto paintStart = MonotonicTime::now();
++#endif
++                auto image = m_owner.createImageBuffer(dirtyRect.size(), deviceScaleFactor);
++                auto& context = image->context();
++                context.translate(-dirtyRect.x(), -dirtyRect.y());
++                m_owner.paintGraphicsLayerContents(context, dirtyRect);
++                image->flushDrawingContextAsync();
++#if defined(PS5_PAYLOAD_SDK)
++                auto& stats = wcTilePaintStats();
++                stats.tiles++;
++                stats.pixels += static_cast<uint64_t>(scaledDirtyRect.width()) * scaledDirtyRect.height();
++                stats.milliseconds += (MonotonicTime::now() - paintStart).milliseconds();
++#endif
++                partUpdate.backingStore.setImageBuffer(WTF::move(image));
++                update.background.tileUpdates.append(WTF::move(partUpdate));
++            }
+         }
+         m_tileGrid.clearDirtyRects();
+         return repainted;
+@@ -89,7 +128,24 @@ public:
+ 
+     bool updateCoverageRect(const FloatRect& rect)
+     {
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: no async scrolling, so every scroll step is a layer-tree
++        // update. Tiles are made half a view (at least one tile row) ahead
++        // above and below what is visible, and kept until they are a further
++        // tile row away, so scroll steps paint nothing until the view nears
++        // a new tile row, and scrolling back reuses the tiles it left.
++        IntRect coverage = enclosingIntRect(rect);
++        if (coverage.isEmpty())
++            return m_tileGrid.setCoverageRect(coverage);
++        int tileHeight = m_tileGrid.tilePixelSize().height();
++        int margin = std::max(tileHeight, coverage.height() / 2);
++        IntRect keep = coverage;
++        coverage.inflateY(margin);
++        keep.inflateY(margin + tileHeight);
++        return m_tileGrid.setCoverageRect(coverage, keep);
++#else
+         return m_tileGrid.setCoverageRect(enclosingIntRect(rect));
++#endif
+     }
+ 
+     TiledBacking* tiledBacking() const { return const_cast<WCTiledBacking*>(this); };
+@@ -186,6 +242,10 @@ void GraphicsLayerWC::setNeedsDisplayInRect(const WebCore::FloatRect& rect, Shou
+         return;
+ 
+     m_tiledBacking->setDirtyRect(rect);
++#if defined(PS5_PAYLOAD_SDK)
++    if (wcLayerLog() && m_lastDirtyText.length() < 600 && rect.width() * rect.height() >= 2000)
++        m_lastDirtyText = makeString(m_lastDirtyText, ' ', rect.width(), 'x', rect.height(), '+', rect.x(), '+', rect.y());
++#endif
+     noteLayerPropertyChanged(WCLayerChange::Background);
+     addRepaintRect(rect);
+ }
+@@ -394,6 +454,10 @@ void GraphicsLayerWC::setDrawsContent(bool value)
+     if (value == drawsContent())
+         return;
+     GraphicsLayer::setDrawsContent(value);
++    // The scene drops a layer's backing store while it has nothing to draw
++    // (hasBackingStore false): repaint every tile when it draws again.
++    if (value)
++        m_tiledBacking->setDirtyRect({ { }, m_size });
+     noteLayerPropertyChanged(WCLayerChange::Background);
+     updateDebugIndicators();
+ }
+@@ -604,10 +668,20 @@ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+         if (drawsContent() && contentsAreVisible()) {
+             update.background.hasBackingStore = true;
+             update.background.backingStoreSize = WebCore::expandedIntSize(size() * deviceScaleFactor());
++#if defined(PS5_PAYLOAD_SDK)
++            auto tilesBefore = wcTilePaintStats().tiles;
++            auto pixelsBefore = wcTilePaintStats().pixels;
++#endif
+             if (m_tiledBacking->paintAndFlush(update)) {
+                 incrementRepaintCount();
+                 update.changes.add(WCLayerChange::RepaintCount);
+             }
++#if defined(PS5_PAYLOAD_SDK)
++            if (wcLayerLog() && wcTilePaintStats().tiles != tilesBefore)
++                WTFLogAlways("[wc-layer] %s %.0fx%.0f at %.0f,%.0f origin %.0f,%.0f: painted %u tiles, %.2f Mpx (%s)", name().utf8().data(), size().width(), size().height(), // NOLINT
++                    position().x(), position().y(), boundsOrigin().x(), boundsOrigin().y(), wcTilePaintStats().tiles - tilesBefore, (wcTilePaintStats().pixels - pixelsBefore) / 1e6, m_lastDirtyText.utf8().data());
++            m_lastDirtyText = { };
++#endif
+         } else
+             update.background.hasBackingStore = false;
+     }
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 632f216b3d..e324fe4a91 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -38,6 +38,16 @@ class TransformState;
+ namespace WebKit {
+ class WCTiledBacking;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Tiles painted on the main thread since DrawingAreaWC last took them ([render] lines).
++struct WCTilePaintStats {
++    unsigned tiles { 0 };
++    uint64_t pixels { 0 };
++    double milliseconds { 0 };
++};
++WCTilePaintStats& wcTilePaintStats();
++#endif
++
+ class GraphicsLayerWC final : public WebCore::GraphicsLayer, public DoublyLinkedListNode<GraphicsLayerWC> {
+ public:
+     struct Observer {
+@@ -128,6 +138,9 @@ private:
+     GraphicsLayerWC* m_prev;
+     GraphicsLayerWC* m_next;
+     WebCore::PlatformLayerIdentifier m_layerID { WebCore::PlatformLayerIdentifier::generate() };
++#if defined(PS5_PAYLOAD_SDK)
++    String m_lastDirtyText; // PS5WK_WC_LAYER_LOG
++#endif
+     Observer* m_observer;
+     const std::unique_ptr<WCTiledBacking> m_tiledBacking;
+     PlatformLayer* m_platformLayer { nullptr };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp
+index f4df3ed41d..b72c8eb1c9 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp
+@@ -34,22 +34,62 @@ namespace WebKit {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(WCTileGrid::Tile);
+ 
++static constexpr size_t maxDirtyRects = 8;
++
+ WCTileGrid::Tile::Tile(WebCore::IntRect rect)
+     : m_tileRect(rect)
+     , m_dirtyRect(rect)
+ {
++    m_dirtyRects.append(rect);
+ }
+ 
+ void WCTileGrid::Tile::addDirtyRect(const WebCore::IntRect& dirtyRect)
+ {
+     WebCore::IntRect rect { dirtyRect };
+     rect.intersect(m_tileRect);
++    if (rect.isEmpty())
++        return;
++    if (m_dirtyRect.contains(rect) && m_dirtyRects.size() <= 1)
++        return;
+     m_dirtyRect.unite(rect);
++    if (m_dirtyRects.size() > maxDirtyRects)
++        return; // too many: the bounds are painted
++    // Merge with a part it touches or overlaps; keep separate otherwise.
++    for (auto& part : m_dirtyRects) {
++        if (part.contains(rect))
++            return;
++        WebCore::IntRect inflated = part;
++        inflated.inflate(1);
++        if (inflated.intersects(rect)) {
++            part.unite(rect);
++            return;
++        }
++    }
++    m_dirtyRects.append(rect);
++}
++
++Vector<WebCore::IntRect, 1> WCTileGrid::Tile::rectsToPaint() const
++{
++    if (m_dirtyRects.size() <= 1 || m_dirtyRects.size() > maxDirtyRects)
++        return { m_dirtyRect };
++    uint64_t partsArea = 0;
++    for (auto& part : m_dirtyRects)
++        partsArea += static_cast<uint64_t>(part.width()) * part.height();
++    uint64_t boundsArea = static_cast<uint64_t>(m_dirtyRect.width()) * m_dirtyRect.height();
++    // Parts may overlap after merging; paint them separately only when that
++    // saves at least half of the bounding rect.
++    if (partsArea * 2 > boundsArea)
++        return { m_dirtyRect };
++    Vector<WebCore::IntRect, 1> rects;
++    for (auto& part : m_dirtyRects)
++        rects.append(part);
++    return rects;
+ }
+ 
+ void WCTileGrid::Tile::clearDirtyRect()
+ {
+     m_dirtyRect = { };
++    m_dirtyRects.shrink(0);
+ }
+ 
+ bool WCTileGrid::Tile::hasDirtyRect() const
+@@ -59,8 +99,25 @@ bool WCTileGrid::Tile::hasDirtyRect() const
+ 
+ void WCTileGrid::setSize(const WebCore::IntSize& size)
+ {
++    if (size == m_size)
++        return;
+     m_size = size;
+-    m_tiles.clear();
++    // Keep the tiles whose rect stays the same (the page grew or shrank
++    // elsewhere); the scene does the same (TextureMapperSparseBackingStore::setSize)
++    // and gets explicit removals for the others, sent before any new tile at
++    // the same index.
++    m_tiles.removeIf([&](auto& entry) {
++        auto& tile = *entry.value;
++        int x1 = entry.key.x() * tilePixelSize().width();
++        int y1 = entry.key.y() * tilePixelSize().height();
++        int x2 = std::min(x1 + tilePixelSize().width(), m_size.width());
++        int y2 = std::min(y1 + tilePixelSize().height(), m_size.height());
++        if (x2 > x1 && y2 > y1 && WebCore::IntRect(x1, y1, x2 - x1, y2 - y1) == tile.tileRect())
++            return false;
++        if (!m_pendingRemovals.contains(entry.key))
++            m_pendingRemovals.append(entry.key);
++        return true;
++    });
+ }
+ 
+ WebCore::IntRect WCTileGrid::tileRectFromPixelRect(const WebCore::IntRect& pixelRect)
+@@ -124,11 +181,17 @@ bool WCTileGrid::ensureTile(TileIndex index)
+ 
+ bool WCTileGrid::setCoverageRect(const WebCore::IntRect& coverage)
+ {
+-    bool needsToPaint = false;
++    return setCoverageRect(coverage, coverage);
++}
++
++bool WCTileGrid::setCoverageRect(const WebCore::IntRect& coverage, const WebCore::IntRect& keep)
++{
++    bool needsToPaint = !m_pendingRemovals.isEmpty();
+     auto tileRect = tileRectFromPixelRect(coverage);
++    auto keepTileRect = tileRectFromPixelRect(keep);
+ 
+     for (auto& iterator : m_tiles) {
+-        if (!tileRect.contains(iterator.key)) {
++        if (!keepTileRect.contains(iterator.key) && !tileRect.contains(iterator.key)) {
+             iterator.value->setWillRemove(true);
+             needsToPaint = true;
+         }
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h
+index 16d2ef72c9..734dbc1b71 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h
+@@ -48,17 +48,28 @@ public:
+         void clearDirtyRect();
+         bool hasDirtyRect() const;
+         WebCore::IntRect& dirtyRect() LIFETIME_BOUND { return m_dirtyRect; }
++        // The rects to paint: the dirty rect's parts when they are few and
++        // the bounding rect would mostly paint pixels that didn't change
++        // (e.g. sticky content at both ends of a tile), else the bounds.
++        Vector<WebCore::IntRect, 1> rectsToPaint() const;
++        const WebCore::IntRect& tileRect() const LIFETIME_BOUND { return m_tileRect; }
+ 
+     private:
+         bool m_willRemove { false };
+         WebCore::IntRect m_tileRect;
+         WebCore::IntRect m_dirtyRect;
++        Vector<WebCore::IntRect, 4> m_dirtyRects; // parts of m_dirtyRect, at most maxDirtyRects
+     };
+ 
+     void setSize(const WebCore::IntSize&);
+     void addDirtyRect(const WebCore::IntRect&);
+     void clearDirtyRects();
+     bool setCoverageRect(const WebCore::IntRect&);
++    // PS5: tiles in coverage are created, tiles outside keep are removed
++    // (keep contains coverage), so small scrolls reuse the tiles around the view.
++    bool setCoverageRect(const WebCore::IntRect& coverage, const WebCore::IntRect& keep);
++    // Tiles dropped by setSize (their rect changed): sent as removals first.
++    Vector<TileIndex> takePendingRemovals() { return std::exchange(m_pendingRemovals, { }); }
+     auto& tiles() LIFETIME_BOUND { return m_tiles; }
+     WebCore::IntSize tilePixelSize() const;
+ 
+@@ -69,6 +80,7 @@ private:
+     
+     WebCore::IntSize m_size;
+     HashMap<TileIndex, std::unique_ptr<Tile>> m_tiles;
++    Vector<TileIndex> m_pendingRemovals;
+ };
+ 
+ } // namespace WebKit
