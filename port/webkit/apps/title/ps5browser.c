@@ -16,6 +16,8 @@
  *   L3 (press the left stick): home page,
  *   touchpad: View in VR (the playing video in the PS VR2 headset; its own
  *   controls while there, see viewinvr.c).
+ * (every button is taken: the ad blocker's per-site switch is on the
+ * Settings page, R3, adblock.c)
  *
  * Logs go to the Mac's tools/logserver.sh (LOG_HOST:LOG_PORT) and to
  * /data/ps5webkit/ps5browser.log.
@@ -24,6 +26,7 @@
 #include "../common/ps5audioserver.h"
 #include "../common/webmem.h"
 #include "common/title.h"
+#include "adblock.h"
 #include "settings.h"
 #include "viewinvr.h"
 
@@ -467,6 +470,9 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
+    /* The ad blocker's filter on or off for this page (allowed sites). */
+    if (event != WEBKIT_LOAD_FINISHED)
+        ps5wk_adblock_navigation(webkit_web_view_get_uri(view));
     int webPid = 0;
     double committed = 0, limit = 0;
     if (event == WEBKIT_LOAD_STARTED && !memRestartURI && !memRestarting && !windDownStart && webkit_web_view_get_uri(view)
@@ -979,6 +985,10 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  *   POST /restart?scope=crash   test only: SIGKILL to the WebProcess, which
  *       then looks like a crash to WebKit (the page reloads as after one)
  *   POST /clear?what=cookies|all       WebKit's website data
+ *   POST /adblock?do=update            the ad blocker's lists, now (adblock.c)
+ *   POST /adblock?do=allow|block&site=<host>   ads allowed on a site (and
+ *       its subdomains) or blocked there again; the page reloads if it is
+ *       on that site
  * The PIN applies as for /open, except to the PS5 itself (127.0.0.1). No
  * CORS headers, and requests with an Origin header must come from the
  * address they were sent to, by IP or a local name: other web pages
@@ -1162,9 +1172,13 @@ static char* settingsState(const char* message)
     char* shownJSON = jsonString(shown);
     char* backJSON = jsonString(back);
     char* messageJSON = message ? jsonString(message) : NULL;
-    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,%s%s%s",
+    /* The ad blocker's site buttons are for the page Settings was opened
+     * from (R3), or the page shown (another device). */
+    char* adblock = ps5wk_adblock_json(isSettingsURI(shown) ? back : shown);
+    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,%s%s%s%s",
         (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false",
-        message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "");
+        message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock);
+    g_free(adblock);
     char* state = ps5wk_settings_json(extra);
     g_free(extra);
     g_free(messageJSON);
@@ -1185,10 +1199,10 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         return;
     }
     gboolean known = (!strcmp(path, "/settings.json") && get)
-        || (post && (!strcmp(path, "/settings") || !strcmp(path, "/restart") || !strcmp(path, "/clear")));
+        || (post && (!strcmp(path, "/settings") || !strcmp(path, "/restart") || !strcmp(path, "/clear") || !strcmp(path, "/adblock")));
     if (!known) {
         settingsReplyJSON(client, !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
-            || !strcmp(path, "/settings") ? 405 : 404, FALSE, "method not allowed or no such page");
+            || !strcmp(path, "/settings") || !strcmp(path, "/adblock") ? 405 : 404, FALSE, "method not allowed or no such page");
         return;
     }
     if (!pinOK && !loopback) {
@@ -1214,6 +1228,7 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         int changed = 0;
         gboolean ok = ps5wk_settings_update(body, json, &message, &changed);
         spike_log("settings from %s: %s (%.300s)", from, message, body);
+        ps5wk_adblock_setting_changed(); /* applies at once (no restart) */
         if (ok || changed) {
             char* state = settingsState(message);
             pushReplyCORS(client, ok ? 200 : 503, "application/json", state, FALSE);
@@ -1221,6 +1236,35 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         } else
             settingsReplyJSON(client, 400, FALSE, message);
         g_free(message);
+    } else if (!strcmp(path, "/adblock")) {
+        char* action = query ? formValue(query, "do") : NULL;
+        if (!action)
+            action = formValue(body, "do");
+        char* site = query ? formValue(query, "site") : NULL;
+        if (!site)
+            site = formValue(body, "site");
+        const char* error = NULL;
+        char* done = NULL;
+        if (action && !strcmp(action, "update")) {
+            error = ps5wk_adblock_update(from);
+            done = g_strdup("Checking for a new list.");
+        } else if (action && (!strcmp(action, "allow") || !strcmp(action, "block"))) {
+            gboolean allow = !strcmp(action, "allow");
+            error = site ? ps5wk_adblock_set_allowed(site, allow, TRUE) : "site=<host> missing";
+            done = g_strdup_printf(allow ? "Ads allowed on %s." : "Ads blocked on %s again.", site ? site : "");
+        } else
+            error = "do=update, do=allow&site=<host> or do=block&site=<host>";
+        spike_log("settings: adblock %s%s%s from %s: %s", action ? action : "?", site ? " " : "", site ? site : "", from, error ? error : "ok");
+        if (error)
+            settingsReplyJSON(client, 400, FALSE, error);
+        else {
+            char* state = settingsState(done);
+            pushReplyCORS(client, 200, "application/json", state, FALSE);
+            g_free(state);
+        }
+        g_free(done);
+        g_free(action);
+        g_free(site);
     } else {
         char* scope = query ? formValue(query, !strcmp(path, "/restart") ? "scope" : "what") : NULL;
         if (!scope)
@@ -1323,7 +1367,8 @@ static void pushServe(int client, const char* from, gboolean loopback)
     if (query)
         *query++ = 0;
     const char* path = target;
-    gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear");
+    gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
+        || !strcmp(path, "/adblock");
 
     if (!strcmp(method, "OPTIONS")) {
         /* No CORS for the settings: a page elsewhere can't send them JSON. */
@@ -1624,7 +1669,16 @@ int main(int argc, char** argv)
     setenv("ICU_DATA", "/data/ps5webkit/share/icu", 0);
     setenv("XDG_DATA_DIRS", "/data/ps5webkit/share", 0); /* share/mime/globs2 */
     setenv("GSETTINGS_BACKEND", "memory", 0);
+    /* Temporary files (g_get_tmp_dir; WebKit's content filter compiler
+     * writes its NFAs there): there is no /tmp for a title. */
+    mkdir("/data/ps5webkit/home/tmp", 0777);
+    setenv("TMPDIR", "/data/ps5webkit/home/tmp", 0);
     g_io_openssl_load(NULL);
+    /* JavaScriptCore in this process runs the ad blocker's list converter
+     * (adblock.c) and nothing else: no JIT in a title. Read when WebKit
+     * initializes JSC (the web context below); the WebProcesses do not see
+     * this environment. */
+    setenv("JSC_useJIT", "false", 0);
     /* The values in use until something restarts (the settings page). */
     ps5wk_settings_init("/data/ps5webkit", pushNormalize);
 
@@ -1724,6 +1778,7 @@ int main(int argc, char** argv)
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
     ps5wk_vr_init(display, webView);
+    ps5wk_adblock_init(webView);
 
     memLog("web view created");
     g_timeout_add_seconds(60, memTimer, NULL);

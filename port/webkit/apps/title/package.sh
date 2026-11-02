@@ -52,7 +52,11 @@ prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchRet
 # in direct memory, memory report).
 rm -f "$W/obj/app_heap.o"
 D10="$ROOT/spikes/10-title-dmem"
-prospero-clang -std=gnu11 -O2 "${TF[@]}" -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
+# 32-byte blocks: WebKit's TZone types fall back to plain malloc here (bmalloc
+# through the system heap) whatever their alignment, and clang stores to
+# 32-byte-aligned types with vmovaps ymm: JSC's Lexer at a 16-byte address
+# was a SIGBUS (code 3, pc = addr) in the title's first JavaScript (adblock.c).
+prospero-clang -std=gnu11 -O2 "${TF[@]}" -DMALLOC_ALIGNMENT=32 -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
 # The system keyboard: libSceImeDialog loaded and bound at run time.
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$HERE" -c "$HERE/titleime.c" -o "$W/obj/titleime.o"
@@ -157,6 +161,13 @@ app="$OUT/$TITLE"; rm -rf -- "$app"; mkdir -p "$app/sce_sys" "$app/sce_module"
 "$TOOL" self --sign --in "$W/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F
 cp "$NATIVE/runtime/libc.prx" "$app/sce_module/libc.prx"
 prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
+# The ad blocker (port/webkit/ADBLOCK.md): uBO Lite's rules converted for
+# WebKit (tools/ubol-convert.js, pinned release; generated, never committed)
+# and the converter the title runs for on-console updates (/app0/adblock).
+AB="$ROOT/toolchain/adblock"
+[[ -f $AB/adblock-rules.json && -f $AB/adblock-info.ini ]] || node "$ROOT/tools/ubol-convert.js"
+mkdir -p "$app/adblock"
+cp "$AB/adblock-rules.json" "$AB/adblock-info.ini" "$PORT/adblock/dnr-to-webkit.js" "$app/adblock/"
 # View in VR: PS VR2 titles declare it in param.json (Hmd2 refuses a title
 # whose attribute words are 0 with 0x8a72001f, FEASIBILITY §3); PS5VR's
 # values, as Spikes 3b and 9 (both also drew on the TV with them).

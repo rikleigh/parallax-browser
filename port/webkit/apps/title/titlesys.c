@@ -199,3 +199,45 @@ int clock_nanosleep(clockid_t clock, int flags, const struct timespec* request, 
     }
     return nanosleep(&rel, remain) ? errno : 0;
 }
+
+/* A raw syscall in the SDK's libc. libc++'s std::filesystem::current_path
+ * sizes its getcwd() buffer with it; WebKit's content filter store
+ * (adblock.c) links that in. Fixed values for the console's file systems. */
+long pathconf(const char* path, int name)
+{
+    (void)path;
+    switch (name) {
+    case _PC_PATH_MAX:
+        return 1024;
+    case _PC_NAME_MAX:
+        return 255;
+    case _PC_LINK_MAX:
+        return 1;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+/* lstat() is EPERM in a title (stat() of the same file works; 2026-11-02).
+ * libc++'s std::filesystem::symlink_status calls it, and WebKit's
+ * FileSystem::deleteFile gives up when that fails: the content filter
+ * compiler's temporary NFA files (thousands per compile) and removed filter
+ * lists stayed behind (adblock.c). /data has no symbolic links: stat(). */
+int lstat(const char* path, struct stat* st)
+{
+    return stat(path, st);
+}
+
+/* The SDK libc's remove() fails in a title too (it returned -1 where unlink()
+ * of the same file works); libc++'s std::filesystem::remove calls it. */
+int remove(const char* path)
+{
+    if (!unlink(path))
+        return 0;
+    int error = errno;
+    if ((error == EISDIR || error == EPERM) && !rmdir(path))
+        return 0;
+    errno = error;
+    return -1;
+}

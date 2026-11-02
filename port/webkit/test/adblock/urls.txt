@@ -1,0 +1,11 @@
+# Ad-blocker A/B pages (port/webkit/ADBLOCK.md): /data/ps5webkit/test-urls.txt,
+# with measure.js as /data/ps5webkit/test-onload.js. "<url> <seconds>".
+https://www.theverge.com/ 25
+https://www.bbc.co.uk/news 25
+https://www.dailymail.co.uk/home/index.html 25
+https://www.independent.co.uk/ 25
+https://edition.cnn.com/ 25
+https://www.reddit.com/r/PS5/ 25
+https://developer.mozilla.org/en-US/docs/Web/JavaScript 20
+https://www.apple.com/iphone/ 20
+https://www.youtube.com/watch?v=aqz-KE-bpKQ 45

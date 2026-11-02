@@ -7,7 +7,7 @@
  *     when it starts): rewritten with every other line (comments, JSC_*,
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
- *   flag files (no-hwdec, audio-silent, push-off): present = that feature
+ *   flag files (no-hwdec, audio-silent, push-off, adblock-off): present = that feature
  *     off; the title reads them when it starts. Opt-in flag files
  *     (compositing): present = that feature on; WebKit in the title reads
  *     it whenever a page gets a new WebProcess.
@@ -49,7 +49,8 @@ typedef struct {
 /* Semantics and defaults: ps5wk-child.cpp (JIT, memory limit), patches
  * 0032 (painting, scrolling), 0031 (decommit), 0017 (hole punch), 0016
  * (VP9), titlevdec.c (no-hwdec), DrawingAreaProxyWCPS5.cpp in WebKit
- * (compositing, WC builds only), ps5browser.c (the rest). */
+ * (compositing, WC builds only), adblock.c (adblock: applied at once,
+ * ps5browser.c calls ps5wk_adblock_setting_changed), ps5browser.c (the rest). */
 static const Setting settings[] = {
     { "jit", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
         "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes.",
@@ -78,6 +79,9 @@ static const Setting settings[] = {
         "Off plays every page at volume 0.", NULL, 0, 0 },
     { "link_server", KIND_FLAG, TYPE_BOOL, "push-off", "1", PS5WK_SETTINGS_BROWSER, "Link server on the network",
         "Lets a phone or Mac send links here and open this page (port 9040). Off: only the PS5 itself can open Settings (R3).",
+        NULL, 0, 0 },
+    { "adblock", KIND_FLAG, TYPE_BOOL, "adblock-off", "1", 0, "Ad blocking",
+        "Blocks ads and trackers with uBlock Origin Lite's network rules. Applies at once; sites where ads are allowed, and the lists, are below.",
         NULL, 0, 0 },
     { "home_url", KIND_FILE, TYPE_TEXT, "home-url.txt", "", 0, "Home page",
         "Opens when the browser starts. Empty: the built-in start page.", NULL, 0, 0 },
@@ -707,6 +711,10 @@ const char ps5wk_settings_page[] =
     "<div id=\"pinbox\" class=\"card\" hidden><p>This PS5 asks for the link server's PIN.</p><div class=\"row\"><input id=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" placeholder=\"PIN\"><button id=\"pinok\" class=\"primary\">OK</button></div></div>\n"
     "<div id=\"list\"></div>\n"
     "<div id=\"actions\" hidden>\n"
+    "<h2>Ad blocking</h2>\n"
+    "<div class=\"card\" id=\"abSite\" hidden><div class=\"row\"><span class=\"name\" id=\"abSiteName\"></span><span class=\"badge\" id=\"abSiteBadge\"></span></div><p class=\"help\" id=\"abSiteHelp\"></p><div class=\"seg\"><button id=\"abSiteButton\" class=\"primary\"></button></div></div>\n"
+    "<div class=\"card\"><div class=\"row\"><span class=\"name\">Sites where ads are allowed</span></div><p class=\"help\" id=\"abSitesHelp\"></p><div class=\"seg\" id=\"abSites\"></div></div>\n"
+    "<div class=\"card\"><div class=\"row\"><span class=\"name\">Lists</span></div><p class=\"help\" id=\"abList\"></p><p class=\"help\" id=\"abStatus\"></p><div class=\"seg\"><button id=\"abUpdate\">Update lists now</button></div></div>\n"
     "<h2>Website data</h2>\n"
     "<div class=\"card\"><p class=\"help\">Clearing cookies logs you out of every site. Clearing all data also removes the cache, local storage and site databases.</p>\n"
     "<div class=\"seg\"><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
@@ -714,7 +722,7 @@ const char ps5wk_settings_page[] =
     "<div class=\"card\"><p class=\"help\">Restart page: the page's process starts again with the settings above (Pages). Restart browser: the browser closes and opens again on the page you were on (Browser settings).</p>\n"
     "<div class=\"seg\"><button id=\"restartPage\">Restart page</button><button id=\"restartBrowser\">Restart browser</button></div></div>\n"
     "<p class=\"note\" id=\"where\"></p>\n"
-    "<p class=\"note\">On the PS5: R3 (press the right stick) opens and closes this page; O goes back.</p>\n"
+    "<p class=\"note\">On the PS5: R3 (press the right stick) opens and closes this page; O goes back. Ad blocking for the page you came from: the first card under Ad blocking.</p>\n"
     "</div>\n"
     "<script>\n"
     "var S=null,pin='',started=0,polling=0;\n"
@@ -774,7 +782,7 @@ const char ps5wk_settings_page[] =
     "  var p=S.pending.page,w=S.pending.browser;\n"
     "  $('banner').hidden=!p&&!w;$('bannerPage').hidden=!p;$('bannerBrowser').hidden=!w;\n"
     "  $('bannerText').textContent=p&&w?'Some changes wait for a page restart, others for a browser restart.':p?'Changes wait for a page restart.':'Changes wait for a browser restart.';\n"
-    "  $('actions').hidden=false;$('back').hidden=!onPS5;\n"
+    "  $('actions').hidden=false;$('back').hidden=!onPS5;renderAdblock();\n"
     "  $('where').textContent=S.uri?'The PS5 is showing '+S.uri:'';\n"
     "  var f=focus=='first'?list.querySelector('button[aria-pressed=true]'):focus&&$(focus);if(f)f.focus();\n"
     "}\n"
@@ -815,5 +823,31 @@ const char ps5wk_settings_page[] =
     "$('back').onclick=function(){if(history.length>1)history.back();else if(S&&S.returnUri)location.href=S.returnUri};\n"
     "$('pinok').onclick=function(){pin=$('pin').value.trim();try{sessionStorage.setItem('ps5pin',pin)}catch(e){}load()};\n"
     "$('pin').onkeydown=function(e){if(e.key=='Enter')$('pinok').click()};\n"
+    "function when(t){return t?new Date(t*1000).toLocaleString():'never'}\n"
+    "function renderAdblock(){\n"
+    "  var a=S.adblock;if(!a)return;\n"
+    "  $('abSite').hidden=!a.site;\n"
+    "  if(a.site){\n"
+    "    var allowed=!!a.siteAllowedBy,b=$('abSiteButton');\n"
+    "    $('abSiteName').textContent=a.site;\n"
+    "    $('abSiteBadge').textContent=!a.enabled?'Ad blocking is off':allowed?'Ads allowed':'Ads blocked';\n"
+    "    $('abSiteHelp').textContent=allowed?'Ad blocking is off on '+a.siteAllowedBy+' and its subdomains.':'If this site does not work with ad blocking, allow ads on it (and its subdomains). The page reloads.';\n"
+    "    b.textContent=allowed?'Block ads on '+a.siteAllowedBy+' again':'Allow ads on '+a.site;\n"
+    "    b.onclick=function(){adblock(allowed?'block':'allow',allowed?a.siteAllowedBy:a.site,'abSiteButton')};\n"
+    "  }\n"
+    "  var list=$('abSites');list.textContent='';\n"
+    "  a.sites.forEach(function(s,i){var b=el('button',null,'Remove '+s);b.id='ab-rm-'+i;b.onclick=function(){adblock('block',s,a.sites.length>1?'ab-rm-'+(i?i-1:0):'abUpdate')};list.appendChild(b)});\n"
+    "  $('abSitesHelp').textContent=a.sites.length?'Remove a site to block ads there again.':'None yet. Allow ads on a site from its page: R3, then the button above.';\n"
+    "  var l=a.list;\n"
+    "  $('abList').textContent=l.version?'uBlock Origin Lite '+l.version+': '+l.rules+' rules, '+(l.origin=='update'?'downloaded '+when(l.generated):'bundled with the browser')+'. Last check for a new list: '+when(a.lastCheck)+' (once a day by itself).':'No list yet.';\n"
+    "  $('abStatus').textContent=a.status||'';\n"
+    "  var u=$('abUpdate');u.disabled=a.updating||a.compiling;u.textContent=a.updating?'Checking…':a.compiling?'Compiling…':'Update lists now';\n"
+    "}\n"
+    "function pollAdblock(){var n=0;(function p(){api('GET','/settings.json').then(function(j){if(!j.ok)return;S=j;renderAdblock();if((j.adblock.updating||j.adblock.compiling)&&++n<150)setTimeout(p,2000)})})()}\n"
+    "function adblock(what,site,focus){\n"
+    "  say(what=='update'?'Checking for a new list…':'Saving…');\n"
+    "  api('POST','/adblock?do='+what+(site?'&site='+encodeURIComponent(site):'')).then(function(j){if(j.settings){S=j;render(focus)}say(j.message||j.error);if(what=='update'&&j.ok)setTimeout(pollAdblock,1500)},function(){say('The PS5 did not answer.')});\n"
+    "}\n"
+    "$('abUpdate').onclick=function(){adblock('update',null,'abUpdate')};\n"
     "load(onPS5?'first':null);\n"
     "</script></main></body></html>\n";

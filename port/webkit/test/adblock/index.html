@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ad blocker test</title>
+<!--
+  Synthetic ad-blocker test (port/webkit/ADBLOCK.md). Requests made-up paths
+  on well-known ad and tracker hosts, which the default uBO Lite lists block
+  host-wide, and on hosts they leave alone (controls). Nothing real is
+  loaded: the paths do not exist, so an unblocked request ends in a 404 or
+  a network error from the server, a blocked one in an immediate failure
+  from WebKit's content blocker.
+
+  Each URL is fetched with fetch(..., {mode: 'no-cors'}): a server answer
+  (any status) resolves, a content-blocker block rejects (so does a DNS or
+  TLS failure: the controls show whether the network works at all). It is
+  also requested as an <img> and a <script>, to see the per-type rules.
+
+  Result: one console line (the title relays it as a [webN] line):
+    [adblock-test] fetch: ads blocked 14/14, controls answered 3/3; img: ...
+  Upload: curl -T index.html ftp://$PS5_HOST:2121/data/ps5webkit/adblock-test.html
+  Open:   tools/launch.sh PPSA99020 file:///data/ps5webkit/adblock-test.html
+-->
+<style>
+:root{color-scheme:dark}
+body{margin:0;background:#10141c;color:#e8ecf2;font:20px/1.4 system-ui,sans-serif;padding:24px 32px}
+h1{font-size:28px;margin:0 0 12px}
+table{border-collapse:collapse;width:100%}
+td,th{padding:4px 10px;border-bottom:1px solid #2e3644;text-align:left;font-size:17px}
+.blocked{color:#8fd18f}.answered{color:#ffb648}.error{color:#ff7a7a}
+#summary{font-size:22px;font-weight:600;margin:12px 0}
+</style>
+</head>
+<body>
+<h1>Ad blocker test</h1>
+<p id="summary">Running…</p>
+<table><thead><tr><th>Host</th><th>Kind</th><th>fetch</th><th>img</th><th>script</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+const tag = 'ps5webkit-adblock-test-' + Date.now();
+const ads = [
+    'https://securepubads.g.doubleclick.net/' + tag + '.js',
+    'https://pagead2.googlesyndication.com/' + tag + '.js',
+    'https://www.google-analytics.com/' + tag + '.js',
+    'https://ib.adnxs.com/' + tag,
+    'https://cdn.taboola.com/' + tag + '.js',
+    'https://widgets.outbrain.com/' + tag + '.js',
+    'https://static.criteo.net/' + tag + '.js',
+    'https://sb.scorecardresearch.com/' + tag,
+    'https://c.amazon-adsystem.com/' + tag + '.js',
+    'https://ads.pubmatic.com/' + tag + '.js',
+    'https://fastlane.rubiconproject.com/' + tag,
+    'https://match.adsrvr.org/' + tag,
+    'https://z.moatads.com/' + tag + '.js',
+    'https://pixel.quantserve.com/' + tag,
+];
+const controls = [
+    'https://example.com/' + tag,
+    'https://en.wikipedia.org/' + tag,
+    'https://www.bbc.co.uk/' + tag,
+];
+
+function probeFetch(url) {
+    const start = performance.now();
+    return fetch(url, { mode: 'no-cors', cache: 'no-store' })
+        .then(() => ({ result: 'answered', ms: performance.now() - start }),
+              () => ({ result: 'blocked', ms: performance.now() - start }));
+}
+
+function probeElement(kind, url) {
+    return new Promise(resolve => {
+        const start = performance.now();
+        const element = document.createElement(kind);
+        const timer = setTimeout(() => resolve({ result: 'timeout', ms: performance.now() - start }), 15000);
+        element.onload = () => { clearTimeout(timer); resolve({ result: 'loaded', ms: performance.now() - start }); };
+        element.onerror = () => { clearTimeout(timer); resolve({ result: 'error', ms: performance.now() - start }); };
+        element.src = url + (url.includes('?') ? '&' : '?') + kind;
+        if (kind === 'script')
+            document.head.appendChild(element);
+    });
+}
+
+async function run() {
+    const rows = document.getElementById('rows');
+    const all = ads.map(u => ({ url: u, kind: 'ad' })).concat(controls.map(u => ({ url: u, kind: 'control' })));
+    const results = await Promise.all(all.map(async item => {
+        const [f, i, s] = await Promise.all([probeFetch(item.url), probeElement('img', item.url), probeElement('script', item.url)]);
+        return Object.assign(item, { fetch: f, img: i, script: s });
+    }));
+    let adsBlocked = 0, controlsAnswered = 0, fastErrors = { img: 0, script: 0 };
+    for (const r of results) {
+        const tr = document.createElement('tr');
+        const host = new URL(r.url).host;
+        const cell = (text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); };
+        cell(host);
+        cell(r.kind);
+        cell(r.fetch.result + ' ' + Math.round(r.fetch.ms) + ' ms', r.fetch.result);
+        cell(r.img.result + ' ' + Math.round(r.img.ms) + ' ms', r.img.result === 'error' ? 'error' : '');
+        cell(r.script.result + ' ' + Math.round(r.script.ms) + ' ms', r.script.result === 'error' ? 'error' : '');
+        rows.appendChild(tr);
+        if (r.kind === 'ad' && r.fetch.result === 'blocked')
+            adsBlocked++;
+        if (r.kind === 'control' && r.fetch.result === 'answered')
+            controlsAnswered++;
+        /* An error within 50 ms: the content blocker (a network round trip
+         * to these hosts takes longer). */
+        for (const k of ['img', 'script']) {
+            if (r.kind === 'ad' && r.result !== 'loaded' && r[k].result === 'error' && r[k].ms < 50)
+                fastErrors[k]++;
+        }
+    }
+    const summary = `fetch: ads blocked ${adsBlocked}/${ads.length}, controls answered ${controlsAnswered}/${controls.length}; ` +
+        `img: ads failing within 50 ms ${fastErrors.img}/${ads.length}; script: ${fastErrors.script}/${ads.length}`;
+    document.getElementById('summary').textContent = summary;
+    console.log('[adblock-test] ' + summary);
+    for (const r of results)
+        console.log(`[adblock-test] ${r.kind} ${new URL(r.url).host}: fetch ${r.fetch.result} ${Math.round(r.fetch.ms)} ms, img ${r.img.result} ${Math.round(r.img.ms)} ms, script ${r.script.result} ${Math.round(r.script.ms)} ms`);
+}
+run();
+</script>
+</body>
+</html>
