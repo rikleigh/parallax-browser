@@ -7,6 +7,8 @@
 #   direct  the old blocking path; the listener is stopped (SIGSTOP) for 10 s
 #   queue   titlelog.c, same stop; TCP buffer 16 KB (log-sink file)
 #   restart titlelog.c; the listener is killed and started again 5 s later
+#   reset   titlelog.c with stall=4: the stop outlasts it, the connection is
+#           reset and a new one made (into the stopped listener's backlog)
 # Prints each run's slowest call per second and checks the listener's copy:
 # every thread's lines in order, a gap only where a "[log] ... dropped" note
 # says so.
@@ -23,7 +25,7 @@ tick() { perl -e 'select undef,undef,undef,$ARGV[0]' "$1"; }
 run_case() { # name mode action
     local name=$1 mode=$2 action=$3
     rm -f "$OUT/log-sink"
-    [[ $mode == queue ]] && echo "127.0.0.1:$PORT queue=16 stall=30" > "$OUT/log-sink"
+    [[ $mode == queue ]] && echo "127.0.0.1:$PORT queue=16 stall=$([[ $name == reset ]] && echo 4 || echo 30)" > "$OUT/log-sink"
     perl "$HERE/listener.pl" -r 8192 $PORT > "$OUT/$name.listener" & local lpid=$!
     tick 0.5
     "$OUT/logsink-test" "$mode" $PORT 20 "$OUT" 3> "$OUT/$name.report" & local tpid=$!
@@ -80,4 +82,5 @@ PY
 run_case direct direct stop
 run_case queue queue stop
 run_case restart queue restart
+run_case reset queue stop
 echo "(files in $OUT)"

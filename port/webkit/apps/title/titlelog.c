@@ -99,6 +99,7 @@ static uint64_t tcpDropped;
 static int64_t droppedSince, lastProgress, connectStarted, nextAttempt, disconnectedAt;
 static int backoffMs = BACKOFF_MIN_MS;
 static int sentMidLine;
+static char lossReason[96]; /* repeated when connected again: its own note may have been dropped */
 static volatile int tcpBacklog; /* connected with bytes not yet sent (flush) */
 
 static int64_t nowMS(void)
@@ -389,6 +390,7 @@ static void disconnect(int64_t now, const char* why, int reset)
     scheduleRetry(now);
     if (wasConnected) {
         disconnectedAt = now;
+        snprintf(lossReason, sizeof lossReason, "%s", why);
         notef("[log] connection to the log server %s:%d lost (%s); reconnecting, %zu KB waiting", host, port, why, outLen >> 10);
     }
 }
@@ -398,11 +400,12 @@ static void connected(int64_t now)
     connecting = 0;
     backoffMs = BACKOFF_MIN_MS;
     lastProgress = now;
-    char note[192];
+    char note[256];
     int k;
     if (everConnected) {
         /* After what was logged while there was no connection. */
-        k = snprintf(note, sizeof note, "[log] connected to %s:%d again after %.1f s\n", host, port, (now - disconnectedAt) / 1000.0);
+        k = snprintf(note, sizeof note, "[log] connected to %s:%d again after %.1f s (lost: %s)\n", host, port,
+            (now - disconnectedAt) / 1000.0, lossReason);
         noteTcp(note, (size_t)k);
     } else {
         /* Before the lines that waited for the first connection. */
