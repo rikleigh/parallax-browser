@@ -18,6 +18,14 @@
        6. X on the label "Name:" (focuses the plain field through <label for>):
           the keyboard stays closed (not a click on a field); Triangle opens it.
        7. R1 (Tab) onto a field: the keyboard opens (focus moved by the pad).
+     The keyboard's OK (patch 0071 and WPEInputMethodContextPS5.cpp):
+       8. In the search field, OK (labelled Go: the field is type=text) commits
+          the text and then presses Return: the results line updates at once
+          ("submit"), and the log shows "keydown Enter" with the new value.
+       9. The type=search field below: OK is labelled Search and submits it.
+      10. The textarea: OK keeps the default label and adds no Return (no
+          "keydown Enter" in the log, no new line after the text).
+      11. Cancel (O) in any of them: nothing changes, no Return.
      Logs (console.log, the title log): REFOCUS <event> ... -->
 <style>
   body { font: 32px/1.4 sans-serif; margin: 60px; background: #f4f4f4; color: #111; }
@@ -41,6 +49,13 @@
 <div class="row">
   <label for="name">Name:</label>
   <input id="name" type="text" placeholder="A plain field (X opens the keyboard)">
+</div>
+<form id="search2" class="row">
+  <input id="s" type="search" placeholder="type=search (OK says Search)">
+  <button type="submit">Find</button>
+</form>
+<div class="row">
+  <textarea id="t" rows="3" cols="40" placeholder="A textarea (OK adds no Return)" style="font: inherit"></textarea>
 </div>
 <div id="log"></div>
 <script>
@@ -70,10 +85,16 @@
   });
   document.getElementById('go').addEventListener('click', () => { log('click on Search'); q.focus(); });
   document.getElementById('plain-go').addEventListener('click', () => { log('click on Search (no refocus)'); search(false); });
-  for (const input of document.querySelectorAll('input')) {
+  document.getElementById('search2').addEventListener('submit', (event) => {
+    event.preventDefault();
+    log('submit #s "' + document.getElementById('s').value + '"');
+  });
+  for (const input of document.querySelectorAll('input, textarea')) {
     input.addEventListener('focus', () => log('focus #' + input.id));
     input.addEventListener('blur', () => log('blur #' + input.id));
     input.addEventListener('input', () => log('input #' + input.id + ' "' + input.value + '"'));
+    for (const type of ['keydown', 'keypress', 'keyup'])
+      input.addEventListener(type, (e) => log(type + ' ' + e.key + ' #' + input.id + ' "' + input.value + '"'));
   }
   const initial = new URLSearchParams(location.search).get('q');
   if (initial)

@@ -441,6 +441,7 @@ the original messages.
 | 0068-ps5-wc-long-feed-webprocess-costs | long feeds (COMPOSITING-PLAN.md, *Long feeds*): `will-change: opacity` at opacity 0 composites no layer of its own; layer positions after a document scroll skip unconstrained subtrees (clip rects stay cached for hit tests); no per-layer event regions with the WC scrolling coordinator; the layer flush skips clean, tile-less subtrees far from the view; `[render] wc flush` / `[render] compositing` lines and the `[wc-reasons]` census (`PS5WK_WC_LAYER_LOG=3`); A/B: `PS5WK_WC_WILLCHANGE_HIDDEN=1`, `PS5WK_LAYERPOS_SKIP=0`, `PS5WK_WC_EVENT_REGIONS=1`, `PS5WK_WC_CULL=0` | (new) |
 | 0069-ps5-wc-long-feed-title-costs | long feeds, the title: DOM-only wheel events paced by the WebProcess's updates (or 250 ms), events the root can't take not resent for 250 ms after the WebProcess found nothing to scroll (`wheelpace=0`, `unconsumedpace=0` in `wc-async-scroll`); scene paint skips subtrees whose bounds miss the clip, no coordinated "future" transforms (`wc-no-cull`) | (new) |
 | 0070-ps5-wc-feed-append-costs | feeds that load more (COMPOSITING-PLAN.md, *Feeds that load more*): a transform animation nested in an animating ancestor (loading spinners) gets its extent through the ancestor's keyframes instead of compositing every later layer; wheel events the root can't take at most one per WebProcess update, deltas carried; wheel transaction (kept target) for DOM-only wheel events; far or clipped-out intersection observer targets skipped for a bounded time; `[render] wc phases` line. A/B: `PS5WK_WC_NESTED_ANIM_EXTENT=0`, `PS5WK_WHEEL_TRANSACTION=0`, `PS5WK_IO_SKIP=0`, `unconsumedpace=0` | (new) |
+| 0071-ps5-input-multiline-hint | a multiline input hint for textarea and contenteditable elements (`InputMethodState::Hint::Multiline` -> `WEBKIT_INPUT_HINT_MULTILINE` -> `WPE_INPUT_HINT_MULTILINE`): the system keyboard's OK presses Return after the text only in single-line fields (*System keyboard*) | (new) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
@@ -2479,6 +2480,26 @@ L1/R1 still opens it; Return (X with the pointer hidden), other buttons and
 focus a page sets by itself (autofocus) don't. A click on a `<label>` doesn't
 either (Triangle opens it). The log says `IME: field focused after a <why>:
 keyboard opens / stays closed`. Test page: `test/input/refocus.html`.
+
+The keyboard's OK acts like a phone keyboard's Go key: in a single-line
+field the text is committed and then Return is pressed and released (real
+keydown/keypress/keyup, as X sends with the pointer hidden), so the form or
+the page's own Enter handler submits. The key events go to the WebProcess
+after the committed text on the same connection, so the page sees the new
+value first. OK is labelled Search in a search field (`type=search`), Go in
+other single-line fields, and keeps the default label with no Return in a
+textarea or contenteditable element: patch 0071 adds a multiline input hint
+(`InputMethodState::Hint::Multiline` -> `WEBKIT_INPUT_HINT_MULTILINE` ->
+`WPE_INPUT_HINT_MULTILINE`), and a new line in the text around the cursor
+counts as multiline too. Cancel changes nothing. The log says
+`IME: committed N bytes, then Return`.
+
+A site's suggestion list that shows again after its search button is
+clicked is the site's own behaviour: in desktop Chrome (2026-11-02) the
+button's click handler puts the focus back in the field, the list shows,
+and it goes when the results arrive and the site moves the focus to its
+menu button (about 1.4 s later there; longer on the console while the
+results load).
 
 ## Process launching
 

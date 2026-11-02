@@ -1,0 +1,109 @@
+diff --git a/Source/WebKit/Shared/glib/InputMethodState.h b/Source/WebKit/Shared/glib/InputMethodState.h
+index e81a58ffad..6882878960 100644
+--- a/Source/WebKit/Shared/glib/InputMethodState.h
++++ b/Source/WebKit/Shared/glib/InputMethodState.h
+@@ -61,6 +61,7 @@ struct InputMethodState {
+         UppercaseSentences = 1 << 4,
+         InhibitOnScreenKeyboard = 1 << 5,
+         Private = 1 << 6,
++        Multiline = 1 << 7,
+     };
+ 
+     void setPurposeOrHintForInputMode(WebCore::InputMode);
+diff --git a/Source/WebKit/Shared/glib/InputMethodState.serialization.in b/Source/WebKit/Shared/glib/InputMethodState.serialization.in
+index 4ab8556d98..5918b2490d 100644
+--- a/Source/WebKit/Shared/glib/InputMethodState.serialization.in
++++ b/Source/WebKit/Shared/glib/InputMethodState.serialization.in
+@@ -43,6 +43,7 @@ header: "InputMethodState.h"
+     UppercaseSentences,
+     InhibitOnScreenKeyboard,
+     Private,
++    Multiline,
+ };
+ 
+ struct WebKit::InputMethodState {
+diff --git a/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp b/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp
+index c36766e1b1..213dea8b44 100644
+--- a/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp
++++ b/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp
+@@ -189,6 +189,8 @@ static WebKitInputHints toWebKitHints(const OptionSet<InputMethodState::Hint>& h
+         wkHints |= WEBKIT_INPUT_HINT_INHIBIT_OSK;
+     if (hints.contains(InputMethodState::Hint::Private))
+         wkHints |= WEBKIT_INPUT_HINT_PRIVATE;
++    if (hints.contains(InputMethodState::Hint::Multiline))
++        wkHints |= WEBKIT_INPUT_HINT_MULTILINE;
+     return static_cast<WebKitInputHints>(wkHints);
+ }
+ 
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitInputMethodContext.h.in b/Source/WebKit/UIProcess/API/glib/WebKitInputMethodContext.h.in
+index 7b08eed6e7..194f0d023e 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitInputMethodContext.h.in
++++ b/Source/WebKit/UIProcess/API/glib/WebKitInputMethodContext.h.in
+@@ -95,6 +95,9 @@ typedef enum {
+  *   (like typing history). It is set for a password field, and kept after its type is changed, for
+  *   example to text to reveal the password.
+  *   Since: 2.56
++ * @WEBKIT_INPUT_HINT_MULTILINE: The editable element takes several lines (a textarea or a
++ *   contenteditable element), so Enter inserts a new line instead of, for example, submitting
++ *   a form. Since: 2.56
+  *
+  * Enum values used to describe hints that might be taken into account by input methods.
+  *
+@@ -108,7 +111,8 @@ typedef enum {
+     WEBKIT_INPUT_HINT_UPPERCASE_WORDS     = 1 << 3,
+     WEBKIT_INPUT_HINT_UPPERCASE_SENTENCES = 1 << 4,
+     WEBKIT_INPUT_HINT_INHIBIT_OSK         = 1 << 5,
+-    WEBKIT_INPUT_HINT_PRIVATE             = 1 << 6
++    WEBKIT_INPUT_HINT_PRIVATE             = 1 << 6,
++    WEBKIT_INPUT_HINT_MULTILINE           = 1 << 7
+ } WebKitInputHints;
+ 
+ typedef struct _WebKitInputMethodUnderline      WebKitInputMethodUnderline;
+diff --git a/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp b/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp
+index 794a56ff03..7a8c54f3b9 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp
+@@ -74,6 +74,8 @@ static WPEInputHints toWPEInputHints(WebKitInputHints hints)
+         wpeHints |= WPE_INPUT_HINT_INHIBIT_OSK;
+     if (hints & WEBKIT_INPUT_HINT_PRIVATE)
+         wpeHints |= WPE_INPUT_HINT_PRIVATE;
++    if (hints & WEBKIT_INPUT_HINT_MULTILINE)
++        wpeHints |= WPE_INPUT_HINT_MULTILINE;
+     return static_cast<WPEInputHints>(wpeHints);
+ }
+ 
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEInputMethodContext.h b/Source/WebKit/WPEPlatform/wpe/WPEInputMethodContext.h
+index 134e29c117..a7e0f15b7a 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEInputMethodContext.h
++++ b/Source/WebKit/WPEPlatform/wpe/WPEInputMethodContext.h
+@@ -106,6 +106,8 @@ typedef enum
+  * @WPE_INPUT_HINT_NO_EMOJI: Suggest not offering Emoji support
+  * @WPE_INPUT_HINT_PRIVATE: Request that the input method should not
+  *    update personalized data (like typing history)
++ * @WPE_INPUT_HINT_MULTILINE: The text may have several lines (a textarea
++ *    or a contenteditable element): Enter inserts a new line
+  *
+  * Describes hints that might be taken into account by input methods
+  * or applications.
+@@ -131,6 +133,7 @@ typedef enum
+   WPE_INPUT_HINT_EMOJI               = 1 << 9,
+   WPE_INPUT_HINT_NO_EMOJI            = 1 << 10,
+   WPE_INPUT_HINT_PRIVATE             = 1 << 11,
++  WPE_INPUT_HINT_MULTILINE           = 1 << 12,
+ } WPEInputHints;
+ 
+ typedef struct _WPEInputMethodUnderline WPEInputMethodUnderline;
+diff --git a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+index b1c6d95172..be5f8c5910 100644
+--- a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+@@ -204,6 +204,9 @@ static std::optional<InputMethodState> inputMethodStateForElement(Element* eleme
+     } else if (is<HTMLTextAreaElement>(*element) || (element->hasEditableStyle() && is<HTMLElement>(*element))) {
+         auto& htmlElement = downcast<HTMLElement>(*element);
+         state.setPurposeOrHintForInputMode(htmlElement.canonicalInputMode());
++        // A textarea or contenteditable element takes new lines: an input method's
++        // "Go"/"Done" key should not act as Enter there.
++        state.hints.add(InputMethodState::Hint::Multiline);
+ #if ENABLE(AUTOCAPITALIZE)
+         state.addHintsForAutocapitalizeType(htmlElement.autocapitalizeType());
+ #endif

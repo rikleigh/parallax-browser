@@ -280,6 +280,11 @@ static void pollTextDialog(WPEDisplayPS5* display)
 gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title, const char* initialText, gboolean url, WPEDisplayPS5TextCallback callback, gpointer userData)
 {
     g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return wpeDisplayPS5RequestText(display, title, initialText, url, url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT, callback, userData);
+}
+
+bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const char* initialText, bool url, int32_t enterLabel, WPEDisplayPS5TextCallback callback, gpointer userData)
+{
     auto* priv = display->priv;
     if (priv->pendingText || !priv->ime.init) {
         PS5_LOG("request_text: %s", priv->pendingText ? "a dialog is already open" : "libSceImeDialog not loaded");
@@ -295,7 +300,7 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
     PS5ImeDialogParam param { };
     param.userID = priv->userID;
     param.type = url ? PS5_IME_TYPE_URL : PS5_IME_TYPE_DEFAULT;
-    param.enterLabel = url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT;
+    param.enterLabel = enterLabel;
     param.option = url ? PS5_IME_OPTION_NO_AUTO_CAPITALIZATION : 0;
     param.maxTextLength = G_N_ELEMENTS(pending->buffer) - 1;
     param.inputTextBuffer = pending->buffer;
@@ -320,7 +325,8 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
         PS5_LOG("sceImeDialogInit failed: 0x%08x", rc);
         return FALSE;
     }
-    PS5_LOG("IME dialog open (%s, %zu chars)", url ? "URL" : "text", strlen(initialText ? initialText : ""));
+    PS5_LOG("IME dialog open (%s, %zu chars, enter label %s)", url ? "URL" : "text", strlen(initialText ? initialText : ""),
+        enterLabel == PS5_IME_ENTER_LABEL_SEARCH ? "Search" : enterLabel == PS5_IME_ENTER_LABEL_GO ? "Go" : enterLabel == PS5_IME_ENTER_LABEL_SEND ? "Send" : "default");
     priv->pendingText = WTF::move(pending);
     return TRUE;
 }
@@ -338,6 +344,12 @@ static void tapKey(WPEView* view, guint keyval, guint keycode, WPEModifiers modi
 {
     sendKey(view, keyval, keycode, modifiers, true);
     sendKey(view, keyval, keycode, modifiers, false);
+}
+
+void wpeDisplayPS5SendReturn(WPEDisplayPS5* display)
+{
+    if (auto* view = display->priv->activeView)
+        tapKey(view, WPE_KEY_Return, 36);
 }
 
 struct KeyMapping {

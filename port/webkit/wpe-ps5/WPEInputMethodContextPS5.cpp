@@ -18,6 +18,7 @@
 
 #include "config.h"
 
+#include "PS5Sce.h"
 #include "WPEPS5Private.h"
 #include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/WTFGType.h>
@@ -31,7 +32,13 @@
 //    button's click handler (a search button that refocuses its field);
 //  - on Triangle while a field is focused.
 // The dialog starts with the field's text around the cursor; on "OK" that
-// text is replaced (delete-surrounding + committed).
+// text is replaced (delete-surrounding + committed), and in a single-line
+// field Return follows, as a phone keyboard's Go key submits the form (the
+// key events reach the WebProcess after the committed text, on the same
+// connection, so the page sees the new value first). The dialog's OK button
+// then says Search in a search field and Go in other single-line fields; a
+// textarea or contenteditable element (WPE_INPUT_HINT_MULTILINE) keeps the
+// default label and gets no Return. Cancel changes nothing.
 
 G_DECLARE_FINAL_TYPE(WPEInputMethodContextPS5, wpe_input_method_context_ps5, WPE, INPUT_METHOD_CONTEXT_PS5, WPEInputMethodContext)
 #define WPE_TYPE_INPUT_METHOD_CONTEXT_PS5 (wpe_input_method_context_ps5_get_type())
@@ -41,6 +48,7 @@ struct _WPEInputMethodContextPS5Private {
     std::string surrounding;
     guint cursorIndex { 0 };
     bool waiting { false };
+    bool enterSubmits { false }; // the open dialog's OK sends Return after the text
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEInputMethodContextPS5, wpe_input_method_context_ps5, WPE_TYPE_INPUT_METHOD_CONTEXT, WPEInputMethodContext)
 
@@ -68,9 +76,15 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
     bool url = purpose == WPE_INPUT_PURPOSE_URL;
     const char* title = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "Password" : url ? "Address" : purpose == WPE_INPUT_PURPOSE_SEARCH ? "Search" : "Text";
     const char* initial = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "" : priv->surrounding.c_str();
+    // Single line: no multiline hint (patch 0071 sets it for textarea and
+    // contenteditable) and no new line in the text around the cursor.
+    bool multiline = (wpe_input_method_context_get_input_hints(context) & WPE_INPUT_HINT_MULTILINE)
+        || priv->surrounding.find('\n') != std::string::npos;
+    priv->enterSubmits = !multiline;
+    int32_t enterLabel = multiline ? PS5_IME_ENTER_LABEL_DEFAULT : purpose == WPE_INPUT_PURPOSE_SEARCH ? PS5_IME_ENTER_LABEL_SEARCH : PS5_IME_ENTER_LABEL_GO;
 
     g_object_ref(context);
-    priv->waiting = wpe_display_ps5_request_text(display, title, initial, url, [](const char* text, gpointer userData) {
+    priv->waiting = wpeDisplayPS5RequestText(display, title, initial, url, enterLabel, [](const char* text, gpointer userData) {
         auto* context = WPE_INPUT_METHOD_CONTEXT(userData);
         auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
         priv->waiting = false;
@@ -83,7 +97,11 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
                 g_signal_emit_by_name(context, "delete-surrounding", static_cast<int>(-before), static_cast<guint>(total));
             }
             g_signal_emit_by_name(context, "committed", text);
-            PS5_LOG("IME: committed %zu bytes", strlen(text));
+            PS5_LOG("IME: committed %zu bytes%s", strlen(text), priv->enterSubmits ? ", then Return" : "");
+            if (priv->enterSubmits) {
+                if (auto* display = displayFor(context))
+                    wpeDisplayPS5SendReturn(display);
+            }
         }
         g_object_unref(context);
     }, context);
