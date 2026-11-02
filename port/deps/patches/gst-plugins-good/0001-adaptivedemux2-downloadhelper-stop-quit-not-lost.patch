@@ -1,0 +1,37 @@
+--- a/ext/adaptivedemux2/downloadhelper.c
++++ b/ext/adaptivedemux2/downloadhelper.c
+@@ -1019,6 +1019,13 @@
+ 
+   GST_DEBUG ("Exiting DownloadHelper thread");
+   return NULL;
++}
++
++static gboolean
++dh_quit_loop (gpointer data)
++{
++  g_main_loop_quit ((GMainLoop *) data);
++  return G_SOURCE_REMOVE;
+ }
+ 
+ gboolean
+@@ -1058,6 +1065,20 @@
+   }
+ 
+   g_main_loop_quit (dh->loop);
++  /* g_main_loop_run() marks the loop running when it starts, so the quit
++   * above is lost when the transfer thread hasn't reached it yet (a stop
++   * right after the start): the join below then waited forever. Also quit
++   * from a source on the transfer context, which runs as soon as the loop
++   * does (or is drained below if the loop already ended). */
++  if (dh->transfer_thread != NULL) {
++    GSource *quit_source = g_idle_source_new ();
++
++    g_source_set_priority (quit_source, G_PRIORITY_HIGH);
++    g_source_set_callback (quit_source, dh_quit_loop,
++        g_main_loop_ref (dh->loop), (GDestroyNotify) g_main_loop_unref);
++    g_source_attach (quit_source, dh->transfer_context);
++    g_source_unref (quit_source);
++  }
+ 
+   transfer_thread = dh->transfer_thread;
+   dh->transfer_thread = NULL;
