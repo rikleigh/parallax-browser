@@ -134,12 +134,34 @@ static GMutex s_uploadLock;
 static std::atomic<bool> s_quiescing { false };
 static std::atomic<int> s_sending { 0 };
 
+// The browser title's log queue (apps/title/titlelog.c) sets this: the
+// relay then never waits on the log sink, and the payloads never wait on a
+// relay stopped behind it (2026-11-02: a dead network froze the title in
+// blocking sends). Unset (ps5wk-shot): stderr.
+extern "C" void (*ps5wk_log_line_hook)(const char* line, size_t length);
+void (*ps5wk_log_line_hook)(const char* line, size_t length) = nullptr;
+
+static void logLine(const char* text)
+{
+    if (auto* hook = ps5wk_log_line_hook) {
+        char line[2304];
+        size_t length = std::min(strlen(text), sizeof(line) - 1);
+        memcpy(line, text, length);
+        line[length++] = '\n';
+        hook(line, length);
+    } else
+        fprintf(stderr, "%s\n", text);
+}
+
 // One line of a payload's output into our log; the performance overlay's
 // lines (PS5PerfOverlay.cpp) stay out of it.
 static void relayLine(const char* tag, const char* line)
 {
-    if (!ps5PerfNoteChildLine(tag, line))
-        fprintf(stderr, "[%s] %s\n", tag, line);
+    if (ps5PerfNoteChildLine(tag, line))
+        return;
+    char text[2200];
+    snprintf(text, sizeof(text), "[%s] %s", tag, line);
+    logLine(text);
 }
 
 // Connects to elfldr and sends the ELF plus the header line. Returns the
@@ -343,7 +365,9 @@ static gpointer uploadThread(gpointer data)
         line[used] = 0;
         relayLine(tag, line);
     }
-    fprintf(stderr, "[%s] (output closed after %.1f s)\n", tag, (g_get_monotonic_time() - t0) / 1e6);
+    char closed[96];
+    snprintf(closed, sizeof(closed), "[%s] (output closed after %.1f s)", tag, (g_get_monotonic_time() - t0) / 1e6);
+    logLine(closed);
     ps5PerfChildEnded(tag);
     close(s);
     if (job->taskEnded)

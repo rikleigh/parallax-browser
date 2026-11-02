@@ -819,6 +819,20 @@ int main(int, char**)
     ps5wk_crash_guard_install("child");
     setvbuf(stdout, nullptr, _IOLBF, 0);
     setvbuf(stderr, nullptr, _IOLBF, 0);
+    // stdout/stderr are the elfldr connection, read by the title's relay.
+    // The relay no longer waits on the title's log sink (titlelog.c), but
+    // the title can still stop reading (hung, suspended): a write then waits
+    // 0.5 s at most and the line is cut or lost, instead of every thread that
+    // logs stopping until the title reads again (2026-11-02: a dead network
+    // stalled the title's log sends, and with them the relay). The larger
+    // buffer rides out short gaps.
+    struct timeval sendTimeout { 0, 500 * 1000 };
+    int stderrBuffer = 256 << 10;
+    bool stderrTimeout = !setsockopt(2, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+    setsockopt(2, SOL_SOCKET, SO_SNDBUF, &stderrBuffer, sizeof(stderrBuffer));
+    socklen_t stderrBufferSize = sizeof(stderrBuffer);
+    if (getsockopt(2, SOL_SOCKET, SO_SNDBUF, &stderrBuffer, &stderrBufferSize))
+        stderrBuffer = -1;
 
     char line[512];
     if (!readHeader(line, sizeof(line), 20000)) {
@@ -860,6 +874,7 @@ int main(int, char**)
         ps5malloc_stats(&heap);
         LOG("locks: %s; malloc: %s", locks.fast ? "futex (ps5locks; /data/ps5webkit/no-fastlock turns it off)" : "the console's libc (no-fastlock)",
             heap.pas ? "libpas (ps5malloc; /data/ps5webkit/no-pasmalloc turns it off)" : "the console's libc (no-pasmalloc)");
+        LOG("stderr: a write waits %s at most (buffer %d KB)", stderrTimeout ? "0.5 s" : "forever (SO_SNDTIMEO failed)", stderrBuffer >> 10);
     }
 
     int fd = rendezvous(path, processIdentifier);

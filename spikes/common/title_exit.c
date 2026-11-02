@@ -47,6 +47,9 @@ static void ask_launcher_to_kill_us(void)
             snprintf(cmd, sizeof cmd, "kill -9\nlaunch %.15s\n", spike_title_relaunch);
         spike_log("closing the title through the launcher (SIGKILL)%s%s", spike_title_relaunch[0] ? ", then starting " : "",
                   spike_title_relaunch);
+        /* A queued log (ps5browser's titlelog.c): out before the kill. */
+        fflush(stderr);
+        spike_log_flush(500);
         if (write(fd, cmd, strlen(cmd)) == (ssize_t)strlen(cmd))
             for (int i = 0; i < 30; i++)
                 usleep(100 * 1000);

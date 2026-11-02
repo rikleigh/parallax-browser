@@ -88,6 +88,11 @@ static inline int spike_title_unjail(void)
     return 0;
 }
 
+/* A title can start its own log instead of the blocking TCP connection
+ * below (ps5browser: titlelog.c, a queue and a sender thread no caller
+ * waits on). Called after the unjail and the file log; 0: it took over. */
+__attribute__((weak)) int (*spike_title_log_start_hook)(const char *name, const char *log_host, int log_port) = 0;
+
 static inline void spike_title_init(const char *name, const char *log_host, int log_port)
 {
     char line[160];
@@ -101,10 +106,15 @@ static inline void spike_title_init(const char *name, const char *log_host, int 
         snprintf(path, sizeof path, "/data/ps5webkit/%s.log", name);
         spike_log_file_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     }
-    const int tcp = spike_log_connect(log_host, log_port);
+    int tcp = -1;
+    const char *how = "FAILED";
+    if (spike_title_log_start_hook && spike_title_log_start_hook(name, log_host, log_port) == 0)
+        tcp = 0, how = "queued (non-blocking sender)";
+    else if ((tcp = spike_log_connect(log_host, log_port)) == 0)
+        how = "connected";
     snprintf(line, sizeof line, "[ps5webkit] %s unjailed %d tcp %d\n", name, unjailed, tcp);
     spike_klog(line);
     spike_log("title %s pid %d: unjailed %d, file log %s, tcp log to %s:%d %s (errno %d)", name,
               (int)getpid(), unjailed, spike_log_file_fd >= 0 ? "on" : "off", log_host, log_port,
-              tcp == 0 ? "connected" : "FAILED", tcp == 0 ? 0 : errno);
+              how, tcp == 0 ? 0 : errno);
 }

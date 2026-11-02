@@ -116,7 +116,7 @@ set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
 # the --wrap options from this link line (its heap, Spike 10's dlmalloc
 # arenas, locks with pthread mutexes).
 add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/adblock.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/title/vrlayout.c ${PS5_APPS_DIR}/common/ps5audioserver.c
-    ${PS5_APPS_DIR}/title/ps5locks-title.c)
+    ${PS5_APPS_DIR}/title/ps5locks-title.c ${PS5_APPS_DIR}/title/titlelog.c)
 target_include_directories(ps5browser PRIVATE ${PS5_API_INCLUDE_DIRECTORIES} ${PS5_PORT_DIR}/../../spikes)
 target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_PORT=${PS5WK_LOG_PORT})
 target_link_options(ps5browser PRIVATE ${PS5_LOCK_WRAPS})

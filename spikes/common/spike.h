@@ -31,6 +31,17 @@
 __attribute__((weak)) int spike_log_fd = -1;
 __attribute__((weak)) int spike_log_file_fd = -1; /* titles: /data/ps5webkit/<title>.log */
 
+/* A title can take over the sinks below: ps5browser's log queue
+ * (port/webkit/apps/title/titlelog.c), which no caller ever waits on.
+ * spike_log_sink gets each line with its '\n'; spike_log_flush() waits at
+ * most timeout_ms for queued lines to reach the sinks (1: they did). */
+__attribute__((weak)) void (*spike_log_sink)(const char *line, size_t n) = 0;
+__attribute__((weak)) int (*spike_log_flush_hook)(int timeout_ms) = 0;
+static inline int spike_log_flush(int timeout_ms)
+{
+    return spike_log_flush_hook ? spike_log_flush_hook(timeout_ms) : 1;
+}
+
 /* Optional second sink: a TCP connection to tools/logserver.sh. */
 static inline int spike_log_connect(const char *host, int port)
 {
@@ -70,6 +81,10 @@ __attribute__((format(printf, 1, 2))) static inline void spike_log(const char *f
     if (n > (int)sizeof line - 2)
         n = (int)sizeof line - 2;
     line[n++] = '\n';
+    if (spike_log_sink) {
+        spike_log_sink(line, (size_t)n);
+        return;
+    }
     fwrite(line, 1, (size_t)n, stdout);
     fflush(stdout);
     if (spike_log_file_fd >= 0 && write(spike_log_file_fd, line, (size_t)n) < 0) {

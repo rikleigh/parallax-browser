@@ -1712,6 +1712,8 @@ static int fileExists(const char* path)
 /* titlevdec.c: hardware video decoding (Videodec2) for the WebProcesses. */
 void ps5wk_title_vdec_preload(void) __attribute__((weak));
 void ps5wk_title_vdec_install(void) __attribute__((weak));
+/* titlelog.c: the log queue no thread waits on (CONSOLE-HEALTH.md, "Logging"). */
+void ps5wk_titlelog_install(const char* dir);
 
 int main(int argc, char** argv)
 {
@@ -1719,11 +1721,14 @@ int main(int argc, char** argv)
      * not load after it). */
     if (ps5wk_title_vdec_preload)
         ps5wk_title_vdec_preload();
+    ps5wk_titlelog_install("/data/ps5webkit");
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
     loadStart = g_get_monotonic_time();
     startedAt = g_get_real_time() / G_USEC_PER_SEC;
     signal(SIGPIPE, SIG_IGN);
-    // WebKit, GLib and the child payloads (relayed) log to stderr.
+    // WebKit, GLib and the child payloads (relayed) log to stderr: titlelog.c
+    // made it a pipe into its queue. Only without it (spike_log_fd: the old
+    // blocking connection) is stderr pointed at the log socket.
     if (spike_log_fd >= 0 && dup2(spike_log_fd, 2) != 2) {
         /* A title can't dup2 (EPERM; fd 2 can't be reused either): point
          * libc's stderr stream at the log socket instead. */
