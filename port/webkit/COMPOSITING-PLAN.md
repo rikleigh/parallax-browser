@@ -2208,3 +2208,119 @@ Not done: an axis lock for diagonal stick input (a mostly vertical push with
 a small sideways part is taken by a carousel under the point, in every mode);
 lazily loaded gallery images at the far end showed black in some mid-run
 captures of the product page (not compared with the flag off).
+
+### Lock-up at the GL cap; carousels juddering under the stick (2026-11-02, src-wc 2e90eec762)
+
+**Owner's TV run 1** (GPU mode, `stickframe=1`, build 20261102-112536): on a
+heavy feed, scrolling down, then up fast (the feed flickers white above),
+then down again made scrolling lock up "for quite a while". In the log the
+second with the fast upward scroll uploaded 420 tiles (252 MB), the GL
+texture average went to 160.4 MB, and coverage was reduced to the visible
+rect. From then on each second showed ~120 wheel events in the title, 0 sent
+to the WebProcess, ~120 clamped at the painted edge (4000+ px), a lead of 0
+and 0 frames moving the page, while the WebProcess kept sending 25-59
+updates/s. It freed up only at "under 96 MB for 20 s: normal tile coverage
+again". This happened twice in the run, lasting 20-35 s each time.
+
+**Cause.** With reduced coverage, `GraphicsLayerWC::coverageMargins`
+reported 0 px painted past the viewport, and
+`PS5WCScrollingTree::clampAtPaintedEdge` zeroed its limits as well
+(`reduced ? 0 : above`). The clamp lets a step go to
+`[min(wp - limit, current), max(wp + limit, current)]`. With a limit of 0
+and the title at the WebProcess's position (lead 0), that range is a single
+point, so every step became 0. The root never moved, so `ScrollUpdatesWC`
+(sent only for scrolls) never told the WebProcess to scroll, and nothing
+moved until the coverage came back. The design note "Reduced coverage
+means 0: scrolling then waits for the WebProcess" was wrong: with title-handled
+events the WebProcess waits for the title. Without the cap the limits are
+at least 532 px, so the deadlock needed reduced coverage.
+
+**Fix.**
+- The title always lets a step move at least 20 px past the WebProcess's
+  position. Every update paints that much past the viewport
+  (`flushCompositingState` inflates the visible rect by 20 px), so nothing
+  unpainted shows and the WebProcess always hears of the new position.
+  `[ascroll]` gains "clamped with zero lead (sent on) N" (clamped steps that
+  started with no lead and still moved). The title no longer zeroes the
+  WebProcess's margins on its own: each update's margins describe that
+  update's tiles.
+- Reduced coverage keeps one tile row (512 px) in the last vertical scroll
+  direction, for every layer (the direction is the sign of the title's
+  velocity and is kept after the velocity goes stale). The reported margins
+  are now that coverage: 20 px, plus 512 px in the scroll direction.
+  `coverageMargins` computes them from the same rect as
+  `WCTiledBacking::updateCoverageRect`. Tiles reach further, to their row
+  edges, but that part isn't counted because it depends on the layer's
+  origin.
+- Recovery: back to normal coverage after **3 s** under 60 % of the cap
+  (was 20 s). If the cap trips again within a minute of a restore, the wait
+  doubles, up to 20 s. Both log lines give the current wait.
+- Fewer tiles ahead near the cap: the title sends a lookahead scale with
+  each `ScrollUpdatesWC`. It is 1 up to 70 % of the cap (112 MB), 0 at 90 %
+  (144 MB), and linear in between. The WebProcess multiplies the
+  velocity-extended margin by it. A fast scroll on a page already near the
+  cap then stops adding up to two views of tiles in one second (the
+  252 MB burst). `[ascroll]` shows it as "lookahead x.xx". Not done: the white
+  flicker itself (tiles of other layers showing late while scrolling back
+  up fast). The lookahead scale should make the cap trip less often there.
+  The flicker needs a capture to say more.
+
+**Owner's TV run 2** (Apple iPhone product page, `stickframe=1`, then
+`stickframe=1 overflow=1`): the carousels "don't scroll and just judder in
+place". While the stick was held right, 20-86 sub-scroller moves per second
+happened in the title (with or without `overflow=1`, so the routing is not the
+issue), about one "snap after wheel" per second, and 120 MB/s of tile
+uploads.
+
+**Cause.** The WebProcess resnapped the carousel after every layout.
+`ScrollableArea::resnapAfterLayout` (run from `updateScrollInfoAfterLayout`
+whenever the scroller lays out) scrolls a scroll-snap container back to its
+active snap index unless `isUserScrollInProgress()` or
+`isScrollSnapInProgress()`. With the scrolling tree in the title,
+`WCScrollingCoordinator` answered neither (AsyncScrollingCoordinator's
+versions ask a local tree, and there is none). The active index followed
+each title position (`ScrollAnimator::setCurrentPosition` ->
+`updateActiveScrollSnapIndexForOffset`: the nearest card). So each layout
+(the page marks the current item, runs videos and animations) scrolled the
+carousel programmatically back to the nearest card. That went to the title
+tree as a requested scroll, and the carousel could never get further than
+half a card from where it was. The synthetic test page had no layouts while
+scrolling, which is why it passed. Without async scrolling the WebProcess's
+own animator reports the user scroll, so it doesn't resnap. The snap timer
+is not the cause: it is restarted by every native pad event
+(`handleNativeWheelEvent`). The ~1/s snaps mean gaps of more than 100 ms in
+the pad's events (light stick input), and the next event stops such a snap.
+
+**Fix.** The title keeps the set of nodes in a wheel gesture: a node joins
+when a wheel event scrolls it, and leaves once its gesture has ended (the
+100 ms end timer) and it no longer animates (its snap). The set goes with
+`ScrollUpdatesWC` whenever it changes. A node that joins is added before
+the message's positions apply, and one that leaves is removed after them.
+`WCScrollingCoordinator::isUserScrollInProgress` answers from the set, as
+RemoteScrollingCoordinator does with the UI process's user-scroll nodes.
+The gesture-end timer now also runs with `snap=0`, so the set empties there too.
+
+**Test pages.**
+- `scrolljank.html?heavy=<n>`: n large composited "photos" (1060x560,
+  `will-change: transform`) per post. With `/data/ps5webkit/wc-gl-cap` at 64
+  and `heavy=1`, a fast up/down `pad-scroll-test` (`secs=1.5 ry=1.0`) trips
+  the cap, which reproduces the lock-up.
+- `carousel.html?relayout[=scroll|frame]`: layout inside the carousels while
+  they scroll. `scroll` marks the card nearest the snap line from each scroll
+  event (alternating border widths); `frame` toggles a 1 px padding every
+  rAF. New `CAR-BACK` lines report a scroll event that moved more than 30 px
+  against the previous direction within 150 ms (a yank back), and the
+  `CAR` lines count them.
+- `title-ascroll-summary.py` adds: stuck seconds (>= 20 pad events, nothing
+  moved) and the longest run, steps sent on at zero lead, GL cap trips and
+  restores, sub-scroller moves, snaps after wheel, CAR-BACK and CAR settles.
+  On the owner's run-1 log: 13 stuck seconds (longest run 7, plus the
+  low-input seconds around them), 2 cap trips.
+
+**Not measured yet (needs console time).** a) `wc-gl-cap` 64 +
+`scrolljank.html?heavy=1` + fast pad-scroll-test, flag `stickframe=1`:
+expect cap trips with no stuck seconds and "sent on" > 0. b)
+`carousel.html?relayout` with `rx=0.5`, with and without `overflow=1`:
+expect snapped settles and no CAR-BACK (before the fix it should show
+CAR-BACK and settles near the start). c) The product page's gallery
+under `pad-scroll-test`.

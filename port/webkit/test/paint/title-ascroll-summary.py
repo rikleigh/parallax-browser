@@ -5,7 +5,10 @@ Per run: seconds with page motion, frames that moved the page per second
 (avg over seconds with >= 20 pad events), pad -> present latency (pooled from
 the per-second p50/p95/max: avg of avgs, max of p95s, max), WebProcess
 updates/s in the same seconds ([wc] lines), wheel routing, clamps, lead,
-SJ scroll events/s and lazy loads, crashes."""
+SJ scroll events/s and lazy loads, crashes; stuck seconds (>= 20 pad events,
+no frame moved the page, no sub-scroller moved: the GL-cap lock-up) and the
+longest run of them, steps sent on at zero lead, GL cap trips and restores,
+snaps after wheel, carousel yanks (CAR-BACK) and settles (CAR)."""
 import re
 import sys
 
@@ -14,6 +17,8 @@ ASCROLL = re.compile(r"\[ascroll\] ([\d.]+) s: (\d+) frames moved the page \((\d
 ROUTE = re.compile(r"\[ascroll\] ([\d.]+) s: wheel events in the title (\d+), sent to the WebProcess first (\d+); clamped at the painted edge (\d+) \((\d+) px\); "
                    r"lead over the WebProcess ([\d.]+) px avg, ([\d.]+) max; (\d+) tree commits(?:; per-frame step ([\d.]+) px avg, sd ([\d.]+))?")
 WC = re.compile(r"\[wc\] ([\d.]+) s: (\d+) updates .*?(\d+) presents;.*?(\d+) paints \(([\d.]+) ms avg")
+EXTRA = re.compile(r"sub-scroller moves in the title (\d+); snaps after wheel (\d+)(?:; clamped with zero lead \(sent on\) (\d+))?")
+CAR = re.compile(r"CAR [\d.]+ s (\w+): left [\d.-]+, card \d+, off [\d.-]+ \((\w+)")
 SJ = re.compile(r"SJ [\d.]+ s: scroll events (\d+), rAF (\d+), scrollY (\S+), long tasks (\d+), lazy loaded (\d+), prevented (\d+)")
 
 
@@ -27,12 +32,25 @@ def summarize(path):
     lazy = prevented = 0
     by_update = by_title = 0
     pending_scroll_second = False
+    stuck = stuck_run = stuck_longest = 0
+    sub_moves = snaps = zero_lead = 0
+    last_sub_moves = 0
+    cap_trips = sum(1 for l in lines if "over the" in l and "cap: tiles for the visible rect only" in l)
+    cap_restores = sum(1 for l in lines if "normal tile coverage again" in l)
+    car_backs = sum(1 for l in lines if "CAR-BACK" in l)
+    car_settles = {}
     for line in lines:
         m = ASCROLL.search(line)
         if m:
             secs = float(m.group(1))
             n_in = int(m.group(5))
             pending_scroll_second = n_in >= 20
+            if pending_scroll_second and int(m.group(2)) == 0 and last_sub_moves == 0:
+                stuck += 1
+                stuck_run += 1
+                stuck_longest = max(stuck_longest, stuck_run)
+            elif n_in >= 20 or int(m.group(2)):
+                stuck_run = 0
             if pending_scroll_second:
                 moved.append(int(m.group(2)) / secs)
                 by_update += int(m.group(3))
@@ -54,6 +72,16 @@ def summarize(path):
             if m.group(9) and int(m.group(2)) >= 20:
                 step_avg.append(float(m.group(9)))
                 step_sd.append(float(m.group(10)))
+            e = EXTRA.search(line)
+            last_sub_moves = int(e.group(1)) if e else 0
+            if e:
+                sub_moves += int(e.group(1))
+                snaps += int(e.group(2))
+                zero_lead += int(e.group(3) or 0)
+            continue
+        m = CAR.search(line)
+        if m:
+            car_settles.setdefault(m.group(1), []).append(m.group(2))
             continue
         m = WC.search(line)
         if m and pending_scroll_second:
@@ -78,6 +106,9 @@ def summarize(path):
           f"wheel title/WebProcess {routes[0]}/{routes[1]}, clamped {routes[2]} ({routes[3]} px), lead max {lead_max:.0f}; "
           f"title per-frame step {avg(step_avg):.1f} px, sd {avg(step_sd):.1f}; "
           f"SJ scroll events/s {avg(sj_scroll):.1f}, rAF/s {avg(sj_raf):.1f}, lazy {lazy}, prevented {prevented}; crash-ish lines {crashes}")
+    cars = ", ".join(f"{k} {sum(1 for v in vs if v == 'snapped')}/{len(vs)} snapped" for k, vs in sorted(car_settles.items()))
+    print(f"    stuck seconds {stuck} (longest run {stuck_longest}); steps sent on at zero lead {zero_lead}; GL cap trips {cap_trips}, restores {cap_restores}; "
+          f"sub-scroller moves {sub_moves}, snaps after wheel {snaps}; CAR-BACK {car_backs}" + (f"; CAR settles: {cars}" if cars else ""))
 
 
 for p in sys.argv[1:]:

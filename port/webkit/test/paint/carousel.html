@@ -11,6 +11,15 @@
        &top=<px>       space above the first carousel (default: the "center"
                        carousel sits at the middle of a 1080 px view, where the
                        pad scrolls when the pointer is hidden)
+       &relayout[=scroll|frame]  layout inside the carousels while they scroll,
+                       as store pages do: "scroll" (default) marks the card
+                       nearest the snap line from each scroll event (a class
+                       that changes its border width), "frame" toggles a 1 px
+                       padding on every carousel's last card in every rAF.
+                       Each layout lets the WebProcess resnap a scroll-snap
+                       container (ScrollableArea::resnapAfterLayout) unless it
+                       knows a user scroll is in progress: with async scrolling
+                       before 2026-11-02 the stick then only juddered in place.
      Carousels:
        center  overflow-x: auto, scroll-snap-type: x mandatory, cards snap-align
                center; paddles call scrollBy({ left: +-card, behavior: smooth })
@@ -24,6 +33,9 @@
        CAR-PADDLE <name> <next|prev> from <left> (auto presses)
        CAR-STOP <t> s <name>: left <scrollLeft> once no scroll event came for
          80 ms (where a stick gesture stopped, before any snap animation)
+       CAR-BACK <t> s <name>: <from> -> <to> a scroll event that moved more than
+         30 px against the previous one's direction within 150 ms (a yank back
+         to a snap position while scrolling); counted in CAR lines as "backs"
      Each carousel has yellow markers above and below at its snap line
      (centre or start), so captures show whether a card sits on it. -->
 <style>
@@ -34,7 +46,9 @@ section { position: relative; margin: 0 0 40px; }
 section h2 { margin: 0 24px 6px; font-size: 24px; }
 .wrap { position: relative; padding: 14px 0; }
 .sc { display: flex; gap: 24px; padding: 0 40px; }
-.sc > div { flex: 0 0 auto; border-radius: 16px; font: bold 64px/1 sans-serif; display: flex; align-items: center; justify-content: center; color: #fff; text-shadow: 0 2px 4px #000; }
+.sc > div.cur { border: 3px solid #fff; }
+.sc > div.cur2 { border: 5px solid #fff; }
+.sc > div { flex: 0 0 auto; box-sizing: border-box; border-radius: 16px; font: bold 64px/1 sans-serif; display: flex; align-items: center; justify-content: center; color: #fff; text-shadow: 0 2px 4px #000; }
 #center { overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; height: 340px; }
 #center > div { width: 640px; height: 320px; scroll-snap-align: center; }
 #start { overflow-x: scroll; scroll-snap-type: x mandatory; scroll-padding: 0 40px; height: 260px; scrollbar-width: none; }
@@ -66,6 +80,7 @@ p.filler { margin: 18px 24px; padding: 18px; background: #18242f; border-radius:
 (function () {
     var q = new URLSearchParams(location.search);
     var busy = +q.get("busy") || 0, auto = +q.get("auto") || 0;
+    var relayout = q.has("relayout") ? (q.get("relayout") || "scroll") : "";
     var t0 = performance.now();
     function secs() { return ((performance.now() - t0) / 1000).toFixed(1); }
     var counts = { center: 12, start: 14, free: 16 };
@@ -120,9 +135,27 @@ p.filler { margin: 18px 24px; padding: 18px; background: #18242f; border-radius:
     var state = {};
     ["center", "start", "free"].forEach(function (name) {
         var sc = document.getElementById(name);
-        var st = state[name] = { events: 0, timer: 0, gapTimer: 0 };
+        var st = state[name] = { events: 0, timer: 0, gapTimer: 0, last: sc.scrollLeft, dir: 0, at: 0, backs: 0, cur: null, flip: false };
         sc.addEventListener("scroll", function () {
             st.events++;
+            var now = performance.now(), left = sc.scrollLeft, d = left - st.last;
+            if (Math.abs(d) > 30 && st.dir && (d > 0) != (st.dir > 0) && now - st.at < 150) {
+                st.backs++;
+                console.log("CAR-BACK " + secs() + " s " + name + ": " + st.last.toFixed(1) + " -> " + left.toFixed(1));
+            }
+            if (d)
+                st.dir = d;
+            st.last = left;
+            st.at = now;
+            if (relayout == "scroll") {
+                var n = nearest(sc), card = sc.children[n.i];
+                if (st.cur)
+                    st.cur.className = "";
+                // alternate the border width so every event changes layout
+                st.flip = !st.flip;
+                card.className = st.flip ? "cur" : "cur2";
+                st.cur = card;
+            }
             clearTimeout(st.timer);
             clearTimeout(st.gapTimer);
             st.gapTimer = setTimeout(function () {
@@ -134,8 +167,9 @@ p.filler { margin: 18px 24px; padding: 18px; background: #18242f; border-radius:
                 var edge = sc.scrollLeft <= 0 ? " at start" : sc.scrollLeft >= max - 1 ? " at end" : "";
                 var ok = name === "free" ? "free" : Math.abs(n.off) < 1.5 ? "snapped" : (edge ? "edge" : "OFF");
                 console.log("CAR " + secs() + " s " + name + ": left " + sc.scrollLeft.toFixed(1) + ", card " + (n.i + 1)
-                    + ", off " + n.off.toFixed(1) + " (" + ok + edge + "), scroll events " + st.events);
+                    + ", off " + n.off.toFixed(1) + " (" + ok + edge + "), scroll events " + st.events + ", backs " + st.backs);
                 st.events = 0;
+                st.backs = 0;
             }, 400);
         }, { passive: true });
     });
@@ -163,6 +197,16 @@ p.filler { margin: 18px 24px; padding: 18px; background: #18242f; border-radius:
             requestAnimationFrame(frame);
         })();
     }
+    if (relayout == "frame") {
+        var odd = false;
+        (function frame() {
+            odd = !odd;
+            ["center", "start", "free"].forEach(function (name) {
+                document.getElementById(name).lastElementChild.style.paddingTop = odd ? "1px" : "0px";
+            });
+            requestAnimationFrame(frame);
+        })();
+    }
     if (auto) {
         var step = 0;
         setInterval(function () {
@@ -174,7 +218,7 @@ p.filler { margin: 18px 24px; padding: 18px; background: #18242f; border-radius:
             step++;
         }, auto);
     }
-    console.log("CAR start: busy " + busy + " ms, auto " + auto + " ms, top " + top + " px; center carousel at y "
+    console.log("CAR start: busy " + busy + " ms, auto " + auto + " ms, relayout " + (relayout || "off") + ", top " + top + " px; center carousel at y "
         + Math.round(document.getElementById("center").getBoundingClientRect().top) + ".." + Math.round(document.getElementById("center").getBoundingClientRect().bottom)
         + ", view " + innerWidth + "x" + innerHeight);
 })();

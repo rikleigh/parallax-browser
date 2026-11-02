@@ -17,6 +17,12 @@
                           events (no scrolling while the pointer is over it)
        &posts=<n>         number of posts (default 200)
        &nowheel           no wheel listener on the page at all
+       &heavy=<n>         n large composited "photos" (1060x560, will-change:
+                          transform, a distinct gradient each) in every post: a
+                          feed whose tiles push the title's GL textures towards
+                          the cap while scrolling fast (with /data/ps5webkit/wc-gl-cap
+                          at e.g. 64 the cap trips at heavy=1: the 2026-11-02
+                          lock-up repro, "tile coverage reduced")
        &inline            the overflow scroller and the wheel region span the
                           column (the pad scrolls at the screen centre: it then
                           lands on them); by default they are 440 px wide on the left
@@ -39,6 +45,7 @@ h2 { position: sticky; top: 68px; z-index: 5; margin: 0; padding: 6px 16px; back
 .thumb { height: 180px; border-radius: 8px; margin: 10px 0; }
 .lazy { height: 120px; border-radius: 8px; margin: 10px 0; background: #1d2b3a; color: #6b7d90; padding: 8px; }
 .card { will-change: transform; opacity: 0.92; }
+.photo { will-change: transform; height: 560px; border-radius: 10px; margin: 10px 0; font: bold 64px/560px sans-serif; text-align: center; color: #fff; text-shadow: 0 2px 6px #000; }
 #scroller, #wheel { width: 440px; }
 body.inline #scroller, body.inline #wheel { width: auto; }
 #scroller { height: 360px; overflow: auto; border: 3px solid #7dbb5a; border-radius: 10px; margin: 18px 0; background: #13261a; }
@@ -59,7 +66,7 @@ body.inline #scroller, body.inline #wheel { width: auto; }
     var q = new URLSearchParams(location.search);
     var busy = +q.get("busy") || 0, spike = +q.get("spike") || 0, every = +q.get("every") || 1000;
     var layers = +q.get("layers") || 0, posts = +q.get("posts") || 200;
-    var parallax = q.has("parallax"), prevent = q.has("prevent");
+    var parallax = q.has("parallax"), prevent = q.has("prevent"), heavy = +q.get("heavy") || 0;
     if (q.has("inline") || prevent)
         document.body.className = "inline";
     var feed = document.getElementById("feed");
@@ -71,6 +78,14 @@ body.inline #scroller, body.inline #wheel { width: auto; }
         return out.join(" ");
     }
     function hue(i) { return (i * 47) % 360; }
+    function photos(i) {
+        var out = "";
+        for (var k = 0; k < heavy; k++) {
+            var h = (hue(i) + k * 120) % 360;
+            out += '<div class="photo" style="background:radial-gradient(circle at ' + ((i * 37 + k * 50) % 100) + '% 40%,hsl(' + h + ',80%,70%),hsl(' + ((h + 60) % 360) + ',70%,35%) 45%,hsl(' + ((h + 180) % 360) + ',60%,15%))">photo ' + i + (heavy > 1 ? "." + k : "") + '</div>';
+        }
+        return out;
+    }
     var html = [];
     for (var i = 0; i < posts; i++) {
         if (i % 20 == 0)
@@ -80,6 +95,7 @@ body.inline #scroller, body.inline #wheel { width: auto; }
             + '<b>post ' + i + '</b><p>' + text(i, 40) + '</p>'
             + (i % 3 == 0 ? '<div class="thumb" style="background:repeating-linear-gradient(' + (i * 17 % 180) + 'deg,hsl(' + h + ',60%,45%) 0 18px,hsl(' + ((h + 40) % 360) + ',60%,30%) 18px 36px)"></div>' : '')
             + (i % 4 == 1 ? '<div class="lazy" data-i="' + i + '">lazy ' + i + '</div>' : '')
+            + photos(i)
             + '<p>' + text(i + 3, 25) + '</p></div>');
         if (i == 6) {
             var rows = ['<div id="scroller"><div class="sh">overflow scroller (sticky inside)</div>'];
@@ -171,7 +187,7 @@ body.inline #scroller, body.inline #wheel { width: auto; }
         stats.yMax = -Infinity;
     }, 1000);
     console.log("SJ start: busy " + busy + " ms, spike " + spike + "/" + every + " ms, layers " + layers + ", posts " + posts
-        + (parallax ? ", parallax" : "") + (prevent ? ", prevent" : "") + "; height " + document.documentElement.scrollHeight);
+        + (parallax ? ", parallax" : "") + (prevent ? ", prevent" : "") + (heavy ? ", heavy " + heavy : "") + "; height " + document.documentElement.scrollHeight);
 })();
 </script>
 </body></html>
