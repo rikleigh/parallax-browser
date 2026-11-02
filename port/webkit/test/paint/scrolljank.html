@@ -1,0 +1,175 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>scroll jank test</title>
+<!-- Async scrolling test page (COMPOSITING-PLAN.md, "Async scrolling"):
+     a long synthetic feed whose WebProcess main thread can be kept busy, to
+     see whether scrolling keeps the display rate while the main thread
+     doesn't. Self-contained (no network): upload it to the console, e.g.
+     /data/ps5webkit/scrolljank.html, and open file:///data/ps5webkit/scrolljank.html?busy=30
+       ?busy=<ms>         busy-wait this long in every requestAnimationFrame
+                          callback (a style/script-heavy page: ~1000/(16+ms) updates/s)
+       &spike=<ms>&every=<ms>  long tasks from a timer (default every 1000)
+       &layers=<n>        n small composited layers spread over the feed
+                          (scene paint cost in the title)
+       &parallax          a scroll-linked transform set from a scroll listener
+                          (lags while the main thread is behind: expected)
+       &prevent           the grey "wheel region" calls preventDefault on wheel
+                          events (no scrolling while the pointer is over it)
+       &posts=<n>         number of posts (default 200)
+       &inline            the overflow scroller and the wheel region span the
+                          column (the pad scrolls at the screen centre: it then
+                          lands on them); by default they are 440 px wide on the left
+     Logs (console.log, the title log):
+       SJ <t> s: scroll events n, rAF n, scrollY a..b, long tasks n, lazy loaded n, prevented n
+       once a second while anything happens.
+     Every post has a distinct stripe colour and number, so captures show
+     missing tiles (the page background, #0b1622) and positions. -->
+<style>
+html { background: #0b1622; }
+body { margin: 0; font: 22px/1.45 sans-serif; color: #e6edf5; background: #0b1622; }
+#hdr { position: sticky; top: 0; z-index: 10; height: 64px; background: #c8402d; color: #fff;
+       font: bold 30px/64px sans-serif; padding: 0 24px; border-bottom: 4px solid #ffd34d; }
+#bar { position: fixed; bottom: 0; left: 0; right: 0; height: 44px; z-index: 10; background: #2d6cc8;
+       font: bold 22px/44px sans-serif; padding: 0 24px; border-top: 4px solid #9fd0ff; }
+main { width: 1100px; margin: 0 auto; padding-bottom: 80px; }
+h2 { position: sticky; top: 68px; z-index: 5; margin: 0; padding: 6px 16px; background: #26384d; font-size: 24px; }
+.post { margin: 18px 0; padding: 16px 20px; border-radius: 12px; background: #142233; border-left: 14px solid; }
+.post p { margin: 6px 0; }
+.thumb { height: 180px; border-radius: 8px; margin: 10px 0; }
+.lazy { height: 120px; border-radius: 8px; margin: 10px 0; background: #1d2b3a; color: #6b7d90; padding: 8px; }
+.card { will-change: transform; opacity: 0.92; }
+#scroller, #wheel { width: 440px; }
+body.inline #scroller, body.inline #wheel { width: auto; }
+#scroller { height: 360px; overflow: auto; border: 3px solid #7dbb5a; border-radius: 10px; margin: 18px 0; background: #13261a; }
+#scroller .sh { position: sticky; top: 0; background: #7dbb5a; color: #08200d; font-weight: bold; padding: 4px 12px; }
+#scroller div.row { padding: 6px 12px; border-bottom: 1px solid #24432c; }
+#snap { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; gap: 12px; margin: 18px 0; }
+#snap div { flex: 0 0 520px; height: 160px; scroll-snap-align: start; border-radius: 10px; font: bold 40px/160px sans-serif; text-align: center; }
+#wheel { height: 220px; margin: 18px 0; border-radius: 10px; background: #59626d; font: bold 28px/220px sans-serif; text-align: center; }
+.dot { position: absolute; width: 18px; height: 18px; border-radius: 9px; background: #ffd34d; will-change: transform; }
+#para { position: absolute; right: 30px; width: 120px; height: 120px; border-radius: 60px; background: #b05ad8; }
+</style></head>
+<body>
+<div id="hdr">sticky header <span id="hdrinfo"></span></div>
+<main id="feed"></main>
+<div id="bar">fixed bar: <span id="barinfo">scrollY 0</span></div>
+<script>
+(function () {
+    var q = new URLSearchParams(location.search);
+    var busy = +q.get("busy") || 0, spike = +q.get("spike") || 0, every = +q.get("every") || 1000;
+    var layers = +q.get("layers") || 0, posts = +q.get("posts") || 200;
+    var parallax = q.has("parallax"), prevent = q.has("prevent");
+    if (q.has("inline") || prevent)
+        document.body.className = "inline";
+    var feed = document.getElementById("feed");
+    var words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim minim veniam quis nostrud exercitation ullamco laboris".split(" ");
+    function text(seed, n) {
+        var out = [];
+        for (var i = 0; i < n; i++)
+            out.push(words[(seed * 7 + i * 13) % words.length]);
+        return out.join(" ");
+    }
+    function hue(i) { return (i * 47) % 360; }
+    var html = [];
+    for (var i = 0; i < posts; i++) {
+        if (i % 20 == 0)
+            html.push('<h2>section ' + (i / 20 + 1) + '</h2>');
+        var h = hue(i);
+        html.push('<div class="post' + (i % 5 == 2 ? ' card' : '') + '" style="border-left-color:hsl(' + h + ',70%,55%)">'
+            + '<b>post ' + i + '</b><p>' + text(i, 40) + '</p>'
+            + (i % 3 == 0 ? '<div class="thumb" style="background:repeating-linear-gradient(' + (i * 17 % 180) + 'deg,hsl(' + h + ',60%,45%) 0 18px,hsl(' + ((h + 40) % 360) + ',60%,30%) 18px 36px)"></div>' : '')
+            + (i % 4 == 1 ? '<div class="lazy" data-i="' + i + '">lazy ' + i + '</div>' : '')
+            + '<p>' + text(i + 3, 25) + '</p></div>');
+        if (i == 6) {
+            var rows = ['<div id="scroller"><div class="sh">overflow scroller (sticky inside)</div>'];
+            for (var r = 0; r < 60; r++)
+                rows.push('<div class="row">row ' + r + ' ' + text(r, 8) + '</div>');
+            html.push(rows.join("") + '</div>');
+        }
+        if (i == 10) {
+            var snaps = ['<div id="snap">'];
+            for (var k = 0; k < 8; k++)
+                snaps.push('<div style="background:hsl(' + (k * 45) + ',55%,40%)">snap ' + k + '</div>');
+            html.push(snaps.join("") + '</div>');
+        }
+        if (i == 14)
+            html.push('<div id="wheel">wheel region' + (prevent ? ' (preventDefault)' : ' (listener, passive: false)') + '</div>');
+    }
+    feed.innerHTML = html.join("");
+    feed.style.position = "relative";
+    for (var d = 0; d < layers; d++) {
+        var dot = document.createElement("div");
+        dot.className = "dot";
+        dot.style.left = (20 + (d * 37) % 1040) + "px";
+        dot.style.top = (100 + (d * 211) % (feed.scrollHeight - 200)) + "px";
+        feed.appendChild(dot);
+    }
+    var para = null;
+    if (parallax) {
+        para = document.createElement("div");
+        para.id = "para";
+        para.style.top = "400px";
+        feed.appendChild(para);
+    }
+
+    var stats = { scroll: 0, raf: 0, longTasks: 0, lazy: 0, prevented: 0, yMin: Infinity, yMax: -Infinity };
+    var barinfo = document.getElementById("barinfo");
+    window.addEventListener("scroll", function () {
+        stats.scroll++;
+        var y = window.scrollY;
+        stats.yMin = Math.min(stats.yMin, y);
+        stats.yMax = Math.max(stats.yMax, y);
+        if (para)
+            para.style.transform = "translateY(" + (y * 0.5) + "px)";
+    }, { passive: true });
+    document.getElementById("wheel").addEventListener("wheel", function (e) {
+        if (prevent) {
+            e.preventDefault();
+            stats.prevented++;
+        }
+    }, { passive: false });
+    var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+            if (!e.isIntersecting || e.target.dataset.loaded)
+                return;
+            e.target.dataset.loaded = 1;
+            var i = +e.target.dataset.i;
+            e.target.textContent = "loaded " + i;
+            e.target.style.background = "linear-gradient(90deg,hsl(" + hue(i) + ",65%,50%),hsl(" + ((hue(i) + 90) % 360) + ",65%,35%))";
+            e.target.style.color = "#fff";
+            stats.lazy++;
+        });
+    }, { rootMargin: "200px" });
+    document.querySelectorAll(".lazy").forEach(function (el) { io.observe(el); });
+
+    function frame() {
+        stats.raf++;
+        barinfo.textContent = "scrollY " + Math.round(window.scrollY);
+        if (busy) {
+            var end = performance.now() + busy;
+            while (performance.now() < end) { }
+        }
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    if (spike) {
+        setInterval(function () {
+            stats.longTasks++;
+            var end = performance.now() + spike;
+            while (performance.now() < end) { }
+        }, every);
+    }
+    var t0 = performance.now();
+    setInterval(function () {
+        if (stats.scroll || stats.lazy || stats.prevented)
+            console.log("SJ " + ((performance.now() - t0) / 1000).toFixed(1) + " s: scroll events " + stats.scroll + ", rAF " + stats.raf
+                + ", scrollY " + (stats.scroll ? Math.round(stats.yMin) + ".." + Math.round(stats.yMax) : Math.round(window.scrollY))
+                + ", long tasks " + stats.longTasks + ", lazy loaded " + stats.lazy + ", prevented " + stats.prevented);
+        stats.scroll = stats.raf = stats.longTasks = stats.lazy = stats.prevented = 0;
+        stats.yMin = Infinity;
+        stats.yMax = -Infinity;
+    }, 1000);
+    console.log("SJ start: busy " + busy + " ms, spike " + spike + "/" + every + " ms, layers " + layers + ", posts " + posts
+        + (parallax ? ", parallax" : "") + (prevent ? ", prevent" : "") + "; height " + document.documentElement.scrollHeight);
+})();
+</script>
+</body></html>

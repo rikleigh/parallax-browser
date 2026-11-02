@@ -1663,3 +1663,123 @@ Total about 3-4 weeks of work at the plan's usual pace.
 6. Scroll-linked JS lag and clamp-vs-checkerboard feel: product calls for
    the owner on the TV, both switchable.
 7. Coverage memory under the GL cap (bounded, dropped over 128 MB).
+
+### Async scrolling: results (2026-11-02)
+
+Built as designed, with AS1-AS3 in one step (src-wc 8b7e3617ac): the
+title's tree handled wheel events from the first working build, so there is
+no separate "positions only" stage. Everything is behind
+`/data/ps5webkit/wc-async-scroll` (read for each new WebProcess: Restart page
+applies it). Without the flag the title sets threaded scrolling off as
+before, no scrolling coordinator is made, and the only differences are two
+fields in UpdateWC that nothing reads unless `/data/ps5webkit/wc-scroll-log`
+is there.
+
+**What runs where**
+- WebProcess (`WebProcess/WebPage/wc/WCScrollingCoordinator.{h,cpp}`): a
+  non-threaded AsyncScrollingCoordinator, made by WebChromeClient for
+  DrawingAreaWC pages when threaded scrolling is on. Its state tree commit
+  goes with each main frame UpdateWC as a
+  `RemoteScrollingCoordinatorTransaction` (that file and its
+  `.serialization.in` are now built for WC; `ScrollbarHoverState`'s GLib
+  fields are `[NotSerialized]`). It applies title scroll updates as
+  RemoteScrollingCoordinator does, including the request/response ordering for
+  programmatic scrolls. Its own `setScrollPinningBehavior` is a no-op
+  (AsyncScrollingCoordinator's version needs a local tree; the first build
+  crashed there at page creation).
+- Title (`UIProcess/wpe/ps5/PS5WCScrollingTree.{h,cpp}`): WebCore's
+  ScrollingTree with WC nodes (frame, overflow, fixed, sticky, positioned,
+  overflow proxy) that write layer positions and bounds origins into a
+  table. Each frame the render thread services scroll animations at the
+  frame's display time, runs `applyLayerPositions` (the tree only marks
+  positions dirty on a scroll), and sets the table on the WCScene
+  (`WCScene::setScrollingLayerPosition`, re-applied after every update that
+  resets them). The first measured build skipped `applyLayerPositions`, so the
+  root's scroll position moved but no layer did, and its numbers were thrown
+  away. Commits are applied in `applyPending`, so the VR loop applies them too.
+- Wheel routing (`DrawingAreaProxyWCPS5::handleWheelEvent`, from
+  `WebPageProxy::handleWheelEvent`):
+  - handled in the title unless the point is over a sub-scroller (overflow or
+    iframe container rects, computed on the render thread after each paint),
+    the root has synchronous scrolling reasons, or the event tracking region
+    says a blocking listener is there;
+  - those cases go to the WebProcess first (`WebPage::HandleWheelEvent`, not
+    the EventDispatcher), and its default handling names the node, which the
+    title's tree then scrolls (`handleWheelEventAfterDefaultHandling`);
+  - title-handled events complete at once for the coalescer, and go to the
+    page's passive listeners as non-blocking DOM events (one in flight,
+    newest kept).
+  - With WHEEL_EVENT_REGIONS on (GLib), blocking listeners live in per-layer
+    event regions that WC doesn't send, so PS5 adds the bounds of nodes with
+    non-passive wheel listeners to the frame's synchronous region
+    (`Document::ps5AbsoluteRegionForNonPassiveWheelEventTargets`). Root
+    listeners stay passive by default.
+- Painted edge (AS3): the WebProcess gets the title's root scroll velocity
+  with each `ScrollUpdatesWC` and makes tiles ahead in that direction
+  (velocity x 0.35 s, at most two visible heights,
+  `PS5WK_WC_LOOKAHEAD_MS`). Each update reports how far the frame's tiles
+  reach above and below the viewport, and the title clamps a wheel event's
+  delta so it never scrolls past that (`checkerboard=<px>` in the flag
+  file lets it go that much further). Reduced coverage (GL cap) means 0:
+  scrolling then waits for the WebProcess, as before.
+
+**Measured** (log-only PPSA99020, build 20261102-032153-edfee43cea, same
+binary for both modes, flag on/off; `test/paint/scrolljank.html`
+uploaded to the console; `pad-scroll-test` = the stick as wheel events every
+8 ms, 4 s down / 4 s up / 1 s still. The fast row uses ry 1.0: 35 px per
+event, 4375 px/s. "Moving frames/s" = presented frames that moved the page,
+in seconds with at least 20 pad events. "pad -> present" = oldest pad event
+not yet shown until the swap of the first frame that moved the page: avg of
+per-second averages / worst per-second p95 / max. `title-ascroll-summary.py`):
+
+| scrolljank page | mode | moving frames/s | pad -> present ms | WebProcess updates/s | lead over the WebProcess, max | clamped |
+| --- | --- | --- | --- | --- | --- | --- |
+| idle main thread | off | 58.4 | 13.3 / 17.4 / 24.1 | 60.0 | | |
+| | async | 59.4 | 12.8 / 17.3 / 30.4 | 60.0 | 54 px | 0 |
+| `?busy=30` (30 ms busy-wait per rAF) | off | 25.6 | 31.9 / 40.2 / 44.8 | 28.2 | | |
+| | async | **54.3** | **13.8 / 32.8 / 36.2** | 18.7 | 216 px | 0 |
+| `?busy=8&spike=200&every=700` | off | 38.3 | 20.9 / 211 / 222 | 44.6 | | |
+| | async | **49.6** | **13.7 / 33.0 / 104** | 24.9 | 540 px | 0 |
+| `?busy=30&spike=250&every=1000`, ry 1.0 | off | 18.2 | 45.9 / 332 / 332 | 20.6 | | |
+| | async | **47.6** | **13.7 / 94.1 / 248** | 14.0 | 1505 px | 62 events (2117 px) |
+
+- Presents ran at 60/s through the scrolling seconds with async on (54/s in
+  5 s windows that include the still second). Title scene paint stayed at
+  2.3-2.6 ms on this page (89 layers).
+- The WebProcess's own update rate drops with async on (busy=30: 28 to 19/s).
+  It now also applies title scroll positions, and the page has a wheel
+  listener, so every title-handled event is also dispatched to the DOM (a
+  hit test each). The page still moves at display rate. Worth checking
+  whether one DOM wheel event per frame would do.
+- In the fast row the lead reached 1505 px (velocity-extended coverage), and
+  62 events were shortened at the painted edge: the page stopped briefly at
+  the edge of painted tiles instead of showing unpainted area.
+- Sticky and fixed: 6 of 6 mid-scroll captures (`?busy=30`, ry 0.5) have the
+  sticky header (rows 0-31 red, 32-33 border) and the fixed bar (rows 516-539)
+  exactly where they are at rest; section headings and lazily loaded
+  images in place.
+- `?prevent` (a non-passive listener that calls preventDefault, spanning the
+  column at the scroll point): once it reached the scroll point, 1484 events
+  went to the WebProcess first, 1459 were prevented, and the page stayed
+  put. Before that, 303 events scrolled in the title.
+- Sub-scrollers at the scroll point (`?inline`, earlier runs): the events go
+  to the WebProcess, the overflow box scrolls, and the page around it
+  doesn't (same as without the flag).
+- Without the flag on the same binary: WC runs match the AS0 baseline. With
+  the compositing flag absent the CPU path paints on 4 threads and scrolls
+  as before (`[render] painting on 4 threads`, 24 scroll events/s at busy=30).
+
+**Not done yet / next:**
+- VR: the VR loop applies commits (`applyPending`) and never paints. No
+  enter/leave cycle has been run with the flag on (`vr-sim` +
+  `vr-guesstest`).
+- Overflow boxes and iframes scroll async only after the WebProcess's
+  answer (AS4: title hit test plus their nodes, which already exist in the
+  title's tree).
+- Frame-locked stick (AS5): pad ticks at 125 Hz over 60 Hz frames still
+  give 2 or 3 ticks per frame.
+- Scene paint culling for many-layer pages (AS6).
+- Real-site checks on the TV (a heavy feed, the MDN sticky header).
+- Measurement caveats: the numbers are from the synthetic page only. A
+  console session by another agent overlapped some earlier runs (series
+  screenshots every 250 ms), and those runs were discarded.
