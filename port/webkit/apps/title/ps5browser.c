@@ -1692,6 +1692,16 @@ int main(int argc, char** argv)
         "enable-write-console-messages-to-stdout", TRUE,
         "user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         NULL);
+    /* screen.orientation: Safari on the Mac has it (WebKit turns it on for
+     * Apple ports only) and pages that see the Safari user agent call
+     * screen.orientation.addEventListener without checking; the throw stopped
+     * their scripts before videos and animations started. */
+    WebKitFeatureList* features = webkit_settings_get_all_features();
+    WebKitFeature* orientation = webkit_feature_list_find(features, "ScreenOrientationAPI");
+    if (orientation)
+        webkit_settings_set_feature_enabled(settings, orientation, TRUE);
+    spike_log("settings: Screen Orientation API %s", orientation ? "on" : "not found");
+    webkit_feature_list_unref(features);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
     networkSession = session;
     /* Without this WPE keeps cookies in memory only: every site logged out
