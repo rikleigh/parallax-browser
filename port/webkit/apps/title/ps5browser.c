@@ -268,6 +268,43 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
     }
 }
 
+/* Performance overlay (port/webkit/OVERLAY.md): Settings' "Performance
+ * overlay" is the flag file, which the renderer reads at start; a change in
+ * Settings applies at once, and the pad's L3 + R3 updates the file. */
+#define PERF_OVERLAY_FLAG "/data/ps5webkit/perf-overlay"
+
+static gboolean perfOverlayFlag(void)
+{
+    int fd = open(PERF_OVERLAY_FLAG, O_RDONLY); /* not access(): see settings.c */
+    if (fd < 0)
+        return FALSE;
+    close(fd);
+    return TRUE;
+}
+
+static void applyPerfOverlaySetting(void)
+{
+    gboolean on = perfOverlayFlag();
+    if (on != wpe_display_ps5_get_perf_overlay(WPE_DISPLAY_PS5(display))) {
+        spike_log("settings: performance overlay %s", on ? "on" : "off");
+        wpe_display_ps5_set_perf_overlay(WPE_DISPLAY_PS5(display), on);
+    }
+}
+
+static void onPerfOverlayToggled(WPEDisplayPS5* d, gboolean enabled, gpointer data)
+{
+    (void)d;
+    (void)data;
+    if (enabled && !perfOverlayFlag()) { /* an existing file keeps its options */
+        int fd = open(PERF_OVERLAY_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) {
+            (void)!write(fd, "1\n", 2);
+            close(fd);
+        }
+    } else if (!enabled)
+        unlink(PERF_OVERLAY_FLAG);
+}
+
 /* Debug screen readback: /data/ps5webkit/debug-screenshot (a file, any
  * content) or PS5WK_SCREENSHOT=1. Frames go to /data/ps5webkit/shots as PPM
  * (port/webkit/test/fetch-shots.sh fetches and converts them). */
@@ -1229,6 +1266,7 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         gboolean ok = ps5wk_settings_update(body, json, &message, &changed);
         spike_log("settings from %s: %s (%.300s)", from, message, body);
         ps5wk_adblock_setting_changed(); /* applies at once (no restart) */
+        applyPerfOverlaySetting();
         if (ok || changed) {
             char* state = settingsState(message);
             pushReplyCORS(client, ok ? 200 : 503, "application/json", state, FALSE);
@@ -1779,6 +1817,7 @@ int main(int argc, char** argv)
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
     ps5wk_vr_init(display, webView);
     ps5wk_adblock_init(webView);
+    wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 
     memLog("web view created");
     g_timeout_add_seconds(60, memTimer, NULL);

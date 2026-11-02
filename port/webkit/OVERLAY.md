@@ -9,6 +9,10 @@ shows its notice; the overlay comes back with the TV.
 
 ## Turning it on
 
+- Settings (R3) > Browser > **Performance overlay** (default off): applies
+  at once, remembered across starts. It is the flag file below
+  (`settings.c`, `ps5browser.c` applies a change live and keeps the file in
+  step with the pad shortcut).
 - `/data/ps5webkit/perf-overlay` (a file) turns it on at start. Its words
   are options: `pos=tl|tr|bl|br` (corner, default `tr`), `size=<px>` (font
   size at 1080p, default 22), `graph=0` (no frame-time graph).

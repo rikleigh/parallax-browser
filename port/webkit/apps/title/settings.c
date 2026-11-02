@@ -50,7 +50,9 @@ typedef struct {
  * 0032 (painting, scrolling), 0031 (decommit), 0017 (hole punch), 0016
  * (VP9), titlevdec.c (no-hwdec), DrawingAreaProxyWCPS5.cpp in WebKit
  * (compositing, WC builds only), adblock.c (adblock: applied at once,
- * ps5browser.c calls ps5wk_adblock_setting_changed), ps5browser.c (the rest). */
+ * ps5browser.c calls ps5wk_adblock_setting_changed), wpe-ps5/PS5Renderer.cpp
+ * (perf-overlay, read at start; ps5browser.c applies changes at once and
+ * keeps the file in step with the pad's L3 + R3), ps5browser.c (the rest). */
 static const Setting settings[] = {
     { "jit", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
         "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes.",
@@ -82,6 +84,9 @@ static const Setting settings[] = {
         NULL, 0, 0 },
     { "adblock", KIND_FLAG, TYPE_BOOL, "adblock-off", "1", 0, "Ad blocking",
         "Blocks ads and trackers with uBlock Origin Lite's network rules. Applies at once; sites where ads are allowed, and the lists, are below.",
+        NULL, 0, 0 },
+    { "perf_overlay", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
+        "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",
         NULL, 0, 0 },
     { "home_url", KIND_FILE, TYPE_TEXT, "home-url.txt", "", 0, "Home page",
         "Opens when the browser starts. Empty: the built-in start page.", NULL, 0, 0 },
@@ -284,7 +289,7 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append(out, ",\"inUse\":");
         appendJSONString(out, s->scope && applied[i] ? applied[i] : value);
         g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\",\"key\":", scopeName(s->scope),
-            waiting ? "true" : "false", s->kind == KIND_ENV || s->kind == KIND_FLAG_ON ? "page" : "browser");
+            waiting ? "true" : "false", s->kind == KIND_ENV || (s->kind == KIND_FLAG_ON && s->scope == PS5WK_SETTINGS_PAGE) ? "page" : "browser");
         appendJSONString(out, s->name);
         g_string_append(out, ",\"label\":");
         appendJSONString(out, s->label);
