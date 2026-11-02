@@ -1933,7 +1933,7 @@ noted; "step sd" = standard deviation of the root's per-frame scroll step, ry
 | | async, earlyreply=0 | 56.6 | 13.4 / 32.6 / 34.1 | 13.8 px | 18.7 |
 | | async (early replies) | 57.8 | 12.1 / 17.2 / 32.6 | 5.9 px | 22.6 |
 | | async + stickframe=1 | **59.7** | **12.0 / 17.3 / 19.5** | **3.7 px** | 22.6 |
-| idle main thread (build 033…, no early replies) | async | 59.5 | 13.0 / 17.2 / 25.1 | 7.0 px | 60.0 |
+| idle main thread (build 20261102-033639, no early replies) | async | 59.5 | 13.0 / 17.2 / 25.1 | 7.0 px | 60.0 |
 | | async + stickframe=1 | 59.6 | 12.6 / 17.1 / 27.0 | 2.0 px | 60.0 |
 | `?busy=8&spike=200&every=700` | async + stickframe=1 | 53.8 | 12.9 / 17.2 / 179 | 5.6 px | 42.9 |
 
@@ -1956,7 +1956,7 @@ video`, 57.6 headset frames/s, the WebProcess kept updating at 56.8/s
 sequence didn't finish within the 60 s dwell in either run (no FAIL line;
 same as before this work).
 
-**AS4 check** (`?inline&busy=30`, the overflow box spans the column under
+**AS4 check** (build 20261102-034351, `?inline&busy=30`, the overflow box spans the column under
 the scroll point, `overflow=1`): 2833 of 2833 wheel events handled in the
 title (against 350 sent to the WebProcess without the token). Captures show
 the box scrolled (rows 4-11) with its sticky inner header in place and the
