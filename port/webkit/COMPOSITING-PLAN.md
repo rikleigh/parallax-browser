@@ -1325,3 +1325,341 @@ late):
   profiler's file was written as usual.
 - Ordinary browsing (Wikipedia, Hacker News, GitHub, BBC News, each
   scrolled down and up by `scroll.js`): no watchdog lines besides "on".
+
+## Async scrolling: design (2026-11-02)
+
+Written from a source read only (no console, no build). Goal: on pages
+whose WebProcess main thread is busy (last TV log: rendering updates 3-16 ms
+avg, p95 41-49 ms, spikes 100-250 ms; 10-30 scroll steps/s while the title
+could present 60), the pad scrolls at display rate and the WebProcess catches
+up later, with tiles painted ahead through the coverage margin.
+
+### Where scrolling is today (WC)
+
+- **No scrolling coordinator at all.** `Page::scrollingCoordinator()` needs
+  `scrollingCoordinatorEnabled`, which `WebPage.cpp:1024-1027` sets only
+  if `threadedScrollingEnabled` and `DrawingArea::supportsAsyncScrolling()`
+  (false by default, `DrawingArea.h:125`; DrawingAreaWC doesn't override it);
+  `DrawingAreaProxyWCPS5::configurePreferencesForNewPage` and
+  `WebPreferencesWPE.cpp:54` force threaded scrolling off. Upstream WC
+  (Windows; PlayStation's async scrolling is its coordinated
+  `LayerTreeHostPlayStation`, not WC) has none either.
+- Scrolling is ScrollView on the WebProcess main thread. The root moves via
+  `RenderLayerCompositor::updateScrollLayerPosition` (scrolled contents
+  layer position = -scroll position), overflow scrollers via the scroll
+  container's bounds origin (`RenderLayerBacking::updateScrollOffset`);
+  sticky/fixed layers are moved by M2/M3's per-step layer position update.
+- Input: `padTick` (`WPEDisplayPS5.cpp`, title main thread, every 8 ms)
+  turns the right stick into precise wheel events (14 px x deflection, x2.5
+  in WebKit: 35 px per tick = 4375 px/s at full deflection, 875 px/s at ry
+  0.2). `WebPageProxy::handleWheelEvent` sends them to the EventDispatcher
+  (`shouldSendWheelEventsToEventDispatcher`), which has no scrolling tree and
+  hops to the main thread; the reply comes from there, and
+  `WheelEventCoalescer` merges everything that arrives meanwhile into the next
+  event. On a busy main thread that is the 10-30 large steps/s. The D-pad is
+  arrow keys (KeyboardScrollingAnimator, main thread).
+- Build (`build-wc`): `ENABLE_ASYNC_SCROLLING=ON`, `ENABLE_SMOOTH_SCROLLING=ON`,
+  `ENABLE_SCROLLING_THREAD` on (GLib + coordinated graphics,
+  `PlatformEnableGlib.h:66`). `ScrollingCoordinatorCoordinated` and
+  `ThreadedScrollingTree` are compiled but unused. `UI_SIDE_COMPOSITING` is
+  Cocoa only, and the ScrollingStateTree serializers
+  (`Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.serialization.in`
+  + `.cpp`) are built only for Cocoa (`DerivedSources.make:907`,
+  `SourcesCocoa.txt:255`), although the .in file is plain C++ types.
+- Passive by default: wheel listeners on window/document/html/body are
+  passive (`Quirks::shouldMakeEventListenerPassive`,
+  `passiveWheelListenersAsDefaultOnDocument`), so most pages only block
+  scrolling in regions with element-level non-passive listeners.
+
+### Options
+
+**(a) WebProcess scrolling thread** (`ScrollingCoordinatorCoordinated` +
+`ThreadedScrollingTree`, wheel events already reach the EventDispatcher
+thread). Not usable as is: every node class targets `CoordinatedPlatformLayer`
+(`ScrollingStateNodeCoordinated.cpp` downcasts each GraphicsLayer to
+GraphicsLayerCoordinated: a crash with GraphicsLayerWC), and the tree assumes
+a compositor in the same process. For WC it needs WC node classes writing
+thread-safe per-layer scroll positions, plus a second WebProcess -> title
+update stream ("positions only", from the scrolling thread) next to
+DrawingAreaWC's one-update-in-flight pipeline, with reconciliation when a
+main-thread update carries older positions, and a display-refresh source on
+the scrolling thread for scroll animations. Latency: pad -> title main ->
+IPC -> EventDispatcher -> scrolling thread -> IPC -> title main -> render
+thread. The scrolling thread also competes with the main thread and the 4
+tile threads for the WebProcess's cores.
+
+**(b) UI-side scrolling tree in the title** (Cocoa's RemoteScrollingCoordinator
+/ RemoteScrollingTree model, which exists because the compositor lives in the
+UI process, as ours does). The WebProcess keeps a non-threaded
+`AsyncScrollingCoordinator` that builds the ScrollingStateTree (frame,
+overflow, fixed, sticky, positioned and overflow-proxy nodes with
+constraints, scroll limits, layout viewport, event tracking regions,
+synchronous scrolling reasons, snap offsets, requested and keyboard scrolls)
+and sends its commit with each UpdateWC; layers are named by
+PlatformLayerIdentifier, which WC already uses. The title holds a WebCore
+`ScrollingTree` per scene: wheel events are handled in the title,
+WebCore's generic node code computes the scrolled contents position, overflow
+bounds origins and sticky/fixed positions, the render thread applies them to
+the WCScene's layers just before painting, and the title tells the
+WebProcess where it scrolled (`ScrollUpdate`, applied with
+`AsyncScrollingCoordinator::applyScrollUpdate`, which moves the frame view,
+fires scroll events and runs IntersectionObserver at its next rendering update).
+
+**(c) Main-frame offset only in the title** (scroll layer id, position and
+limits sent with UpdateWC, fixed layers counter-moved). Cheapest first step,
+but sticky constraints are only computed when a scrolling coordinator exists
+(`RenderLayerCompositor` builds them for scrolling nodes), and programmatic
+scroll reconciliation, wheel regions and later overflow scrollers would be
+reinvented outside WebKit's tested code.
+
+**Recommendation: (b), staged so its first async step is (c)'s scope (main
+frame only) built on the full tree.** Reasons:
+- Latency: zero IPC on the scroll path. A pad tick changes the tree on the
+  title main thread (microseconds, under the tree lock) and the next render
+  thread frame shows it: the same latency as the drawn pointer.
+- The title owns both the pad and the vsync. Only here can the stick be
+  integrated per frame at the frame's display time (125 Hz pad ticks over
+  60 Hz frames give 2 or 3 ticks per frame: steps of 70/105 px at full
+  deflection, visible judder even at 60 fps), and only here does the scroll
+  position at present time meet what tiles the scene has (clamp at the painted
+  edge, below).
+- Reuse: WebCore's ScrollingTree, its node bases (`ScrollingTreeStickyNode::computeConstrainingRectAndAnchorLayerPosition`,
+  `ScrollingTreeFixedNode`, latching, `ScrollingEffectsController` for
+  snapping, keyboard and smooth programmatic scrolls), the state tree and its
+  generated serializers. New code is the WC glue: a WebProcess coordinator
+  (~300 lines after `RemoteScrollingCoordinator.mm`), title tree + 6 node
+  classes + delegate (~1000, after the Coordinated ones, which are 2.3k
+  lines incl. scrollbars), host/scene hooks (~300).
+- The WC pipeline stays as it is: one update in flight, reply after the
+  swap, rAF paced by presents. Scroll frames are title-only frames like M3's
+  animation frames and M4's video frames.
+- VR keeps working without change: the VR loop runs `applyPending` (scroll
+  commits are applied there) and `didPresent`, never paints, and the pad is
+  captured by VR (no scroll input); positions are applied at the next TV paint.
+
+### Design (b)
+
+**WebProcess** (`WebProcess/WebPage/wc/WCScrollingCoordinator.{h,cpp}`, new):
+- `AsyncScrollingCoordinator` subclass, made by
+  `WebChromeClient::createScrollingCoordinator` when the page's drawing area
+  is DrawingAreaWC (run-time choice; `ScrollingCoordinatorCoordinated`
+  otherwise). `coordinatesScrollingForFrameView` true for composited frames;
+  `scheduleTreeStateCommit` -> `DrawingAreaWC::triggerRenderingUpdate`.
+- On by preference: the title sets `threadedScrollingEnabled` for WC pages
+  when the flag is on (`configurePreferencesForNewPage`), and
+  `DrawingAreaWC::supportsAsyncScrolling()` returns true. `registerScrollingTree`
+  stays a no-op (no EventDispatcher tree).
+- `DrawingAreaWC::sendUpdateAC`: after the layer flush,
+  `commitTreeStateForRootFrameID(frame, LayerRepresentation::PlatformLayerIDRepresentation)`
+  goes into the UpdateWC message as an optional transaction (reusing
+  `RemoteScrollingCoordinatorTransaction`: guard
+  `ENABLE(UI_SIDE_COMPOSITING) || USE(GRAPHICS_LAYER_WC)`, the .cpp and the
+  .serialization.in added to the WPE WC build). With it: the coverage rect
+  of the frame's tiled contents layer (document coordinates; M5 sends an
+  update only when all its tiles are painted, so coverage = painted).
+- New message `DrawingArea::ScrollUpdatesWC(Vector<ScrollUpdate>) -> ()`:
+  applies the newest update per node (`applyScrollUpdate(..., ScrollType::User)`,
+  `ScrollingLayerPositionAction::Sync`: `GraphicsLayerWC::syncPosition`/
+  `syncBoundsOrigin` keep the WebProcess's layer tree current without
+  fighting the title), replies at once. Requested (programmatic) scrolls and
+  their responses follow `RemoteScrollingCoordinator::scrollUpdateForNode`.
+- Coverage ahead (AS3): GraphicsLayerWC gets the scroll velocity from the
+  updates (px/s, smoothed) and extends the margin in the scroll direction,
+  below.
+
+**Title** (`UIProcess/wpe/ps5/`):
+- `PS5WCScrollingTree` (ScrollingTree subclass, one per scene, owned by
+  DrawingAreaProxyWCPS5, shared with SceneHost) and node classes
+  `ScrollingTree{FrameScrolling,OverflowScrolling,Fixed,Sticky,Positioned,OverflowScrollProxy}NodeWC`
+  that keep layer ids (`layer()` returns null) and write their results into
+  a `ScrollingLayerPositions` table (layer id -> position or bounds origin,
+  in GraphicsLayer's top-left convention, alignment offset subtracted as
+  `ScrollingTreeStickyNodeCoordinated::applyLayerPositions` does).
+- Threads: wheel events on the title main thread; commits, animation ticks
+  (`serviceScrollAnimations(displayTime)`) and `applyLayerPositions` on the
+  render thread; all under the tree's own lock, never while holding
+  SceneHost's queue lock. Commits are applied in `applyPending` right after
+  the WCUpdateInfo of the same message, so they run in VR too.
+- `WebPageProxy::handleWheelEvent`: PS5 WC branch (as `PLATFORM(MAC)`'s
+  scrolling-coordinator branch) -> `DrawingAreaProxyWCPS5::handleWheelEvent`:
+  `determineWheelEventProcessing` (event tracking regions, synchronous
+  reasons) + latching + `handleWheelEvent` on the tree, then
+  `continueWheelEventHandling(result)`: handled in the title and nothing
+  blocking -> completed at once (the coalescer never waits for the
+  WebProcess), DOM `wheel` listeners still get it as NonBlockingDOMEventDispatch
+  via `WebPage::HandleWheelEvent` (`shouldSendWheelEventsToEventDispatcher`
+  false while the tree is on); in a blocking region or with synchronous
+  reasons -> SynchronousScrolling + BlockingDOMEventDispatch to the WebProcess as
+  today (a preventDefault blocks it; the main-thread scroll comes back as a
+  state tree position).
+- Hit testing (which node scrolls at the point; pointer or centre):
+  root node until AS4; then a WCScene helper walking layer geometry
+  (positions, transforms, masksToBounds clips) for scroll container layers.
+  Event regions aren't sent in WC; a pointer-events:none overlay over a
+  scroller can pick the wrong node (accepted, measured).
+- SceneHost::paint: tick animations, apply layer positions
+  (`WCScene::setScrollingLayerPositions`, re-applied after every `apply()` so
+  the title's positions win over a WebProcess update carrying older ones),
+  mark the scene dirty when anything moved. `didPresent` posts the presented
+  positions to the main thread, which sends `ScrollUpdatesWC` with at most one
+  message in flight (the next goes when the WebProcess acks: a stalled main
+  thread gets one coalesced update, not 15).
+- Pacing: the "frame without an update waits for the expected one" rule
+  (TV test 2) waits until 6 ms before the frame is due; while the title is
+  scrolling it waits only until `displayUS - max(6 ms, smoothed scene paint + 2 ms)`
+  so a heavy scene doesn't miss the vsync waiting for a late WebProcess.
+- Lifetime: the tree goes with its scene (crash, page restart, GL-cap
+  fallback); a new drawing area starts with a full commit.
+
+**Behaviour that must stay right:**
+- Sticky/fixed: positions come from WebCore's constraint math every frame
+  in the title, so MDN-style sticky headers are exact during async scroll
+  (no "one step behind"). M3's PS5 sticky compositing and b235085eb2's
+  scroll order are for main-thread scrolling only; with a coordinator the
+  upstream paths (`isAsyncScrollableStickyLayer`, `hasCoordinatedScrolling`)
+  apply, and the PS5 changes in `RenderLayerCompositor.cpp` /
+  `LocalFrameView.cpp` must step aside then (check each).
+- Overflow scrollers: main-thread (sent to the WebProcess) until AS4, then async with
+  latching and scroll chaining from the tree.
+- Scroll-linked JS: scroll events and IntersectionObserver run when the
+  WebProcess applies the position, as in every async-scrolling browser.
+  JS-positioned effects (parallax, hide-on-scroll headers) lag while the main
+  thread is behind; CSS sticky/fixed don't. Lazy images load when it catches
+  up. No per-site handling; the flag turns it all off.
+- preventDefault: blocking regions go synchronous (above). Root listeners are
+  passive by default, so a page-wide blocking region needs an element-level
+  non-passive listener.
+- Keyboard (D-pad) and smooth programmatic scrolls: the key still goes to the
+  main thread first (it may be prevented); the animation then runs in the
+  title (`RequestedKeyboardScrollData`, `RequestedScrollData` animated),
+  ticked per frame on the render thread.
+- Snapping: snap offsets are in the state tree; ScrollingEffectsController's
+  discrete-snap timer runs on the title main RunLoop.
+- Synchronous reasons (e.g. `background-attachment: fixed`, non-composited
+  viewport-constrained objects): that frame scrolls on the main thread as
+  today.
+- Scrollbars: the WebProcess still paints the thumb (M1's generic
+  controller), so it lags the content while the main thread is behind. A
+  title-drawn thumb for the main frame is an option later.
+- GL cap: ReduceCoverage (no margin) leaves nothing painted ahead, so the
+  clamp below holds async scroll at the visible rect: correct, WebProcess-paced.
+
+### Coverage and outrunning the tiles
+
+Today: margin max(512, half the visible height) = 540 px above and below
+at 1080p, tiles aligned to 512, kept one more row: 540-1051 px painted
+ahead. Time until a still WebProcess is outrun:
+
+| stick | px/s | painted ahead lasts | 250 ms stall overruns by |
+| --- | --- | --- | --- |
+| ry 0.2 | 875 | >= 0.62 s | 0 |
+| ry 0.5 | 2190 | >= 0.25 s | up to 7 px |
+| ry 0.8 | 3500 | >= 0.15 s | up to 335 px |
+| full | 4375 | >= 0.12 s | up to 554 px |
+
+- **Velocity-aware margin (AS3):** ahead = clamp(v x 0.35 s, 540, 2 x view
+  height) in the scroll direction, behind = one tile row while v > 1000 px/s;
+  0.35 s covers the TV log's p95 plus a 250 ms stall plus one async tile
+  batch. Only for the frame's contents layer and tiled layers over 1 Mpx
+  under the scrolled node (not for every card of a feed). After a stall
+  the WebProcess needs one rendering update plus the new rows' tiles
+  (~1 Mpx per 512 px row at 1920 wide, 2-7 ms on the pool) to catch up.
+- **Memory:** a 512 px row of the 1920-wide root is 4 tiles = 4 MB of GL
+  texture. Today ~8 rows (~32 MB); at full speed 512 behind + 1080 + 1530
+  ahead + kept rows ~10 rows (~40 MB), i.e. +8 MB on the root, temporary.
+  Typical pages run 15-55 MB median, the worst seen 137 MB (`wcfeed.html`,
+  mostly texture-pool surfaces) against the 128 MB log / 160 MB cap; the
+  extension is dropped when the 1 s average is over 128 MB.
+- **Outrunning: clamp by default.** The title never scrolls the frame past
+  the painted coverage rect it got with the last applied update (async
+  scroll stops at the edge until the WebProcess catches up: never worse than
+  today, never blank). Option `checkerboard=<px>` in the flag file allows up
+  to that many px past it, drawn in the frame's background colour, for an A/B
+  on the TV. Other layers' missing tiles show their background (rare: each
+  has its own margin). Both counted in the log.
+
+### Milestones
+
+Flag file `/data/ps5webkit/wc-async-scroll` (WC builds, read for each new
+WebProcess like `compositing`, so Restart page applies it; tokens:
+`overflow=0|1 stick=events|frame checkerboard=<px> lookahead=<ms>`).
+Absent = today's behaviour exactly.
+
+| | what | pass (console, log-only unless noted) | effort |
+| --- | --- | --- | --- |
+| AS0 | Baseline instrumentation + test page; no behaviour change. WCUpdateInfo carries the newest wheel event time the rendering update consumed; the title logs pad -> present latency, scroll frames/s, WebProcess updates/s | numbers for `scrolljank.html` (below) at busy 0/30, spikes, ry 0.2/0.5/1.0, and the TV log's heavy feed pages | 1 day |
+| AS1 | WCScrollingCoordinator + transaction with UpdateWC + title tree applying layer positions; all wheel events still go to the WebProcess (synchronous) | captures equal AS0's (`shot-diff.py` 0 %) on `sticky.html`, `layers.html`, `static.html`, docs pages; MDN sticky header 0 rows off mid-scroll (pad-scroll-test); updates/s and main-thread ms not worse; tree dump (node counts by type) per page | 4-6 days (serializer build risk) |
+| AS2 | Async main-frame scrolling in the title: wheel handling in DrawingAreaProxyWCPS5, ScrollUpdatesWC, clamp at the painted edge, overflow and blocking regions to the WebProcess | `scrolljank.html?busy=30`: >= 58 scroll frames/s with the WebProcess at ~25 updates/s; pad -> present p95 <= 35 ms (vs AS0); sticky/fixed 0 rows off in mid-scroll captures; SJ scroll events keep coming; lazy images all load; `?prevent` region doesn't scroll; VR enter/leave cycles (`vr-sim` + `vr-guesstest`) PASS | 4-5 days |
+| AS3 | Velocity-aware coverage, `checkerboard=` option, GL-cap interplay | clamped frames and px per second at ry 0.5/1.0 with 100/250 ms spikes (AS2 vs AS3); GL textures under the cap on `wcfeed.html` while scrolling | 2-3 days |
+| AS4 | Overflow scrollers and iframes async (WCScene hit test, overflow/positioned/proxy nodes, latching, chaining at the limits) | `sticky.html` sidebar and table header, `layers.html` overflow box, scrolljank's scroller: captures equal AS1's, async share of wheel events logged | 3-4 days |
+| AS5 | Frame-locked stick (`stick=frame`): padTick publishes the stick velocity, the render thread advances the latched node by v x (display time - last display time); wheel events still go to DOM listeners, non-blocking. Keyboard/programmatic smooth scrolls ticked per frame | per-frame scroll step stddev ~0 while held (`[frame]` lines get `scroll dy`); D-pad scroll smooth under `?busy=30` once started | 2-3 days |
+| AS6 | Scene paint for scroll frames on many-layer pages (skip off-screen layer subtrees, not only tiles); optional title-drawn main-frame thumb; TV check, then default on | `scrolljank.html?layers=2500`: scene paint <= 8 ms (YouTube-like pages paid ~18 ms per frame for 2772 layers, which caps any title-side scrolling at 30-55 fps) | 2-4 days |
+
+**Log lines** (title, 1 s windows while scrolling, `[ascroll]`): frames
+that moved (title-only / with an update), wheel events async vs sent to
+the WebProcess (blocking region, synchronous reasons, sub-scroller, off),
+lead over the WebProcess (title position - position in its last update:
+max/avg px), clamped frames and px, checkerboard px, pad -> present latency
+avg/p95/max (wheel event time to the swap that first shows it), ScrollUpdates
+sent/acked and the WebProcess's apply delay. WebProcess: `[render] wc scroll:`
+updates applied, coalesced. `title-ascroll-summary.py` (after
+`title-scroll-summary.py`) turns them into the tables above.
+
+**Test page** `test/paint/scrolljank.html` (synthetic content only): 200
+posts of text, CSS-gradient "thumbnails" (each with a distinct stripe, so
+missing tiles show as background in captures), translucent `will-change`
+cards, a sticky page header, sticky section headings, a fixed bottom bar, an
+`overflow: auto` box with its own sticky header, a scroll-snap strip, lazy
+images (IntersectionObserver, `make-images.py` thumbnails), a region with a
+non-passive wheel listener. Knobs: `?busy=<ms>` (busy-wait in every rAF:
+style/JS-heavy main thread), `?spike=<ms>&every=<ms>` (long tasks),
+`?layers=<n>` (tiny composited layers, scene-paint stress), `?parallax`
+(scroll-linked transform, expected to lag), `?prevent` (the region calls
+preventDefault). Logs `SJ` lines: scroll events/s, scrollY per rAF, long
+tasks, image loads, preventDefault count. Driven by `pad-scroll-test`
+(ry 0.2/0.5/1.0, mid-scroll captures; header strip and stripe checks as in
+TV test 2) and `scroll-raf.js`.
+
+### Patches
+
+- WebCore: `rendering/RenderLayerCompositor.cpp` and `page/LocalFrameView.cpp`
+  (PS5 main-thread-scrolling changes only without coordinated scrolling);
+  `platform/graphics/texmap/TextureMapperLayer.{h,cpp}` (combined transform
+  for hit testing and subtree culling, AS4/AS6). ScrollingTree code itself
+  unchanged if possible (a null `layer()` must be safe in the paths we use).
+- WebKit: `Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.{h,cpp}`
+  (guard), `CMakeLists.txt` / `PlatformWPE.cmake` / `Platform/WC.cmake`
+  (serialization + sources), `WebProcess/WebCoreSupport/WebChromeClient.cpp`,
+  `WebProcess/WebPage/wc/{DrawingAreaWC,GraphicsLayerWC}.{h,cpp}`,
+  `WCUpdateInfo.h`/`.serialization.in`, `WebProcess/WebPage/DrawingArea.messages.in`,
+  `UIProcess/DrawingAreaProxy.{h,messages.in}`, `UIProcess/WebPageProxy.cpp`
+  (wheel branch), `GPUProcess/graphics/wc/WCScene.{h,cpp}`,
+  `UIProcess/wpe/ps5/{DrawingAreaProxyWCPS5,PS5WCHost}.cpp`. New:
+  `WebProcess/WebPage/wc/WCScrollingCoordinator.{h,cpp}`,
+  `UIProcess/wpe/ps5/PS5WCScrollingTree.{h,cpp}`, `PS5WCScrollingNodes.{h,cpp}`.
+  About 2-2.5k lines.
+- Outer repo: `wpe-ps5/WPEDisplayPS5.cpp` and `PS5Compositor.h` (AS5 stick
+  velocity to the render thread), test page and summary script; a Settings
+  item once it is the default.
+
+Total about 3-4 weeks of work at the plan's usual pace.
+
+### Risks, in order
+
+1. **WebProcess behaviour once a scrolling coordinator exists:** coordinated
+   scrolling switches paths in LocalFrameView/RenderLayerCompositor (layer
+   positions, scrollbars, event regions on the main thread), next to our M2/M3
+   PS5 changes. AS1 exists to find this with the title still main-thread paced.
+2. **Serializers outside Cocoa:** the generated ScrollingStateTree coders
+   and `RemoteScrollingCoordinatorTransaction.cpp` may pull in Cocoa-only
+   types; fallback is a smaller hand-written WC transaction of the same nodes.
+3. **Scene paint cost** on many-layer pages bounds title-side scrolling,
+   whatever the WebProcess does (AS6).
+4. **Sticky/fixed exactness** (anchor/alignment conventions between
+   GraphicsLayerWC, the constraints and TextureMapperLayer): checked by
+   mid-scroll captures on every milestone.
+5. Threading in the title (tree lock vs SceneHost lock; main thread wheel
+   handling vs render thread commits and ticks).
+6. Scroll-linked JS lag and clamp-vs-checkerboard feel: product calls for
+   the owner on the TV, both switchable.
+7. Coverage memory under the GL cap (bounded, dropped over 128 MB).
