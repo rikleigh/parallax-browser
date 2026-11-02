@@ -1,0 +1,120 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Player teardown stress</title>
+<!-- Hammers GStreamer pipeline teardown the way long autoplaying feeds do:
+     many muted autoplay <video> elements that are created, re-attached
+     (display none -> block followed by a computed-style read, so the style
+     recalc attaches the renderer and RenderVideo::updateFromElement runs
+     WebKit's off-screen suspend: the pipeline goes to NULL from inside the
+     style recalc), moved off and on screen, given a new src and removed,
+     each at a random point of its startup (while the demuxer and decodebin3
+     are still adding pads).
+     Clips from test/media/make-media.sh (feed-*, hls-ts), nothing third-party.
+       tools/serve-media.py --port 8775 --page port/webkit/test/media/teardown-stress.html
+       then http://<mac>:8775/teardown-stress.html
+     Params: ?n=<players, 12> &secs=<run time, 240> &hls=1 (HLS players too)
+             &media=<base URL> &min=<ms, 60> &max=<ms, 900> (time between actions)
+     Console lines (prefix TD):
+       TD t=<s> ops=<n> created=<n> reattach=<n> moves=<n> srcs=<n> removed=<n>
+          playing=<n> maxgap=<ms>        every 2 s
+       TD GAP <ms>                       the page's 100 ms timer was late by > 1 s
+                                         (main thread stalled)
+       TD DONE ...                       totals at the end -->
+<style>
+body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:16px 24px;overflow:hidden}
+#grid{display:flex;flex-wrap:wrap;gap:12px}
+.cell{position:relative;width:240px;height:300px;background:#2d3a52;border-radius:6px;overflow:hidden}
+.cell video{display:block;width:100%;height:100%;object-fit:cover;background:#000}
+.cell.off video{transform:translateY(-4000px)}
+#tick{font:22px monospace;margin:0 0 10px}
+</style></head><body>
+<div id="tick">starting</div>
+<div id="grid"></div>
+<script>
+var params = new URLSearchParams(location.search);
+var base = params.get('media') || (location.protocol === 'file:' ? 'media/' : '');
+var N = +(params.get('n') || 12), SECS = +(params.get('secs') || 240);
+var MIN = +(params.get('min') || 60), MAX = +(params.get('max') || 900);
+var SRCS = ['feed-480x854-h264.mp4', 'feed-854x480-h264.mp4', 'feed-480x854-vp9.webm'];
+if (params.get('hls') === '1') SRCS.push('hls-ts/master.m3u8');
+var t0 = performance.now(), st = { ops: 0, created: 0, reattach: 0, moves: 0, srcs: 0, removed: 0 }, maxGap = 0, lastBeat = t0, done = false;
+function say(s) { console.log('TD ' + s); }
+function rnd(a, b) { return a + Math.random() * (b - a); }
+function pick(a) { return a[Math.floor(Math.random() * a.length)]; }
+
+function newVideo(cell) {
+  var v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.autoplay = true; v.loop = true; v.preload = 'auto';
+  v.src = base + pick(SRCS);
+  v.addEventListener('error', function () { say('ERR ' + v.src + ' ' + (v.error && v.error.code)); });
+  cell.appendChild(v);
+  var p = v.play(); if (p && p.catch) p.catch(function () {});
+  st.created++;
+  return v;
+}
+function dropVideo(v) {
+  try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {}
+  v.remove();
+  st.removed++;
+}
+
+function act(cell) {
+  if (done) return;
+  var v = cell.querySelector('video'), r = Math.random();
+  st.ops++;
+  if (!v) { newVideo(cell); }
+  else if (r < 0.35) {             // re-attach: style recalc from a computed-style read
+    v.style.display = 'none';
+    getComputedStyle(v).width;
+    v.style.display = '';
+    getComputedStyle(v).width;
+    st.reattach++;
+  } else if (r < 0.6) {            // off screen / back on screen (suspend / resume)
+    cell.classList.toggle('off');
+    getComputedStyle(v).transform;
+    st.moves++;
+  } else if (r < 0.8) {            // new src on the same element
+    v.src = base + pick(SRCS);
+    var p = v.play(); if (p && p.catch) p.catch(function () {});
+    st.srcs++;
+  } else {                         // remove, and a new player in its place
+    dropVideo(v);
+    if (Math.random() < 0.7) newVideo(cell);
+  }
+  setTimeout(function () { act(cell); }, rnd(MIN, MAX));
+}
+
+var grid = document.getElementById('grid');
+for (var i = 0; i < N; i++) {
+  var c = document.createElement('div');
+  c.className = 'cell';
+  grid.appendChild(c);
+  newVideo(c);
+  (function (c) { setTimeout(function () { act(c); }, rnd(MIN, MAX)); })(c);
+}
+say('start n=' + N + ' secs=' + SECS + ' srcs=' + SRCS.join(',') + ' ' + navigator.userAgent);
+
+setInterval(function () {
+  var now = performance.now(), gap = now - lastBeat - 100;
+  lastBeat = now;
+  if (gap > maxGap) maxGap = gap;
+  if (gap > 1000) say('GAP ' + Math.round(gap));
+}, 100);
+function line() {
+  var playing = 0;
+  document.querySelectorAll('video').forEach(function (v) { if (!v.paused && v.readyState >= 3) playing++; });
+  return 't=' + ((performance.now() - t0) / 1000).toFixed(0) + ' ops=' + st.ops + ' created=' + st.created + ' reattach=' + st.reattach +
+    ' moves=' + st.moves + ' srcs=' + st.srcs + ' removed=' + st.removed + ' playing=' + playing + ' maxgap=' + Math.round(maxGap);
+}
+var stats = setInterval(function () {
+  var s = line();
+  document.getElementById('tick').textContent = s;
+  say(s);
+  if ((performance.now() - t0) / 1000 >= SECS && !done) {
+    done = true;
+    clearInterval(stats);
+    document.querySelectorAll('video').forEach(dropVideo);
+    say('DONE ' + line());
+  }
+}, 2000);
+</script>
+</body></html>
