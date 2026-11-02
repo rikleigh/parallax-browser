@@ -175,3 +175,76 @@ Pids stepped by exactly 5 per cycle (title, dialog, 2 children, ps).
 - The ad blocker's update in the title crashed with SIGBUS (signal 10 in
   `[adblock-debug]`) four times on 11-02 between 10:32 and 10:41. Each title
   crash is a chance to cut an upload.
+
+## Logging (2026-11-02: the title froze when the network went away)
+
+The PS5 lost its network (no ARP reply, no ping) and the browser's picture
+froze at that moment; the PS button still closed the title. The title's log
+was the cause: `spike_log()` sent each line to `tools/logserver.sh` with a
+blocking `send()`, and stderr (WebKit, GLib, the relayed `[webN]` lines of
+the children) was an `fdopen()` stream on the same socket. With nobody
+acknowledging, the socket's send buffer filled and every thread that logged
+stopped in `send()`: the render thread at its next `[present]` line (every
+5 s while frames go out), the main thread, the relay threads, and behind
+them the children, whose stderr (the elfldr connection) nobody read. Shown
+on the Mac with the old code (`test/logsink/run.sh`, case `direct`): with
+the log server stopped, logging calls took 4-7 s each and no thread logged
+for 10 s.
+
+**Now** (`apps/title/titlelog.c`; spike.h's `spike_log_sink`, title.h's
+`spike_title_log_start_hook`, `ps5wk_log_line_hook` in
+WPEProcessManagerPS5.cpp):
+
+- `spike_log`, the relay and stderr (now a pipe, drained by a `log-stderr`
+  thread) put whole lines into a 512 KB ring under a mutex held for a
+  memcpy. A full ring drops the line and counts it:
+  `[log] N lines dropped: the log queue was full`.
+- A `log-send` thread writes every line to `/data/ps5webkit/ps5browser.log`
+  (now with stderr and the children's lines too; at 32 MB it becomes
+  `ps5browser.log.1` and a new file starts) and to TCP through a 512 KB
+  buffer: non-blocking connect (5 s timeout) and `send(MSG_DONTWAIT)` when
+  poll says there is room. Lines that do not fit are dropped from TCP only
+  and noted once it takes lines again: `[log] N lines dropped over X s: the
+  log server was not taking them (they are in the file log)`. A connection
+  that takes nothing for 30 s is reset (RST, so its leftovers never arrive
+  after the new connection's lines); reconnects back off 0.25 s to 4 s:
+  `[log] connection to the log server ... lost (...)`, `[log] connected to
+  ... again after X s (lost: ...)`.
+- At start: `[log] non-blocking log: TCP host:port (buffer 512 KB, ...)`;
+  the title line says `tcp log to ... queued (non-blocking sender)`.
+- The title's exit (`title_exit.c`, before asking for the SIGKILL) and
+  `abort()` (`titleabort.c`) wait up to 0.5 s / 1 s for the queue to go out.
+- Children: stderr writes wait 0.5 s at most (`SO_SNDTIMEO` on the elfldr
+  connection, 256 KB buffer); the line is then cut or lost. Each child logs
+  `stderr: a write waits 0.5 s at most (buffer 256 KB)`. Untested with a
+  title that stops reading (the relay no longer does).
+- Line order per source and the `[app msg]`, `[webN]` prefixes are as
+  before; the log server and the parsing scripts are unchanged.
+
+**Test knob:** `/data/ps5webkit/log-sink`, one line `[host]:port
+[queue=<KB>] [stall=<s>]`, read at title start: the TCP log goes there
+(e.g. `test/logsink/listener.pl -a 0.0.0.0 -r 8192 9998`, which can be
+stopped with `kill -STOP` without touching `tools/logserver.sh`). Delete it
+after a test; the start line shows it while it is there.
+
+**Results.** Mac (`test/logsink/run.sh`: 5 threads, 2000 lines/s,
+listener stopped 10 s or killed and restarted): slowest logging call 3-7 ms
+(macOS scheduling) against 4-7 s for the old code; the file log complete;
+in the listener's copy every thread in order, each gap right after a drop
+note. Console (animated page plus a `console.log` every 100 ms, listener
+on :9998, 16 KB TCP buffer): stopped for 25 s, 45 s and (with `stall=10`)
+45 s, then killed for 10 s and restarted. The file log's `[present]` lines
+show 300 frames (59.9/s) in every 5 s window through all of it (30 and 17
+windows in the two runs); the listener got `[log] 290 lines dropped over
+20.5 s`, the reset and reconnect notes, and the page's numbered lines with
+one gap, right after the note. A normal `--stop` still delivers `closing
+the title through the launcher (SIGKILL)`.
+
+**What to know:**
+- After a network outage, look in `/data/ps5webkit/ps5browser.log` (FTP)
+  for what the log server missed.
+- A connection reset after 30 s without progress can leave half a line in
+  the log server's copy (the part the old connection had delivered),
+  joined to the first line of the new one.
+- Lines in the kernel's send buffer of a reset connection are lost without
+  a count; the file has them.
