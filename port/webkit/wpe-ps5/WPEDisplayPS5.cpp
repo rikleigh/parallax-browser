@@ -362,13 +362,19 @@ static void openPad(WPEDisplayPS5* display)
 // `secs` s up, `pause` s still, from `delay` s after the first pad tick with
 // a view; `shots` captures per direction
 // (evenly spaced, mid-scroll) to /data/ps5webkit/shots/pad-NNN-down|up.ppm.
-// Content: "delay=15 secs=4 ry=0.5 pause=4 shots=3" (any subset).
+// Content: "delay=15 secs=4 ry=0.5 pause=4 shots=3" (any subset). Also
+// rx=<0-1> (horizontal: "down" scrolls right), px=/py=<0-1> (where the events
+// land, as a fraction of the view; default the centre, as padTick without a
+// pointer), hold=<s> (still between down and up), rest=<s> (one capture
+// that long into each hold and pause, after any snap: pad-NNN-rest.ppm).
 struct PadScrollTest {
     bool on { false };
-    double delay { 15 }, secs { 4 }, ry { 0.5 }, pause { 4 };
+    double delay { 15 }, secs { 4 }, ry { 0.5 }, rx { 0 }, pause { 4 };
+    double px { 0.5 }, py { 0.5 }, rest { 0 }, hold { 0 };
     int shots { 3 };
     double start { 0 };
     int lastShot { -1 };
+    int lastRestShot { -1 };
     unsigned shotCount { 0 };
 };
 static PadScrollTest s_padScrollTest;
@@ -391,13 +397,23 @@ static void padScrollTestInit()
             test.secs = value;
         else if (!strcmp(key, "ry"))
             test.ry = value;
+        else if (!strcmp(key, "rx"))
+            test.rx = value;
+        else if (!strcmp(key, "px"))
+            test.px = value;
+        else if (!strcmp(key, "py"))
+            test.py = value;
+        else if (!strcmp(key, "rest"))
+            test.rest = value;
+        else if (!strcmp(key, "hold"))
+            test.hold = value;
         else if (!strcmp(key, "pause"))
             test.pause = value;
         else if (!strcmp(key, "shots"))
             test.shots = static_cast<int>(value);
     }
-    PS5_LOG("pad-scroll-test: from %.0f s, %.1f s down / up at ry %.2f, %.1f s pause, %d shots per direction",
-        test.delay, test.secs, test.ry, test.pause, test.shots);
+    PS5_LOG("pad-scroll-test: from %.0f s, %.1f s down / up at rx %.2f ry %.2f (at %.2f, %.2f of the view), %.1f s hold, %.1f s pause, %d shots per direction, rest shot %.1f s",
+        test.delay, test.secs, test.rx, test.ry, test.px, test.py, test.hold, test.pause, test.shots, test.rest);
 }
 
 static void padScrollTestTick(WPEDisplayPS5* display)
@@ -409,22 +425,35 @@ static void padScrollTestTick(WPEDisplayPS5* display)
     double t = nowSeconds();
     if (!test.start)
         test.start = t + test.delay;
-    double cycle = 2 * test.secs + test.pause;
+    // down, hold (still), up, pause (still)
+    double cycle = 2 * test.secs + test.hold + test.pause;
     double at = t - test.start;
     if (at < 0 || cycle <= 0)
         return;
     double phase = std::fmod(at, cycle);
-    if (phase >= 2 * test.secs)
+    bool inHold = phase >= test.secs && phase < test.secs + test.hold;
+    bool inPause = phase >= 2 * test.secs + test.hold;
+    if (inHold || inPause) {
+        double still = inHold ? phase - test.secs : phase - 2 * test.secs - test.hold;
+        int restSlot = static_cast<int>(at / cycle) * 2 + (inPause ? 1 : 0);
+        if (test.rest > 0 && still >= test.rest && restSlot != test.lastRestShot) {
+            test.lastRestShot = restSlot;
+            char path[128];
+            snprintf(path, sizeof path, "/data/ps5webkit/shots/pad-%03u-rest.ppm", ++test.shotCount);
+            wpe_display_ps5_capture_screen(display, path);
+        }
         return;
+    }
     bool down = phase < test.secs;
     double ry = down ? test.ry : -test.ry;
+    double rx = down ? test.rx : -test.rx;
     const double speed = 14.0; // as padTick
-    double x = wpe_view_get_width(view) / 2.0, y = wpe_view_get_height(view) / 2.0;
+    double x = wpe_view_get_width(view) * test.px, y = wpe_view_get_height(view) * test.py;
     GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
-        static_cast<WPEModifiers>(0), 0, -ry * speed, TRUE, FALSE, x, y));
+        static_cast<WPEModifiers>(0), -rx * speed, -ry * speed, TRUE, FALSE, x, y));
     wpe_view_event(view, event.get());
     if (test.shots > 0) {
-        double within = down ? phase : phase - test.secs;
+        double within = down ? phase : phase - test.secs - test.hold;
         int k = static_cast<int>(within / (test.secs / (test.shots + 1)));
         int slot = (static_cast<int>(at / cycle) * 2 + (down ? 0 : 1)) * (test.shots + 1) + k;
         if (k >= 1 && k <= test.shots && slot != test.lastShot) {

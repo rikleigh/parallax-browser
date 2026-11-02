@@ -1,0 +1,182 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>carousel test</title>
+<!-- Horizontal scrolling carousels (COMPOSITING-PLAN.md, "Horizontal carousels"):
+     overflow-x scrollers with CSS scroll snapping and "paddle" buttons that
+     scroll them from script, as product and store pages have them. Synthetic
+     content only (CSS gradients, numbers). Upload to the console, e.g.
+     /data/ps5webkit/carousel.html, and open file:///data/ps5webkit/carousel.html
+       ?busy=<ms>      busy-wait this long in every requestAnimationFrame callback
+       &auto=<ms>      press the paddles from script every <ms> (the "center"
+                       and "start" carousels: next x3, prev x3, ...)
+       &top=<px>       space above the first carousel (default: the "center"
+                       carousel sits at the middle of a 1080 px view, where the
+                       pad scrolls when the pointer is hidden)
+     Carousels:
+       center  overflow-x: auto, scroll-snap-type: x mandatory, cards snap-align
+               center; paddles call scrollBy({ left: +-card, behavior: smooth })
+       start   overflow-x: scroll, mandatory, scroll-padding 40 px, snap-align
+               start; paddles call scrollTo({ left: <next card>, smooth })
+       free    overflow-x: auto, no snapping
+     Logs (console.log, the title log):
+       CAR <t> s <name>: left <scrollLeft>, card <i>, off <px> (<state>), scroll events <n>
+         once the carousel has been still for 400 ms after scrolling; off = how
+         far the nearest card is from its snap position (0 = snapped/centered).
+       CAR-PADDLE <name> <next|prev> from <left> (auto presses)
+       CAR-STOP <t> s <name>: left <scrollLeft> once no scroll event came for
+         80 ms (where a stick gesture stopped, before any snap animation)
+     Each carousel has yellow markers above and below at its snap line
+     (centre or start), so captures show whether a card sits on it. -->
+<style>
+html { background: #101820; }
+body { margin: 0; font: 22px/1.4 sans-serif; color: #e6edf5; background: #101820; }
+#hdr { height: 60px; background: #2d6cc8; font: bold 28px/60px sans-serif; padding: 0 24px; }
+section { position: relative; margin: 0 0 40px; }
+section h2 { margin: 0 24px 6px; font-size: 24px; }
+.wrap { position: relative; padding: 14px 0; }
+.sc { display: flex; gap: 24px; padding: 0 40px; }
+.sc > div { flex: 0 0 auto; border-radius: 16px; font: bold 64px/1 sans-serif; display: flex; align-items: center; justify-content: center; color: #fff; text-shadow: 0 2px 4px #000; }
+#center { overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; height: 340px; }
+#center > div { width: 640px; height: 320px; scroll-snap-align: center; }
+#start { overflow-x: scroll; scroll-snap-type: x mandatory; scroll-padding: 0 40px; height: 260px; scrollbar-width: none; }
+#start > div { width: 420px; height: 240px; scroll-snap-align: start; }
+#free { overflow-x: auto; height: 200px; }
+#free > div { width: 300px; height: 180px; }
+.mk { position: absolute; width: 0; height: 0; border-left: 12px solid transparent; border-right: 12px solid transparent; }
+.mk.t { top: 0; border-top: 12px solid #ffd34d; }
+.mk.b { bottom: 0; border-bottom: 12px solid #ffd34d; }
+.pad { position: absolute; top: 50%; margin-top: -32px; width: 64px; height: 64px; border-radius: 32px; border: 0; background: rgba(240,240,240,0.85); font: bold 34px/64px sans-serif; color: #222; z-index: 2; }
+.pad.prev { left: 8px; } .pad.next { right: 8px; }
+p.filler { margin: 18px 24px; padding: 18px; background: #18242f; border-radius: 10px; }
+</style></head>
+<body>
+<div id="hdr">carousel test <span id="info"></span></div>
+<div id="spacer"></div>
+<section><h2>center: snap-align center, paddles scrollBy smooth</h2>
+  <div class="wrap"><div class="mk t" id="mkct"></div><div class="mk b" id="mkcb"></div>
+    <div class="sc" id="center"></div>
+    <button class="pad prev" data-for="center" data-dir="-1">&lsaquo;</button><button class="pad next" data-for="center" data-dir="1">&rsaquo;</button></div></section>
+<section><h2>start: snap-align start, scroll-padding 40 px, paddles scrollTo smooth</h2>
+  <div class="wrap"><div class="mk t" id="mkst"></div><div class="mk b" id="mksb"></div>
+    <div class="sc" id="start"></div>
+    <button class="pad prev" data-for="start" data-dir="-1">&lsaquo;</button><button class="pad next" data-for="start" data-dir="1">&rsaquo;</button></div></section>
+<section><h2>free: no snapping</h2>
+  <div class="wrap"><div class="sc" id="free"></div></div></section>
+<div id="filler"></div>
+<script>
+(function () {
+    var q = new URLSearchParams(location.search);
+    var busy = +q.get("busy") || 0, auto = +q.get("auto") || 0;
+    var t0 = performance.now();
+    function secs() { return ((performance.now() - t0) / 1000).toFixed(1); }
+    var counts = { center: 12, start: 14, free: 16 };
+    Object.keys(counts).forEach(function (name) {
+        var sc = document.getElementById(name);
+        for (var i = 0; i < counts[name]; i++) {
+            var d = document.createElement("div");
+            var h = (i * 47 + (name === "start" ? 120 : name === "free" ? 240 : 0)) % 360;
+            d.style.background = "linear-gradient(135deg, hsl(" + h + ",70%,45%), hsl(" + ((h + 40) % 360) + ",70%,30%))";
+            d.textContent = name[0].toUpperCase() + (i + 1);
+            sc.appendChild(d);
+        }
+    });
+    var top = q.has("top") ? +q.get("top") : Math.max(0, 540 - 60 - 40 - 14 - 170);
+    document.getElementById("spacer").style.height = top + "px";
+    var filler = document.getElementById("filler");
+    for (var i = 0; i < 40; i++) {
+        var p = document.createElement("p");
+        p.className = "filler";
+        p.textContent = "Filler paragraph " + (i + 1) + " so the page scrolls vertically too.";
+        filler.appendChild(p);
+    }
+
+    function snapLine(sc) {
+        var r = sc.getBoundingClientRect();
+        return sc.id === "center" ? r.left + r.width / 2 : r.left + 40;
+    }
+    function nearest(sc) {
+        var line = snapLine(sc), best = null;
+        for (var i = 0; i < sc.children.length; i++) {
+            var cr = sc.children[i].getBoundingClientRect();
+            var at = sc.id === "center" ? cr.left + cr.width / 2 : cr.left;
+            var off = at - line;
+            if (!best || Math.abs(off) < Math.abs(best.off))
+                best = { i: i, off: off };
+        }
+        return best;
+    }
+    function placeMarkers() {
+        ["center", "start"].forEach(function (name) {
+            var sc = document.getElementById(name);
+            var wr = sc.parentNode.getBoundingClientRect();
+            var x = snapLine(sc) - wr.left - 12;
+            var k = name === "center" ? "c" : "s";
+            document.getElementById("mk" + k + "t").style.left = x + "px";
+            document.getElementById("mk" + k + "b").style.left = x + "px";
+        });
+    }
+    placeMarkers();
+    addEventListener("resize", placeMarkers);
+
+    var state = {};
+    ["center", "start", "free"].forEach(function (name) {
+        var sc = document.getElementById(name);
+        var st = state[name] = { events: 0, timer: 0, gapTimer: 0 };
+        sc.addEventListener("scroll", function () {
+            st.events++;
+            clearTimeout(st.timer);
+            clearTimeout(st.gapTimer);
+            st.gapTimer = setTimeout(function () {
+                console.log("CAR-STOP " + secs() + " s " + name + ": left " + sc.scrollLeft.toFixed(1) + " (no scroll event for 80 ms)");
+            }, 80);
+            st.timer = setTimeout(function () {
+                var n = nearest(sc);
+                var max = sc.scrollWidth - sc.clientWidth;
+                var edge = sc.scrollLeft <= 0 ? " at start" : sc.scrollLeft >= max - 1 ? " at end" : "";
+                var ok = name === "free" ? "free" : Math.abs(n.off) < 1.5 ? "snapped" : (edge ? "edge" : "OFF");
+                console.log("CAR " + secs() + " s " + name + ": left " + sc.scrollLeft.toFixed(1) + ", card " + (n.i + 1)
+                    + ", off " + n.off.toFixed(1) + " (" + ok + edge + "), scroll events " + st.events);
+                st.events = 0;
+            }, 400);
+        }, { passive: true });
+    });
+
+    function paddle(name, dir) {
+        var sc = document.getElementById(name);
+        if (name === "center") {
+            sc.scrollBy({ left: dir * (640 + 24), behavior: "smooth" });
+            return;
+        }
+        // "start": scrollTo the next card's snap position, from the current one.
+        var n = nearest(sc), i = Math.max(0, Math.min(sc.children.length - 1, n.i + dir));
+        var target = sc.children[i].offsetLeft - sc.firstElementChild.offsetLeft;
+        sc.scrollTo({ left: target, behavior: "smooth" });
+    }
+    Array.prototype.forEach.call(document.querySelectorAll(".pad"), function (b) {
+        b.addEventListener("click", function () { paddle(b.dataset.for, +b.dataset.dir); });
+    });
+    window.carPaddle = paddle;
+
+    if (busy) {
+        (function frame() {
+            var end = performance.now() + busy;
+            while (performance.now() < end) { }
+            requestAnimationFrame(frame);
+        })();
+    }
+    if (auto) {
+        var step = 0;
+        setInterval(function () {
+            var dir = (Math.floor(step / 3) % 2) ? -1 : 1;
+            ["center", "start"].forEach(function (name) {
+                console.log("CAR-PADDLE " + name + " " + (dir > 0 ? "next" : "prev") + " from " + document.getElementById(name).scrollLeft.toFixed(1));
+                paddle(name, dir);
+            });
+            step++;
+        }, auto);
+    }
+    console.log("CAR start: busy " + busy + " ms, auto " + auto + " ms, top " + top + " px; center carousel at y "
+        + Math.round(document.getElementById("center").getBoundingClientRect().top) + ".." + Math.round(document.getElementById("center").getBoundingClientRect().bottom)
+        + ", view " + innerWidth + "x" + innerHeight);
+})();
+</script>
+</body></html>

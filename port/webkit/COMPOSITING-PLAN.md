@@ -2046,3 +2046,87 @@ moving frames/s, 30 ms pad -> present, as the baseline); CPU path (no
 compositing flag) paints on 4 threads and scrolls; async with stickframe on
 the 2800-layer page: 45 moving frames/s (bound by the 40 ms scene paint);
 search page 52.6 moving frames/s with 3.8 ms scene paints.
+
+### Horizontal carousels under async scrolling (2026-11-02, src-wc b8033dea3f)
+
+Owner, on a big product page with the flag at `stickframe=1`: the
+horizontal carousels (overflow-x scrollers with `scroll-snap-type: x
+mandatory` and script "paddle" buttons) didn't always sit centred, and
+sideways stick scrolling didn't work well. His log had seconds of ~120
+wheel events "in the title", 0 sent to the WebProcess and nothing moving.
+
+New test page `test/paint/carousel.html` (synthetic cards; carousels with
+snap-align center + paddles calling `scrollBy({smooth})`, snap-align start +
+`scrollTo({smooth})`, and no snapping; `?busy=`, `?auto=<ms>` presses the
+paddles; `CAR` lines give where each carousel settles and how far the nearest
+card is from its snap position). `pad-scroll-test` gained `rx=` (sideways),
+`px=`/`py=` (where the events land), `hold=` (still time between the two
+directions) and `rest=` (a capture that long into each still period).
+
+**Causes, all async-only** (the same page with the flag absent, WC or CPU,
+snaps the paddle scrolls to the cards):
+1. **Sub-scroller rects slid with their content.** The title routes the
+   stick by the rect of each overflow node's container layer
+   (`WCScene::layerRectOnSurface`). A TextureMapperLayer's surface transform
+   includes -boundsOrigin, so once a carousel had scrolled by its width the
+   rect no longer held the point: the next events went to the root, which
+   can't scroll sideways, and were dropped (frame-locked steps nothing took).
+   Reproduced on the test page: one second of scrolling (54 events to the
+   WebProcess, carousel at 990 px), then 120 events/s that moved nothing.
+   Fix: the box is mapped at its bounds origin.
+2. **Nothing ended a stick gesture.** The pad's precise wheel events have no
+   end phase, so ScrollingEffectsController never snapped (and kept "user
+   scroll in progress"). The carousel stopped wherever the stick let go
+   (test page: 262 px off). Fix: 100 ms after the last wheel event the tree
+   gives the last node a wheel event scrolled an end-of-gesture event, if that
+   node snaps; WebKit then animates it to the nearest snap position (no
+   fling: kinetic scrolling is skipped for snapping nodes). Stick input stops
+   a running animated scroll.
+3. **Paddle `scrollBy` landed between cards.** For scrolls by a delta the
+   WebProcess sends the unsnapped delta (`AnimatedDeltaUpdate`), and the tree
+   just added it: 664 instead of the 728 snap position (64 px off-centre,
+   every press). Fix: the tree snaps delta destinations directionally, as the
+   WebProcess's ScrollAnimator does.
+4. Also: events the root can't take (nothing the title knows of under the
+   point, root pinned that way) now go to the WebProcess, whose hit test can
+   find a scroller (`unconsumed=0` restores the old drop); events a carousel
+   can't take (vertical over it) stay with the root in the title
+   (frame-locked) instead of a WebProcess round trip.
+
+New flag tokens (defaults on): `snap=0`, `unconsumed=0`. The `[ascroll]`
+line adds: root could not take, frame steps nothing took, sub-scroller moves
+in the title, snaps after wheel.
+
+**Results** (log-only PPSA99020, build 20261102-085929; `stickframe=1`
+unless noted; stick 1.5 s right, 1.5 s still, 1.5 s left, 2 s still):
+
+| test | events | where it settled |
+| --- | --- | --- |
+| test page, old behaviour (`unconsumed=0 snap=0`, before the rect fix) | 54 to the WebProcess, then ~120/s "in the title", 0 moved | 990 px, card 3 262 px off |
+| test page, ov0 (default) | 1566 to the WebProcess, 0 dropped | 9/9 settles snapped (off 0.0) |
+| test page, `overflow=1` | 1579 in the title, 0 dropped | 9/9 snapped |
+| test page `?busy=30`, ov0 | 655 to the WebProcess (coalesced) | 6/6 snapped |
+| test page `?busy=30`, `overflow=1` | 1250 in the title | 7/7 snapped |
+| test page paddles (`?auto=1500`), before fix 3 | | centre carousel 664/1328/1992: 64 px off every time |
+| same, after | | 728/1392/2056: snapped, as WC without the flag and CPU |
+| product page, gallery at the view centre, rx 0.5 | 3638 to the WebProcess, 5477 gallery moves in the title, 21 snaps | full travel both ways (0 and 3152) |
+| product page, rx 0.2, ov0 | 2447 to the WebProcess, 14 snaps | 1432 / 0, card edge on the gutter line (captures) |
+| product page, rx 0.2, `overflow=1` | 2462 in the title, 14 snaps | same positions |
+| product page, its paddle buttons (clicked from script) | | 0 / 716 / 1432 / 2148, the same snap positions |
+
+Vertical regression check, `scrolljank.html?busy=30` ry 0.5 with
+`stickframe=1`: 52.6 moving frames/s, pad -> present 12.2 ms avg (3115 events
+in the title, 0 to the WebProcess). Flag absent: no scrolling tree, SJ 25
+scroll events/s as before.
+
+**`overflow=1`:** on these pages it behaves the same as the default, and on
+a busy main thread it delivers every stick event to the carousel in the title
+(1250 against 655 coalesced ones through the WebProcess). Its known gap is
+unchanged: the title picks the innermost scroller rect under the point and
+ignores z-order and pointer-events (an overlay above a scroller routes to the
+scroller). It is a good candidate for the default; not flipped.
+
+Not done: an axis lock for diagonal stick input (a mostly vertical push with
+a small sideways part is taken by a carousel under the point, in every mode);
+lazily loaded gallery images at the far end showed black in some mid-run
+captures of the product page (not compared with the flag off).
