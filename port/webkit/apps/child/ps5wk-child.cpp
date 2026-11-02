@@ -46,6 +46,9 @@
 #include <time.h>
 #include <unistd.h>
 
+// adblock-job.c: the ad blocker's list compile/update (a task payload).
+extern "C" int ps5wk_adblock_job(const char* jobPath);
+
 namespace WebKit {
 // Source/WebKit/WebProcess/WebProcessMain.h, NetworkProcess/NetworkProcessMain.h
 int WebProcessMain(int argc, char** argv);
@@ -757,6 +760,17 @@ int main(int, char**)
         || strcmp(magic, PS5WK_LAUNCH_HEADER) || version != PS5WK_LAUNCH_VERSION) {
         LOG("bad launch header: \"%s\"", line);
         return 1;
+    }
+    // Task payloads (wpe_process_manager_ps5_run_task): no WebKit process,
+    // the header's path is the task's argument.
+    if (!strcmp(type, "adblock")) {
+        ps5wk_crash_guard_install("adblock");
+        setupEnvironment(path);
+        g_io_openssl_load(nullptr);
+        int result = ps5wk_adblock_job(path);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(result); // as below: no static destructors
     }
     bool network = !strcmp(type, "network");
     char tag[32];

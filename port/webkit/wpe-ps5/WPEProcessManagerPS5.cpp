@@ -94,6 +94,10 @@ struct UploadJob {
     std::string tag;
     WPEProcessManagerPS5* manager { nullptr }; // a reference, dropped on the main thread
     guint64 handle { 0 };
+    // A task payload (wpe_process_manager_ps5_run_task): no WebKit process.
+    WPEProcessManagerPS5TaskOutput taskOutput { nullptr };
+    WPEProcessManagerPS5TaskEnded taskEnded { nullptr };
+    gpointer taskData { nullptr };
 };
 
 static bool writeAll(int fd, const void* data, size_t size)
@@ -280,7 +284,11 @@ static gpointer uploadThread(gpointer data)
     g_mutex_unlock(&s_uploadLock);
     if (s < 0) {
         g_warning("[ps5-launch %s] launch failed", tag);
-        g_idle_add(launchFailedOnMain, new LaunchFailure { job->manager, job->handle, job->tag });
+        if (job->taskEnded) {
+            job->taskEnded(FALSE, job->taskData);
+            g_idle_add(unrefOnMain, job->manager);
+        } else
+            g_idle_add(launchFailedOnMain, new LaunchFailure { job->manager, job->handle, job->tag });
         return nullptr;
     }
     g_idle_add(unrefOnMain, job->manager);
@@ -293,6 +301,8 @@ static gpointer uploadThread(gpointer data)
         for (char* nl; (nl = strchr(start, '\n')); start = nl + 1) {
             *nl = 0;
             relayLine(tag, start);
+            if (job->taskOutput)
+                job->taskOutput(start, job->taskData);
         }
         used = static_cast<size_t>(line + used - start);
         memmove(line, start, used);
@@ -315,6 +325,8 @@ static gpointer uploadThread(gpointer data)
     fprintf(stderr, "[%s] (output closed after %.1f s)\n", tag, (g_get_monotonic_time() - t0) / 1e6);
     ps5PerfChildEnded(tag);
     close(s);
+    if (job->taskEnded)
+        job->taskEnded(TRUE, job->taskData);
     return nullptr;
 }
 
@@ -620,6 +632,34 @@ WPEProcessManager* wpe_process_manager_ps5_new(const char* childELF)
     // A payload whose title went away gets EPIPE, not a signal; same here.
     signal(SIGPIPE, SIG_IGN);
     return WPE_PROCESS_MANAGER(manager);
+}
+
+// A task payload: the child ELF in another mode (ps5wk-child.cpp's main
+// picks it by the header's type), with no WebKit process and no IPC socket.
+// Header: PS5WK-LAUNCH <version> <task> 0 <argument>. Uploaded like the
+// WebKit processes (serialized, retried); output relayed to the log as
+// [<task>] lines and passed to output, then ended (launched or not), both on
+// the relay thread. The payload ends when it likes; it should also end when
+// its stdin (the connection) closes.
+gboolean wpe_process_manager_ps5_run_task(WPEProcessManager* processManager, const char* task, const char* argument,
+    WPEProcessManagerPS5TaskOutput output, WPEProcessManagerPS5TaskEnded ended, gpointer userData)
+{
+    g_return_val_if_fail(WPE_IS_PROCESS_MANAGER_PS5(processManager), FALSE);
+    g_return_val_if_fail(task && *task && !strchr(task, ' ') && argument && *argument && !strchr(argument, ' '), FALSE);
+    auto* manager = WPE_PROCESS_MANAGER_PS5(processManager);
+    auto* job = new UploadJob;
+    job->elfPath = manager->priv->childELF;
+    char text[512];
+    snprintf(text, sizeof(text), PS5WK_LAUNCH_HEADER " %d %s 0 %s\n", PS5WK_LAUNCH_VERSION, task, argument);
+    job->header = text;
+    job->tag = task;
+    job->manager = WPE_PROCESS_MANAGER_PS5(g_object_ref(manager));
+    job->taskOutput = output;
+    job->taskEnded = ended;
+    job->taskData = userData;
+    PS5_LOG("[ps5-launch] launching task %s (%s) from %s", task, argument, job->elfPath.c_str());
+    g_thread_unref(g_thread_new("ps5-task", uploadThread, job));
+    return TRUE;
 }
 
 void wpe_process_manager_ps5_set_child_elf(WPEProcessManager* manager, const char* path)

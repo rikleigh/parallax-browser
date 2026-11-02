@@ -32,6 +32,21 @@ WPE_API WPEProcessManager *wpe_process_manager_ps5_new           (const char    
 WPE_API void               wpe_process_manager_ps5_set_child_elf (WPEProcessManager *manager,
                                                                   const char        *child_elf);
 
+/* A task payload: @child_elf started in another mode (header type @task,
+ * one @argument without spaces), with no WebKit process. @output gets each
+ * line the payload prints, @ended once at the end (@launched FALSE: it never
+ * ran), both on a thread of their own. Used by the title's ad blocker
+ * (apps/title/adblock.c) to compile its list in a process whose memory goes
+ * back when it exits. */
+typedef void (*WPEProcessManagerPS5TaskOutput) (const char *line, gpointer user_data);
+typedef void (*WPEProcessManagerPS5TaskEnded)  (gboolean launched, gpointer user_data);
+WPE_API gboolean wpe_process_manager_ps5_run_task (WPEProcessManager             *manager,
+                                                   const char                    *task,
+                                                   const char                    *argument,
+                                                   WPEProcessManagerPS5TaskOutput output,
+                                                   WPEProcessManagerPS5TaskEnded  ended,
+                                                   gpointer                       user_data);
+
 G_END_DECLS
 
 #endif /* WPEProcessManagerPS5_h */

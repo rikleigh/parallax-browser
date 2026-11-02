@@ -18,15 +18,17 @@
  *   /data/ps5webkit/adblock/compiled.ini says which one and from what.
  *   Later starts only load it (no compile) while the source is unchanged.
  *
- * The update (Settings "Update lists now", or by itself once a day, 2 min
- * after start at the earliest and never while a page loads): a thread
- * fetches (as WebKit downloads, through the NetworkProcess: no TLS in the
- * title) uBO Lite's manifest.json from github.com/uBlockOrigin/uBOL-home,
- * and if its version is newer than the list in use, the default rulesets at
- * that release tag, runs dnr-to-webkit.js in a JavaScriptCore context of its
- * own (no JIT in the title: JSC_useJIT=false, ps5browser.c), writes the
- * list to /data/ps5webkit/adblock, and the main loop compiles it. Any
- * failure keeps the list in use.
+ * Compiling and updating happen in a child process (ps5wk-child's
+ * "adblock" mode, apps/child/adblock-job.c), so the memory they take (the
+ * compile peaks at several hundred MB) goes back when it exits; the title
+ * only loads the compiled result. The update (Settings "Update lists now",
+ * or by itself once a day, 2 min after start at the earliest and never while
+ * a page loads): the child fetches uBO Lite's manifest.json from
+ * github.com/uBlockOrigin/uBOL-home, and if its version is newer than the
+ * list in use, the default rulesets at that release tag, runs
+ * dnr-to-webkit.js in JavaScriptCore, compiles the result into the slot not
+ * in use and saves the list to /data/ps5webkit/adblock. Any failure keeps
+ * the list in use.
  *
  * Off switches: the "Ad blocking" setting (/data/ps5webkit/adblock-off) and
  * the per-site allow list (/data/ps5webkit/adblock-allow.txt, one site per
@@ -41,6 +43,7 @@
 #include "adblock.h"
 #include "settings.h"
 #include "viewinvr.h"
+#include "WPEProcessManagerPS5.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -54,7 +57,6 @@
 #define AB_OFF_FLAG "/data/ps5webkit/adblock-off"
 #define AB_ALLOW_FILE "/data/ps5webkit/adblock-allow.txt"
 #define AB_NO_UPDATE_FLAG "/data/ps5webkit/adblock-noupdate"
-#define AB_REPO "https://raw.githubusercontent.com/uBlockOrigin/uBOL-home"
 #define AB_FIRST_CHECK_S 120
 #define AB_RECHECK_S (30 * 60)
 #define AB_CHECK_INTERVAL_S (24 * 3600)
@@ -98,8 +100,9 @@ static void listInfoCopy(ListInfo* to, const ListInfo* from)
 }
 
 /* ---- state ----
- * Main loop: webView..compiling. Under abLock (read by the link server
- * thread): enabled, sites, status, active info, updating, lastCheck. */
+ * Main loop: webView..filterOn (and jobRunning below). Under abLock (read by
+ * the link server thread): enabled, sites, status, active info, updating,
+ * compiling, lastCheck. */
 static WebKitWebView* webView;
 static WebKitUserContentManager* contentManager;
 static WebKitUserContentFilterStore* store;
@@ -465,10 +468,46 @@ const char* ps5wk_adblock_set_allowed(const char* host, gboolean allowed, gboole
     return NULL;
 }
 
-/* ---- loading and compiling ---- */
+/* ---- loading and compiling ----
+ *
+ * The compile and the update run in a child process (ps5wk-child in its
+ * "adblock" mode, apps/child/adblock-job.c), started through elfldr like the
+ * WebProcesses (wpe_process_manager_ps5_run_task): WebKit's compile of this
+ * list peaks at several hundred MB, and in the title's heap (dlmalloc over
+ * direct memory) ~420 MB of it stayed mapped until the browser restarted.
+ * The child writes the compiled list into the store under the slot not in
+ * use, in WebKit's own format, and the title only loads it (ms). One job at
+ * a time; a job that fails, crashes or never reports leaves the list in use.
+ *
+ * The job's files: AB_WORK/job.ini (what to do), AB_WORK/result.ini
+ * (written last by the child), AB_WORK/bundled-rules.json and
+ * dnr-to-webkit.js (copies from /app0, which a payload can't see), AB_WORK/tmp
+ * (the compiler's temporary files; the child clears it). */
 
-static void startUpdateCompile(void);
-static gboolean pendingUpdateCompile;
+#define AB_WORK AB_DIR "/work"
+
+static gboolean jobRunning; /* main loop */
+
+typedef struct {
+    char* mode;       /* compile | update */
+    char* from;       /* why, for the log */
+    gboolean force;
+    ListInfo info;    /* compile: the list being compiled; update: the one in use */
+    char* source;     /* compile: the rules as the title sees them */
+    char* identifier; /* the slot it goes to */
+    gint64 started;
+    gboolean launched;
+} Job;
+
+static void jobFree(Job* job)
+{
+    g_free(job->mode);
+    g_free(job->from);
+    listInfoClear(&job->info);
+    g_free(job->source);
+    g_free(job->identifier);
+    g_free(job);
+}
 
 static void storeRemoved(GObject* object, GAsyncResult* result, gpointer data)
 {
@@ -509,78 +548,305 @@ static void useFilter(WebKitUserContentFilter* filter, const char* identifier, c
     g_free(oldID);
 }
 
+/* Streams from to to (0666): no copy of the file in the heap. */
+static gboolean copyFile(const char* from, const char* to)
+{
+    static char buffer[256 * 1024]; /* the job's preparation thread only (one job at a time) */
+    int in = open(from, O_RDONLY);
+    if (in < 0)
+        return FALSE;
+    char* temporary = g_strdup_printf("%s.tmp", to);
+    int out = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    gboolean ok = out >= 0;
+    while (ok) {
+        ssize_t n = read(in, buffer, sizeof buffer);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            ok = !n;
+            break;
+        }
+        for (ssize_t done = 0; ok && done < n;) {
+            ssize_t w = write(out, buffer + done, (size_t)(n - done));
+            ok = w > 0;
+            done += w > 0 ? w : 0;
+        }
+    }
+    close(in);
+    if (out >= 0) {
+        fchmod(out, 0666);
+        ok = !close(out) && ok;
+    }
+    if (ok)
+        ok = !rename(temporary, to);
+    if (!ok)
+        unlink(temporary);
+    g_free(temporary);
+    return ok;
+}
+
+/* The converter: the copy in /data/ps5webkit/adblock (tests) or the title's. */
+static const char* converterPath(void)
+{
+    return fileExists(AB_DIR "/dnr-to-webkit.js") ? AB_DIR "/dnr-to-webkit.js" : AB_BUNDLED "/dnr-to-webkit.js";
+}
+
+static void removeJobFiles(void)
+{
+    unlink(AB_WORK "/job.ini");
+    unlink(AB_WORK "/result.ini");
+    unlink(AB_WORK "/bundled-rules.json");
+    unlink(AB_WORK "/dnr-to-webkit.js");
+    unlink(AB_WORK "/update-rules.json"); /* left by a child that was ended */
+}
+
+static void jobLaunch(Job* job);
+static gboolean jobFinishedOnMain(gpointer data);
+
+static gboolean jobLaunchOnMain(gpointer data)
+{
+    jobLaunch(data);
+    return G_SOURCE_REMOVE;
+}
+
+/* The relay thread: one line of the child's output. */
+static void jobOutput(const char* line, gpointer data)
+{
+    (void)data;
+    static const char statusPrefix[] = "[adblock-job] status: ";
+    if (!strncmp(line, statusPrefix, sizeof statusPrefix - 1))
+        setStatus("%s", line + sizeof statusPrefix - 1);
+    else if (!strcmp(line, "[adblock-job] phase: compiling")) {
+        g_mutex_lock(&abLock);
+        updating = FALSE;
+        compiling = TRUE;
+        g_mutex_unlock(&abLock);
+        memLog("adblock: child compiling");
+    }
+}
+
+/* The relay thread: the child's output closed (it ended), or it never ran. */
+static void jobEnded(gboolean launched, gpointer data)
+{
+    Job* job = data;
+    job->launched = launched;
+    g_idle_add(jobFinishedOnMain, job);
+}
+
+/* A thread: the files the child needs, then the launch on the main loop. */
+static void* jobPrepare(void* data)
+{
+    Job* job = data;
+    g_mkdir_with_parents(AB_WORK, 0777);
+    g_mkdir_with_parents(AB_STORE, 0777);
+    /* The child runs under another uid. */
+    chmod(AB_DIR, 0777);
+    chmod(AB_WORK, 0777);
+    chmod(AB_STORE, 0777);
+    removeJobFiles();
+    GKeyFile* file = g_key_file_new();
+    g_key_file_set_string(file, "job", "mode", job->mode);
+    g_key_file_set_string(file, "job", "from", job->from);
+    g_key_file_set_string(file, "job", "store", AB_STORE);
+    g_key_file_set_string(file, "job", "identifier", job->identifier);
+    g_key_file_set_string(file, "job", "work", AB_WORK);
+    g_key_file_set_string(file, "job", "result", AB_WORK "/result.ini");
+    gboolean ok = TRUE;
+    const char* failure = NULL;
+    if (!strcmp(job->mode, "compile")) {
+        const char* source = job->source;
+        if (g_str_has_prefix(source, AB_BUNDLED "/")) { /* /app0 is the title's alone */
+            gint64 start = g_get_monotonic_time();
+            ok = copyFile(source, AB_WORK "/bundled-rules.json");
+            spike_log("[adblock] copied %s for the child in %.0f ms%s", source, msSince(start), ok ? "" : " (FAILED)");
+            source = AB_WORK "/bundled-rules.json";
+            failure = ok ? NULL : "the bundled list could not be copied";
+        }
+        g_key_file_set_string(file, "job", "source", source);
+        g_key_file_set_string(file, "job", "version", job->info.version ? job->info.version : "");
+    } else {
+        const char* converter = converterPath();
+        ok = copyFile(converter, AB_WORK "/dnr-to-webkit.js");
+        failure = ok ? NULL : "the converter could not be copied";
+        g_key_file_set_string(file, "job", "converter", AB_WORK "/dnr-to-webkit.js");
+        g_key_file_set_string(file, "job", "dest", AB_DIR);
+        g_key_file_set_boolean(file, "job", "force", job->force);
+        g_key_file_set_string(file, "job", "current-version", job->info.version ? job->info.version : "");
+        g_key_file_set_integer(file, "job", "current-converter", job->info.converter);
+    }
+    if (ok && !writeKeyFile(file, AB_WORK "/job.ini")) {
+        ok = FALSE;
+        failure = "the job file could not be written";
+    }
+    g_key_file_unref(file);
+    if (!ok) {
+        spike_log("[adblock] %s job not started: %s", job->mode, failure);
+        setStatus("The list work could not start (%s); the list in use stays.", failure);
+        job->launched = FALSE;
+        job->started = 0;
+        g_idle_add(jobFinishedOnMain, job);
+        return NULL;
+    }
+    g_idle_add(jobLaunchOnMain, job);
+    return NULL;
+}
+
+static void jobLaunch(Job* job)
+{
+    WPEProcessManager* manager = wpe_process_manager_get_default();
+    if (!manager
+        || !wpe_process_manager_ps5_run_task(manager, "adblock", AB_WORK "/job.ini", jobOutput, jobEnded, job)) {
+        spike_log("[adblock] %s job not started: no PS5 process manager", job->mode);
+        job->launched = FALSE;
+        jobFinishedOnMain(job);
+    }
+}
+
+/* Main loop: a compile or an update in the child. NULL, or why not. */
+static const char* startJob(const char* mode, const char* from, gboolean force, const ListInfo* info, const char* source)
+{
+    if (jobRunning)
+        return !strcmp(mode, "update") ? "the list is being updated or compiled" : "another compile is running";
+    Job* job = g_new0(Job, 1);
+    job->mode = g_strdup(mode);
+    job->from = g_strdup(from);
+    job->force = force;
+    listInfoCopy(&job->info, info);
+    job->source = g_strdup(source);
+    job->identifier = g_strdup(activeID && !strcmp(activeID, "ubol-a") ? "ubol-b" : "ubol-a");
+    job->started = g_get_monotonic_time();
+    jobRunning = TRUE;
+    gboolean update = !strcmp(mode, "update");
+    g_mutex_lock(&abLock);
+    updating = update;
+    compiling = !update;
+    g_mutex_unlock(&abLock);
+    struct stat st;
+    if (update)
+        spike_log("[adblock] update started (%s) in a child process; list in use %s (converter %d); result goes to %s", from,
+            info->version ? info->version : "none", info->converter, job->identifier);
+    else
+        spike_log("[adblock] compiling %s (uBO Lite %s, %s, %ld rules, %.1f MB) as %s in a child process: %s", source, info->version,
+            info->origin, info->rules, stat(source, &st) ? -1.0 : st.st_size / 1048576.0, job->identifier, from);
+    memLog(update ? "adblock: update start" : "adblock: compile start");
+    setStatus(update ? "Checking for a new list…" : "Compiling the list %s…", info->version ? info->version : "");
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 256 * 1024);
+    pthread_t thread;
+    int rc = pthread_create(&thread, &attributes, jobPrepare, job);
+    pthread_attr_destroy(&attributes);
+    if (rc) {
+        job->launched = FALSE;
+        job->started = 0;
+        jobFinishedOnMain(job);
+        return "no thread for the job";
+    }
+    pthread_detach(thread);
+    return NULL;
+}
+
 typedef struct {
     ListInfo info;
     char* identifier;
-    char* path;
     gint64 started;
-} CompileJob;
+    double jobSeconds;
+    double compileSeconds;
+} NewListLoad;
 
-static void compileJobFree(CompileJob* job)
+/* Main loop: the child's compiled list, loaded (the 6 ms path). */
+static void newListLoaded(GObject* object, GAsyncResult* result, gpointer data)
 {
-    listInfoClear(&job->info);
-    g_free(job->identifier);
-    g_free(job->path);
-    g_free(job);
-}
-
-static void compiled(GObject* object, GAsyncResult* result, gpointer data)
-{
-    CompileJob* job = data;
+    NewListLoad* load = data;
     GError* error = NULL;
-    WebKitUserContentFilter* filter = webkit_user_content_filter_store_save_from_file_finish(WEBKIT_USER_CONTENT_FILTER_STORE(object), result, &error);
-    double ms = msSince(job->started);
-    compiling = FALSE;
-    memLog("adblock: compiled");
-    if (!filter) {
-        spike_log("[adblock] compiling %s (uBO Lite %s, %ld rules) FAILED after %.0f ms: %s; keeping %s", job->path, job->info.version,
-            job->info.rules, ms, error ? error->message : "?", activeID ? activeID : "no list");
-        setStatus("The list %s could not be compiled (%s); the list in use stays.", job->info.version, error ? error->message : "unknown error");
+    WebKitUserContentFilter* filter = webkit_user_content_filter_store_load_finish(WEBKIT_USER_CONTENT_FILTER_STORE(object), result, &error);
+    double ms = msSince(load->started);
+    if (filter) {
+        gint64 now = g_get_real_time() / G_USEC_PER_SEC;
+        spike_log("[adblock] loaded the new list %s (uBO Lite %s, %s, converter %d, %ld rules) in %.0f ms; the child took %.1f s (compile %.1f s)",
+            load->identifier, load->info.version, load->info.origin, load->info.converter, load->info.rules, ms, load->jobSeconds, load->compileSeconds);
+        GKeyFile* file = g_key_file_new();
+        infoToKeyFile(file, &load->info);
+        g_key_file_set_string(file, "compiled", "identifier", load->identifier);
+        g_key_file_set_int64(file, "compiled", "at", now);
+        g_key_file_set_int64(file, "compiled", "ms", (gint64)(load->compileSeconds * 1000));
+        if (!writeKeyFile(file, AB_DIR "/compiled.ini"))
+            spike_log("[adblock] %s/compiled.ini not written", AB_DIR);
+        g_key_file_unref(file);
+        useFilter(filter, load->identifier, &load->info, now);
+        setStatus("Using uBO Lite %s (%ld rules), compiled in %.1f s.", load->info.version, load->info.rules, load->compileSeconds);
+    } else {
+        spike_log("[adblock] the new list %s was compiled but did not load: %s; keeping %s", load->identifier,
+            error ? error->message : "?", activeID ? activeID : "no list");
+        setStatus("The list %s was compiled but could not be loaded (%s); the list in use stays.", load->info.version,
+            error ? error->message : "unknown error");
         g_clear_error(&error);
-        compileJobFree(job);
-        return;
     }
-    gint64 now = g_get_real_time() / G_USEC_PER_SEC;
-    spike_log("[adblock] compiled uBO Lite %s (%s, converter %d): %ld rules in %.0f ms as %s", job->info.version, job->info.origin,
-        job->info.converter, job->info.rules, ms, job->identifier);
-    GKeyFile* file = g_key_file_new();
-    infoToKeyFile(file, &job->info);
-    g_key_file_set_string(file, "compiled", "identifier", job->identifier);
-    g_key_file_set_int64(file, "compiled", "at", now);
-    g_key_file_set_int64(file, "compiled", "ms", (gint64)ms);
-    if (!writeKeyFile(file, AB_DIR "/compiled.ini"))
-        spike_log("[adblock] %s/compiled.ini not written", AB_DIR);
-    g_key_file_unref(file);
-    useFilter(filter, job->identifier, &job->info, now);
-    setStatus("Using uBO Lite %s (%ld rules), compiled in %.1f s.", job->info.version, job->info.rules, ms / 1000);
-    compileJobFree(job);
-    if (pendingUpdateCompile) {
-        pendingUpdateCompile = FALSE;
-        startUpdateCompile();
-    }
+    memLog("adblock: new list in use");
+    listInfoClear(&load->info);
+    g_free(load->identifier);
+    g_free(load);
 }
 
-/* Main loop: compile the rules at path (described by info). */
+static gboolean jobFinishedOnMain(gpointer data)
+{
+    Job* job = data;
+    gboolean update = !strcmp(job->mode, "update");
+    double seconds = job->started ? msSince(job->started) / 1000 : 0;
+    GKeyFile* result = g_key_file_new();
+    gboolean haveResult = job->launched && g_key_file_load_from_file(result, AB_WORK "/result.ini", G_KEY_FILE_NONE, NULL);
+    char* outcome = haveResult ? g_key_file_get_string(result, "result", "status", NULL) : NULL;
+    char* message = haveResult ? g_key_file_get_string(result, "result", "message", NULL) : NULL;
+    double compileSeconds = haveResult ? g_key_file_get_int64(result, "result", "compile-ms", NULL) / 1000.0 : 0;
+    long childPeak = haveResult ? (long)g_key_file_get_int64(result, "result", "peak-rss-mb", NULL) : -1;
+    removeJobFiles();
+    memLog("adblock: child ended");
+    spike_log("[adblock] %s job (%s) ended after %.1f s: %s%s%s; child peak rss %ld MB", job->mode, job->from, seconds,
+        !job->launched ? "the child did not start" : outcome ? outcome : "no result (the child failed or was ended)",
+        message && *message ? ": " : "", message ? message : "", childPeak);
+    gboolean newList = outcome && !strcmp(outcome, "ok");
+    ListInfo info = { 0 };
+    if (newList && update && !readInfo(AB_DIR "/adblock-info.ini", &info)) {
+        newList = FALSE;
+        g_free(message);
+        message = g_strdup("The new list's adblock-info.ini is missing; the list in use stays.");
+    } else if (newList && !update)
+        listInfoCopy(&info, &job->info);
+    if (newList) {
+        NewListLoad* load = g_new0(NewListLoad, 1);
+        load->info = info;
+        load->identifier = g_strdup(job->identifier);
+        load->started = g_get_monotonic_time();
+        load->jobSeconds = seconds;
+        load->compileSeconds = compileSeconds;
+        webkit_user_content_filter_store_load(store, load->identifier, NULL, newListLoaded, load);
+    } else if (outcome && !strcmp(outcome, "uptodate"))
+        setStatus("%s", message && *message ? message : "The list is up to date.");
+    else if (!job->launched)
+        setStatus("The list work could not start (the child process did not run); the list in use stays.");
+    else if (outcome)
+        setStatus("%s", message && *message ? message : "The list work failed; the list in use stays.");
+    else
+        setStatus("The list work ended without a result after %.0f s (the child process failed); the list in use stays.", seconds);
+    g_mutex_lock(&abLock);
+    if (update)
+        lastCheckResult = g_get_real_time() / G_USEC_PER_SEC;
+    updating = FALSE;
+    compiling = FALSE;
+    g_mutex_unlock(&abLock);
+    jobRunning = FALSE;
+    g_free(outcome);
+    g_free(message);
+    g_key_file_unref(result);
+    jobFree(job);
+    return G_SOURCE_REMOVE;
+}
+
 static void compileList(const char* path, const ListInfo* info, const char* why)
 {
-    if (compiling) {
-        spike_log("[adblock] compile of %s skipped: another compile is running", path);
-        return;
-    }
-    CompileJob* job = g_new0(CompileJob, 1);
-    listInfoCopy(&job->info, info);
-    job->identifier = g_strdup(activeID && !strcmp(activeID, "ubol-a") ? "ubol-b" : "ubol-a");
-    job->path = g_strdup(path);
-    job->started = g_get_monotonic_time();
-    compiling = TRUE;
-    struct stat st;
-    spike_log("[adblock] compiling %s (uBO Lite %s, %s, %ld rules, %.1f MB) as %s: %s", path, info->version, info->origin,
-        info->rules, stat(path, &st) ? -1.0 : st.st_size / 1048576.0, job->identifier, why);
-    memLog("adblock: compile start");
-    setStatus("Compiling the list %s…", info->version);
-    GFile* file = g_file_new_for_path(path);
-    webkit_user_content_filter_store_save_from_file(store, job->identifier, file, NULL, compiled, job);
-    g_object_unref(file);
+    const char* busy = startJob("compile", why, FALSE, info, path);
+    if (busy)
+        spike_log("[adblock] compile of %s skipped: %s", path, busy);
 }
 
 /* The list to use: the newer of the bundled and the downloaded one. */
@@ -646,432 +912,7 @@ static void loaded(GObject* object, GAsyncResult* result, gpointer data)
     g_free(job);
 }
 
-/* ---- the update ---- */
-
-typedef struct {
-    gboolean force;
-    char* from;
-    ListInfo current; /* the list in use when it started */
-    /* results */
-    gboolean wrote;   /* a new list is in AB_DIR */
-    char* message;
-    ListInfo info;
-} UpdateJob;
-
-/* Downloads go through WebKit (webkit_network_session_download_uri: the
- * NetworkProcess fetches, as for any page) rather than libsoup in this
- * process: TLS in the title ended it (2026-11-02, no log; OpenSSL there has
- * never worked). The update thread waits for each one. */
-typedef struct {
-    gint refs;
-    char* url;
-    char* path;
-    GMutex lock;
-    GCond cond;
-    gboolean done;
-    guint status;
-    char* error;
-    WebKitDownload* download; /* main loop */
-} DownloadRequest;
-
-static void downloadRequestUnref(DownloadRequest* request)
-{
-    if (!g_atomic_int_dec_and_test(&request->refs))
-        return;
-    g_free(request->url);
-    g_free(request->path);
-    g_free(request->error);
-    g_mutex_clear(&request->lock);
-    g_cond_clear(&request->cond);
-    g_free(request);
-}
-
-static gboolean downloadDecideDestination(WebKitDownload* download, const char* suggested, gpointer data)
-{
-    (void)suggested;
-    DownloadRequest* request = data;
-    webkit_download_set_allow_overwrite(download, TRUE);
-    webkit_download_set_destination(download, request->path);
-    return TRUE;
-}
-
-static void downloadFailed(WebKitDownload* download, GError* error, gpointer data)
-{
-    (void)download;
-    DownloadRequest* request = data;
-    g_mutex_lock(&request->lock);
-    if (!request->error)
-        request->error = g_strdup(error ? error->message : "failed");
-    g_mutex_unlock(&request->lock);
-}
-
-static void downloadFinished(WebKitDownload* download, gpointer data)
-{
-    DownloadRequest* request = data;
-    WebKitURIResponse* response = webkit_download_get_response(download);
-    g_mutex_lock(&request->lock);
-    request->status = response ? webkit_uri_response_get_status_code(response) : 0;
-    request->done = TRUE;
-    g_cond_signal(&request->cond);
-    g_mutex_unlock(&request->lock);
-    g_signal_handlers_disconnect_by_data(download, request);
-    request->download = NULL;
-    g_object_unref(download);
-    downloadRequestUnref(request);
-}
-
-static gboolean downloadStart(gpointer data)
-{
-    DownloadRequest* request = data;
-    WebKitNetworkSession* session = webView ? webkit_web_view_get_network_session(webView) : NULL;
-    if (!session) {
-        downloadFailed(NULL, NULL, request);
-        g_mutex_lock(&request->lock);
-        request->done = TRUE;
-        g_cond_signal(&request->cond);
-        g_mutex_unlock(&request->lock);
-        downloadRequestUnref(request);
-        return G_SOURCE_REMOVE;
-    }
-    request->download = webkit_network_session_download_uri(session, request->url);
-    g_signal_connect(request->download, "decide-destination", G_CALLBACK(downloadDecideDestination), request);
-    g_signal_connect(request->download, "failed", G_CALLBACK(downloadFailed), request);
-    g_signal_connect(request->download, "finished", G_CALLBACK(downloadFinished), request);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean downloadCancel(gpointer data)
-{
-    DownloadRequest* request = data;
-    if (request->download)
-        webkit_download_cancel(request->download); /* "failed", "finished" */
-    downloadRequestUnref(request);
-    return G_SOURCE_REMOVE;
-}
-
-/* Update thread: url's body, or NULL (*missing for a 404 when optional). */
-static GBytes* fetch(const char* url, gboolean optional, gboolean* missing, GError** error)
-{
-    static unsigned serial;
-    DownloadRequest* request = g_new0(DownloadRequest, 1);
-    request->refs = 2; /* this thread, the main loop */
-    request->url = g_strdup(url);
-    request->path = g_strdup_printf(AB_DIR "/download-%u.tmp", ++serial);
-    g_mutex_init(&request->lock);
-    g_cond_init(&request->cond);
-    g_idle_add(downloadStart, request);
-    gint64 deadline = g_get_monotonic_time() + 120 * G_USEC_PER_SEC;
-    g_mutex_lock(&request->lock);
-    while (!request->done) {
-        if (!g_cond_wait_until(&request->cond, &request->lock, deadline)) {
-            if (!request->error)
-                request->error = g_strdup("no answer within 120 s");
-            g_atomic_int_inc(&request->refs);
-            g_idle_add(downloadCancel, request);
-            deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
-            if (!g_cond_wait_until(&request->cond, &request->lock, deadline))
-                break;
-        }
-    }
-    gboolean done = request->done;
-    guint status = request->status;
-    char* failure = g_strdup(request->error);
-    g_mutex_unlock(&request->lock);
-    GBytes* body = NULL;
-    if (done && !failure && status == 200) {
-        gchar* contents = NULL;
-        gsize length = 0;
-        if (g_file_get_contents(request->path, &contents, &length, error))
-            body = g_bytes_new_take(contents, length);
-    } else if (done && status == 404 && optional && missing) /* WebKit: "failed", Not Found */
-        *missing = TRUE;
-    else {
-        char code[32];
-        snprintf(code, sizeof code, "HTTP %u", status);
-        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "%s for %s", failure ? failure : status ? code : "no response", url);
-    }
-    unlink(request->path);
-    g_free(failure);
-    downloadRequestUnref(request);
-    return body;
-}
-
-/* The converter: the copy in /data/ps5webkit/adblock (tests) or the title's. */
-static char* converterPath(void)
-{
-    if (fileExists(AB_DIR "/dnr-to-webkit.js"))
-        return g_strdup(AB_DIR "/dnr-to-webkit.js");
-    return g_strdup(AB_BUNDLED "/dnr-to-webkit.js");
-}
-
-static char* jscError(JSCContext* context)
-{
-    JSCException* exception = jsc_context_get_exception(context);
-    if (!exception)
-        return NULL;
-    char* text = jsc_exception_report(exception);
-    jsc_context_clear_exception(context);
-    return text;
-}
-
-/* Long value of "key":<number> in a flat JSON object (the stats line). */
-static long jsonNumber(const char* json, const char* key)
-{
-    char* pattern = g_strdup_printf("\"%s\":", key);
-    const char* at = strstr(json, pattern);
-    long value = at ? strtol(at + strlen(pattern), NULL, 10) : -1;
-    g_free(pattern);
-    return value;
-}
-
-
-/* The update thread: download, convert, write. */
-static void runUpdate(UpdateJob* job)
-{
-    gint64 started = g_get_monotonic_time();
-    GError* error = NULL;
-    JSCVirtualMachine* vm = NULL;
-    JSCContext* js = NULL;
-    char* converted = NULL;
-    GString* fetchedList = g_string_new(NULL);
-    size_t fetchedBytes = 0;
-
-    GBytes* manifest = fetch(AB_REPO "/main/chromium/manifest.json", FALSE, NULL, &error);
-    if (!manifest) {
-        job->message = g_strdup_printf("Could not check for a new list: %s", error ? error->message : "download failed");
-        goto done;
-    }
-    double fetchManifestMS = msSince(started);
-
-    /* JavaScriptCore with the converter (also reads the manifest). */
-    gint64 jsStart = g_get_monotonic_time();
-    char* scriptPath = converterPath();
-    gchar* script = NULL;
-    gsize scriptLength = 0;
-    if (!g_file_get_contents(scriptPath, &script, &scriptLength, &error)) {
-        job->message = g_strdup_printf("The converter %s is missing: %s", scriptPath, error ? error->message : "?");
-        g_free(scriptPath);
-        goto done;
-    }
-    vm = jsc_virtual_machine_new();
-    js = jsc_context_new_with_virtual_machine(vm);
-    JSCValue* ignored = jsc_context_evaluate_with_source_uri(js, script, (gssize)scriptLength, scriptPath, 1);
-    g_clear_object(&ignored);
-    g_free(script);
-    char* jsFailure = jscError(js);
-    if (jsFailure) {
-        job->message = g_strdup_printf("The converter %s did not load: %s", scriptPath, jsFailure);
-        g_free(jsFailure);
-        g_free(scriptPath);
-        goto done;
-    }
-    g_free(scriptPath);
-    JSCValue* converter = jsc_context_get_value(js, "DNRToWebKit");
-    JSCValue* manifestText = jsc_value_new_string_from_bytes(js, manifest);
-    JSCValue* manifestInfo = jsc_value_object_invoke_method(converter, "rulesetsFromManifest", JSC_TYPE_VALUE, manifestText, G_TYPE_NONE);
-    g_object_unref(manifestText);
-    char* manifestJSON = manifestInfo && jsc_value_is_string(manifestInfo) ? jsc_value_to_string(manifestInfo) : NULL;
-    g_clear_object(&manifestInfo);
-    jsFailure = jscError(js);
-    if (!manifestJSON || jsFailure) {
-        job->message = g_strdup_printf("uBO Lite's manifest was not understood: %s", jsFailure ? jsFailure : "no answer");
-        g_free(jsFailure);
-        g_free(manifestJSON);
-        g_object_unref(converter);
-        goto done;
-    }
-    JSCValue* parsed = jsc_value_new_from_json(js, manifestJSON);
-    g_free(manifestJSON);
-    JSCValue* versionValue = jsc_value_object_get_property(parsed, "version");
-    JSCValue* idsValue = jsc_value_object_get_property(parsed, "rulesets");
-    char* version = jsc_value_to_string(versionValue);
-    JSCValue* lengthValue = jsc_value_object_get_property(idsValue, "length");
-    int count = jsc_value_to_int32(lengthValue);
-    g_object_unref(lengthValue);
-    GPtrArray* ids = g_ptr_array_new_with_free_func(g_free);
-    for (int i = 0; i < count; i++) {
-        JSCValue* item = jsc_value_object_get_property_at_index(idsValue, (guint)i);
-        g_ptr_array_add(ids, jsc_value_to_string(item));
-        g_object_unref(item);
-    }
-    g_object_unref(versionValue);
-    g_object_unref(idsValue);
-    g_object_unref(parsed);
-
-    ListInfo candidate = { 0 };
-    candidate.version = g_strdup(version);
-    JSCValue* converterVersion = jsc_value_object_get_property(converter, "VERSION");
-    candidate.converter = jsc_value_to_int32(converterVersion);
-    g_object_unref(converterVersion);
-    gboolean newer = compareLists(&candidate, &job->current) > 0;
-    spike_log("[adblock] update check (%s): uBO Lite %s on GitHub (converter %d), in use %s (converter %d)%s; manifest in %.0f ms, JavaScriptCore and converter ready in %.0f ms",
-        job->from, version, candidate.converter, job->current.version ? job->current.version : "none", job->current.converter,
-        newer ? "" : job->force ? ": not newer, converting anyway (asked from Settings)" : ": up to date", fetchManifestMS, msSince(jsStart));
-    if (!newer && !job->force) {
-        job->message = g_strdup_printf("The list is up to date (uBO Lite %s).", job->current.version ? job->current.version : version);
-        listInfoClear(&candidate);
-        g_free(version);
-        g_ptr_array_unref(ids);
-        g_object_unref(converter);
-        goto done;
-    }
-
-    /* The rulesets at that release's tag. */
-    gint64 downloadStart = g_get_monotonic_time();
-    JSCValue* inputs = jsc_value_new_object(js, NULL, NULL);
-    for (guint i = 0; i < ids->len && !job->message; i++) {
-        const char* id = g_ptr_array_index(ids, i);
-        for (int regex = 0; regex < 2 && !job->message; regex++) {
-            char* url = g_strdup_printf(AB_REPO "/%s/chromium/rulesets/%s/%s.json", version, regex ? "regex" : "main", id);
-            gboolean missing = FALSE;
-            GBytes* body = fetch(url, regex, &missing, &error);
-            if (body) {
-                char* key = g_strdup_printf("%s%s", id, regex ? ".regex" : "");
-                JSCValue* text = jsc_value_new_string_from_bytes(js, body);
-                jsc_value_object_set_property(inputs, key, text);
-                g_object_unref(text);
-                fetchedBytes += g_bytes_get_size(body);
-                g_string_append_printf(fetchedList, "%s%s", fetchedList->len ? ", " : "", key);
-                g_free(key);
-                g_bytes_unref(body);
-            } else if (!missing)
-                job->message = g_strdup_printf("Could not download the list: %s", error ? error->message : url);
-            g_clear_error(&error);
-            g_free(url);
-        }
-    }
-    double downloadMS = msSince(downloadStart);
-    if (job->message) {
-        g_object_unref(inputs);
-        listInfoClear(&candidate);
-        g_free(version);
-        g_ptr_array_unref(ids);
-        g_object_unref(converter);
-        goto done;
-    }
-    spike_log("[adblock] downloaded uBO Lite %s: %s (%.1f MB) in %.0f ms", version, fetchedList->str, fetchedBytes / 1048576.0, downloadMS);
-    memLog("adblock: downloaded");
-
-    gint64 convertStart = g_get_monotonic_time();
-    JSCValue* output = jsc_value_object_invoke_method(converter, "convertJSON", JSC_TYPE_VALUE, inputs, G_TYPE_NONE);
-    g_object_unref(inputs);
-    g_object_unref(converter);
-    jsFailure = jscError(js);
-    if (!jsFailure && output && jsc_value_is_string(output))
-        converted = jsc_value_to_string(output);
-    g_clear_object(&output);
-    double convertMS = msSince(convertStart);
-    memLog("adblock: converted (JSC context alive)");
-    g_clear_object(&js);
-    g_clear_object(&vm);
-    memLog("adblock: JSC context released");
-    if (!converted) {
-        job->message = g_strdup_printf("The conversion failed: %s", jsFailure ? jsFailure : "no result");
-        spike_log("[adblock] conversion of uBO Lite %s failed after %.0f ms: %s", version, convertMS, jsFailure ? jsFailure : "no result");
-        g_free(jsFailure);
-        listInfoClear(&candidate);
-        g_free(version);
-        g_ptr_array_unref(ids);
-        goto done;
-    }
-    char* newline = strchr(converted, '\n');
-    long rules = newline ? jsonNumber(converted, "output") : -1;
-    if (!newline || rules <= 0 || newline[1] != '[') {
-        job->message = g_strdup("The conversion gave no rules.");
-        listInfoClear(&candidate);
-        g_free(version);
-        g_ptr_array_unref(ids);
-        goto done;
-    }
-    *newline = 0;
-    const char* rulesText = newline + 1;
-    size_t rulesLength = strlen(rulesText);
-    spike_log("[adblock] converted uBO Lite %s in %.0f ms: %s; %.1f MB of WebKit JSON", version, convertMS, converted, rulesLength / 1048576.0);
-
-    candidate.rules = rules;
-    candidate.dnrRules = jsonNumber(converted, "input");
-    candidate.skipped = jsonNumber(converted, "skipped");
-    candidate.generated = g_get_real_time() / G_USEC_PER_SEC;
-    candidate.origin = g_strdup("update");
-    candidate.sha256 = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar*)rulesText, rulesLength);
-    GString* joined = g_string_new(NULL);
-    for (guint i = 0; i < ids->len; i++)
-        g_string_append_printf(joined, "%s%s", i ? ";" : "", (char*)g_ptr_array_index(ids, i));
-    candidate.rulesets = g_string_free(joined, FALSE);
-    g_ptr_array_unref(ids);
-    g_free(version);
-
-    /* The rules first, the info last: an info file always describes the
-     * rules next to it. A failed write leaves the previous pair (the info
-     * is removed first, so a half pair is never chosen). */
-    gint64 writeStart = g_get_monotonic_time();
-    unlink(AB_DIR "/adblock-info.ini");
-    GKeyFile* file = g_key_file_new();
-    infoToKeyFile(file, &candidate);
-    gboolean ok = writeAtomically(AB_DIR "/adblock-rules.json", rulesText, rulesLength) && writeKeyFile(file, AB_DIR "/adblock-info.ini");
-    g_key_file_unref(file);
-    if (!ok) {
-        job->message = g_strdup_printf("The new list could not be saved in %s (%s).", AB_DIR, g_strerror(errno));
-        listInfoClear(&candidate);
-        goto done;
-    }
-    spike_log("[adblock] saved uBO Lite %s (%ld rules) in %.0f ms; update took %.1f s so far", candidate.version, candidate.rules,
-        msSince(writeStart), msSince(started) / 1000);
-    job->info = candidate;
-    job->wrote = TRUE;
-
-done:
-    g_clear_error(&error);
-    g_clear_object(&js);
-    g_clear_object(&vm);
-    if (manifest)
-        g_bytes_unref(manifest);
-    g_free(converted);
-    g_string_free(fetchedList, TRUE);
-}
-
-static gboolean updateFinished(gpointer data)
-{
-    UpdateJob* job = data;
-    gint64 now = g_get_real_time() / G_USEC_PER_SEC;
-    g_mutex_lock(&abLock);
-    updating = FALSE;
-    lastCheckResult = now;
-    g_mutex_unlock(&abLock);
-    if (job->wrote) {
-        setStatus("Downloaded uBO Lite %s (%ld rules); compiling…", job->info.version, job->info.rules);
-        if (compiling)
-            pendingUpdateCompile = TRUE;
-        else
-            startUpdateCompile();
-    } else {
-        spike_log("[adblock] update (%s): %s", job->from, job->message ? job->message : "nothing to do");
-        setStatus("%s", job->message ? job->message : "Nothing to do.");
-    }
-    listInfoClear(&job->current);
-    listInfoClear(&job->info);
-    g_free(job->from);
-    g_free(job->message);
-    g_free(job);
-    return G_SOURCE_REMOVE;
-}
-
-static void* updateThread(void* data)
-{
-    runUpdate(data);
-    g_idle_add(updateFinished, data);
-    return NULL;
-}
-
-/* Main loop: compile what the update saved. */
-static void startUpdateCompile(void)
-{
-    ListInfo info;
-    if (!readInfo(AB_DIR "/adblock-info.ini", &info))
-        return;
-    compileList(AB_DIR "/adblock-rules.json", &info, "update");
-    listInfoClear(&info);
-}
+/* ---- the update (in the child too) ---- */
 
 static void writeLastCheck(gint64 when)
 {
@@ -1083,44 +924,31 @@ static void writeLastCheck(gint64 when)
 /* Main loop. */
 static const char* startUpdate(gboolean force, const char* from)
 {
+    if (jobRunning)
+        return "the list is being updated or compiled";
     g_mutex_lock(&abLock);
-    if (updating) {
-        g_mutex_unlock(&abLock);
-        return "an update is already running";
-    }
-    updating = TRUE;
     lastCheck = g_get_real_time() / G_USEC_PER_SEC;
-    UpdateJob* job = g_new0(UpdateJob, 1);
-    job->force = force;
-    job->from = g_strdup(from);
-    listInfoCopy(&job->current, &active);
+    ListInfo current = { 0 };
+    listInfoCopy(&current, &active);
     g_mutex_unlock(&abLock);
     writeLastCheck(lastCheck);
-    setStatus("Checking for a new list…");
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setstacksize(&attributes, 4 * 1024 * 1024);
-    pthread_t thread;
-    int rc = pthread_create(&thread, &attributes, updateThread, job);
-    pthread_attr_destroy(&attributes);
-    if (rc) {
-        g_mutex_lock(&abLock);
-        updating = FALSE;
-        g_mutex_unlock(&abLock);
-        listInfoClear(&job->current);
-        g_free(job->from);
-        g_free(job);
-        setStatus("The update could not start (no thread).");
-        return "no thread for the update";
-    }
-    pthread_detach(thread);
-    spike_log("[adblock] update started (%s)", from);
-    return NULL;
+    const char* why = startJob("update", from, force, &current, NULL);
+    listInfoClear(&current);
+    return why;
 }
 
 static gboolean startUpdateOnMain(gpointer data)
 {
-    startUpdate(TRUE, data);
+    const char* why = startUpdate(TRUE, data);
+    if (why && !jobRunning) {
+        g_mutex_lock(&abLock);
+        updating = FALSE;
+        g_mutex_unlock(&abLock);
+    }
+    if (why) {
+        spike_log("[adblock] update (%s) not started: %s", (char*)data, why);
+        setStatus("Not now: %s.", why);
+    }
     g_free(data);
     return G_SOURCE_REMOVE;
 }
@@ -1128,10 +956,12 @@ static gboolean startUpdateOnMain(gpointer data)
 const char* ps5wk_adblock_update(const char* from)
 {
     g_mutex_lock(&abLock);
-    gboolean busy = updating;
+    gboolean busy = updating || compiling;
+    if (!busy)
+        updating = TRUE; /* the reply already says so; startJob confirms it */
     g_mutex_unlock(&abLock);
     if (busy)
-        return "an update is already running";
+        return "the list is being updated or compiled";
     g_idle_add(startUpdateOnMain, g_strdup(from));
     return NULL;
 }
@@ -1139,15 +969,14 @@ const char* ps5wk_adblock_update(const char* from)
 /* Main loop timer: the daily check, when the browser is idle. */
 static gboolean autoCheck(gpointer data)
 {
-    (void)data;
     if (fileExists(AB_NO_UPDATE_FLAG))
-        return G_SOURCE_CONTINUE;
+        return data ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
     gint64 now = g_get_real_time() / G_USEC_PER_SEC;
     g_mutex_lock(&abLock);
-    gboolean due = !updating && (now - lastCheck >= AB_CHECK_INTERVAL_S || now < lastCheck);
+    gboolean due = now - lastCheck >= AB_CHECK_INTERVAL_S || now < lastCheck;
     g_mutex_unlock(&abLock);
-    if (!due || compiling)
-        return G_SOURCE_CONTINUE;
+    if (!due || jobRunning)
+        return data ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
     if (webkit_web_view_is_loading(webView) || ps5wk_vr_active()) {
         g_timeout_add_seconds(30, autoCheck, GINT_TO_POINTER(1)); /* once, soon */
         return data ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
@@ -1186,6 +1015,7 @@ void ps5wk_adblock_init(WebKitWebView* view)
     webView = view;
     contentManager = webkit_web_view_get_user_content_manager(view);
     mkdir(AB_DIR, 0777);
+    removeJobFiles(); /* of a job the title did not see end (the next child clears its temporary files) */
     store = webkit_user_content_filter_store_new(AB_STORE);
     readSites();
     enabled = !fileExists(AB_OFF_FLAG);

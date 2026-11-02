@@ -10,9 +10,11 @@ Files:
 
 | | |
 | --- | --- |
-| `adblock/dnr-to-webkit.js` | the converter: uBO Lite's declarativeNetRequest (DNR) rules to WebKit content-blocker JSON. Plain JavaScript, no dependencies; the same file runs under node on the Mac and in JavaScriptCore inside the title |
+| `adblock/dnr-to-webkit.js` | the converter: uBO Lite's declarativeNetRequest (DNR) rules to WebKit content-blocker JSON. Plain JavaScript, no dependencies; the same file runs under node on the Mac and in JavaScriptCore on the console (in the child below) |
 | `../../tools/ubol-convert.js` | Mac tool: downloads the pinned uBO Lite release, checks its sha256 pins, converts, writes `toolchain/adblock/adblock-rules.json` + `adblock-info.ini` (never committed) |
-| `apps/title/adblock.c` | the title side: compile/load, the filter on the web view, the per-site allow list, the on-console update |
+| `apps/title/adblock.c` | the title side: loading the compiled list, the filter on the web view, the per-site allow list, starting compile and update jobs |
+| `apps/child/adblock-job.c` | the compile and the update, in `ps5wk-child` started as a task payload (*Compile and update in a child process* below) |
+| `wpe-ps5/WPEProcessManagerPS5.cpp` | `wpe_process_manager_ps5_run_task`: starts the child ELF in another mode through elfldr, like the WebProcesses |
 | `apps/title/package.sh` | puts `adblock-rules.json`, `adblock-info.ini` and `dnr-to-webkit.js` in the title (`/app0/adblock`), so blocking works offline and on first start |
 | `test/adblock/index.html` | synthetic test page (made-up paths on well-known ad hosts and on control hosts) |
 | `test/adblock/measure.js`, `urls.txt` | A/B measurement on real pages (test URL list + `test-onload.js`) |
@@ -52,29 +54,35 @@ own, so an exception in one list cannot undo a block in another.
 
 1. **Bundled:** `package.sh` copies `toolchain/adblock/adblock-rules.json`
    (made by `node tools/ubol-convert.js` if missing) into the title.
-2. **First start:** the title compiles it into
-   `/data/ps5webkit/browser/contentfilters/ContentRuleList-ubol-a`
-   (`compiled.ini` in `/data/ps5webkit/adblock` says which slot and from
-   which list). Later starts only load it (6 ms).
+2. **First start:** a child process compiles it into
+   `/data/ps5webkit/browser/contentfilters/ContentRuleList-ubol-a`, and the
+   title loads that (`compiled.ini` in `/data/ps5webkit/adblock` says which
+   slot and from which list). Later starts only load it (2-6 ms).
 3. **Update on the console**, by itself once a day (first check 2 minutes
    after start, never while a page loads or in VR; `last-check` holds the
    time; `/data/ps5webkit/adblock-noupdate` turns it off) or with *Update
    lists now*:
+   all in one child process:
    - `manifest.json` of the newest uBO Lite (raw.githubusercontent.com,
-     `uBOL-home/main/chromium/`), downloaded as a WebKit download (the
-     NetworkProcess fetches it: no TLS code in the title);
+     `uBOL-home/main/chromium/`), downloaded with libsoup and the payloads'
+     TLS (glib-networking OpenSSL, `/data/ps5webkit/etc/ssl/cert.pem`, as in
+     the NetworkProcess);
    - if its version (or the converter's version) is newer than the list in
-     use: the default rulesets at that release's tag
-     (`rulesets/main/<id>.json`, `rulesets/regex/<id>.json`);
-   - converted by `dnr-to-webkit.js` in a JavaScriptCore context on a thread
-     of the title (LLInt, no JIT);
-   - saved as `/data/ps5webkit/adblock/adblock-rules.json` + `adblock-info.ini`;
+     use, or the update was asked for from Settings: the default rulesets
+     at that release's tag (`rulesets/main/<id>.json`,
+     `rulesets/regex/<id>.json`);
+   - converted by `dnr-to-webkit.js` in JavaScriptCore (LLInt);
    - compiled into the other slot (`ubol-b`) while the old list keeps
-     blocking; then swapped (new filter added before the old one is
-     removed) and the old slot deleted.
-   Any failure (download, conversion, compile) keeps the list in use; the
-   *Lists* card and `[adblock]` log lines say what happened. At start the
-   newer of the bundled and the downloaded list is used.
+     blocking, and only then saved as
+     `/data/ps5webkit/adblock/adblock-rules.json` + `adblock-info.ini`;
+   - the title loads the new slot, swaps it in (new filter added before the
+     old one is removed) and deletes the old slot.
+   Any failure (download, conversion, compile, the child crashing or being
+   ended) keeps the list in use; the *Lists* card and `[adblock]` log lines
+   say what happened. At start the newer of the bundled and the downloaded
+   list is used. The daily check is a child launch too (a few seconds,
+   memory outside the title); it ends after the manifest when nothing is
+   new.
 
 ### Updating the bundled list (Mac)
 
@@ -161,8 +169,8 @@ prevented ...` in the log), 3 of 3 control hosts answered; with blocking off,
 
 | | |
 | --- | --- |
-| compile (first start, or after an update) | 44-67 s on a WebKit work-queue thread (one core); the JSON parse runs on the main thread first: ~1.2 s of the title's main loop (`[cpu] title: main thread busy 23 %` in that 5 s window) |
-| title memory while compiling | direct heap peak 557-691 MB; **~420 MB of it stays mapped in the title's heap (dlmalloc) until the browser restarts** |
+| compile (first start, or after an update) | in the title (before the child process): 44-67 s on a WebKit work-queue thread (one core), plus a ~1.2 s JSON parse on the title's main loop. Now in the child: 53-57 s, and none of it in the title |
+| title memory while compiling | in the title: direct heap peak 557-691 MB, **~420 MB of it kept until the browser restarted**. Now: flat (26.8 MB before, during and after; below) |
 | compiled file | 78.7 MB in `/data/ps5webkit/browser/contentfilters` (includes the 26 MB source) |
 | load at later starts | 6 ms (170 ms once) |
 | WebProcess | +10 MB peak RSS on example.com (177.2 -> 187.2 MB); over nine heavy pages the WebProcess stayed lower with blocking on (peak RSS 682-814 MB on, 779-844 MB off) |
@@ -216,17 +224,88 @@ file through WebKit:
   (EPERM in a title; `stat` works) and `remove` (fails in a title): without
   them WebKit's `deleteFile` failed and every compile left ~2500
   `SerializedNFA-*` files and the replaced list behind.
-- TLS in the title is untried: the update downloads through WebKit (the
-  NetworkProcess) instead of libsoup in the title.
+- TLS in the title is untried: the update downloads in the child process
+  (libsoup, as the NetworkProcess does). The title no longer runs any
+  JavaScript itself.
+
+## Compile and update in a child process
+
+WebKit's compile of this list peaks at several hundred MB. In the title,
+whose heap is dlmalloc over direct memory (`dheap.c`), ~420 MB of that
+stayed mapped until the browser restarted, and an update's JavaScriptCore
+conversion added ~400 MB more. Both now run in `ps5wk-child`, started as a
+*task payload*: the title writes `/data/ps5webkit/adblock/work/job.ini`
+and calls `wpe_process_manager_ps5_run_task(manager, "adblock", <job>)`,
+which uploads the child ELF to elfldr exactly as for a WebProcess (same
+serialized, retried path) with the header
+`PS5WK-LAUNCH 1 adblock 0 <job file>`. `ps5wk-child.cpp`'s `main` sees the
+type and runs `ps5wk_adblock_job` (`apps/child/adblock-job.c`) instead of a
+WebKit process: no IPC socket, no rendezvous.
+
+- **Same format, same code:** the child compiles with WebKit's public
+  `WebKitUserContentFilterStore` into the title's store directory under
+  the slot the title chose (the one not in use). It is the same WebKit
+  build as the title (packaged together), so the file's
+  `ContentRuleListStore::CurrentContentRuleListFileVersion` matches and the
+  title only loads it (`webkit_user_content_filter_store_load`: 2 ms).
+  The child `chmod`s what it writes to 0666 (payloads run as uid 0, the
+  title as uid 1; the title deletes the old slot later).
+- **Bundled list:** a payload can't see the title's `/app0`, so the title
+  copies `/app0/adblock/adblock-rules.json` (and the converter) into
+  `work/` on a short thread (streamed, 256 KiB buffer) before the launch.
+- **Progress:** the child's output comes back on the elfldr connection and
+  is relayed to the log as `[adblock] [adblock-job] ...`;
+  `[adblock-job] status: <text>` lines become the *Lists* card's status,
+  `[adblock-job] phase: compiling` switches `updating` to `compiling` in
+  `/settings.json`.
+- **Result:** the child writes `work/result.ini` last (ok / uptodate /
+  failed, message, compile ms, peak RSS). The title reads it when the
+  child's output closes. No result (crash: the crash guard ends the child,
+  a kill, the 20-minute limit) = failure, and the list in use stays. An
+  update's new list is saved only after it compiled, so a list that
+  doesn't compile is never picked at the next start.
+- **One job at a time** (`jobRunning`); an update asked for during a job
+  answers "the list is being updated or compiled".
+- **The title going away:** the child watches its stdin (the elfldr
+  connection) and ends when it closes, so a restarted title never has two
+  children writing the same slot. Checked: the title stopped 15 s into a
+  compile; the child's temporary file stopped growing and no slot was
+  written.
+- **Temporary files:** `TMPDIR` for the child is `work/tmp` (WebKit's
+  `SerializedNFA-*`); WebKit writes `ContentRuleList-XXXXXX` next to the
+  result until it is complete. A payload can list directories, so each job
+  first removes leftovers of an ended one (both places), and clears
+  `work/tmp` at the end; the title removes the job files after each job
+  and at start.
+- The child runs at `setpriority(10)` (one busy core for about a minute).
+
+**Measured on the console** (2026-11-02, WC build, log-only, 119449 rules):
+
+| | title direct heap (before / during / after) | child | total |
+| --- | --- | --- | --- |
+| first-start compile (Wikipedia loading at the same time) | 26.8 / 26.8 / 26.8 MB (peak 26.8) | peak RSS 472 MB, compile 52.7 s | 55.3 s launch to list in use; load 2 ms |
+| forced update (`POST /adblock?do=update`) | 26.8 / 26.8 / 26.8 MB (peak 26.8) | peak RSS 477 MB (408 MB after the conversion); manifest 0.26 s, 10 files (4.7 MB) 3.4 s, conversion 3.1 s, compile 56.8 s | 64.9 s; same sha256 as node (`04185856...`) |
+| before (compile in the title) | 27 / 557-691 / 370-450 MB (kept until restart) | - | 44-67 s; +400 MB more during an update's conversion |
+
+Flexible memory stayed at 282 MB in the title throughout. Page loads
+during the compile (BBC News, MDN, Wikipedia, twice each, warm cache):
+1.0-1.6 s, against 1.1-2.1 s with nothing running: no slowdown measured.
+The upload of the child ELF (130 MB) to elfldr took 0.25-0.28 s.
+
+**Was it only the allocator?** Measured once with the old in-title
+compile followed by `dheap_trim()` (dlmalloc `mspace_trim` on every
+arena): the heap went from 370.8 MB after the compile to 134.8 MB, against
+26.8 MB before it. So a trim gives back about two thirds, but ~110 MB stays
+(blocks still in use scattered over 2 MB segments), and the 557-691 MB
+peak in the title remains. Not used; the child process returns all of it.
 
 ## Options if it is too heavy
 
-The compile cost (time, and the title heap kept until restart) scales with
-the rule count. Easyprivacy is 56313 of the 119449 rules (trackers, not
-ads); easylist 46189. Leaving easyprivacy out would roughly halve compile
-time and memory; it would be a list of rulesets in `rulesetsFromManifest`
-(not done: the owner asked for the default set). A restart after an update
-gives the ~420 MB back; a heap trim in dheap.c would avoid that.
+The compile cost (time; memory now only in the child) scales with the rule
+count. Easyprivacy is 56313 of the 119449 rules (trackers, not ads);
+easylist 46189. Leaving easyprivacy out would roughly halve compile time
+and memory; it would be a list of rulesets in `rulesetsFromManifest` (not
+done: the owner asked for the default set).
 
 ## Not in phase 1
 
