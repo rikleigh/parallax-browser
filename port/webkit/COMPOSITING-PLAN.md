@@ -2363,3 +2363,115 @@ pushed right, with and without `overflow=1`. Not done: the white flicker
 when scrolling back up fast. With pool surfaces released near the cap and
 less lookahead, the cap should trip less often there, but the flicker
 itself needs a capture.
+
+### Carousel snap feel and the missing last card (2026-11-02, src-wc 9c7811f80e)
+
+Owner's TV run (build 20261102-122550, `compositing` + `stickframe=1`) on
+the phone product page: (1) "carousels scroll better, but we seem to have
+snapping on the carousel items which I don't see in Chrome", then "maybe
+there is snapping in Chrome, but it feels very smooth and the carousel just
+settles on the correct image naturally"; (2) "the first horizontal carousel
+is missing the last image".
+
+**What the page declares.** Its galleries are `overflow-x: scroll` with
+`scroll-snap-type: x mandatory` (the media gallery: items `scroll-snap-align:
+center`; the other galleries `start`, the last item `start end`), no
+`scroll-snap-stop`; one product list uses `scroll-snap-type: inline`
+(proximity). Script: the gallery's scroll listener picks the current item
+200 ms after the last scroll event, marks items more than one away
+`out-of-view` (their card `display: none`), and runs a staggered fade-in
+(`will-change: opacity, transform`, `visibility: hidden` while waiting).
+Paddles call `scrollTo`. Snapping is what the CSS asks for, so it stays.
+
+**1. Snap feel.** Chrome ends a touchpad fling on a snap container by
+picking the snap position nearest the fling's projected end and bending
+the fling onto it: the motion never stops, it decelerates onto the card.
+Ours (since b8033dea3f): the stick's precise wheel events have no end
+phase, so 100 ms after the last one the title sent an end-of-gesture event
+and ScrollingEffectsController animated (ScrollAnimationSmooth: ease-in-out,
+1000 px/s, at most 200 ms) to the snap position nearest the stop. On screen:
+the carousel stopped, stood still for ~100 ms, then lurched, often
+backwards (`carousel.html`, centre carousel, frame steps after release:
+`36 36 36 0 0 -32 -29 -15 -7 -1`, a CAR-BACK yank in 1 of 2 gestures, and at
+the start edge it stayed at 0 although the first snap position is 64). The
+title's snap and the WebProcess don't fight: with the gesture nodes
+(2e90eec762) the WebProcess doesn't resnap while the title animates.
+
+Now (title, `PS5WCScrollingTree::startSnapGlide`): the release speed is the
+node's movement over the last 100 ms of stick scrolling; the target is the
+snap position nearest to where 0.2 s of that speed would take it (WebKit's
+snap selection, so snap-stop and proximity behave as specified; with
+proximity and nothing near, it glides to the projected position); the node
+glides there from the release speed on a cubic Hermite curve: an even
+deceleration when the duration is 2 x distance / speed (kept to
+0.25-0.7 s), a small overshoot and return when the target is behind. It
+runs per frame on the render thread at the frame's display time, starting
+one frame before its first frame (no catch-up jump). The gesture ends after
+40 ms without pad events (was 100 ms). Stick input during the glide takes
+over; a programmatic scroll cancels it. `glide=0` in the flag file restores
+the old snap, `gestureend=<ms>` the pause. Each glide logs
+`[ascroll] glide node N: from at v px/s -> snap target in T ms`.
+
+| `carousel.html`, centre carousel, `stickframe=1`, stick 0.7 s at rx 0.5 | settles | frame steps around the release |
+| --- | --- | --- |
+| `glide=0` (old) | 4/4 rightward on a card (after a snap back); 4/4 leftward left at 0, 64 px short of the first snap position | `36 36 36 36 36 0 0 -24 -33 -17 -8 -2 0` (stop, then back) |
+| default | 8/8 snapped, 0 CAR-BACK | `34 34 34 0 0 -32 -31 -31 -29 ... -3 -2 -1 0` (the stick's speed, decelerating over ~0.6 s onto the next card) |
+| default, `overflow=1` | 8/8 snapped | the same |
+
+Product page, media gallery at the view centre, stick 1 s at rx 0.5: every
+release glided onto a card (`3391 at 2004 px/s -> snap 3840 in 448 ms`,
+`1835 at -2085 px/s -> snap 1280 in 532 ms`; once 3879 -> 3840 against the
+motion, with a ~100 px overshoot and return). What remains: ~2 frames still
+between the last stick step and the glide (the 40 ms gesture end), and
+sub-scroller steps under the stick are not frame-locked (only the root is).
+
+**2. The missing last card: a WC compositing bug, not async scrolling.**
+A/B with the pad at the gallery (`pad-scroll-test rx=0.5 ry=0`; note: `rx=`
+alone keeps the default `ry=0.5`, a diagonal push): with the stick at the
+far end the DOM was the same in every mode (item 5 current, card `display:
+grid`, its image loaded at 1260 px), but the card was empty in WC without
+async scrolling and in WC with `stickframe=1`; the CPU path showed it.
+`PS5WK_WC_LAYER_LOG=2` (new, child.env: `[wc-cl]` lines with the compositing
+state of layers inside composited scrollers) showed the items composited
+(stacking, will-change: the fade-in) with the paint-order parent outside
+the scroller, so WebKit parents them under a "scrolling proxy" layer whose
+bounds origin is the scroll offset (correct in the WebProcess: 640, 1280,
+...). `GraphicsLayerWC::computeVisibleAndCoverageRect` applied a bounds
+origin to the visible rect only through the masksToBounds reset, which the
+proxy (0x0, not clipping) doesn't have: its children's tile coverage was
+computed as if the scroller were at 0, so items that came into view by
+scrolling never painted a tile. Videos in the other cards are their own
+layers, which is why only the static last card looked missing.
+GraphicsLayerCA doesn't tile such small layers, so upstream doesn't see it.
+Fix: a non-clipping layer with a bounds origin maps the visible rect into
+its children's space. Also, `setContentsVisible` now drops the scene's
+backing store while the contents are hidden and repaints every tile when
+they show again (as `setDrawsContent`): before, a layer hidden at a coverage
+change lost its store and got back only its dirty tiles.
+
+New test page `test/paint/carousel-cards.html` (synthetic): carousels with
+cards as stacking contexts, `display` switching, items with
+`transform: translateY(0)`, and a `vis` carousel of composited items with
+`visibility: hidden` switching. `?step=3000` scrolls them from script. With
+`debug-screenshot` `series=1000x26`, WC without async scrolling: the `vis`
+carousel was blank in every capture before the fix and shows its cards
+after. Product page after the fix: the last card shows in WC with and
+without `stickframe=1` (captures at the end of each stick gesture).
+
+Also seen, not changed: pad wheel events have no phases, so WebKit fires
+`scrollend` after every step (logged in CPU, WC and async modes alike);
+Chrome fires it once per gesture. The gallery uses its own 200 ms timer, so
+it isn't affected.
+
+**Checks on the final build** (20261102-140250, log-only PPSA99020):
+`scrolljank.html?busy=30`, ry 0.5, `stickframe=1`: 56.0 moving frames/s,
+pad -> present 13.2 ms avg (2017 events in the title), no glide (the root
+doesn't snap); tile uploads 0.09-0.11 ms each (the console isn't slow).
+
+**For the owner on the TV:** `compositing` + `stickframe=1` on the phone
+product page: push the stick right through the first gallery and let go
+between cards; it should carry on and slow down onto a card, not stop and
+jump. The last card ("Siri") should show. Same with `overflow=1`. If the
+glide feels too long or carries too far: `glide=0` gives the old snap for
+comparison; the projection (0.2 s) and duration range are constants in
+`startSnapGlide`.
