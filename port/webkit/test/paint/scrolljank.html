@@ -10,6 +10,7 @@
        &spike=<ms>&every=<ms>  long tasks from a timer (default every 1000)
        &layers=<n>        n small composited layers spread over the feed
                           (scene paint cost in the title)
+       &cluster=<px>      the layers only within the first <px> px of the feed
        &parallax          a scroll-linked transform set from a scroll listener
                           (lags while the main thread is behind: expected)
        &prevent           the grey "wheel region" calls preventDefault on wheel
@@ -101,7 +102,7 @@ body.inline #scroller, body.inline #wheel { width: auto; }
         var dot = document.createElement("div");
         dot.className = "dot";
         dot.style.left = (20 + (d * 37) % 1040) + "px";
-        dot.style.top = (100 + (d * 211) % (feed.scrollHeight - 200)) + "px";
+        dot.style.top = (100 + (d * 211) % ((+q.get("cluster") || feed.scrollHeight) - 200)) + "px";
         feed.appendChild(dot);
     }
     var para = null;
