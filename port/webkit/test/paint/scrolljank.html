@@ -15,6 +15,7 @@
        &prevent           the grey "wheel region" calls preventDefault on wheel
                           events (no scrolling while the pointer is over it)
        &posts=<n>         number of posts (default 200)
+       &nowheel           no wheel listener on the page at all
        &inline            the overflow scroller and the wheel region span the
                           column (the pad scrolls at the screen centre: it then
                           lands on them); by default they are 440 px wide on the left
@@ -121,7 +122,7 @@ body.inline #scroller, body.inline #wheel { width: auto; }
         if (para)
             para.style.transform = "translateY(" + (y * 0.5) + "px)";
     }, { passive: true });
-    document.getElementById("wheel").addEventListener("wheel", function (e) {
+    if (!q.has("nowheel")) document.getElementById("wheel").addEventListener("wheel", function (e) {
         if (prevent) {
             e.preventDefault();
             stats.prevented++;

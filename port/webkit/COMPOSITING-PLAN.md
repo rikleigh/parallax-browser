@@ -1897,3 +1897,78 @@ compositing off and once with it on. Both should be about as slow while
 the covers download (several seconds per screen on this link), and both
 quick when revisited within the HTTP cache's life. A wired connection
 would help here: the console's link measured ~5 MB/s, LAN ping 18-75 ms.
+
+### Async scrolling: second round (2026-11-02, src-wc e8f6923ada)
+
+New flag file tokens: `/data/ps5webkit/wc-async-scroll` content, e.g.
+`stickframe=1 overflow=1`. Early replies are on by default.
+
+- **Early replies** (default; `earlyreply=0` turns them off). With async
+  scrolling the title paints every frame of a scroll itself, so the
+  WebProcess's update found a frame already in progress. Its reply came after
+  the following swap: `frame done` 24 ms against 4 ms without the flag, and
+  `?busy=30` updates fell from 28 to 19/s. The cause was not the DOM wheel
+  dispatch: `?nowheel` (no wheel listener) ran the same 18.8/s. Updates of an
+  async-scrolling scene are now answered when applied, since their tiles have
+  been copied out of the arena by then. Result: `frame done` 12.6 ms,
+  22.6 updates/s.
+- **Frame-locked stick (AS5, `stickframe=1`).** Title-handled pad wheel events
+  become a velocity (smoothed, per axis) that the render thread integrates
+  over each frame's display-time interval, within what has been queued, all
+  of it once the stick stops for 30 ms, catching up if more than 3 frames'
+  worth waits. The painted-edge clamp applies per frame.
+- **Async sub-scrollers (AS4, `overflow=1`).** The innermost overflow or
+  iframe container rect (surface rects from the last paint) under the point
+  scrolls in the title, chaining to its ancestors at its limits
+  (`EventTargeting::Propagate`), unless that node scrolls synchronously.
+  Without the token the WebProcess picks the node, as before.
+
+Same method as the first round (build 20261102-035852-730265f633 unless
+noted; "step sd" = standard deviation of the root's per-frame scroll step, ry
+0.5 ≈ 34 px per frame):
+
+| scrolljank page | mode | moving frames/s | pad -> present ms | step sd | WebProcess updates/s |
+| --- | --- | --- | --- | --- | --- |
+| `?busy=30` | off | 25.9 | 32.0 / 70.1 / 70.1 | | 28.2 |
+| | async, earlyreply=0 | 56.6 | 13.4 / 32.6 / 34.1 | 13.8 px | 18.7 |
+| | async (early replies) | 57.8 | 12.1 / 17.2 / 32.6 | 5.9 px | 22.6 |
+| | async + stickframe=1 | **59.7** | **12.0 / 17.3 / 19.5** | **3.7 px** | 22.6 |
+| idle main thread (build 033…, no early replies) | async | 59.5 | 13.0 / 17.2 / 25.1 | 7.0 px | 60.0 |
+| | async + stickframe=1 | 59.6 | 12.6 / 17.1 / 27.0 | 2.0 px | 60.0 |
+| `?busy=8&spike=200&every=700` | async + stickframe=1 | 53.8 | 12.9 / 17.2 / 179 | 5.6 px | 42.9 |
+
+**Real pages** (build 20261102-032153; flag on/off, ry 0.5, 40 s from load):
+- reddit front page (the TV log's heavy feed): moving frames/s 5.8 to
+  **41.2**, pad -> present 317 to **28 ms** avg. The WebProcess ran 5-8
+  updates/s while the page loaded and settled. 1332 wheel events were
+  shortened at the painted edge (lead up to 1476 px): the page stopped at the
+  edge of painted tiles rather than showing unpainted area.
+- MDN reference page with sticky header, breadcrumbs, sticky sidebar and
+  table of contents: 6 mid-scroll captures with the flag on and off at the
+  same moments. The header and breadcrumb rows (0-48 of 540) are identical
+  in every pair; below them only the scroll offset differs (the async run is
+  a few px further on). Sidebar and TOC are in place.
+
+**VR with the flag on** (`vr-sim` + `vr-selftest`, video.html with the 1080p
+H.264 clip, async + stickframe): `RESULT ps5browser vr PASS headset shows the
+video`, 57.6 headset frames/s, the WebProcess kept updating at 56.8/s
+(commits applied in the VR loop), no crash. The self-test's full enter/leave
+sequence didn't finish within the 60 s dwell in either run (no FAIL line;
+same as before this work).
+
+**AS4 check** (`?inline&busy=30`, the overflow box spans the column under
+the scroll point, `overflow=1`): 2833 of 2833 wheel events handled in the
+title (against 350 sent to the WebProcess without the token). Captures show
+the box scrolled (rows 4-11) with its sticky inner header in place and the
+page held still around it. Its scrollbar thumb is the WebProcess's (it lags).
+
+**Flag absent on the final build:** WC `?busy=30` 25.9 moving frames/s,
+32 ms, the same as the AS0 baseline. With compositing off the CPU path paints
+on 4 threads and scrolls (23 scroll events/s).
+
+**Left:** AS6 (scene paint culling for many-layer pages); a title-drawn
+scrollbar thumb; AS4 hit testing ignores pointer-events/z-order (a fixed
+element over a scroller still routes to the scroller); the owner's TV check.
+Suggested TV setting: `/data/ps5webkit/wc-async-scroll` with content
+`stickframe=1` (add `overflow=1` to try async overflow boxes), with
+`/data/ps5webkit/compositing` on. Then Restart page.

@@ -12,7 +12,7 @@ import sys
 ASCROLL = re.compile(r"\[ascroll\] ([\d.]+) s: (\d+) frames moved the page \((\d+) by WebProcess updates, (\d+) by the title\); (\d+) pad wheel events; "
                      r"pad -> present ([\d.]+) ms avg, p50 ([\d.]+), p95 ([\d.]+), max ([\d.]+) \((\d+), (\d+) stale\); step ([\d.]+) px avg, ([\d.]+) max")
 ROUTE = re.compile(r"\[ascroll\] ([\d.]+) s: wheel events in the title (\d+), sent to the WebProcess first (\d+); clamped at the painted edge (\d+) \((\d+) px\); "
-                   r"lead over the WebProcess ([\d.]+) px avg, ([\d.]+) max; (\d+) tree commits")
+                   r"lead over the WebProcess ([\d.]+) px avg, ([\d.]+) max; (\d+) tree commits(?:; per-frame step ([\d.]+) px avg, sd ([\d.]+))?")
 WC = re.compile(r"\[wc\] ([\d.]+) s: (\d+) updates .*?(\d+) presents;.*?(\d+) paints \(([\d.]+) ms avg")
 SJ = re.compile(r"SJ [\d.]+ s: scroll events (\d+), rAF (\d+), scrollY (\S+), long tasks (\d+), lazy loaded (\d+), prevented (\d+)")
 
@@ -22,6 +22,7 @@ def summarize(path):
     moved, lat_avg, lat_p95, lat_max, inputs, steps = [], [], [], [], [], []
     wc_updates, wc_paints, sj_scroll, sj_raf = [], [], [], []
     routes = [0, 0, 0, 0]
+    step_avg, step_sd = [], []
     lead_max = 0.0
     lazy = prevented = 0
     by_update = by_title = 0
@@ -50,6 +51,9 @@ def summarize(path):
             routes[2] += int(m.group(4))
             routes[3] += int(m.group(5))
             lead_max = max(lead_max, float(m.group(7)))
+            if m.group(9) and int(m.group(2)) >= 20:
+                step_avg.append(float(m.group(9)))
+                step_sd.append(float(m.group(10)))
             continue
         m = WC.search(line)
         if m and pending_scroll_second:
@@ -72,6 +76,7 @@ def summarize(path):
           f"pad events/s {avg(inputs):.0f}; pad->present avg {avg(lat_avg):.1f} ms, p95 max {max(lat_p95 or [0]):.1f}, max {max(lat_max or [0]):.1f}; "
           f"step {avg(steps):.1f} px; WebProcess updates/s {avg(wc_updates):.1f}, scene paint {avg(wc_paints):.2f} ms; "
           f"wheel title/WebProcess {routes[0]}/{routes[1]}, clamped {routes[2]} ({routes[3]} px), lead max {lead_max:.0f}; "
+          f"title per-frame step {avg(step_avg):.1f} px, sd {avg(step_sd):.1f}; "
           f"SJ scroll events/s {avg(sj_scroll):.1f}, rAF/s {avg(sj_raf):.1f}, lazy {lazy}, prevented {prevented}; crash-ish lines {crashes}")
 
 
