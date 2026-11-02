@@ -14,6 +14,9 @@ void ps5wk_vr_toggle(void);
 /* Leave VR; wait: until the headset is released (wind-down). */
 void ps5wk_vr_stop(gboolean wait, const char* why);
 gboolean ps5wk_vr_active(void);
+/* View in VR's pad handling (the touchpad, the whole pad while in VR):
+ * TRUE when it took the press. For a button handler that chains it. */
+gboolean ps5wk_vr_buttons(guint32 pressed);
 /* Log-only test sequence (/data/ps5webkit/vr-selftest with vr-sim): started
  * after a test page loaded. */
 void ps5wk_vr_selftest_schedule(unsigned delaySeconds);

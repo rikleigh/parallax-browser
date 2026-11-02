@@ -10,7 +10,8 @@
  * Pad (see WPEDisplayPS5.cpp for the full map):
  *   left stick: pointer, X: click (or Enter when the pointer is hidden),
  *   right stick: scroll, D-pad: move between links (spatial navigation),
- *   O: back, Options: type a URL or search, Square: reload,
+ *   O: back, Options: the browser menu (address bar, tabs, bookmarks,
+ *   history: browserui.c), Square: reload,
  *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard
  *   (also opens by itself when X on a field, the D-pad or L1/R1 focus one),
  *   R3 (press the right stick): Settings, and back to the page from there,
@@ -28,6 +29,7 @@
 #include "../common/webmem.h"
 #include "common/title.h"
 #include "adblock.h"
+#include "browser.h"
 #include "settings.h"
 #include "viewinvr.h"
 
@@ -118,6 +120,9 @@ static gboolean beginWindDown(gpointer data)
     windDownStart = g_get_monotonic_time();
     /* The headset first: Hmd2/VrTracker2 left open could need a reboot. */
     ps5wk_vr_stop(TRUE, "wind-down");
+    /* The open tabs, before about:blank replaces the page. */
+    ps5wk_browser_close_menu();
+    ps5wk_browser_save();
     spike_log("wind-down: quit requested; %d audio stream(s) open; loading about:blank", ps5wk_audio_server_active_streams());
     if (webView)
         webkit_web_view_load_uri(webView, "about:blank");
@@ -193,6 +198,12 @@ static void logHandler(const gchar* domain, GLogLevelFlags level, const gchar* m
     spike_log("[%s %s] %s", domain ? domain : "app", kind, message);
 }
 
+static char* uriFromInput(const char* text);
+char* ps5wk_uri_from_input(const char* text)
+{
+    return uriFromInput(text);
+}
+
 static char* uriFromInput(const char* text)
 {
     while (*text == ' ')
@@ -209,21 +220,6 @@ static char* uriFromInput(const char* text)
     return uri;
 }
 
-static void onURLEntered(const char* text, gpointer data)
-{
-    (void)data;
-    if (!text) {
-        spike_log("URL prompt cancelled");
-        return;
-    }
-    char* uri = uriFromInput(text);
-    if (uri) {
-        spike_log("loading %s", uri);
-        webkit_web_view_load_uri(webView, uri);
-        g_free(uri);
-    }
-}
-
 static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
 {
     (void)view;
@@ -232,8 +228,8 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
         return FALSE;
     switch (wpe_event_keyboard_get_keyval(event)) {
     case WPE_KEY_Back:
-        if (webkit_web_view_can_go_back(webView))
-            webkit_web_view_go_back(webView);
+        /* not into the empty first entry of a new tab */
+        ps5wk_browser_go_back();
         return TRUE;
     case WPE_KEY_Reload:
         webkit_web_view_reload(webView);
@@ -255,15 +251,10 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
         webkit_web_view_set_zoom_level(webView, zoom);
         spike_log("zoom %.2f", zoom);
         return TRUE;
-    case WPE_KEY_Menu: {
-        /* Start from the current address, except for the built-in pages. */
-        const char* current = webkit_web_view_get_uri(webView);
-        if (!current || !strncmp(current, "data:", 5) || !strncmp(current, "file:", 5) || !strncmp(current, "about:", 6))
-            current = "";
-        if (!wpe_display_ps5_request_text(WPE_DISPLAY_PS5(display), "Address or search", current, TRUE, onURLEntered, NULL))
-            spike_log("URL prompt: no system keyboard");
+    case WPE_KEY_Menu:
+        /* Options is the browser's button (browserui.c takes it first). */
+        ps5wk_browser_toggle_menu();
         return TRUE;
-    }
     default:
         return FALSE;
     }
@@ -529,6 +520,8 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
+    /* Tabs, history, the address bar (browserui.c). */
+    ps5wk_browser_load_changed(event);
     /* The ad blocker's filter on or off for this page (allowed sites). */
     if (event != WEBKIT_LOAD_FINISHED)
         ps5wk_adblock_navigation(webkit_web_view_get_uri(view));
@@ -677,6 +670,11 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     lastCrashTime = 0;
 }
 
+char* ps5wk_home_url(void)
+{
+    return homeURL();
+}
+
 static char* homeURL(void)
 {
     gchar* contents = NULL;
@@ -801,6 +799,7 @@ static gboolean pushOpenOnMain(gpointer data)
         return G_SOURCE_REMOVE;
     if (ps5wk_vr_active())
         ps5wk_vr_stop(FALSE, "a link was sent");
+    ps5wk_browser_close_menu();
     spike_log("push: loading %s", uri);
     loadStart = g_get_monotonic_time();
     webkit_web_view_load_uri(webView, uri);
@@ -1131,6 +1130,13 @@ static void toggleSettings(void)
     spike_log("settings: R3, opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
     loadStart = g_get_monotonic_time();
     webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
+}
+
+/* The browser menu's L3/R3 and Settings links: Settings, unless shown. */
+void ps5wk_open_settings(void)
+{
+    if (!isSettingsURI(webkit_web_view_get_uri(webView)))
+        toggleSettings();
 }
 
 /* host: the Host header; origin: the Origin header or "". */
@@ -1472,10 +1478,11 @@ static void pushServe(int client, const char* from, gboolean loopback)
     const char* path = target;
     gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
         || !strcmp(path, "/adblock");
+    gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
 
     if (!strcmp(method, "OPTIONS")) {
         /* No CORS for the settings: a page elsewhere can't send them JSON. */
-        pushReplyCORS(client, 204, "text/plain", NULL, !settingsPath);
+        pushReplyCORS(client, 204, "text/plain", NULL, !settingsPath && !browserPath);
         g_free(request);
         return;
     }
@@ -1498,6 +1505,24 @@ static void pushServe(int client, const char* from, gboolean loopback)
 
     if (settingsPath) {
         settingsServe(client, from, loopback, get, post, path, query, body, type, host, origin, pinOK);
+    } else if (browserPath) {
+        /* Tabs, bookmarks, history and simulated menu keys (browserui.c):
+         * the settings' rules (no CORS, same Host and Origin, the PIN). */
+        if (!pinOK && !loopback)
+            settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
+        else if (!settingsRequestAllowed(host, origin)) {
+            spike_log("browser: refused a request from %s (Host \"%s\", Origin \"%s\")", from, host, origin);
+            settingsReplyJSON(client, 403, FALSE, "refused");
+        } else if (windDownStart)
+            settingsReplyJSON(client, 503, FALSE, "the browser is closing");
+        else {
+            int code = 200;
+            char* reply = ps5wk_browser_api(method, path, query, body, &code);
+            if (post)
+                spike_log("browser API from %s: %s %s%s%s", from, method, path, query ? "?" : "", query ? query : "");
+            pushReplyCORS(client, code, "application/json", reply, FALSE);
+            g_free(reply);
+        }
     } else if (!strcmp(path, "/status") && get) {
         char* shown = copyShownURI();
         char* quoted = jsonString(shown);
@@ -1887,6 +1912,8 @@ int main(int argc, char** argv)
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
     g_signal_connect(webView, "mouse-target-changed", G_CALLBACK(onMouseTargetChanged), NULL);
     ps5wk_vr_init(display, webView);
+    /* After View in VR: the browser's button handler chains it. */
+    ps5wk_browser_init(display, webView);
     ps5wk_adblock_init(webView);
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 
@@ -1894,17 +1921,18 @@ int main(int argc, char** argv)
     g_timeout_add_seconds(60, memTimer, NULL);
 
     char* start = startURLFromLaunch(argc, argv);
+    char* home = homeURL();
     if (readTestURLs()) {
         if (start)
             spike_log("test URL list wins over the start URL %s", start);
+        ps5wk_browser_start(NULL, home, TRUE);
         loadNextTestURL();
     } else {
-        char* home = start ? g_strdup(start) : homeURL();
-        spike_log("loading %s", home);
+        /* The saved tabs come back; a start link opens in a new tab. */
         loadStart = g_get_monotonic_time();
-        webkit_web_view_load_uri(webView, home);
-        g_free(home);
+        ps5wk_browser_start(start, home, FALSE);
     }
+    g_free(home);
 
     g_free(start);
     pthread_t control;

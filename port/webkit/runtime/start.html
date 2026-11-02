@@ -8,8 +8,48 @@ ul{list-style:none;padding:0;display:grid;grid-template-columns:repeat(4,1fr);ga
 a{display:block;padding:28px 24px;border-radius:14px;background:#1f2633;color:#9cc7ff;font-size:28px;text-decoration:none}
 a:focus,a:hover{background:#2d3a52;outline:3px solid #9cc7ff}
 p{color:#9aa4b2;font-size:20px}
+a small{display:block;color:#9aa4b2;font-size:17px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+a span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style></head><body>
 <h1>PS5 WebKit</h1>
+<div id="mine"></div>
+<!-- Bookmarks and most visited pages: start-data.js is written by the
+     browser (browserdata.c) next to this file; web pages can't read it. -->
+<script src="start-data.js"></script>
+<script>
+(function () {
+    var data = window.ps5wkData;
+    if (!data)
+        return;
+    var mine = document.getElementById("mine");
+    function section(name, entries) {
+        if (!entries || !entries.length)
+            return;
+        var h = document.createElement("h2");
+        h.textContent = name;
+        var ul = document.createElement("ul");
+        entries.forEach(function (e) {
+            if (!/^https?:/.test(e.url))
+                return;
+            var li = document.createElement("li"), a = document.createElement("a"), t = document.createElement("span"), u = document.createElement("small");
+            a.href = e.url;
+            t.textContent = e.title || e.url;
+            u.textContent = e.url.replace(/^https?:\/\/(www\.)?/, "");
+            a.append(t, u);
+            li.append(a);
+            ul.append(li);
+        });
+        mine.append(h, ul);
+    }
+    section("Bookmarks", data.bookmarks);
+    section("Most visited", data.top);
+    if (mine.childNodes.length) {
+        var h = document.createElement("h2");
+        h.textContent = "Links";
+        mine.append(h);
+    }
+})();
+</script>
 <ul>
 <li><a href="https://en.wikipedia.org/wiki/PlayStation_5">Wikipedia</a></li>
 <li><a href="https://lite.duckduckgo.com/lite?q=ps5+vr2">DuckDuckGo</a></li>
@@ -45,6 +85,6 @@ p{color:#9aa4b2;font-size:20px}
 <li><a href="video.html?src=media/vrtest_MKX200_LR.mp4">Fisheye 200 (MKX200) 3D</a></li>
 <li><a href="video.html?src=media/sync-1080p30-h264.mp4">Flat video (big screen)</a></li>
 </ul>
-<p>Options = type an address or a search. R3 (press the right stick) = Settings (JIT, painting, video, sound, home page, clear cookies), and back. X on a text field (or Triangle while one is focused) = keyboard. O = back. Touchpad = watch the playing video in the PS VR2 headset (there: X play/pause, left/right seek 10 s, Triangle projection, Square recentre, O back to the TV).</p>
+<p>Options = the browser menu: address bar (X on it = type an address or a search), tabs, bookmarks, history. R3 (press the right stick) = Settings (JIT, painting, video, sound, home page, clear cookies), and back. X on a text field (or Triangle while one is focused) = keyboard. O = back. Touchpad = watch the playing video in the PS VR2 headset (there: X play/pause, left/right seek 10 s, Triangle projection, Square recentre, O back to the TV).</p>
 <p lang="mul">Fonts: العربية · עברית · हिन्दी · ไทย · বাংলা · தமிழ் · Ελληνικά · Русский · 日本語 · 中文 · 한국어 · ∑ ∞ → ★ · 😀 🎮 🚀 👍🏽 🇬🇧</p>
 </body></html>

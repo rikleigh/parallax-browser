@@ -48,6 +48,7 @@ default it asks for no password.
   used instead of `fetch`, because an https page may not fetch from a plain
   http address (mixed content). If the pop-up is blocked, the bookmarklet
   opens the same address in the current tab instead.
+- Links load in the tab shown (see *Tabs, bookmarks, history*).
 - **Terminal:** `tools/ps5open <url>` (bare hosts get `https://`, other words
   a DuckDuckGo search). With no argument it sends the front Safari tab, or
   Chrome's if Safari has none: if Safari or Chrome is the frontmost app, that
@@ -315,6 +316,139 @@ PS5's WebKit (the script ran, focus was on the selected JIT button). Not
 checked yet: R3 and D-pad navigation on the TV, the PIN box, and *Clear all
 website data* (skipped so the owner's site data was kept; same code path
 as cookies).
+
+## Tabs, bookmarks, history
+
+The browser has tabs, bookmarks, a history and an address bar, all on the
+pad. `apps/title/browserui.c` (tabs, the bar and menu, the pad while the
+menu is open, the `/browser` API) and `apps/title/browserdata.c` (the
+files).
+
+**Pad.** On a page, every button does what it did before, except
+**Options**, which now opens the **browser menu** instead of the URL prompt.
+The D-pad's focus starts on the address field, so **Options, then X** (or
+Triangle) brings up the system keyboard (URL layout, *Go*): an address, or
+words to search for (DuckDuckGo Lite, as before).
+
+| In the menu | |
+| --- | --- |
+| D-pad | move the yellow focus: the bar's buttons (left/right), down into the list, up back to the bar; left/right in a list switch lists |
+| X | pick: a button, a tab (switch to it), a bookmark or history entry (open it in this tab), *+ New tab*; with the pointer shown, what is under the pointer |
+| left stick | the pointer (the focus follows it) |
+| right stick | scroll the list |
+| L1 / R1 | previous / next list: Tabs, Bookmarks, History |
+| Square | close the tab / delete the bookmark / delete the history entry |
+| R2 | open the bookmark or history entry in a new tab |
+| Triangle | the keyboard for the address |
+| O or Options | close the menu |
+| L3 / R3 | close the menu, then home page / Settings |
+| touchpad | close the menu, then View in VR |
+
+The bar: Back, Forward, Reload (Stop while loading), Home, the address
+field (the page's title and address), the tab count, Bookmark (☆ adds the
+page shown, ★ removes it) and New tab (the home page). History has *Clear
+all history* at the top (X twice). While a page loads (menu closed), the bar
+shows at the top with the page's title, address and a progress line, and
+goes 1.5 s after the load ends; the pad still drives the page.
+`/data/ps5webkit/no-load-bar` (a file) turns that off.
+
+**Tabs and memory.** All tabs share the one WebKitWebView and its one
+WebProcess: only the tab shown is a live page. A background tab is its
+address, title, scroll position and WebKit's serialized session state (its
+back/forward list, `webkit_web_view_get_session_state`, a few hundred bytes
+to a few KB; over 512 KB only the address is kept). Switching reads the
+page's scroll position (a script in an isolated world), saves its state,
+restores the other tab's state and goes to its current entry, then scrolls
+back to where it was (again while the page is still at the top, for 3 s).
+WebKit loads a restored entry as a normal load (the HTTP cache revalidates,
+`wasRestoredFromSession`), so a switch costs a page load, not memory. A
+page that came from a form (POST) is never sent again by a switch or a
+restore: the tab shows *This page came from a form* with a link that loads
+the address without the form. A new tab starts with a fresh back/forward
+list (an empty `about:blank` first entry, built in WebKit's session state
+format, which Back skips). At most **12 tabs** (a 13th is refused with a
+message). Links with `target=_blank` and `window.open()` after a click open
+in a new tab; pop-ups without a click are dropped (`browser: pop-up without
+a click blocked`). Links sent from another device (`/open`, ps5open) load in
+the tab shown.
+
+**Session restore.** The tabs, the one shown, their scroll positions and
+back/forward lists are saved 2 s after a change and at the wind-down
+(before the `about:blank` of the wind-down), and come back at the next
+start; the tab shown loads, the others when picked. A link given at start
+(ps5open while the browser is closed, *Restart browser*) opens in a new tab
+after the restored ones, unless it is the page the restored tab shows. Test
+runs (`test-urls.txt`) neither restore nor write the session.
+`/data/ps5webkit/no-session-restore` (a file) starts with one tab (the
+session is still written).
+
+**Files** (`/data/ps5webkit`, JSON, each written to `<name>.tmp`, synced
+and renamed over the old one; no sync, no telemetry):
+
+| File | Contents |
+| --- | --- |
+| `session.json` | `{"version":1,"active":N,"tabs":[{"url","title","scrollX","scrollY","form","state"}]}`; `state`: the session state, base64; `form` 1: the page is a form's result |
+| `bookmarks.json` | `{"version":1,"bookmarks":[{"url","title","added"}]}`, newest first, at most 500 |
+| `history.json` | `{"version":1,"history":[{"url","title","last","visits"}]}`, newest first, at most 1000 pages; http/https only (not the start page, Settings or files); written 10 s after a change |
+| `start-data.js` | `window.ps5wkData = {bookmarks, top}`: the start page's *Bookmarks* and *Most visited* (pages visited at least twice). A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
+
+The start page (`runtime/start.html`, still the home page and what a new
+tab opens) shows the bookmarks and most visited pages above its links.
+
+**How it is drawn.** The title draws the bar and menu itself, like the
+performance overlay, instead of a second WebView (our platform has one view
+and the renderer one page; a second WebView would need a second page in
+the renderer and likely a second WebProcess). `wpe-ps5/PS5UICanvas.cpp`
+rasterizes rectangles and UTF-8 text on the CPU (FreeType, Noto Sans with
+the symbol, math, CJK and script Noto fonts as fallbacks, no shaping;
+rendered glyphs cached) into a premultiplied BGRA canvas;
+`wpe_display_ps5_set_ui_layer()` hands a copy to `PS5Renderer`, which puts
+it in a persistent GL buffer (a memcpy on the render thread, the page's own
+shader reads it) and draws it over the page or the composited scene, under
+the messages, the pointer and the performance overlay. So it is the same
+with GPU compositing on or off, and not shown in the headset (View in VR
+draws the TV notice instead). A menu frame is a 1920x1080 canvas (8 MB,
+freed when the menu closes; the renderer keeps one 8 MB GL buffer after
+the first use); the loading bar 1920x96 (0.7 MB).
+`wpe_display_ps5_set_ui_mode()` gives the pad to the application while the
+menu is open: every button to its handler (D-pad, L1/R1, L2/R2 repeat while
+held), the left stick moves the pointer without page events, the right
+stick and pointer moves to `wpe_display_ps5_set_ui_pointer_callback()`.
+The browser's button handler chains View in VR's (`ps5wk_vr_buttons`).
+
+**API** (link server, the settings' rules: no CORS, the same Host and
+Origin, the PIN; for log-only tests, since the pad can't be driven
+remotely; indexes are 1-based as in the menu):
+
+```sh
+curl http://192.168.1.50:9040/browser/state       # tabs, menu focus, back/forward, bookmarks, the last 50 history entries
+curl -X POST 'http://192.168.1.50:9040/browser/tab?action=new&url=example.com'   # or action=switch&index=2, action=close&index=2
+curl -X POST 'http://192.168.1.50:9040/browser/key?name=options'  # a menu press: options up down left right x o square triangle l1 r1 r2 l3 r3
+curl -X POST 'http://192.168.1.50:9040/browser/address?text=ps5+vr2'  # as typed on the keyboard
+curl -X POST 'http://192.168.1.50:9040/browser/bookmark'          # toggle the page shown (or url=...)
+curl -X POST 'http://192.168.1.50:9040/browser/history?action=clear'
+curl -X POST 'http://192.168.1.50:9040/browser/shot?name=menu'    # screen to /data/ps5webkit/shots/ui-menu.ppm (960x540)
+curl -X POST http://192.168.1.50:9040/browser/save                # write session/bookmarks/history now
+```
+
+The log shows `browser: ...` lines (new tab, `tab N: back to <url>
+(scroll x,y)`, `scrolled back to`, `came from a form`, menu open/closed,
+bookmarks) and `browser API from ...`. Test page: `test/browser/post.html`
+(posts a form once, for the form-result case).
+
+**Checked on the console** (2026-11-02, log only, GPU compositing on): new
+tab, switch and close through the API and simulated menu keys; screenshots
+of the menu (tabs, history, focus ring) and of the loading bar; a new tab's
+Back skips its empty first entry while a restored tab keeps its own back
+list; a page opened at an anchor (scroll 3207) came back at 3207 after two
+switches; six tabs of news, forum and code sites cycled 6 times with one
+WebProcess throughout (its peak RSS 582 MB, that of the heaviest page; the
+title's free flexible memory stayed at 279 MB and its direct memory went
+with the page shown, as before); the wind-down saved 6 tabs, the next start
+restored them (tab 4 shown) and opened the start link in a 7th; a form
+result tab showed *This page came from a form* on every return, with
+nothing posted. Not checked yet: the pad on the TV (focus, pointer, repeat,
+the keyboard from the address field), GPU compositing off.
 
 ## Build
 
@@ -2432,10 +2566,12 @@ later. Console log: `port/webkit/test/date.js`, results below.
 Pad map: D-pad = arrow keys (spatial navigation between links in the
 browser); X = click at the pointer when it is shown (it shows for 8 s after
 the left stick moves), otherwise Enter; O = Back; left stick = pointer;
-right stick = scroll under the pointer; Options = URL/search prompt;
+right stick = scroll under the pointer; Options = the browser menu (address
+bar, tabs, bookmarks, history; see *Tabs, bookmarks, history*);
 Triangle = keyboard for the focused field (it also opens by itself when X
 focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
-R3 = Settings (XF86Tools; see *Settings*).
+R3 = Settings (XF86Tools; see *Settings*); L3 = home page; L3 + R3 =
+performance overlay; touchpad = View in VR.
 
 GL goes through libepoxy; in the title, `--wrap=dlopen/dlsym` and
 `apps/title/dlshim.c` resolve epoxy's lookups to the statically linked

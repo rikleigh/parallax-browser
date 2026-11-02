@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>POST result test</title></head><body>
+<!-- Tab restore must not send a form again (browserui.c): this page posts a
+     form once on load; the result page is then a POST result. Switch to
+     another tab and back: the browser shows "This page came from a form"
+     instead of posting again. -->
+<form method="post" action="https://httpbin.org/post"><input name="tabtest" value="1"></form>
+<script>
+if (!sessionStorage.getItem("posted")) {
+    sessionStorage.setItem("posted", "1");
+    document.forms[0].submit();
+} else
+    document.body.append("Posted already (sessionStorage); clear it to post again.");
+</script>
+</body></html>

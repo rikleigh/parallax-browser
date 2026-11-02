@@ -867,6 +867,12 @@ static gboolean onButtons(WPEDisplayPS5* display, guint32 pressed, gpointer data
     return TRUE;
 }
 
+/* The browser's button handler (browserui.c) calls this first. */
+gboolean ps5wk_vr_buttons(guint32 pressed)
+{
+    return onButtons(vrDisplay, pressed, NULL);
+}
+
 void ps5wk_vr_init(WPEDisplay* display, WebKitWebView* webView)
 {
     vrDisplay = WPE_DISPLAY_PS5(display);
