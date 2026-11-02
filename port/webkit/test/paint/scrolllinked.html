@@ -1,0 +1,134 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>scroll-linked test</title>
+<!-- Scroll-linked effects under async scrolling (COMPOSITING-PLAN.md,
+     "Scroll-linked animations under async scrolling"). Self-contained:
+     upload to /data/ps5webkit/scrolllinked.html, open
+     file:///data/ps5webkit/scrolllinked.html, drive with pad-scroll-test
+     (rx=0 ry=0.5 shots=N).
+       (a) JS: a magenta bar (#ff00ff, 12 px) that a rAF callback keeps at
+           300 px from the top of the view by moving it in the document
+           (transform = scrollY + 300). In a mid-scroll capture its row is
+           300 px (at the capture's scale) only if the WebProcess's frame was
+           made at the scroll position the title presented: the offset is the
+           content lag in px (scrolllinked-shots.py).
+           A cyan bar (#00ffff) does the same from scroll events.
+       (b) IntersectionObserver: cards fade/slide in (CSS transition) when
+           they enter the view; the callback logs how far into the view the
+           card already was (px late).
+       (c) CSS scroll-driven animation (animation-timeline: scroll()), if this
+           WebKit supports it: a progress bar at the top.
+       ?busy=<ms>  busy-wait in every rAF callback.
+     Logs (console.log, the title log), once a second while scrolling:
+       SL <t> s: rAF n (scrolling n), same-position n, gaps>25ms n, max gap ms,
+       scroll events n, scrollY a..b, step avg px, IO n late avg/max px, sda yes|no
+     "same-position" = rAF frames during a scroll whose scrollY didn't change
+     (the WebProcess rendered without a new title position); gaps = rAF
+     intervals over 25 ms (a missed vsync). -->
+<style>
+html { background: #101820; }
+body { margin: 0; font: 22px/1.45 sans-serif; color: #dde6ee; background: #101820; }
+.band { height: 400px; border-bottom: 2px solid #31404e; padding: 16px 40px; box-sizing: border-box; }
+.band:nth-child(odd) { background: #16222e; }
+.card { display: inline-block; width: 300px; height: 160px; margin: 20px 30px 0 0; border-radius: 12px;
+        background: #3a6ea5; opacity: 0; transform: translateY(80px); transition: opacity 0.4s, transform 0.4s; }
+.card.in { opacity: 1; transform: none; }
+#jsbar { position: absolute; left: 0; top: 0; width: 100%; height: 12px; background: #ff00ff; z-index: 20; will-change: transform; }
+#evbar { position: absolute; left: 50%; top: 0; width: 50%; height: 12px; background: #00ffff; z-index: 21; will-change: transform; }
+#sda { position: fixed; left: 0; top: 0; height: 8px; width: 100%; background: #ffd34d; transform-origin: 0 0; transform: scaleX(0); z-index: 30; }
+@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@supports (animation-timeline: scroll()) {
+  #sda { animation: grow linear both; animation-timeline: scroll(root); }
+}
+</style></head>
+<body>
+<div id="sda"></div>
+<div id="jsbar"></div>
+<div id="evbar"></div>
+<div id="page"></div>
+<script>
+(function () {
+    var q = new URLSearchParams(location.search);
+    var busy = +q.get("busy") || 0;
+    var page = document.getElementById("page");
+    var html = [];
+    for (var i = 0; i < 90; i++) {
+        var cards = "";
+        for (var k = 0; k < 4; k++)
+            cards += '<div class="card" style="background:hsl(' + ((i * 47 + k * 30) % 360) + ',55%,45%)"></div>';
+        html.push('<div class="band">band ' + i + '<br>' + cards + '</div>');
+    }
+    page.innerHTML = html.join("");
+    var sda = CSS.supports("animation-timeline: scroll()");
+
+    var jsbar = document.getElementById("jsbar"), evbar = document.getElementById("evbar");
+    var t0 = performance.now(), lastLog = t0;
+    var s = { raf: 0, rafScrolling: 0, same: 0, gaps: 0, maxGap: 0, scroll: 0, min: 1e9, max: -1, steps: 0, stepPx: 0, io: 0, ioLate: 0, ioLateMax: 0 };
+    var lastY = scrollY, lastT = 0, lastScrollEvent = -1e9;
+
+    addEventListener("scroll", function () {
+        s.scroll++;
+        lastScrollEvent = performance.now();
+        evbar.style.transform = "translateY(" + (scrollY + 300) + "px)";
+    }, { passive: true });
+
+    var io = new IntersectionObserver(function (entries) {
+        var vh = innerHeight;
+        entries.forEach(function (e) {
+            if (!e.isIntersecting || e.target.classList.contains("in"))
+                return;
+            e.target.classList.add("in");
+            // How far into the view the card already was when we heard of it.
+            var r = e.boundingClientRect;
+            var late = Math.max(0, Math.min(vh - r.top, r.bottom));
+            s.io++;
+            s.ioLate += late;
+            s.ioLateMax = Math.max(s.ioLateMax, late);
+        });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".card"), function (c) { io.observe(c); });
+
+    function frame(t) {
+        var y = scrollY;
+        jsbar.style.transform = "translateY(" + (y + 300) + "px)";
+        s.raf++;
+        var scrolling = t - lastScrollEvent < 120;
+        if (scrolling) {
+            s.rafScrolling++;
+            if (y == lastY)
+                s.same++;
+            else {
+                s.steps++;
+                s.stepPx += Math.abs(y - lastY);
+            }
+            if (lastT) {
+                var gap = t - lastT;
+                if (gap > 25)
+                    s.gaps++;
+                s.maxGap = Math.max(s.maxGap, gap);
+            }
+        }
+        s.min = Math.min(s.min, y);
+        s.max = Math.max(s.max, y);
+        lastY = y;
+        lastT = t;
+        if (busy) {
+            var end = performance.now() + busy;
+            while (performance.now() < end) { }
+        }
+        var now = performance.now();
+        if (now - lastLog >= 1000) {
+            if (s.rafScrolling || s.scroll || s.io)
+                console.log("SL " + ((now - t0) / 1000).toFixed(1) + " s: rAF " + s.raf + " (scrolling " + s.rafScrolling + "), same-position " + s.same
+                    + ", gaps>25ms " + s.gaps + ", max gap " + s.maxGap.toFixed(1) + " ms, scroll events " + s.scroll
+                    + ", scrollY " + Math.round(s.min) + ".." + Math.round(s.max) + ", step avg " + (s.steps ? (s.stepPx / s.steps).toFixed(1) : 0) + " px"
+                    + ", IO " + s.io + " late avg " + (s.io ? Math.round(s.ioLate / s.io) : 0) + " max " + Math.round(s.ioLateMax) + " px, sda " + (sda ? "yes" : "no"));
+            s = { raf: 0, rafScrolling: 0, same: 0, gaps: 0, maxGap: 0, scroll: 0, min: 1e9, max: -1, steps: 0, stepPx: 0, io: 0, ioLate: 0, ioLateMax: 0 };
+            lastLog = now;
+        }
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    console.log("SL start: busy " + busy + " ms, scroll-driven animations " + (sda ? "supported" : "not supported") + ", height " + document.documentElement.scrollHeight);
+})();
+</script>
+</body></html>

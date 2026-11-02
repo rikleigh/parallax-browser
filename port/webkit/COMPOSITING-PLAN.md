@@ -2475,3 +2475,153 @@ jump. The last card ("Siri") should show. Same with `overflow=1`. If the
 glide feels too long or carries too far: `glide=0` gives the old snap for
 comparison; the projection (0.2 s) and duration range are constants in
 `startSnapGlide`.
+
+### Scroll-linked animations under async scrolling (2026-11-02, src-wc f4d8a064a5)
+
+Owner's A/B on a big phone product page (build 20261102-140250,
+`compositing` on): with `stickframe=1` the scroll animations "frequently only
+happen when scrolling stops"; without async scrolling they are "less smooth
+but work properly with the scrolling"; with `stickframe=1 gesturenodes=0` they
+"keep up but skip quite a few frames".
+
+**1. Gesture nodes (2e90eec762) don't hold anything back.** With the title's
+gesture set, `WCScrollingCoordinator::isUserScrollInProgress` answers true for
+the nodes the stick scrolls, as Cocoa's `RemoteScrollingCoordinator` does
+with the UI process's user-scroll nodes (`m_nodesWithActiveUserScrolls`). In
+this WebCore the answer is read only by `ScrollableArea::resnapAfterLayout`
+(ScrollableArea.cpp:657, the carousel fix), the post-layout clamp of overflow
+scrollers (RenderLayerScrollableArea.cpp:1322, which Cocoa skips during a
+gesture too), `KeyboardScrollingAnimator::beginKeyboardScrollGesture` (:215)
+and a log line. Scroll events (`Document::runScrollSteps` defers only for
+`Page::shouldDeferScrollEvents`, an iOS resize path), IntersectionObserver,
+scroll timelines and the rAF clock don't look at it. Measured, same build,
+pad-scroll-test ry 0.5:
+
+| | gesture nodes on | `gesturenodes=0` |
+| --- | --- | --- |
+| `scrolllinked.html`: rAF / scroll events per s while scrolling | 54.7 / 54.4 | 54.6 / 54.5 |
+| same: JS-moved bar in mid-scroll captures | 24/24 one frame (35 CSS px) behind | 18/18 one frame behind |
+| product page (script counting DOM changes): scroll events/s, rAF/s | 40.6, 51.2 | 41.0, 51.5 |
+| same: class / style attribute changes per s, scrolling | 5.3 / 72 | 5.4 / 63 |
+| same: class / style changes per s, still | 0.4 / 20 | 0.5 / 20 |
+
+The page's animation changes come while it scrolls in both modes. The
+owner's two runs differ in input rather than mode: run 1 had 34.8 moving
+frames/s in vertical scrolling seconds (part deflection, stops, carousel
+use), the `gesturenodes=0` run 52. The WebProcess's numbers in those seconds
+were the same (53.5 against 54.5 updates/s, lead 27 against 29 px). So the
+gesture set stays as it is (Cocoa's behaviour). Narrowing it to snap
+containers would only change the overflow clamp and keyboard scrolls.
+
+**2. What "skips frames": page content a frame behind the scroll.** With
+async scrolling the title presents its own scroll position every frame.
+Anything the page positions from `scrollY` (rAF code, scroll listeners,
+IntersectionObserver-started transitions, scroll-driven animations) is in
+the WebProcess's layers, made at an older position:
+- Early replies (e8f6923ada) answered an update when the render thread
+  applied it, at the start of a frame (`applyPending`). The new frame's
+  stick step was integrated later in that frame and went out as
+  `ScrollUpdatesWC` after the reply, so the rendering update the reply
+  started usually ran at the previous position.
+- The update then arrived while the frame was painting and was applied at
+  the next frame's start, where the title had moved on again. `frame done` was
+  16 ms with early replies on a light page.
+- Result on `scrolllinked.html`: the JS-positioned bar 35 CSS px (exactly one
+  ry 0.5 step) off in 24 of 24 mid-scroll captures. Without async scrolling it
+  is exact (18/18) because the WebProcess moves the page itself. When the
+  WebProcess misses a vsync the offset becomes two steps for a frame: the
+  "skipped frames".
+
+**Fix: frames that scroll wait for the update made at their position**
+(`SceneHost::syncWithWebProcess`, PS5WCHost.cpp; like the
+rendering-update synchronization of Cocoa's `RemoteLayerTreeEventDispatcher`
+and `ThreadedScrollingTree`, which wait up to half a frame for the main
+thread's commit before applying scroll positions, and desynchronize when it
+is late):
+- Replies to early-answered updates are held (`m_heldReplies`). At the start
+  of the frame's paint the tree is serviced first (the frame-locked stick
+  step, snap glide, animations). Its scroll updates go to the main thread,
+  then the held replies on the same queue, so `ScrollUpdatesWC` arrives at
+  the WebProcess before the reply that starts its next rendering update.
+- If the root moved this frame, the render thread waits for the WebProcess's
+  update made at that position (its `mainFrameScrollPosition` within 1 px). It
+  waits until `displayUS - max(R, scene paint + R - 3 ms)`, R = 5 ms
+  (`syncreserve=<ms>` in the flag file, 3-14), then applies the update and
+  paints. The reply to that update is held until the next frame's position
+  has gone out. An update made before the position arrived (stale) is
+  answered at once so the next one can come in time. A late update is
+  applied at the next frame start as before.
+- `didPresent` sends held replies if no paint synced this frame (VR loop, no
+  scene shown). If an in-frame sync is holding one, it asks for the next
+  frame, which sends it at once.
+- WebProcess (`DrawingAreaWC::scrollUpdatesWC`): a scroll update that comes
+  with no update in flight fires the refresh monitor at once (not twice
+  within 8 ms) instead of waiting for the idle 60 Hz timer.
+  `[render] wc scroll:` counts them. They were 0-1 in these runs: pages that
+  scroll always had an update in flight.
+- Also: `applyFrameLockedScroll` takes one step per frame (a second service
+  within 4 ms would have taken the whole queue as catch-up).
+- `sync=0` in the flag file turns it off. New log line `[ascroll] 1.0 s sync:`
+  shows frames that moved the root, how many had content made at that
+  position, and waits (avg/max ms, in time, missed, stale first).
+  `title-ascroll-summary.py` sums it and the test page's `SL` lines.
+
+New test page `test/paint/scrolllinked.html` (synthetic):
+- (a) a magenta bar that a rAF callback keeps 300 px below the top of the view
+  (transform = scrollY + 300), and a cyan one moved from scroll events;
+- (b) cards with IntersectionObserver-started CSS transitions (`IO late`: how
+  far into the view a card was when the callback ran);
+- (c) a CSS scroll-driven progress bar (`animation-timeline: scroll()`,
+  supported in this build).
+- `SL` lines per second: rAF and scroll events while scrolling, rAF frames
+  without a new position, gaps over 25 ms.
+- `scrolllinked-shots.py` reads the bars' rows in pad-scroll-test captures:
+  the offset from row 150 (960x540) is the content lag in capture px.
+
+**Results** (log-only PPSA99020, final build 20261102-152836 with
+`stickframe=1`, pad-scroll-test ry 0.5 rx 0, 4 s down / 4 s up; "in step" = moving
+frames whose content was made at the presented position; frame rates from
+runs without captures, which stall the render thread ~110 ms each):
+
+| page | mode | JS bar in captures | in step | WebProcess updates/s | moving frames/s (held seconds) | pad -> present avg |
+| --- | --- | --- | --- | --- | --- | --- |
+| `scrolllinked.html` | async off | 18/18 at 0 | | 60 | | |
+| | before (old build, sync n/a) | 24/24 at 35 px | 0 % | 56 | | 13.3 ms |
+| | `sync=0` | | 0 % (lead max 70 px) | 60.0 | 60 | 11.9 ms |
+| | **sync** | **18/18 at 0** (twice) | **100 %** (waits 2.5 ms avg) | 60.0 | 60 | 12.2 ms |
+| product page | old build | | | 52.8 | | 14.3 ms |
+| | `sync=0` | | 0 % | 57.3 | | 12.5 ms |
+| | sync, R = 7 ms | | 57.8 % | 58.3 | | 12.2 ms |
+| | **sync, R = 5 ms (default)** | | **72.4-72.8 %** (waits 6.9 ms avg) | 58.7 | | 12.1-12.2 ms |
+| `scrolljank.html?busy=30` | sync | | 0 % (30 ms rAF: always late) | 30.6 (28.2 without async before) | 60.0 | 11.8 ms |
+| `scrolljank.html?layers=2500` (4.2 ms scene paint) | sync / `sync=0` | | 0 % / 0 % | 40.3 / 35.2 | 60.0 / 60.0 | 12.5 / 12.3 ms |
+
+- Presents stayed at 59.9/s in every 5 s window with the stick held, in both
+  modes. Render max 17-21 ms, the same as `sync=0`, so the wait made no
+  frame miss its vsync.
+- On the product page scroll events reached the page 50.5/s with sync
+  against 44.5/s without (rAF 58.5 against 56.8).
+- On slow pages the wait ends at the deadline without the update. Stale
+  updates that come in meanwhile are applied in that frame and answered at
+  once. The WebProcess then runs a little faster than without sync (busy=30:
+  30.6 against 22.6-28/s before; layers=2500: 40 against 35/s) and the page
+  moves at 60 as before.
+- Regression checks: `carousel.html?relayout` rx 0.5 ry 0: full travel each
+  gesture (0 <-> 3384), 0 CAR-BACK, every rightward settle on a card
+  (leftward ones glide to the start edge at 0, which WebKit's snap selection
+  picks at the end of the travel: unchanged). Async absent: WC scrolls at 60,
+  SL 60 scroll events/s. Tile uploads 0.09-0.11 ms each: the console isn't
+  slow.
+
+Not done: product page frames that miss (27 %) are those whose WebProcess
+update (p95 ~8 ms with tiles) doesn't fit in ~11 ms after the frame starts.
+A larger window would need the stick step decided a frame earlier
+(more latency). Sub-scrollers (carousels) aren't synced: only root moves
+wait.
+
+**For the owner on the TV:** `compositing` + `wc-async-scroll` with
+`stickframe=1` on the phone product page: scroll-linked effects (the large
+text and image sequences that move with the page) should now move with the
+page rather than shudder a frame behind. To compare: add `sync=0` (the old
+behaviour). If frames ever stutter while scrolling a heavy page,
+`syncreserve=7` waits less.

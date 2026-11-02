@@ -8,7 +8,11 @@ updates/s in the same seconds ([wc] lines), wheel routing, clamps, lead,
 SJ scroll events/s and lazy loads, crashes; stuck seconds (>= 20 pad events,
 no frame moved the page, no sub-scroller moved: the GL-cap lock-up) and the
 longest run of them, steps sent on at zero lead, GL cap trips and restores,
-snaps after wheel, carousel yanks (CAR-BACK) and settles (CAR)."""
+snaps after wheel, carousel yanks (CAR-BACK) and settles (CAR); sync
+("[ascroll] ... s sync:" lines): frames the title moved the root and the
+share whose content was made at that position, sync waits (avg ms, in time,
+missed); scrolllinked.html's SL lines (rAF and scroll events while
+scrolling, rAF frames without a new position, gaps over 25 ms)."""
 import re
 import sys
 
@@ -19,6 +23,9 @@ ROUTE = re.compile(r"\[ascroll\] ([\d.]+) s: wheel events in the title (\d+), se
 WC = re.compile(r"\[wc\] ([\d.]+) s: (\d+) updates .*?(\d+) presents;.*?(\d+) paints \(([\d.]+) ms avg")
 EXTRA = re.compile(r"sub-scroller moves in the title (\d+); snaps after wheel (\d+)(?:; clamped with zero lead \(sent on\) (\d+))?")
 CAR = re.compile(r"CAR [\d.]+ s (\w+): left [\d.-]+, card \d+, off [\d.-]+ \((\w+)")
+SYNC = re.compile(r"\[ascroll\] [\d.]+ s sync: (\d+) frames moved the root in the title, content made at that position in (\d+) \(\d+ behind\); "
+                  r"waited for the WebProcess in (\d+) frames \(([\d.]+) ms avg, ([\d.]+) max\): its update came in time (\d+), missed (\d+), stale updates first (\d+)")
+SL = re.compile(r"SL [\d.]+ s: rAF (\d+) \(scrolling (\d+)\), same-position (\d+), gaps>25ms (\d+), max gap [\d.]+ ms, scroll events (\d+)")
 SJ = re.compile(r"SJ [\d.]+ s: scroll events (\d+), rAF (\d+), scrollY (\S+), long tasks (\d+), lazy loaded (\d+), prevented (\d+)")
 
 
@@ -39,7 +46,28 @@ def summarize(path):
     cap_restores = sum(1 for l in lines if "normal tile coverage again" in l)
     car_backs = sum(1 for l in lines if "CAR-BACK" in l)
     car_settles = {}
+    sync = [0, 0, 0, 0.0, 0, 0, 0]  # moving, in step, waits, wait ms sum, in time, missed, stale
+    sl = [0, 0, 0, 0, 0]  # seconds, rAF while scrolling, same position, gaps, scroll events
     for line in lines:
+        m = SYNC.search(line)
+        if m:
+            sync[0] += int(m.group(1))
+            sync[1] += int(m.group(2))
+            sync[2] += int(m.group(3))
+            sync[3] += int(m.group(3)) * float(m.group(4))
+            sync[4] += int(m.group(6))
+            sync[5] += int(m.group(7))
+            sync[6] += int(m.group(8))
+            continue
+        m = SL.search(line)
+        if m:
+            if int(m.group(2)) >= 40:
+                sl[0] += 1
+                sl[1] += int(m.group(2))
+                sl[2] += int(m.group(3))
+                sl[3] += int(m.group(4))
+                sl[4] += int(m.group(5))
+            continue
         m = ASCROLL.search(line)
         if m:
             secs = float(m.group(1))
@@ -109,6 +137,12 @@ def summarize(path):
     cars = ", ".join(f"{k} {sum(1 for v in vs if v == 'snapped')}/{len(vs)} snapped" for k, vs in sorted(car_settles.items()))
     print(f"    stuck seconds {stuck} (longest run {stuck_longest}); steps sent on at zero lead {zero_lead}; GL cap trips {cap_trips}, restores {cap_restores}; "
           f"sub-scroller moves {sub_moves}, snaps after wheel {snaps}; CAR-BACK {car_backs}" + (f"; CAR settles: {cars}" if cars else ""))
+    if sync[0] or sync[2]:
+        print(f"    sync: {sync[0]} frames moved the root, content in step {sync[1]} ({100.0 * sync[1] / max(1, sync[0]):.1f} %); "
+              f"waits {sync[2]} ({sync[3] / max(1, sync[2]):.1f} ms avg), in time {sync[4]}, missed {sync[5]}, stale first {sync[6]}")
+    if sl[0]:
+        n = sl[0]
+        print(f"    SL ({n} s scrolling): rAF {sl[1] / n:.1f}/s, same-position {sl[2] / n:.1f}/s, gaps>25ms {sl[3] / n:.1f}/s, scroll events {sl[4] / n:.1f}/s")
 
 
 for p in sys.argv[1:]:
