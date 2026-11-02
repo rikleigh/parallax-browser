@@ -135,6 +135,12 @@ public:
     void setVRSimLook(float yawDegrees, float pitchDegrees);
     // A short message over the page on the TV (e.g. "No headset").
     void showMessage(const char* text, double seconds);
+    // Main thread: the application's own UI (the browser's address bar and
+    // menu) over the page and under the pointer: premultiplied BGRA rows
+    // (row 0 = top, stride width * 4) at (x, y) in TV pixels; copied, so
+    // the caller keeps its buffer. nullptr removes it. Not drawn while the
+    // headset owns the render loop.
+    void setUILayer(const uint8_t* bgra, int x, int y, int width, int height);
     // Small luma pictures of the playing video (View in VR's layout guess):
     // up to `count` decoded frames at least 200 ms apart, within 1 s (fewer
     // if the video is paused: no newer frame within 400 ms ends it), each kThumbnailSize x kThumbnailSize bytes,
@@ -160,6 +166,8 @@ private:
     void writeCapture(char* path);
     void drawPanel(unsigned texture, int width, int height, double centerX, double centerY, double scale);
     void updateMessage(int64_t now);
+    void applyUILayer();
+    void drawUILayer();
 
     // PS5RendererVR.cpp, render thread
     void vrHandleRequests();
@@ -270,6 +278,21 @@ private:
     unsigned m_messageTexture { 0 };
     int m_messageWidth { 0 }, m_messageHeight { 0 };
     int64_t m_messageUntilUS { 0 };
+
+    // The application's UI layer: the latest image (guarded by m_lock), and
+    // on the render thread a persistent GL buffer the page shader reads (a
+    // texture when that program or the mapping is missing).
+    std::vector<uint8_t> m_uiPending;
+    int m_uiPendingRect[4] { };
+    bool m_uiChanged { false };
+    std::vector<uint8_t> m_uiStaging; // render thread: taken from m_uiPending
+    bool m_uiStagingNew { false };
+    unsigned m_uiBuffer { 0 };
+    uint8_t* m_uiMap { nullptr };
+    size_t m_uiBufferBytes { 0 };
+    unsigned m_uiTexture { 0 };
+    bool m_uiAsTexture { false };
+    int m_uiRect[4] { }; // x, y, width, height; width 0: none
 
     // View in VR requests (guarded by m_lock).
     struct VRRequest {

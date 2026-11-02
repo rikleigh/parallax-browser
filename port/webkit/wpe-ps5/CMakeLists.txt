@@ -6,6 +6,7 @@ set(WPEPlatformPS5_SOURCES
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5Renderer.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5RendererVR.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5Text.cpp
+    ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5UICanvas.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5VideoDecoder.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5VideoServer.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEDisplayPS5.cpp

@@ -62,7 +62,8 @@
  *   left stick       moves the drawn pointer
  *   right stick      scrolls under the pointer
  *   (the application's button handler sees presses first; ps5browser takes
- *   the touchpad button for "View in VR", and the whole pad while in VR)
+ *   the touchpad button for "View in VR", and the whole pad while in VR;
+ *   Options for its menu, which puts the pad in UI mode while open)
  */
 
 static constexpr unsigned padIntervalMS = 8;
@@ -129,6 +130,13 @@ struct _WPEDisplayPS5Private {
     uint32_t swallowedButtons { 0 };
     bool padCaptured { false };
     bool stickChord { false }; // L3 + R3 went down together: their own keys are not sent
+    // UI mode (wpe_display_ps5_set_ui_mode): the application's own UI has
+    // the pad; D-pad/L1/R1/L2/R2 presses repeat while held.
+    bool uiMode { false };
+    uint32_t uiRepeatButton { 0 };
+    double uiRepeatNext { 0 };
+    WPEDisplayPS5UIPointerCallback uiPointerCallback { nullptr };
+    gpointer uiPointerCallbackData { nullptr };
     WPEDisplayPS5PerfOverlayCallback perfOverlayCallback { nullptr };
     gpointer perfOverlayCallbackData { nullptr };
     WPEDisplayPS5VRCallback vrCallback { nullptr };
@@ -523,6 +531,56 @@ static void padScrollTestTick(WPEDisplayPS5* display)
     }
 }
 
+// UI mode: the pointer moves for the application's UI (no page events), the
+// right stick scrolls it, and held D-pad/shoulder buttons repeat.
+static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, uint32_t now, uint32_t pressed, double t)
+{
+    auto* priv = display->priv;
+    constexpr uint32_t repeatable = PS5_PAD_UP | PS5_PAD_DOWN | PS5_PAD_LEFT | PS5_PAD_RIGHT | PS5_PAD_L1 | PS5_PAD_R1 | PS5_PAD_L2 | PS5_PAD_R2;
+    if (pressed & repeatable) {
+        uint32_t bits = pressed & repeatable;
+        priv->uiRepeatButton = bits & (~bits + 1); // the lowest one
+        priv->uiRepeatNext = t + repeatDelay;
+    }
+    if (priv->uiRepeatButton && !(now & priv->uiRepeatButton))
+        priv->uiRepeatButton = 0;
+    if (priv->uiRepeatButton && t >= priv->uiRepeatNext && priv->buttonHandler) {
+        priv->uiRepeatNext = t + repeatInterval * 1.5;
+        uint32_t button = priv->uiRepeatButton;
+        priv->buttonHandler(display, button, priv->buttonHandlerData);
+        if (!priv->uiMode)
+            return;
+    }
+
+    int width = PS5Renderer::singleton().width(), height = PS5Renderer::singleton().height();
+    if (priv->activeView) {
+        width = wpe_view_get_width(priv->activeView);
+        height = wpe_view_get_height(priv->activeView);
+    }
+    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
+    double sx = stickValue(data.sticks[0]), sy = stickValue(data.sticks[1]);
+    if (sx || sy) {
+        if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
+            priv->pointerX = width / 2.0;
+            priv->pointerY = height / 2.0;
+        }
+        const double speed = 22.0;
+        priv->pointerX = std::fmin(std::fmax(priv->pointerX + sx * speed, 0), width - 1);
+        priv->pointerY = std::fmin(std::fmax(priv->pointerY + sy * speed, 0), height - 1);
+        priv->pointerMovedAt = t;
+        wpeDisplayPS5ScheduleRedraw(display);
+        if (priv->uiPointerCallback)
+            priv->uiPointerCallback(display, priv->pointerX, priv->pointerY, 0, priv->uiPointerCallbackData);
+        if (!priv->uiMode)
+            return;
+    } else if (priv->pointerWasVisible && !pointerVisible)
+        wpeDisplayPS5ScheduleRedraw(display);
+
+    double ry = stickValue(data.sticks[3]);
+    if (ry && priv->uiPointerCallback)
+        priv->uiPointerCallback(display, priv->pointerX, priv->pointerY, ry * 14.0, priv->uiPointerCallbackData);
+}
+
 static void padTick(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
@@ -588,8 +646,9 @@ static void padTick(WPEDisplayPS5* display)
     }
     if (pressed && priv->buttonHandler) {
         bool wasCaptured = priv->padCaptured;
+        bool wasUI = priv->uiMode;
         bool taken = priv->buttonHandler(display, pressed, priv->buttonHandlerData);
-        if (priv->padCaptured != wasCaptured || priv->activeView != view)
+        if (priv->padCaptured != wasCaptured || priv->uiMode != wasUI || priv->activeView != view)
             return; // the handler changed the pad's owner (held buttons are ignored until released)
         if (taken) {
             priv->swallowedButtons |= pressed;
@@ -598,6 +657,10 @@ static void padTick(WPEDisplayPS5* display)
     }
     if (priv->padCaptured) {
         priv->repeatingKey = 0;
+        return;
+    }
+    if (priv->uiMode) {
+        uiTick(display, data, now, pressed, t);
         return;
     }
 
@@ -948,6 +1011,52 @@ static void setPadCaptured(WPEDisplayPS5* display, bool captured)
         wpeDisplayPS5ScheduleRedraw(display);
     }
     PS5_LOG("pad %s", captured ? "captured (View in VR)" : "back to the page");
+}
+
+void wpe_display_ps5_set_ui_mode(WPEDisplayPS5* display, gboolean enabled)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    auto* priv = display->priv;
+    if (priv->uiMode == !!enabled)
+        return;
+    priv->uiMode = enabled;
+    priv->ignoredButtons |= priv->buttons;
+    priv->buttons = 0;
+    priv->swallowedButtons = 0;
+    priv->repeatingKey = 0;
+    priv->uiRepeatButton = 0;
+    if (priv->pointerDown && priv->activeView) {
+        priv->pointerDown = false;
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, priv->activeView, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
+        wpe_view_event(priv->activeView, event.get());
+    }
+    wpeDisplayPS5ScheduleRedraw(display);
+    PS5_LOG("pad %s", enabled ? "to the application's UI" : "back to the page");
+}
+
+gboolean wpe_display_ps5_get_ui_mode(WPEDisplayPS5* display)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return display->priv->uiMode;
+}
+
+gboolean wpe_display_ps5_get_pointer(WPEDisplayPS5* display, double* x, double* y)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    auto* priv = display->priv;
+    if (x)
+        *x = priv->pointerX;
+    if (y)
+        *y = priv->pointerY;
+    return nowSeconds() - priv->pointerMovedAt < pointerShownFor;
+}
+
+void wpe_display_ps5_set_ui_pointer_callback(WPEDisplayPS5* display, WPEDisplayPS5UIPointerCallback callback, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->uiPointerCallback = callback;
+    display->priv->uiPointerCallbackData = userData;
 }
 
 void wpe_display_ps5_set_perf_overlay(WPEDisplayPS5* display, gboolean enabled)

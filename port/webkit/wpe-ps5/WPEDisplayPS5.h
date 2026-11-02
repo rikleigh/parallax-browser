@@ -109,6 +109,76 @@ WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
 WPE_API void        wpe_display_ps5_set_pointer_over_editable (WPEDisplayPS5 *display,
                                                                gboolean       editable);
 
+/* ---- The application's own UI (the browser's address bar and menu) ---- */
+
+/* A CPU image (premultiplied BGRA) the application draws its UI into:
+ * rectangles and UTF-8 text with the Noto fonts in /data/ps5webkit/fonts
+ * (symbol, CJK and script fallbacks; no shaping). Main thread. Colours are
+ * 0xAARRGGBB, not premultiplied, blended over what is there. */
+typedef struct _WPEDisplayPS5Canvas WPEDisplayPS5Canvas;
+WPE_API WPEDisplayPS5Canvas *wpe_display_ps5_canvas_new        (int                  width,
+                                                                int                  height);
+WPE_API void                 wpe_display_ps5_canvas_free       (WPEDisplayPS5Canvas *canvas);
+WPE_API int                  wpe_display_ps5_canvas_get_width  (WPEDisplayPS5Canvas *canvas);
+WPE_API int                  wpe_display_ps5_canvas_get_height (WPEDisplayPS5Canvas *canvas);
+/* Every pixel set to @argb (0 = transparent). */
+WPE_API void                 wpe_display_ps5_canvas_clear      (WPEDisplayPS5Canvas *canvas,
+                                                                guint32              argb);
+/* A rectangle with corners rounded by @radius px. */
+WPE_API void                 wpe_display_ps5_canvas_fill       (WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  y,
+                                                                int                  width,
+                                                                int                  height,
+                                                                int                  radius,
+                                                                guint32              argb);
+/* One line of text, its baseline at @baseline, @size px; cut with an
+ * ellipsis to @max_width when that is > 0. Returns the width drawn. */
+WPE_API int                  wpe_display_ps5_canvas_text       (WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  baseline,
+                                                                int                  max_width,
+                                                                int                  size,
+                                                                gboolean             bold,
+                                                                guint32              argb,
+                                                                const char          *utf8);
+WPE_API int                  wpe_display_ps5_canvas_text_width (WPEDisplayPS5Canvas *canvas,
+                                                                int                  size,
+                                                                gboolean             bold,
+                                                                const char          *utf8);
+/* Shows a copy of @canvas over the page at (@x, @y) in TV pixels, under the
+ * pointer, messages and the performance overlay, with GPU compositing on or
+ * off; NULL removes it. Not shown while the video plays in the headset. */
+WPE_API void                 wpe_display_ps5_set_ui_layer      (WPEDisplayPS5       *display,
+                                                                WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  y);
+
+/* UI mode: the pad belongs to the application's own UI. Every button goes
+ * to the button handler (D-pad, L1/R1, L2/R2 also as auto-repeated presses
+ * while held), the left stick moves the pointer without page events, and
+ * pointer moves and right-stick scrolling go to the UI pointer callback.
+ * The page sees nothing; buttons held across the switch are ignored until
+ * released. View in VR's capture takes precedence. */
+WPE_API void                 wpe_display_ps5_set_ui_mode       (WPEDisplayPS5       *display,
+                                                                gboolean             enabled);
+WPE_API gboolean             wpe_display_ps5_get_ui_mode       (WPEDisplayPS5       *display);
+/* The pointer position in TV pixels; returns whether it is shown (it shows
+ * for a few seconds after the left stick moves). */
+WPE_API gboolean             wpe_display_ps5_get_pointer       (WPEDisplayPS5       *display,
+                                                                double              *x,
+                                                                double              *y);
+/* In UI mode: the pointer moved (@x, @y), or the right stick scrolled
+ * (@scroll_y px, down positive; 0 for a move). Main thread. */
+typedef void (* WPEDisplayPS5UIPointerCallback) (WPEDisplayPS5 *display,
+                                                 double         x,
+                                                 double         y,
+                                                 double         scroll_y,
+                                                 gpointer       user_data);
+WPE_API void                 wpe_display_ps5_set_ui_pointer_callback (WPEDisplayPS5                 *display,
+                                                                      WPEDisplayPS5UIPointerCallback callback,
+                                                                      gpointer                       user_data);
+
 /* ---- Performance overlay (port/webkit/OVERLAY.md) ---- */
 
 /* Live numbers in a corner of the TV (frames, CPU, memory, compositing,

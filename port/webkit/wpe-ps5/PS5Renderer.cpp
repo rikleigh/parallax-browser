@@ -679,6 +679,13 @@ void PS5Renderer::threadMain()
         capturePath = m_capturePath;
         m_capturePath = nullptr;
         bool perfWanted = m_perfWanted;
+        if (m_uiChanged) {
+            m_uiStaging.swap(m_uiPending);
+            m_uiPending.clear();
+            memcpy(m_uiRect, m_uiPendingRect, sizeof m_uiRect);
+            m_uiChanged = false;
+            m_uiStagingNew = true;
+        }
         g_mutex_unlock(&m_lock);
 
         if (perfWanted != m_perfOn) {
@@ -693,6 +700,7 @@ void PS5Renderer::threadMain()
         serviceBufferRequests();
         int64_t start = nowUS();
         updateMessage(start);
+        applyUILayer();
         bool commitGeometry = m_job.pending;
         double uploadMS = 0;
         if (m_job.pending) {
@@ -1140,6 +1148,9 @@ void PS5Renderer::drawScene()
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
 
+    // The application's UI (address bar, menu) over the page.
+    drawUILayer();
+
     // A message over the page (bottom centre), e.g. "No headset".
     if (m_messageTexture && m_messageUntilUS)
         drawPanel(m_messageTexture, m_messageWidth, m_messageHeight, m_width / 2.0, m_height - m_messageHeight / 2.0 - 60, 1.0);
@@ -1207,6 +1218,117 @@ static void uploadPanel(unsigned& texture, const PS5TextImage& image)
 void ps5RendererUploadPanel(unsigned& texture, const PS5TextImage& image)
 {
     uploadPanel(texture, image);
+}
+
+void PS5Renderer::setUILayer(const uint8_t* bgra, int x, int y, int width, int height)
+{
+    if (!m_initialized)
+        return;
+    g_mutex_lock(&m_lock);
+    if (bgra && width > 0 && height > 0) {
+        m_uiPending.assign(bgra, bgra + static_cast<size_t>(width) * height * 4);
+        m_uiPendingRect[0] = x;
+        m_uiPendingRect[1] = y;
+        m_uiPendingRect[2] = width;
+        m_uiPendingRect[3] = height;
+    } else {
+        m_uiPending.clear();
+        memset(m_uiPendingRect, 0, sizeof m_uiPendingRect);
+    }
+    m_uiChanged = true;
+    m_frameRequested = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+// Render thread: a new UI image goes into the GL buffer (the previous
+// frame's GPU work is done, the swap waited for it), or a texture.
+void PS5Renderer::applyUILayer()
+{
+    if (!m_uiStagingNew)
+        return;
+    m_uiStagingNew = false;
+    const int width = m_uiRect[2], height = m_uiRect[3];
+    const size_t needed = static_cast<size_t>(std::max(0, width)) * std::max(0, height) * 4;
+    if (!needed || m_uiStaging.size() < needed) {
+        m_uiRect[2] = 0;
+        m_uiStaging.clear();
+        m_uiStaging.shrink_to_fit();
+        return;
+    }
+    if (!m_uiAsTexture && m_pageProgram && needed > m_uiBufferBytes) {
+        if (m_uiBuffer)
+            glDeleteBuffers(1, &m_uiBuffer);
+        // Room for a whole screen, so a bigger menu doesn't reallocate.
+        size_t bytes = std::max(needed, static_cast<size_t>(m_width) * m_height * 4);
+        const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        glGenBuffers(1, &m_uiBuffer);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_uiBuffer);
+        glBufferStorage(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, flags);
+        m_uiMap = static_cast<uint8_t*>(glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), flags));
+        if (!m_uiMap) {
+            g_message("[wpe-ps5] ui layer: buffer map failed (GL error 0x%x): a texture instead", glGetError());
+            glDeleteBuffers(1, &m_uiBuffer);
+            m_uiBuffer = 0;
+            m_uiBufferBytes = 0;
+            m_uiAsTexture = true;
+        } else
+            m_uiBufferBytes = bytes;
+    }
+    if (!m_uiAsTexture && m_pageProgram && m_uiMap)
+        memcpy(m_uiMap, m_uiStaging.data(), needed);
+    else {
+        m_uiAsTexture = true;
+        if (!m_uiTexture) {
+            GLuint name = 0;
+            glGenTextures(1, &name);
+            m_uiTexture = name;
+        }
+        glBindTexture(GL_TEXTURE_2D, m_uiTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, m_uiStaging.data());
+    }
+    // The copy is in GL now: no second 8 MB kept on the CPU side.
+    m_uiStaging.clear();
+    m_uiStaging.shrink_to_fit();
+}
+
+void PS5Renderer::drawUILayer()
+{
+    const int x = m_uiRect[0], y = m_uiRect[1], w = m_uiRect[2], h = m_uiRect[3];
+    if (w <= 0 || h <= 0 || (!m_uiMap && !m_uiTexture))
+        return;
+    float r[4] = {
+        static_cast<float>(static_cast<double>(x) / m_width * 2.0 - 1.0),
+        static_cast<float>(1.0 - static_cast<double>(y + h) / m_height * 2.0),
+        static_cast<float>(static_cast<double>(x + w) / m_width * 2.0 - 1.0),
+        static_cast<float>(1.0 - static_cast<double>(y) / m_height * 2.0),
+    };
+    glBindVertexArray(m_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    if (!m_uiAsTexture) {
+        glUseProgram(m_pageProgram);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_uiBuffer);
+        glUniform4f(m_uPageNDC, r[0], r[1], r[2], r[3]);
+        glUniform4f(m_uPageRect, static_cast<float>(x), static_cast<float>(y), static_cast<float>(w), static_cast<float>(h));
+        glUniform2i(m_uPageSize, w, h);
+        glUniform1i(m_uPageStride, w);
+        glUniform1i(m_uScreenHeight, m_height);
+    } else {
+        glUseProgram(m_program);
+        glUniform1i(m_uTexture, 0);
+        glUniform1i(m_uOpaque, 0);
+        glBindTexture(GL_TEXTURE_2D, m_uiTexture);
+        glUniform4f(m_uRect, r[0], r[1], r[2], r[3]);
+    }
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
 void PS5Renderer::showMessage(const char* text, double seconds)
