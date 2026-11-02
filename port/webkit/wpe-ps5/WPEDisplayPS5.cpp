@@ -50,7 +50,9 @@
  *   D-pad            arrow keys (auto-repeat)
  *   Cross (X)        click at the pointer when it is shown, else Return
  *   Circle (O)       Back (XF86Back; the browser goes back)
- *   Triangle         on-screen keyboard for the focused field
+ *   Triangle         on-screen keyboard for the focused field (it also
+ *                    opens by itself when a click on a field, or the D-pad
+ *                    or L1/R1, focuses one)
  *   Square           Reload (XF86Reload)
  *   L1 / R1          Shift+Tab / Tab (previous / next focusable element)
  *   L2 / R2          ZoomOut / ZoomIn (XF86ZoomOut/In)
@@ -96,6 +98,12 @@ struct _WPEDisplayPS5Private {
     uint32_t repeatingKey { 0 };
     double repeatNext { 0 };
     double lastPress { -1000 };
+    // What the last press was, for the keyboard: focus that follows a click
+    // on a text field or a move of the focus (D-pad, L1/R1) opens it, focus
+    // a page moves by itself (on load, or in a button's click handler) does
+    // not.
+    enum class PressKind : uint8_t { Other, PointerClick, FocusMove };
+    PressKind lastPressKind { PressKind::Other };
     GRefPtr<GSource> padSource;
 
     double pointerX { 0 };
@@ -103,6 +111,11 @@ struct _WPEDisplayPS5Private {
     double pointerMovedAt { -1000 };
     bool pointerDown { false };
     bool pointerWasVisible { false };
+    // Whether the pointer is over an editable node, from the application's
+    // hit tests (wpe_display_ps5_set_pointer_over_editable); until it
+    // reports one, any click counts as a click on a field.
+    bool pointerOverEditable { false };
+    bool pointerTargetReported { false };
 
     GRefPtr<GSource> redrawSource;
 
@@ -196,9 +209,25 @@ void wpeDisplayPS5InputContextDestroyed(WPEDisplayPS5* display, WPEInputMethodCo
         display->priv->focusedInputContext = nullptr;
 }
 
-double wpeDisplayPS5SecondsSinceLastPress(WPEDisplayPS5* display)
+bool wpeDisplayPS5FocusFollowsPressOnField(WPEDisplayPS5* display, const char** why)
 {
-    return nowSeconds() - display->priv->lastPress;
+    auto* priv = display->priv;
+    using PressKind = _WPEDisplayPS5Private::PressKind;
+    const char* reason = nullptr; // no recent press: the page focused the field by itself
+    bool open = false;
+    if (nowSeconds() - priv->lastPress >= 1.0)
+        ;
+    else if (priv->lastPressKind == PressKind::FocusMove) {
+        open = true;
+        reason = "D-pad or L1/R1 press (focus moved)";
+    } else if (priv->lastPressKind == PressKind::PointerClick) {
+        open = priv->pointerOverEditable || !priv->pointerTargetReported;
+        reason = !priv->pointerTargetReported ? "click (no hit test)" : open ? "click on a field" : "click outside a field";
+    } else
+        reason = "press other than a click or a focus move";
+    if (why)
+        *why = reason;
+    return open;
 }
 
 // ------------------------------------------------------------- IME dialog
@@ -511,8 +540,10 @@ static void padTick(WPEDisplayPS5* display)
     uint32_t released = priv->buttons & ~now;
     priv->buttons = now;
     const double t = nowSeconds();
-    if (pressed)
+    if (pressed) {
         priv->lastPress = t;
+        priv->lastPressKind = _WPEDisplayPS5Private::PressKind::Other;
+    }
 
     // The application first (View in VR); what it takes, the page never sees.
     if (uint32_t swallowedReleases = released & priv->swallowedButtons) {
@@ -571,6 +602,16 @@ static void padTick(WPEDisplayPS5* display)
     // Cross: click when the pointer is shown, otherwise Return.
     if (pressed & PS5_PAD_CROSS) {
         if (pointerVisible) {
+            // A move to where the pointer already is first: the page hit
+            // tests it and the application learns what is under the pointer
+            // now (the page may have scrolled or changed under a still
+            // pointer). That answer reaches the main thread before any focus
+            // change the click causes, which decides whether the keyboard
+            // opens (wpeDisplayPS5FocusFollowsPressOnField).
+            GRefPtr<WPEEvent> move = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
+                eventTime(), static_cast<WPEModifiers>(0), priv->pointerX, priv->pointerY, 0, 0));
+            wpe_view_event(view, move.get());
+            priv->lastPressKind = _WPEDisplayPS5Private::PressKind::PointerClick;
             priv->pointerDown = true;
             guint count = wpe_view_compute_press_count(view, priv->pointerX, priv->pointerY, WPE_BUTTON_PRIMARY, eventTime());
             GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, view, WPE_INPUT_SOURCE_MOUSE,
@@ -619,6 +660,10 @@ static void padTick(WPEDisplayPS5* display)
     // Triangle: the on-screen keyboard for the focused field.
     if ((pressed & PS5_PAD_TRIANGLE) && priv->focusedInputContext)
         wpeInputMethodContextPS5OpenKeyboard(priv->focusedInputContext);
+
+    constexpr uint32_t focusMoveButtons = PS5_PAD_UP | PS5_PAD_DOWN | PS5_PAD_LEFT | PS5_PAD_RIGHT | PS5_PAD_L1 | PS5_PAD_R1;
+    if ((pressed & focusMoveButtons) && priv->lastPressKind == _WPEDisplayPS5Private::PressKind::Other)
+        priv->lastPressKind = _WPEDisplayPS5Private::PressKind::FocusMove;
 
     for (const auto& mapping : keyMappings) {
         if (pressed & mapping.button) {
@@ -886,6 +931,13 @@ void wpe_display_ps5_set_perf_overlay_callback(WPEDisplayPS5* display, WPEDispla
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
     display->priv->perfOverlayCallback = callback;
     display->priv->perfOverlayCallbackData = userData;
+}
+
+void wpe_display_ps5_set_pointer_over_editable(WPEDisplayPS5* display, gboolean editable)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->pointerTargetReported = true;
+    display->priv->pointerOverEditable = editable;
 }
 
 void wpe_display_ps5_set_perf_counter(WPEDisplayPS5*, const char* name, guint64 value)

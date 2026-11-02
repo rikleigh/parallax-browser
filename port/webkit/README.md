@@ -2466,6 +2466,20 @@ D-pad couldn't move it. `wpe_display_ps5_request_text` passes it with
 `PS5_IME_EXT_OPTION_DISABLE_POINTER` (0x40), and opens the dialog without it
 if init refuses it.
 
+When the keyboard opens by itself (`WPEInputMethodContextPS5.cpp`): a field
+that gets focus within 1 s of a click opens it only if the pointer was over
+an editable node. The title reports that from WebKitWebView
+`mouse-target-changed` (`webkit_hit_test_result_context_is_editable`, to
+`wpe_display_ps5_set_pointer_over_editable`), and the display sends a pointer
+move at the pointer just before each click so the hit test is fresh; its
+answer reaches the main thread before the focus change the click causes. A
+search button whose click handler refocuses its field (the keyboard used to
+reopen after each search) no longer opens it. Focus moved by the D-pad or
+L1/R1 still opens it; Return (X with the pointer hidden), other buttons and
+focus a page sets by itself (autofocus) don't. A click on a `<label>` doesn't
+either (Triangle opens it). The log says `IME: field focused after a <why>:
+keyboard opens / stays closed`. Test page: `test/input/refocus.html`.
+
 ## Process launching
 
 `WPEProcessManagerPS5` (WebKit's `WPEProcessManager` hook):

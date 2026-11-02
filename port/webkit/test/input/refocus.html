@@ -1,0 +1,86 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>keyboard refocus test</title>
+<!-- When the system keyboard opens by itself (wpe-ps5/WPEInputMethodContextPS5.cpp):
+     a field that gets focus right after a click opens it only if the click was
+     on the field. A search button whose click handler puts the focus back in
+     its field (as many search boxes do) must not reopen the keyboard.
+     Upload to the console, e.g. /data/ps5webkit/refocus.html, and open
+     file:///data/ps5webkit/refocus.html
+       ?autofocus      focus the search field on load (keyboard must stay closed)
+     What to check on the TV (left stick + X):
+       1. X on the search field: the keyboard opens. Type words, OK.
+       2. X on "Search": the results line updates, the field has focus again,
+          and the keyboard stays closed. The title log says
+          "IME: field focused after a click outside a field: keyboard stays closed".
+       3. Triangle: the keyboard opens for the focused search field.
+       4. X on "Search (no refocus)": updates without focusing the field.
+       5. X on the plain field below: the keyboard opens.
+       6. X on the label "Name:" (focuses the plain field through <label for>):
+          the keyboard stays closed (not a click on a field); Triangle opens it.
+       7. R1 (Tab) onto a field: the keyboard opens (focus moved by the pad).
+     Logs (console.log, the title log): REFOCUS <event> ... -->
+<style>
+  body { font: 32px/1.4 sans-serif; margin: 60px; background: #f4f4f4; color: #111; }
+  form, .row { display: flex; gap: 20px; align-items: center; margin: 30px 0; }
+  input { font: inherit; padding: 12px 18px; width: 640px; border: 2px solid #888; border-radius: 8px; }
+  input:focus { border-color: #06c; outline: 3px solid #9cf; }
+  button { font: inherit; padding: 12px 30px; border-radius: 8px; border: 2px solid #555; background: #fff; }
+  button:hover { background: #def; }
+  #results { margin: 20px 0; padding: 20px; background: #fff; border-radius: 8px; min-height: 1.4em; }
+  #log { font: 22px/1.3 monospace; white-space: pre-wrap; color: #444; }
+  label { padding: 12px 0; }
+</style>
+</head><body>
+<h1>Keyboard refocus test</h1>
+<form id="search">
+  <input id="q" type="text" placeholder="Search words" autocomplete="off">
+  <button id="go" type="submit">Search</button>
+  <button id="plain-go" type="button">Search (no refocus)</button>
+</form>
+<div id="results">No search yet.</div>
+<div class="row">
+  <label for="name">Name:</label>
+  <input id="name" type="text" placeholder="A plain field (X opens the keyboard)">
+</div>
+<div id="log"></div>
+<script>
+  const q = document.getElementById('q');
+  const results = document.getElementById('results');
+  const logBox = document.getElementById('log');
+  let searches = 0;
+  function log(text) {
+    const line = 'REFOCUS ' + (performance.now() / 1000).toFixed(2) + ' s ' + text;
+    console.log(line);
+    logBox.textContent = (line + '\n' + logBox.textContent).split('\n').slice(0, 12).join('\n');
+  }
+  function search(refocus) {
+    searches++;
+    const words = q.value.trim();
+    results.textContent = words ? 'Search ' + searches + ': results for "' + words + '"' : 'Search ' + searches + ': (empty)';
+    try {
+        history.replaceState(null, '', '?q=' + encodeURIComponent(words) + (location.search.includes('autofocus') ? '&autofocus' : ''));
+    } catch (e) { log('replaceState: ' + e); }
+    if (refocus)
+        q.focus(); // as a site's search button does
+  }
+  document.getElementById('search').addEventListener('submit', (event) => {
+    event.preventDefault();
+    log('submit (refocus the field)');
+    search(true);
+  });
+  document.getElementById('go').addEventListener('click', () => { log('click on Search'); q.focus(); });
+  document.getElementById('plain-go').addEventListener('click', () => { log('click on Search (no refocus)'); search(false); });
+  for (const input of document.querySelectorAll('input')) {
+    input.addEventListener('focus', () => log('focus #' + input.id));
+    input.addEventListener('blur', () => log('blur #' + input.id));
+    input.addEventListener('input', () => log('input #' + input.id + ' "' + input.value + '"'));
+  }
+  const initial = new URLSearchParams(location.search).get('q');
+  if (initial)
+    q.value = initial;
+  if (location.search.includes('autofocus')) {
+    log('autofocus on load');
+    q.focus();
+  }
+</script>
+</body></html>

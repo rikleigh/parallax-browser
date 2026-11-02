@@ -100,6 +100,15 @@ WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
                                                   const char    *text,
                                                   double         seconds);
 
+/* What is under the pointer, from the application's hit tests (e.g.
+ * WebKitWebView::mouse-target-changed and
+ * webkit_hit_test_result_context_is_editable()). A field that gets focus
+ * right after a click opens the system keyboard only if the click was over
+ * an editable node, so a button whose click handler focuses a field does not
+ * reopen it. Until this is called, any click counts. */
+WPE_API void        wpe_display_ps5_set_pointer_over_editable (WPEDisplayPS5 *display,
+                                                               gboolean       editable);
+
 /* ---- Performance overlay (port/webkit/OVERLAY.md) ---- */
 
 /* Live numbers in a corner of the TV (frames, CPU, memory, compositing,

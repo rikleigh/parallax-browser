@@ -11,7 +11,8 @@
  *   left stick: pointer, X: click (or Enter when the pointer is hidden),
  *   right stick: scroll, D-pad: move between links (spatial navigation),
  *   O: back, Options: type a URL or search, Square: reload,
- *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard,
+ *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard
+ *   (also opens by itself when X on a field, the D-pad or L1/R1 focus one),
  *   R3 (press the right stick): Settings, and back to the page from there,
  *   L3 (press the left stick): home page,
  *   touchpad: View in VR (the playing video in the PS VR2 headset; its own
@@ -507,6 +508,20 @@ static gboolean memRestart(gpointer data)
     webkit_web_view_load_uri(webView, uri);
     g_free(uri);
     return G_SOURCE_REMOVE;
+}
+
+/* What is under the pointer: a field that gets focus right after a click
+ * opens the system keyboard only when the click was on an editable node, so
+ * a button whose click handler focuses a field doesn't reopen it
+ * (wpe_display_ps5_set_pointer_over_editable). WebKit hit tests on every
+ * pointer move, and the display sends one at the pointer before each click,
+ * so the latest result is what the click lands on. */
+static void onMouseTargetChanged(WebKitWebView* view, WebKitHitTestResult* hit, guint modifiers, gpointer data)
+{
+    (void)view;
+    (void)modifiers;
+    (void)data;
+    wpe_display_ps5_set_pointer_over_editable(WPE_DISPLAY_PS5(display), webkit_hit_test_result_context_is_editable(hit));
 }
 
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
@@ -1870,6 +1885,7 @@ int main(int argc, char** argv)
     g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);
     g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
     g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
+    g_signal_connect(webView, "mouse-target-changed", G_CALLBACK(onMouseTargetChanged), NULL);
     ps5wk_vr_init(display, webView);
     ps5wk_adblock_init(webView);
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);

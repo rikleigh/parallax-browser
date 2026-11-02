@@ -25,8 +25,10 @@
 
 // Text input through the system keyboard (libSceImeDialog). WebKit focuses
 // this context when an editable element gets focus. The keyboard opens:
-//  - right away if the focus followed a pad press (X on a field), not when a
-//    page focuses a field by itself on load;
+//  - right away if the focus followed a click with the pointer over an
+//    editable node (X on a field) or a D-pad / L1 / R1 press that moved the
+//    focus; not when a page focuses a field by itself, on load or in a
+//    button's click handler (a search button that refocuses its field);
 //  - on Triangle while a field is focused.
 // The dialog starts with the field's text around the cursor; on "OK" that
 // text is replaced (delete-surrounding + committed).
@@ -120,8 +122,12 @@ static void wpeInputMethodContextPS5FocusIn(WPEInputMethodContext* context)
     if (!display)
         return;
     wpeDisplayPS5SetFocusedInputContext(display, context);
+    const char* why = nullptr;
+    bool open = wpeDisplayPS5FocusFollowsPressOnField(display, &why);
+    if (why)
+        PS5_LOG("IME: field focused after a %s: keyboard %s", why, open ? "opens" : "stays closed (Triangle opens it)");
     // Defer: WebKit sends the surrounding text right after focus.
-    if (wpeDisplayPS5SecondsSinceLastPress(display) < 1.0) {
+    if (open) {
         g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, [](gpointer userData) -> gboolean {
             auto* context = WPE_INPUT_METHOD_CONTEXT(userData);
             if (WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv->focused)

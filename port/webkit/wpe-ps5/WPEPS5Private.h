@@ -37,9 +37,12 @@ void wpeDisplayPS5ScheduleRedraw(WPEDisplayPS5*);
 void wpeDisplayPS5SetFocusedInputContext(WPEDisplayPS5*, WPEInputMethodContext*);
 void wpeDisplayPS5InputContextDestroyed(WPEDisplayPS5*, WPEInputMethodContext*);
 
-// Seconds since the last pad press: focus that follows a press opens the
-// keyboard, focus a page sets by itself (autofocus) does not.
-double wpeDisplayPS5SecondsSinceLastPress(WPEDisplayPS5*);
+// Whether a field that just got focus should open the keyboard: the focus
+// followed (within 1 s) a click with the pointer over an editable node, or a
+// D-pad / L1 / R1 press that moved the focus. Focus a page sets by itself
+// (autofocus, or a button's click handler focusing a field) does not. @why
+// gets a short reason for the log (NULL when no press was recent).
+bool wpeDisplayPS5FocusFollowsPressOnField(WPEDisplayPS5*, const char** why);
 
 // IME context (WPEInputMethodContextPS5.cpp)
 WPEInputMethodContext* wpeInputMethodContextPS5New(WPEView*);
