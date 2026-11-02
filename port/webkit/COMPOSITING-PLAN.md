@@ -25,7 +25,8 @@ Paths are relative to `toolchain/wpe-webkit/src` unless they start with `port/`.
 - **CPU fallback:** AC/ForceCompositing follow a runtime switch (settings item
   `compositing`, flag file `/data/ps5webkit/no-compositing`); the UI proxy and
   `DrawingArea::create` both choose at runtime. Automatic fallback if the scene
-  context fails.
+  context fails. (Until 2026-11-02 compositing was opt-in through a
+  `compositing` file; it is now on by default, see the last section.)
 
 ## Facts it rests on
 
@@ -1661,7 +1662,8 @@ ahead. Time until a still WebProcess is outrun:
 Flag file `/data/ps5webkit/wc-async-scroll` (WC builds, read for each new
 WebProcess like `compositing`, so Restart page applies it; tokens:
 `overflow=0|1 stick=events|frame checkerboard=<px> lookahead=<ms>`).
-Absent = today's behaviour exactly.
+Absent = today's behaviour exactly. (Since 2026-11-02 async scrolling is on
+by default and the file only changes it: see the last section.)
 
 | | what | pass (console, log-only unless noted) | effort |
 | --- | --- | --- | --- |
@@ -2625,3 +2627,65 @@ text and image sequences that move with the page) should now move with the
 page rather than shudder a frame behind. To compare: add `sync=0` (the old
 behaviour). If frames ever stutter while scrolling a heavy page,
 `syncreserve=7` waits less.
+
+## GPU compositing and async scrolling on by default (2026-11-02)
+
+The `ps5-wc` branch (44 commits on 30c37bf34f) is merged into `ps5`: its
+commits were regrouped into patches 0037-0066 (the final tree is identical
+to `ps5-wc` f4d8a064a5; the old commits stay reachable as branch
+`ps5-wc-history`, and README.md *Patches* maps each patch to them). Patch
+0067 makes the defaults. `ps5` is b39826f089. The worktree `src-wc`
+(branch `ps5-wc`) and `build-wc` are kept for parallel work at `ps5`'s
+commits.
+
+**Build.** `port/webkit/build.sh` builds with the compositor by default
+(`WC=1`; build dir `toolchain/wpe-webkit/build`); the two media options that
+had to go in `EXTRA_CMAKE_ARGS` are in the option list for every build.
+`WC=0` builds without it into `build-cpu`. `build` reconfigures by itself
+when the dir was configured with the other setting. Both link `ps5browser`
+and `ps5wk-child` (`build` reconfigured from the CPU configuration: 534 +
+373 s, one transient clang segfault in between; `build-cpu` from scratch:
+990 s).
+
+**Defaults (0067, `DrawingAreaProxyWCPS5.cpp`, `PS5WCHost.cpp`; Settings in
+`apps/title/settings.c`):**
+- Compositing is on unless `/data/ps5webkit/no-compositing` exists. Settings
+  > *GPU compositing* (default on; no longer "experimental") writes that
+  file when turned off; *Restart page* applies it. The old opt-in file
+  `compositing` changes nothing now. `ps5wk-shot` still defaults to the CPU
+  path (`ps5wk_compositing_set_override(0)`).
+- Async scrolling is on with compositing unless `wc-async-scroll` holds the
+  word `off` (or `0`). The file's `key=value` words override the defaults, so
+  a file left from testing keeps working. Default `stickframe=1` (the
+  owner's tested setting); `overflow=0` stays off until the TV has seen it;
+  `sync`, `glide`, `snap`, `gesturenodes` keep their defaults (1).
+- `[ascroll]` per-second lines are logged whenever async scrolling is on
+  (they were tied to the file's existence), so TV logs keep them. The
+  drawing area's line names the options in use:
+  `[ascroll] drawing area N: async scrolling (the title's scrolling tree;
+  stick frame, overflow off, sync on; defaults)` (`defaults +
+  wc-async-scroll` when a file is there).
+- Fallbacks unchanged: no scene host, `WC=0` build, GL texture cap.
+
+**Checked on the console** (log-only PPSA99020, build
+20261102-165217-b39826f089, no flag files unless named; tile uploads
+0.092 ms each and start-page raster 2.9 ms/s, so the console wasn't slow):
+
+| check | result |
+| --- | --- |
+| start, no flag files | `[wc] page 5: WC compositor`, async scrolling with `stick frame, overflow off, sync on; defaults`; `[watchdog web4] on:` and `[watchdog network2] on:`; ad blocker `loaded compiled list ubol-a (... 119449 rules) in 172 ms`, `filter on` |
+| `scrolljank.html?busy=30`, ry 0.5 (pad-scroll-test 4 s down/up) | 54.7 moving frames/s over 35 scrolling seconds (direction changes included), pad -> present 11.8 ms avg (p95 max 17.0), WebProcess 30.5 updates/s, 3816 wheel events in the title, 0 stuck seconds, 0 % in step (30 ms rAF: always late), as in the sync round (60 in held seconds, 11.8 ms, 30.6/s) |
+| `carousel.html?relayout`, rx 0.5 ry 0 | full travel 0 <-> 3384 every gesture, 0 CAR-BACK, every rightward settle snapped (glide `3150 at 2142 px/s -> snap 3384 in 250 ms`), leftward ones glide to the start edge at 0 (as before) |
+| Settings `compositing=0`, *Restart page* | `no-compositing` written, the new WebProcess `painting on 4 threads`, no `[wc]` line; `compositing=1` deletes it and the next page composites again with async scrolling |
+| `wc-async-scroll` = `off` | WC, no scrolling tree, no `[ascroll]` lines |
+| `wc-async-scroll` = `stickframe=0 overflow=1` | `stick events, overflow on, sync on; defaults + wc-async-scroll` |
+| `wc-gl-cap` 8 | coverage reduced, then `this page goes to the CPU path`, the reload paints on 4 threads |
+| `vr-sim` + `vr-selftest`, `video.html` H.264 1080p30, dwell 170 s | `RESULT ps5browser vr-selftest PASS 15 eye-buffer captures, 8 projections, controls, 4 entries in 72 s`; 55-58 headset frames/s, video 28-29 shown/s |
+
+**For the owner on the TV:** nothing to set up: the browser starts in GPU
+mode with async scrolling and the frame-locked stick. If a page looks or
+scrolls wrong, Settings > *GPU compositing* off (then *Restart page*)
+compares with the CPU path; `wc-async-scroll` containing `off` keeps
+compositing but lets the WebProcess scroll. An old `compositing` or
+`wc-async-scroll` (`stickframe=1`) file on the console can be deleted; it
+does no harm.

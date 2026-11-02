@@ -22,6 +22,11 @@ software decoders in the WebProcess, audio played by the title (see
 decoded frames under the page (see *Hole-punch video* below). Step 2b
 (same day): H.264/HEVC/VP9 decoded in the title by Videodec2 (see *Step 2b*).
 
+GPU compositing (2026-11-01/02, on by default since 2026-11-02): pages are
+composited on the GPU by WebKit's WC compositor in the title, with
+title-side (async) scrolling; the CPU path stays as the fallback and the
+Settings switch (see *Settings* and COMPOSITING-PLAN.md).
+
 No WebGL, WebXR, GPU process, Web Audio, WebRTC, speech, geolocation,
 sandbox, introspection, docs, journald or libbacktrace.
 
@@ -184,6 +189,7 @@ are saved as soon as you press a button.
 | Give back freed memory (default on) | `PS5WK_PAS_DECOMMIT=0` when off | page restart (the NetworkProcess at the next browser start) |
 | Video under the page, i.e. hole punch (default on) | `PS5WK_HOLEPUNCH=0` when off | page restart |
 | Offer VP9 video (default on; off makes YouTube send H.264) | `PS5WK_MEDIA_VP9=0` when off | page restart |
+| GPU compositing (default on; includes async scrolling) | `/data/ps5webkit/no-compositing` when off | page restart |
 | Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
@@ -219,6 +225,30 @@ restarting the browser each ask for a second press.
   running. If the launcher isn't running, the page says to restart the
   browser from the home screen, and nothing closes. On the Mac, the page
   waits until the browser answers again with a new start time.
+- **GPU compositing** (`compositing`, on by default since 2026-11-02):
+  pages are put together on the GPU in layers by WebKit's WC compositor
+  inside the title, and the right stick scrolls them on the GPU (async
+  scrolling, frame-locked stick). See COMPOSITING-PLAN.md. WebKit reads the
+  setting whenever a page gets a new WebProcess, so *Restart page* applies
+  it. The log shows `[wc] page N: WC compositor` and `[ascroll] drawing area
+  N: async scrolling (... stick frame, overflow off, sync on; defaults)`.
+  Off (`no-compositing`) paints on the CPU as before, and the CPU-only
+  settings (painting threads, fast scrolling, video under the page) apply
+  again. The title falls back to the CPU by itself when the GL scene host
+  can't start (`[wc] compositing is on but the scene host is not
+  available`), in a `WC=0` build, and for a page whose GL textures stay over
+  the 160 MB cap (that page gets a new WebProcess that paints on the CPU;
+  the next WebProcess composites again). The old opt-in file `compositing`
+  is no longer needed and changes nothing.
+- **Async scrolling** has no Settings entry. `/data/ps5webkit/wc-async-scroll`
+  changes it: the word `off` (or `0`) turns it off (the WebProcess scrolls,
+  as before); `key=value` words override the defaults, which are
+  `stickframe=1 overflow=0 sync=1 syncreserve=5 earlyreply=1 glide=1 snap=1
+  gestureend=40 gesturenodes=1 unconsumed=1 thumb=1 checkerboard=0`. A file left over
+  from testing (e.g. `stickframe=1`) keeps working. COMPOSITING-PLAN.md
+  (*Async scrolling*) has what each one does; `overflow=1` (carousels and
+  overflow boxes scrolled in the title too) works on the test pages but
+  hasn't been checked on the TV.
 - **Link server off** (`push-off`): the server now listens on 127.0.0.1 only,
   instead of not running at all. R3 still opens Settings, but phones,
   `ps5open` and the bookmarklet can't reach the PS5. Turn it back on from the
@@ -240,7 +270,7 @@ curl -X POST 'http://192.168.1.50:9040/clear?what=cookies'     # or what=all
 ```
 
 Settings are named by their id (`jit`, `paint_threads`, `scroll_copy`,
-`mem_restart_mb`, `pas_decommit`, `holepunch`, `media_vp9`, `hwdec`, `sound`,
+`mem_restart_mb`, `pas_decommit`, `holepunch`, `media_vp9`, `compositing`, `hwdec`, `sound`,
 `link_server`, `home_url`) or by their child.env or file name
 (`PS5WK_JIT=0`). Booleans take `1`/`0`, `true`/`false` or `on`/`off`, and
 `null` means the default. A request with any invalid value changes nothing
@@ -256,8 +286,17 @@ and the A/B and logging lines in child.env (`PS5WK_PAINT_ASYNC`,
 `PS5WK_PAINT_RECORD`, `PS5WK_PAINT_BBH`, `PS5WK_PAINT_MIN_PX`,
 `PS5WK_IDLE_GAP`, `PS5WK_SHM_READBACK`, `PS5WK_*_LOG`, `PS5WK_PROFILE`,
 `PS5WK_FD_TRACE`, `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_AV1`, `PS5WK_HWDEC`,
-`PS5WK_PROCESS_SWAPS`, `PS5WK_STILL_FRAME`). They still work in child.env,
-and the page leaves them alone.
+`PS5WK_PROCESS_SWAPS`, `PS5WK_STILL_FRAME`, `PS5WK_MEDIA_SUSPEND_PREROLLED`,
+`PS5WK_WC_LAYER_LOG`). They still work in child.env,
+and the page leaves them alone. Also not exposed: the GPU compositing knobs
+`wc-async-scroll` (above), `wc-gl-cap` (the GL texture cap in MB, default
+160), `wc-scroll-log`, `wc-frame-log`, `wc-scene-stats`, `wc-fan-draws`,
+`pad-scroll-test`, the decoder budget's `vdec-budget` (*Step 2b* below) and
+`POST /restart?scope=crash` (kills the WebProcess, for crash-recovery tests).
+
+The ad blocker has its own section in Settings and its own notes in
+ADBLOCK.md; the performance overlay (Settings > *Performance overlay*,
+L3 + R3) is described in OVERLAY.md.
 
 **Checked on the console** (2026-10-29, log only, no TV): from the Mac,
 `/settings.json` read the console's files. Setting JIT to DFG and painting
@@ -287,13 +326,36 @@ NINJA_TARGETS="ps5wk-child ps5wk-shot ps5browser" port/webkit/build.sh build
 port/webkit/build.sh export-patches      # after editing the clone: commits -> patches/
 port/webkit/apps/title/package.sh        # title folder -> toolchain/wpe-webkit/titles/PPSA99020
 port/webkit/test/run-shot.sh [url]       # payload-only first light on the console
+
+# CPU-only build (no WC compositor), in toolchain/wpe-webkit/build-cpu:
+WC=0 NINJA_TARGETS="ps5browser ps5wk-child" port/webkit/build.sh build
+BLD=$PWD/toolchain/wpe-webkit/build-cpu port/webkit/apps/title/package.sh
 ```
+
+- **GPU compositing is built in by default** (since 2026-11-02): `WC=1`
+  (`USE_TEXTURE_MAPPER`, `USE_GRAPHICS_LAYER_WC`, patches 0037-0067) is the
+  default, and `ENABLE_MEDIA_CONTROLS_CONTEXT_MENUS` /
+  `ENABLE_VIDEO_USES_ELEMENT_FULLSCREEN` are off in every build (they used
+  to be passed in `EXTRA_CMAKE_ARGS`). The title still paints on the CPU at
+  run time when compositing is off in Settings, the scene host isn't
+  available or a page goes over the GL texture cap (*Settings* above).
+  `WC=0` builds without the compositor; its build dir defaults to
+  `toolchain/wpe-webkit/build-cpu` (logs there too), so the two
+  configurations don't rebuild each other. `build` reconfigures by itself
+  when the build dir was configured with the other `WC` setting.
+- Second worktree: `toolchain/wpe-webkit/src-wc` (branch `ps5-wc`) and
+  `build-wc` were where GPU compositing was developed; `ps5-wc` was merged
+  into `ps5` on 2026-11-02 and the worktree is kept for parallel work (at
+  `ps5`'s commits; build it with `SRC=$PWD/toolchain/wpe-webkit/src-wc
+  BLD=$PWD/toolchain/wpe-webkit/build-wc LOGDIR=$PWD/toolchain/wpe-webkit/build-wc
+  port/webkit/build.sh build`). Commits made there go to `ps5` and are
+  exported from it.
 
 - Source: `toolchain/wpe-webkit/src`, a clone of `ref/WebKit` that uses its
   object store through `alternates` (ref/WebKit is never written), sparse
   (Source/ without libwebrtc). Branch `ps5` = 15486a0178 + one commit per
   patch; `export-patches` writes them back to `patches/`.
-- Build: `toolchain/wpe-webkit/build`, Release, `-O2 -gline-tables-only`
+- Build: `toolchain/wpe-webkit/build` (WC; `build-cpu` for `WC=0`), Release, `-O2 -gline-tables-only`
   (`DEBUG_FLAGS=-g0` for the smallest build), ninja, all cores.
 - Toolchain: `prospero-clang` 18 + libc++ 19.1.7 (`toolchain/libcxx19`),
   dependencies from `toolchain/wpe-sysroot` (port/deps, its
@@ -336,11 +398,53 @@ port/webkit/test/run-shot.sh [url]       # payload-only first light on the conso
 | 0035-ps5-profiling | PS5 only (see *Profiling* below): JIT counters for the profiler and the `[mem]` line (`ps5wk_jit_counts`: compiles by tier and outcome, compile ms, refused executable allocations, the executable-memory pressure multiplier); every executable allocation noted with the tier of the compiling thread (`ps5wk_jit_tier(pc)`); WTF threads named with `pthread_set_name_np` |
 | 0036-ps5-media-state | PS5 only (see *Feeds: spinners over playing videos* below): `requestVideoFrameCallback` works with the hole-punch sink and CPU painting (presented frames were only counted on the accelerated path, so callbacks never ran); a buffering change that arrives during an async state change is applied when it completes (it was dropped, leaving the player at HaveCurrentData once the download was done), an older one is no longer "delayed" again by every later seek, loop or resume, and the download-complete message runs the normal buffering update; seamless looping (non-flushing SEGMENT seeks) is off for http(s) progressive media, whose qtdemux pull loop waits for bytes only the main thread delivers (the page froze when a looping video resumed from WebKit's off-screen suspend); the MSE player keeps its pipeline when the ended notification started a loop seek (it tore it down under the seek: "seeking" for good); the "Autoplay blocked ... PageConsentRequired" line is only logged for an element that has the autoplay attribute and is still waiting to autoplay |
 
+GPU compositing (COMPOSITING-PLAN.md; `WC=1` builds, the default since
+2026-11-02). These were developed on branch `ps5-wc` (worktree `src-wc`) and
+regrouped into patches when they were merged into `ps5`; the last column
+names the `ps5-wc` commits (still reachable as branch `ps5-wc-history` in
+the clone) that older notes refer to. Each regrouped commit's message holds
+the original messages.
+
+| patch | what | ps5-wc commits |
+| --- | --- | --- |
+| 0037-ps5-wc-build-options | `USE_TEXTURE_MAPPER` + `USE_GRAPHICS_LAYER_WC` on WPE next to coordinated graphics and Skia: `Platform/WC.cmake` included, TextureMapperTile built, the GPU-process-only WC files left out | 687d4c1cfb |
+| 0038-ps5-wc-without-gpu-process | WC without the GPU process: `UpdateInfo` and `DrawingAreaWC` build on WPE, `flushImageBuffers` only with the GPU process, `DrawingArea::create` picks WC at run time, `glGetStringi` extensions in core profiles, WPE definitions `PageClient` and `WebPageProxy` need | 9928301709 |
+| 0039-ps5-wc-ui-process-drawing-area | `UpdateWC` message to the UI process; `DrawingAreaProxyWCPS5` (the run-time compositing switch, preferences per new WebProcess), `PS5WCHost` interface and the null scene host for ps5wk-shot | 2d6c10a99d a69c8b94ca a6cee1584e 444b57d4fa dca82b46b4 |
+| 0040-ps5-wc-texture-mapper-on-gl-core | TextureMapper on PS5Renderer's desktop GL 4.6 core context (S1b): its own VAO, core-profile extension list, shader compile/link checks (`#version 330 core` fallback, `PS5WK_TEXMAP_GLSL=core`) | 4482488ce0 |
+| 0041-ps5-wc-tile-uploads | tile uploads through a staging ring and an FBO pass (`BitmapTextureUploaderPS5`; `glTexSubImage2D` detiles on the CPU at ~5 ms per tile) | 9762a8c577 |
+| 0042-ps5-wc-scene-host | `WCScene::apply`/`paint` split with a borrowed context; `PS5WCHost`, the scene host on the title's render thread (M1) | 8b9c728b7a 9371aa286b |
+| 0043-ps5-wc-tile-grid-and-coverage | tiles survive layer resizes, up to 8 dirty parts per tile; coverage half a view ahead, one more row kept; tile paint stats (M2) | 057ebfbb87 1106c18420 |
+| 0044-ps5-wc-frame-pacing | DisplayRefreshMonitor driven by the title's presents, `[render]` lines for WC; no scene repaint for updates without layer changes (M2) | 74efe25133 29a9396e3d |
+| 0045-ps5-wc-scrollbars-fixed-and-sticky | scrollbars painted into their layers; no full repaint of fixed and sticky content per scroll step; composited sticky elements (M3) | c945b3ae90 1b74f03f8a 4e0fe1c13e |
+| 0046-ps5-wc-tile-painting-arena | tiles painted into a shared-memory arena, recorded once and replayed on the painting threads (M5) | 8af4f0f1d2 |
+| 0047-ps5-wc-accelerated-animations | transform and opacity animations run in the WC scene (M3) | fea93260ac |
+| 0048-ps5-wc-async-tile-replay | tile replay asynchronous by default; recordings snapshot ImageBuffers | 2f640b9488 |
+| 0049-ps5-wc-texture-pool-off-main-thread | no BitmapTexturePool timer on the title's main thread; a log line when the pool goes over its limit | 7d09449da9 c290e972ee |
+| 0050-ps5-wc-animations-at-display-time | animations sampled at the frame's display time; animated layers tiled whole | b83769b247 |
+| 0051-ps5-wc-video-layers | composited video layers name their ps5videosink stream key and draw the title's converted frames (M4) | 02a3f8847b 0e6aee371a |
+| 0052-ps5-media-suspend-after-preroll | muted videos made off screen go to their suspend state once prerolled (`PS5WK_MEDIA_SUSPEND_PREROLLED=0`: old behaviour; M6) | b9007fb2c3 |
+| 0053-ps5-wc-gl-texture-cap | GL texture cap in the title (reduced coverage, then the CPU path for that WebProcess); scene teardown empties the texture pool (M6) | 900ba6f6ad |
+| 0054-ps5-wc-sticky-at-current-scroll-position | composited sticky layers placed with the current scroll position | b235085eb2 |
+| 0055-ps5-wc-reply-and-update-pacing | a rendering update asked for after a reply starts at once; title frames without an update wait for the expected one | 95e259c204 80573f3544 |
+| 0056-ps5-wc-tiles-outside-scissor | tiles outside the scissor box are not drawn | 8f6597b8f5 |
+| 0057-ps5-wc-overlap-on-scroll-layout | overlap recomputed on scroll steps that also need a layout | edfee43cea |
+| 0058-ps5-wc-async-scrolling | async scrolling in the title: `WCScrollingCoordinator` in the WebProcess, `PS5WCScrollingTree` in the title, wheel events handled there, ScrollUpdatesWC back (AS0-AS3) | 8b7e3617ac |
+| 0059-ps5-image-decode-metadata-without-waiting | painting doesn't wait for an image's background decode to read its metadata (and the stack-overflow fix of that guard) | 730265f633 2295014834 |
+| 0060-ps5-wc-async-scrolling-stick-and-sub-scrollers | early replies, the frame-locked stick (`stickframe=1`), async overflow scrollers (`overflow=1`) (AS4, AS5) | e8f6923ada |
+| 0061-ps5-wc-scene-paint-batching-and-timing | scene quads as triangles (the driver batches only `GL_TRIANGLES`: 2800-layer scene paint 82-96 -> 39-41 ms; `wc-fan-draws` for A/B); scene and tile-arena timing (`wc-scene-stats`); lagging scrollbar hidden (AS6) | 513c01b0c4 |
+| 0062-ps5-wc-async-scrolling-overflow-and-snap | horizontal overflow scrollers and scroll snapping under async scrolling | b8033dea3f |
+| 0063-ps5-wc-perf-overlay-counters | counters for the title's performance overlay (`PS5CompositorClient::perfSnapshot`, OVERLAY.md) | 9e25fc7e55 |
+| 0064-ps5-wc-async-scrolling-gl-cap-and-gesture-nodes | no lock-up at the GL cap; gesture nodes so carousels aren't resnapped under the stick; pool surfaces released after 50 ms near the cap | 2e90eec762 85fdae9903 |
+| 0065-ps5-wc-overflow-proxy-tiles-and-snap-glide | tiles for children of overflow scroll proxies (the missing last card); snap carousels glide on after the stick | 9c7811f80e |
+| 0066-ps5-wc-async-scrolling-sync | frames that scroll wait for the update made at their position, so scroll-linked content moves with the page (`sync=0` off) | f4d8a064a5 |
+| 0067-ps5-wc-on-by-default | GPU compositing on unless `/data/ps5webkit/no-compositing`; async scrolling on with it unless `wc-async-scroll` says `off`, frame-locked stick by default; `[ascroll]` lines whenever async scrolling is on | (new) |
+
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS
 includes, WKAPICast PlayStation guard, `EGL_DEFAULT_DISPLAY` as an int on PS5,
 xdgmime globals renamed (clash with GIO's copy in a static link), CPU-only
-WPE preferences on PS5 (no hardware acceleration, no compositing), and the
+WPE preferences on PS5 (no hardware acceleration, no compositing; in WC
+builds 0039 turns compositing on per WebProcess at run time), and the
 128 MB JSC structure heap on PS5.
 
 The memmem shim and `<sys/sysinfo.h>` from Spike 4 are in `shim/`
@@ -1201,6 +1305,21 @@ Not done yet: HDR (10-bit BT.2020/PQ streams are shown with the BT.709
 matrix, no tone mapping); canvas `drawImage` of a hardware-decoded video
 draws nothing; two 8K decoders at once won't fit the title's flexible
 memory (the second waits up to 3 s, then the proxy fails that stream).
+
+**Decoder budget (2026-11-01, COMPOSITING-PLAN.md *M6*).** The title admits
+at most 8 hardware decoders at once, with their memory (decoder + output
+buffers, measured around each open) within 2048 MB of direct memory, and
+only while 64 MB of flexible memory stay free. An open over budget waits up
+to 0.5 s for decoders to close (off-screen videos being suspended), then is
+refused, and that pipeline run decodes in software (a suspended video that
+comes back asks again). VP9 gets its 4K headroom only for streams above
+1080p while it fits in half the budget; otherwise its decoder is sized to
+the stream (at least 1920x1088). Muted videos made off screen (a feed at
+load) go to their suspend state once prerolled, like videos that scrolled
+away (patch 0052; `PS5WK_MEDIA_SUSPEND_PREROLLED=0` in child.env: the old
+behaviour). `/data/ps5webkit/vdec-budget` overrides it (`decoders= direct=
+reserve= wait= vp9headroom=0/1/2`); the open/close lines log each
+decoder's cost and `budget N decoders, X MB (peak ...)`.
 
 The plan this followed:
 1. **WebProcess:** a proxy decoder element, `ps5vdecproxy` (klass
