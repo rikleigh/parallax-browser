@@ -1252,33 +1252,111 @@ run a watchdog (`apps/common/watchdog.c`, on by default):
 - **Heartbeat:** a GLib timeout on the default main context (WebKit's main
   RunLoop), `G_PRIORITY_HIGH`, every 250 ms, stores the time and the main
   thread's own CPU clock.
-- **Watchdog thread:** wakes once a second. When the main thread has not
+- **Monitor thread:** wakes once a second. When the main thread has not
   turned for `PS5WK_WATCHDOG_S` seconds (child.env; default 3, `0` off), it
-  sends the main thread `SIGVTALRM` (unused by WebKit, JSC, GLib and the
-  profiler's `SIGPROF`); the handler unwinds the interrupted stack with the
-  profiler's unwinder (CFI + rbp chains through LLInt/JIT, `profiler.c`
-  `ps5wk_backtrace_context`) into a static buffer and reads its own CPU
-  clock. Then every other thread the crash guard's trampoline registered,
-  once per stall. Every ~10 s while it lasts: the main thread again. Then a
-  "recovered" line. Works with `PS5WK_PROFILE` off or on (checked with
-  `threads`). If the whole process was stopped (rest mode: the watchdog
-  itself did not run for > 3 s), that time is not counted.
-- **Cost:** 4 timer dispatches/s on the main thread and 1 wake-up/s of the
-  helper; idle WebProcess 0.00 cores with it on and off (`PS5WK_CPU_LOG=all`,
-  60 s each). The watchdog takes no WebKit or GLib lock (the main thread may
-  hold one) and writes its lines with `write(2)`.
+  writes the "stalled" line at once, before anything that could block, and
+  asks the reporter thread for stacks. Every ~10 s while it lasts: "still
+  stalled" and the main thread's stack again. Then a "recovered" line. It
+  also watches the reporter: a report step that takes over 3 s is named
+  ("report held up for 3.0 s in pthread_kill ..., thread t17").
+- **Reporter thread:** sends each thread `SIGVTALRM` (unused by WebKit, JSC,
+  GLib and the profiler's `SIGPROF`); the handler unwinds the interrupted
+  stack with the profiler's unwinder (CFI + rbp chains through LLInt/JIT,
+  `profiler.c` `ps5wk_backtrace_context`) into a static buffer and reads its
+  own CPU clock. The main thread first, then every other thread the crash
+  guard's trampoline registered, once per stall. Works with
+  `PS5WK_PROFILE` off or on (checked with `threads`). If the whole process
+  was stopped (rest mode: the monitor itself did not run for > 3 s), that
+  time is not counted.
+- **Nothing on the report path can wait on another thread** (since TV test
+  5, where a WebProcess froze for 6 minutes and the watchdog printed
+  nothing): no C library formatting (lines are put together by hand, no
+  `snprintf`), no allocation, static buffers and helper stacks touched at
+  start (no page fault while the process is stuck), output with system
+  calls only. stderr is the elfldr connection to the title (a socket): a
+  line it does not take within 0.5 s (the title not reading, a full socket,
+  where every thread that logs would be stuck too) is dropped there, and
+  the report goes on in the file:
+  `/data/ps5webkit/prof/watchdog-<tag>-<pid>.txt` (`PS5WK_PROFILE_DIR`),
+  appended at every stall. A note in the file says when stderr stopped (and
+  started again) taking output.
+- **Stacks on demand:** touching `/data/ps5webkit/prof/watchdog-dump` (an
+  FTP upload of any file) makes every running child write the stacks of all
+  its threads once (to the log and its file), stalled or not: for a process
+  whose run loop still turns but does no work.
+- **Cost:** 4 timer dispatches/s on the main thread and 1 wake-up plus one
+  `stat()` per second of the monitor; the reporter sleeps in `read()`.
+  Idle WebProcess 0.00 cores with it on and off (`PS5WK_CPU_LOG=all`, 60 s
+  each, first version).
+
+**TV test 5: a silent WebProcess freeze** (build 20261102-112536-9e25fc7e55).
+On a search results page, a hover preview started: VP9 640x360 MSE, the
+title's decoder opened, `ps5videosink` connected, "NV12 decoded in the
+title", and the session went to Playing. After that the WebProcess printed
+nothing for 6.7 minutes. There were no `[render]`, console or `[cpu]` lines,
+and no watchdog line, although the watchdog was on. A navigation (L3 home)
+never produced `load started`, so the main thread was not serving IPC. The
+process stayed alive: its output closed after 402.7 s, at the page restart.
+At teardown the title reported that stream: 2 frames received and shown;
+the decoder had 9 AUs and 7 pictures, 0 PRELEASEs; 5 audio streams from that
+pid with 0.0 s of audio. The title's process CPU went from 0.15-0.25 to a
+steady 0.47 cores for the whole freeze and down to 0.27 when the
+WebProcess was killed. Which title thread that was is not known: the
+servers' code has no busy loop.
+- The old watchdog wrote with a blocking `write(2)` to fd 2. That is the
+  elfldr TCP connection the title relays from. The report path also used
+  libc `snprintf`, `pthread_kill`/`pthread_getname_np` (libthr locks), and
+  stack and `.bss` pages touched for the first time. Any of these blocking
+  would explain the silence. So would a run loop that kept turning in a
+  nested loop. The new watchdog (above) writes the "stalled" line first and
+  never blocks on stderr. It names a report step that hangs and keeps a
+  file copy. `watchdog-dump` gives stacks even when the loop turns.
+- Code candidates in the media path, unconfirmed:
+  - **(a)** `ps5videosink` `set_geometry`/`set_visible` on the main thread
+    (WebKit's paint) do a blocking `sendmsg` under `self->lock`, which
+    `show()` also holds while it sends or logs.
+  - **(b)** `ps5vdecproxy` `conn_send` blocks under the connection lock
+    from `ps5_flush` (FLUSH_STOP on the seeking thread) and from
+    `placeholder_free` (any thread).
+  - **(c)** `ps5audiosink` `ps5_write` blocks in `send` (4 KB buffers) while
+    the title sits in `sceAudioOutOutput`. A PAUSED->READY transition then
+    joins the ring thread from the main thread.
+  - **(d)** stderr back-pressure: every logging thread blocks on the child's
+    stdio lock. The title's relay showed no sign of stopping, though.
+  The overlay's new child code (`perfReporter`: `getrusage`,
+  `sysctl(KERN_PROC_PID)`, `fprintf` once a second) takes no WebKit or
+  GStreamer lock.
+- After the restart, the new page process's ELF upload failed at once
+  ("sent 0 bytes ... (write failed)", elfldr right after the old one was
+  killed). The title only logged "launch failed" and kept WebKit's IPC
+  socket open, so WebKit waited forever on a process that never ran. The
+  page stayed on it: at quit, closing that socket printed "the old one is
+  gone". The web7 that connected 4.4 s later and was closed by WebKit 10 s
+  after its launch was another process. Most likely it was a worker-only
+  process: with one WebProcess for all pages, a service worker for a site
+  other than the page process's gets its own process, as web5 had in the
+  same session (launched as the site's navigation started, idle for 150 s).
+  Fixed in `WPEProcessManagerPS5.cpp`:
+  - a failed upload (elfldr unreachable, or the write failing) is retried
+    up to 6 times with 1-5 s pauses;
+  - a launch that still fails closes the process's IPC socket on the main
+    thread, so WebKit sees the process end as a crash.
+  The title (`onWebProcessTerminated`) then loads the restart's address in
+  a new process. It tries up to 3 times, then shows the crash page.
 
 **The lines** (title log, prefixed `[web<N>]`/`[network<N>]`):
 
 ```
-[watchdog web4] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding)
-[watchdog web4] main thread stalled: no run loop turn for 3.9 s, its CPU +3.8 s (busy); backtraces follow
+[watchdog web4] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding); reports also in /data/ps5webkit/prof/watchdog-web4-1278.txt, touch /data/ps5webkit/prof/watchdog-dump for the stacks of every thread
+[watchdog web4] main thread stalled: no run loop turn for 3.9 s (pid 1278); stacks follow, also in /data/ps5webkit/prof/watchdog-web4-1278.txt
+[watchdog web4] main thread: its CPU +3.8 s since its last turn (busy)
 [watchdog web4] bt main t756 cpu 3895 ms: j3 f7b2c4 30295fe 318083d 16d02e2 ... 2d38cc5 2c1e5a 2d57 4c1e
 [watchdog web4] bt t95 JIT_Worklist_Helper_Thread cpu 3 ms: x800001dfc 2d3cfcb 2caa9df e5f8 2c82f2a ...
 [watchdog web4] bt t324 PS5Paint cpu 1 ms: same as t262
 [watchdog web4] bt t437 gmain: no answer to the signal
 [watchdog web4] 16 other threads (9 distinct stacks, 1 silent)
-[watchdog web4] main thread still stalled after 14.2 s, its CPU +13.8 s (busy)
+[watchdog web4] main thread still stalled after 14.2 s
+[watchdog web4] main thread: its CPU +13.8 s since its last turn (busy)
 [watchdog web4] bt main t194 cpu 13924 ms: j3 f7b2c4 ...
 [watchdog web4] main thread recovered: stalled 15.0 s, its CPU +14.6 s (busy)
 ```

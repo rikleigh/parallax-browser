@@ -685,28 +685,47 @@ void ps5wk_backtrace_refresh_jit(void)
     }
 }
 
+// " <hex>" without the C library (the watchdog formats while other threads
+// may hold any libc lock).
+static size_t appendHex(char* buffer, size_t used, size_t size, const char* prefix, uintptr_t value)
+{
+    char digits[2 * sizeof value];
+    unsigned n = 0;
+    do {
+        digits[n++] = "0123456789abcdef"[value & 15];
+        value >>= 4;
+    } while (value && n < sizeof digits);
+    for (const char* p = prefix; *p && used + 1 < size; p++)
+        buffer[used++] = *p;
+    while (n && used + 1 < size)
+        buffer[used++] = digits[--n];
+    buffer[used] = 0;
+    return used;
+}
+
 size_t ps5wk_backtrace_format(char* buffer, size_t size, const uintptr_t* pcs, unsigned n)
 {
     size_t used = 0;
-    if (size)
-        buffer[0] = 0;
+    if (!size)
+        return 0;
+    buffer[0] = 0;
     uintptr_t js = atomic_load(&jitStart), je = atomic_load(&jitEnd);
     for (unsigned k = 0; k < n && used + 24 < size; k++) {
         uintptr_t pc = pcs[k];
-        int written;
         if (pc >= textStart && pc < textEnd)
-            written = snprintf(buffer + used, size - used, " %lx", (unsigned long)(pc - base));
+            used = appendHex(buffer, used, size, " ", pc - base);
         else if (pc >= js && pc < je) {
             // Uncached: the profiler's cache belongs to its writer thread.
             int tier = ps5wk_jit_tier ? ps5wk_jit_tier((const void*)pc) : -1;
-            written = tier >= 0 ? snprintf(buffer + used, size - used, " j%d", tier) : snprintf(buffer + used, size - used, " j");
+            buffer[used++] = ' ';
+            buffer[used++] = 'j';
+            if (tier >= 0 && tier <= 9)
+                buffer[used++] = (char)('0' + tier);
+            buffer[used] = 0;
         } else
-            written = snprintf(buffer + used, size - used, " x%lx", (unsigned long)pc);
-        if (written < 0)
-            break;
-        used += (size_t)written;
+            used = appendHex(buffer, used, size, " x", pc);
     }
-    return used < size ? used : size - 1;
+    return used;
 }
 
 unsigned ps5wk_profiler_threads(uintptr_t* keys, unsigned* indices, unsigned max)
