@@ -1783,3 +1783,117 @@ per-second averages / worst per-second p95 / max. `title-ascroll-summary.py`):
 - Measurement caveats: the numbers are from the synthetic page only. A
   console session by another agent overlapped some earlier runs (series
   screenshots every 250 ms), and those runs were discarded.
+
+## Music section thumbnails (2026-11-02)
+
+Owner: in GPU mode, thumbnails on the video site's Music section (the music
+channel's page, which signed-out sessions can reach) load very slowly, while
+they now come in fast everywhere else on the site.
+
+**Cause: mostly the network, in both modes.** On that page each playlist
+card's cover is a 1200x1200 PNG (served as `maxresdefault.jpg`,
+`image/png`) of 0.66-2.57 MB (20 sampled). The page script chooses it as
+`src` for a 314x176 box (no `srcset`), and the same image is drawn a second
+time as the card's blurred stack backdrop. One screen holds ~20 covers, and
+the page sets `src` on ~10-30 more just off screen: ~30 MB per screen. Other
+pages use 480x360 JPEGs (~20-50 KB). The console's link measured ~5 MB/s:
+a 20 MB download in 3.9-4.0 s, 20 x 100 KB in parallel in 0.26-0.31 s,
+LAN ping 18-75 ms, FTP 2-7 MB/s. The Mac on the same network got 19 MB/s.
+The soup session's limits (256 connections, 6 per host) are Chrome's.
+With a cold HTTP cache (cache directory moved aside for each run; JS
+timings of every visible `img` from navigation start; scroll steps of 0.8
+viewport every 3-4 s):
+
+| run | first screen: all visible covers loaded | step 1 | step 2 | step 3 |
+| --- | --- | --- | --- | --- |
+| GPU (WC), cold | 8.5 s | 3.7 s | 3.3 s | 1.0 s |
+| GPU (WC), cold, earlier run | 7.9 s | 3.9 s | > 4 s | 2.5 s |
+| CPU path, cold | 10.7 s | > 5 s | > 4.4 s | 2.1 s |
+| CPU path, covers in the HTTP cache | 5.2 s | 0.8 s | 0.9 s | 0.7 s |
+
+An earlier "CPU is fast" result came from a CPU run that came right after
+a GPU run, with the covers already in the HTTP cache. Covers complete one
+after another, 0.3-0.5 s apart, at the link's rate. Once loaded, they show
+within 0.25-0.8 s in both modes (250 ms captures).
+
+**Not the GL texture cap:** GL textures were 71-97 MB on this page
+(624-641 layers), under the 128 MB log line and the 160 MB cap. The
+128/160 MB events in the TV log were on other pages of the site.
+
+**What the main thread does on this page** (sampling profiler, 45 s: load,
+4 scroll steps, 5 jumps back to loaded content; WC vs CPU, same script):
+
+| | WC | CPU path |
+| --- | --- | --- |
+| main thread CPU | 18.5 s | 26.8 s |
+| PNG/JPEG decode in painting (synchronous) | 1.30 s | 1.84 s |
+| CSS `filter: blur()` of the backdrops, in software while recording | 0.57 s | 6.5 s (all filters 9.8 s) |
+| recording (WC tiles / CPU frame) | 2.8 s | 16.5 s |
+| `computeCompositingRequirements` | 3.9 s (21 %) | 0 |
+
+- The memory cache is 96 MB (`DocumentBrowser`, RAM >= 2 GB). A cover costs
+  ~1.5 MB encoded + 5.8 MB decoded, so the encoded covers alone exceed it.
+  The decoded data of any cover not drawn for 1 s and not in the viewport is
+  pruned: 11-25 large frames destroyed per 5 s while scrolling. Each revisit
+  decodes again, synchronously, 40-60 ms per cover (0.4-0.8 s of main
+  thread per 5 s window). Raising the capacity was considered but not done:
+  WebProcess memory is the tightest resource (1.3 GB RSS seen on the TV).
+- Scroll jumps back to loaded content (250 ms captures): the CPU path shows
+  them in 0.25-0.5 s; WC in 0.5-1.25 s, plus stalls of 2.5-3 s in some of
+  them (below).
+
+**Fixed: painting waited on an image's background decode** (src-wc
+730265f633, `BitmapImageSource::frameAtIndexCacheIfNeeded`, both modes).
+Upstream decodes large off-screen images (e.g. in WC's coverage margin) on
+the image's decoding queue. `ScalableImageDecoder` holds its lock for the
+whole decode. Painting that image meanwhile (`RenderImage::paintReplaced`
+-> `currentFrameIsComplete` -> `cacheMetadataAtIndex` ->
+`frameHasAlphaAtIndex`) blocked the main thread on that lock until the
+decode ended. A 1 s watchdog (`PS5WK_WATCHDOG_S=1`) caught a 2.5 s stall of
+the whole update this way, the main thread "waiting". Now the metadata
+read is skipped while a decode of that image is in flight. The frame counts
+as not decoded yet, and the decode's completion caches the metadata and
+repaints its waiting clients. `PS5WK_DECODE_METADATA_WAIT=1` (child.env)
+waits, as upstream. With it: 12-28 skipped reads per 5 s while loading,
+and covers drawn normally after jumps (captures checked). The A/B runs are
+noisy (network, page content changes per load); the evidence is the
+backtrace. The same commit adds a `[render] image decodes` line (every 5 s
+while images are decoded): main-thread decodes with ms and large-image
+count, asynchronous requests and results, large frames destroyed,
+metadata reads skipped.
+
+**Tried and dropped:** decoding large images asynchronously when painting
+WC tiles (instead of synchronously in the recording). After a jump, covers
+stayed gray for more than 5 s: decodes completed (25 per 5 s), but the
+frames were destroyed and asked for again. The two clients per cover (main
+image and blurred backdrop, different draw sizes) and the cache pruning
+above are the likely reasons. Not committed.
+
+**Open:**
+- A second kind of 2.5-3 s stall on some jumps (2 of ~6 runs, both modes of
+  the knob). The main thread does not answer the watchdog's signal ("its
+  CPU unknown", then "+0.7 s (waiting)"). In 2 of 3 cases it came right
+  after a new 8 MB tile-arena chunk (`SharedMemory::allocate`: `shm_open`
+  + `mmap`, then the title maps it). Not resolved. Next step: time
+  `addChunk` and the title's map, or pre-allocate the arena chunks.
+- The software blur of the backdrops (0.57 s in WC, 6.5 s on the CPU
+  path) runs on the main thread because filters are applied when recorded.
+  Moving it to the replay threads (a Skia image filter in the picture)
+  would be a bigger change.
+- Visible-first image priority and HTTP/2 to the image host were not
+  looked into. At ~5 MB/s, a screen of these covers takes ~6 s whatever
+  the order.
+
+**The 2772-layer / 18 ms scene paint** in the TV log is a different page
+of the site. On this page: 624-641 layers, scene paint 11-15 ms per frame
+(home page: 7.6 ms). It costs frame rate, not thumbnail time (covers are
+gated by the network). TextureMapper already skips invisible layers
+(opacity 0, empty). The WebProcess side is `computeCompositingRequirements`
+at 21 % of the main thread. No cheap win found; the touch-feedback overlay
+layers (see "Thumbnails slower to show") are the candidate.
+
+**For the owner, on the TV:** open the Music section once with GPU
+compositing off and once with it on. Both should be about as slow while
+the covers download (several seconds per screen on this link), and both
+quick when revisited within the HTTP cache's life. A wired connection
+would help here: the console's link measured ~5 MB/s, LAN ping 18-75 ms.
