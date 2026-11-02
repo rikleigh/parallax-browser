@@ -284,10 +284,16 @@ WebKit process: no IPC socket, no rendezvous.
 | | title direct heap (before / during / after) | child | total |
 | --- | --- | --- | --- |
 | first-start compile (Wikipedia loading at the same time) | 26.8 / 26.8 / 26.8 MB (peak 26.8) | peak RSS 472 MB, compile 52.7 s | 55.3 s launch to list in use; load 2 ms |
+| first-start compile of the bundled list (copied from `/app0` in 0.5 s) | 26.8 / 26.8 / 26.8 MB | peak RSS 472 MB, compile 51.5 s | 53.9 s |
 | forced update (`POST /adblock?do=update`) | 26.8 / 26.8 / 26.8 MB (peak 26.8) | peak RSS 477 MB (408 MB after the conversion); manifest 0.26 s, 10 files (4.7 MB) 3.4 s, conversion 3.1 s, compile 56.8 s | 64.9 s; same sha256 as node (`04185856...`) |
 | before (compile in the title) | 27 / 557-691 / 370-450 MB (kept until restart) | - | 44-67 s; +400 MB more during an update's conversion |
 
-Flexible memory stayed at 282 MB in the title throughout. Page loads
+Flexible memory stayed at 282 MB in the title throughout. Failure check:
+a newer downloaded list that WebKit refuses (an unsupported regex) gave
+`compile job (the source list changed) ended after 2.5 s: failed: ...`,
+the Settings status said so and the list in use stayed (filter on, same
+version); the next job removed the temporary file it had left (since then
+the child removes it at once). Page loads
 during the compile (BBC News, MDN, Wikipedia, twice each, warm cache):
 1.0-1.6 s, against 1.1-2.1 s with nothing running: no slowdown measured.
 The upload of the child ELF (130 MB) to elfldr took 0.25-0.28 s.
