@@ -481,6 +481,10 @@ static gboolean readTestURLs(void)
 static char* memRestartURI;
 static gboolean memRestarting;
 static gboolean settingsRestart;
+/* The address the restart loads (until it commits) and how often its new
+ * WebProcess ended before that (a failed launch). */
+static char* restartTargetURI;
+static int restartFailures;
 
 static gboolean memRestart(gpointer data)
 {
@@ -497,6 +501,9 @@ static gboolean memRestart(gpointer data)
     spike_log("[mem] WebProcess ended (%s); loading %s in a new one", settingsRestart ? "Settings: restart page" : "memory limit", memRestartURI);
     char* uri = memRestartURI;
     memRestartURI = NULL;
+    g_free(restartTargetURI);
+    restartTargetURI = g_strdup(uri);
+    restartFailures = 0;
     webkit_web_view_load_uri(webView, uri);
     g_free(uri);
     return G_SOURCE_REMOVE;
@@ -523,6 +530,7 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     }
     if (event == WEBKIT_LOAD_COMMITTED && memRestarting) {
         memRestarting = FALSE;
+        g_clear_pointer(&restartTargetURI, g_free);
         if (settingsRestart) {
             settingsRestart = FALSE;
             SPIKE_PASS("page-restart", "new WebProcess committed %s", webkit_web_view_get_uri(view));
@@ -591,11 +599,31 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     lastCrashURI = g_strdup(uri ? uri : "");
     lastCrashTime = now;
     ps5wk_settings_applied(PS5WK_SETTINGS_PAGE); /* the next WebProcess reads child.env */
+    if (memRestarting && restartTargetURI && ++restartFailures <= 3) {
+        /* The new WebProcess of a restart ended before the page committed
+         * (its launch failed: WPEProcessManagerPS5 then closes its IPC
+         * socket). Nothing committed to reload: load the address again. */
+        SPIKE_FAIL("webprocess", "the restarted page's process ended before its first load (reason %d, %d. time); loading %s in another",
+            reason, restartFailures, restartTargetURI);
+        char* address = g_strdup(restartTargetURI);
+        webkit_web_view_load_uri(view, address);
+        g_free(address);
+        return;
+    }
+    if (memRestarting && restartTargetURI) {
+        /* Three new processes in a row did not start: the error page. */
+        g_free(lastCrashURI);
+        lastCrashURI = g_strdup(restartTargetURI);
+        again = TRUE;
+    }
     if (!again) {
         SPIKE_FAIL("webprocess", "terminated (reason %d); reloading", reason);
         webkit_web_view_reload(view);
         return;
     }
+    memRestarting = FALSE; /* the error page below is not the restarted page */
+    settingsRestart = FALSE;
+    g_clear_pointer(&restartTargetURI, g_free);
     SPIKE_FAIL("webprocess", "terminated (reason %d) again on %s within 30 s; showing an error page", reason, lastCrashURI);
     char* escaped = g_markup_escape_text(lastCrashURI, -1);
     char* html = g_strdup_printf("<!doctype html><html><head><meta charset=\"utf-8\"><title>Page crashed</title>"

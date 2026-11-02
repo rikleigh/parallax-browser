@@ -92,6 +92,8 @@ struct UploadJob {
     std::string elfPath;
     std::string header;
     std::string tag;
+    WPEProcessManagerPS5* manager { nullptr }; // a reference, dropped on the main thread
+    guint64 handle { 0 };
 };
 
 static bool writeAll(int fd, const void* data, size_t size)
@@ -126,10 +128,11 @@ static void relayLine(const char* tag, const char* line)
 }
 
 // Connects to elfldr and sends the ELF plus the header line. Returns the
-// connection (the payload's stdout) or -1.
-static int sendToElfldr(const UploadJob& job, const char* tag)
+// connection (the payload's stdout), or -1 (*retry: worth another attempt).
+static int sendToElfldr(const UploadJob& job, const char* tag, bool* retry)
 {
     gint64 t0 = g_get_monotonic_time();
+    *retry = false;
     int elf = open(job.elfPath.c_str(), O_RDONLY);
     if (elf < 0) {
         g_warning("[ps5-launch %s] cannot open child ELF %s: errno %d", tag, job.elfPath.c_str(), errno);
@@ -161,14 +164,14 @@ static int sendToElfldr(const UploadJob& job, const char* tag)
     }
     if (s < 0) {
         g_warning("[ps5-launch %s] cannot reach elfldr on 127.0.0.1:%d: errno %d", tag, PS5WK_ELFLDR_PORT, errno);
-        if (s >= 0)
-            close(s);
         close(elf);
+        *retry = true;
         return -1;
     }
     static char chunk[1 << 20];
     size_t total = 0;
     bool ok = true;
+    int writeError = 0;
     for (;;) {
         ssize_t n = read(elf, chunk, sizeof(chunk));
         if (n < 0 && errno == EINTR)
@@ -176,20 +179,60 @@ static int sendToElfldr(const UploadJob& job, const char* tag)
         if (n <= 0)
             break;
         if (!writeAll(s, chunk, static_cast<size_t>(n))) {
+            writeError = errno;
             ok = false;
             break;
         }
         total += static_cast<size_t>(n);
     }
     close(elf);
-    ok = ok && writeAll(s, job.header.c_str(), job.header.length());
+    if (ok && !writeAll(s, job.header.c_str(), job.header.length())) {
+        writeError = errno;
+        ok = false;
+    }
     PS5_LOG("[ps5-launch %s] sent %zu bytes + header to elfldr in %.0f ms%s", tag, total,
         (g_get_monotonic_time() - t0) / 1000.0, ok ? "" : " (write failed)");
     if (!ok) {
+        // elfldr closed the connection under us (seen right after a
+        // WebProcess was killed, 2026-11-02: 0 bytes taken, errno below).
+        g_warning("[ps5-launch %s] elfldr took %zu bytes, then the write failed: errno %d", tag, total, writeError);
         close(s);
+        *retry = true;
         return -1;
     }
     return s;
+}
+
+// The upload of a launch failed for good: close the IPC socket WebKit gave us
+// for that process, so that WebKit sees the process end (as a crash) and
+// the page asks for another one. Otherwise WebKit waits forever for a
+// process that never runs and the page stays on it (2026-11-02: a page
+// restart whose upload failed left the browser without a page process).
+struct LaunchFailure {
+    WPEProcessManagerPS5* manager;
+    guint64 handle;
+    std::string tag;
+};
+
+static gboolean launchFailedOnMain(gpointer data)
+{
+    std::unique_ptr<LaunchFailure> failure(static_cast<LaunchFailure*>(data));
+    auto* priv = failure->manager->priv;
+    auto it = priv->launches.find(failure->handle);
+    if (it != priv->launches.end() && it->value->ipcFD >= 0 && !it->value->pid) {
+        PS5_LOG("[ps5-launch %s] the launch failed: closing its IPC socket, so WebKit takes the process as ended and starts another",
+            failure->tag.c_str());
+        close(it->value->ipcFD);
+        it->value->ipcFD = -1;
+    }
+    g_object_unref(failure->manager);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean unrefOnMain(gpointer data)
+{
+    g_object_unref(data);
+    return G_SOURCE_REMOVE;
 }
 
 static gpointer uploadThread(gpointer data)
@@ -203,9 +246,15 @@ static gpointer uploadThread(gpointer data)
 
     g_mutex_lock(&s_uploadLock);
     for (int attempt = 1; attempt <= 6 && s < 0; attempt++) {
-        s = sendToElfldr(*job, tag);
-        if (s < 0)
-            break;
+        bool retry = false;
+        s = sendToElfldr(*job, tag, &retry);
+        if (s < 0) {
+            if (!retry || attempt == 6)
+                break;
+            g_warning("[ps5-launch %s] upload failed (attempt %d); retrying in %d s", tag, attempt, attempt);
+            g_usleep(attempt * 1000 * 1000);
+            continue;
+        }
         // Wait for the payload's first output: it is running, or elfldr
         // refused the spawn.
         struct pollfd p { s, POLLIN, 0 };
@@ -231,8 +280,10 @@ static gpointer uploadThread(gpointer data)
     g_mutex_unlock(&s_uploadLock);
     if (s < 0) {
         g_warning("[ps5-launch %s] launch failed", tag);
+        g_idle_add(launchFailedOnMain, new LaunchFailure { job->manager, job->handle, job->tag });
         return nullptr;
     }
+    g_idle_add(unrefOnMain, job->manager);
 
     // The payload's stdout/stderr come back on this connection: relay them
     // to our log, line by line, until the payload exits.
@@ -510,6 +561,8 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
 
     ensureListener(manager);
     guint64 handle = launch->handle;
+    job->manager = WPE_PROCESS_MANAGER_PS5(g_object_ref(manager));
+    job->handle = handle;
     priv->launches.add(handle, WTF::move(launch));
     g_thread_unref(g_thread_new("ps5-launch", uploadThread, job));
     return handle;
