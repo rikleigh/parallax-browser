@@ -530,7 +530,7 @@ index 9a4db15ce3..97430f6b95 100644
  
      // Returns true if the policy changed.
 diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
-index 1e66ce6d12..4dd1e4d84a 100644
+index 1e66ce6d12..aafc0f3544 100644
 --- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
 +++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
 @@ -252,6 +252,36 @@ bool DrawingAreaProxyWCPS5::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
@@ -598,14 +598,6 @@ index 1e66ce6d12..4dd1e4d84a 100644
      }
      stats = { };
      stats.windowStart = now;
-@@ -489,6 +524,7 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
-             if (asyncScrollingOption("sync", 1) > 0)
-                 syncScenes().add(identifier().toUInt64());
-             PS5WCHost::setSyncReserveMS(asyncScrollingOption("syncreserve", 5));
-+            PS5WCHost::setSyncPause(asyncScrollingOption("syncpause", 1) > 0);
-         }
-         Locker locker { scrollingTreesLock() };
-         scrollingTrees().set(identifier().toUInt64(), *m_scrollingTree);
 diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
 index b19b12fb06..2253c4c691 100644
 --- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
@@ -625,108 +617,6 @@ index b19b12fb06..2253c4c691 100644
      unsigned m_updatesReceived { 0 };
      unsigned m_updatesAtDOMWheelSend { 0 };
      MonotonicTime m_domWheelSentAt;
-diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
-index 47c42c94ab..0a208cf468 100644
---- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
-+++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
-@@ -453,6 +453,11 @@ private:
-     void releaseHeldReplies();
-     Vector<CompletionHandler<void()>> m_heldReplies;
-     bool m_syncRanThisFrame { false };
-+    // A WebProcess too slow to make the frame (missed several waits in a
-+    // row): don't wait for it for a while; scroll-linked content lags then,
-+    // but the render thread isn't held up every frame for nothing.
-+    unsigned m_syncMissStreak { 0 };
-+    int64_t m_syncPausedUntilUS { 0 };
-     bool m_treeServicedThisFrame { false };
-     double m_paintEstimateMS { 3 }; // scene paint, smoothed
-     void updateSubScrollerRects(WCScene&, uint64_t sceneID);
-@@ -477,7 +482,7 @@ private:
-         // Frames the title moved the root: content made at that position
-         // (lead under 1 px) or behind it; sync waits and how they ended.
-         unsigned movingFrames { 0 }, contentInStep { 0 };
--        unsigned syncWaits { 0 }, syncInTime { 0 }, syncStale { 0 }, syncMissed { 0 }, syncAlready { 0 };
-+        unsigned syncWaits { 0 }, syncInTime { 0 }, syncStale { 0 }, syncMissed { 0 }, syncAlready { 0 }, syncPaused { 0 };
-         double syncWaitMS { 0 }, syncWaitMaxMS { 0 };
-     } m_scrollStats;
-     void noteScrollPresent();
-@@ -1189,6 +1194,7 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
- }
- 
- static std::atomic<float> s_syncReserveMS { 5 }; // PS5WCHost::setSyncReserveMS
-+static std::atomic<bool> s_syncPause { true }; // PS5WCHost::setSyncPause
- 
- void SceneHost::releaseHeldReplies()
- {
-@@ -1224,6 +1230,11 @@ void SceneHost::syncWithWebProcess(uint64_t sceneID, int64_t displayUS)
-         return; // the root doesn't move this frame: nothing to keep in step
-     if (auto webProcess = tree->webProcessScrollPosition(); webProcess && samePosition(*webProcess, *target)) {
-         m_scrollStats.syncAlready++;
-+        m_syncMissStreak = 0;
-+        return;
-+    }
-+    if (g_get_monotonic_time() < m_syncPausedUntilUS) {
-+        m_scrollStats.syncPaused++;
-         return;
-     }
-     // Wait for it until the scene must be painted to make the vsync.
-@@ -1261,10 +1272,17 @@ void SceneHost::syncWithWebProcess(uint64_t sceneID, int64_t displayUS)
-     double waitedMS = (g_get_monotonic_time() - startUS) / 1000.0;
-     m_scrollStats.syncWaitMS += waitedMS;
-     m_scrollStats.syncWaitMaxMS = std::max(m_scrollStats.syncWaitMaxMS, waitedMS);
--    if (inTime)
-+    if (inTime) {
-         m_scrollStats.syncInTime++;
--    else
-+        m_syncMissStreak = 0;
-+    } else {
-         m_scrollStats.syncMissed++;
-+        // Four misses in a row: its updates take longer than a frame (a long
-+        // page, a slow script). Try again in 500 ms (one wait then, and a
-+        // pause again if that misses too).
-+        if (++m_syncMissStreak >= 4 && s_syncPause.load())
-+            m_syncPausedUntilUS = g_get_monotonic_time() + 500000;
-+    }
- }
- 
- void SceneHost::updateSubScrollerRects(WCScene& scene, uint64_t sceneID)
-@@ -1336,10 +1354,10 @@ void SceneHost::maybeLogScroll()
-     }
-     if (m_scrollStats.movingFrames || m_scrollStats.syncWaits) {
-         WTFLogAlways("[ascroll] %.1f s sync: %u frames moved the root in the title, content made at that position in %u (%u behind); " // NOLINT
--            "waited for the WebProcess in %u frames (%.1f ms avg, %.1f max): its update came in time %u, missed %u, stale updates first %u; already there %u",
-+            "waited for the WebProcess in %u frames (%.1f ms avg, %.1f max): its update came in time %u, missed %u, stale updates first %u; already there %u; not waited for (it kept missing) %u",
-             seconds, m_scrollStats.movingFrames, m_scrollStats.contentInStep, m_scrollStats.movingFrames - m_scrollStats.contentInStep,
-             m_scrollStats.syncWaits, m_scrollStats.syncWaits ? m_scrollStats.syncWaitMS / m_scrollStats.syncWaits : 0.0, m_scrollStats.syncWaitMaxMS,
--            m_scrollStats.syncInTime, m_scrollStats.syncMissed, m_scrollStats.syncStale, m_scrollStats.syncAlready);
-+            m_scrollStats.syncInTime, m_scrollStats.syncMissed, m_scrollStats.syncStale, m_scrollStats.syncAlready, m_scrollStats.syncPaused);
-     }
-     if (m_scrollStats.movedFrames || inputs) {
-         auto& latencies = m_scrollStats.latenciesMS;
-@@ -1646,6 +1664,11 @@ void PS5WCHost::setSyncReserveMS(float value)
- {
-     s_syncReserveMS = std::clamp(value, 3.f, 14.f);
- }
-+
-+void PS5WCHost::setSyncPause(bool value)
-+{
-+    s_syncPause = value;
-+}
- #endif
- 
- void PS5WCHost::noteScrollEvent(ScrollNote note)
-diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
-index 25579d17b2..eb500727f5 100644
---- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
-+++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
-@@ -67,6 +67,7 @@ public:
-     // position (ms; "syncreserve=" in the flag file, default 5; the wait also
-     // leaves the smoothed scene paint time + reserve - 3).
-     static void setSyncReserveMS(float);
-+    static void setSyncPause(bool); // "syncpause=0": wait every frame even when the WebProcess keeps missing
- 
- private:
-     PS5WCHost();
 diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
 index 2bec9f85de..6b3704d9a9 100644
 --- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp

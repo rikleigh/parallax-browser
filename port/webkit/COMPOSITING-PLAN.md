@@ -2942,7 +2942,13 @@ causes of our own and the page's own costs:
    FIXME, and the layer position and z-order rebuild after each layout).
 
 The title's scroll sync (0066) then waited ~11 ms every frame for updates
-that never came in time (`[ascroll] sync ... missed 46`).
+that never came in time (`[ascroll] sync ... missed 46`). A pause after 4
+misses in a row was tried and dropped: on `scrolljank.html?busy=30` (a 30 ms
+rAF, always late) it cost the WebProcess 10 % of its updates (26-27/s
+instead of 30) and 1 ms of pad -> present (13.3 instead of 12.2 ms), because
+an update that arrives during the wait is applied and answered at once,
+otherwise only at the next frame. The wait ends before the frame must be
+painted, so it doesn't cost frames.
 
 ### Fixes (patch 0070)
 
@@ -2976,17 +2982,13 @@ that never came in time (`[ascroll] sync ... missed 46`).
   only. `PS5WK_IO_SKIP=0` = old. (A first version read the clock per target:
   `MonotonicTime::now()` is a system call here and was half the observers'
   time; it is read once per observer now.)
-- **Scroll sync pause** (`SceneHost::syncWithWebProcess`): after 4 missed
-  waits in a row the title doesn't wait for 500 ms, then tries one wait
-  again. `syncpause=0` in `wc-async-scroll` = old.
 - **Logs:** `[render] wc phases (ms per update)`: layout before, scroll
   events, animations, rAF callbacks, layout after rAF, resize observers,
   intersection observers (targets computed and skipped per update), final
   layout + compositing, other; `[render] intersection observers since
   start` every 30 s (why targets were computed); the `[ascroll] DOM wheel
   events` line counts the root's unconsumed events sent, handled by the
-  WebProcess and held; the sync line counts frames `not waited for (it kept
-  missing)`. `feed-summary.py` has rAF / IO / final layout+comp columns.
+  WebProcess and held. `feed-summary.py` has rAF / IO / final layout+comp columns.
 - **Test tools:** `feedlayers.html` gained `&load=<ms>` (append only near the
   end, after a wait, with a spinner at the end meanwhile), `&spinner=nested|single|css`,
   and triggers `io` (an IntersectionObserver on every card) and `wheel` (a
@@ -3010,13 +3012,14 @@ after (`delay=35 secs=110 ry=0.6`):
 
 Burst scrolling (`secs=8 ry=0.6 upry=0 pause=2`, 200 s, same build: "old"
 = `PS5WK_WC_NESTED_ANIM_EXTENT=0 PS5WK_WHEEL_TRANSACTION=0 PS5WK_IO_SKIP=0`
-in child.env and `unconsumedpace=0 syncpause=0`), averages of the 5 s
-windows once the feed passed ~400 layers (~300-600 items):
+in child.env and `unconsumedpace=0 syncpause=0`; this build still had the
+sync pause, since dropped), averages of the 5 s windows once the feed passed
+~400 layers (~300-600 items):
 
 | | WebProcess updates/s while scrolling | ms per update (non-paint part) | rAF callbacks | intersection observers | final layout + compositing | layer flush incl. tile recording | max layers | sync waits missed |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | old | 7.0 | 93 (64) | 26.8 | 14.9 | 14.9 | 27.5 | 2797 | 2293 |
-| new | 11.4 | 72 (50) | 23.5 | 8.5 | 10.5 | 21.4 | 593 | 199 (2520 frames not waited for) |
+| new | 11.4 | 72 (50) | 23.5 | 8.5 | 10.5 | 21.4 | 593 | 199 (2520 frames not waited for: the dropped pause) |
 
 Synthetic feed (`feedlayers.html?n=100&add=60&load=1500&t=menu,ov,io,wheel,ripple,sticky,preview`,
 held stick, 940 items): the spinner's stacking layers gone (old build
@@ -3024,6 +3027,11 @@ held stick, 940 items): the spinner's stacking layers gone (old build
 instead of 1-5 ms growing with the feed; this page is otherwise cheap (45-60
 updates/s either way), so it reproduces the mechanisms, not the real page's
 slowness.
+
+Regression, `scrolljank.html?busy=30` with the pad (ry 0.5, 4 s down/up),
+final build 20261102-222924-89c28821ce: moving frames 58.0/s in the held
+seconds, pad -> present 12.1 ms avg, WebProcess 30.0-30.5 updates/s (the
+same counting on the build before: 57.9 / 12.2 / 30.0-30.5).
 
 **What is left.** On the real feed the WebProcess still makes only ~11
 updates/s while scrolling at ~550 items (idle: 25-40/s): the page's own rAF
