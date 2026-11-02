@@ -1,0 +1,350 @@
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
+index 761854b63d..ce85751e7d 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
+@@ -32,6 +32,10 @@
+ #include <wtf/Scope.h>
+ #include <wtf/SetForScope.h>
+ #include <wtf/TZoneMallocInlines.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ 
+ #if USE(COORDINATED_GRAPHICS)
+ #include "CoordinatedAnimatedBackingStoreClient.h"
+@@ -283,6 +287,12 @@ void TextureMapperLayer::computeTransformsRecursive(ComputeTransformData& data)
+         m_layerTransforms.combinedForChildren.translate3d(-originX, -originY, -m_state.anchorPoint.z());
+ 
+ #if USE(COORDINATED_GRAPHICS)
++#if defined(PS5_PAYLOAD_SDK)
++        // Only coordinated graphics' animated backing stores read the
++        // future transforms; the title's WC scene has none (three matrix
++        // products per layer per frame for nothing).
++        if (m_animatedBackingStoreClient || (m_parent && m_parent->m_animatedBackingStoreClient)) {
++#endif
+         // Compute transforms for the future as well.
+         TransformationMatrix futureParentTransform;
+         if (m_parent)
+@@ -302,6 +312,9 @@ void TextureMapperLayer::computeTransformsRecursive(ComputeTransformData& data)
+             m_layerTransforms.futureCombinedForChildren.flatten();
+         m_layerTransforms.futureCombinedForChildren.multiply(m_state.childrenTransform);
+         m_layerTransforms.futureCombinedForChildren.translate3d(-originX, -originY, -m_state.anchorPoint.z());
++#if defined(PS5_PAYLOAD_SDK)
++        }
++#endif
+ #endif
+ 
+ #if ENABLE(DAMAGE_TRACKING)
+@@ -351,6 +364,39 @@ void TextureMapperLayer::computeTransformsRecursive(ComputeTransformData& data)
+     if (m_backingStore && m_animatedBackingStoreClient)
+         m_animatedBackingStoreClient->requestBackingStoreUpdateIfNeeded(m_layerTransforms.futureCombined);
+ #endif
++
++#if defined(PS5_PAYLOAD_SDK)
++    // Subtree bounds for paintRecursive's culling.
++    m_ps5SubtreeLayerCount = 1;
++    m_ps5SubtreeBoundsValid = !isFlattened() && !m_state.preserves3D && !m_isReplica && !m_state.replicaLayer
++        && !m_state.backdropLayer && !hasFilters() && m_layerTransforms.combined.isAffine();
++    if (m_ps5SubtreeBoundsValid) {
++        auto& combined = m_layerTransforms.combined;
++        FloatRect bounds = combined.mapRect(layerRect());
++        if (m_contentsLayer || m_state.solidColor.isValid())
++            bounds.unite(combined.mapRect(m_state.contentsRect));
++        bool clipsChildren = m_state.masksToBounds && !m_state.contentsRectClipsDescendants;
++        if (clipsChildren) {
++            // Children are clipped to the layer rect at the bounds origin.
++            FloatRect clip = layerRect();
++            clip.moveBy(m_state.boundsOrigin);
++            bounds.unite(combined.mapRect(clip));
++        }
++        for (auto* child : m_children) {
++            m_ps5SubtreeLayerCount += child->m_ps5SubtreeLayerCount;
++            if (clipsChildren)
++                continue;
++            if (!child->m_ps5SubtreeBoundsValid)
++                m_ps5SubtreeBoundsValid = false;
++            else
++                bounds.unite(child->m_ps5SubtreeBounds);
++        }
++        m_ps5SubtreeBounds = bounds;
++    } else {
++        for (auto* child : m_children)
++            m_ps5SubtreeLayerCount += child->m_ps5SubtreeLayerCount;
++    }
++#endif
+ }
+ 
+ #if defined(PS5_PAYLOAD_SDK)
+@@ -1232,6 +1278,20 @@ void TextureMapperLayer::paintSelfChildrenReplicaFilterAndMask(TextureMapperPain
+         paintSelfAndChildrenWithReplica(options);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++static bool ps5SubtreeCullingEnabled()
++{
++    static const bool enabled = [] {
++        int fd = open("/data/ps5webkit/wc-no-cull", O_RDONLY);
++        if (fd < 0)
++            return true;
++        close(fd);
++        return false;
++    }();
++    return enabled;
++}
++#endif
++
+ void TextureMapperLayer::paintRecursive(TextureMapperPaintOptions& options)
+ {
+ #if defined(PS5_PAYLOAD_SDK)
+@@ -1245,6 +1305,23 @@ void TextureMapperLayer::paintRecursive(TextureMapperPaintOptions& options)
+         return;
+     }
+ #if defined(PS5_PAYLOAD_SDK)
++    // A subtree wholly outside the clip (the surface or the scissor box) draws
++    // nothing: skip it. A long feed keeps thousands of layers above and
++    // below the view, and visiting each of them every frame (overlap
++    // regions for translucent ones included) was most of the scene paint.
++    // /data/ps5webkit/wc-no-cull draws all (TextureMapperSparseBackingStore).
++    if (m_ps5SubtreeBoundsValid && options.transform.isAffine() && ps5SubtreeCullingEnabled()) {
++        TransformationMatrix toSurface;
++        toSurface.translate(options.offset.width(), options.offset.height());
++        toSurface.multiply(options.transform);
++        auto bounds = toSurface.mapRect(m_ps5SubtreeBounds);
++        bounds.inflate(1); // antialiased edges
++        if (!bounds.intersects(options.textureMapper.clipBounds())) {
++            stats.culledSubtrees++;
++            stats.culledLayers += m_ps5SubtreeLayerCount;
++            return;
++        }
++    }
+     if (m_layerTransforms.combined.isAffine() && options.transform.isAffine()) {
+         TransformationMatrix toSurface;
+         toSurface.translate(options.offset.width(), options.offset.height());
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
+index a6f655308e..3007be5422 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
+@@ -131,6 +131,7 @@ public:
+     // Where a scene paint goes (COMPOSITING-PLAN.md, AS6), render thread only.
+     struct PS5PaintStats {
+         unsigned visits { 0 }, invisible { 0 }, offscreen { 0 }, offscreenSubtrees { 0 };
++        unsigned culledSubtrees { 0 }, culledLayers { 0 };
+         unsigned selfPaints { 0 }, blendLayers { 0 }, overlapComputations { 0 }, surfaces { 0 };
+         uint64_t surfacePixels { 0 };
+         unsigned clips { 0 };
+@@ -313,6 +314,17 @@ private:
+     std::optional<FloatRect> m_previousLayerRectInGlobalCoordinateSpace;
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // Off-screen culling of whole subtrees (paintRecursive): the bounds of
++    // this layer, its contents and its descendants in the root's space
++    // (computeTransformsRecursive), valid while every transform in the
++    // subtree is affine and nothing draws outside its layer rect (filters,
++    // replicas, backdrops).
++    FloatRect m_ps5SubtreeBounds;
++    unsigned m_ps5SubtreeLayerCount { 1 };
++    bool m_ps5SubtreeBoundsValid { false };
++#endif
++
+     struct {
+         TransformationMatrix localTransform;
+         TransformationMatrix combined;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index c617eb3490..1e66ce6d12 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -242,6 +242,17 @@ bool DrawingAreaProxyWCPS5::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
+         && !m_scrollingTree->rootCanScrollForEvent(platformWheelEvent)) {
+         PS5WCHost::noteScrollEvent(PS5WCHost::ScrollNote::RootCouldNotScroll);
+         auto now = MonotonicTime::now();
++        // The WebProcess just said it had nothing to scroll this way (the end
++        // of a feed that is loading more items): don't make it hit-test the
++        // whole page again for every pad tick (8 ms) meanwhile. Each of those
++        // blocking events cost a long feed's WebProcess 50-100 ms.
++        int direction = platformWheelEvent.deltaY() > 0 ? 1 : platformWheelEvent.deltaY() < 0 ? -1 : 0;
++        if (m_paceUnconsumed && direction && direction == m_unconsumedRejectedDirection && now < m_unconsumedRejectedUntil && !platformWheelEvent.deltaX()) {
++            m_unconsumedDropped++;
++            page->continueWheelEventHandling(WTF::move(wheelEvent), { { }, false }, std::nullopt);
++            return true;
++        }
++        m_unconsumedInFlight = true;
+         if (now - m_lastUnconsumedLog > 2_s) {
+             m_lastUnconsumedLog = now;
+             WTFLogAlways("[ascroll] the root can't scroll by %.0f,%.0f at %d,%d: to the WebProcess; %s", // NOLINT
+@@ -287,6 +298,13 @@ void DrawingAreaProxyWCPS5::wheelEventHandlingCompleted(const WebCore::PlatformW
+     if (m_scrollingTree) {
+         result = m_scrollingTree->handleWheelEventAfterDefaultHandling(wheelEvent, nodeID, gestureState);
+         wheelEventReceived(); // the gesture ends after its last scroll
++        if (std::exchange(m_unconsumedInFlight, false)) {
++            if (!wasHandled && !result.wasHandled && wheelEvent.deltaY()) {
++                m_unconsumedRejectedDirection = wheelEvent.deltaY() > 0 ? 1 : -1;
++                m_unconsumedRejectedUntil = MonotonicTime::now() + 250_ms;
++            } else
++                m_unconsumedRejectedDirection = 0;
++        }
+     }
+     if (page)
+         page->wheelEventHandlingCompleted(wasHandled || result.wasHandled);
+@@ -316,25 +334,87 @@ void DrawingAreaProxyWCPS5::wheelGestureEndTimerFired()
+ 
+ // The page's passive wheel listeners still get the events the tree took,
+ // without blocking anything: one in flight, the newest kept meanwhile.
++// Each one costs the WebProcess a hit test of the whole render layer tree
++// (EventHandler::handleWheelEvent), which on a long feed with thousands of
++// layers took 50-100 ms: with the stick held, those dispatches ran back to
++// back and left the main thread little time for rendering updates (37 % of
++// it on a results page in the profile). Paced, the next one goes only after
++// the WebProcess has sent an update since the last one (or after 250 ms), so
++// listeners still hear about the scrolling at the page's own frame rate.
+ void DrawingAreaProxyWCPS5::dispatchWheelEventToDOM(Ref<WebWheelEvent>&& wheelEvent)
+ {
+-    if (m_domWheelEventInFlight) {
++    if (m_domWheelEventInFlight || m_pendingDOMWheelEvent) {
++        if (m_pendingDOMWheelEvent)
++            m_domWheelStats.replaced++;
+         m_pendingDOMWheelEvent = WTF::move(wheelEvent);
++        if (!m_domWheelEventInFlight)
++            sendPendingDOMWheelEventIfPaced();
+         return;
+     }
+     RefPtr page = this->page();
+     if (!page)
+         return;
+     m_domWheelEventInFlight = true;
++    m_updatesAtDOMWheelSend = m_updatesReceived;
++    m_domWheelSentAt = MonotonicTime::now();
++    m_domWheelStats.sent++;
+     page->ps5DispatchWheelEventToDOM(WTF::move(wheelEvent), [sceneID = identifier().toUInt64()] {
+         RefPtr protectedThis = liveDrawingAreas().get(sceneID);
+         if (!protectedThis)
+             return;
+         protectedThis->m_domWheelEventInFlight = false;
+-        if (RefPtr next = std::exchange(protectedThis->m_pendingDOMWheelEvent, nullptr))
+-            protectedThis->dispatchWheelEventToDOM(next.releaseNonNull());
++        auto& stats = protectedThis->m_domWheelStats;
++        double roundTrip = (MonotonicTime::now() - protectedThis->m_domWheelSentAt).milliseconds();
++        stats.roundTripMS += roundTrip;
++        stats.roundTripMaxMS = std::max(stats.roundTripMaxMS, roundTrip);
++        protectedThis->logDOMWheelStats();
++        protectedThis->sendPendingDOMWheelEventIfPaced();
+     });
+ }
++
++void DrawingAreaProxyWCPS5::sendPendingDOMWheelEventIfPaced()
++{
++    if (m_domWheelEventInFlight || !m_pendingDOMWheelEvent)
++        return;
++    if (m_paceDOMWheelEvents && m_updatesReceived == m_updatesAtDOMWheelSend) {
++        auto wait = 250_ms - (MonotonicTime::now() - m_domWheelSentAt);
++        if (wait > 0_s) {
++            // updateWC sends it when the update comes; the timer if none does.
++            if (!m_domWheelPaceTimer) {
++                m_domWheelPaceTimer = makeUnique<RunLoop::Timer>(RunLoop::mainSingleton(), "DrawingAreaProxyWCPS5::domWheelPace"_s, [this] { // owned by this
++                    m_updatesAtDOMWheelSend = m_updatesReceived - 1; // waited long enough
++                    sendPendingDOMWheelEventIfPaced();
++                });
++            }
++            if (!m_domWheelPaceTimer->isActive()) {
++                m_domWheelStats.heldForUpdate++;
++                m_domWheelPaceTimer->startOneShot(wait);
++            }
++            return;
++        }
++    }
++    if (m_domWheelPaceTimer)
++        m_domWheelPaceTimer->stop();
++    dispatchWheelEventToDOM(std::exchange(m_pendingDOMWheelEvent, nullptr).releaseNonNull());
++}
++
++void DrawingAreaProxyWCPS5::logDOMWheelStats()
++{
++    auto now = MonotonicTime::now();
++    auto& stats = m_domWheelStats;
++    if (!stats.windowStart)
++        stats.windowStart = now;
++    if (now - stats.windowStart < 5_s)
++        return;
++    if (stats.sent) {
++        WTFLogAlways("[ascroll] DOM wheel events: %u sent in %.1f s (round trip %.1f ms avg, %.1f max), %u replaced by a newer one, %u held for a WebProcess update%s; %u events the root couldn't take not sent (the WebProcess had nothing to scroll that way)", // NOLINT
++            stats.sent, (now - stats.windowStart).seconds(), stats.roundTripMS / stats.sent, stats.roundTripMaxMS, stats.replaced, stats.heldForUpdate,
++            m_paceDOMWheelEvents ? "" : " (wheelpace=0: not paced)", m_unconsumedDropped);
++        m_unconsumedDropped = 0;
++    }
++    stats = { };
++    stats.windowStart = now;
++}
+ #endif
+ 
+ bool DrawingAreaProxyWCPS5::hostAvailable()
+@@ -399,6 +479,8 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+         m_scrollingTree->setSnapGlide(asyncScrollingOption("glide", 1) > 0);
+         m_wheelGestureEndDelay = Seconds::fromMilliseconds(std::clamp(asyncScrollingOption("gestureend", 40), 20.f, 500.f));
+         m_scrollingTree->setReportGestureNodes(asyncScrollingOption("gesturenodes", 1) > 0);
++        m_paceDOMWheelEvents = asyncScrollingOption("wheelpace", 1) > 0;
++        m_paceUnconsumed = asyncScrollingOption("unconsumedpace", 1) > 0;
+         if (asyncScrollingOption("earlyreply", 1) > 0) {
+             Locker locker { earlyReplyLock() };
+             earlyReplyScenes().add(identifier().toUInt64());
+@@ -572,6 +654,11 @@ void DrawingAreaProxyWCPS5::resolveTileArena(WCUpdateInfo& info)
+ void DrawingAreaProxyWCPS5::updateWC(WCUpdateInfo&& info, CompletionHandler<void()>&& completionHandler)
+ {
+     uint64_t sceneID = identifier().toUInt64();
++#if ENABLE(ASYNC_SCROLLING)
++    m_updatesReceived++;
++    if (m_pendingDOMWheelEvent)
++        sendPendingDOMWheelEventIfPaced();
++#endif
+     resolveTileArena(info);
+     if (PS5WCNullHost::isInstalled()) {
+         PS5WCNullHost::update(sceneID, WTF::move(info), [reply = PresentReply(WTF::move(completionHandler))]() mutable {
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index e677bee7ca..b19b12fb06 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -130,6 +130,28 @@ private:
+     bool m_waitingForScrollUpdateReply { false };
+     bool m_domWheelEventInFlight { false };
+     RefPtr<WebWheelEvent> m_pendingDOMWheelEvent;
++    // DOM wheel pacing ("wheelpace=0" off): the next DOM-only wheel event
++    // waits for a WebProcess update after the last one (or 250 ms).
++    void sendPendingDOMWheelEventIfPaced();
++    void logDOMWheelStats();
++    bool m_paceDOMWheelEvents { true };
++    // Events the root couldn't take, given to the WebProcess: when it
++    // didn't scroll anything with one either, further ones the same way
++    // aren't sent for 250 ms (the end of a feed while it loads more).
++    bool m_paceUnconsumed { true }; // "unconsumedpace=0" off
++    bool m_unconsumedInFlight { false };
++    int m_unconsumedRejectedDirection { 0 };
++    MonotonicTime m_unconsumedRejectedUntil;
++    unsigned m_unconsumedDropped { 0 };
++    unsigned m_updatesReceived { 0 };
++    unsigned m_updatesAtDOMWheelSend { 0 };
++    MonotonicTime m_domWheelSentAt;
++    std::unique_ptr<RunLoop::Timer> m_domWheelPaceTimer;
++    struct DOMWheelStats {
++        unsigned sent { 0 }, replaced { 0 }, heldForUpdate { 0 };
++        double roundTripMS { 0 }, roundTripMaxMS { 0 };
++        MonotonicTime windowStart;
++    } m_domWheelStats;
+ #endif
+     uint64_t m_currentBackingStoreStateID { 0 };
+     HashMap<uint64_t, Ref<WebCore::SharedMemory>> m_tileArenaChunks;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index c64a5f0568..47c42c94ab 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -1099,9 +1099,9 @@ void SceneHost::maybeLog()
+             auto& paint = TextureMapperLayer::ps5PaintStats();
+             if (paint.paints) {
+                 double n = paint.paints;
+-                WTFLogAlways("[wc] scene per paint: %.2f ms prepare, %.2f ms paint; layers visited %.0f (invisible %.0f, off screen %.0f of which leaves %.0f), " // NOLINT
++                WTFLogAlways("[wc] scene per paint: %.2f ms prepare, %.2f ms paint; layers visited %.0f (invisible %.0f, off screen %.0f of which leaves %.0f; culled %.0f subtrees, %.0f layers), " // NOLINT
+                     "self paints %.0f, blending layers %.0f (overlap computations %.0f), surfaces %.1f (%.2f Mpx), tiles drawn %.0f culled %.0f, draws %.0f (%.0f antialiased): %.2f ms in textured quads, %.2f ms in glDrawArrays",
+-                    paint.prepareMS / n, paint.paintMS / n, paint.visits / n, paint.invisible / n, paint.offscreen / n, paint.offscreenSubtrees / n,
++                    paint.prepareMS / n, paint.paintMS / n, paint.visits / n, paint.invisible / n, paint.offscreen / n, paint.offscreenSubtrees / n, paint.culledSubtrees / n, paint.culledLayers / n,
+                     paint.selfPaints / n, paint.blendLayers / n, paint.overlapComputations / n, paint.surfaces / n, paint.surfacePixels / n / 1e6,
+                     paint.tilesDrawn / n, paint.tilesCulled / n, paint.draws / n, paint.antialiasedDraws / n, paint.texturedQuadMS / n, paint.drawArraysMS / n);
+             }

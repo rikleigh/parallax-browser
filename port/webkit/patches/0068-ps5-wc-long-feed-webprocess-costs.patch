@@ -1,0 +1,750 @@
+diff --git a/Source/WebCore/rendering/RenderLayer.cpp b/Source/WebCore/rendering/RenderLayer.cpp
+index 0aed4a1802..fc870c8df5 100644
+--- a/Source/WebCore/rendering/RenderLayer.cpp
++++ b/Source/WebCore/rendering/RenderLayer.cpp
+@@ -1618,6 +1618,17 @@ void RenderLayer::updateLayerPositionsAfterDocumentScroll()
+     OptionSet<UpdateLayerPositionsAfterScrollFlag> flags;
+     if (renderer().settings().siteIsolationEnabled())
+         flags.add(SkipsUnconstrainedSubtrees);
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: on for every page (upstream's FIXME above). Otherwise every
++    // document scroll step (each title scroll update under async scrolling)
++    // walked every RenderLayer of the page and cleared its cached clip
++    // rects, so the hit test of the next wheel event recomputed all of them:
++    // on a long feed with thousands of layers both grew with the feed.
++    // PS5WK_LAYERPOS_SKIP=0 (child.env): the full walk, for A/B tests.
++    static const bool skipUnconstrained = !getenv("PS5WK_LAYERPOS_SKIP") || strcmp(getenv("PS5WK_LAYERPOS_SKIP"), "0");
++    if (skipUnconstrained)
++        flags.add(SkipsUnconstrainedSubtrees);
++#endif
+ 
+     recursiveUpdateLayerPositionsAfterScroll(flags);
+ }
+diff --git a/Source/WebCore/rendering/RenderLayerBacking.cpp b/Source/WebCore/rendering/RenderLayerBacking.cpp
+index 5d7aca5077..f168a09f2e 100644
+--- a/Source/WebCore/rendering/RenderLayerBacking.cpp
++++ b/Source/WebCore/rendering/RenderLayerBacking.cpp
+@@ -2433,6 +2433,21 @@ bool RenderLayerBacking::maintainsEventRegion() const
+     if (!m_owningLayer.page().scrollingCoordinator())
+         return false;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: the only scrolling coordinator is the WC one (async scrolling in
++    // the title), which never sends per-layer event regions: blocking wheel
++    // listeners reach the title as the frame's synchronous region
++    // (Document::ps5AbsoluteRegionForNonPassiveWheelEventTargets), sub-scrollers
++    // are found by their layer rects, and there are no touch events. Building
++    // the regions repainted every composited layer in event-region mode after
++    // each change (wheel and touch listeners, sub-scrollers): 14-28 % of the
++    // main thread's rendering updates on a long results feed.
++    // PS5WK_WC_EVENT_REGIONS=1 (child.env): build them, for A/B tests.
++    static const bool buildRegions = getenv("PS5WK_WC_EVENT_REGIONS") && !strcmp(getenv("PS5WK_WC_EVENT_REGIONS"), "1");
++    if (!buildRegions)
++        return false;
++#endif
++
+     if (paintsIntoCompositedAncestor())
+         return false;
+ 
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.cpp b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+index 9d8c0b7b96..19ff0095fa 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -1055,11 +1055,51 @@ static std::optional<ScrollingNodeID> frameHostingNodeForFrame(LocalFrame& frame
+ // Returns true on a successful update.
+ #if defined(PS5_PAYLOAD_SDK)
+ static void ps5LogScrolledLayerCompositing(const RenderLayerCompositor&, const RenderLayer& root);
++static void ps5LogCompositingReasons(const RenderLayerCompositor&, const RenderLayer& root);
++
++// [render] compositing lines (every 5 s while updates run, PS5WK_RENDER_LOG
++// not 0): how often the compositing layers were updated and what it cost.
++struct PS5CompositingUpdateStats {
++    unsigned updates { 0 }, requirementTraversals { 0 }, hierarchyUpdates { 0 };
++    double milliseconds { 0 }, maxMilliseconds { 0 };
++    MonotonicTime windowStart;
++};
++static PS5CompositingUpdateStats& ps5CompositingUpdateStats()
++{
++    static NeverDestroyed<PS5CompositingUpdateStats> stats; // main thread only
++    return stats.get();
++}
++static void ps5NoteCompositingUpdate(MonotonicTime start)
++{
++    static const bool enabled = !getenv("PS5WK_RENDER_LOG") || strcmp(getenv("PS5WK_RENDER_LOG"), "0");
++    if (!enabled)
++        return;
++    auto now = MonotonicTime::now();
++    auto& stats = ps5CompositingUpdateStats();
++    double ms = (now - start).milliseconds();
++    stats.updates++;
++    stats.milliseconds += ms;
++    stats.maxMilliseconds = std::max(stats.maxMilliseconds, ms);
++    if (!stats.windowStart)
++        stats.windowStart = start;
++    if (now - stats.windowStart < 5_s)
++        return;
++    WTFLogAlways("[render] compositing: %u updates in %.1f s, %.1f ms avg, %.1f max (%u with a requirements traversal, %u with a backing/hierarchy update)", // NOLINT
++        stats.updates, (now - stats.windowStart).seconds(), stats.milliseconds / stats.updates, stats.maxMilliseconds, stats.requirementTraversals, stats.hierarchyUpdates);
++    stats = { };
++    stats.windowStart = now;
++}
+ #endif
+ 
+ bool RenderLayerCompositor::updateCompositingLayers(CompositingUpdateType updateType, RenderLayer* updateRootArg)
+ {
+     LOG_WITH_STREAM(Compositing, stream << "RenderLayerCompositor " << this << " [" << m_renderView.frameView() << "] updateCompositingLayers " << updateType << " contentLayersCount " << m_contentLayersCount);
++#if defined(PS5_PAYLOAD_SDK)
++    auto ps5Start = MonotonicTime::now();
++    auto ps5Note = makeScopeExit([&] {
++        ps5NoteCompositingUpdate(ps5Start);
++    });
++#endif
+ 
+     TraceScope tracingScope(CompositingUpdateStart, CompositingUpdateEnd);
+ 
+@@ -1153,6 +1193,9 @@ bool RenderLayerCompositor::updateCompositingLayers(CompositingUpdateType update
+         LayerOverlapMap overlapMap(rootLayer);
+ 
+         computeCompositingRequirements(nullptr, rootLayer, overlapMap, compositingState, backingSharingState);
++#if defined(PS5_PAYLOAD_SDK)
++        ps5CompositingUpdateStats().requirementTraversals++;
++#endif
+     }
+ 
+     LOG(Compositing, "\nRenderLayerCompositor::updateCompositingLayers - mid");
+@@ -1178,6 +1221,9 @@ bool RenderLayerCompositor::updateCompositingLayers(CompositingUpdateType update
+         UpdateBackingTraversalState traversalState;
+         Vector<Ref<GraphicsLayer>> childList;
+         updateBackingAndHierarchy(*updateRoot, childList, traversalState, scrollingTreeState);
++#if defined(PS5_PAYLOAD_SDK)
++        ps5CompositingUpdateStats().hierarchyUpdates++;
++#endif
+ 
+         if (scrollingTreeState.needSynchronousScrollingReasonsUpdate)
+             updateSynchronousScrollingNodes();
+@@ -1213,6 +1259,7 @@ bool RenderLayerCompositor::updateCompositingLayers(CompositingUpdateType update
+ 
+ #if defined(PS5_PAYLOAD_SDK)
+     ps5LogScrolledLayerCompositing(*this, rootRenderLayer());
++    ps5LogCompositingReasons(*this, rootRenderLayer());
+ #endif
+ 
+ #if ENABLE(TREE_DEBUGGING)
+@@ -3664,6 +3711,100 @@ static void ps5LogScrolledLayerCompositing(const RenderLayerCompositor& composit
+ }
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5WK_WC_LAYER_LOG=3 (child.env; digits combine, e.g. 13): at most once
++// a second after a compositing update, when the number of composited layers
++// changed by 5 % or more since the last line: render layers, composited layers by reason (the
++// first reason of each layer in the order below: why it has its own
++// backing), the layers sharing a backing, and per reason the element kinds
++// that make most of them (tag and first class name).
++static void ps5LogCompositingReasons(const RenderLayerCompositor& compositor, const RenderLayer& root)
++{
++    static const bool enabled = [] {
++        const char* value = getenv("PS5WK_WC_LAYER_LOG");
++        return value && strchr(value, '3');
++    }();
++    if (!enabled)
++        return;
++    static MonotonicTime lastLog;
++    static unsigned lastComposited;
++    auto now = MonotonicTime::now();
++    // Walk at most once a second; log when the count moved by 5 % or more.
++    if (now - lastLog < 1_s)
++        return;
++    lastLog = now;
++    unsigned renderLayers = 0, composited = 0, sharing = 0;
++    HashMap<String, unsigned> byReason;
++    HashMap<String, HashMap<String, unsigned>> kindsByReason;
++    Function<void(const RenderLayer&)> visit = [&](const RenderLayer& layer) {
++        renderLayers++;
++        if (layer.isComposited()) {
++            composited++;
++            auto reasons = compositor.reasonsForCompositing(layer);
++            ASCIILiteral label = "none"_s;
++            static constexpr CompositingReason order[] = {
++                CompositingReason::Root, CompositingReason::Video, CompositingReason::Canvas, CompositingReason::IFrame,
++                CompositingReason::Transform3D, CompositingReason::WillChange, CompositingReason::Animation,
++                CompositingReason::PositionFixed, CompositingReason::PositionSticky, CompositingReason::OverflowScrolling,
++                CompositingReason::Filters, CompositingReason::BackfaceVisibilityHidden, CompositingReason::Perspective,
++                CompositingReason::Preserve3D, CompositingReason::Overlap, CompositingReason::Stacking,
++                CompositingReason::ClipsCompositingDescendants, CompositingReason::OverflowScrollPositioning,
++                CompositingReason::NegativeZIndexChildren, CompositingReason::TransformWithCompositedDescendants,
++                CompositingReason::OpacityWithCompositedDescendants, CompositingReason::MaskWithCompositedDescendants,
++                CompositingReason::ReflectionWithCompositedDescendants, CompositingReason::FilterWithCompositedDescendants,
++                CompositingReason::BlendingWithCompositedDescendants, CompositingReason::IsolatesCompositedBlendingDescendants,
++                CompositingReason::BackdropRoot, CompositingReason::AnchorPositioning, CompositingReason::Plugin,
++                CompositingReason::Model, CompositingReason::SpatialPortal };
++            for (auto reason : order) {
++                if (reasons.contains(reason)) {
++                    label = compositingReasonToString(reason);
++                    break;
++                }
++            }
++            byReason.add(label, 0).iterator->value++;
++            StringBuilder kind;
++            if (RefPtr element = layer.renderer().element()) {
++                kind.append(element->localName());
++                if (element->hasClass() && element->classNames().size())
++                    kind.append('.', element->classNames()[0]);
++            } else
++                kind.append(layer.renderer().renderName());
++            String kindString = kind.toString();
++            if (kindString.length() > 60)
++                kindString = kindString.left(60);
++            kindsByReason.add(label, HashMap<String, unsigned>()).iterator->value.add(kindString, 0).iterator->value++;
++        } else if (layer.backingProviderLayer())
++            sharing++;
++        for (auto* child = layer.firstChild(); child; child = child->nextSibling())
++            visit(*child);
++    };
++    visit(root);
++    if (lastComposited && composited * 20 < lastComposited * 21 && composited * 20 > lastComposited * 19)
++        return;
++    lastComposited = composited;
++    Vector<std::pair<String, unsigned>> reasons;
++    for (auto& entry : byReason)
++        reasons.append({ entry.key, entry.value });
++    std::sort(reasons.begin(), reasons.end(), [](auto& a, auto& b) { return a.second > b.second; });
++    StringBuilder line;
++    for (auto& [reason, count] : reasons)
++        line.append(line.isEmpty() ? ""_s : ", "_s, reason, ' ', count);
++    WTFLogAlways("[wc-reasons] %u render layers, %u composited, %u painting into a shared backing; by reason: %s", renderLayers, composited, sharing, line.toString().utf8().data()); // NOLINT
++    for (auto& [reason, count] : reasons) {
++        if (count < 10)
++            continue;
++        Vector<std::pair<String, unsigned>> kinds;
++        for (auto& entry : kindsByReason.get(reason))
++            kinds.append({ entry.key, entry.value });
++        std::sort(kinds.begin(), kinds.end(), [](auto& a, auto& b) { return a.second > b.second; });
++        StringBuilder kindLine;
++        for (size_t i = 0; i < kinds.size() && i < 6; ++i)
++            kindLine.append(i ? ", "_s : ""_s, kinds[i].first, ' ', kinds[i].second);
++        WTFLogAlways("[wc-reasons]   %s %u: %s", reason.utf8().data(), count, kindLine.toString().utf8().data()); // NOLINT
++    }
++}
++#endif
++
+ #if !LOG_DISABLED
+ ASCIILiteral RenderLayerCompositor::logOneReasonForCompositing(const RenderLayer& layer)
+ {
+@@ -4097,6 +4238,30 @@ bool RenderLayerCompositor::requiresCompositingForWillChange(RenderLayerModelObj
+     if (!renderer.style().willChange().canTriggerCompositing())
+         return false;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: `will-change: opacity` on an element whose opacity is 0 doesn't
++    // get a layer of its own. Feeds put it on two invisible touch-feedback
++    // shapes in every button and card, and each of those layers then makes
++    // the icons and labels painted over it composite for overlap: on a
++    // results page about 860 + 780 of 1770 layers, every one of them walked
++    // by each compositing update and layer flush and painted (empty) in the
++    // title. The layer comes back as soon as the opacity changes (that style
++    // change re-evaluates it; an opacity animation or transition composites
++    // through its own reason), so a fade-in costs one repaint at its start.
++    // Transform, filter and backdrop-filter in will-change still composite.
++    // PS5WK_WC_WILLCHANGE_HIDDEN=1 (child.env): composite them, for A/B tests.
++    static const bool compositeHidden = getenv("PS5WK_WC_WILLCHANGE_HIDDEN") && !strcmp(getenv("PS5WK_WC_WILLCHANGE_HIDDEN"), "1");
++    if (!compositeHidden && renderer.style().opacity().isTransparent()) {
++        auto& willChange = renderer.style().willChange();
++        bool otherTrigger = willChange.containsProperty(CSSPropertyID::Transform) || willChange.containsProperty(CSSPropertyID::Translate)
++            || willChange.containsProperty(CSSPropertyID::Scale) || willChange.containsProperty(CSSPropertyID::Rotate)
++            || willChange.containsProperty(CSSPropertyID::OffsetPath) || willChange.containsProperty(CSSPropertyID::Filter)
++            || willChange.containsProperty(CSSPropertyID::BackdropFilter) || willChange.containsProperty(CSSPropertyID::WebkitBackdropFilter);
++        if (!otherTrigger)
++            return false;
++    }
++#endif
++
+ #if ENABLE(FULLSCREEN_API)
+     // FIXME: does this require layout?
+     if (renderer.layer() && isDescendantOfFullScreenLayer(*renderer.layer()) == FullScreenDescendant::No)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index e498a9c45e..2bec9f85de 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -96,7 +96,9 @@ struct WCRenderStats {
+     // Async scrolling: title scroll updates (ScrollUpdatesWC), and those
+     // that came with nothing in flight and fired the refresh at once.
+     unsigned scrollUpdates { 0 }, scrollFires { 0 };
++    double scrollApplyMS { 0 }, scrollApplyMaxMS { 0 };
+     MonotonicTime windowStart;
++    WCFlushStats flushStart;
+     // WCTilePainter (deltas of wcTilePaintStats over the window).
+     WCTilePaintStats painterStart;
+     bool havePainterStart { false };
+@@ -115,6 +117,7 @@ struct WCRenderStats {
+             windowStart = end;
+         if (!havePainterStart) {
+             painterStart = before;
++            flushStart = wcFlushStats();
+             havePainterStart = true;
+         }
+         totalMS.append(total);
+@@ -144,7 +147,13 @@ struct WCRenderStats {
+                 frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires,
+                 replyGaps ? replyGapMS / replyGaps : 0.0, replyGapMaxMS, waitingAtReply, replyGaps, idleStarted, tileWaits ? tileWaitMS / tileWaits : 0.0);
+             if (scrollUpdates)
+-                WTFLogAlways("[render] wc scroll: %u title scroll updates (%.1f/s), %u fired the refresh at once (nothing in flight)", scrollUpdates, scrollUpdates / seconds, scrollFires); // NOLINT
++                WTFLogAlways("[render] wc scroll: %u title scroll updates (%.1f/s), %u fired the refresh at once (nothing in flight); applying them %.2f ms avg, %.1f max", scrollUpdates, scrollUpdates / seconds, scrollFires, scrollApplyMS / scrollUpdates, scrollApplyMaxMS); // NOLINT
++            auto& flush = wcFlushStats();
++            if (unsigned flushes = flush.flushes - flushStart.flushes) {
++                WTFLogAlways("[render] wc flush: %u layer tree flushes, %.2f ms avg; layers per flush: %.0f walked, %.0f skipped (culled), %.1f changed", flushes, (flush.milliseconds - flushStart.milliseconds) / flushes, // NOLINT
++                    static_cast<double>(flush.layersVisited - flushStart.layersVisited) / flushes, static_cast<double>(flush.layersSkipped - flushStart.layersSkipped) / flushes,
++                    static_cast<double>(flush.layersChanged - flushStart.layersChanged) / flushes);
++            }
+             auto& now = wcTilePaintStats();
+             WTFLogAlways("[render] wc tiles: record %.1f ms/s (%.2f Mpx/s), raster %.1f ms/s wall (%.2f Mpx/s, %u items, %u async), shm allocations %.1f/s, old way %u", // NOLINT
+                 (now.recordMS - painterStart.recordMS) / seconds, (now.recordedPixels - painterStart.recordedPixels) / 1e6 / seconds,
+@@ -152,6 +161,7 @@ struct WCRenderStats {
+                 now.asyncBatches - painterStart.asyncBatches, (now.shmAllocations - painterStart.shmAllocations) / seconds, now.arenaFallbacks - painterStart.arenaFallbacks);
+         }
+         painterStart = wcTilePaintStats();
++        flushStart = wcFlushStats();
+         totalMS.shrink(0);
+         paintMS.shrink(0);
+         updateMS = megapixels = frameDoneMS = 0;
+@@ -159,6 +169,7 @@ struct WCRenderStats {
+         replyGapMS = replyGapMaxMS = tileWaitMS = 0;
+         replyGaps = waitingAtReply = idleStarted = tileWaits = 0;
+         scrollUpdates = scrollFires = 0;
++        scrollApplyMS = scrollApplyMaxMS = 0;
+         windowStart = end;
+     }
+ };
+@@ -418,6 +429,9 @@ void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize ve
+ {
+     GraphicsLayerWC::setScrollVelocity(velocity, lookaheadScale);
+     bool moved = !updates.isEmpty();
++#if defined(PS5_PAYLOAD_SDK)
++    auto applyStart = MonotonicTime::now();
++#endif
+     if (auto* scrollingCoordinator = WCScrollingCoordinator::forPage(m_webPage.get())) {
+         // Nodes that start a gesture count as user-scrolled before their new
+         // positions apply; nodes whose gesture ended, only after.
+@@ -431,7 +445,13 @@ void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize ve
+     if (!moved)
+         return;
+ #if defined(PS5_PAYLOAD_SDK)
+-    wcRenderStats().scrollUpdates++;
++    {
++        auto& stats = wcRenderStats();
++        stats.scrollUpdates++;
++        double applyMS = (MonotonicTime::now() - applyStart).milliseconds();
++        stats.scrollApplyMS += applyMS;
++        stats.scrollApplyMaxMS = std::max(stats.scrollApplyMaxMS, applyMS);
++    }
+ #endif
+     // The title sends a frame's scroll position as that frame starts, ahead
+     // of the replies that start the next rendering update (PS5WCHost sync),
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 5ca8eaf5c1..c20352c02f 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -68,6 +68,24 @@ WCTilePaintStats& wcTilePaintStats()
+     static WCTilePaintStats stats; // main thread only
+     return stats;
+ }
++
++WCFlushStats& wcFlushStats()
++{
++    static WCFlushStats stats; // main thread only
++    return stats;
++}
++
++// Flush culling (recursiveCommitChanges). PS5WK_WC_CULL=0 (child.env): every
++// layer is walked on every flush, for A/B tests.
++static bool flushCullingEnabled()
++{
++    static const bool enabled = !getenv("PS5WK_WC_CULL") || strcmp(getenv("PS5WK_WC_CULL"), "0");
++    return enabled;
++}
++
++// Bumped when every layer's coverage must be recomputed (reduced coverage
++// toggled): no subtree is skipped until it has been walked again.
++static unsigned s_cullGeneration = 1;
+ #endif
+ 
+ #if USE(SKIA) && !ENABLE(GPU_PROCESS)
+@@ -167,6 +185,19 @@ public:
+         m_tileGrid.setSize(expandedIntSize(size));
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // No backing store in the scene (the layer doesn't draw, or is hidden):
++    // the scene has dropped its tiles, so removals and removed tiles have
++    // nothing to tell it. Left here, they reported a change on every flush.
++    void dropRemovedTiles()
++    {
++        m_tileGrid.takePendingRemovals();
++        m_tileGrid.clearDirtyRects();
++    }
++
++    bool hasLiveTiles() const { return m_tileGrid.hasLiveTiles(); }
++#endif
++
+     void setDirtyRect(const WebCore::FloatRect& rect)
+     {
+         m_tileGrid.addDirtyRect(enclosingIntRect(rect));
+@@ -319,41 +350,65 @@ void GraphicsLayerWC::setContentsNeedsDisplay()
+     noteLayerPropertyChanged(WCLayerChange::PlatformLayer);
+ }
+ 
++// A layer that gets a new parent is walked by the next flush: its culling
++// bounds are in its old parent's space.
++static void markChildDirty(GraphicsLayer& child)
++{
++#if defined(PS5_PAYLOAD_SDK)
++    static_cast<GraphicsLayerWC&>(child).noteChildAdded();
++#else
++    UNUSED_PARAM(child);
++#endif
++}
++
+ bool GraphicsLayerWC::setChildren(Vector<Ref<GraphicsLayer>>&& children)
+ {
+     bool childrenChanged = GraphicsLayer::setChildren(WTF::move(children));
+-    if (childrenChanged)
++    if (childrenChanged) {
++        for (auto& child : this->children())
++            markChildDirty(child.get());
+         noteLayerPropertyChanged(WCLayerChange::Children);
++    }
+     return childrenChanged;
+ }
+ 
+ void GraphicsLayerWC::addChild(Ref<GraphicsLayer>&& childLayer)
+ {
++    Ref child = childLayer;
+     GraphicsLayer::addChild(WTF::move(childLayer));
++    markChildDirty(child.get());
+     noteLayerPropertyChanged(WCLayerChange::Children);
+ }
+ 
+ void GraphicsLayerWC::addChildAtIndex(Ref<GraphicsLayer>&& childLayer, int index)
+ {
++    Ref child = childLayer;
+     GraphicsLayer::addChildAtIndex(WTF::move(childLayer), index);
++    markChildDirty(child.get());
+     noteLayerPropertyChanged(WCLayerChange::Children);
+ }
+ 
+ void GraphicsLayerWC::addChildBelow(Ref<GraphicsLayer>&& childLayer, GraphicsLayer* sibling)
+ {
++    Ref child = childLayer;
+     GraphicsLayer::addChildBelow(WTF::move(childLayer), sibling);
++    markChildDirty(child.get());
+     noteLayerPropertyChanged(WCLayerChange::Children);
+ }
+ 
+ void GraphicsLayerWC::addChildAbove(Ref<GraphicsLayer>&& childLayer, GraphicsLayer* sibling)
+ {
++    Ref child = childLayer;
+     GraphicsLayer::addChildAbove(WTF::move(childLayer), sibling);
++    markChildDirty(child.get());
+     noteLayerPropertyChanged(WCLayerChange::Children);
+ }
+ 
+ bool GraphicsLayerWC::replaceChild(GraphicsLayer* oldChild, Ref<GraphicsLayer>&& newChild)
+ {
++    Ref child = newChild;
+     if (GraphicsLayer::replaceChild(oldChild, WTF::move(newChild))) {
++        markChildDirty(child.get());
+         noteLayerPropertyChanged(WCLayerChange::Children);
+         return true;
+     }
+@@ -820,6 +875,9 @@ void GraphicsLayerWC::noteLayerPropertyChanged(OptionSet<WCLayerChange> flags, S
+         return;
+     bool needsFlush = !m_uncommittedChanges;
+     m_uncommittedChanges.add(flags);
++#if defined(PS5_PAYLOAD_SDK)
++    markSubtreeDirty();
++#endif
+     if (client().isFlushingLayers())
+         return;
+     if (needsFlush && scheduleFlush == ScheduleFlush)
+@@ -916,7 +974,12 @@ std::pair<int, int> GraphicsLayerWC::coverageMargins(int viewportHeight, int scr
+ 
+ bool GraphicsLayerWC::setTileCoverageReduced(bool reduced)
+ {
+-    return s_tileCoverageReduced.exchange(reduced) != reduced;
++    bool changed = s_tileCoverageReduced.exchange(reduced) != reduced;
++#if defined(PS5_PAYLOAD_SDK)
++    if (changed)
++        s_cullGeneration++;
++#endif
++    return changed;
+ }
+ 
+ bool GraphicsLayerWC::tileCoverageReduced()
+@@ -930,9 +993,43 @@ void GraphicsLayerWC::flushCompositingState(const FloatRect& passedVisibleRect)
+     FloatRect visibleRect = passedVisibleRect;
+     visibleRect.inflate(20.f);
+     TransformState state(TransformState::UnapplyInverseTransformDirection, FloatQuad(visibleRect), FloatQuad { visibleRect });
++#if defined(PS5_PAYLOAD_SDK)
++    auto start = MonotonicTime::now();
++    recursiveCommitChanges(state);
++    auto& stats = wcFlushStats();
++    stats.flushes++;
++    stats.milliseconds += (MonotonicTime::now() - start).milliseconds();
++#else
+     recursiveCommitChanges(state);
++#endif
++}
++
++#if defined(PS5_PAYLOAD_SDK)
++void GraphicsLayerWC::markSubtreeDirty()
++{
++    // An ancestor that is dirty has dirty ancestors too: a walk clears a
++    // layer only when nothing under it is left dirty.
++    for (GraphicsLayer* layer = this; layer; layer = layer->parent()) {
++        auto& layerWC = static_cast<GraphicsLayerWC&>(*layer);
++        if (layerWC.m_subtreeDirty)
++            break;
++        layerWC.m_subtreeDirty = true;
++    }
++}
++
++void GraphicsLayerWC::noteChildAdded()
++{
++    m_subtreeCullable = false;
++    markSubtreeDirty();
+ }
+ 
++bool GraphicsLayerWC::canSkipFlush(const FloatRect& cullRect) const
++{
++    return m_subtreeCullable && !m_subtreeDirty && !m_subtreeHasTiles && m_cullGeneration == s_cullGeneration
++        && !cullRect.intersects(m_subtreeBoundsInParent);
++}
++#endif
++
+ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+ {
+     if (!m_uncommittedChanges)
+@@ -999,8 +1096,12 @@ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+                     position().x(), position().y(), boundsOrigin().x(), boundsOrigin().y(), wcTilePaintStats().tiles - tilesBefore, (wcTilePaintStats().pixels - pixelsBefore) / 1e6, m_lastDirtyText.utf8().data());
+             m_lastDirtyText = { };
+ #endif
+-        } else
++        } else {
+             update.background.hasBackingStore = false;
++#if defined(PS5_PAYLOAD_SDK)
++            m_tiledBacking->dropRemovedTiles();
++#endif
++        }
+     }
+     if (update.changes & WCLayerChange::SolidColor)
+         update.solidColor = m_solidColor;
+@@ -1165,7 +1266,7 @@ GraphicsLayerWC::VisibleAndCoverageRects GraphicsLayerWC::computeVisibleAndCover
+     }
+ #endif
+ 
+-    return { clipRectForSelf, coverageRect, currentTransform };
++    return { clipRectForSelf, coverageRect, currentTransform, layerTransform };
+ }
+ 
+ void GraphicsLayerWC::recursiveCommitChanges(const TransformState& state, bool affectedByTransformAnimation)
+@@ -1174,6 +1275,11 @@ void GraphicsLayerWC::recursiveCommitChanges(const TransformState& state, bool a
+ 
+     bool accumulateTransform = accumulatesTransform(*this);
+     VisibleAndCoverageRects rects = computeVisibleAndCoverageRect(localState, accumulateTransform);
++#if defined(PS5_PAYLOAD_SDK)
++    wcFlushStats().layersVisited++;
++    if (m_uncommittedChanges)
++        wcFlushStats().layersChanged++;
++#endif
+ #if defined(PS5_PAYLOAD_SDK)
+     // An accelerated transform animation moves this layer (and the layers
+     // under it) in the scene without commits: tile the whole layer while it
+@@ -1195,8 +1301,79 @@ void GraphicsLayerWC::recursiveCommitChanges(const TransformState& state, bool a
+         static_cast<GraphicsLayerWC*>(mask)->recursiveCommitChanges(localState, affectedByTransformAnimation);
+     if (auto* replica = replicaLayer())
+         static_cast<GraphicsLayerWC*>(replica)->recursiveCommitChanges(localState, affectedByTransformAnimation);
++#if defined(PS5_PAYLOAD_SDK)
++    // Flush culling. A feed keeps every item's layers; most are far above
++    // or below the view, unchanged and without tiles, yet each flush (one per
++    // rendering update) computed their visible and coverage rects: on a feed
++    // with 12k composited layers that was 62 % of the WebProcess main thread.
++    // A child subtree is skipped when it has no uncommitted changes and no
++    // tiles, holds only translations (so its bounds are exact), and its bounds
++    // are further from the visible rect than any coverage reaches: the
++    // margin (half a view, at least a tile row), the row kept beyond it and
++    // the scroll lookahead (up to two views) come to at most 2.5 visible
++    // heights + 1024 px; the cull rect adds 3 heights + 2048 px.
++    bool cullChildren = flushCullingEnabled() && !affectedByTransformAnimation && !accumulateTransform && !preserves3D();
++    FloatRect cullRect;
++    if (cullChildren && !children().isEmpty()) {
++        bool mapWasClamped = false;
++        cullRect = localState.mappedQuad(&mapWasClamped).boundingBox();
++        if (mapWasClamped)
++            cullChildren = false;
++        else {
++            float height = cullRect.height();
++            cullRect.inflateX(1024);
++            cullRect.inflateY(3 * height + 2048);
++        }
++    }
++    unsigned layerCount = 1;
++    bool hasTiles = m_tiledBacking->hasLiveTiles();
++    bool childrenCullable = !maskLayer() && !replicaLayer() && !hasNonIdentityChildrenTransform();
++    std::optional<FloatRect> bounds;
++    bool childDirty = false;
++    for (auto& child : children()) {
++        auto& childWC = static_cast<GraphicsLayerWC&>(child.get());
++        if (cullChildren && childWC.canSkipFlush(cullRect))
++            wcFlushStats().layersSkipped += childWC.m_subtreeLayerCount;
++        else
++            childWC.recursiveCommitChanges(localState, affectedByTransformAnimation);
++        layerCount += childWC.m_subtreeLayerCount;
++        hasTiles |= childWC.m_subtreeHasTiles;
++        childDirty |= childWC.m_subtreeDirty;
++        if (!childWC.m_subtreeCullable)
++            childrenCullable = false;
++        else if (bounds)
++            bounds->unite(childWC.m_subtreeBoundsInParent);
++        else
++            bounds = childWC.m_subtreeBoundsInParent;
++    }
++    m_subtreeLayerCount = layerCount;
++    m_subtreeHasTiles = hasTiles;
++    // Changes noted on a layer of this subtree during the walk (after it was
++    // visited) keep it dirty.
++    m_subtreeDirty = childDirty || !!m_uncommittedChanges;
++    m_cullGeneration = s_cullGeneration;
++
++    // This subtree's bounds in the parent's children space: the content rect
++    // (boundsOrigin, size) and the children's, mapped by this layer's
++    // transform, which must be a translation (also the transform used for
++    // the visible rect, e.g. a running main-thread transform).
++    m_subtreeCullable = false;
++    if (childrenCullable && m_animations.isEmpty() && !affectedByTransformAnimation && !accumulateTransform && !preserves3D()) {
++        auto& layerTransform = rects.layerTransform;
++        if (layerTransform.isIdentityOrTranslation() && !layerTransform.m43()) {
++            FloatRect subtreeBounds(m_boundsOrigin, m_size);
++            if (bounds)
++                subtreeBounds.unite(*bounds);
++            subtreeBounds.move(-m_boundsOrigin.x(), -m_boundsOrigin.y());
++            subtreeBounds.move(layerTransform.m41(), layerTransform.m42());
++            m_subtreeBoundsInParent = subtreeBounds;
++            m_subtreeCullable = true;
++        }
++    }
++#else
+     for (auto& child : children())
+         static_cast<GraphicsLayerWC*>(child.ptr())->recursiveCommitChanges(localState, affectedByTransformAnimation);
++#endif
+ }
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index a71d198934..680ebf8c1c 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -56,6 +56,16 @@ struct WCTilePaintStats {
+     unsigned arenaFallbacks { 0 }; // parts painted the old way (arena full)
+ };
+ WCTilePaintStats& wcTilePaintStats();
++
++// Layer tree flushes since DrawingAreaWC last took them ([render] lines).
++struct WCFlushStats {
++    unsigned flushes { 0 };
++    uint64_t layersVisited { 0 };
++    uint64_t layersSkipped { 0 }; // in clean subtrees outside the cull rect
++    uint64_t layersChanged { 0 }; // sent a WCLayerUpdateInfo
++    double milliseconds { 0 };
++};
++WCFlushStats& wcFlushStats();
+ #endif
+ 
+ class GraphicsLayerWC final : public WebCore::GraphicsLayer, public DoublyLinkedListNode<GraphicsLayerWC> {
+@@ -164,6 +174,7 @@ private:
+         WebCore::FloatRect visibleRect;
+         WebCore::FloatRect coverageRect;
+         WebCore::TransformationMatrix animatingTransform;
++        WebCore::TransformationMatrix layerTransform; // the one applied to the state
+     };
+ 
+     enum ScheduleFlushOrNot { ScheduleFlush, DontScheduleFlush };
+@@ -172,6 +183,16 @@ private:
+     WebCore::TransformationMatrix layerTransform(const WebCore::FloatPoint&, const WebCore::TransformationMatrix* = nullptr) const;
+     VisibleAndCoverageRects computeVisibleAndCoverageRect(WebCore::TransformState&, bool preserves3D) const;
+     void recursiveCommitChanges(const WebCore::TransformState&, bool affectedByTransformAnimation = false);
++#if defined(PS5_PAYLOAD_SDK)
++    // Flush culling (COMPOSITING-PLAN.md, "Long feeds"): a subtree with no
++    // uncommitted changes, no tiles and only translations, whose bounds are
++    // far outside the visible rect, is not walked by the flush.
++    void markSubtreeDirty();
++    bool canSkipFlush(const WebCore::FloatRect& cullRect) const;
++public:
++    void noteChildAdded();
++private:
++#endif
+ 
+     friend class WTF::DoublyLinkedListNode<GraphicsLayerWC>;
+ 
+@@ -194,6 +215,15 @@ private:
+     OptionSet<WCLayerChange> m_uncommittedChanges;
+ #if defined(PS5_PAYLOAD_SDK)
+     Vector<WCAnimation> m_animations;
++    // Flush culling: the subtree's bounds in the parent's children space
++    // (valid while m_subtreeCullable), its layer count, whether any layer in
++    // it kept tiles, and whether anything in it changed since its last walk.
++    WebCore::FloatRect m_subtreeBoundsInParent;
++    unsigned m_subtreeLayerCount { 1 };
++    unsigned m_cullGeneration { 0 };
++    bool m_subtreeDirty { true };
++    bool m_subtreeCullable { false };
++    bool m_subtreeHasTiles { true };
+ #endif
+     float m_debugBorderWidth { 0 };
+ };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp
+index b72c8eb1c9..e76541902c 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.cpp
+@@ -163,6 +163,15 @@ void WCTileGrid::clearDirtyRects()
+         iterator.value->clearDirtyRect();
+ }
+ 
++bool WCTileGrid::hasLiveTiles() const
++{
++    for (auto& iterator : m_tiles) {
++        if (!iterator.value->willRemove())
++            return true;
++    }
++    return false;
++}
++
+ bool WCTileGrid::ensureTile(TileIndex index)
+ {
+     auto addResult = m_tiles.ensure(index, [&]() {
+@@ -192,6 +201,13 @@ bool WCTileGrid::setCoverageRect(const WebCore::IntRect& coverage, const WebCore
+ 
+     for (auto& iterator : m_tiles) {
+         if (!keepTileRect.contains(iterator.key) && !tileRect.contains(iterator.key)) {
++#if defined(PS5_PAYLOAD_SDK)
++            // A layer that doesn't draw keeps its removed tiles (only
++            // paintAndFlush drops them): don't report them again on every
++            // flush (a Background change per such layer per update).
++            if (iterator.value->willRemove())
++                continue;
++#endif
+             iterator.value->setWillRemove(true);
+             needsToPaint = true;
+         }
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h
+index 734dbc1b71..c2346e9419 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTileGrid.h
+@@ -71,6 +71,8 @@ public:
+     // Tiles dropped by setSize (their rect changed): sent as removals first.
+     Vector<TileIndex> takePendingRemovals() { return std::exchange(m_pendingRemovals, { }); }
+     auto& tiles() LIFETIME_BOUND { return m_tiles; }
++    // Tiles that stay (not marked for removal).
++    bool hasLiveTiles() const;
+     WebCore::IntSize tilePixelSize() const;
+ 
+ private:

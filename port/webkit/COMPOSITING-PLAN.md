@@ -2689,3 +2689,207 @@ compares with the CPU path; `wc-async-scroll` containing `off` keeps
 compositing but lets the WebProcess scroll. An old `compositing` or
 `wc-async-scroll` (`stickframe=1`) file on the console can be deleted; it
 does no harm.
+
+## Long feeds: composited layers and per-update cost (2026-11-02, patches 0068-0069)
+
+Owner (default build 20261102-165217, `tv30.log`): on a video site's
+results feed and a forum's front page, scrolling "starts off fast" and gets
+more sluggish the further down the feed goes; the forum feed at first shows
+no white when scrolling back up, then white gaps come back and it lags.
+
+**What the TV log shows.** The composited layer count follows the feed
+(items stay in the DOM): results feed 232, 806, 1516, 1680, 2005 layers,
+WebProcess rendering updates 0.4 ms at the top, then 29-34 ms, then
+204 ms average (p95 1282 ms) and 126 ms, 2-3 updates/s; forum feed on the
+second visit 764-1052 layers, 292 ms average (p95 889), 2.6/s (the first
+visit, 118-219 layers, 1-10 ms). With the WebProcess at 2-3 updates/s the
+title's async scrolling runs ahead of the painted tiles: clamped steps and
+white where other layers' tiles come late.
+
+### Why so many layers
+
+`PS5WK_WC_LAYER_LOG=3` (new, child.env) logs `[wc-reasons]` lines: render
+layers, composited layers by their first reason, the layers painting into a
+shared backing, and per reason the element kinds (tag and first class) that
+make most of them. On the results page after scrolling (5439 render layers):
+
+| reason | layers | what |
+| --- | --- | --- |
+| will-change | 860 | the site's touch-feedback shapes, a fill and a stroke div in every button and card, `will-change: opacity` at opacity 0 (`ytSpecTouchFeedbackShapeFill/Stroke` 203 each, `yt-interaction` `div.fill`/`div.stroke` 226 each) |
+| overlap | 776 | icons, tooltips, channel names, now-playing overlays painted over those shapes (later in paint order, overlapping a composited sibling) |
+| 3D transform | 112 | short-video thumbnails (`translateZ`) |
+| other | 22 | filters, fixed, video, root, scroller |
+
+1770 composited, 242 sharing a backing. So it is the page's own
+`will-change`, plus overlap with it. The port forces nothing per element:
+`DrawingAreaWC::updatePreferences` (`DrawingAreaWC.cpp:381,388`) sets
+`acceleratedCompositingForFixedPosition` with accelerated compositing (as
+macOS) and `forceCompositingMode` (only the root composites because of it),
+and M3's composited sticky elements are one layer per sticky element (upstream
+composites them too once there is a scrolling coordinator). WebKit's backing
+sharing only lets an overlapping layer paint into a provider that is an
+ancestor in its containing-block chain
+(`RenderLayerCompositor.cpp:438`, `backingProviderCandidateForLayer`), so
+an icon over its sibling's composited shape needs a backing of its own;
+Chrome squashes such overlap-only layers into shared squashing layers, so it
+would have the ~860 `will-change` layers but far fewer for overlap. Safari
+on macOS would composite like us (same code), on far faster cores.
+
+**Fix 1 (0068, `requiresCompositingForWillChange`):** `will-change: opacity`
+on an element whose opacity is 0 no longer composites by itself (transform,
+filter and backdrop-filter in will-change still do). The style change that
+makes it visible re-evaluates it, and an opacity animation or transition
+composites through its own reason, so a fade-in costs one repaint of that
+element at its start. With the shapes not composited, the icons over them
+no longer overlap anything composited. `PS5WK_WC_WILLCHANGE_HIDDEN=1`
+(child.env) restores it. Measured below.
+
+### Why each update cost O(all layers)
+
+Sampling profiler (`PS5WK_PROFILE=1`), default build, results page scrolled
+for 80 s at ry 0.6 (4000 composited layers by the end), WebProcess main
+thread (92 % busy):
+
+| where | share | why it grows with the feed |
+| --- | --- | --- |
+| DOM wheel events: `WebPage::handleWheelEvent` -> `Document::hitTest` | 37.7 % | async scrolling gives every title-handled stick event to the page's passive wheel listeners (one in flight, the newest kept), and each one hit-tests the whole render layer tree; the clip rects it needs had all been thrown away by the last scroll (next row) |
+| JavaScript (rAF callbacks, timers: the page) | ~24 % | the page |
+| `GraphicsLayerWC::recursiveCommitChanges` (the layer flush) | 9.4 % | every composited layer's visible and coverage rect on every update |
+| event regions (`Document::updateEventRegions`) | 8.9 % | every composited layer repainted in event-region mode after changes |
+| compositing updates (`updateCompositingLayers`) | 8.5 % | `computeCompositingRequirements` re-evaluates every layer after the first changed one in paint order (upstream FIXME at `RenderLayerCompositor.cpp:1366`) |
+| `RenderLayer::recursiveUpdateLayerPositionsAfterScroll` | 5.0 % | every title scroll update walked every render layer and cleared its cached clip rects |
+| intersection observers | ~3 % | the page's observed targets |
+
+On the synthetic feed below (12314 composited layers, nothing changing
+while scrolling) the flush was 62 % of the main thread and the layer
+position walk 25 %.
+
+In the title, the scene paint visited every layer every frame
+(`TextureMapperLayer::paintRecursive`, translucent ones with overlap
+regions) and computed every layer's transforms twice over (coordinated
+graphics' "future" transforms, which nothing in the WC scene reads).
+
+**Fixes:**
+- **Layer positions after a document scroll** (0068, `RenderLayer::updateLayerPositionsAfterDocumentScroll`):
+  `SkipsUnconstrainedSubtrees` for every page, as upstream does with site
+  isolation (its FIXME asks for it everywhere): only fixed and sticky layers
+  and their subtrees are walked, and the other layers keep their cached clip
+  rects for the next hit test. `PS5WK_LAYERPOS_SKIP=0` = old.
+- **No per-layer event regions** (0068, `RenderLayerBacking::maintainsEventRegion`):
+  WC never sends them; blocking wheel listeners reach the title as the
+  frame's synchronous region (`Document::ps5AbsoluteRegionForNonPassiveWheelEventTargets`),
+  sub-scrollers are found by layer rects, and there are no touch events.
+  Touch handlers and sub-scrollers had kept them on even without wheel
+  listeners. `PS5WK_WC_EVENT_REGIONS=1` = old.
+- **Flush culling** (0068, `GraphicsLayerWC::recursiveCommitChanges`): a
+  child subtree with no uncommitted changes (a dirty bit set by
+  `noteLayerPropertyChanged` up the parent chain and on reparenting), no
+  live tiles and only translations (so its bounds in the parent's space are
+  exact) is not walked when its bounds are further from the visible rect
+  than any coverage reaches: the cull rect is the visible rect plus 3
+  visible heights + 2048 px vertically and 1024 px sideways (coverage reaches
+  at most 2.5 heights + 1024: half a view or a tile row, the kept row, two
+  views of scroll lookahead). Not under transform animations (whole-layer
+  tiling) or 3D. Also: a layer without a backing store no longer reports its
+  removed tiles as a change on every flush (`WCTileGrid::setCoverageRect`,
+  `dropRemovedTiles`). `PS5WK_WC_CULL=0` = old.
+- **DOM wheel pacing** (0069, `DrawingAreaProxyWCPS5::dispatchWheelEventToDOM`):
+  the next DOM-only wheel event goes after the WebProcess has sent an
+  update since the last one (or after 250 ms), the newest kept meanwhile:
+  listeners hear about scrolling at the page's own frame rate, and the hit
+  tests no longer crowd out rendering updates. Events the root couldn't take
+  (the end of the feed while it loads more) went to the WebProcess as
+  blocking events, a hit test every 8 ms pad tick; when the WebProcess has
+  just answered one with "nothing to scroll", further ones in that direction
+  aren't sent for 250 ms. Flag file words `wheelpace=0`, `unconsumedpace=0`
+  (in `wc-async-scroll`) = old.
+- **Scene culling** (0069, `TextureMapperLayer`): each layer's subtree bounds
+  in the root's space are computed with its transforms (affine, no filters,
+  replicas or backdrops; children of a clipping layer don't count), and
+  `paintRecursive` skips a subtree whose bounds miss the current clip. The
+  "future" transforms are computed only for layers with an animated backing
+  store client (none in WC). `/data/ps5webkit/wc-no-cull` = old (with the
+  tile culling of 0056).
+- **Log lines:** `[render] wc flush:` (flushes, ms, layers walked, culled and
+  changed per flush), `[render] wc scroll:` now with the time to apply title
+  scroll updates, `[render] compositing:` (compositing updates, ms, how many
+  traversed requirements or updated backings), `[ascroll] DOM wheel events:`
+  (sent, round trip, replaced, held for an update, unconsumed not sent),
+  `[wc] scene per paint` with culled subtrees and layers, `[wc-reasons]`.
+- **Tools:** `test/paint/feedlayers.html` (synthetic infinite feed, `?n=` items at
+  load, `&add=`, `&t=` triggers: `wc`, `tz`, `ov`, `sticky`, `preview`, `ripple`,
+  `ripplewc`, `contain`, `fade`, `menu`; `FEED` lines with the item count) and
+  `test/paint/feed-summary.py <log> [--buckets 500,1000,2000]` (one row per
+  5 s window: items, layers, WebProcess updates/s and ms, flush, scroll apply,
+  compositing, DOM wheel, scene ms and culled layers, moving frames/s, clamped).
+
+### Measured (log-only PPSA99020, 2026-11-02 evening)
+
+Same binary for both columns (builds 20261102-182910 to -193330; "old" =
+`PS5WK_WC_CULL=0 PS5WK_LAYERPOS_SKIP=0 PS5WK_WC_EVENT_REGIONS=1
+PS5WK_WC_WILLCHANGE_HIDDEN=1` in child.env, `wheelpace=0 unconsumedpace=0` in
+`wc-async-scroll`, `wc-no-cull`), `pad-scroll-test` ry 0.5-1.0 (rx 0),
+`feed-summary.py` averages over the 5 s windows while the stick moved. Tile
+uploads 0.098-0.107 ms each on the synthetic page; 0.123-0.136 ms on the two
+real sites (their tiles; the start page and synthetic page in the same
+sessions stayed at 0.10-0.11, so the console wasn't slow).
+
+| page | | composited (GL) layers | WebProcess updates/s | ms per update (p95) | layer flush ms (layers walked) | title scroll update applied, ms | scene paint ms | moving frames/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `feedlayers.html?n=1500&t=ripplewc,ov,preview,sticky,menu` | old | 21314 | 20.8 | 23.7 (34) | 23.6 (21311) | 4.9 | 22.4 | 43 |
+| | new | 12314 | 59.9 | 2.0 (11) | 1.8 (~700) | 0.68 | 12.0 | 60 |
+| `feedlayers.html?n=1500&t=ripple,ov,preview,sticky,menu` (no will-change) | old | 12314 | 47.7 | 8.5 (18) | 8.3 (12311) | 4.4 | 14.9 | 59 |
+| | new | 12314 | 51.5 | 2.1 (11) | 1.9 (670) | 0.69 | 12.0 | 59 |
+| `feedlayers.html?n=500&add=100&t=ripplewc,...`, at 800 items | old | 11374 | 40.6 | 13.5 (19) | 13.4 | 2.7 | 16.8 | 53 |
+| | new | 6574 | 57.9 | 1.9 (7) | 1.7 | 0.47 | 10.9 | 59 |
+| results page (video site), 80 s down/up at ry 0.6 | old | 2790 avg, 3905 max | 6.3 | 107 (203) | 18.9 (2631) | 2.4 | 11.9 | 41 |
+| | new | 639 avg, 1402 max | 14.2 | 66 (206) | 11.5 (246) | 0.32 | 4.1 | 43 |
+| forum front page, same | old | 254 avg, 483 max | 7.9 | 49 (301) | 10.1 | 1.4 | 2.7 | 30 |
+| | new | 262 avg, 500 max | 9.8 | 47 (368) | 8.6 | 0.52 | 2.1 | 31 |
+
+- Results page, `[wc-reasons]` at the end: old 1708 composited render layers
+  (will-change 830, overlap 749, 3D 113), new **199** (3D 123, overlap 54,
+  110 more sharing a backing). DOM wheel events: old 150 per 5 s, new 102
+  (paced). The rest of the WebProcess's time there is the page's own
+  script (rAF callbacks and timers, ~30 % of the main thread), layout and
+  compositing updates (`[render] compositing` 5.4 ms avg new, 11.0 old) and
+  intersection observers.
+- Forum front page: few layers in an 80 s session (the TV's 764-1052 came
+  after minutes on the feed), clipping and 3D transforms of image carousels
+  plus overlap; its cost is its own script and layout in both columns, and
+  the title clamps at the painted edge about as often in both (1400 steps
+  per run) because the WebProcess makes 8-10 updates/s with 300 ms spikes.
+  The fixes stop the growth with the feed (no flush, layer-position or event
+  region cost per layer, paced hit tests) but don't make this page's own
+  work cheaper.
+- Synthetic page, scene paint: 6.2 ms of the 12 ms is now
+  `computeTransformsRecursive` over all 12k layers (paint itself 2.0 ms, culling
+  12250 layers in 6128 subtrees); the rest grows with the scroll position
+  because every section heading above the view is stuck at the top of
+  `<main>` (stacked, all drawn): a property of the test page. With the
+  real page's ~200-400 layers the transform pass is well under a
+  millisecond, so it was left alone.
+- Regression check, `scrolljank.html?busy=30` ry 0.5 on the final build:
+  54.6 moving frames/s, pad -> present 11.8 ms avg (p95 max 16.8), WebProcess
+  30.2 updates/s, 0 stuck seconds: as before (54.7 / 11.8 / 30.5).
+
+**Not done / open:**
+- `computeCompositingRequirements` still re-evaluates every layer after the
+  first changed one in paint order (upstream FIXME); on the results page that
+  is most of the 5-11 ms per compositing update.
+- The title's transform pass is O(all layers) per frame (6 ms at 12k layers).
+- DOM wheel hit tests remain O(render layers), now at the page's frame rate.
+- Overlap-only layers still can't share a sibling's backing (Chrome's
+  squashing); with the invisible `will-change` shapes gone there are few
+  left on the pages measured.
+
+**For the owner on the TV:** the same two feeds as `tv30.log`, scrolled
+down for a few minutes and back up. The video site's results feed should
+keep its speed as it grows (the log's `[wc] ... layers` should stay in the
+hundreds, not thousands; `[render] wc:` updates/s should not fall to 2-3).
+White when scrolling back up should be rarer. The forum feed is limited
+by its own script, so expect less change there: the log's `[ascroll]
+... clamped` count shows how often scrolling waited for its tiles. To
+compare with the old behaviour without another build, put
+`PS5WK_WC_WILLCHANGE_HIDDEN=1` in child.env (layers back) and `wheelpace=0`
+in `wc-async-scroll`. Remove them afterwards.

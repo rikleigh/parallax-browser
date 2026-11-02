@@ -1,0 +1,150 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>feed layers test</title>
+<!-- Infinite feed for the composited-layer slowdown (COMPOSITING-PLAN.md,
+     "Long feeds: composited layers and per-update cost"). Items stay in the
+     DOM as the feed grows, like a video site's results and a forum's front
+     page. Self-contained (no network): upload it to /data/ps5webkit/feedlayers.html
+     and open file:///data/ps5webkit/feedlayers.html?n=500&t=ripple,ov
+       ?n=<items>      items at load (default 30)
+       &add=<items>    items appended when the end comes within two views
+                       (default 20); &max=<items> stops there (default 5000)
+       &t=<list>       per-item compositing triggers, comma separated:
+         wc       the card has will-change: transform
+         tz       the thumbnail has transform: translateZ(0)
+         ov       the thumbnail is composited (will-change: transform) and a
+                  positioned duration badge and progress bar sit over it
+                  (later in paint order, overlapping a composited sibling)
+         sticky   a sticky date heading every 10 items
+         preview  an empty hover-preview box (position absolute, opacity 0,
+                  will-change: opacity) over each thumbnail, like a video
+                  site's inline player placeholder
+         ripple   touch-feedback shapes: two positioned fill/stroke divs in
+                  each of the 3 buttons per item (opacity 0, opacity transition)
+         ripplewc the same with will-change: opacity
+         contain  the card has contain: layout paint
+         fade     cards fade in (opacity 0 -> 1 over 400 ms) when appended
+         menu     a positioned "more" menu button (z-index 1) in each card
+       &hdr=0          no sticky page header / fixed bottom bar (default both)
+       &hover          a timer moves a "hover" class over the visible cards
+                       (a preview box shows) every 500 ms, as a pointer would
+     Logs (console.log): FEED <t> s: items n, scrollY y, height h, appended n
+     once a second while anything changes. -->
+<style>
+html { background: #0f0f0f; }
+body { margin: 0; font: 18px/1.4 sans-serif; color: #f1f1f1; background: #0f0f0f; }
+#hdr { position: sticky; top: 0; z-index: 10; height: 56px; background: #212121; font: bold 24px/56px sans-serif; padding: 0 24px; border-bottom: 2px solid #c00; }
+#bar { position: fixed; bottom: 0; left: 0; right: 0; height: 40px; z-index: 10; background: #181818; border-top: 2px solid #333; font: 16px/40px sans-serif; padding: 0 24px; }
+main { width: 1240px; margin: 0 auto; padding: 8px 0 80px; }
+h3 { position: sticky; top: 58px; z-index: 5; margin: 8px 0; padding: 6px 12px; background: #263238; font-size: 18px; }
+body.nohdr h3 { top: 0; }
+.card { display: flex; gap: 16px; margin: 0 0 16px; padding: 8px; border-radius: 12px; background: #181818; position: relative; }
+.thumbbox { position: relative; flex: 0 0 360px; height: 202px; border-radius: 10px; overflow: hidden; }
+.thumb { position: absolute; inset: 0; border-radius: 10px; }
+.badge { position: absolute; right: 6px; bottom: 6px; padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,.8); font-size: 14px; }
+.prog { position: absolute; left: 0; bottom: 0; height: 4px; background: #f00; }
+.preview { position: absolute; inset: 0; opacity: 0; background: #000; transition: opacity .2s; }
+.card.hover .preview { opacity: .6; }
+.meta { flex: 1; min-width: 0; }
+.meta h4 { margin: 4px 0 6px; font-size: 20px; }
+.meta p { margin: 2px 0; color: #aaa; font-size: 15px; }
+.btns { display: flex; gap: 8px; margin-top: 10px; }
+.btn { position: relative; padding: 6px 14px; border-radius: 18px; background: #272727; font-size: 14px; }
+.fill, .stroke { position: absolute; inset: 0; border-radius: inherit; opacity: 0; transition: opacity .3s; }
+.fill { background: rgba(255,255,255,.1); }
+.stroke { border: 1px solid rgba(255,255,255,.3); }
+.menu { position: absolute; top: 8px; right: 8px; z-index: 1; width: 32px; height: 32px; border-radius: 16px; background: #272727; text-align: center; line-height: 32px; }
+body.t-wc .card { will-change: transform; }
+body.t-tz .thumb { transform: translateZ(0); }
+body.t-ov .thumb { will-change: transform; }
+body.t-preview .preview { will-change: opacity; }
+body.t-ripplewc .fill, body.t-ripplewc .stroke { will-change: opacity; }
+body.t-contain .card { contain: layout paint; }
+.card.fading { opacity: 0; }
+.card.fadein { opacity: 1; transition: opacity .4s; }
+</style></head>
+<body>
+<div id="hdr">feed layers</div>
+<main id="feed"></main>
+<div id="bar">items <span id="count">0</span></div>
+<script>
+const q = new URLSearchParams(location.search);
+const n0 = +(q.get('n') || 30), add = +(q.get('add') || 20), max = +(q.get('max') || 5000);
+const t = new Set((q.get('t') || '').split(',').filter(Boolean));
+const hdr = q.get('hdr') !== '0';
+for (const k of t) document.body.classList.add('t-' + k);
+if (!hdr) {
+  document.body.classList.add('nohdr');
+  document.getElementById('hdr').remove();
+  document.getElementById('bar').remove();
+}
+const feed = document.getElementById('feed');
+const countEl = document.getElementById('count');
+let items = 0, appended = 0, lastLog = '';
+
+function hue(i) { return (i * 47) % 360; }
+function makeItem(i) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  const ripple = t.has('ripple') || t.has('ripplewc');
+  const btn = (label) => '<div class="btn">' + label + (ripple ? '<div class="fill"></div><div class="stroke"></div>' : '') + '</div>';
+  const ov = t.has('ov');
+  card.innerHTML =
+    '<div class="thumbbox"><div class="thumb" style="background:linear-gradient(135deg,hsl(' + hue(i) + ',60%,45%),hsl(' + hue(i + 3) + ',60%,25%))"></div>' +
+    (ov ? '<div class="badge">' + (i % 60) + ':' + String(i % 59).padStart(2, '0') + '</div><div class="prog" style="width:' + (i * 13 % 100) + '%"></div>' : '') +
+    (t.has('preview') ? '<div class="preview"></div>' : '') + '</div>' +
+    '<div class="meta"><h4>Item ' + i + ': a synthetic title that is long enough to wrap onto a second line in this column</h4>' +
+    '<p>Channel ' + (i % 37) + ' &middot; ' + (i * 7919 % 1000) + 'K views &middot; ' + (i % 12 + 1) + ' days ago</p>' +
+    '<p>Description text for item ' + i + ', a couple of lines of ordinary inline content that paints into the card.</p>' +
+    '<div class="btns">' + btn('Like') + btn('Share') + btn('Save') + '</div></div>' +
+    (t.has('menu') ? '<div class="menu">&#8942;</div>' : '');
+  return card;
+}
+function append(count) {
+  const frag = document.createDocumentFragment();
+  const fresh = [];
+  for (let k = 0; k < count && items < max; k++, items++) {
+    if (t.has('sticky') && items % 10 === 0) {
+      const h = document.createElement('h3');
+      h.textContent = 'Section ' + (items / 10);
+      frag.appendChild(h);
+    }
+    const card = makeItem(items);
+    if (t.has('fade') && appended) { card.classList.add('fading'); fresh.push(card); }
+    frag.appendChild(card);
+  }
+  feed.appendChild(frag);
+  appended++;
+  countEl.textContent = items;
+  if (fresh.length)
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      for (const c of fresh) { c.classList.remove('fading'); c.classList.add('fadein'); }
+    }));
+}
+append(n0);
+function check() {
+  if (items < max && document.documentElement.scrollHeight - (scrollY + innerHeight) < 2 * innerHeight)
+    append(add);
+}
+addEventListener('scroll', check, { passive: true });
+setInterval(check, 250);
+if (q.has('hover')) {
+  let prev = null;
+  setInterval(() => {
+    const el = document.elementFromPoint(innerWidth / 2 - 300, innerHeight / 2);
+    const card = el && el.closest('.card');
+    if (prev && prev !== card) prev.classList.remove('hover');
+    if (card) card.classList.add('hover');
+    prev = card;
+  }, 500);
+}
+const t0 = performance.now();
+setInterval(() => {
+  const line = 'items ' + items + ', scrollY ' + Math.round(scrollY) + ', height ' + document.documentElement.scrollHeight + ', appended ' + appended;
+  if (line !== lastLog) {
+    console.log('FEED ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s: ' + line);
+    lastLog = line;
+  }
+}, 1000);
+console.log('FEED start: n ' + n0 + ', add ' + add + ', triggers ' + ([...t].join(',') || 'none') + (hdr ? '' : ', no header'));
+</script>
+</body></html>
