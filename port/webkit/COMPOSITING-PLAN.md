@@ -1972,3 +1972,77 @@ element over a scroller still routes to the scroller); the owner's TV check.
 Suggested TV setting: `/data/ps5webkit/wc-async-scroll` with content
 `stickframe=1` (add `overflow=1` to try async overflow boxes), with
 `/data/ps5webkit/compositing` on. Then Restart page.
+
+### Scene paint for many-layer pages, tile-arena timing, scrollbar (2026-11-02 night, src-wc 513c01b0c4)
+
+**Where the scene paint time goes.** I added a per-second `[wc] scene per
+paint` line (`/data/ps5webkit/wc-scene-stats`): prepare and paint ms, layers
+visited, invisible, off screen, blending, surfaces, tiles drawn and culled,
+draws, and time in textured quads and in `glDrawArrays`. On
+`scrolljank.html?layers=2800&cluster=2500` (2879 layers, about 1100 of them
+small composited dots on screen), a paint took 82-96 ms. Of that, 81 ms was
+inside `glDrawArrays`: 1142 draws at ~71 us of render-thread CPU each.
+Visiting the 2879 layers was cheap: with the dots spread over the whole feed
+(74 draws), the paint was 6.3 ms, nearly all of it the 74 draws. Overlap
+computations, intermediate surfaces and transforms (prepare 1 ms) don't
+matter here. On a video site's search page: 1249 layers, 287 invisible,
+106 draws, 8.3 ms.
+
+**Why a draw cost 71 us.** The PS5 GL driver can defer and batch draws.
+Its eligibility check (`ps5_multidraw_eligible`) only accepts GL_TRIANGLES,
+and its batch summary showed 335k rejects for "input" against 4k eligible.
+TextureMapper drew every quad as a GL_TRIANGLE_FAN, so each draw was
+prepared and submitted on its own. Caching GL state (program, blend, vertex
+buffer, unchanged uniforms) changed nothing measurable (39.6 against 40.5
+ms) and was dropped again.
+
+**Fix:** quads are drawn as two triangles (6 vertices), so the driver
+batches them. A/B with `/data/ps5webkit/wc-fan-draws`:
+
+| page | draws per paint | paint before | paint after |
+| --- | --- | --- | --- |
+| scrolljank, 2800 layers clustered | 1142 | 82-96 ms | 39-41 ms (~29 us per draw) |
+| scrolljank, 2800 layers spread | 74 | 6.3 ms | ~2 ms |
+| video site search page (1249 layers) | ~100 | 8.3 ms | 3.9 ms |
+| a heavy feed page (79 layers) | 56 | | 2.1 ms |
+
+Captures (`debug-screenshot`, +10 s, no scrolling) of `layers.html`,
+`static.html` and the 2800-dot page are pixel-identical between triangles
+and fans. This change is not behind the async flag. It changes how every
+WC scene is drawn, with `wc-fan-draws` as the way back. The remaining
+~29 us per draw is driver work per draw: descriptors and texture
+publication. Going lower needs fewer draws (an atlas for small layers) or
+driver work. A 2800-layer page still paints at ~40 ms, so it scrolls at
+~25 frames/s even in the title.
+
+**Tile-arena stall** (from the music-section thumbnails round). The chunk
+path is now timed in the log. On the console, `SharedMemory::allocate` of
+an 8 MB chunk took 0.02-0.03 ms on the WebProcess main thread, and the
+title's map took 0.2-0.9 ms. A jump test (`test-onload.js` jumping to far
+places every 1.5 s, 24 jumps, a 600-post page, `PS5WK_WATCHDOG_S=1`) grew
+the arena to 4 chunks and released them again, twice, with no watchdog
+report. The allocation is not the stall. A guess that fits "the main
+thread doesn't answer the signal, then waiting": the page faults on
+swapped-out memory under the 1.3 GB WebProcess of that site. I haven't
+checked it; the kernel VM stats around a stall would show it. A spare chunk
+made on a background thread exists but is off (`PS5WK_WC_ARENA_SPARE=1`),
+since it doesn't help and would add 8 MB.
+
+**Scrollbar during async scrolling.** The WebProcess paints the frame's
+overlay scrollbar thumb at its own scroll position. While the title is more
+than 24 px ahead, that layer is hidden (opacity override in the scene), and
+it comes back once the WebProcess has caught up. `thumb=0` in the flag file
+keeps it. Measured: the scrollbar was hidden and shown once per scroll
+burst, and was absent from mid-scroll captures. Adwaita's overlay thumb is
+faint anyway (9 px of it in one of 4 captures without the change).
+
+**VR self-test with async scrolling on** (dwell 170 s, `vr-sim` +
+`vr-selftest`, async + stickframe): `RESULT ps5browser vr-selftest PASS 15
+eye-buffer captures, 8 projections, controls, 4 entries in 72 s; VR off
+now`.
+
+**Final checks on this build:** flag absent in WC mode (`?busy=30`: 25.6
+moving frames/s, 30 ms pad -> present, as the baseline); CPU path (no
+compositing flag) paints on 4 threads and scrolls; async with stickframe on
+the 2800-layer page: 45 moving frames/s (bound by the 40 ms scene paint);
+search page 52.6 moving frames/s with 3.8 ms scene paints.
