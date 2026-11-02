@@ -2893,3 +2893,154 @@ by its own script, so expect less change there: the log's `[ascroll]
 compare with the old behaviour without another build, put
 `PS5WK_WC_WILLCHANGE_HIDDEN=1` in child.env (layers back) and `wheelpace=0`
 in `wc-async-scroll`. Remove them afterwards.
+
+## Feeds that load more: the spinner and the end of the page (2026-11-02, patch 0070)
+
+Owner (build 20261102-195347 with 0068/0069, `tv31.log`): smooth at first,
+then "everything starts to degrade" once the feed has to load more and the
+loading spinner shows, and it doesn't come back to the first speed. (The
+forum page's lock-up in that log was the GStreamer decodebin3 deadlock,
+fixed separately.)
+
+### What the logs show
+
+`tv31.log`, video site results feed: idle windows after several loads are
+still fast (WebProcess 30-36 updates/s, 5-6 ms each), but every scroll after
+the first load costs 40-130 ms per update (4-9 updates/s, of which tile
+painting 19-39 ms for ~1.3 Mpx), and at each load the composited layer count
+jumps for about a second: 198 -> 927, 244 -> 1167, 312 -> 1410, 344 -> 1603,
+398 -> 1838, 466 -> 2134, growing with the feed.
+
+Log-only runs on the console (`pad-scroll-test`, same page) found three
+causes of our own and the page's own costs:
+
+1. **The spinner composites every later layer.** `[wc-reasons]` during a
+   load: `stacking 635-699` (tooltips, channel names, menus of every item),
+   next to `animation 13: div.circle 8, div.spinner-layer 4, div.active 1`.
+   The spinner is three nested rotating elements; for a layer whose
+   transform animates inside an animating ancestor, upstream gives up on its
+   extent ("too hard") and switches overlap testing off for everything after
+   it in paint order, so every positioned element of the feed (positive
+   z-order lists) composites for as long as it spins.
+2. **The end of the page with the stick held.** The root can't scroll
+   further while the next batch loads, so every pad tick (105/s) went to the
+   WebProcess as a blocking event, a hit test of ~7000 render layers each.
+   They ran back to back: WebProcess main thread 0.97 cores for 69 s with 21
+   rendering updates in 72 s (profile: 68.6 % in `WebPage::handleWheelEvent`
+   -> `Document::hitTest`), so the items that would end the wait never came
+   (that is the "locks up at the spinner" case). 0069's rule (don't resend
+   for 250 ms after "nothing to scroll") never fired: the WebProcess answered
+   "handled" (its own scroll position lagged the title's).
+3. **Per-update costs that grow with the feed** (profile, run without the
+   flood, ~550 items): DOM wheel hit tests for the page's passive listeners
+   22.8 % of the main thread (10-20 ms per event at that size), rAF
+   callbacks 14.8 % (the page's script; 42 % of that is `setAttribute` on a
+   container, whose descendant style invalidation walks the whole feed),
+   intersection observers 13.1 % (8000-11000 targets per update: every item
+   is observed), compositing and layer flush 11.2 %, layout 8.4 % (a third
+   of it `computeCompositingRequirements` over all render layers, upstream's
+   FIXME, and the layer position and z-order rebuild after each layout).
+
+The title's scroll sync (0066) then waited ~11 ms every frame for updates
+that never came in time (`[ascroll] sync ... missed 46`).
+
+### Fixes (patch 0070)
+
+- **Nested transform animations** (`RenderLayerCompositor`,
+  `ps5ExtentThroughAnimatedAncestors`): each composited layer with a running
+  transform animation passes its descendants an affine from its coordinates
+  to the overlap map's space (sampled from the geometry map at three points,
+  checked at a fourth); a nested animating layer's own animated extent is
+  mapped into each animating ancestor, run through that ancestor's keyframe
+  extent (`Styleable::computeAnimationExtent`, upstream's one-level bound)
+  and mapped back, instead of switching overlap testing off. Unknown links
+  (non-affine, an ancestor's extent uncertain) keep upstream's behaviour.
+  `PS5WK_WC_NESTED_ANIM_EXTENT=0` (child.env) = old.
+- **Events the root can't take** (`DrawingAreaProxyWCPS5::handleWheelEvent`):
+  at most one per WebProcess update (or 250 ms); the deltas of those held
+  back are added to the next one (for a box the WebProcess scrolls itself).
+  `unconsumedpace=0` in `wc-async-scroll` = old (with 0069's rule).
+- **Wheel transaction for DOM-only wheel events** (`EventHandler`): while
+  the stick stays over the same point, the target of the transaction's
+  first event is kept instead of a hit test per event (as wheel transactions
+  in other engines); 500 ms without an event, a moved point or a detached
+  element end it. Only the passive-listener dispatch (`NonBlockingDOMEventDispatch`);
+  blocking and scrolling events hit-test as before.
+  `PS5WK_WHEEL_TRANSACTION=0` = old.
+- **Far intersection observer targets** (`IntersectionObserver::updateObservations`):
+  a target that wasn't intersecting, at a distance from the margin-expanded
+  root bounds, is skipped until the layout viewport has moved half that
+  distance, for at most 8 updates and 500 ms (moves by layout or animation
+  are seen within that); targets clipped out by an ancestor (or in skipped
+  content) for at most 4 updates and 250 ms. Implicit or document root
+  only. `PS5WK_IO_SKIP=0` = old. (A first version read the clock per target:
+  `MonotonicTime::now()` is a system call here and was half the observers'
+  time; it is read once per observer now.)
+- **Scroll sync pause** (`SceneHost::syncWithWebProcess`): after 4 missed
+  waits in a row the title doesn't wait for 500 ms, then tries one wait
+  again. `syncpause=0` in `wc-async-scroll` = old.
+- **Logs:** `[render] wc phases (ms per update)`: layout before, scroll
+  events, animations, rAF callbacks, layout after rAF, resize observers,
+  intersection observers (targets computed and skipped per update), final
+  layout + compositing, other; `[render] intersection observers since
+  start` every 30 s (why targets were computed); the `[ascroll] DOM wheel
+  events` line counts the root's unconsumed events sent, handled by the
+  WebProcess and held; the sync line counts frames `not waited for (it kept
+  missing)`. `feed-summary.py` has rAF / IO / final layout+comp columns.
+- **Test tools:** `feedlayers.html` gained `&load=<ms>` (append only near the
+  end, after a wait, with a spinner at the end meanwhile), `&spinner=nested|single|css`,
+  and triggers `io` (an IntersectionObserver on every card) and `wheel` (a
+  passive wheel listener); `pad-scroll-test` gained `upry=` (`upry=0`: the
+  stick only goes down, the "up" half is still), e.g. `delay=30 secs=8
+  ry=0.6 upry=0 pause=2` = 8 s down, 10 s still, repeated.
+
+### Measured (log-only PPSA99020, 2026-11-02 night)
+
+Console health: start-page raster 2.7 ms/s, tile uploads 0.084-0.087 ms.
+
+Held stick, results feed, same build before the fix (20261102-195347) and
+after (`delay=35 secs=110 ry=0.6`):
+
+| | before | after |
+| --- | --- | --- |
+| composited layers while the spinner shows | 866-948 (stacking 635-699), up to 2797 in the A/B run | 90-284, `stacking` in no census line |
+| unconsumed events sent to the WebProcess at the end | 103-108 per second | 9-18 per 5 s (80-180 held, deltas carried) |
+| WebProcess at the end of the feed | 0.97 cores, 0.3 updates/s for 69 s | 3-13 updates/s, the feed keeps loading |
+| main thread in wheel hit tests (profile) | 68.6 % (flood), 22.8 % (without it) | 2.3 % |
+
+Burst scrolling (`secs=8 ry=0.6 upry=0 pause=2`, 200 s, same build: "old"
+= `PS5WK_WC_NESTED_ANIM_EXTENT=0 PS5WK_WHEEL_TRANSACTION=0 PS5WK_IO_SKIP=0`
+in child.env and `unconsumedpace=0 syncpause=0`), averages of the 5 s
+windows once the feed passed ~400 layers (~300-600 items):
+
+| | WebProcess updates/s while scrolling | ms per update (non-paint part) | rAF callbacks | intersection observers | final layout + compositing | layer flush incl. tile recording | max layers | sync waits missed |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| old | 7.0 | 93 (64) | 26.8 | 14.9 | 14.9 | 27.5 | 2797 | 2293 |
+| new | 11.4 | 72 (50) | 23.5 | 8.5 | 10.5 | 21.4 | 593 | 199 (2520 frames not waited for) |
+
+Synthetic feed (`feedlayers.html?n=100&add=60&load=1500&t=menu,ov,io,wheel,ripple,sticky,preview`,
+held stick, 940 items): the spinner's stacking layers gone (old build
++470-830 layers during each load, new none), DOM wheel round trip 0.6 ms
+instead of 1-5 ms growing with the feed; this page is otherwise cheap (45-60
+updates/s either way), so it reproduces the mechanisms, not the real page's
+slowness.
+
+**What is left.** On the real feed the WebProcess still makes only ~11
+updates/s while scrolling at ~550 items (idle: 25-40/s): the page's own rAF
+script (20-60 ms per update, much of it descendant style invalidation from
+`setAttribute` on a container), layout plus `computeCompositingRequirements`
+and the z-order/layer-position rebuild over all ~7000 render layers (O(all
+layers), upstream), and tile painting (~1 Mpx per update while scrolling).
+The title keeps scrolling on its own tiles (moving frames 30-45/s with
+clamps at the painted edge). Next candidates: a cheaper descendant
+invalidation walk (pre-filter by the rule set's rightmost keys before
+building an `ElementRuleCollector` per element), skipping clean subtrees in
+`computeCompositingRequirements`, and the intersection observers' remaining
+per-target cost. The forum feed was not re-measured in this round.
+
+**For the owner on the TV:** the same feeds. At the spinner the log's `[wc]
+... layers` should stay in the hundreds (no jump to 1000-2000), holding the
+stick at the end should no longer stall the page (`events the root couldn't
+take: N sent` stays small), and `[render] wc phases` says where each
+update's time goes. To compare with the old behaviour: the child.env lines
+and `wc-async-scroll` words above.

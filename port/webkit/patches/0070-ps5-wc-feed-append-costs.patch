@@ -1,0 +1,781 @@
+diff --git a/Source/WebCore/page/EventHandler.cpp b/Source/WebCore/page/EventHandler.cpp
+index 81b816f829..8588635e40 100644
+--- a/Source/WebCore/page/EventHandler.cpp
++++ b/Source/WebCore/page/EventHandler.cpp
+@@ -3713,10 +3713,47 @@ HandleUserInputEventResult EventHandler::handleWheelEventInternal(const Platform
+     WeakPtr<ScrollableArea> scrollableArea;
+     bool isOverWidget = false;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // Wheel transaction for DOM-only wheel events (PS5 async scrolling: the
++    // title scrolled, the page's passive listeners hear about it). While the
++    // pad's stick is held over the same point, the events keep the target the
++    // transaction's first one hit, as wheel transactions do in other engines,
++    // instead of hit-testing the whole render layer tree for each one (on a
++    // long feed that was 10-20 ms per event, a fifth of the main thread while
++    // scrolling). The transaction ends after 500 ms without an event, when the
++    // point moves or the element leaves the document.
++    static NeverDestroyed<WeakPtr<Element, WeakPtrImplWithEventTargetData>> transactionElement;
++    static NeverDestroyed<WeakPtr<Document, WeakPtrImplWithEventTargetData>> transactionDocument;
++    static IntPoint transactionPoint;
++    static MonotonicTime lastTransactionEvent;
++    static const bool wheelTransactions = !getenv("PS5WK_WHEEL_TRANSACTION") || strcmp(getenv("PS5WK_WHEEL_TRANSACTION"), "0");
++    bool domOnly = processingSteps == OptionSet<WheelEventProcessingSteps> { WheelEventProcessingSteps::NonBlockingDOMEventDispatch };
++    auto now = MonotonicTime::now();
++    IntPoint eventPoint = flooredIntPoint(position);
++    bool latched = false;
++    if (wheelTransactions && domOnly && transactionElement->get() && transactionDocument->get() == document.get()
++        && now - lastTransactionEvent < 500_ms && (eventPoint - transactionPoint).diagonalLengthSquared() <= 16
++        && transactionElement->get()->isConnected() && &transactionElement->get()->document() == document.get()) {
++        element = transactionElement->get();
++        latched = true;
++    }
++    if (domOnly) {
++        lastTransactionEvent = now;
++        transactionPoint = eventPoint;
++    }
++    if (!latched && !fetchLatchedWheelEventTarget(event, element, scrollableArea)) {
++#else
+     if (!fetchLatchedWheelEventTarget(event, element, scrollableArea)) {
++#endif
+         document->hitTest(HitTestRequest { }, result);
+         element = result.targetElement();
+         isOverWidget = result.isOverWidget();
++#if defined(PS5_PAYLOAD_SDK)
++        if (domOnly) {
++            transactionElement.get() = isOverWidget ? nullptr : element.get();
++            transactionDocument.get() = document.get();
++        }
++#endif
+ 
+         // FIXME: Despite doing this up-front search for the correct scrollable area, we dispatch events via elements which
+         // itself finds and tries to scroll overflow scrollers.
+diff --git a/Source/WebCore/page/IntersectionObserver.cpp b/Source/WebCore/page/IntersectionObserver.cpp
+index 8d1cba4704..a57ec672ab 100644
+--- a/Source/WebCore/page/IntersectionObserver.cpp
++++ b/Source/WebCore/page/IntersectionObserver.cpp
+@@ -503,6 +503,16 @@ auto IntersectionObserver::computeIntersectionState(const IntersectionObserverRe
+ 
+     auto rootLocalIntersectionRect = intersectionState.rootBounds;
+     intersectionState.isIntersecting = rootRelativeTargetRect && rootLocalIntersectionRect.edgeInclusiveIntersect(*rootRelativeTargetRect);
++#if defined(PS5_PAYLOAD_SDK)
++    if (!intersectionState.isIntersecting && rootRelativeTargetRect && (!root() || root() == &target.document())) {
++        FloatRect target = *rootRelativeTargetRect;
++        auto& bounds = rootLocalIntersectionRect;
++        float dx = std::max({ 0.f, target.x() - bounds.maxX(), bounds.x() - target.maxX() });
++        float dy = std::max({ 0.f, target.y() - bounds.maxY(), bounds.y() - target.maxY() });
++        intersectionState.ps5Distance = std::max(dx, dy);
++    } else if (!intersectionState.isIntersecting && !rootRelativeTargetRect && (!root() || root() == &target.document()))
++        intersectionState.ps5Distance = -1; // clipped out by an ancestor, or skipped content
++#endif
+ 
+     if (isFirstObservation || intersectionState.isIntersecting) {
+         // FIXME: Remove suppression once rdar://189998444 is fixed.
+@@ -570,6 +580,37 @@ auto IntersectionObserver::computeIntersectionState(const IntersectionObserverRe
+     return intersectionState;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Targets computed and skipped by updateObservations, read by the drawing
++// area's [render] wc phases line (DrawingAreaWC.cpp).
++struct PS5IntersectionObserverStats {
++    uint64_t computed { 0 };
++    uint64_t skipped { 0 };
++    // Why computed: explicit root, intersecting or first observation, near
++    // (or the distance unknown: clipped out, skipped content), far but due.
++    uint64_t explicitRoot { 0 }, intersecting { 0 }, near { 0 }, due { 0 }, clippedOut { 0 };
++};
++static PS5IntersectionObserverStats& ps5IntersectionObserverStats()
++{
++    static PS5IntersectionObserverStats stats;
++    return stats;
++}
++
++void ps5IntersectionObserverCounts(uint64_t& computed, uint64_t& skipped)
++{
++    auto& stats = ps5IntersectionObserverStats();
++    computed = stats.computed;
++    skipped = stats.skipped;
++    static MonotonicTime lastLog;
++    if (MonotonicTime::now() - lastLog > 30_s && stats.computed) {
++        lastLog = MonotonicTime::now();
++        WTFLogAlways("[render] intersection observers since start: %llu targets computed (%llu explicit root, %llu intersecting or new, %llu near, %llu due; %llu of them clipped out last time), %llu far or clipped-out ones skipped", // NOLINT
++            static_cast<unsigned long long>(stats.computed), static_cast<unsigned long long>(stats.explicitRoot), static_cast<unsigned long long>(stats.intersecting),
++            static_cast<unsigned long long>(stats.near), static_cast<unsigned long long>(stats.due), static_cast<unsigned long long>(stats.clippedOut), static_cast<unsigned long long>(stats.skipped));
++    }
++}
++#endif
++
+ auto IntersectionObserver::updateObservations(const Frame& hostFrame) -> NeedNotify
+ {
+     RefPtr hostFrameView = hostFrame.virtualView();
+@@ -594,6 +635,12 @@ auto IntersectionObserver::updateObservations(const Frame& hostFrame) -> NeedNot
+         return isFullyActive;
+     };
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // Once per observer: MonotonicTime::now() is a system call on the PS5
++    // (it was half of this function's time when read per target).
++    auto viewport = hostFrameView->layoutViewportRect().location();
++    auto now = MonotonicTime::now();
++#endif
+     for (const auto& target : copyToVectorOf<Ref<Element>>(m_observationTargets)) {
+         // Per HTML spec, "update the rendering" step (which includes "run the update intersection
+         // observations") only occurs for fully active documents. Hence skip updating the target if
+@@ -615,7 +662,53 @@ auto IntersectionObserver::updateObservations(const Frame& hostFrame) -> NeedNot
+             return false;
+         }();
+         auto applyRootMargin = isSameOriginObservation ? ApplyRootMargin::Yes : ApplyRootMargin::No;
++#if defined(PS5_PAYLOAD_SDK)
++        // Far targets (PS5): a long feed observes every item (lazy loading,
++        // impressions), and each one costs a walk up its containers with
++        // their clips on every rendering update (on a results page scrolled
++        // to ~550 items: 8000-11000 targets, 30 ms per update, growing with
++        // the feed). A target that was not intersecting, at a distance from
++        // the (margin-expanded) root bounds, can't reach them before
++        // scrolling has moved half that distance: it is skipped until then,
++        // for at most 8 updates in a row and 500 ms, so that moves by layout
++        // or animation are still seen soon. Implicit root (or the document
++        // as root) only. PS5WK_IO_SKIP=0 (child.env): every target every update.
++        static const bool skipFarTargets = !getenv("PS5WK_IO_SKIP") || strcmp(getenv("PS5WK_IO_SKIP"), "0");
++        auto& ioStats = ps5IntersectionObserverStats();
++        bool documentRoot = !root() || root() == &target->document();
++        // Targets clipped out entirely by an ancestor (or in skipped content)
++        // don't come into view by the page's scrolling but by a layout or
++        // a sub-scroller's scrolling: at most 4 updates and 250 ms.
++        bool clippedOut = registration.ps5Distance < 0;
++        if (skipFarTargets && documentRoot && registration.previousThresholdIndex && !*registration.previousThresholdIndex && (registration.ps5Distance > 64 || clippedOut)) {
++            auto moved = viewport - registration.ps5ViewportAt;
++            bool skip = clippedOut ? registration.ps5Skipped < 4 && now - registration.ps5ComputedAt < 250_ms
++                : registration.ps5Skipped < 8 && now - registration.ps5ComputedAt < 500_ms && std::max(std::abs(moved.width()), std::abs(moved.height())) < registration.ps5Distance / 2;
++            if (skip) {
++                registration.ps5Skipped++;
++                ioStats.skipped++;
++                continue;
++            }
++            ioStats.due++;
++        } else if (skipFarTargets) {
++            if (!documentRoot)
++                ioStats.explicitRoot++;
++            else if (!registration.previousThresholdIndex || *registration.previousThresholdIndex)
++                ioStats.intersecting++;
++            else
++                ioStats.near++;
++        }
++        if (registration.ps5Distance < 0)
++            ioStats.clippedOut++;
++        ioStats.computed++;
++#endif
+         auto intersectionState = computeIntersectionState(registration, *hostFrameView, target, applyRootMargin);
++#if defined(PS5_PAYLOAD_SDK)
++        registration.ps5Distance = intersectionState.ps5Distance;
++        registration.ps5ViewportAt = viewport;
++        registration.ps5ComputedAt = now;
++        registration.ps5Skipped = 0;
++#endif
+ 
+         if (intersectionState.observationChanged) {
+             if (intersectionState.isIntersecting) {
+diff --git a/Source/WebCore/page/IntersectionObserver.h b/Source/WebCore/page/IntersectionObserver.h
+index 4b191bb201..60ca748ee1 100644
+--- a/Source/WebCore/page/IntersectionObserver.h
++++ b/Source/WebCore/page/IntersectionObserver.h
+@@ -53,6 +53,15 @@ class IntersectionObserverEntry;
+ struct IntersectionObserverRegistration {
+     WeakPtr<IntersectionObserver> observer;
+     std::optional<size_t> previousThresholdIndex;
++#if defined(PS5_PAYLOAD_SDK)
++    // IntersectionObserver::updateObservations: a target that was this far
++    // (px, content coordinates) outside the root bounds when last computed,
++    // with the layout viewport at ps5ViewportAt then.
++    float ps5Distance { 0 };
++    FloatPoint ps5ViewportAt;
++    MonotonicTime ps5ComputedAt;
++    unsigned ps5Skipped { 0 };
++#endif
+ };
+ 
+ struct IntersectionObserverData {
+@@ -145,6 +154,9 @@ private:
+         bool canComputeIntersection { false };
+         bool isIntersecting { false };
+         bool observationChanged { false };
++#if defined(PS5_PAYLOAD_SDK)
++        float ps5Distance { 0 }; // not intersecting: the gap to the root bounds (0 unknown)
++#endif
+     };
+ 
+     enum class ApplyRootMargin : bool { No, Yes };
+diff --git a/Source/WebCore/page/Page.cpp b/Source/WebCore/page/Page.cpp
+index 16f249544b..cfd48f9f32 100644
+--- a/Source/WebCore/page/Page.cpp
++++ b/Source/WebCore/page/Page.cpp
+@@ -2476,6 +2476,33 @@ void Page::enumerateLocalFrameGeometry(NOESCAPE const Function<void(LocalFrame&,
+ }
+ 
+ // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
++#if defined(PS5_PAYLOAD_SDK)
++// [render] wc phases (DrawingAreaWC): main-thread ms per rendering update
++// step, accumulated here and read and reset by the drawing area's 5 s line.
++// 0 layout and style before the steps, 1 scroll events, 2 animations,
++// 3 requestAnimationFrame callbacks, 4 layout after them, 5 resize observers,
++// 6 intersection observers, 7 the final layout and compositing update,
++// 8 the whole of Page::updateRendering.
++double* ps5RenderingPhaseMS()
++{
++    static double phases[9];
++    return phases;
++}
++
++namespace {
++struct PS5PhaseTimer {
++    explicit PS5PhaseTimer(unsigned phase)
++        : m_phase(phase), m_start(MonotonicTime::now()) { }
++    ~PS5PhaseTimer() { ps5RenderingPhaseMS()[m_phase] += (MonotonicTime::now() - m_start).milliseconds(); }
++    unsigned m_phase;
++    MonotonicTime m_start;
++};
++}
++#define PS5_PHASE(n) PS5PhaseTimer ps5PhaseTimer##n(n)
++#else
++#define PS5_PHASE(n)
++#endif
++
+ void Page::updateRendering()
+ {
+     LOG(EventLoop, "Page %p updateRendering() - re-entering %d", this, !m_renderingUpdateRemainingSteps.isEmpty());
+@@ -2499,8 +2526,16 @@ void Page::updateRendering()
+     bool isSVGImagePage = chrome().client().isSVGImageChromeClient();
+     if (!isSVGImagePage)
+         tracePoint(RenderingUpdateStart);
++#if defined(PS5_PAYLOAD_SDK)
++    std::optional<PS5PhaseTimer> ps5Total;
++    if (!isSVGImagePage)
++        ps5Total.emplace(8);
++#endif
+ 
+-    layoutIfNeeded();
++    {
++        PS5_PHASE(0);
++        layoutIfNeeded();
++    }
+ 
+     auto runProcessingStep = [&](RenderingUpdateStep step, NOESCAPE const Function<void(Document&)>& perDocumentFunction) {
+         m_renderingUpdateRemainingSteps.last().remove(step);
+@@ -2540,6 +2575,7 @@ void Page::updateRendering()
+     });
+ 
+     runProcessingStep(RenderingUpdateStep::Scroll, [] (Document& document) {
++        PS5_PHASE(1);
+         document.runScrollSteps();
+     });
+ 
+@@ -2552,6 +2588,7 @@ void Page::updateRendering()
+     });
+ 
+     runProcessingStep(RenderingUpdateStep::Animations, [] (Document& document) {
++        PS5_PHASE(2);
+         document.updateAnimationsAndSendEvents();
+     });
+ 
+@@ -2574,6 +2611,7 @@ void Page::updateRendering()
+     });
+ 
+     runProcessingStep(RenderingUpdateStep::AnimationFrameCallbacks, [] (Document& document) {
++        PS5_PHASE(3);
+         document.serviceRequestAnimationFrameCallbacks();
+     });
+ 
+@@ -2581,9 +2619,13 @@ void Page::updateRendering()
+         document.serviceCaretAnimation();
+     });
+ 
+-    layoutIfNeeded();
++    {
++        PS5_PHASE(4);
++        layoutIfNeeded();
++    }
+ 
+     runProcessingStep(RenderingUpdateStep::ResizeObservations, [&] (Document& document) {
++        PS5_PHASE(5);
+         document.updateResizeObservations(*this);
+     });
+ 
+@@ -2610,6 +2652,7 @@ void Page::updateRendering()
+     });
+ 
+     runProcessingStep(RenderingUpdateStep::IntersectionObservations, [] (Document& document) {
++        PS5_PHASE(6);
+         document.updateIntersectionObservers();
+     });
+ 
+@@ -2643,7 +2686,10 @@ void Page::updateRendering()
+     if (m_isTrackingRenderingUpdates)
+         ++m_renderingUpdateCount;
+ 
+-    layoutIfNeeded(LayoutOptions::UpdateCompositingLayers);
++    {
++        PS5_PHASE(7);
++        layoutIfNeeded(LayoutOptions::UpdateCompositingLayers);
++    }
+     doAfterUpdateRendering();
+ 
+     if (!isSVGImagePage)
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.cpp b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+index 19ff0095fa..6d47a4244c 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -26,6 +26,7 @@
+ #include "config.h"
+ #include "RenderLayerCompositor.h"
+ 
++#include "AffineTransform.h"
+ #include "AsyncScrollingCoordinator.h"
+ #include "BorderData.h"
+ #include "BorderShape.h"
+@@ -80,6 +81,7 @@
+ #include "Settings.h"
+ #include "StyleComputedStyle+GettersInlines.h"
+ #include "StyleOffsetRotate.h"
++#include "Styleable.h"
+ #include "TiledBacking.h"
+ #include "TransformState.h"
+ #include "TranslateTransformOperation.h"
+@@ -151,6 +153,28 @@ struct RenderLayerCompositor::OverlapExtent {
+     bool LEGACY_NODELETE knownToBeHaveExtentUncertainty() const { return extentComputed && animationCausesExtentUncertainty; }
+ };
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Nested transform animations (PS5): a composited layer with a running
++// transform animation whose extent is known pushes one of these for its
++// descendants: how its own coordinates map to the overlap map's absolute
++// space (which leaves the transforms of animating layers out), so that a
++// descendant that animates its transform too can have its extent carried
++// through this layer's animation (ps5ExtentThroughAnimatedAncestors) instead
++// of switching overlap testing off for every later layer.
++struct RenderLayerCompositor::AnimatedAncestorExtent {
++    const RenderLayer* layer { nullptr };
++    AffineTransform toAbsolute;
++    bool valid { false };
++    const AnimatedAncestorExtent* parent { nullptr };
++};
++
++static bool ps5NestedAnimationExtentEnabled()
++{
++    static const bool enabled = !getenv("PS5WK_WC_NESTED_ANIM_EXTENT") || strcmp(getenv("PS5WK_WC_NESTED_ANIM_EXTENT"), "0");
++    return enabled;
++}
++#endif
++
+ struct RenderLayerCompositor::CompositingState {
+     CompositingState(RenderLayer* compAncestor, bool testOverlap = true)
+         : compositingAncestor(compAncestor)
+@@ -173,6 +197,9 @@ struct RenderLayerCompositor::CompositingState {
+         childState.fullPaintOrderTraversalRequired = fullPaintOrderTraversalRequired;
+         childState.descendantsRequireCompositingUpdate = descendantsRequireCompositingUpdate;
+         childState.ancestorHasTransformAnimation = ancestorHasTransformAnimation;
++#if defined(PS5_PAYLOAD_SDK)
++        childState.animatedAncestors = animatedAncestors;
++#endif
+         childState.ancestorAllowsBackingStoreDetachingForFixed = ancestorAllowsBackingStoreDetachingForFixed;
+         childState.hasCompositedNonContainedDescendants = false;
+         childState.hasNotIsolatedCompositedBlendingDescendants = false; // FIXME: should this only be reset for stacking contexts?
+@@ -240,6 +267,11 @@ struct RenderLayerCompositor::CompositingState {
+     bool fullPaintOrderTraversalRequired { false };
+     bool descendantsRequireCompositingUpdate { false };
+     bool ancestorHasTransformAnimation { false };
++#if defined(PS5_PAYLOAD_SDK)
++    // The nearest animating ancestor (owned by its traversal frame; each
++    // links to the next one out).
++    const AnimatedAncestorExtent* animatedAncestors { nullptr };
++#endif
+     bool ancestorAllowsBackingStoreDetachingForFixed { false };
+     bool hasCompositedNonContainedDescendants { false };
+     bool hasNotIsolatedCompositedBlendingDescendants { false };
+@@ -1432,6 +1464,9 @@ void RenderLayerCompositor::computeCompositingRequirements(RenderLayer* ancestor
+     // a compositing layer among them, so start by inheriting the compositing
+     // ancestor with subtreeIsCompositing set to false.
+     CompositingState currentState = compositingState.stateForPaintOrderChildren(layer);
++#if defined(PS5_PAYLOAD_SDK)
++    AnimatedAncestorExtent animatedAncestorStorage;
++#endif
+     bool didPushOverlapContainer = false;
+ 
+     auto layerWillComposite = [&] {
+@@ -1484,8 +1519,14 @@ void RenderLayerCompositor::computeCompositingRequirements(RenderLayer* ancestor
+         if (!allowsBackingStoreDetachingForFixed && layer.behavesAsFixed())
+             currentState.ancestorAllowsBackingStoreDetachingForFixed = allowsBackingStoreDetachingForFixed = allowBackingStoreDetachingForFixedPosition(layer, layerExtent.bounds);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        if (layerExtent.hasTransformAnimation && compositingState.ancestorHasTransformAnimation && !layerExtent.animationCausesExtentUncertainty)
++            layerExtent.animationCausesExtentUncertainty = !ps5ExtentThroughAnimatedAncestors(compositingState, layerExtent);
++        ps5PushAnimatedAncestor(overlapMap, layer, layerExtent, compositingState, currentState, animatedAncestorStorage);
++#else
+         // Too hard to compute animated bounds if both us and some ancestor is animating transform.
+         layerExtent.animationCausesExtentUncertainty |= layerExtent.hasTransformAnimation && compositingState.ancestorHasTransformAnimation;
++#endif
+     } else if (providedBackingLayer) {
+         currentState.backingSharingAncestor = &layer;
+         overlapMap.pushCompositingContainer(layer);
+@@ -1681,6 +1722,9 @@ void RenderLayerCompositor::traverseUnchangedSubtree(RenderLayer* ancestorLayer,
+     }
+ 
+     CompositingState currentState = compositingState.stateForPaintOrderChildren(layer);
++#if defined(PS5_PAYLOAD_SDK)
++    AnimatedAncestorExtent animatedAncestorStorage;
++#endif
+ 
+     if (layerIsComposited) {
+         // This layer is going to be composited, so children can safely ignore the fact that there's an
+@@ -1695,8 +1739,14 @@ void RenderLayerCompositor::traverseUnchangedSubtree(RenderLayer* ancestorLayer,
+ 
+         computeExtent(overlapMap, layer, layerExtent);
+         currentState.ancestorHasTransformAnimation |= layerExtent.hasTransformAnimation;
++#if defined(PS5_PAYLOAD_SDK)
++        if (layerExtent.hasTransformAnimation && compositingState.ancestorHasTransformAnimation && !layerExtent.animationCausesExtentUncertainty)
++            layerExtent.animationCausesExtentUncertainty = !ps5ExtentThroughAnimatedAncestors(compositingState, layerExtent);
++        ps5PushAnimatedAncestor(overlapMap, layer, layerExtent, compositingState, currentState, animatedAncestorStorage);
++#else
+         // Too hard to compute animated bounds if both us and some ancestor is animating transform.
+         layerExtent.animationCausesExtentUncertainty |= layerExtent.hasTransformAnimation && compositingState.ancestorHasTransformAnimation;
++#endif
+     } else if (layerPaintsIntoProvidedBacking) {
+         overlapMap.pushCompositingContainer(layer);
+         currentState.backingSharingAncestor = &layer;
+@@ -2702,6 +2752,70 @@ RenderLayer* RenderLayerCompositor::enclosingNonStackingClippingLayer(const Rend
+     return nullptr;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// A composited layer with a running transform animation: its descendants
++// get its coordinate mapping (ps5ExtentThroughAnimatedAncestors). The overlap
++// map's geometry map has this layer pushed without its transform (as for
++// every animating layer), so the mapping from its coordinates to the map's
++// space is the stack below it: sampled at three points (affine; a fourth
++// point checks that no perspective or column step makes it otherwise).
++void RenderLayerCompositor::ps5PushAnimatedAncestor(const LayerOverlapMap& overlapMap, const RenderLayer& layer, const OverlapExtent& extent, const CompositingState& parentState, CompositingState& childState, AnimatedAncestorExtent& storage) const
++{
++    if (!extent.hasTransformAnimation || !ps5NestedAnimationExtentEnabled())
++        return;
++    storage.layer = &layer;
++    storage.parent = parentState.animatedAncestors;
++    bool outerChainKnown = !parentState.ancestorHasTransformAnimation || (parentState.animatedAncestors && parentState.animatedAncestors->valid);
++    storage.valid = outerChainKnown && !extent.animationCausesExtentUncertainty;
++    if (storage.valid) {
++        auto& map = overlapMap.geometryMap();
++        constexpr float unit = 1024;
++        auto p0 = map.mapToContainer(FloatPoint(), nullptr);
++        auto px = map.mapToContainer(FloatPoint(unit, 0), nullptr);
++        auto py = map.mapToContainer(FloatPoint(0, unit), nullptr);
++        auto pxy = map.mapToContainer(FloatPoint(unit, unit), nullptr);
++        storage.toAbsolute = AffineTransform((px.x() - p0.x()) / unit, (px.y() - p0.y()) / unit, (py.x() - p0.x()) / unit, (py.y() - p0.y()) / unit, p0.x(), p0.y());
++        auto check = storage.toAbsolute.mapPoint(FloatPoint(unit, unit));
++        storage.valid = storage.toAbsolute.isInvertible() && std::abs(check.x() - pxy.x()) < 1 && std::abs(check.y() - pxy.y()) < 1;
++    }
++    childState.animatedAncestors = &storage;
++}
++
++// Upstream gives up on a layer whose transform animates inside an ancestor
++// whose transform animates too: overlap testing is switched off for every
++// layer after it in paint order, which then all composite ("stacking"). A
++// loading spinner made of nested rotating elements at the end of a feed
++// composited every positioned element of the feed that way (700-1700 layers
++// on a long results page, for as long as it spun). Instead, the layer's own
++// animated extent (computeExtent, in the overlap map's space, where animating
++// transforms are left out) is carried out through each animating ancestor:
++// mapped into its coordinates, run through its keyframes' extent
++// (Styleable::computeAnimationExtent, the same bound upstream uses for one
++// level) and mapped back. False (upstream's uncertainty) if any link is unknown.
++bool RenderLayerCompositor::ps5ExtentThroughAnimatedAncestors(const CompositingState& state, OverlapExtent& extent) const
++{
++    if (!ps5NestedAnimationExtentEnabled() || !state.animatedAncestors)
++        return false;
++    FloatRect rect = extent.bounds;
++    for (auto* ancestor = state.animatedAncestors; ancestor; ancestor = ancestor->parent) {
++        if (!ancestor->valid || !ancestor->layer)
++            return false;
++        auto inverse = ancestor->toAbsolute.inverse();
++        if (!inverse)
++            return false;
++        LayoutRect local = enclosingLayoutRect(inverse->mapRect(rect));
++        auto styleable = Styleable::fromRenderer(ancestor->layer->renderer());
++        if (!styleable || !styleable->computeAnimationExtent(local))
++            return false;
++        rect = ancestor->toAbsolute.mapRect(FloatRect(local));
++    }
++    extent.bounds = enclosingLayoutRect(rect);
++    if (extent.bounds.isEmpty())
++        extent.bounds.setSize(LayoutSize(1, 1));
++    return true;
++}
++#endif
++
+ void RenderLayerCompositor::computeExtent(const LayerOverlapMap& overlapMap, const RenderLayer& layer, OverlapExtent& extent) const
+ {
+     if (extent.extentComputed)
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.h b/Source/WebCore/rendering/RenderLayerCompositor.h
+index 9a4db15ce3..97430f6b95 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.h
++++ b/Source/WebCore/rendering/RenderLayerCompositor.h
+@@ -441,6 +441,11 @@ public:
+ private:
+     struct CompositingState;
+     struct OverlapExtent;
++#if defined(PS5_PAYLOAD_SDK)
++    struct AnimatedAncestorExtent;
++    void ps5PushAnimatedAncestor(const LayerOverlapMap&, const RenderLayer&, const OverlapExtent&, const CompositingState& parentState, CompositingState& childState, AnimatedAncestorExtent& storage) const;
++    bool ps5ExtentThroughAnimatedAncestors(const CompositingState&, OverlapExtent&) const;
++#endif
+     struct UpdateBackingTraversalState;
+ 
+     // Returns true if the policy changed.
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 1e66ce6d12..4dd1e4d84a 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -252,6 +252,36 @@ bool DrawingAreaProxyWCPS5::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
+             page->continueWheelEventHandling(WTF::move(wheelEvent), { { }, false }, std::nullopt);
+             return true;
+         }
++        // At most one per WebProcess update (or 250 ms): each is a hit test
++        // of the whole page, and back to back (the stick held at the end of a
++        // feed: 105 a second) they kept a long feed's WebProcess busy with
++        // nothing else, so the items that would end the wait never came. The
++        // deltas held back meanwhile are added to the next one, for a box the
++        // WebProcess scrolls itself.
++        if (m_paceUnconsumed && direction && !platformWheelEvent.deltaX()) {
++            if (m_unconsumedSentAt && now - m_unconsumedSentAt < 250_ms && m_updatesReceived == m_updatesAtUnconsumedSend) {
++                bool sameWay = (m_unconsumedHeldDelta.height() > 0) == (wheelEvent->delta().height() > 0);
++                if (!sameWay)
++                    m_unconsumedHeldDelta = m_unconsumedHeldTicks = { };
++                m_unconsumedHeldDelta += wheelEvent->delta();
++                m_unconsumedHeldTicks += wheelEvent->wheelTicks();
++                m_unconsumedStats.held++;
++                page->continueWheelEventHandling(WTF::move(wheelEvent), { { }, false }, std::nullopt);
++                return true;
++            }
++            if (!m_unconsumedHeldDelta.isZero() && now - m_unconsumedSentAt < 500_ms
++                && (m_unconsumedHeldDelta.height() > 0) == (wheelEvent->delta().height() > 0)) {
++                auto data = wheelEvent->wheelData();
++                data.delta += m_unconsumedHeldDelta;
++                data.wheelTicks += m_unconsumedHeldTicks;
++                wheelEvent = WebWheelEvent::create(WebEventData { wheelEvent->eventData() }, WTF::move(data));
++                platformWheelEvent = platform(wheelEvent.get());
++            }
++            m_unconsumedHeldDelta = m_unconsumedHeldTicks = { };
++            m_unconsumedSentAt = now;
++            m_updatesAtUnconsumedSend = m_updatesReceived;
++        }
++        m_unconsumedStats.sent++;
+         m_unconsumedInFlight = true;
+         if (now - m_lastUnconsumedLog > 2_s) {
+             m_lastUnconsumedLog = now;
+@@ -299,6 +329,9 @@ void DrawingAreaProxyWCPS5::wheelEventHandlingCompleted(const WebCore::PlatformW
+         result = m_scrollingTree->handleWheelEventAfterDefaultHandling(wheelEvent, nodeID, gestureState);
+         wheelEventReceived(); // the gesture ends after its last scroll
+         if (std::exchange(m_unconsumedInFlight, false)) {
++            if (wasHandled || result.wasHandled)
++                m_unconsumedStats.handled++;
++            logDOMWheelStats();
+             if (!wasHandled && !result.wasHandled && wheelEvent.deltaY()) {
+                 m_unconsumedRejectedDirection = wheelEvent.deltaY() > 0 ? 1 : -1;
+                 m_unconsumedRejectedUntil = MonotonicTime::now() + 250_ms;
+@@ -406,11 +439,13 @@ void DrawingAreaProxyWCPS5::logDOMWheelStats()
+         stats.windowStart = now;
+     if (now - stats.windowStart < 5_s)
+         return;
+-    if (stats.sent) {
+-        WTFLogAlways("[ascroll] DOM wheel events: %u sent in %.1f s (round trip %.1f ms avg, %.1f max), %u replaced by a newer one, %u held for a WebProcess update%s; %u events the root couldn't take not sent (the WebProcess had nothing to scroll that way)", // NOLINT
+-            stats.sent, (now - stats.windowStart).seconds(), stats.roundTripMS / stats.sent, stats.roundTripMaxMS, stats.replaced, stats.heldForUpdate,
+-            m_paceDOMWheelEvents ? "" : " (wheelpace=0: not paced)", m_unconsumedDropped);
++    if (stats.sent || m_unconsumedStats.sent) {
++        WTFLogAlways("[ascroll] DOM wheel events: %u sent in %.1f s (round trip %.1f ms avg, %.1f max), %u replaced by a newer one, %u held for a WebProcess update%s; " // NOLINT
++            "events the root couldn't take: %u sent (%u scrolled something in the WebProcess), %u held for a WebProcess update (deltas sent with the next), %u not sent (the WebProcess had nothing to scroll that way)",
++            stats.sent, (now - stats.windowStart).seconds(), stats.sent ? stats.roundTripMS / stats.sent : 0.0, stats.roundTripMaxMS, stats.replaced, stats.heldForUpdate,
++            m_paceDOMWheelEvents ? "" : " (wheelpace=0: not paced)", m_unconsumedStats.sent, m_unconsumedStats.handled, m_unconsumedStats.held, m_unconsumedDropped);
+         m_unconsumedDropped = 0;
++        m_unconsumedStats = { };
+     }
+     stats = { };
+     stats.windowStart = now;
+@@ -489,6 +524,7 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+             if (asyncScrollingOption("sync", 1) > 0)
+                 syncScenes().add(identifier().toUInt64());
+             PS5WCHost::setSyncReserveMS(asyncScrollingOption("syncreserve", 5));
++            PS5WCHost::setSyncPause(asyncScrollingOption("syncpause", 1) > 0);
+         }
+         Locker locker { scrollingTreesLock() };
+         scrollingTrees().set(identifier().toUInt64(), *m_scrollingTree);
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index b19b12fb06..2253c4c691 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -143,6 +143,14 @@ private:
+     int m_unconsumedRejectedDirection { 0 };
+     MonotonicTime m_unconsumedRejectedUntil;
+     unsigned m_unconsumedDropped { 0 };
++    // And at most one per WebProcess update (or 250 ms) while the root can't
++    // take them: the deltas of those held back go with the next one.
++    unsigned m_updatesAtUnconsumedSend { 0 };
++    MonotonicTime m_unconsumedSentAt;
++    WebCore::FloatSize m_unconsumedHeldDelta, m_unconsumedHeldTicks;
++    struct UnconsumedStats {
++        unsigned sent { 0 }, handled { 0 }, held { 0 };
++    } m_unconsumedStats;
+     unsigned m_updatesReceived { 0 };
+     unsigned m_updatesAtDOMWheelSend { 0 };
+     MonotonicTime m_domWheelSentAt;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 47c42c94ab..0a208cf468 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -453,6 +453,11 @@ private:
+     void releaseHeldReplies();
+     Vector<CompletionHandler<void()>> m_heldReplies;
+     bool m_syncRanThisFrame { false };
++    // A WebProcess too slow to make the frame (missed several waits in a
++    // row): don't wait for it for a while; scroll-linked content lags then,
++    // but the render thread isn't held up every frame for nothing.
++    unsigned m_syncMissStreak { 0 };
++    int64_t m_syncPausedUntilUS { 0 };
+     bool m_treeServicedThisFrame { false };
+     double m_paintEstimateMS { 3 }; // scene paint, smoothed
+     void updateSubScrollerRects(WCScene&, uint64_t sceneID);
+@@ -477,7 +482,7 @@ private:
+         // Frames the title moved the root: content made at that position
+         // (lead under 1 px) or behind it; sync waits and how they ended.
+         unsigned movingFrames { 0 }, contentInStep { 0 };
+-        unsigned syncWaits { 0 }, syncInTime { 0 }, syncStale { 0 }, syncMissed { 0 }, syncAlready { 0 };
++        unsigned syncWaits { 0 }, syncInTime { 0 }, syncStale { 0 }, syncMissed { 0 }, syncAlready { 0 }, syncPaused { 0 };
+         double syncWaitMS { 0 }, syncWaitMaxMS { 0 };
+     } m_scrollStats;
+     void noteScrollPresent();
+@@ -1189,6 +1194,7 @@ bool SceneHost::applyScrollingTree(WCScene& scene, uint64_t sceneID, int64_t dis
+ }
+ 
+ static std::atomic<float> s_syncReserveMS { 5 }; // PS5WCHost::setSyncReserveMS
++static std::atomic<bool> s_syncPause { true }; // PS5WCHost::setSyncPause
+ 
+ void SceneHost::releaseHeldReplies()
+ {
+@@ -1224,6 +1230,11 @@ void SceneHost::syncWithWebProcess(uint64_t sceneID, int64_t displayUS)
+         return; // the root doesn't move this frame: nothing to keep in step
+     if (auto webProcess = tree->webProcessScrollPosition(); webProcess && samePosition(*webProcess, *target)) {
+         m_scrollStats.syncAlready++;
++        m_syncMissStreak = 0;
++        return;
++    }
++    if (g_get_monotonic_time() < m_syncPausedUntilUS) {
++        m_scrollStats.syncPaused++;
+         return;
+     }
+     // Wait for it until the scene must be painted to make the vsync.
+@@ -1261,10 +1272,17 @@ void SceneHost::syncWithWebProcess(uint64_t sceneID, int64_t displayUS)
+     double waitedMS = (g_get_monotonic_time() - startUS) / 1000.0;
+     m_scrollStats.syncWaitMS += waitedMS;
+     m_scrollStats.syncWaitMaxMS = std::max(m_scrollStats.syncWaitMaxMS, waitedMS);
+-    if (inTime)
++    if (inTime) {
+         m_scrollStats.syncInTime++;
+-    else
++        m_syncMissStreak = 0;
++    } else {
+         m_scrollStats.syncMissed++;
++        // Four misses in a row: its updates take longer than a frame (a long
++        // page, a slow script). Try again in 500 ms (one wait then, and a
++        // pause again if that misses too).
++        if (++m_syncMissStreak >= 4 && s_syncPause.load())
++            m_syncPausedUntilUS = g_get_monotonic_time() + 500000;
++    }
+ }
+ 
+ void SceneHost::updateSubScrollerRects(WCScene& scene, uint64_t sceneID)
+@@ -1336,10 +1354,10 @@ void SceneHost::maybeLogScroll()
+     }
+     if (m_scrollStats.movingFrames || m_scrollStats.syncWaits) {
+         WTFLogAlways("[ascroll] %.1f s sync: %u frames moved the root in the title, content made at that position in %u (%u behind); " // NOLINT
+-            "waited for the WebProcess in %u frames (%.1f ms avg, %.1f max): its update came in time %u, missed %u, stale updates first %u; already there %u",
++            "waited for the WebProcess in %u frames (%.1f ms avg, %.1f max): its update came in time %u, missed %u, stale updates first %u; already there %u; not waited for (it kept missing) %u",
+             seconds, m_scrollStats.movingFrames, m_scrollStats.contentInStep, m_scrollStats.movingFrames - m_scrollStats.contentInStep,
+             m_scrollStats.syncWaits, m_scrollStats.syncWaits ? m_scrollStats.syncWaitMS / m_scrollStats.syncWaits : 0.0, m_scrollStats.syncWaitMaxMS,
+-            m_scrollStats.syncInTime, m_scrollStats.syncMissed, m_scrollStats.syncStale, m_scrollStats.syncAlready);
++            m_scrollStats.syncInTime, m_scrollStats.syncMissed, m_scrollStats.syncStale, m_scrollStats.syncAlready, m_scrollStats.syncPaused);
+     }
+     if (m_scrollStats.movedFrames || inputs) {
+         auto& latencies = m_scrollStats.latenciesMS;
+@@ -1646,6 +1664,11 @@ void PS5WCHost::setSyncReserveMS(float value)
+ {
+     s_syncReserveMS = std::clamp(value, 3.f, 14.f);
+ }
++
++void PS5WCHost::setSyncPause(bool value)
++{
++    s_syncPause = value;
++}
+ #endif
+ 
+ void PS5WCHost::noteScrollEvent(ScrollNote note)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+index 25579d17b2..eb500727f5 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -67,6 +67,7 @@ public:
+     // position (ms; "syncreserve=" in the flag file, default 5; the wait also
+     // leaves the smoothed scene paint time + reserve - 3).
+     static void setSyncReserveMS(float);
++    static void setSyncPause(bool); // "syncpause=0": wait every frame even when the WebProcess keeps missing
+ 
+ private:
+     PS5WCHost();
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 2bec9f85de..6b3704d9a9 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -60,6 +60,13 @@
+ #include <wtf/text/MakeString.h>
+ #include <wtf/text/StringToIntegerConversion.h>
+ 
++#if defined(PS5_PAYLOAD_SDK)
++namespace WebCore {
++double* ps5RenderingPhaseMS(); // Page.cpp
++void ps5IntersectionObserverCounts(uint64_t& computed, uint64_t& skipped); // IntersectionObserver.cpp
++}
++#endif
++
+ namespace WebKit {
+ using namespace WebCore;
+ 
+@@ -99,6 +106,7 @@ struct WCRenderStats {
+     double scrollApplyMS { 0 }, scrollApplyMaxMS { 0 };
+     MonotonicTime windowStart;
+     WCFlushStats flushStart;
++    uint64_t ioComputedStart { 0 }, ioSkippedStart { 0 };
+     // WCTilePainter (deltas of wcTilePaintStats over the window).
+     WCTilePaintStats painterStart;
+     bool havePainterStart { false };
+@@ -146,6 +154,16 @@ struct WCRenderStats {
+                 updateMS / count, paint / count, percentile(paintMS, 0.95), megapixels / count, static_cast<double>(tiles) / count,
+                 frameDones ? frameDoneMS / frameDones : 0.0, (monitorFires + idleFires) / seconds, idleFires,
+                 replyGaps ? replyGapMS / replyGaps : 0.0, replyGapMaxMS, waitingAtReply, replyGaps, idleStarted, tileWaits ? tileWaitMS / tileWaits : 0.0);
++            {
++                // Page::updateRendering's steps (ps5RenderingPhaseMS), per update.
++                double* phase = ps5RenderingPhaseMS();
++                double named = phase[0] + phase[1] + phase[2] + phase[3] + phase[4] + phase[5] + phase[6] + phase[7];
++                uint64_t ioComputed, ioSkipped;
++                ps5IntersectionObserverCounts(ioComputed, ioSkipped);
++                WTFLogAlways("[render] wc phases (ms per update): layout before %.1f, scroll events %.1f, animations %.1f, rAF callbacks %.1f, layout after rAF %.1f, resize observers %.1f, intersection observers %.1f (targets per update: %.0f computed, %.0f far ones skipped), final layout + compositing %.1f, other %.1f", // NOLINT
++                    phase[0] / count, phase[1] / count, phase[2] / count, phase[3] / count, phase[4] / count, phase[5] / count, phase[6] / count,
++                    static_cast<double>(ioComputed - ioComputedStart) / count, static_cast<double>(ioSkipped - ioSkippedStart) / count, phase[7] / count, std::max(0.0, phase[8] - named) / count);
++            }
+             if (scrollUpdates)
+                 WTFLogAlways("[render] wc scroll: %u title scroll updates (%.1f/s), %u fired the refresh at once (nothing in flight); applying them %.2f ms avg, %.1f max", scrollUpdates, scrollUpdates / seconds, scrollFires, scrollApplyMS / scrollUpdates, scrollApplyMaxMS); // NOLINT
+             auto& flush = wcFlushStats();
+@@ -162,6 +180,8 @@ struct WCRenderStats {
+         }
+         painterStart = wcTilePaintStats();
+         flushStart = wcFlushStats();
++        std::fill_n(ps5RenderingPhaseMS(), 9, 0.0);
++        ps5IntersectionObserverCounts(ioComputedStart, ioSkippedStart);
+         totalMS.shrink(0);
+         paintMS.shrink(0);
+         updateMS = megapixels = frameDoneMS = 0;

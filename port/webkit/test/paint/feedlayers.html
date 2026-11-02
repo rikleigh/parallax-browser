@@ -24,6 +24,15 @@
          contain  the card has contain: layout paint
          fade     cards fade in (opacity 0 -> 1 over 400 ms) when appended
          menu     a positioned "more" menu button (z-index 1) in each card
+         io       an IntersectionObserver on every card (lazy loading)
+         wheel    a passive wheel listener on the window (the title sends
+                  DOM wheel events while it scrolls)
+       &load=<ms>      append only when the end is within one view, after a
+                       "network" wait of that long, with a loading spinner at
+                       the end of the feed meanwhile (an infinite feed)
+       &spinner=nested|single|css  the spinner: nested rotating elements like
+                       a material spinner (default), one rotating element, or
+                       a non-composited border-color animation
        &hdr=0          no sticky page header / fixed bottom bar (default both)
        &hover          a timer moves a "hover" class over the visible cards
                        (a preview box shows) every 500 ms, as a pointer would
@@ -60,17 +69,47 @@ body.t-preview .preview { will-change: opacity; }
 body.t-ripplewc .fill, body.t-ripplewc .stroke { will-change: opacity; }
 body.t-contain .card { contain: layout paint; }
 .card.fading { opacity: 0; }
+#spin { display: none; position: relative; width: 48px; height: 48px; margin: 24px auto; }
+#spin.on { display: block; }
+#spin .sc { width: 100%; height: 100%; animation: sp-rot 1568ms linear infinite; }
+#spin .layer { position: absolute; inset: 0; animation: sp-fill 5332ms cubic-bezier(.4,0,.2,1) infinite both; }
+#spin .clip { position: absolute; top: 0; width: 50%; height: 100%; overflow: hidden; }
+#spin .clip.l { left: 0; } #spin .clip.r { right: 0; }
+#spin .circle { position: absolute; top: 0; width: 200%; height: 100%; box-sizing: border-box; border: 4px solid #3ea6ff; border-bottom-color: transparent; border-radius: 50%; animation: sp-l 1333ms cubic-bezier(.4,0,.2,1) infinite both; }
+#spin .clip.l .circle { left: 0; border-right-color: transparent; }
+#spin .clip.r .circle { left: -100%; border-left-color: transparent; animation-name: sp-r; }
+#spin.single .sc { border: 4px solid #3ea6ff; border-bottom-color: transparent; border-radius: 50%; box-sizing: border-box; }
+#spin.css .sc { animation: sp-color 800ms linear infinite; border: 4px solid #3ea6ff; border-radius: 50%; box-sizing: border-box; }
+@keyframes sp-rot { to { transform: rotate(360deg); } }
+@keyframes sp-fill { 12.5% { transform: rotate(135deg); } 25% { transform: rotate(270deg); } 37.5% { transform: rotate(405deg); } 50% { transform: rotate(540deg); } 62.5% { transform: rotate(675deg); } 75% { transform: rotate(810deg); } 87.5% { transform: rotate(945deg); } to { transform: rotate(1080deg); } }
+@keyframes sp-l { from { transform: rotate(130deg); } 50% { transform: rotate(-5deg); } to { transform: rotate(130deg); } }
+@keyframes sp-r { from { transform: rotate(-130deg); } 50% { transform: rotate(5deg); } to { transform: rotate(-130deg); } }
+@keyframes sp-color { 50% { border-color: #ff4e45; } }
 .card.fadein { opacity: 1; transition: opacity .4s; }
 </style></head>
 <body>
 <div id="hdr">feed layers</div>
 <main id="feed"></main>
+<div id="spin"><div class="sc"></div></div>
 <div id="bar">items <span id="count">0</span></div>
 <script>
 const q = new URLSearchParams(location.search);
 const n0 = +(q.get('n') || 30), add = +(q.get('add') || 20), max = +(q.get('max') || 5000);
 const t = new Set((q.get('t') || '').split(',').filter(Boolean));
 const hdr = q.get('hdr') !== '0';
+const loadMS = q.has('load') ? +q.get('load') : -1;
+const spinKind = q.get('spinner') || 'nested';
+const spin = document.getElementById('spin');
+if (spinKind === 'nested')
+  spin.firstElementChild.innerHTML = '<div class="layer"><div class="clip l"><div class="circle"></div></div><div class="clip r"><div class="circle"></div></div></div>';
+else
+  spin.classList.add(spinKind);
+let loading = false, loads = 0;
+const io = t.has('io') ? new IntersectionObserver((entries) => {
+  for (const e of entries) e.target.classList.toggle('seen', e.isIntersecting);
+}, { rootMargin: '200px' }) : null;
+if (t.has('wheel'))
+  addEventListener('wheel', () => { window.wheelCount = (window.wheelCount || 0) + 1; }, { passive: true });
 for (const k of t) document.body.classList.add('t-' + k);
 if (!hdr) {
   document.body.classList.add('nohdr');
@@ -111,6 +150,7 @@ function append(count) {
     const card = makeItem(items);
     if (t.has('fade') && appended) { card.classList.add('fading'); fresh.push(card); }
     frag.appendChild(card);
+    if (io) io.observe(card);
   }
   feed.appendChild(frag);
   appended++;
@@ -122,8 +162,21 @@ function append(count) {
 }
 append(n0);
 function check() {
-  if (items < max && document.documentElement.scrollHeight - (scrollY + innerHeight) < 2 * innerHeight)
-    append(add);
+  if (items >= max || loading)
+    return;
+  const left = document.documentElement.scrollHeight - (scrollY + innerHeight);
+  if (loadMS < 0) {
+    if (left < 2 * innerHeight)
+      append(add);
+    return;
+  }
+  // An infinite feed: the spinner shows at the end while the next batch
+  // "loads", then the items replace it.
+  if (left < innerHeight) {
+    loading = true;
+    spin.classList.add('on');
+    setTimeout(() => { append(add); loads++; spin.classList.remove('on'); loading = false; }, loadMS);
+  }
 }
 addEventListener('scroll', check, { passive: true });
 setInterval(check, 250);
@@ -139,12 +192,12 @@ if (q.has('hover')) {
 }
 const t0 = performance.now();
 setInterval(() => {
-  const line = 'items ' + items + ', scrollY ' + Math.round(scrollY) + ', height ' + document.documentElement.scrollHeight + ', appended ' + appended;
+  const line = 'items ' + items + ', scrollY ' + Math.round(scrollY) + ', height ' + document.documentElement.scrollHeight + ', appended ' + appended + (loadMS >= 0 ? ', loads ' + loads + (loading ? ' (loading)' : '') : '') + (t.has('wheel') ? ', wheel ' + (window.wheelCount || 0) : '');
   if (line !== lastLog) {
     console.log('FEED ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s: ' + line);
     lastLog = line;
   }
 }, 1000);
-console.log('FEED start: n ' + n0 + ', add ' + add + ', triggers ' + ([...t].join(',') || 'none') + (hdr ? '' : ', no header'));
+console.log('FEED start: n ' + n0 + ', add ' + add + ', triggers ' + ([...t].join(',') || 'none') + (hdr ? '' : ', no header') + (loadMS >= 0 ? ', load ' + loadMS + ' ms, spinner ' + spinKind : ''));
 </script>
 </body></html>

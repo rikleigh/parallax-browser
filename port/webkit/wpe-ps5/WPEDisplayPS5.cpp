@@ -375,11 +375,13 @@ static void openPad(WPEDisplayPS5* display)
 // rx=<0-1> (horizontal: "down" scrolls right), px=/py=<0-1> (where the events
 // land, as a fraction of the view; default the centre, as padTick without a
 // pointer), hold=<s> (still between down and up), rest=<s> (one capture
-// that long into each hold and pause, after any snap: pad-NNN-rest.ppm).
+// that long into each hold and pause, after any snap: pad-NNN-rest.ppm),
+// upry=<0-1> (the stick in the "up" half; default ry; 0: still, so the cycle
+// only goes down, for infinite feeds).
 struct PadScrollTest {
     bool on { false };
     double delay { 15 }, secs { 4 }, ry { 0.5 }, rx { 0 }, pause { 4 };
-    double px { 0.5 }, py { 0.5 }, rest { 0 }, hold { 0 };
+    double px { 0.5 }, py { 0.5 }, rest { 0 }, hold { 0 }, upry { -1 };
     int shots { 3 };
     double start { 0 };
     int lastShot { -1 };
@@ -418,11 +420,13 @@ static void padScrollTestInit()
             test.hold = value;
         else if (!strcmp(key, "pause"))
             test.pause = value;
+        else if (!strcmp(key, "upry"))
+            test.upry = value;
         else if (!strcmp(key, "shots"))
             test.shots = static_cast<int>(value);
     }
-    PS5_LOG("pad-scroll-test: from %.0f s, %.1f s down / up at rx %.2f ry %.2f (at %.2f, %.2f of the view), %.1f s hold, %.1f s pause, %d shots per direction, rest shot %.1f s",
-        test.delay, test.secs, test.rx, test.ry, test.px, test.py, test.hold, test.pause, test.shots, test.rest);
+    PS5_LOG("pad-scroll-test: from %.0f s, %.1f s down / up at rx %.2f ry %.2f (up %.2f) (at %.2f, %.2f of the view), %.1f s hold, %.1f s pause, %d shots per direction, rest shot %.1f s",
+        test.delay, test.secs, test.rx, test.ry, test.upry >= 0 ? test.upry : test.ry, test.px, test.py, test.hold, test.pause, test.shots, test.rest);
 }
 
 static void padScrollTestTick(WPEDisplayPS5* display)
@@ -454,8 +458,12 @@ static void padScrollTestTick(WPEDisplayPS5* display)
         return;
     }
     bool down = phase < test.secs;
-    double ry = down ? test.ry : -test.ry;
-    double rx = down ? test.rx : -test.rx;
+    double base = test.ry > 0 ? test.ry : test.rx; // upry scales the up half of either axis
+    double upScale = test.upry >= 0 && base > 0 ? test.upry / base : 1;
+    double ry = down ? test.ry : -test.ry * upScale;
+    double rx = down ? test.rx : -test.rx * upScale;
+    if (!down && !ry && !rx)
+        return; // still in the up half (upry=0)
     const double speed = 14.0; // as padTick
     double x = wpe_view_get_width(view) * test.px, y = wpe_view_get_height(view) * test.py;
     GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),

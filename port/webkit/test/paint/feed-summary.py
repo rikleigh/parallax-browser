@@ -7,7 +7,9 @@ One row per WebProcess [render] window (5 s): feed items (feedlayers.html's
 FEED lines, if any), composited layers and scene paint ms (the title's [wc]
 lines), WebProcess updates/s and ms per update (avg, p95, the style/layout/
 script part), the layer tree flush (ms, layers walked and culled), title
-scroll updates applied (ms), compositing updates (ms), DOM wheel events sent
+scroll updates applied (ms), compositing updates (ms), the rendering update's rAF callbacks,
+intersection observers and final layout + compositing ([render] wc phases, ms
+per update), DOM wheel events sent
 and their round trip, moving frames/s and clamped steps ([ascroll]).
 With --buckets, averages of the rows whose item count is closest to each
 bucket (within 25 %).
@@ -63,6 +65,10 @@ for line in lines:
         pending['skipped'] = num(r'([\d.]+) skipped', line)
     elif '[render] wc scroll:' in line:
         pending['scrollApply'] = num(r'applying them ([\d.]+) ms avg', line)
+    elif '[render] wc phases' in line:
+        pending['raf'] = num(r'rAF callbacks ([\d.]+)', line)
+        pending['io'] = num(r'intersection observers ([\d.]+)', line)
+        pending['final'] = num(r'final layout \+ compositing ([\d.]+)', line)
     elif '[render] compositing:' in line:
         pending['comp'] = num(r'([\d.]+) ms avg', line)
         pending['compN'] = num(r'(\d+) updates in', line, int)
@@ -82,12 +88,13 @@ for line in lines:
 def f(v, fmt='%.1f'):
     return '' if v is None else fmt % v
 
-print('| items | layers | WP upd/s | ms avg | p95 | update | flush ms | walked | culled | scroll apply | compositing ms (n) | DOM wheel n, rt | scene ms | scene culled | moving fps | clamped |')
-print('| ' + ' | '.join(['---'] * 16) + ' |')
+print('| items | layers | WP upd/s | ms avg | p95 | update | rAF | IO | final layout+comp | flush ms | walked | culled | scroll apply | compositing ms (n) | DOM wheel n, rt | scene ms | scene culled | moving fps | clamped |')
+print('| ' + ' | '.join(['---'] * 19) + ' |')
 for r in rows:
     p = r['_pending']
     print('| ' + ' | '.join([
         f(r['items'], '%d'), f(r['layers'], '%d'), f(r['ups']), f(r['avg']), f(r['p95']), f(r['update']),
+        f(p.get('raf')), f(p.get('io')), f(p.get('final')),
         f(p.get('flush'), '%.2f'), f(p.get('walked'), '%.0f'), f(p.get('skipped'), '%.0f'), f(p.get('scrollApply'), '%.2f'),
         (f(p.get('comp')) + (' (%d)' % p['compN'] if p.get('compN') else '')) if p.get('comp') is not None else '',
         ('%d, %.0f' % (p['dom'], p['domRT'] or 0)) if p.get('dom') else '',
