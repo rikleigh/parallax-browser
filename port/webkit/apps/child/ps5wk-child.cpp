@@ -153,17 +153,31 @@ static int rendezvous(const char* path, unsigned long long processIdentifier)
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
     int s = -1;
     double start = nowMS();
+    // ENOENT: the title has not bound its socket yet (it waits for this
+    // directory). ECONNREFUSED: the socket is there with nobody listening,
+    // so the title that sent us is gone; give up after 10 s of that instead
+    // of holding ~150 MB and ~200 page tables for a minute.
+    double refusedSince = 0;
+    int lastError = 0;
     while (nowMS() - start < 60000) {
         s = socket(AF_UNIX, SOCK_STREAM, 0);
         if (s >= 0 && !connect(s, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)))
             break;
+        int error = errno;
+        lastError = error;
         if (s >= 0)
             close(s);
         s = -1;
+        if (error != ECONNREFUSED)
+            refusedSince = 0;
+        else if (!refusedSince)
+            refusedSince = nowMS();
+        else if (nowMS() - refusedSince > 10000)
+            break;
         usleep(50 * 1000);
     }
     if (s < 0) {
-        LOG("rendezvous: cannot connect to %s (errno %d)", path, errno);
+        LOG("rendezvous: cannot connect to %s after %.0f ms (errno %d)", path, nowMS() - start, lastError);
         return -1;
     }
 
@@ -251,7 +265,63 @@ static void removeStaleRuntimeFiles(int uiPid)
         LOG("stale files: removed %u from %s, %u not removed (errno %d)", removed, PS5WK_LAUNCH_DIR, failed, unlinkError);
 }
 
-static void setupEnvironment(const char* launchPath)
+// Console health (CONSOLE-HEALTH.md): a payload of ours that outlived its
+// title. A title killed while it streamed a child to elfldr left one that
+// never ran and never ended (2026-11-02); each one cost ~180 page tables and
+// ~150 MB of swap and slowed later launches and pages, until a restart.
+// Payloads all show as payload.elf: ours have ~300 MB or more of address
+// space (the 130 MB image), elfldr's small ones (launcher, klogsrv, ps) much
+// less. Reported only, not killed: a ps5wk-shot run is a big payload too.
+// The NetworkProcess, the first payload of each title start, does this.
+static void reportStalePayloads(int uiPid)
+{
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0 };
+    size_t length = 0;
+    if (sysctl(mib, 4, nullptr, &length, nullptr, 0))
+        return;
+    length += 64 * 1024;
+    char* buffer = static_cast<char*>(malloc(length));
+    if (!buffer || sysctl(mib, 4, buffer, &length, nullptr, 0)) {
+        free(buffer);
+        return;
+    }
+    time_t titleStart = 0;
+    for (size_t offset = 0; offset < length;) {
+        auto* info = reinterpret_cast<struct kinfo_proc*>(buffer + offset);
+        if (info->ki_structsize <= 0)
+            break;
+        if (info->ki_pid == uiPid)
+            titleStart = info->ki_start.tv_sec;
+        offset += info->ki_structsize;
+    }
+    unsigned stale = 0;
+    double staleMB = 0;
+    std::string list;
+    for (size_t offset = 0; titleStart && offset < length;) {
+        auto* info = reinterpret_cast<struct kinfo_proc*>(buffer + offset);
+        if (info->ki_structsize <= 0)
+            break;
+        double megabytes = info->ki_size / 1048576.0;
+        if (!strcmp(info->ki_comm, "payload.elf") && info->ki_pid != getpid() && megabytes > 200 && info->ki_start.tv_sec
+            && info->ki_start.tv_sec < titleStart) {
+            stale++;
+            staleMB += megabytes;
+            char entry[96];
+            snprintf(entry, sizeof(entry), " pid %d (%.0f MB, %ld s old, state %d)", info->ki_pid, megabytes,
+                (long)(time(nullptr) - info->ki_start.tv_sec), info->ki_stat);
+            list += entry;
+        }
+        offset += info->ki_structsize;
+    }
+    free(buffer);
+    if (stale)
+        LOG("[health] WARNING: %u big payload(s) older than this title, %.0f MB of address space:%s. A WebKit payload left over "
+            "from an earlier title run slows the console until it restarts (CONSOLE-HEALTH.md)", stale, staleMB, list.c_str());
+    else if (titleStart)
+        LOG("[health] no payloads left over from earlier title runs");
+}
+
+static void setupEnvironment(const char* launchPath, bool network = false)
 {
     // elfldr payloads start with an empty environment.
     mkdir("/data/ps5webkit", 0777);
@@ -309,6 +379,8 @@ static void setupEnvironment(const char* launchPath)
         snprintf(file, sizeof(file), "/data/ps5webkit/child-%d.env", uiPid);
         readEnvFile(file);
         removeStaleRuntimeFiles(uiPid);
+        if (network)
+            reportStalePayloads(uiPid);
     }
 }
 
@@ -794,7 +866,7 @@ int main(int, char**)
     if (fd < 0)
         return 1;
 
-    setupEnvironment(path);
+    setupEnvironment(path, network);
     if (!network)
         configureJIT();
     // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):

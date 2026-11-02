@@ -23,6 +23,7 @@
 #include "WPEPS5Private.h"
 #include <arpa/inet.h>
 #include <algorithm>
+#include <atomic>
 #include <dirent.h>
 #include <climits>
 #include <cstring>
@@ -123,6 +124,16 @@ static bool writeAll(int fd, const void* data, size_t size)
 // a refused spawn is retried.
 static GMutex s_uploadLock;
 
+// A title that dies while it streams a child to elfldr leaves elfldr with a
+// cut-off ELF, and the payload elfldr makes of it never runs and never ends:
+// it stays until the console restarts (2026-11-02: one after a WebProcess
+// crash loop was killed, more after title crashes; each made every later
+// launch and page slower, see CONSOLE-HEALTH.md). The title therefore calls
+// wpe_process_manager_ps5_quiesce() before it asks for its SIGKILL: no new
+// upload starts after that, and it waits for the one being sent.
+static std::atomic<bool> s_quiescing { false };
+static std::atomic<int> s_sending { 0 };
+
 // One line of a payload's output into our log; the performance overlay's
 // lines (PS5PerfOverlay.cpp) stay out of it.
 static void relayLine(const char* tag, const char* line)
@@ -137,6 +148,16 @@ static int sendToElfldr(const UploadJob& job, const char* tag, bool* retry)
 {
     gint64 t0 = g_get_monotonic_time();
     *retry = false;
+    // Counted before the flag is read (both sequentially consistent), so
+    // quiesce() either sees this send or this send sees its flag.
+    s_sending++;
+    struct SendingScope {
+        ~SendingScope() { s_sending--; }
+    } sendingScope;
+    if (s_quiescing) {
+        PS5_LOG("[ps5-launch %s] not sent: the title is ending", tag);
+        return -1;
+    }
     int elf = open(job.elfPath.c_str(), O_RDONLY);
     if (elf < 0) {
         g_warning("[ps5-launch %s] cannot open child ELF %s: errno %d", tag, job.elfPath.c_str(), errno);
@@ -660,6 +681,20 @@ gboolean wpe_process_manager_ps5_run_task(WPEProcessManager* processManager, con
     PS5_LOG("[ps5-launch] launching task %s (%s) from %s", task, argument, job->elfPath.c_str());
     g_thread_unref(g_thread_new("ps5-task", uploadThread, job));
     return TRUE;
+}
+
+gboolean wpe_process_manager_ps5_quiesce(guint timeoutMS)
+{
+    s_quiescing = true;
+    gint64 t0 = g_get_monotonic_time();
+    gint64 end = t0 + static_cast<gint64>(timeoutMS) * 1000;
+    int sending = s_sending;
+    while (s_sending > 0 && g_get_monotonic_time() < end)
+        g_usleep(5 * 1000);
+    bool done = !s_sending;
+    PS5_LOG("[ps5-launch] quiesced: no new payloads; %d send(s) in flight at the call, %s after %.0f ms", sending,
+        done ? "none left" : "STILL SENDING", (g_get_monotonic_time() - t0) / 1000.0);
+    return done;
 }
 
 void wpe_process_manager_ps5_set_child_elf(WPEProcessManager* manager, const char* path)

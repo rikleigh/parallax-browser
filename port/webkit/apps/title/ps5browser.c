@@ -590,6 +590,28 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     const char* uri = webkit_web_view_get_uri(view);
     gint64 now = g_get_monotonic_time();
     ps5wk_vr_stop(FALSE, "the page's process ended");
+    if (windDownStart) {
+        /* The wind-down ended it: a reload here started another 130 MB
+         * upload to elfldr just before the SIGKILL, and a title killed
+         * mid-upload leaves a payload that never ends (CONSOLE-HEALTH.md). */
+        spike_log("wind-down: the WebProcess ended (reason %d); no reload", reason);
+        return;
+    }
+    /* Any page, any reason but ours: more than 6 ends in 2 minutes is a
+     * WebProcess that dies at start (2026-11-02: ~80 crashed in a row, the
+     * error page's process crashing too, until the title was killed in the
+     * middle of a launch). Stop launching; the page stays as it is. */
+    static gint64 recentEnds[6];
+    static unsigned recentEndCount;
+    if (reason != WEBKIT_WEB_PROCESS_TERMINATED_BY_API) {
+        gint64 oldest = recentEnds[recentEndCount % G_N_ELEMENTS(recentEnds)];
+        recentEnds[recentEndCount++ % G_N_ELEMENTS(recentEnds)] = now;
+        if (recentEndCount > G_N_ELEMENTS(recentEnds) && now - oldest < 120 * G_USEC_PER_SEC) {
+            SPIKE_FAIL("webprocess", "terminated (reason %d), the %u. time, %u times in %.0f s: not starting another (restart the browser)",
+                reason, recentEndCount, (unsigned)G_N_ELEMENTS(recentEnds) + 1, (now - oldest) / 1e6);
+            return;
+        }
+    }
     if (memRestarting && reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API) {
         spike_log("[mem] WebProcess restart: the old one is gone");
         return;
@@ -1871,6 +1893,8 @@ int main(int argc, char** argv)
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     mainLoop = loop;
     g_main_loop_run(loop);
+    /* No child upload may be cut off by the SIGKILL that follows main. */
+    wpe_process_manager_ps5_quiesce(5000);
     ps5wk_vr_stop(TRUE, "main loop ended");
     ps5wk_audio_server_stop();
     /* Restart browser, after the wind-down: title_exit.c launches the title

@@ -47,6 +47,13 @@ WPE_API gboolean wpe_process_manager_ps5_run_task (WPEProcessManager            
                                                    WPEProcessManagerPS5TaskEnded  ended,
                                                    gpointer                       user_data);
 
+/* Before the title ends (it is SIGKILLed): no payload upload starts after
+ * this call, and it waits up to @timeout_ms for the one being sent to
+ * elfldr. A title killed in the middle of an upload leaves elfldr a cut-off
+ * ELF whose payload never runs and never ends (CONSOLE-HEALTH.md). TRUE if
+ * nothing is being sent any more. Any thread. */
+WPE_API gboolean wpe_process_manager_ps5_quiesce (guint timeout_ms);
+
 G_END_DECLS
 
 #endif /* WPEProcessManagerPS5_h */
