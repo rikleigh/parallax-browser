@@ -1,0 +1,758 @@
+diff --git a/Source/WebCore/page/EventHandler.cpp b/Source/WebCore/page/EventHandler.cpp
+index 8588635e40..4cdf8c40bf 100644
+--- a/Source/WebCore/page/EventHandler.cpp
++++ b/Source/WebCore/page/EventHandler.cpp
+@@ -3296,6 +3296,20 @@ void EventHandler::updateMouseEventTargetAfterLayoutIfNeeded()
+     if (m_lastKnownMousePositionSource == LastKnownMousePositionSource::Touch)
+         return;
+ 
++#if defined(PS5_PAYLOAD_SDK) && !ENABLE(IOS_TOUCH_EVENTS)
++    // While the page scrolls under a still pointer (PS5): every scroll step
++    // (re)starts the fake mouse move, which updates the element under the
++    // mouse once scrolling pauses. Layouts during the scroll (a feed's
++    // scripts lay out in nearly every frame) fired this as well, every
++    // 200 ms: a hit test of every layer and mouseout/mouseover on a new
++    // item each time, whose handlers (hover previews) cost more again, in
++    // the middle of the scroll. With the fake mouse move pending, it is left
++    // to that. PS5WK_HOVER_AFTER_SCROLL=0 (child.env): old behaviour.
++    static const bool deferWhileScrolling = !getenv("PS5WK_HOVER_AFTER_SCROLL") || strcmp(getenv("PS5WK_HOVER_AFTER_SCROLL"), "0");
++    if (deferWhileScrolling && m_fakeMouseMoveEventTimer.isActive() && !m_capturingMouseEventsElement)
++        return;
++#endif
++
+     RefPtr document = frame->document();
+ 
+     // Clear element tracking if there's a document mismatch.
+diff --git a/Source/WebCore/page/IntersectionObserver.cpp b/Source/WebCore/page/IntersectionObserver.cpp
+index a57ec672ab..54d50fac7f 100644
+--- a/Source/WebCore/page/IntersectionObserver.cpp
++++ b/Source/WebCore/page/IntersectionObserver.cpp
+@@ -641,6 +641,45 @@ auto IntersectionObserver::updateObservations(const Frame& hostFrame) -> NeedNot
+     auto viewport = hostFrameView->layoutViewportRect().location();
+     auto now = MonotonicTime::now();
+ #endif
++#if defined(PS5_PAYLOAD_SDK)
++    // Per-target overhead (PS5): a long feed has thousands of targets per
++    // observer and most of them are skipped below or have no renderer, so the
++    // loop itself was most of this function (copying the list into a vector
++    // of Refs, a hash lookup for the document's activity and a security
++    // origin comparison per target). Targets are visited in place (nothing in
++    // this loop runs script or changes the list), the document's answers are
++    // kept for the next target of the same document, the far-target test
++    // comes before the origin check, and a target without a renderer whose
++    // last observation was "not intersecting" is not recomputed (it would
++    // give the same answer: nothing to report).
++    Document* cachedDocument = nullptr;
++    bool cachedFullyActive = false;
++    bool cachedSameOrigin = false;
++    RefPtr hostFrameSecurityOrigin = hostFrame.frameDocumentSecurityOrigin();
++    for (auto& targetElement : m_observationTargets) {
++        Ref target = targetElement;
++        auto& targetDocument = target->document();
++        if (&targetDocument != cachedDocument) {
++            cachedDocument = &targetDocument;
++            cachedFullyActive = root() || isDocumentFullyActive(targetDocument);
++            cachedSameOrigin = hostFrameSecurityOrigin && protect(targetDocument.securityOrigin())->isSameOriginDomain(*hostFrameSecurityOrigin);
++        }
++        if (!cachedFullyActive)
++            continue;
++
++        auto& targetRegistrations = target->intersectionObserverDataIfExists()->registrations;
++        auto index = targetRegistrations.findIf([&](auto& registration) {
++            return registration.observer.get() == this;
++        });
++        ASSERT(index != notFound);
++        auto& registration = targetRegistrations[index];
++
++        bool isSameOriginObservation = cachedSameOrigin;
++        if (!target->renderer() && registration.previousThresholdIndex && !*registration.previousThresholdIndex && (!root() || root() == &targetDocument)) {
++            ps5IntersectionObserverStats().skipped++;
++            continue;
++        }
++#else
+     for (const auto& target : copyToVectorOf<Ref<Element>>(m_observationTargets)) {
+         // Per HTML spec, "update the rendering" step (which includes "run the update intersection
+         // observations") only occurs for fully active documents. Hence skip updating the target if
+@@ -661,6 +700,7 @@ auto IntersectionObserver::updateObservations(const Frame& hostFrame) -> NeedNot
+ 
+             return false;
+         }();
++#endif
+         auto applyRootMargin = isSameOriginObservation ? ApplyRootMargin::Yes : ApplyRootMargin::No;
+ #if defined(PS5_PAYLOAD_SDK)
+         // Far targets (PS5): a long feed observes every item (lazy loading,
+diff --git a/Source/WebCore/rendering/RenderLayer.cpp b/Source/WebCore/rendering/RenderLayer.cpp
+index fc870c8df5..5e8f948a3e 100644
+--- a/Source/WebCore/rendering/RenderLayer.cpp
++++ b/Source/WebCore/rendering/RenderLayer.cpp
+@@ -3486,6 +3486,11 @@ void RenderLayer::paintLayer(GraphicsContext& context, const LayerPaintingInfo&
+         return;
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (ps5CanSkipPaintingOutsideDirtyRect(paintingInfo, paintFlags))
++        return;
++#endif
++
+     if (RefPtr recorder = canvasDrawableRecorder(*this, context, paintingInfo.rootLayer)) {
+         paintLayerWithEffects(*recorder, paintingInfo, paintFlags);
+         return;
+@@ -3494,6 +3499,106 @@ void RenderLayer::paintLayer(GraphicsContext& context, const LayerPaintingInfo&
+     paintLayerWithEffects(context, paintingInfo, paintFlags);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Leaf layers outside the dirty rect (PS5). A z-order list holds every
++// positioned element of its stacking context, flattened: on a long feed the
++// root's list has thousands of entries, and painting a tile of one composited
++// layer ran each of them through collectFragments, clip rects, the canvas
++// recorder lookup and font quantization before its bounds were compared with
++// the dirty rect (about three quarters of tile painting on a feed scrolled to
++// ~550 items: it grew with the feed, not with what was painted). A layer
++// whose painting is its renderer's alone (no self-painting descendants that it
++// paints itself: none at all, or, for a layer that isn't a stacking context,
++// none in its normal flow list), with
++// no transform, filter, reflection or fragmentation, paints nothing outside
++// its bounding box (the visual overflow rect: borders, shadows, outlines and
++// floats included; the box paintLayerContents tests too) and is skipped when
++// that box, a little inflated, misses the dirty rect. Ordinary painting only
++// (no event or accessibility regions, overlay scrollbars or flattening).
++// PS5WK_PAINT_CULL=0 (child.env): old behaviour.
++// Layers that reached the test, skipped, not leaves, and not eligible
++// otherwise (for the drawing area's [render] wc tiles line).
++static uint64_t s_ps5PaintCull[4];
++void ps5PaintCullCounts(uint64_t& tested, uint64_t& skipped, uint64_t& notLeaf, uint64_t& notEligible)
++{
++    tested = s_ps5PaintCull[0];
++    skipped = s_ps5PaintCull[1];
++    notLeaf = s_ps5PaintCull[2];
++    notEligible = s_ps5PaintCull[3];
++}
++
++bool RenderLayer::ps5CanSkipPaintingOutsideDirtyRect(const LayerPaintingInfo& paintingInfo, OptionSet<PaintLayerFlag> paintFlags)
++{
++    static const bool enabled = !getenv("PS5WK_PAINT_CULL") || strcmp(getenv("PS5WK_PAINT_CULL"), "0");
++    if (!enabled)
++        return false;
++    if (paintingInfo.paintDirtyRect.isInfinite() || paintingInfo.regionContext || paintingInfo.overlapTestRequests || !paintingInfo.rootLayer || paintingInfo.rootLayer == this)
++        return false;
++    if (paintFlags.containsAny({ PaintLayerFlag::CollectingEventRegion, PaintLayerFlag::PaintingOverlayScrollbars, PaintLayerFlag::PaintingReflection, PaintLayerFlag::AppliedTransform }))
++        return false;
++    if (paintingInfo.paintBehavior.containsAny({ PaintBehavior::FlattenCompositingLayers, PaintBehavior::Snapshotting }))
++        return false;
++    s_ps5PaintCull[0]++;
++
++    // The answer and the bounds are kept for the rendering update: a
++    // composited layer's tiles are painted rect by rect, each pass over the
++    // whole list, and nothing moves or restyles while the update's tiles are
++    // painted (any layout or layer position update since makes a new entry).
++    auto& layoutContext = renderer().view().frameView().layoutContext();
++    auto update = page().lastRenderingUpdateTimestamp(); // set at the start of each update
++    auto& cache = m_ps5PaintCull;
++    if (cache.root != paintingInfo.rootLayer || cache.update != update || cache.layouts != layoutContext.layoutUpdateCount() || cache.positions != layoutContext.renderLayerPositionUpdateCount()) {
++        cache.root = paintingInfo.rootLayer;
++        cache.update = update;
++        cache.layouts = layoutContext.layoutUpdateCount();
++        cache.positions = layoutContext.renderLayerPositionUpdateCount();
++        cache.state = ps5PaintCullState(*paintingInfo.rootLayer, cache.bounds);
++    }
++    switch (cache.state) {
++    case PS5PaintCull::PaintsChildLayers:
++        s_ps5PaintCull[2]++;
++        return false;
++    case PS5PaintCull::NotEligible:
++        s_ps5PaintCull[3]++;
++        return false;
++    case PS5PaintCull::Eligible:
++        break;
++    }
++    if (cache.bounds.intersects(paintingInfo.paintDirtyRect))
++        return false;
++    s_ps5PaintCull[1]++;
++    return true;
++}
++
++auto RenderLayer::ps5PaintCullState(const RenderLayer& rootLayer, LayoutRect& bounds) -> PS5PaintCull
++{
++    if (hasSelfPaintingLayerDescendant()) {
++        // A layer that isn't a stacking context paints only its normal flow
++        // child layers; its other self-painting descendants are in its
++        // stacking context's z-order lists and painted from there.
++        if (isStackingContext())
++            return PS5PaintCull::PaintsChildLayers;
++        updateLayerListsIfNeeded();
++        for (auto* child : normalFlowLayers()) {
++            if (child->isSelfPaintingLayer() || child->hasSelfPaintingLayerDescendant())
++                return PS5PaintCull::PaintsChildLayers;
++        }
++    }
++    if (!isSelfPaintingLayer() || isRenderViewLayer())
++        return PS5PaintCull::NotEligible;
++    auto& renderer = this->renderer();
++    if (!renderer.isRenderBox() || renderer.isDocumentElementRenderer() || renderer.isSVGLayerAwareRenderer() || is<RenderTableRow>(renderer))
++        return PS5PaintCull::NotEligible;
++    if (renderer.hasTransformRelatedProperty() || renderer.hasFilter() || renderer.hasBackdropFilter() || renderer.hasReflection())
++        return PS5PaintCull::NotEligible;
++    if (enclosingPaginationLayer(IncludeCompositedPaginatedLayers))
++        return PS5PaintCull::NotEligible;
++    bounds = boundingBox(&rootLayer, offsetFromAncestor(&rootLayer));
++    bounds.inflate(LayoutUnit(4));
++    return PS5PaintCull::Eligible;
++}
++#endif
++
+ void RenderLayer::paintLayerWithEffects(GraphicsContext& context, const LayerPaintingInfo& paintingInfo, OptionSet<PaintLayerFlag> paintFlags)
+ {
+     // Non self-painting leaf layers don't need to be painted as their renderer() should properly paint itself.
+diff --git a/Source/WebCore/rendering/RenderLayer.h b/Source/WebCore/rendering/RenderLayer.h
+index 975714d7a3..97234e0835 100644
+--- a/Source/WebCore/rendering/RenderLayer.h
++++ b/Source/WebCore/rendering/RenderLayer.h
+@@ -1274,6 +1274,19 @@ private:
+ 
+     void paintLayer(GraphicsContext&, const LayerPaintingInfo&, OptionSet<PaintLayerFlag>);
+     void paintLayerWithEffects(GraphicsContext&, const LayerPaintingInfo&, OptionSet<PaintLayerFlag>);
++#if defined(PS5_PAYLOAD_SDK)
++    bool ps5CanSkipPaintingOutsideDirtyRect(const LayerPaintingInfo&, OptionSet<PaintLayerFlag>);
++    enum class PS5PaintCull : uint8_t { PaintsChildLayers, NotEligible, Eligible };
++    PS5PaintCull ps5PaintCullState(const RenderLayer& rootLayer, LayoutRect& bounds);
++    struct PS5PaintCullCache {
++        const RenderLayer* root { nullptr };
++        MonotonicTime update;
++        unsigned layouts { 0 }, positions { 0 };
++        LayoutRect bounds;
++        PS5PaintCull state { PS5PaintCull::NotEligible };
++    };
++    PS5PaintCullCache m_ps5PaintCull;
++#endif
+ 
+     void paintLayerContentsAndReflection(GraphicsContext&, const LayerPaintingInfo&, OptionSet<PaintLayerFlag>);
+     void paintLayerByApplyingTransform(GraphicsContext&, const LayerPaintingInfo&, OptionSet<PaintLayerFlag>, const LayoutSize& translationOffset = LayoutSize());
+diff --git a/Source/WebCore/rendering/RenderLayerCompositor.cpp b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+index 6d47a4244c..ff6960e581 100644
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -458,6 +458,31 @@ auto RenderLayerCompositor::BackingSharingState::backingProviderCandidateForLaye
+ 
+     LOG_WITH_STREAM(Compositing, stream << "Looking for backing provider candidate for " << &layer);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // The layers of the containing block chain, collected once (PS5): with
++    // several candidates each one that isn't in it walked the chain to the
++    // root again (ancestorLayerIsInContainingBlockChain), for every layer of
++    // every compositing requirements traversal. Same answer: a candidate is
++    // in the chain if one of the containing blocks below the RenderView has it.
++    // The chain is walked only as far as a lookup needs (never further than
++    // ancestorLayerIsInContainingBlockChain would).
++    Vector<const RenderLayer*, 16> containingBlockLayers;
++    const RenderBlock* nextBlock = layer.renderer().containingBlock();
++    auto isInContainingBlockChain = [&](const RenderLayer& ancestor) {
++        if (containingBlockLayers.contains(&ancestor))
++            return true;
++        for (; nextBlock && !is<RenderView>(*nextBlock); ) {
++            auto* blockLayer = nextBlock->layer();
++            nextBlock = nextBlock->containingBlock();
++            if (!blockLayer)
++                continue;
++            containingBlockLayers.append(blockLayer);
++            if (blockLayer == &ancestor)
++                return true;
++        }
++        return false;
++    };
++#endif
+     // First, find the frontmost provider that is an ancestor in the containing block chain.
+     auto candidateIndex = m_backingProviderCandidates.reverseFindIf([&](auto& provider) {
+         auto& providerLayer = *provider.providerLayer;
+@@ -467,7 +492,11 @@ auto RenderLayerCompositor::BackingSharingState::backingProviderCandidateForLaye
+             return false;
+         }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        if (!isInContainingBlockChain(providerLayer)) {
++#else
+         if (!layer.ancestorLayerIsInContainingBlockChain(providerLayer)) {
++#endif
+             LOG_WITH_STREAM(Compositing, stream << "Rejected non-containing block ancestor " << &providerLayer);
+             return false;
+         }
+@@ -1095,12 +1124,42 @@ struct PS5CompositingUpdateStats {
+     unsigned updates { 0 }, requirementTraversals { 0 }, hierarchyUpdates { 0 };
+     double milliseconds { 0 }, maxMilliseconds { 0 };
+     MonotonicTime windowStart;
++    // Layers through computeCompositingRequirements' full path and through
++    // traverseUnchangedSubtree, and the layers that started a traversal of
++    // every later layer in paint order (element.class: count).
++    uint64_t fullLayers { 0 }, unchangedLayers { 0 };
++    HashMap<String, unsigned> fullTraversalStarters;
+ };
+ static PS5CompositingUpdateStats& ps5CompositingUpdateStats()
+ {
+     static NeverDestroyed<PS5CompositingUpdateStats> stats; // main thread only
+     return stats.get();
+ }
++static void ps5NoteFullTraversalStarter(const RenderLayer& layer, ASCIILiteral why)
++{
++    StringBuilder kind;
++    kind.append(why);
++    // Which dirty bits: paint order children, post-layout, descendants, later layers.
++    if (layer.needsCompositingPaintOrderChildrenUpdate())
++        kind.append('C');
++    if (layer.needsPostLayoutCompositingUpdate())
++        kind.append('P');
++    if (layer.descendantsNeedCompositingRequirementsTraversal())
++        kind.append('D');
++    if (layer.subsequentLayersNeedCompositingRequirementsTraversal())
++        kind.append('S');
++    kind.append(' ');
++    if (RefPtr element = layer.renderer().element()) {
++        kind.append(element->localName());
++        if (element->hasClass() && element->classNames().size())
++            kind.append('.', element->classNames()[0]);
++    } else
++        kind.append(layer.renderer().renderName());
++    String kindString = kind.toString();
++    if (kindString.length() > 70)
++        kindString = kindString.left(70);
++    ps5CompositingUpdateStats().fullTraversalStarters.add(kindString, 0).iterator->value++;
++}
+ static void ps5NoteCompositingUpdate(MonotonicTime start)
+ {
+     static const bool enabled = !getenv("PS5WK_RENDER_LOG") || strcmp(getenv("PS5WK_RENDER_LOG"), "0");
+@@ -1118,6 +1177,17 @@ static void ps5NoteCompositingUpdate(MonotonicTime start)
+         return;
+     WTFLogAlways("[render] compositing: %u updates in %.1f s, %.1f ms avg, %.1f max (%u with a requirements traversal, %u with a backing/hierarchy update)", // NOLINT
+         stats.updates, (now - stats.windowStart).seconds(), stats.milliseconds / stats.updates, stats.maxMilliseconds, stats.requirementTraversals, stats.hierarchyUpdates);
++    if (stats.requirementTraversals) {
++        Vector<std::pair<String, unsigned>> starters;
++        for (auto& entry : stats.fullTraversalStarters)
++            starters.append({ entry.key, entry.value });
++        std::sort(starters.begin(), starters.end(), [](auto& a, auto& b) { return a.second > b.second; });
++        StringBuilder list;
++        for (size_t i = 0; i < starters.size() && i < 6; ++i)
++            list.append(i ? ", "_s : ""_s, starters[i].first, ' ', starters[i].second);
++        WTFLogAlways("[render] compositing requirements per traversal: %.0f layers on the full path, %.0f unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): %s", // NOLINT
++            static_cast<double>(stats.fullLayers) / stats.requirementTraversals, static_cast<double>(stats.unchangedLayers) / stats.requirementTraversals, list.toString().utf8().data());
++    }
+     stats = { };
+     stats.windowStart = now;
+ }
+@@ -1394,6 +1464,11 @@ void RenderLayerCompositor::computeCompositingRequirements(RenderLayer* ancestor
+ 
+     LOG_WITH_STREAM(Compositing, stream << TextStream::Repeat(treeDepth * 2, ' ') << &layer << " computeCompositingRequirements (backing provider candidates " << backingSharingState.backingProviderCandidates() << ")");
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    ps5CompositingUpdateStats().fullLayers++;
++    if (!compositingState.fullPaintOrderTraversalRequired && layer.needsCompositingRequirementsTraversal())
++        ps5NoteFullTraversalStarter(layer, "self"_s);
++#endif
+     // FIXME: maybe we can avoid updating all remaining layers in paint order.
+     compositingState.fullPaintOrderTraversalRequired |= layer.needsCompositingRequirementsTraversal();
+     compositingState.descendantsRequireCompositingUpdate |= layer.descendantsNeedCompositingRequirementsTraversal();
+@@ -1410,6 +1485,10 @@ void RenderLayerCompositor::computeCompositingRequirements(RenderLayer* ancestor
+         willBeComposited = needsToBeComposited(layer, queryData);
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (!compositingState.fullPaintOrderTraversalRequired && layer.subsequentLayersNeedCompositingRequirementsTraversal())
++        ps5NoteFullTraversalStarter(layer, "later"_s);
++#endif
+     compositingState.fullPaintOrderTraversalRequired |= layer.subsequentLayersNeedCompositingRequirementsTraversal();
+ 
+     OverlapExtent layerExtent;
+@@ -1697,6 +1776,9 @@ void RenderLayerCompositor::traverseUnchangedSubtree(RenderLayer* ancestorLayer,
+     ASSERT(!layer.needsCompositingRequirementsTraversal());
+ 
+     LOG_WITH_STREAM(Compositing, stream << TextStream::Repeat(treeDepth * 2, ' ') << &layer << (layer.isNormalFlowOnly() ? " n" : " s") << " traverseUnchangedSubtree");
++#if defined(PS5_PAYLOAD_SDK)
++    ps5CompositingUpdateStats().unchangedLayers++;
++#endif
+ 
+     bool layerIsComposited = layer.isComposited();
+     bool layerPaintsIntoProvidedBacking = false;
+diff --git a/Source/WebCore/style/RuleSet.h b/Source/WebCore/style/RuleSet.h
+index 0d957926bf..24da00738e 100644
+--- a/Source/WebCore/style/RuleSet.h
++++ b/Source/WebCore/style/RuleSet.h
+@@ -137,6 +137,11 @@ public:
+     unsigned ruleCount() const { return m_ruleCount; }
+ 
+     bool hasAttributeRules() const { return !m_attributeLocalNameRules.isEmpty(); }
++#if defined(PS5_PAYLOAD_SDK)
++    bool ps5HasIdRules() const { return !m_idRules.isEmpty(); }
++    bool ps5HasClassRules() const { return !m_classRules.isEmpty(); }
++    bool ps5HasTagRules() const { return !m_tagLocalNameRules.isEmpty() || !m_tagLowercaseLocalNameRules.isEmpty(); }
++#endif
+     bool hasUserAgentPartRules() const { return !m_userAgentPartRules.isEmpty(); }
+     bool hasHostPseudoClassRulesMatchingInShadowTree() const { return m_hasHostPseudoClassRulesMatchingInShadowTree; }
+     bool hasRulesMatchingShadowHost() const { return !m_hostPseudoClassRules.isEmpty() || !m_shadowHostRulesInUniversalBucket.isEmpty(); }
+diff --git a/Source/WebCore/style/StyleInvalidator.cpp b/Source/WebCore/style/StyleInvalidator.cpp
+index 24c57f065e..d275bbd024 100644
+--- a/Source/WebCore/style/StyleInvalidator.cpp
++++ b/Source/WebCore/style/StyleInvalidator.cpp
+@@ -30,7 +30,9 @@
+ #include "ElementChildIteratorInlines.h"
+ #include "ElementRareData.h"
+ #include "ElementRuleCollector.h"
++#include "ElementTraversal.h"
+ #include "HTMLSlotElement.h"
++#include "Page.h"
+ #include "RuleSetBuilder.h"
+ #include "SelectorChecker.h"
+ #include "SelectorMatchingState.h"
+@@ -110,8 +112,110 @@ Invalidator::Invalidator(const InvalidationRuleSetVector& ruleSets)
+     , m_ruleInformation(collectRuleInformation())
+ {
+     ASSERT(m_ruleSets.size());
++#if defined(PS5_PAYLOAD_SDK)
++    // Keyed rule sets (PS5): an attribute or class change on a container
++    // with rules like "[attr] .item" walks the container's whole subtree,
++    // and each element built an ElementRuleCollector (a MatchResult
++    // allocation) and looked itself up in the rule set's buckets, which
++    // for nearly every element of a long feed finds nothing (18 % of the
++    // main thread while scrolling such a feed: the page toggles an attribute
++    // on the feed's container in its animation frames). When every rule of
++    // a set is in an id, class, attribute or tag bucket, the same lookups
++    // are done first without the collector; only an element with a hit
++    // goes through ElementRuleCollector (and gets the selector filter, see
++    // invalidateStyleForDescendants). PS5WK_STYLE_INVALIDATION_PREFILTER=0
++    // (child.env): old behaviour.
++    static const bool enabled = !getenv("PS5WK_STYLE_INVALIDATION_PREFILTER") || strcmp(getenv("PS5WK_STYLE_INVALIDATION_PREFILTER"), "0");
++    if (!enabled)
++        return;
++    m_ps5Prefilter = true;
++    for (auto& entry : m_ruleSets) {
++        auto& ruleSet = *entry.ruleSet;
++        bool keyedOnly = ruleSet.linkPseudoClassRules().isEmpty()
++            && ruleSet.focusPseudoClassRules().isEmpty()
++            && ruleSet.focusVisiblePseudoClassRules().isEmpty()
++            && ruleSet.fullscreenPseudoClassRules().isEmpty()
++            && ruleSet.rootElementRules().isEmpty()
++            && ruleSet.universalRules().isEmpty()
++            && ruleSet.universalPseudoElementRules().isEmpty()
++            && !ruleSet.universalPseudoElementTypes()
++            && !ruleSet.universalHTMLPseudoElementTypes()
++            && !ruleSet.hasUserAgentPartRules();
++        m_ps5KeyedOnly.append(keyedOnly);
++        m_ps5Buckets.append({ ruleSet.ps5HasIdRules(), ruleSet.ps5HasClassRules(), ruleSet.ps5HasTagRules(), ruleSet.hasAttributeRules() });
++        if (!keyedOnly)
++            m_ps5Prefilter = false;
++    }
++#endif
++}
++
++#if defined(PS5_PAYLOAD_SDK)
++// The lookups of ElementRuleCollector::collectMatchingRules for a keyed-only
++// rule set: false means that it collects nothing for this element (and
++// matchesAnyAuthorRules() is false), true that it may.
++bool Invalidator::ps5MayMatch(const Element& element) const
++{
++    bool isCaseInsensitiveForHTML = element.isHTMLElement() && element.document().isHTMLDocument();
++    bool hasClass = element.hasClass();
++    bool hasAttributes = element.hasAttributesWithoutUpdate();
++    for (size_t i = 0; i < m_ruleSets.size(); ++i) {
++        auto& ruleSet = *m_ruleSets[i].ruleSet;
++        auto& buckets = m_ps5Buckets[i];
++        if (buckets.tag && ruleSet.tagRules(element.localName(), isCaseInsensitiveForHTML))
++            return true;
++        if (buckets.id) {
++            auto& id = element.idForStyleResolution();
++            if (!id.isNull() && ruleSet.idRules(id))
++                return true;
++        }
++        if (hasClass && buckets.classes) {
++            for (auto& className : element.classNames()) {
++                if (ruleSet.classRules(className))
++                    return true;
++            }
++        }
++        if (hasAttributes && buckets.attributes) {
++            for (auto& attribute : element.attributes()) {
++                if (ruleSet.attributeRules(attribute.localName(), isCaseInsensitiveForHTML))
++                    return true;
++            }
++        }
++    }
++    return false;
++}
++
++struct PS5StyleInvalidationStats {
++    uint64_t walks { 0 }, elements { 0 }, prefiltered { 0 }, collected { 0 }, invalidated { 0 };
++    // Walks of a root with the same rule sets as an earlier walk in the same
++    // rendering update (diagnostic: how much deferring and merging would save).
++    uint64_t repeatedWalks { 0 }, repeatedElements { 0 };
++};
++static PS5StyleInvalidationStats& ps5StyleInvalidationStats()
++{
++    static PS5StyleInvalidationStats stats;
++    return stats;
++}
++
++// For the drawing area's [render] lines (DrawingAreaWC.cpp): descendant
++// invalidation walks, elements visited, elements the key prefilter
++// answered, elements matched with a collector, elements invalidated.
++void ps5StyleInvalidationRepeats(uint64_t& walks, uint64_t& elements)
++{
++    walks = ps5StyleInvalidationStats().repeatedWalks;
++    elements = ps5StyleInvalidationStats().repeatedElements;
+ }
+ 
++void ps5StyleInvalidationCounts(uint64_t& walks, uint64_t& elements, uint64_t& prefiltered, uint64_t& collected, uint64_t& invalidated)
++{
++    auto& stats = ps5StyleInvalidationStats();
++    walks = stats.walks;
++    elements = stats.elements;
++    prefiltered = stats.prefiltered;
++    collected = stats.collected;
++    invalidated = stats.invalidated;
++}
++#endif
++
+ Invalidator::~Invalidator() = default;
+ 
+ Invalidator::RuleInformation Invalidator::collectRuleInformation()
+@@ -162,6 +266,10 @@ static void invalidateAssignedElements(HTMLSlotElement& slot)
+ 
+ Invalidator::CheckDescendants Invalidator::invalidateIfNeeded(Element& element, SelectorMatchingState* selectorMatchingState)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // Taken before anything else: invalidating a shadow tree comes back here.
++    int8_t hint = std::exchange(m_ps5MayMatchHint, -1);
++#endif
+     ++m_elementTraversalCount;
+     invalidateInShadowTreeIfNeeded(element);
+ 
+@@ -174,12 +282,32 @@ Invalidator::CheckDescendants Invalidator::invalidateIfNeeded(Element& element,
+     case Validity::Valid:
+     case Validity::AnimationInvalid:
+     case Validity::InlineStyleInvalid: {
++#if defined(PS5_PAYLOAD_SDK)
++        auto& stats = ps5StyleInvalidationStats();
++        stats.elements++;
++        if (m_ps5Prefilter && !(hint >= 0 ? hint : ps5MayMatch(element))) {
++            // Nothing collected: matches is false for every rule set.
++            stats.prefiltered++;
++            for (auto& ruleSet : m_ruleSets) {
++                if (ruleSet.isNegation == IsNegation::Yes) {
++                    element.invalidateStyle();
++                    stats.invalidated++;
++                    break;
++                }
++            }
++            return CheckDescendants::Yes;
++        }
++        stats.collected++;
++#endif
+         for (auto& ruleSet : m_ruleSets) {
+             ElementRuleCollector ruleCollector(element, *ruleSet.ruleSet, selectorMatchingState, SelectorChecker::Mode::StyleInvalidation);
+ 
+             auto matches = ruleCollector.matchesAnyAuthorRules();
+             if (ruleSet.isNegation == IsNegation::No ? matches : !matches) {
+                 element.invalidateStyle();
++#if defined(PS5_PAYLOAD_SDK)
++                stats.invalidated++;
++#endif
+                 break;
+             }
+         }
+@@ -204,6 +332,12 @@ void Invalidator::invalidateStyleForTree(Element& root, SelectorMatchingState* s
+ 
+ void Invalidator::invalidateStyleForDescendants(Element& root, SelectorMatchingState* selectorMatchingState)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_ps5Prefilter && selectorMatchingState) {
++        ps5InvalidateStyleForDescendants(root, *selectorMatchingState);
++        return;
++    }
++#endif
+     Vector<Element*, 20> parentStack;
+     RefPtr previousElement = &root;
+     for (auto it = descendantsOfType<Element>(root).begin(); it; ) {
+@@ -231,6 +365,80 @@ void Invalidator::invalidateStyleForDescendants(Element& root, SelectorMatchingS
+     }
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// invalidateStyleForDescendants with the key prefilter: the selector filter
++// (the ancestors' identifier hashes, 15 % of the walk when every parent was
++// pushed and popped) only matters to an element that is matched with a
++// collector, so the parents are pushed into it only when such an element is
++// reached (the ones not pushed yet, in order) and popped when the walk leaves
++// them. A matched element sees the same filter as before.
++void Invalidator::ps5InvalidateStyleForDescendants(Element& root, SelectorMatchingState& selectorMatchingState)
++{
++    auto& filter = selectorMatchingState.selectorFilter;
++    Vector<Element*, 20> parentStack;
++    size_t pushed = 0;
++    Element* previousElement = &root;
++    auto& stats = ps5StyleInvalidationStats();
++    stats.walks++;
++    static HashSet<std::pair<uintptr_t, uintptr_t>> seen;
++    static MonotonicTime seenUpdate;
++    bool repeated = false;
++    if (RefPtr page = root.document().page()) {
++        if (page->lastRenderingUpdateTimestamp() != seenUpdate) {
++            seenUpdate = page->lastRenderingUpdateTimestamp();
++            seen.clear();
++        }
++        repeated = !seen.add({ reinterpret_cast<uintptr_t>(&root), reinterpret_cast<uintptr_t>(m_ruleSets[0].ruleSet.get()) * 31 + m_ruleSets.size() }).isNewEntry;
++        if (repeated)
++            stats.repeatedWalks++;
++    }
++    uint64_t elementsBefore = stats.elements;
++    // Raw pointers: nothing here runs script or changes the tree (reference
++    // counting each element of a long feed was a write to each one).
++    for (Element* descendant = ElementTraversal::firstWithin(root); descendant; ) {
++        Element* parent = descendant->parentElement();
++        if (parentStack.isEmpty() || parentStack.last() != parent) {
++            if (parent == previousElement)
++                parentStack.append(parent);
++            else {
++                while (parentStack.last() != parent) {
++                    parentStack.removeLast();
++                    if (pushed > parentStack.size()) {
++                        filter.popParent();
++                        pushed--;
++                    }
++                }
++            }
++        }
++        previousElement = descendant;
++
++        bool needsFilter = false;
++        switch (descendant->styleValidity()) {
++        case Validity::Valid:
++        case Validity::AnimationInvalid:
++        case Validity::InlineStyleInvalid:
++            needsFilter = ps5MayMatch(*descendant);
++            break;
++        case Validity::ElementInvalid:
++        case Validity::SubtreeInvalid:
++            break;
++        }
++        if (needsFilter) {
++            for (; pushed < parentStack.size(); ++pushed)
++                filter.pushParentInitializingIfNeeded(*parentStack[pushed]);
++        }
++        m_ps5MayMatchHint = needsFilter;
++
++        if (invalidateIfNeeded(*descendant, needsFilter ? &selectorMatchingState : nullptr) == CheckDescendants::Yes)
++            descendant = ElementTraversal::next(*descendant, &root);
++        else
++            descendant = ElementTraversal::nextSkippingChildren(*descendant, &root);
++    }
++    if (repeated)
++        stats.repeatedElements += stats.elements - elementsBefore;
++}
++#endif
++
+ void Invalidator::invalidateStyle(Document& document)
+ {
+     ASSERT(!m_dirtiesAllStyle);
+diff --git a/Source/WebCore/style/StyleInvalidator.h b/Source/WebCore/style/StyleInvalidator.h
+index a2cff98be2..75ba1437b4 100644
+--- a/Source/WebCore/style/StyleInvalidator.h
++++ b/Source/WebCore/style/StyleInvalidator.h
+@@ -76,6 +76,9 @@ private:
+     CheckDescendants invalidateIfNeeded(Element&, SelectorMatchingState*);
+     void invalidateStyleForTree(Element&, SelectorMatchingState*);
+     void invalidateStyleForDescendants(Element&, SelectorMatchingState*);
++#if defined(PS5_PAYLOAD_SDK)
++    void ps5InvalidateStyleForDescendants(Element&, SelectorMatchingState&);
++#endif
+     void invalidateInShadowTreeIfNeeded(Element&);
+     void invalidateUserAgentParts(ShadowRoot&);
+     void invalidateStyleWithMatchElement(Element&, MatchElement);
+@@ -89,6 +92,19 @@ private:
+         bool hasPartPseudoElementRules { false };
+     };
+     RuleInformation LEGACY_NODELETE collectRuleInformation();
++#if defined(PS5_PAYLOAD_SDK)
++    bool ps5MayMatch(const Element&) const;
++    // Per rule set: every rule sits in an id, class, attribute or tag bucket
++    // (nothing an element without those keys could match).
++    Vector<bool, 4> m_ps5KeyedOnly;
++    // Which buckets of each rule set have rules (the others aren't looked up).
++    struct PS5Buckets { bool id { false }, classes { false }, tag { false }, attributes { false }; };
++    Vector<PS5Buckets, 4> m_ps5Buckets;
++    bool m_ps5Prefilter { false };
++    // Set by ps5InvalidateStyleForDescendants for the next invalidateIfNeeded:
++    // ps5MayMatch's answer for that element (-1: not known).
++    int8_t m_ps5MayMatchHint { -1 };
++#endif
+ 
+     const RefPtr<RuleSet> m_ownedRuleSet;
+     const InvalidationRuleSetVector m_ruleSets;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index ab536dcf2f..3d54f6ac16 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -64,6 +64,11 @@
+ namespace WebCore {
+ double* ps5RenderingPhaseMS(); // Page.cpp
+ void ps5IntersectionObserverCounts(uint64_t& computed, uint64_t& skipped); // IntersectionObserver.cpp
++void ps5PaintCullCounts(uint64_t& tested, uint64_t& skipped, uint64_t& notLeaf, uint64_t& notEligible); // RenderLayer.cpp
++namespace Style {
++void ps5StyleInvalidationCounts(uint64_t& walks, uint64_t& elements, uint64_t& prefiltered, uint64_t& collected, uint64_t& invalidated); // StyleInvalidator.cpp
++void ps5StyleInvalidationRepeats(uint64_t& walks, uint64_t& elements);
++}
+ }
+ #endif
+ 
+@@ -107,6 +112,11 @@ struct WCRenderStats {
+     MonotonicTime windowStart;
+     WCFlushStats flushStart;
+     uint64_t ioComputedStart { 0 }, ioSkippedStart { 0 };
++    // Style::Invalidator's descendant walks (ps5StyleInvalidationCounts).
++    uint64_t invalidationStart[5] { };
++    uint64_t repeatStart[2] { };
++    // RenderLayer's paint cull (ps5PaintCullCounts).
++    uint64_t cullStart[4] { };
+     // WCTilePainter (deltas of wcTilePaintStats over the window).
+     WCTilePaintStats painterStart;
+     bool havePainterStart { false };
+@@ -164,6 +174,20 @@ struct WCRenderStats {
+                     phase[0] / count, phase[1] / count, phase[2] / count, phase[3] / count, phase[4] / count, phase[5] / count, phase[6] / count,
+                     static_cast<double>(ioComputed - ioComputedStart) / count, static_cast<double>(ioSkipped - ioSkippedStart) / count, phase[7] / count, std::max(0.0, phase[8] - named) / count);
+             }
++            {
++                uint64_t now[5];
++                Style::ps5StyleInvalidationCounts(now[0], now[1], now[2], now[3], now[4]);
++                uint64_t repeats[2];
++                Style::ps5StyleInvalidationRepeats(repeats[0], repeats[1]);
++                if (now[1] != invalidationStart[1]) {
++                    WTFLogAlways("[render] style invalidation (per update): %.1f descendant walks (%.1f repeating an earlier one of the update, %.0f elements), %.0f elements checked, %.0f answered by the key prefilter, %.0f matched with a collector, %.0f invalidated", // NOLINT
++                        static_cast<double>(now[0] - invalidationStart[0]) / count, static_cast<double>(repeats[0] - repeatStart[0]) / count, static_cast<double>(repeats[1] - repeatStart[1]) / count,
++                        static_cast<double>(now[1] - invalidationStart[1]) / count, static_cast<double>(now[2] - invalidationStart[2]) / count,
++                        static_cast<double>(now[3] - invalidationStart[3]) / count, static_cast<double>(now[4] - invalidationStart[4]) / count);
++                }
++                repeatStart[0] = repeats[0];
++                repeatStart[1] = repeats[1];
++            }
+             if (scrollUpdates)
+                 WTFLogAlways("[render] wc scroll: %u title scroll updates (%.1f/s), %u fired the refresh at once (nothing in flight); applying them %.2f ms avg, %.1f max", scrollUpdates, scrollUpdates / seconds, scrollFires, scrollApplyMS / scrollUpdates, scrollApplyMaxMS); // NOLINT
+             auto& flush = wcFlushStats();
+@@ -172,6 +196,14 @@ struct WCRenderStats {
+                     static_cast<double>(flush.layersVisited - flushStart.layersVisited) / flushes, static_cast<double>(flush.layersSkipped - flushStart.layersSkipped) / flushes,
+                     static_cast<double>(flush.layersChanged - flushStart.layersChanged) / flushes);
+             }
++            {
++                uint64_t cull[4];
++                ps5PaintCullCounts(cull[0], cull[1], cull[2], cull[3]);
++                if (cull[0] != cullStart[0]) {
++                    WTFLogAlways("[render] paint cull (per update): %.0f layers painted into tiles, %.0f skipped outside the dirty rect, %.0f with self-painting descendants, %.0f not eligible", // NOLINT
++                        static_cast<double>(cull[0] - cullStart[0]) / count, static_cast<double>(cull[1] - cullStart[1]) / count, static_cast<double>(cull[2] - cullStart[2]) / count, static_cast<double>(cull[3] - cullStart[3]) / count);
++                }
++            }
+             auto& now = wcTilePaintStats();
+             WTFLogAlways("[render] wc tiles: record %.1f ms/s (%.2f Mpx/s), raster %.1f ms/s wall (%.2f Mpx/s, %u items, %u async), shm allocations %.1f/s, old way %u", // NOLINT
+                 (now.recordMS - painterStart.recordMS) / seconds, (now.recordedPixels - painterStart.recordedPixels) / 1e6 / seconds,
+@@ -182,6 +214,8 @@ struct WCRenderStats {
+         flushStart = wcFlushStats();
+         std::fill_n(ps5RenderingPhaseMS(), 9, 0.0);
+         ps5IntersectionObserverCounts(ioComputedStart, ioSkippedStart);
++        Style::ps5StyleInvalidationCounts(invalidationStart[0], invalidationStart[1], invalidationStart[2], invalidationStart[3], invalidationStart[4]);
++        ps5PaintCullCounts(cullStart[0], cullStart[1], cullStart[2], cullStart[3]);
+         totalMS.shrink(0);
+         paintMS.shrink(0);
+         updateMS = megapixels = frameDoneMS = 0;

@@ -3052,3 +3052,154 @@ stick at the end should no longer stall the page (`events the root couldn't
 take: N sent` stays small), and `[render] wc phases` says where each
 update's time goes. To compare with the old behaviour: the child.env lines
 and `wc-async-scroll` words above.
+
+## Feeds that slow down as they grow (2026-11-03, patch 0074)
+
+Owner: "YouTube still gets a bit laggy after scrolling a bit". Scrolling
+starts at 60 fps and degrades once hundreds of items have been appended.
+
+### What grows with the feed
+
+Log-only runs on the console: results feed, `pad-scroll-test delay=30
+secs=8 ry=0.6 upry=0 pause=2`, 215 s. The 5 s windows while scrolling,
+build 20261103-082216 (0073):
+
+| composited layers (~items) | WebProcess updates/s | ms per update | moving frames/s | painted-edge clamps per 5 s |
+| --- | --- | --- | --- | --- |
+| 100-300 (~100-250) | 18.8 | 29 | 44 | 0.3 |
+| 300-450 | 13.8 | 50 | 37 | 28 |
+| 450-600 (~400-600) | 7.5 | 90 | 24 | 42 |
+
+The title side stays flat: scene paint 3.6-4.6 ms, update apply < 1 ms,
+GL textures 80-105 MB. The title keeps scrolling on its own tiles, but
+with 5-7 WebProcess updates/s it runs into the painted edge. So the cost is
+in the WebProcess. A main-thread profile of the late part of the run
+(`PS5WK_PROFILE=1`, ~550 items, inclusive):
+
+| what | share of the main thread | grows with |
+| --- | --- | --- |
+| tile painting (`WCTilePainter::paintLayer`); ~75 % of it per-layer overhead: `collectFragments`, clip rects, the canvas recorder lookup and font quantization, for every entry of a z-order list on every painted rect, before the bounds test | 20 % | render layers |
+| descendant style invalidation: the page sets/removes an attribute on the feed's container in its rAF and IO callbacks; rules like `[attr] .x` walk the whole feed, an `ElementRuleCollector` per element (`collectMatchingRules` finds nothing for >99 %) | 18 % | elements |
+| `computeCompositingRequirements`: a full paint-order traversal of 7000-10000 render layers in almost every update | 12 % | render layers |
+| intersection observers (~8800 targets per update, ~5500 computed: most have no renderer) | 9 % | targets |
+| post-layout hover update every 200 ms while scrolling: a hit test of every layer, then mouseout/mouseover on a new item (hover previews start) | 5 % | render layers |
+| layout, layer positions, z-order rebuild; the page's own script | the rest | |
+
+The earlier candidates "layer tree flush / WC update size" and "GL texture or
+tile churn in the title" didn't grow. The flush walks ~300 composited layers
+at 550 items; its cost was the tile recording above.
+
+### Fixes (patch 0074)
+
+- **Style invalidation key prefilter** (`StyleInvalidator`): when every rule
+  of the invalidation rule set sits in an id, class, attribute or tag bucket
+  (no universal, link, focus, root or pseudo-element rules), an element is
+  first looked up in those buckets (only the non-empty ones). Only an element
+  with a hit is matched with an `ElementRuleCollector`, and that is also the
+  only point where the selector filter gets its ancestors (lazily). The walk
+  uses raw-pointer traversal. The same elements are invalidated
+  (negation rule sets included). On the feed, 2-105k elements are checked per
+  update and >99.8 % are answered by the prefilter.
+  `PS5WK_STYLE_INVALIDATION_PREFILTER=0` = old.
+- **Leaf layers outside the dirty rect** (`RenderLayer::paintLayer`): a layer
+  is skipped before `paintLayerContents` when it paints only its own renderer
+  and its bounding box (visual overflow, +4 px) misses the dirty rect. "Only
+  its own renderer" means no self-painting descendants, or, for a non-stacking
+  context, none in its normal-flow list. It must also have no transform,
+  filter, backdrop filter, reflection or fragmentation, be a RenderBox and not
+  SVG or a table row, and be painted ordinarily (no event or accessibility
+  region, overlay scrollbars, flattening, snapshot or overlap test). This is
+  the box upstream's own `intersectsDamageRect` tests. The answer and bounds
+  are kept for the rendering update (keyed on its timestamp and the layout and
+  layer-position counters), since each painted rect walks the whole list
+  again. On the feed ~64 % of the layer visits are skipped; on
+  `feedlayers.html` 370k of 370k. `PS5WK_PAINT_CULL=0` = old.
+- **Hover after scrolling** (`EventHandler`): while the fake mouse move is
+  pending (restarted by every scroll step), the post-layout update of the
+  element under the mouse is left to it, so it runs once when scrolling
+  pauses. `PS5WK_HOVER_AFTER_SCROLL=0` = old.
+- **Intersection observer loop**: targets are visited in place (no vector of
+  Refs). The document's activity and origin are looked up once per document.
+  A target without a renderer whose last state was "not intersecting" isn't
+  recomputed (it gives the same answer). Targets computed per update dropped
+  from ~5500 to 600-1900.
+- **Backing sharing**: the containing block chain is walked once per layer
+  for all provider candidates (it was walked again for each one).
+- **Logs**:
+  - `[render] style invalidation (per update)`: walks (and how many repeat an
+    earlier walk of the update), elements checked, prefiltered, matched,
+    invalidated.
+  - `[render] paint cull (per update)`: layers tested, skipped, with
+    self-painting descendants, not eligible.
+  - `[render] compositing requirements per traversal`: layers on the full
+    path vs unchanged, and which layers' dirty bits (C paint order children,
+    P post-layout, D descendants, S later layers) started full traversals.
+- **Test page**: `feedlayers.html` `t=attr` flips an attribute on the feed's
+  container in every animation frame while scrolling, with rules that depend
+  on it (one invalidation walk per frame).
+
+Tried and dropped: dropping `NeedsPaintOrderChildrenUpdate` when the rebuilt
+z-order lists equal the ones the last traversal saw. On the feed the
+container's stacking context also had P and D set in the same updates, so it
+applied about once per 5 s.
+
+### Measured (log-only PPSA99020, 2026-11-03)
+
+Results feed, same pad pattern, windows at 450-600 composited layers
+(~400-600 items):
+
+| | WebProcess updates/s | ms per update | rAF | IO | flush incl. tile recording | moving frames/s | clamps per 5 s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| before (0073) | 7.5 | 90 | 26 | 9.6 | 33 | 24 | 42 |
+| 0074, knobs off (IO loop and backing chain still new) | 8.2 | 83 | 23 | 7.8 | 24 | 26 | 37 |
+| 0074 (three runs) | 10.4-13.5 | 68-73 | 22-24 | 6-8 | 18-22 | 27-34 | 21-30 |
+
+The site makes single runs noisy (±30 %: hover previews, what it appends),
+so the profiles are the firmer comparison. Shares of the main thread in the
+late window, before and after:
+- descendant invalidation: 17.9 % → 10.7 %, of which `collectMatchingRules`
+  6.2 % → 0.4 %;
+- hover update after layout: 5.3 % → 1.7 %;
+- IO update loop: 8.0 % → 6.7 %;
+- the main thread's total CPU in that window: 0.80 → 0.63 cores.
+
+`feedlayers.html?n=100&add=60&t=menu,ripple,io,wheel,attr,sticky` (few
+composited layers, many render layers), the stick held for 110 s, knobs off
+→ on:
+
+| items | updates/s | ms per update | moving frames/s |
+| --- | --- | --- | --- |
+| 300 | 10.8 → 23.2 | 82 → 32 | 60 → 59 |
+| 600 | 5.7 → 12.4 | 165 → 69 | 60 → 60 |
+| 900 | 4.6 → 7.7 | 214 → 117 | 38 → 60 |
+| 1200 | 5.4 → 6.4 | 195 → 134 | 29 → 60 |
+
+The flush at 940 items went from 188 to 62 ms. What still grows there is
+real style recalc (the test's rules invalidate ~4500 elements per flip) and
+the full compositing traversal.
+
+**What is left.** The cost is still O(feed) in places:
+- `computeCompositingRequirements` takes the full path for every layer after
+  the feed container in paint order in almost every update (~15 % of the
+  main thread at 550 items). The container's stacking context gets C, P and
+  D in the same updates: layers made and dropped by the page's script; with
+  a video layer on the page (hover previews) every layer add/remove sets D
+  on its parent, an upstream rule for content layers.
+- layout with the layer position and z-order rebuild;
+- the invalidation walk itself (each element still visited);
+- the page's script.
+
+Next: a cheaper full path for layers whose own direct reasons can't have
+changed (needs care: position and overflow reasons depend on layout).
+
+Skeleton rows at the end of the feed (the owner's question): during the run
+the feed's `ytd-continuation-item-renderer` held only a
+`tp-yt-paper-spinner`, with no ghost/skeleton cards in the DOM. The site
+serves us that continuation; nothing is hidden or left unpainted.
+
+**For the owner on the TV:** the same feeds. While scrolling far down, the
+log's `[render] wc:` updates/s should stay higher than before (10+ at ~500
+items instead of 5-7). `[render] paint cull` should show most layers skipped,
+and `[render] style invalidation` should show nearly all elements answered by
+the prefilter. To compare with the old behaviour, use the three child.env
+lines above.
