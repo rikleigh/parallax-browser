@@ -39,7 +39,13 @@ default it asks for no password.
 
 - **A phone or any browser:** open `http://192.168.1.50:9040/`, type or
   paste an address (or search words), and press *Open on PS5*. The page also
-  shows the address the PS5 is on now.
+  shows the address the PS5 is on now. **On the TV**, the start page and
+  Settings show a *Send from your phone* card: a QR code of this address
+  (the PS5's address now) for the phone's camera, and the address as text.
+  With the link server set to this PS5 only (`push-off`) the card says so
+  instead; without a network address, that. The pages (this one, the
+  bookmarklet's pop-up and Settings from another device) are in Parallax's
+  palette, a light variant when the device is in light mode, with the logo.
 - **Bookmarklet (Safari, Chrome, Firefox on the Mac):** the same page has a
   *Send to PS5* link. Drag it to the bookmarks bar, then click it on any page.
   It opens a small pop-up at
@@ -113,6 +119,17 @@ default it asks for no password.
   the server listens on 127.0.0.1 only, so nothing on the LAN reaches it but
   the in-app Settings still work (see *Settings*). Both files are read at
   startup.
+- **The QR code:** `GET /link.json` (from the PS5 itself only; CORS, for
+  the start page, a `file:` page) answers `{"localOnly", "pin", "url",
+  "qr"}`: `url` is `http://<address>:9040/`, the address the PS5 has now
+  (the source address of a route out, from a UDP socket connected to a
+  public address, which sends nothing; else the address the last LAN
+  request came to), `qr` the code's rows as `"0"`/`"1"` strings; no `url`
+  with push-off or without an address. `apps/title/qrcode.c` encodes it
+  (byte mode, level M, versions 1-10, the mask with the lowest penalty;
+  checked against macOS's Vision decoder for every version). The PIN is
+  never in the code: the page asks for it. `GET /logo.png` serves the
+  logo (`/app0/ui/parallax-logo.png`, from the title package).
 - The port is fixed at 9040. The other ports in use are elfldr 9021, the
   launcher 9031, ftpsrv 2121 and the Mac's log server 9999.
 - **Checked on the console** (2026-10-29, log only, no TV): with the browser
@@ -346,7 +363,8 @@ words to search for (DuckDuckGo Lite, as before).
 
 The bar: Back, Forward, Reload (Stop while loading), Home, the address
 field (the page's title and address), the tab count, Bookmark (☆ adds the
-page shown, ★ removes it) and New tab (the home page). History has *Clear
+page shown, ★ removes it), New tab (the home page) and Settings (⚙, as
+R3). History has *Clear
 all history* at the top (X twice). While a page loads (menu closed), the bar
 shows at the top with the page's title, address and a progress line, and
 goes 1.5 s after the load ends; the pad still drives the page.
@@ -450,7 +468,8 @@ and renamed over the old one; no sync, no telemetry):
 | `start-data.js` | `window.ps5wkData = {bookmarks, top}`: the start page's *Bookmarks* and *Most visited* (pages visited at least twice). A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
 
 The start page (`runtime/start.html`, still the home page and what a new
-tab opens) has the Parallax logo and wordmark, a field for an address or
+tab opens) has the Parallax logo and wordmark, the *Send from your phone*
+card and a Settings tile at the top right, a field for an address or
 words to search for (as the bar's: an address with a dot and no spaces,
 else DuckDuckGo Lite), then tiles for the bookmarks, the most visited pages
 and the links, and the test pages as smaller pills. The D-pad moves between

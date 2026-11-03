@@ -30,6 +30,7 @@
 #include "common/title.h"
 #include "adblock.h"
 #include "browser.h"
+#include "qrcode.h"
 #include "settings.h"
 #include "viewinvr.h"
 
@@ -719,6 +720,11 @@ static int fileExists(const char* path);
  *       /data/ps5webkit/push-cookie-key.txt: a key the X-PS5-Key header must match
  *   GET /settings, GET /settings.json, POST /settings, POST /restart,
  *       POST /clear  the settings page and its API (settingsServe below)
+ *   GET /link.json  (the PS5 itself only) this server's address on the LAN
+ *       now, for the start page's and Settings' QR code: {"localOnly",
+ *       "pin", "url", "qr": rows of "0"/"1"}; no url without an address or
+ *       with push-off
+ *   GET /logo.png   Parallax's logo (/app0/ui), for these pages
  * The control socket takes "open <url>" too. Bare hosts get https://, other
  * words a search; only http, https and file:///data/ps5webkit/ URLs load.
  * Loading a page also leaves View in VR (onLoadChanged).
@@ -1014,17 +1020,100 @@ static void pushReply(int client, int status, const char* type, const char* body
     pushReplyCORS(client, status, type, body, TRUE);
 }
 
+/* Sends a file's bytes (the logo). */
+static void pushReplyBytes(int client, const char* type, const char* data, size_t length)
+{
+    char* head = g_strdup_printf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Cache-Control: max-age=3600\r\nConnection: close\r\n\r\n", type, length);
+    send(client, head, strlen(head), 0);
+    for (size_t sent = 0; sent < length;) {
+        ssize_t n = send(client, data + sent, length - sent, 0);
+        if (n <= 0)
+            break;
+        sent += (size_t)n;
+    }
+    g_free(head);
+}
+
+/* This PS5's address on the LAN: the source address of a route out (a
+ * UDP socket connected to a public address sends nothing), else the
+ * address the last LAN request came to. Push thread. */
+static char pushLastLocal[INET_ADDRSTRLEN];
+
+static gboolean lanAddress(char* out, size_t size)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_in to, local;
+        memset(&to, 0, sizeof to);
+        to.sin_family = AF_INET;
+        to.sin_port = htons(53);
+        to.sin_addr.s_addr = htonl(0x08080808);
+        socklen_t length = sizeof local;
+        gboolean ok = !connect(fd, (struct sockaddr*)&to, sizeof to) && !getsockname(fd, (struct sockaddr*)&local, &length)
+            && local.sin_addr.s_addr != htonl(INADDR_ANY) && local.sin_addr.s_addr != htonl(INADDR_LOOPBACK)
+            && inet_ntop(AF_INET, &local.sin_addr, out, (socklen_t)size);
+        close(fd);
+        if (ok)
+            return TRUE;
+    }
+    if (*pushLastLocal) {
+        g_strlcpy(out, pushLastLocal, size);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* What a phone needs to reach this server, with its QR code (see GET /link.json). */
+static char* linkJSON(void)
+{
+    GString* out = g_string_new(NULL);
+    g_string_append_printf(out, "{\"localOnly\":%s,\"pin\":%s", pushLocalOnly ? "true" : "false", pushPIN ? "true" : "false");
+    char ip[INET_ADDRSTRLEN];
+    if (!pushLocalOnly && lanAddress(ip, sizeof ip)) {
+        char url[64];
+        snprintf(url, sizeof url, "http://%s:%d/", ip, PS5WK_PUSH_PORT);
+        uint8_t modules[QR_MAX_SIZE * QR_MAX_SIZE];
+        int size = qr_encode(url, strlen(url), modules);
+        g_string_append_printf(out, ",\"url\":\"%s\",\"qr\":[", url);
+        for (int y = 0; y < size; y++) {
+            g_string_append(out, y ? ",\"" : "\"");
+            for (int x = 0; x < size; x++)
+                g_string_append_c(out, modules[y * size + x] ? '1' : '0');
+            g_string_append_c(out, '"');
+        }
+        g_string_append_c(out, ']');
+    }
+    g_string_append_c(out, '}');
+    return g_string_free(out, FALSE);
+}
+
+/* The link server's pages (phones and computers): Parallax's palette, a
+ * light variant by day, the dark one at night (the device's setting). */
 static const char pushPageStyle[] =
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<style>:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#15181d;--muted:#5d6672;--card:#fff;--line:#d5d9df;--accent:#0b5cd5}"
-    "@media(prefers-color-scheme:dark){:root{--bg:#07061f;--fg:#f4f2ff;--muted:#b9b5e0;--card:#110f35;--line:#2b2766;--accent:#8a4dff}}"
-    "body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.45 -apple-system,system-ui,sans-serif}"
-    "main{max-width:34rem;margin:0 auto;padding:24px 16px}h1{font-size:1.4rem;margin:0 0 16px}"
-    "form{display:flex;flex-direction:column;gap:10px}input{font:inherit;padding:12px;border:1px solid var(--line);"
-    "border-radius:10px;background:var(--card);color:var(--fg);min-width:0}button{font:inherit;font-weight:600;padding:12px;"
-    "border:0;border-radius:10px;background:var(--accent);color:#fff}p,li{color:var(--muted)}code{word-break:break-all}"
-    "a.bm{display:inline-block;padding:8px 14px;border:1px dashed var(--accent);border-radius:8px;color:var(--accent);"
-    "text-decoration:none;font-weight:600}#status{min-height:1.5em;color:var(--fg)}</style>";
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/logo.png\">"
+    "<style>:root{color-scheme:light dark;--bg:#f7f5ff;--fg:#14113d;--muted:#5a5584;--card:#fff;--line:#dcd6f7;--accent:#6d0efd;"
+    "--focus:#d10aa6;--glow:rgba(109,14,253,.12)}"
+    "@media(prefers-color-scheme:dark){:root{--bg:#07061f;--fg:#f4f2ff;--muted:#b9b5e0;--card:#110f35;--line:#2b2766;--accent:#a77bff;"
+    "--focus:#ff5cd6;--glow:rgba(109,14,253,.32)}}"
+    "*{box-sizing:border-box}"
+    "body{margin:0;min-height:100vh;color:var(--fg);font:17px/1.45 -apple-system,system-ui,\"Noto Sans\",sans-serif;"
+    "background:radial-gradient(520px 320px at 100% -6%,var(--glow),transparent 70%) no-repeat,var(--bg)}"
+    "main{max-width:34rem;margin:0 auto;padding:20px 16px 32px}"
+    ".brand{display:flex;align-items:center;gap:12px;margin:4px 0 22px}.brand img{width:48px;height:48px;margin:-4px}"
+    ".brand b{display:block;font-size:1.3rem;letter-spacing:-.01em;line-height:1.1}.brand span{color:var(--muted);font-size:.92rem}"
+    "h1{font-size:1.35rem;margin:0 0 14px}h2{font-size:1.02rem;margin:26px 0 6px}"
+    ".card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}"
+    "form{display:flex;flex-direction:column;gap:10px}input{font:inherit;padding:13px 14px;border:1px solid var(--line);"
+    "border-radius:12px;background:var(--bg);color:var(--fg);min-width:0}input:focus{outline:2px solid var(--focus);outline-offset:1px;border-color:transparent}"
+    "button{font:inherit;font-weight:700;padding:13px;border:0;border-radius:12px;color:#fff;cursor:pointer;"
+    "background:linear-gradient(90deg,#6d0efd,#a50ccf)}button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
+    "p,li{color:var(--muted)}code{word-break:break-all;color:var(--fg)}a{color:var(--accent)}"
+    "a.bm{display:inline-block;padding:9px 16px;border:1.5px dashed var(--accent);border-radius:999px;color:var(--accent);"
+    "text-decoration:none;font-weight:700}#status{color:var(--fg);margin:12px 0 0}#status:empty{display:none}</style>";
+
+static const char pushBrand[] =
+    "<div class=\"brand\"><img src=\"/logo.png\" alt=\"\" onerror=\"this.remove()\"><div><b>Parallax</b><span>Browser on your PS5</span></div></div>";
 
 /* The page with the text box; host: what the bookmarklet calls. */
 static char* pushIndexPage(const char* host, const char* pin)
@@ -1035,11 +1124,11 @@ static char* pushIndexPage(const char* host, const char* pin)
     char* bookmarklet = g_strdup_printf("javascript:(function(){var u='http://%s/open?url='+encodeURIComponent(location.href)%s;"
         "var w=window.open(u,'ps5open','width=420,height=260');if(!w)location.href=u;})()", host, pinPart);
     char* bookmarkletHTML = g_markup_escape_text(bookmarklet, -1);
-    char* page = g_strdup_printf("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Send to PS5</title>%s</head><body><main>"
-        "<h1>Send a link to the PS5</h1>"
+    char* page = g_strdup_printf("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Send to PS5</title>%s</head><body><main>%s"
+        "<div class=\"card\"><h1>Send a link to the PS5</h1>"
         "<form id=\"f\" method=\"post\" action=\"/open\">"
         "<input name=\"url\" id=\"url\" placeholder=\"Address or search\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" inputmode=\"url\" autofocus required>"
-        "%s<button>Open on PS5</button></form><p id=\"status\"></p>"
+        "%s<button>Open on PS5</button></form><p id=\"status\"></p></div>"
         "<p>Showing now: <code>%s</code></p>"
         "<h2>Bookmarklet</h2><p>Drag this to the bookmarks bar, then click it on any page to open that page on the PS5:</p>"
         "<p><a class=\"bm\" href=\"%s\">Send to PS5</a></p>"
@@ -1048,7 +1137,7 @@ static char* pushIndexPage(const char* host, const char* pin)
         "s.textContent='Sending…';fetch('/open',{method:'POST',headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(this))})"
         ".then(function(r){return r.json()}).then(function(j){s.textContent=j.ok?'Opening '+j.url:'Not sent: '+j.error})"
         ".catch(function(){s.textContent='The PS5 did not answer'})}</script></main></body></html>",
-        pushPageStyle, pushPIN ? "<input name=\"pin\" placeholder=\"PIN\" inputmode=\"numeric\" autocomplete=\"off\">" : "",
+        pushPageStyle, pushBrand, pushPIN ? "<input name=\"pin\" placeholder=\"PIN\" inputmode=\"numeric\" autocomplete=\"off\">" : "",
         shownHTML, bookmarkletHTML, host);
     g_free(shown);
     g_free(shownHTML);
@@ -1058,13 +1147,15 @@ static char* pushIndexPage(const char* host, const char* pin)
     return page;
 }
 
+/* The bookmarklet's pop-up (420x260) and the form's answer without script. */
 static char* pushResultPage(const char* uri, const char* error)
 {
     char* text = g_markup_escape_text(uri ? uri : error, -1);
-    char* page = g_strdup_printf("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>%s</title>%s</head><body><main>"
+    char* page = g_strdup_printf("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>%s</title>%s"
+        "<style>main{padding-top:16px}.brand{margin-bottom:12px}h1{margin-bottom:6px}</style></head><body><main>%s"
         "<h1>%s</h1><p><code>%s</code></p><p><a href=\"/\">Send another link</a></p>"
         "<script>if(%s&&window.opener)setTimeout(function(){window.close()},1200)</script></main></body></html>",
-        uri ? "Sent to PS5" : "Not sent", pushPageStyle, uri ? "Opening on the PS5" : "Not sent", text, uri ? "true" : "false");
+        uri ? "Sent to PS5" : "Not sent", pushPageStyle, pushBrand, uri ? "Opening on the PS5" : "Not sent", text, uri ? "true" : "false");
     g_free(text);
     return page;
 }
@@ -1319,9 +1410,12 @@ static char* settingsState(const char* message)
     /* The ad blocker's site buttons are for the page Settings was opened
      * from (R3), or the page shown (another device). */
     char* adblock = ps5wk_adblock_json(isSettingsURI(shown) ? back : shown);
-    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,%s%s%s%s",
-        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false",
+    /* For the "Send from your phone" card (on the PS5 only). */
+    char* link = linkJSON();
+    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,%s%s%s%s",
+        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link,
         message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock);
+    g_free(link);
     g_free(adblock);
     char* state = ps5wk_settings_json(extra);
     g_free(extra);
@@ -1607,6 +1701,20 @@ static void pushServe(int client, const char* from, gboolean loopback)
         pushReply(client, code, json && !html ? "application/json" : html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", reply);
         g_free(reply);
         g_free(uri);
+    } else if (!strcmp(path, "/link.json") && get && loopback) {
+        /* The start page (a file: page: CORS) and Settings on the PS5. */
+        char* reply = linkJSON();
+        pushReply(client, 200, "application/json", reply);
+        g_free(reply);
+    } else if (!strcmp(path, "/logo.png") && get) {
+        gchar* data = NULL;
+        gsize length = 0;
+        if (g_file_get_contents("/app0/ui/parallax-logo.png", &data, &length, NULL)
+            || g_file_get_contents("/data/ps5webkit/parallax-logo.png", &data, &length, NULL))
+            pushReplyBytes(client, "image/png", data, length);
+        else
+            pushReply(client, 404, "text/plain", "ERR no logo\n");
+        g_free(data);
     } else if ((!strcmp(path, "/") || !strcmp(path, "/index.html")) && get) {
         /* The bookmarklet calls the address this page was reached by. */
         gboolean hostOK = *host != 0;
@@ -1677,6 +1785,13 @@ static void* pushThread(void* unused)
         char ip[INET_ADDRSTRLEN];
         if (inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip))
             snprintf(from, sizeof from, "http %s", ip);
+        if (peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+            /* the address this request came to: this PS5's on the LAN */
+            struct sockaddr_in local;
+            socklen_t localLength = sizeof local;
+            if (!getsockname(client, (struct sockaddr*)&local, &localLength))
+                inet_ntop(AF_INET, &local.sin_addr, pushLastLocal, sizeof pushLastLocal);
+        }
         pushServe(client, from, peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
         close(client);
     }

@@ -171,9 +171,11 @@ sips -s format bmp "$HERE/sce_sys/pic0.png" --out "$W/pic0.bmp" >/dev/null
 "$BC7DDS" "$W/pic0.bmp" "$app/sce_sys/pic0.dds" 3
 "$BC7DDS" "$W/pic0.bmp" "$app/sce_sys/pic1.dds" 1
 # The logo for the browser's menu header (browserdraw.c reads /app0/ui):
-# made from icon0.png by brand-assets.py.
+# made from icon0.png by brand-assets.py; and for the link server's pages
+# (GET /logo.png).
 mkdir -p "$app/ui"
 python3 "$HERE/brand-assets.py" mark 48 "$app/ui/parallax-mark.bgra"
+cp "$PORT/runtime/parallax-logo.png" "$app/ui/parallax-logo.png"
 prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
 # The ad blocker (port/webkit/ADBLOCK.md): uBO Lite's rules converted for
 # WebKit (tools/ubol-convert.js, pinned release; generated, never committed)

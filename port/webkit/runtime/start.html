@@ -22,6 +22,18 @@ body{margin:0;min-height:100vh;color:var(--text);font-family:"Noto Sans",sans-se
   background-repeat:no-repeat}
 main{max-width:1600px;margin:0 auto;padding:72px 80px 56px}
 header{display:flex;align-items:center;gap:28px;margin-bottom:44px}
+header .end{margin-left:auto;display:flex;align-items:stretch;gap:20px}
+#phone{display:flex;align-items:center;gap:18px;padding:12px 22px 12px 12px;border-radius:var(--radius);background:rgba(22,20,64,.72);border:1px solid var(--line)}
+#phone[hidden]{display:none}
+#phone svg{flex:none;width:136px;height:136px;border-radius:10px}
+#phone b{display:block;font-size:22px}#phone span{display:block;font-size:19px;color:var(--text-3);max-width:300px}
+#phone code{display:block;margin-top:4px;font:700 21px/1.2 "Noto Sans Mono",monospace;color:var(--text-2)}
+a.settings{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;min-width:128px;padding:12px 18px;
+  border-radius:var(--radius);background:rgba(22,20,64,.72);border:3px solid transparent;font-size:20px;color:var(--text-2)}
+a.settings i{font-style:normal;font-size:40px;line-height:1;color:var(--text)}
+a.settings:focus,a.settings:hover{outline:none;color:var(--text);
+  background:linear-gradient(var(--raised-hi),var(--raised-hi)) padding-box,var(--focus) border-box;
+  box-shadow:-6px 0 26px rgba(109,14,253,.35),6px 0 26px rgba(252,14,198,.3)}
 header img{width:112px;height:112px;margin:-8px -6px -8px -12px}
 header h1{margin:0;font-size:68px;font-weight:700;letter-spacing:-.01em;line-height:1}
 header p{margin:6px 0 0;font-size:24px;color:var(--text-3)}
@@ -60,6 +72,10 @@ footer span{display:inline-flex;align-items:center;gap:10px}
 <header>
   <img src="parallax-logo.png" alt="" onerror="this.remove()">
   <div><h1>Parallax</h1><p>Browser for PS5 and PS VR2</p></div>
+  <div class="end">
+    <div id="phone" hidden></div>
+    <a class="settings" href="http://127.0.0.1:9040/settings"><i>⚙</i>Settings</a>
+  </div>
 </header>
 
 <form id="go" autocomplete="off">
@@ -87,7 +103,6 @@ footer span{display:inline-flex;align-items:center;gap:10px}
 
 <h2>Tests</h2>
 <div class="pills">
-<a href="http://127.0.0.1:9040/settings">Settings</a>
 <a href="video.html">Video test</a>
 <a href="video.html?src=media/sound-test.m4a">Sound test (beeps)</a>
 <a href="video.html?src=media/sync-2160p30-hevc.mp4">4K HEVC</a>
@@ -186,6 +201,50 @@ footer span{display:inline-flex;align-items:center;gap:10px}
         section(mine, "Most visited", data.top);
     };
     document.head.append(script);
+
+    /* "Send from your phone": the link server's address now, as a QR code
+     * (dark on white, for phone cameras), from the browser itself. */
+    function qrSVG(rows) {
+        var n = rows.length, q = 4, ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg"), d = "";
+        svg.setAttribute("viewBox", "0 0 " + (n + 2 * q) + " " + (n + 2 * q));
+        svg.setAttribute("shape-rendering", "crispEdges");
+        rows.forEach(function (r, y) {
+            for (var x = 0; x < n; x++) {
+                if (r[x] != "1")
+                    continue;
+                var e = x;
+                while (e < n && r[e] == "1")
+                    e++;
+                d += "M" + (x + q) + "," + (y + q) + "h" + (e - x) + "v1h-" + (e - x) + "z";
+                x = e;
+            }
+        });
+        var bg = document.createElementNS(ns, "rect"), p = document.createElementNS(ns, "path");
+        bg.setAttribute("width", "100%");
+        bg.setAttribute("height", "100%");
+        bg.setAttribute("fill", "#fff");
+        p.setAttribute("d", d);
+        p.setAttribute("fill", "#14113d");
+        svg.append(bg, p);
+        return svg;
+    }
+    fetch("http://127.0.0.1:9040/link.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (link) {
+        var box = document.getElementById("phone"), text = document.createElement("div"), b = document.createElement("b"), span = document.createElement("span");
+        b.textContent = "Send from your phone";
+        text.append(b);
+        if (link.url && link.qr) {
+            box.append(qrSVG(link.qr));
+            span.textContent = "Scan with the camera, or open";
+            var code = document.createElement("code");
+            code.textContent = link.url.replace(/\/$/, "");
+            text.append(span, code);
+        } else {
+            span.textContent = link.localOnly ? "The link server is set to this PS5 only. Settings: Link server on the network." : "No network address right now.";
+            text.append(span);
+        }
+        box.append(text);
+        box.hidden = false;
+    }, function () { /* no link server: no card */ });
 
     /* The field: an address, or words to search for (as the browser's
      * address bar does, ps5browser.c's uriFromInput). */
