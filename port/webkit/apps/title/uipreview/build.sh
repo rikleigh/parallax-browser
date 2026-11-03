@@ -44,13 +44,17 @@ H
 # Copies, so their quoted includes find the stand-ins.
 cp "$PORT/wpe-ps5/PS5UICanvas.cpp" "$PORT/wpe-ps5/PS5Text.cpp" "$PORT/wpe-ps5/PS5Text.h" "$B/src/"
 
+# The logo as the title ships it (package.sh).
+[[ $B/parallax-mark.bgra -nt $TITLE/sce_sys/icon0.png && $B/parallax-mark.bgra -nt $TITLE/brand-assets.py ]] ||
+    python3 "$TITLE/brand-assets.py" mark 48 "$B/parallax-mark.bgra"
+
 PKG="$(pkg-config --cflags glib-2.0 freetype2 libpng)"
 LIBS="$(pkg-config --libs glib-2.0 freetype2 libpng)"
 DEFS=(-DPS5WK_FONT_DIR="\"$FONTS\"")
 c++ -std=c++20 -O2 -I"$B/src" $PKG "${DEFS[@]}" -c "$B/src/PS5UICanvas.cpp" -o "$B/canvas.o"
 c++ -std=c++20 -O2 -I"$B/src" $PKG "${DEFS[@]}" -c "$B/src/PS5Text.cpp" -o "$B/text.o"
 c++ -std=c++20 -O2 -I"$B/src" $PKG -c "$HERE/uipreview-glue.cpp" -o "$B/glue.o"
-cc -std=gnu11 -O2 -Wall -I"$B/src" -I"$TITLE" $PKG -c "$TITLE/browserdraw.c" -o "$B/draw.o"
+cc -std=gnu11 -O2 -Wall -I"$B/src" -I"$TITLE" $PKG -DBUI_MARK_PATH="\"$B/parallax-mark.bgra\"" -c "$TITLE/browserdraw.c" -o "$B/draw.o"
 cc -std=gnu11 -O2 -Wall -I"$B/src" -I"$TITLE" $PKG -c "$HERE/uipreview.c" -o "$B/uipreview.o"
 c++ "$B"/{canvas,text,glue,draw,uipreview}.o $LIBS -o "$B/uipreview"
 "$B/uipreview" "$OUTDIR" "$BG"

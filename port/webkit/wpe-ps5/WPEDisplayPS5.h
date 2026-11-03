@@ -132,6 +132,49 @@ WPE_API void                 wpe_display_ps5_canvas_fill       (WPEDisplayPS5Can
                                                                 int                  height,
                                                                 int                  radius,
                                                                 guint32              argb);
+/* The same with a gradient from @from to @to, left to right (or top to
+ * bottom when @vertical). */
+WPE_API void                 wpe_display_ps5_canvas_fill_gradient (WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  y,
+                                                                int                  width,
+                                                                int                  height,
+                                                                int                  radius,
+                                                                guint32              from,
+                                                                guint32              to,
+                                                                gboolean             vertical);
+/* The rounded rectangle's outline, @line_width px inside its edge, with a
+ * gradient as above (@from == @to: one colour). */
+WPE_API void                 wpe_display_ps5_canvas_stroke     (WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  y,
+                                                                int                  width,
+                                                                int                  height,
+                                                                int                  radius,
+                                                                int                  line_width,
+                                                                guint32              from,
+                                                                guint32              to,
+                                                                gboolean             vertical);
+/* A soft glow around the rounded rectangle (not inside it), fading out
+ * over @spread px; colours left to right as above. */
+WPE_API void                 wpe_display_ps5_canvas_glow       (WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  y,
+                                                                int                  width,
+                                                                int                  height,
+                                                                int                  radius,
+                                                                int                  spread,
+                                                                guint32              from,
+                                                                guint32              to);
+/* A premultiplied image (0xAARRGGBB words, @width x @height, rows top
+ * down) blended at (@x, @y) with @alpha (0-255). */
+WPE_API void                 wpe_display_ps5_canvas_image      (WPEDisplayPS5Canvas *canvas,
+                                                                int                  x,
+                                                                int                  y,
+                                                                int                  width,
+                                                                int                  height,
+                                                                const guint32       *pixels,
+                                                                guint                alpha);
 /* One line of text, its baseline at @baseline, @size px; cut with an
  * ellipsis to @max_width when that is > 0. Returns the width drawn. */
 WPE_API int                  wpe_display_ps5_canvas_text       (WPEDisplayPS5Canvas *canvas,

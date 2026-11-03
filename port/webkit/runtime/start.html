@@ -1,62 +1,76 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>PS5 WebKit start</title>
+<html lang="en"><head><meta charset="utf-8"><title>Parallax</title>
+<!-- Parallax Browser's start page (the home page and every new tab).
+     The palette is apps/title/brand.h's. Pad: L1/R1 or the D-pad move
+     between tiles (D-pad up from the first row: the address field, which
+     brings up the keyboard), X opens. -->
 <style>
-body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:48px}
-h1{font-weight:600;font-size:40px;margin:0 0 24px}
-h2{font-weight:600;font-size:30px;margin:32px 0 0}
-ul{list-style:none;padding:0;display:grid;grid-template-columns:repeat(4,1fr);gap:20px}
-a{display:block;padding:28px 24px;border-radius:14px;background:#1f2633;color:#9cc7ff;font-size:28px;text-decoration:none}
-a:focus,a:hover{background:#2d3a52;outline:3px solid #9cc7ff}
-p{color:#9aa4b2;font-size:20px}
-a small{display:block;color:#9aa4b2;font-size:17px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-a span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-</style></head><body>
-<h1>PS5 WebKit</h1>
-<div id="mine"></div>
-<!-- Bookmarks and most visited pages: start-data.js is written by the
-     browser (browserdata.c) next to this file; web pages can't read it.
-     Loaded with a fresh query each time: the WebProcess's memory cache
-     would otherwise keep the first copy. -->
-<script>
-(function () {
-    var script = document.createElement("script");
-    script.src = "start-data.js?" + Date.now();
-    script.onload = function () { render(window.ps5wkData); };
-    document.head.append(script);
-function render(data) {
-    if (!data)
-        return;
-    var mine = document.getElementById("mine");
-    function section(name, entries) {
-        if (!entries || !entries.length)
-            return;
-        var h = document.createElement("h2");
-        h.textContent = name;
-        var ul = document.createElement("ul");
-        entries.forEach(function (e) {
-            if (!/^https?:/.test(e.url))
-                return;
-            var li = document.createElement("li"), a = document.createElement("a"), t = document.createElement("span"), u = document.createElement("small");
-            a.href = e.url;
-            t.textContent = e.title || e.url;
-            u.textContent = e.url.replace(/^https?:\/\/(www\.)?/, "");
-            a.append(t, u);
-            li.append(a);
-            ul.append(li);
-        });
-        mine.append(h, ul);
-    }
-    section("Bookmarks", data.bookmarks);
-    section("Most visited", data.top);
-    if (mine.childNodes.length) {
-        var h = document.createElement("h2");
-        h.textContent = "Links";
-        mine.append(h);
-    }
+:root{
+  --ink:#01001a;--indigo:#3202c2;--violet:#6d0efd;--blue:#156bfd;--cyan:#0ee3fe;--magenta:#fc0ec6;
+  --base:#07061f;--surface:#0d0b2a;--raised:#161440;--raised-hi:#211d56;--line:#2b2766;
+  --text:#f4f2ff;--text-2:#b9b5e0;--text-3:#8a86b8;--pink:#ff5cd6;
+  --focus:linear-gradient(90deg,var(--violet),var(--magenta));
+  --radius:16px;--radius-chip:10px;
 }
-})();
-</script>
-<ul>
+*{box-sizing:border-box}
+html{background:var(--ink)}
+body{margin:0;min-height:100vh;color:var(--text);font-family:"Noto Sans",sans-serif;
+  /* the artwork's light: violet from the top right, a little magenta below it */
+  background:radial-gradient(1100px 620px at 88% -8%,rgba(109,14,253,.26),transparent 70%),
+             radial-gradient(900px 560px at 104% 62%,rgba(252,14,198,.12),transparent 70%),
+             radial-gradient(800px 500px at -8% 108%,rgba(21,107,253,.10),transparent 70%),var(--ink);
+  background-repeat:no-repeat}
+main{max-width:1600px;margin:0 auto;padding:72px 80px 56px}
+header{display:flex;align-items:center;gap:28px;margin-bottom:44px}
+header img{width:112px;height:112px;margin:-8px -6px -8px -12px}
+header h1{margin:0;font-size:68px;font-weight:700;letter-spacing:-.01em;line-height:1}
+header p{margin:6px 0 0;font-size:24px;color:var(--text-3)}
+form{position:relative;margin:0 0 56px}
+input{width:100%;height:84px;padding:0 260px 0 32px;font:400 30px/1 "Noto Sans",sans-serif;color:var(--text);
+  background:rgba(1,0,26,.72);border:1px solid var(--line);border-radius:var(--radius);outline:none;-webkit-appearance:none}
+input::placeholder{color:var(--text-3)}
+input:focus{background:var(--raised-hi);border-color:transparent;box-shadow:0 0 0 3px var(--violet),0 0 28px rgba(109,14,253,.45),0 0 44px rgba(252,14,198,.25)}
+form .keys{position:absolute;right:22px;top:22px;display:flex;align-items:center;gap:10px;color:var(--text-2);font-size:20px;pointer-events:none}
+.cap{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:34px;padding:0 9px;border-radius:17px;
+  background:rgba(255,255,255,.12);color:var(--text);font:700 17px/1 "Noto Sans",sans-serif}
+.cap.face{padding:0;font-weight:400;font-size:19px}
+h2{margin:44px 0 18px;font-size:26px;font-weight:700;color:var(--text-2);letter-spacing:.01em}
+ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:20px}
+a{color:inherit;text-decoration:none}
+.tiles a{display:flex;align-items:center;gap:20px;height:104px;padding:0 22px;border-radius:var(--radius);
+  background:rgba(22,20,64,.72);border:3px solid transparent;overflow:hidden}
+.tiles a:focus,.tiles a:hover,.pills a:focus,.pills a:hover{outline:none;
+  background:linear-gradient(var(--raised-hi),var(--raised-hi)) padding-box,var(--focus) border-box;
+  box-shadow:-6px 0 26px rgba(109,14,253,.35),6px 0 26px rgba(252,14,198,.3)}
+.tile{flex:none;display:flex;align-items:center;justify-content:center;width:56px;height:56px;border-radius:12px;
+  font-size:26px;font-weight:700;color:var(--text);background:rgba(109,14,253,.38);border:1px solid rgba(109,14,253,.88)}
+.tiles .text{min-width:0}
+.tiles b,.tiles small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tiles b{font-size:25px;font-weight:700}
+.tiles small{margin-top:4px;font-size:20px;color:var(--text-3)}
+.pills{display:flex;flex-wrap:wrap;gap:14px}
+.pills a{display:block;padding:14px 24px;border-radius:999px;font-size:21px;color:var(--text-2);
+  background:rgba(22,20,64,.72);border:3px solid transparent}
+.pills a:focus,.pills a:hover{color:var(--text)}
+footer{margin-top:56px;padding-top:24px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:14px 34px;color:var(--text-2);font-size:20px}
+footer span{display:inline-flex;align-items:center;gap:10px}
+.fonts{margin-top:22px;color:var(--text-3);font-size:18px}
+</style></head><body>
+<main>
+<header>
+  <img src="parallax-logo.png" alt="" onerror="this.remove()">
+  <div><h1>Parallax</h1><p>Browser for PS5 and PS VR2</p></div>
+</header>
+
+<form id="go" autocomplete="off">
+  <input id="q" type="text" name="q" placeholder="Search or type an address" spellcheck="false" autocapitalize="off" enterkeyhint="go">
+  <span class="keys"><span class="cap">R1</span>to type</span>
+</form>
+
+<div id="mine"></div>
+
+<h2>Links</h2>
+<ul class="tiles" id="links">
 <li><a href="https://en.wikipedia.org/wiki/PlayStation_5">Wikipedia</a></li>
 <li><a href="https://lite.duckduckgo.com/lite?q=ps5+vr2">DuckDuckGo</a></li>
 <li><a href="https://www.bbc.co.uk/news">BBC News</a></li>
@@ -69,28 +83,166 @@ function render(data) {
 <li><a href="https://www.apple.com/">Apple</a></li>
 <li><a href="https://html5test.co/">HTML5 test</a></li>
 <li><a href="https://example.com/">example.com</a></li>
-<li><a href="video.html">Video test</a></li>
-<li><a href="video.html?src=media/sound-test.m4a">Sound test (beeps)</a></li>
-<li><a href="http://127.0.0.1:9040/settings">Settings</a></li>
 </ul>
-<h2>Hardware video tests</h2>
-<ul>
-<li><a href="video.html?src=media/sync-2160p30-hevc.mp4">4K HEVC</a></li>
-<li><a href="video.html?src=media/sync-2160p30-hevc10.mp4">4K HEVC 10-bit</a></li>
-<li><a href="video.html?src=media/sync-3840p30-hevc.mp4">8K HEVC</a></li>
-<li><a href="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube 4K60 (Big Buck Bunny)</a></li>
-</ul>
-<h2>View in VR tests (touchpad while a video plays)</h2>
-<ul>
-<li><a href="video.html?src=media/vrtest_360_mono.mp4">360 mono grid</a></li>
-<li><a href="video.html?src=media/vrtest_180_LR.mp4">180 3D side by side</a></li>
-<li><a href="video.html?src=media/vrtest_180_TB.mp4">180 3D top/bottom</a></li>
-<li><a href="video.html?src=media/vrtest_180_mono.mp4">180 mono</a></li>
-<li><a href="video.html?src=media/vrtest_360_TB.mp4">360 3D top/bottom</a></li>
-<li><a href="video.html?src=media/vrtest_360_SBS.mp4">360 3D side by side</a></li>
-<li><a href="video.html?src=media/vrtest_MKX200_LR.mp4">Fisheye 200 (MKX200) 3D</a></li>
-<li><a href="video.html?src=media/sync-1080p30-h264.mp4">Flat video (big screen)</a></li>
-</ul>
-<p>Options = the browser menu: address bar (X on it = type an address or a search), tabs, bookmarks, history. R3 (press the right stick) = Settings (JIT, painting, video, sound, home page, clear cookies), and back. X on a text field (or Triangle while one is focused) = keyboard. O = back. Touchpad = watch the playing video in the PS VR2 headset (there: X play/pause, left/right seek 10 s, Triangle projection, Square recentre, O back to the TV).</p>
-<p lang="mul">Fonts: العربية · עברית · हिन्दी · ไทย · বাংলা · தமிழ் · Ελληνικά · Русский · 日本語 · 中文 · 한국어 · ∑ ∞ → ★ · 😀 🎮 🚀 👍🏽 🇬🇧</p>
+
+<h2>Tests</h2>
+<div class="pills">
+<a href="http://127.0.0.1:9040/settings">Settings</a>
+<a href="video.html">Video test</a>
+<a href="video.html?src=media/sound-test.m4a">Sound test (beeps)</a>
+<a href="video.html?src=media/sync-2160p30-hevc.mp4">4K HEVC</a>
+<a href="video.html?src=media/sync-2160p30-hevc10.mp4">4K HEVC 10-bit</a>
+<a href="video.html?src=media/sync-3840p30-hevc.mp4">8K HEVC</a>
+<a href="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube 4K60 (Big Buck Bunny)</a>
+</div>
+<h2>View in VR tests <span style="font-weight:400;color:var(--text-3)">(touchpad while a video plays)</span></h2>
+<div class="pills">
+<a href="video.html?src=media/vrtest_360_mono.mp4">360 mono grid</a>
+<a href="video.html?src=media/vrtest_180_LR.mp4">180 3D side by side</a>
+<a href="video.html?src=media/vrtest_180_TB.mp4">180 3D top/bottom</a>
+<a href="video.html?src=media/vrtest_180_mono.mp4">180 mono</a>
+<a href="video.html?src=media/vrtest_360_TB.mp4">360 3D top/bottom</a>
+<a href="video.html?src=media/vrtest_360_SBS.mp4">360 3D side by side</a>
+<a href="video.html?src=media/vrtest_MKX200_LR.mp4">Fisheye 200 (MKX200) 3D</a>
+<a href="video.html?src=media/sync-1080p30-h264.mp4">Flat video (big screen)</a>
+</div>
+
+<footer>
+  <span><span class="cap">Options</span>Menu: address, tabs, bookmarks, history</span>
+  <span><span class="cap face">○</span>Back</span>
+  <span><span class="cap">L1</span><span class="cap">R1</span>Move between links and fields</span>
+  <span><span class="cap face">△</span>Keyboard in a text field</span>
+  <span><span class="cap">R3</span>Settings</span>
+  <span><span class="cap">L3</span>Home</span>
+  <span><span class="cap" style="width:46px;border-radius:8px;border:2px solid var(--text-2);background:rgba(255,255,255,.08)"></span>Watch the playing video in PS VR2 (there: ✕ play/pause, ◀ ▶ seek, △ projection, □ recentre, ○ back to the TV)</span>
+</footer>
+<p class="fonts" lang="mul">Fonts: العربية · עברית · हिन्दी · ไทย · বাংলা · தமிழ் · Ελληνικά · Русский · 日本語 · 中文 · 한국어 · ∑ ∞ → ★ · 😀 🎮 🚀 👍🏽 🇬🇧</p>
+</main>
+
+<!-- Bookmarks and most visited pages: start-data.js is written by the
+     browser (browserdata.c) next to this file; web pages can't read it.
+     Loaded with a fresh query each time: the WebProcess's memory cache
+     would otherwise keep the first copy. -->
+<script>
+(function () {
+    /* The site's name and tint, as the browser menu draws them (browserdraw.c). */
+    var tints = ["109,14,253", "21,107,253", "252,14,198", "14,227,254", "179,12,222"];
+    function host(url) {
+        var m = /^[a-z]+:\/\/([^\/:?#]*)/i.exec(url);
+        return m ? m[1].replace(/^www\./, "") : "";
+    }
+    function siteName(h) {
+        var labels = h.split(".");
+        if (labels.length < 2)
+            return h;
+        var n = 1;
+        if (labels.length >= 3 && labels[labels.length - 1].length == 2 && /^(co|com|org|net|ac|gov|edu|ne|or)$/.test(labels[labels.length - 2]))
+            n = 2;
+        return labels.length > n ? labels[labels.length - n - 1] : h;
+    }
+    function tile(a, url, title) {
+        var name = siteName(host(url)), hash = 5381;
+        for (var i = 0; i < name.length; i++)
+            hash = (hash * 33 + name.charCodeAt(i)) >>> 0;
+        var rgb = tints[hash % tints.length];
+        var t = document.createElement("span"), text = document.createElement("span"), b = document.createElement("b"), small = document.createElement("small");
+        t.className = "tile";
+        t.textContent = (name.charAt(0) || "?").toUpperCase();
+        t.style.background = "rgba(" + rgb + ",.38)";
+        t.style.borderColor = "rgba(" + rgb + ",.88)";
+        text.className = "text";
+        b.textContent = title || url;
+        small.textContent = url.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "");
+        text.append(b, small);
+        a.textContent = "";
+        a.append(t, text);
+    }
+    /* the fixed links as tiles too */
+    document.querySelectorAll("#links a").forEach(function (a) { tile(a, a.href, a.textContent); });
+
+    function section(mine, name, entries) {
+        entries = (entries || []).filter(function (e) { return /^https?:/.test(e.url); });
+        if (!entries.length)
+            return;
+        var h = document.createElement("h2"), ul = document.createElement("ul");
+        h.textContent = name;
+        ul.className = "tiles";
+        entries.forEach(function (e) {
+            var li = document.createElement("li"), a = document.createElement("a");
+            a.href = e.url;
+            tile(a, e.url, e.title);
+            li.append(a);
+            ul.append(li);
+        });
+        mine.append(h, ul);
+    }
+    var script = document.createElement("script");
+    script.src = "start-data.js?" + Date.now();
+    script.onload = function () {
+        var data = window.ps5wkData, mine = document.getElementById("mine");
+        if (!data)
+            return;
+        section(mine, "Bookmarks", data.bookmarks);
+        section(mine, "Most visited", data.top);
+    };
+    document.head.append(script);
+
+    /* The field: an address, or words to search for (as the browser's
+     * address bar does, ps5browser.c's uriFromInput). */
+    document.getElementById("go").addEventListener("submit", function (event) {
+        event.preventDefault();
+        var text = document.getElementById("q").value.trim();
+        if (!text)
+            return;
+        if (/:\/\//.test(text) || /^(about|data):/.test(text))
+            location.href = text;
+        else if (!/ /.test(text) && /\./.test(text))
+            location.href = "https://" + text;
+        else
+            location.href = "https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(text);
+    });
+
+    /* D-pad: from tile to tile (the nearest in that direction); up from the
+     * first row reaches the field. The page scrolls to the focused tile. */
+    var keys = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    document.addEventListener("keydown", function (event) {
+        var dir = keys[event.key];
+        if (!dir || event.altKey || event.ctrlKey || event.metaKey)
+            return;
+        var from = document.activeElement;
+        if (from && from.tagName == "INPUT")
+            return;
+        var all = Array.prototype.slice.call(document.querySelectorAll("main a, #q"));
+        if (!from || all.indexOf(from) < 0) {
+            var first = document.querySelector("main a");
+            if (first) {
+                event.preventDefault();
+                first.focus();
+            }
+            return;
+        }
+        var r = from.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2, best = null, bestScore = Infinity;
+        all.forEach(function (el) {
+            if (el == from)
+                return;
+            var q = el.getBoundingClientRect(), x = q.left + q.width / 2, y = q.top + q.height / 2;
+            var along = (x - cx) * dir[0] + (y - cy) * dir[1];
+            if (along <= 4)
+                return;
+            var across = Math.abs((x - cx) * dir[1] + (y - cy) * dir[0]);
+            /* a row's neighbours: straight on, then the nearest */
+            var score = along + across * (dir[0] ? 4 : 1.2);
+            if (score < bestScore) {
+                bestScore = score;
+                best = el;
+            }
+        });
+        if (best) {
+            event.preventDefault();
+            best.focus();
+            best.scrollIntoView({ block: "nearest" });
+        }
+    });
+})();
+</script>
 </body></html>

@@ -33,6 +33,6 @@ struct PS5TextImage {
 };
 
 // UTF-8 text, '\n' between lines; the first line is drawn at pixelSize,
-// the others at 0.62 of it, all centred, white on a rounded translucent
-// dark panel. False (and an empty image) when the fonts are missing.
+// the others at 0.62 of it, all centred, white and lavender on a rounded
+// navy glass panel with a violet-to-magenta edge (Parallax's palette). False (and an empty image) when the fonts are missing.
 bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out);

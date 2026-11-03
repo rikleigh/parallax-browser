@@ -830,7 +830,7 @@ static void listRow(int row, BUIRow* r, void* data)
     (void)data;
     if (section == SEC_TABS) {
         if (row >= (int)tabs->len) {
-            r->title = "+ New tab";
+            r->title = "New tab";
             r->url = "Opens the home page";
             r->action = TRUE;
             return;
@@ -1582,9 +1582,9 @@ static gboolean showFormPage(gpointer data)
         return G_SOURCE_REMOVE;
     char* escaped = g_markup_escape_text(formPageURI, -1);
     char* html = g_strdup_printf("<!doctype html><html><head><meta charset=\"utf-8\"><title>%s</title>"
-        "<style>body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:64px;font-size:26px}"
-        "a{color:#9cc7ff;display:inline-block;padding:18px 28px;background:#1f2633;border-radius:12px;text-decoration:none}"
-        "a:focus,a:hover{outline:3px solid #ffd54a}code{color:#9aa4b2;word-break:break-all}</style></head><body>"
+        "<style>body{font-family:sans-serif;background:#01001a;color:#f4f2ff;margin:64px;font-size:26px}"
+        "a{color:#f4f2ff;display:inline-block;padding:18px 28px;background:#161440;border-radius:16px;text-decoration:none}"
+        "a:focus,a:hover{outline:3px solid #ff5cd6;box-shadow:0 0 24px rgba(109,14,253,.5)}code{color:#b9b5e0;word-break:break-all}</style></head><body>"
         "<h1>This page came from a form</h1><p>Showing it again would send the form again, so the browser didn't.</p>"
         "<p><code>%s</code></p><p><a href=\"%s\" autofocus>Load the address (without the form)</a></p>"
         "<p>O goes back.</p></body></html>", escaped, escaped, escaped);

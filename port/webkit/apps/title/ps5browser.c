@@ -673,8 +673,8 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     SPIKE_FAIL("webprocess", "terminated (reason %d) again on %s within 30 s; showing an error page", reason, lastCrashURI);
     char* escaped = g_markup_escape_text(lastCrashURI, -1);
     char* html = g_strdup_printf("<!doctype html><html><head><meta charset=\"utf-8\"><title>Page crashed</title>"
-        "<style>body{font-family:sans-serif;background:#10141c;color:#e8ecf2;margin:64px;font-size:24px}"
-        "a{color:#9cc7ff}code{color:#9aa4b2;word-break:break-all}</style></head><body>"
+        "<style>body{font-family:sans-serif;background:#01001a;color:#f4f2ff;margin:64px;font-size:24px}"
+        "a{color:#c7a8ff}a:focus{outline:3px solid #ff5cd6;outline-offset:4px}code{color:#b9b5e0;word-break:break-all}</style></head><body>"
         "<h1>This page keeps crashing</h1><p>The browser stopped reloading it after two crashes.</p>"
         "<p><code>%s</code></p><p><a href=\"%s\">Try again</a> &middot; <a href=\"file:///data/ps5webkit/start.html\">Start page</a></p>"
         "<p>O goes back.</p></body></html>", escaped, escaped);
@@ -1017,7 +1017,7 @@ static void pushReply(int client, int status, const char* type, const char* body
 static const char pushPageStyle[] =
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<style>:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#15181d;--muted:#5d6672;--card:#fff;--line:#d5d9df;--accent:#0b5cd5}"
-    "@media(prefers-color-scheme:dark){:root{--bg:#10141c;--fg:#e8ecf2;--muted:#9aa4b2;--card:#1a202b;--line:#2e3644;--accent:#6aa8ff}}"
+    "@media(prefers-color-scheme:dark){:root{--bg:#07061f;--fg:#f4f2ff;--muted:#b9b5e0;--card:#110f35;--line:#2b2766;--accent:#8a4dff}}"
     "body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.45 -apple-system,system-ui,sans-serif}"
     "main{max-width:34rem;margin:0 auto;padding:24px 16px}h1{font-size:1.4rem;margin:0 0 16px}"
     "form{display:flex;flex-direction:column;gap:10px}input{font:inherit;padding:12px;border:1px solid var(--line);"

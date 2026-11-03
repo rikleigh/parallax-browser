@@ -113,7 +113,7 @@ bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
     }
     g_strfreev(parts);
 
-    const int pad = pixelSize / 2;
+    const int pad = pixelSize * 6 / 10;
     int width = 0, height = pad;
     for (auto& line : lines) {
         width = std::max(width, lineWidth(line));
@@ -127,26 +127,42 @@ bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
     out.height = height;
     out.rgba.assign(static_cast<size_t>(width) * height * 4, 0);
 
-    // Panel: rounded rectangle, dark and 80 % opaque (premultiplied).
+    // Panel: Parallax's navy glass (apps/title/brand.h: PX_SURFACE, 95 %
+    // opaque) with a thin edge from the logo's violet to its magenta.
     const float radius = pixelSize * 0.6f;
-    const float panelAlpha = 0.80f;
+    const float panelAlpha = 0.95f, edgeAlpha = 0.9f;
+    const float edge = std::max(1.5f, pixelSize / 26.0f);
+    static const float surface[3] = { 0x0d / 255.0f, 0x0b / 255.0f, 0x2a / 255.0f };
+    static const float violet[3] = { 0x6d / 255.0f, 0x0e / 255.0f, 0xfd / 255.0f };
+    static const float magenta[3] = { 0xfc / 255.0f, 0x0e / 255.0f, 0xc6 / 255.0f };
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             float dx = std::max({ radius - x - 0.5f, x + 0.5f - (width - radius), 0.0f });
             float dy = std::max({ radius - y - 0.5f, y + 0.5f - (height - radius), 0.0f });
-            float coverage = std::clamp(radius - std::sqrt(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f);
-            float a = coverage * panelAlpha;
+            float inside = radius - std::sqrt(dx * dx + dy * dy); // distance to the edge, > 0 inside
+            if (!dx && !dy) // the straight parts
+                inside = std::min({ x + 0.5f, width - x - 0.5f, y + 0.5f, height - y - 0.5f });
+            float coverage = std::clamp(inside + 0.5f, 0.0f, 1.0f);
+            float ring = coverage - std::clamp(inside - edge + 0.5f, 0.0f, 1.0f);
+            float t = width > 1 ? static_cast<float>(x) / (width - 1) : 0;
+            float a = coverage * panelAlpha, e = ring * edgeAlpha;
             uint8_t* p = &out.rgba[(static_cast<size_t>(y) * width + x) * 4];
-            p[0] = static_cast<uint8_t>(a * 0.06f * 255);
-            p[1] = static_cast<uint8_t>(a * 0.08f * 255);
-            p[2] = static_cast<uint8_t>(a * 0.11f * 255);
-            p[3] = static_cast<uint8_t>(a * 255);
+            for (int k = 0; k < 3; k++) {
+                float edgeColor = violet[k] + (magenta[k] - violet[k]) * t;
+                p[k] = static_cast<uint8_t>(std::lround(255 * (edgeColor * e + surface[k] * a * (1 - e))));
+            }
+            p[3] = static_cast<uint8_t>(std::lround(255 * (e + a * (1 - e))));
         }
     }
 
-    // Glyphs, white, composited over the panel.
+    // Glyphs over the panel: the first line in white (PX_TEXT), the others
+    // lavender (PX_TEXT_2).
     int baseline = pad;
-    for (auto& line : lines) {
+    for (size_t index = 0; index < lines.size(); index++) {
+        auto& line = lines[index];
+        static const float first[3] = { 0xf4 / 255.0f, 0xf2 / 255.0f, 0xff / 255.0f };
+        static const float other[3] = { 0xb9 / 255.0f, 0xb5 / 255.0f, 0xe0 / 255.0f };
+        const float* color = index ? other : first;
         baseline += line.size;
         int penX = (width - line.width) / 2;
         for (gunichar c : line.text) {
@@ -167,8 +183,9 @@ bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
                         continue;
                     float g = bitmap.buffer[row * bitmap.pitch + col] / 255.0f;
                     uint8_t* p = &out.rgba[(static_cast<size_t>(y) * width + x) * 4];
-                    for (int k = 0; k < 4; k++)
-                        p[k] = static_cast<uint8_t>(std::lround(255 * g + p[k] * (1 - g)));
+                    for (int k = 0; k < 3; k++)
+                        p[k] = static_cast<uint8_t>(std::lround(255 * color[k] * g + p[k] * (1 - g)));
+                    p[3] = static_cast<uint8_t>(std::lround(255 * g + p[3] * (1 - g)));
                 }
             }
             penX += static_cast<int>(face->glyph->advance.x >> 6);

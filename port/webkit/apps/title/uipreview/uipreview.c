@@ -110,7 +110,7 @@ static void row(int index, BUIRow* r, void* user)
     const BUIState* s = user;
     if (s->section == SEC_TABS) {
         if (index >= tabCount) {
-            r->title = "+ New tab";
+            r->title = "New tab";
             r->url = "Opens the home page";
             r->action = TRUE;
             return;

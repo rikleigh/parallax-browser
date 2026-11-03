@@ -244,5 +244,6 @@ if [ "${1:-}" = --upload ]; then
     curl -s --ftp-create-dirs -T "$HERE/preview.html" "$FTP/data/ps5webkit/preview.html"
     curl -s --ftp-create-dirs -T "$HERE/feed.html" "$FTP/data/ps5webkit/feed.html"
     curl -s --ftp-create-dirs -T "$ROOT/port/webkit/runtime/start.html" "$FTP/data/ps5webkit/start.html"
-    echo "uploaded to /data/ps5webkit/media/, video.html, start.html"
+    curl -s --ftp-create-dirs -T "$ROOT/port/webkit/runtime/parallax-logo.png" "$FTP/data/ps5webkit/parallax-logo.png"
+    echo "uploaded to /data/ps5webkit/media/, video.html, start.html (and its logo)"
 fi

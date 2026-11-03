@@ -186,6 +186,33 @@ static inline uint32_t over(uint32_t dst, uint32_t src)
     return (std::min(a, 255u) << 24) | (std::min(r, 255u) << 16) | (std::min(g, 255u) << 8) | std::min(b, 255u);
 }
 
+// over() for runs of one source on one destination (a panel, a row): the
+// last result is reused, so a translucent fill over a uniform area costs a
+// compare per pixel.
+struct Over {
+    uint32_t lastDst { 0 }, lastSrc { 0 }, lastOut { 0 };
+    inline uint32_t operator()(uint32_t dst, uint32_t src)
+    {
+        if (dst != lastDst || src != lastSrc) {
+            lastDst = dst;
+            lastSrc = src;
+            lastOut = over(dst, src);
+        }
+        return lastOut;
+    }
+};
+
+// A premultiplied colour times a coverage (0-255).
+static inline uint32_t scaled(uint32_t premultiplied, unsigned coverage)
+{
+    if (coverage >= 255)
+        return premultiplied;
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8)
+        out |= ((((premultiplied >> shift) & 0xff) * coverage + 127) / 255) << shift;
+    return out;
+}
+
 static std::u32string decode(const char* utf8)
 {
     std::u32string out;
@@ -250,6 +277,7 @@ void wpe_display_ps5_canvas_fill(WPEDisplayPS5Canvas* canvas, int x, int y, int 
         return;
     radius = std::clamp(radius, 0, std::min(width, height) / 2);
     const uint32_t color = premultiply(argb, 255);
+    Over blendOver;
     const int x0 = std::max(0, x), y0 = std::max(0, y);
     const int x1 = std::min(canvas->width, x + width), y1 = std::min(canvas->height, y + height);
     for (int py = y0; py < y1; py++) {
@@ -275,7 +303,161 @@ void wpe_display_ps5_canvas_fill(WPEDisplayPS5Canvas* canvas, int x, int y, int 
                 if (edge < 0.5)
                     c = premultiply(argb, static_cast<unsigned>((edge + 0.5) * 255));
             }
-            row[px] = over(row[px], c);
+            row[px] = blendOver(row[px], c);
+        }
+    }
+}
+
+namespace {
+
+// A rounded rectangle's signed distance at a pixel centre (negative inside).
+struct RoundRect {
+    float cx, cy, hx, hy, r; // centre; half extents less the radius; radius
+    RoundRect(int x, int y, int width, int height, int radius)
+    {
+        r = static_cast<float>(std::clamp(radius, 0, std::min(width, height) / 2));
+        cx = x + width / 2.0f;
+        cy = y + height / 2.0f;
+        hx = width / 2.0f - r;
+        hy = height / 2.0f - r;
+    }
+    float distance(float px, float py) const
+    {
+        float qx = std::fabs(px - cx) - hx, qy = std::fabs(py - cy) - hy;
+        if (qx > 0 && qy > 0)
+            return std::sqrt(qx * qx + qy * qy) - r;
+        return std::max(qx, qy) - r;
+    }
+};
+
+static inline uint32_t mix(uint32_t from, uint32_t to, float t)
+{
+    if (from == to || t <= 0)
+        return from;
+    if (t >= 1)
+        return to;
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        float a = (from >> shift) & 0xff, b = (to >> shift) & 0xff;
+        out |= static_cast<uint32_t>(a + (b - a) * t + 0.5f) << shift;
+    }
+    return out;
+}
+
+// The gradient's colours along one axis (premultiplied), one per pixel.
+static std::vector<uint32_t> ramp(uint32_t from, uint32_t to, int length)
+{
+    std::vector<uint32_t> colors(std::max(length, 1));
+    for (int i = 0; i < length; i++)
+        colors[i] = premultiply(mix(from, to, length > 1 ? static_cast<float>(i) / (length - 1) : 0), 255);
+    return colors;
+}
+
+static inline void blend(Over& blendOver, uint32_t& dst, uint32_t premultiplied, float coverage)
+{
+    if (coverage <= 0)
+        return;
+    dst = blendOver(dst, coverage >= 1 ? premultiplied : scaled(premultiplied, static_cast<unsigned>(coverage * 255 + 0.5f)));
+}
+
+} // namespace
+
+void wpe_display_ps5_canvas_fill_gradient(WPEDisplayPS5Canvas* canvas, int x, int y, int width, int height, int radius, guint32 from, guint32 to, gboolean vertical)
+{
+    if (!canvas || width <= 0 || height <= 0)
+        return;
+    const RoundRect shape(x, y, width, height, radius);
+    const std::vector<uint32_t> colors = ramp(from, to, vertical ? height : width);
+    const int x0 = std::max(0, x), y0 = std::max(0, y);
+    const int x1 = std::min(canvas->width, x + width), y1 = std::min(canvas->height, y + height);
+    Over blendOver;
+    for (int py = y0; py < y1; py++) {
+        uint32_t* row = canvas->px.data() + static_cast<size_t>(py) * canvas->width;
+        const bool corners = py < y + shape.r || py >= y + height - shape.r;
+        for (int px = x0; px < x1; px++) {
+            uint32_t c = vertical ? colors[py - y] : colors[px - x];
+            float coverage = 1;
+            if (corners || px < x + 1 || px >= x + width - 1)
+                coverage = std::clamp(0.5f - shape.distance(px + 0.5f, py + 0.5f), 0.0f, 1.0f);
+            blend(blendOver, row[px], c, coverage);
+        }
+    }
+}
+
+void wpe_display_ps5_canvas_stroke(WPEDisplayPS5Canvas* canvas, int x, int y, int width, int height, int radius, int lineWidth, guint32 from, guint32 to, gboolean vertical)
+{
+    if (!canvas || width <= 0 || height <= 0 || lineWidth <= 0)
+        return;
+    const RoundRect shape(x, y, width, height, radius);
+    const std::vector<uint32_t> colors = ramp(from, to, vertical ? height : width);
+    const float line = static_cast<float>(lineWidth);
+    const int band = lineWidth + 1; // in the straight part, only this near the left and right edges
+    const int x0 = std::max(0, x), y0 = std::max(0, y);
+    const int x1 = std::min(canvas->width, x + width), y1 = std::min(canvas->height, y + height);
+    Over blendOver;
+    for (int py = y0; py < y1; py++) {
+        uint32_t* row = canvas->px.data() + static_cast<size_t>(py) * canvas->width;
+        const bool straight = py >= y + shape.r + band && py < y + height - shape.r - band;
+        for (int px = x0; px < x1; px++) {
+            if (straight && px == x + band && x + width - band > px)
+                px = x + width - band; // skip the inside
+            float d = shape.distance(px + 0.5f, py + 0.5f);
+            float coverage = std::clamp(0.5f - d, 0.0f, 1.0f) - std::clamp(0.5f - (d + line), 0.0f, 1.0f);
+            blend(blendOver, row[px], vertical ? colors[py - y] : colors[px - x], coverage);
+        }
+    }
+}
+
+void wpe_display_ps5_canvas_glow(WPEDisplayPS5Canvas* canvas, int x, int y, int width, int height, int radius, int spread, guint32 from, guint32 to)
+{
+    if (!canvas || width <= 0 || height <= 0 || spread <= 0)
+        return;
+    const RoundRect shape(x, y, width, height, radius);
+    const int gx = x - spread, gw = width + 2 * spread;
+    const std::vector<uint32_t> colors = ramp(from, to, gw);
+    const float s = static_cast<float>(spread);
+    const int x0 = std::max(0, gx), y0 = std::max(0, y - spread);
+    const int x1 = std::min(canvas->width, gx + gw), y1 = std::min(canvas->height, y + height + spread);
+    Over blendOver;
+    for (int py = y0; py < y1; py++) {
+        uint32_t* row = canvas->px.data() + static_cast<size_t>(py) * canvas->width;
+        const bool straight = py >= y + shape.r + 1 && py < y + height - shape.r - 1;
+        for (int px = x0; px < x1; px++) {
+            if (straight && px == x + 1 && x + width - 1 > px)
+                px = x + width - 1; // nothing inside
+            float d = shape.distance(px + 0.5f, py + 0.5f);
+            if (d >= s || d <= -0.5f)
+                continue;
+            float f = 1 - std::max(d, 0.0f) / s;
+            blend(blendOver, row[px], colors[px - gx], f * f * f * std::clamp(d + 0.5f, 0.0f, 1.0f));
+        }
+    }
+}
+
+void wpe_display_ps5_canvas_image(WPEDisplayPS5Canvas* canvas, int x, int y, int width, int height, const guint32* pixels, guint alpha)
+{
+    if (!canvas || !pixels || width <= 0 || height <= 0 || !alpha)
+        return;
+    alpha = std::min(alpha, 255u);
+    Over blendOver;
+    for (int row = 0; row < height; row++) {
+        int py = y + row;
+        if (py < 0 || py >= canvas->height)
+            continue;
+        uint32_t* dst = canvas->px.data() + static_cast<size_t>(py) * canvas->width;
+        const guint32* src = pixels + static_cast<size_t>(row) * width;
+        for (int col = 0; col < width; col++) {
+            int px = x + col;
+            if (px < 0 || px >= canvas->width || !src[col])
+                continue;
+            uint32_t s = src[col];
+            if (alpha < 255) {
+                uint32_t out = 0;
+                for (int shift = 0; shift < 32; shift += 8)
+                    out |= ((((s >> shift) & 0xff) * alpha + 127) / 255) << shift;
+                s = out;
+            }
+            dst[px] = blendOver(dst[px], s);
         }
     }
 }
@@ -316,6 +498,8 @@ int wpe_display_ps5_canvas_text(WPEDisplayPS5Canvas* canvas, int x, int baseline
             text.push_back(0x2026);
         }
     }
+    const uint32_t color = premultiply(argb, 255);
+    Over blendOver;
     int penX = x;
     for (char32_t ch : text) {
         gunichar c = ch < 0x20 || ch == 0x7f ? ' ' : ch;
@@ -331,7 +515,7 @@ int wpe_display_ps5_canvas_text(WPEDisplayPS5Canvas* canvas, int x, int baseline
                 int px = gx + col;
                 if (px < 0 || px >= canvas->width || !cov[col])
                     continue;
-                dst[px] = over(dst[px], premultiply(argb, cov[col]));
+                dst[px] = blendOver(dst[px], scaled(color, cov[col]));
             }
         }
         penX += g->advance;
