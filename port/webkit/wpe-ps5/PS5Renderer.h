@@ -124,6 +124,9 @@ public:
     // Back to the TV. wait: block until the headset is released (wind-down;
     // at most ~3 s).
     void stopVR(bool wait);
+    // Back to the TV as if the headset ended it: ended(why) runs afterwards
+    // (the pad's owner gave up: the system held the pad in VR).
+    void endVR(const char* why);
     bool vrActive();
     void setVRProjection(int projection, float fisheyeDegrees);
     void recenterVR();
@@ -305,6 +308,7 @@ private:
         bool simLook { false };
         float simYaw { 0 }, simPitch { 0 };
         bool stop { false };
+        std::string stopWhy; // endVR(): ended(why) after the stop
         bool setProjection { false };
         bool recenter { false };
         bool textChanged { false };

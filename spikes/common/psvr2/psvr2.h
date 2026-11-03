@@ -49,6 +49,18 @@ int psvr2_preload(void);
  * was set up; psvr2_close releases everything, its direct memory included,
  * and open can be called again afterwards. */
 int psvr2_open(int user_id);
+/* psvr2_open's result when psvr2_require_headset(1) is set and Hmd2 reports
+ * no headset (device status not 0: 2 with the PS VR2 unplugged, 0 with it
+ * connected, worn or not). Nothing is left open. */
+#define PSVR2_NO_HEADSET (-3)
+/* 1: psvr2_open refuses (PSVR2_NO_HEADSET) before the tracker, the
+ * reprojection and VR mode when no headset is connected. Default 0 (the
+ * spikes and vr-probe open Hmd2 without a headset). */
+void psvr2_require_headset(int on);
+/* Hmd2's device information, live while open (else what the last open saw):
+ * status (0 = connected), worn flag, lens distance in mm. Returns the call's
+ * result (0 = read). */
+int psvr2_device_status(uint32_t *status, int *worn, int *lens_mm);
 /* Hmd2 only, opened and closed again (no tracker, no VR mode: nothing shows
  * in the headset): 0 if the headset could be opened, with its device status
  * and worn flag; else the error. */

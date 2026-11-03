@@ -65,6 +65,8 @@ int psvr2_begin_frame(psvr2_frame_t*) __attribute__((weak));
 int psvr2_submit(int index, const psvr2_frame_t*, const float tan[2][4]) __attribute__((weak));
 void psvr2_close(void) __attribute__((weak));
 int psvr2_worn(void) __attribute__((weak));
+void psvr2_require_headset(int on) __attribute__((weak));
+int psvr2_device_status(uint32_t* status, int* worn, int* lens_mm) __attribute__((weak));
 }
 
 void ps5RendererUploadPanel(unsigned& texture, const PS5TextImage&);
@@ -76,9 +78,18 @@ static constexpr int kSamples = 4;        // rotated-grid supersampling per eye 
 static constexpr float kOverscan = 1.15f; // reprojection margin (Spike 3b/9)
 static constexpr int64_t kFrameUS = 16667; // 60 frames/s rendered, 120 Hz out
 static constexpr float kFlatHalfWidth = 0.70f; // flat screen: tan(35 deg), a 70 degree wide screen
+static constexpr int64_t kNoTrackingUS = 15000000; // no tracked pose at all this long after entering: back to the TV
+static constexpr int64_t kStatusPollUS = 1000000;  // Hmd2's device status (connected, worn) while in VR
+static constexpr unsigned kDisconnectedPolls = 2;  // status not 0 this many polls in a row: back to the TV
 
 struct PS5VRState {
     bool sim { false };
+    bool simUntracked { false }; // /data/ps5webkit/vr-sim-untracked: simulated frames without a pose
+    // the headset's device status, polled (kStatusPollUS)
+    int64_t statusPollUS { 0 };
+    uint32_t devStatus { 0 };
+    int devWorn { -1 };
+    unsigned disconnectedPolls { 0 };
     int eye { kEyeSize };
     GLuint eyeTexture[PSVR2_MAX_BUFFERS] { };
     GLuint eyeFBO[PSVR2_MAX_BUFFERS] { };
@@ -365,11 +376,25 @@ void PS5Renderer::stopVR(bool wait)
         return;
     g_mutex_lock(&m_lock);
     m_vrRequest.stop = true;
+    m_vrRequest.stopWhy.clear();
     g_cond_broadcast(&m_cond);
     if (wait) {
         int64_t deadline = nowUS() + 3000000;
         while ((m_vrActiveShared || m_vrRequest.stop || m_vrRequest.start) && nowUS() < deadline)
             g_cond_wait_until(&m_cond, &m_lock, deadline);
+    }
+    g_mutex_unlock(&m_lock);
+}
+
+void PS5Renderer::endVR(const char* why)
+{
+    if (!m_initialized)
+        return;
+    g_mutex_lock(&m_lock);
+    if (m_vrActiveShared) {
+        m_vrRequest.stop = true;
+        m_vrRequest.stopWhy = why && *why ? why : "back to the TV";
+        g_cond_broadcast(&m_cond);
     }
     g_mutex_unlock(&m_lock);
 }
@@ -441,10 +466,11 @@ void PS5Renderer::vrHandleRequests()
     VRRequest request = m_vrRequest;
     m_vrRequest.start = m_vrRequest.stop = m_vrRequest.setProjection = m_vrRequest.recenter = false;
     m_vrRequest.textChanged = m_vrRequest.tvTextChanged = m_vrRequest.simLook = false;
+    m_vrRequest.stopWhy.clear();
     g_mutex_unlock(&m_lock);
 
     if (request.stop && m_vr)
-        vrStop(nullptr);
+        vrStop(request.stopWhy.empty() ? nullptr : request.stopWhy.c_str()); // endVR(): ended(why) follows
     if (request.start && request.stop) {
         // Stopped before it started (another page, wind-down).
         request.start = false;
@@ -529,6 +555,7 @@ bool PS5Renderer::vrStart(int projection, float fisheyeDegrees, char* message, s
     }
     auto* vr = new PS5VRState;
     vr->sim = fileExists("/data/ps5webkit/vr-sim");
+    vr->simUntracked = vr->sim && fileExists("/data/ps5webkit/vr-sim-untracked");
     vr->projection = std::clamp(projection, 0, static_cast<int>(VRProjectionCount) - 1);
     vr->fisheyeHalf = std::clamp(fisheyeDegrees, 120.0f, 240.0f) * static_cast<float>(M_PI) / 360.0f;
 
@@ -539,11 +566,26 @@ bool PS5Renderer::vrStart(int projection, float fisheyeDegrees, char* message, s
             return false;
         }
         psvr2_set_logger(vrLog);
+        // No headset, no VR mode: Hmd2, the tracker, the reprojection and VR
+        // mode all open without one (device status 2), and the title then
+        // sat in VR mode with the pad gone (2026-11-02, a touchpad pressed by
+        // accident with the PS VR2 unplugged).
+        if (psvr2_require_headset)
+            psvr2_require_headset(1);
         int32_t user = -1;
         if (sceUserServiceGetInitialUser)
             sceUserServiceGetInitialUser(&user);
-        if (psvr2_open(user) != 0) {
-            snprintf(message, messageSize, "No PS VR2 headset found. Connect it, turn it on and try again.");
+        int rc = psvr2_open(user);
+        if (rc != 0) {
+            if (rc == PSVR2_NO_HEADSET) {
+                uint32_t status = 0;
+                int worn = 0, lens = 0;
+                if (psvr2_device_status)
+                    psvr2_device_status(&status, &worn, &lens);
+                VRLOG("PS VR2 not connected (device status %u, worn %d, lens %d mm): staying on the TV", status, worn, lens);
+                snprintf(message, messageSize, "PS VR2 not connected. Connect the headset, turn it on and press the touchpad again.");
+            } else
+                snprintf(message, messageSize, "The PS VR2 headset could not be opened. Connect it, turn it on and try again.");
             delete vr;
             return false;
         }
@@ -839,7 +881,7 @@ void PS5Renderer::vrFrame()
             vr->simNextUS = now;
         vr->simNextUS += kFrameUS;
         frame.frame = vr->frames + 1;
-        frame.tracked = 1;
+        frame.tracked = !vr->simUntracked;
         // Head direction: yaw about +Y (positive = left), then pitch.
         const float yaw = -vr->simYaw * static_cast<float>(M_PI) / 180, pitch = vr->simPitch * static_cast<float>(M_PI) / 180;
         const float qy[4] = { 0, sinf(yaw / 2), 0, cosf(yaw / 2) }, qp[4] = { sinf(pitch / 2), 0, 0, cosf(pitch / 2) };
@@ -930,6 +972,33 @@ void PS5Renderer::vrFrame()
             vr->sourceWidth = m_videoSources[i].width;
             vr->sourceHeight = m_videoSources[i].height;
         }
+    }
+
+    // Back to the TV by itself, so nothing can keep the title in VR mode
+    // with no way out: the headset unplugged (Hmd2's device status), or no
+    // tracked pose at all since entering (a headset that never shows up).
+    if (!vr->sim && psvr2_device_status && now - vr->statusPollUS >= kStatusPollUS) {
+        vr->statusPollUS = now;
+        uint32_t status = 0;
+        int worn = 0, lens = 0;
+        if (!psvr2_device_status(&status, &worn, &lens)) {
+            if (status != vr->devStatus || worn != vr->devWorn)
+                VRLOG("headset device status %u, %s (lens %d mm) after %.1f s", status, worn ? "worn" : "not worn", lens, (now - vr->startUS) / 1e6);
+            vr->devStatus = status;
+            vr->devWorn = worn;
+            vr->disconnectedPolls = status ? vr->disconnectedPolls + 1 : 0;
+            if (vr->disconnectedPolls >= kDisconnectedPolls) {
+                vrStop("The PS VR2 headset is not connected any more. Back on the TV.");
+                return;
+            }
+        }
+    }
+    if ((!vr->sim || vr->simUntracked) && !vr->tracked && now - vr->startUS > kNoTrackingUS) {
+        char why[192];
+        snprintf(why, sizeof(why), "No head tracking from the PS VR2 in %.0f s. Back on the TV: put the headset on, then press the touchpad.",
+            kNoTrackingUS / 1e6);
+        vrStop(why);
+        return;
     }
 }
 

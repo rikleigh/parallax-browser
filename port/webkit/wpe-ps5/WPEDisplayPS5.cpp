@@ -67,6 +67,7 @@
  */
 
 static constexpr unsigned padIntervalMS = 8;
+static constexpr double kSystemHeldEndsVR = 10.0; // seconds
 static constexpr double repeatDelay = 0.40;
 static constexpr double repeatInterval = 0.06;
 static constexpr double pointerShownFor = 8.0; // seconds after the last stick move
@@ -129,6 +130,18 @@ struct _WPEDisplayPS5Private {
     gpointer buttonHandlerData { nullptr };
     uint32_t swallowedButtons { 0 };
     bool padCaptured { false };
+    // What the pad read says about the system (logged on change): the read's
+    // result, the intercepted bit (the system's UI has the pad), connected.
+    // While captured, the system holding the pad for kSystemHeldEndsVR with
+    // no press reaching View in VR ends VR (the title must never be left in
+    // VR mode with no way out).
+    int padReadResult { 0 };
+    bool padIntercepted { false };
+    int padConnected { -1 };
+    unsigned padStateLogs { 0 };
+    double systemHeldSince { -1 };
+    double capturedPressAt { 0 };
+    bool systemHeldEndedVR { false };
     bool stickChord { false }; // L3 + R3 went down together: their own keys are not sent
     // UI mode (wpe_display_ps5_set_ui_mode): the application's own UI has
     // the pad; D-pad/L1/R1/L2/R2 presses repeat while held.
@@ -581,6 +594,45 @@ static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, uint32_t now,
         priv->uiPointerCallback(display, priv->pointerX, priv->pointerY, ry * 14.0, priv->uiPointerCallbackData);
 }
 
+// The system's hold on the pad: logged when it changes (a read failing, the
+// intercepted bit, connected), so a log shows whether presses could reach the
+// title at all. While View in VR has the pad, the system holding it for
+// kSystemHeldEndsVR seconds with no press getting through ends VR: on
+// 2026-11-02 the title entered VR mode with the PS VR2 unplugged and no
+// O/touchpad press ever reached it (nothing was logged in 466 s).
+static void padSystemState(WPEDisplayPS5* display, int readResult, const PS5PadData& data)
+{
+    auto* priv = display->priv;
+    const bool intercepted = !readResult && (data.buttons & PS5_PAD_INTERCEPTED);
+    const int connected = readResult ? priv->padConnected : data.connected;
+    if (readResult != priv->padReadResult || intercepted != priv->padIntercepted || connected != priv->padConnected) {
+        if (priv->padStateLogs < 40 || !(priv->padStateLogs % 100))
+            PS5_LOG("pad: read 0x%x, %s, connected %d%s (raw buttons 0x%x)", static_cast<unsigned>(readResult),
+                intercepted ? "intercepted by the system" : "not intercepted", connected, priv->padCaptured ? "; View in VR has the pad" : "",
+                readResult ? 0 : data.buttons);
+        priv->padStateLogs++;
+        priv->padReadResult = readResult;
+        priv->padIntercepted = intercepted;
+        priv->padConnected = connected;
+    }
+    const double t = nowSeconds();
+    const bool held = readResult || intercepted;
+    if (!held || !priv->padCaptured) {
+        priv->systemHeldSince = -1;
+        if (!priv->padCaptured)
+            priv->systemHeldEndedVR = false;
+        return;
+    }
+    if (priv->systemHeldSince < 0)
+        priv->systemHeldSince = t;
+    if (!priv->systemHeldEndedVR && t - priv->systemHeldSince >= kSystemHeldEndsVR && t - priv->capturedPressAt >= kSystemHeldEndsVR) {
+        priv->systemHeldEndedVR = true;
+        PS5_LOG("pad: the system has held the pad for %.0f s in View in VR (read 0x%x, intercepted %d): back to the TV", t - priv->systemHeldSince,
+            static_cast<unsigned>(readResult), intercepted);
+        PS5Renderer::singleton().endVR("The system had the controller for 10 s. Back on the TV.");
+    }
+}
+
 static void padTick(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
@@ -592,8 +644,11 @@ static void padTick(WPEDisplayPS5* display)
         return;
 
     PS5PadData data { };
-    if (scePadReadState(priv->pad, &data))
+    int readResult = scePadReadState(priv->pad, &data);
+    padSystemState(display, readResult, data);
+    if (readResult)
         return;
+    data.buttons &= ~PS5_PAD_INTERCEPTED;
 
     // While the on-screen keyboard is up, the pad belongs to it.
     if (priv->pendingText) {
@@ -646,6 +701,8 @@ static void padTick(WPEDisplayPS5* display)
     }
     if (pressed && priv->buttonHandler) {
         bool wasCaptured = priv->padCaptured;
+        if (wasCaptured)
+            priv->capturedPressAt = t;
         bool wasUI = priv->uiMode;
         bool taken = priv->buttonHandler(display, pressed, priv->buttonHandlerData);
         if (priv->padCaptured != wasCaptured || priv->uiMode != wasUI || priv->activeView != view)

@@ -21,11 +21,14 @@
  *   D-pad left/right seek -10 s / +10 s
  *   Triangle         next projection
  *   Square           recentre (the video's front where you look)
- *   Options          show the hint again
- *   O or touchpad    back to the TV (playback continues)
+ *   O, Options or    back to the TV (playback continues)
+ *   touchpad
  *
- * The TV shows a notice meanwhile. Without a headset the shortcut shows a
- * message on the TV instead.
+ * The TV shows a notice meanwhile, saying how to get back. Without a
+ * connected headset the shortcut shows "PS VR2 not connected" on the TV and
+ * stays there. VR also ends by itself when the headset is unplugged, when no
+ * head pose arrives within 15 s, and when the system holds the pad for 10 s
+ * (wpe-ps5), so the title is never left in VR mode with no way out.
  *
  * /data/ps5webkit/vr-selftest (with /data/ps5webkit/vr-sim, so no headset is
  * touched): a scripted log-only run after the first test page loads.
@@ -536,6 +539,8 @@ static void formatTime(double seconds, char* out, size_t size)
 #define CONTROLS_PLAYER "\xE2\x9C\x95 play/pause   \xE2\x97\x80 \xE2\x96\xB6 seek 10 s"
 #define CONTROLS_VIEW "\xE2\x96\xB3 projection   \xE2\x96\xA1 recentre   \xE2\x97\x8B exit"
 #define CONTROLS CONTROLS_PLAYER "    " CONTROLS_VIEW
+/* On the TV, whatever else it says: how to get back. */
+#define TV_BACK "Back to the TV: \xE2\x97\x8B, Options or the touchpad"
 
 /* status: e.g. "Playing  1:23 / 10:00" (NULL: none). */
 static void showHint(const char* status, double seconds)
@@ -543,8 +548,9 @@ static void showHint(const char* status, double seconds)
     char* label = projectionLabel(vrProjection, vrFisheye);
     char* hint = g_strdup_printf("%s\n%s%s%s%s%s", label, vrShown, *vrShown ? "\n" : "", status ? status : "", status ? "\n" : "",
         vrControls ? CONTROLS_PLAYER "\n" CONTROLS_VIEW : CONTROLS_VIEW "\n(no player controls on this page)");
-    char* tv = g_strdup_printf("Playing in the PS VR2 headset\n%s\n%s%s%s\n%s", vrTitle && *vrTitle ? vrTitle : "Video", label,
-        *vrShown ? "  \xC2\xB7  " : "", vrShown, vrControls ? CONTROLS : "\xE2\x97\x8B back to the TV");
+    char* tv = g_strdup_printf("Playing in the PS VR2 headset\n%s\n%s%s%s\n%s%s" TV_BACK, vrTitle && *vrTitle ? vrTitle : "Video", label,
+        *vrShown ? "  \xC2\xB7  " : "", vrShown, vrControls ? CONTROLS_PLAYER "   \xE2\x96\xB3 projection   \xE2\x96\xA1 recentre" : "",
+        vrControls ? "\n" : "");
     wpe_display_ps5_vr_set_text(vrDisplay, hint, seconds, tv);
     g_free(hint);
     g_free(tv);
@@ -632,7 +638,14 @@ static void rememberChoice(void)
 static void onVRState(WPEDisplayPS5* display, gboolean active, const char* message, gpointer data)
 {
     (void)display;
-    (void)data;
+    if (active && GPOINTER_TO_UINT(data) != vrSeq) {
+        /* Left (O, another page, the wind-down) while the headset was
+         * coming up: the render thread may have taken the stop after the
+         * start, so make sure it is down. */
+        spike_log("vr: the headset came up after leaving was asked: stopping it");
+        wpe_display_ps5_vr_stop(vrDisplay, FALSE);
+        return;
+    }
     vrStarting = FALSE;
     vrOn = active;
     if (active) {
@@ -643,7 +656,7 @@ static void onVRState(WPEDisplayPS5* display, gboolean active, const char* messa
     rememberChoice();
     SPIKE_RESULT("vr", "INFO", "not in VR: %s", message ? message : "");
     if (message && *message)
-        wpe_display_ps5_show_message(vrDisplay, message, 5);
+        wpe_display_ps5_show_message(vrDisplay, message, 8);
 }
 
 /* The guess from what is known so far (the page's hints, the thumbnails),
@@ -728,7 +741,7 @@ static void startWhenReady(void)
     vrProjection = projection;
     vrFisheye = fisheye;
     spike_log("vr: player controls %s", vrControls ? "yes" : "no (no <video> found in the page)");
-    wpe_display_ps5_vr_start(vrDisplay, (WPEDisplayPS5VRProjection)projection, fisheye, onVRState, NULL);
+    wpe_display_ps5_vr_start(vrDisplay, (WPEDisplayPS5VRProjection)projection, fisheye, onVRState, GUINT_TO_POINTER(vrSeq));
     if (!vrGuessConclusive && !vrRemembered)
         g_timeout_add_seconds(3, refineGuess, GUINT_TO_POINTER(vrSeq));
 }
@@ -836,22 +849,32 @@ gboolean ps5wk_vr_active(void)
     return vrOn;
 }
 
+/* O, Options or the touchpad: back to the TV, at any time in VR (also while
+ * the headset comes up). */
+#define LEAVE_BUTTONS (WPE_DISPLAY_PS5_BUTTON_CIRCLE | WPE_DISPLAY_PS5_BUTTON_OPTIONS | WPE_DISPLAY_PS5_BUTTON_TOUCHPAD)
+
 static gboolean onButtons(WPEDisplayPS5* display, guint32 pressed, gpointer data)
 {
     (void)display;
     (void)data;
     if (!vrOn && !vrStarting) {
         if (pressed & WPE_DISPLAY_PS5_BUTTON_TOUCHPAD) {
+            spike_log("vr: touchpad pressed: View in VR");
             ps5wk_vr_toggle();
             return TRUE;
         }
         return FALSE;
     }
+    /* Every press in VR is logged: whether presses reach the title at all
+     * (2026-11-02: none was seen in 466 s of VR mode without a headset). */
+    spike_log("vr: pad 0x%x in VR%s", (unsigned)pressed, vrStarting ? " (headset coming up)" : "");
+    if (pressed & LEAVE_BUTTONS) {
+        ps5wk_vr_stop(FALSE, vrStarting ? "pad, while the headset came up" : "pad");
+        return TRUE;
+    }
     if (vrStarting)
         return TRUE; /* the headset is coming up: the pad is ours already */
-    if (pressed & (WPE_DISPLAY_PS5_BUTTON_CIRCLE | WPE_DISPLAY_PS5_BUTTON_TOUCHPAD))
-        ps5wk_vr_stop(FALSE, "pad");
-    else if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS)
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS)
         vrControls ? pageCommand("toggle", 0, NULL) : showHint(NULL, 4);
     else if (pressed & WPE_DISPLAY_PS5_BUTTON_LEFT)
         vrControls ? pageCommand("seek", -10, "-10 s") : showHint(NULL, 4);
@@ -862,8 +885,7 @@ static gboolean onButtons(WPEDisplayPS5* display, guint32 pressed, gpointer data
     else if (pressed & WPE_DISPLAY_PS5_BUTTON_SQUARE) {
         wpe_display_ps5_vr_recenter(vrDisplay);
         showHint("Recentred", 2);
-    } else if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS)
-        vrControls ? pageCommand("status", 0, NULL) : showHint(NULL, 6);
+    }
     return TRUE;
 }
 
@@ -962,7 +984,7 @@ static gboolean selftestTick(gpointer data)
         ps5wk_vr_toggle();
         return G_SOURCE_CONTINUE;
     }
-    if (!vrOn && step < 1 + 2 * nLooks + 2 * nProj + 10) {
+    if (!vrOn && step < 1 + 2 * nLooks + 2 * nProj + 9) {
         SPIKE_FAIL("vr-selftest", "not in VR at step %u", step);
         return G_SOURCE_REMOVE;
     }
@@ -1007,24 +1029,32 @@ static gboolean selftestTick(gpointer data)
     case 4: wpe_display_ps5_vr_sim_look(vrDisplay, 45, 0); return G_SOURCE_CONTINUE;
     case 5: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_SQUARE, NULL); return G_SOURCE_CONTINUE;   /* recentre at 45 */
     case 6: selftestShot("recentred-at-45"); return G_SOURCE_CONTINUE;
-    case 7: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_OPTIONS, NULL); return G_SOURCE_CONTINUE;
-    case 8: pageCommand("seek", -40, "-40 s (test)"); return G_SOURCE_CONTINUE; /* time left for the re-entries */
-    case 9: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_CIRCLE, NULL); return G_SOURCE_CONTINUE;   /* leave */
+    case 7: pageCommand("seek", -40, "-40 s (test)"); return G_SOURCE_CONTINUE; /* time left for the re-entries */
+    case 8: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_CIRCLE, NULL); return G_SOURCE_CONTINUE;   /* leave with O */
     default: break;
     }
-    step -= 10;
-    /* then enter and leave again, three times */
+    step -= 9;
+    /* then enter (touchpad) and leave again, three times: with the touchpad,
+     * Options and O */
+    static const guint32 leave[] = { WPE_DISPLAY_PS5_BUTTON_TOUCHPAD, WPE_DISPLAY_PS5_BUTTON_OPTIONS, WPE_DISPLAY_PS5_BUTTON_CIRCLE };
+    static const char* const leaveName[] = { "touchpad", "Options", "O" };
     if (selftestCycles < 3) {
         if (step % 3 == 0)
-            ps5wk_vr_toggle();
+            onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_TOUCHPAD, NULL);
         else if (step % 3 == 1) {
             if (!vrOn) {
                 SPIKE_FAIL("vr-selftest", "re-entry %u did not reach VR", selftestCycles + 1);
                 return G_SOURCE_REMOVE;
             }
-            ps5wk_vr_toggle();
-        } else
+            onButtons(vrDisplay, leave[selftestCycles], NULL);
+        } else {
+            if (vrOn || wpe_display_ps5_vr_is_active(vrDisplay)) {
+                SPIKE_FAIL("vr-selftest", "%s did not leave VR (re-entry %u)", leaveName[selftestCycles], selftestCycles + 1);
+                return G_SOURCE_REMOVE;
+            }
+            spike_log("vr-selftest: %s left VR (re-entry %u)", leaveName[selftestCycles], selftestCycles + 1);
             selftestCycles++;
+        }
         return G_SOURCE_CONTINUE;
     }
     SPIKE_PASS("vr-selftest", "%u eye-buffer captures, %u projections, controls, 4 entries in %.0f s; VR %s now",
@@ -1033,9 +1063,41 @@ static gboolean selftestTick(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* /data/ps5webkit/vr-sim-untracked (with vr-sim and vr-selftest): the
+ * simulated headset gives no head pose; VR must end by itself (no tracking
+ * within 15 s) and the TV get its message. */
+static unsigned untrackedSeconds;
+static gboolean untrackedTick(gpointer data)
+{
+    (void)data;
+    untrackedSeconds++;
+    if (untrackedSeconds == 1 && !vrOn && !vrStarting) {
+        SPIKE_FAIL("vr-selftest-untracked", "did not enter VR");
+        return G_SOURCE_REMOVE;
+    }
+    if (vrOn || vrStarting || wpe_display_ps5_vr_is_active(vrDisplay)) {
+        if (untrackedSeconds > 25) {
+            SPIKE_FAIL("vr-selftest-untracked", "still in VR after %u s without a head pose; leaving", untrackedSeconds);
+            ps5wk_vr_stop(FALSE, "self-test");
+            return G_SOURCE_REMOVE;
+        }
+        return G_SOURCE_CONTINUE;
+    }
+    SPIKE_PASS("vr-selftest-untracked", "VR ended by itself %.0f s after entering without a head pose",
+        (g_get_monotonic_time() - selftestEnterStart) / 1e6);
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean selftestStart(gpointer data)
 {
     (void)data;
+    struct stat st;
+    if (stat("/data/ps5webkit/vr-sim-untracked", &st) == 0) {
+        selftestEnterStart = g_get_monotonic_time();
+        onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_TOUCHPAD, NULL);
+        g_timeout_add(1000, untrackedTick, NULL);
+        return G_SOURCE_REMOVE;
+    }
     selftestTick(NULL);
     g_timeout_add(1500, selftestTick, NULL);
     return G_SOURCE_REMOVE;

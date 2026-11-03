@@ -70,6 +70,7 @@ enum : uint32_t {
     PS5_PAD_CROSS = 0x00004000,
     PS5_PAD_SQUARE = 0x00008000,
     PS5_PAD_TOUCHPAD = 0x00100000,
+    PS5_PAD_INTERCEPTED = 0x80000000, // the system has the pad (its UI in front); the buttons read 0
 };
 
 // libSceImeDialog (PS4-compatible layout, as OpenOrbis documents it; text is

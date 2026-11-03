@@ -280,7 +280,37 @@ static struct {
     layer_set_t sets[PSVR2_MAX_BUFFERS];
     uint64_t frame, next_begin;
     unsigned submits, errors;
+    int require_headset, no_headset;
+    uint32_t dev_status;
+    int dev_worn, dev_lens;
 } g = {.hmd = -1, .vh = -1};
+
+void psvr2_require_headset(int on)
+{
+    g.require_headset = on != 0;
+}
+
+int psvr2_device_status(uint32_t *status, int *worn, int *lens_mm)
+{
+    int rc = 0;
+    if (g.open) {
+        uint8_t info[64];
+        memset(info, 0, sizeof info);
+        rc = sceHmd2GetDeviceInformation(info);
+        if (rc == 0) {
+            g.dev_status = *(uint32_t *)info;
+            g.dev_worn = info[20];
+            g.dev_lens = info[21];
+        }
+    }
+    if (status)
+        *status = g.dev_status;
+    if (worn)
+        *worn = g.dev_worn;
+    if (lens_mm)
+        *lens_mm = g.dev_lens;
+    return rc;
+}
 
 int psvr2_preload(void)
 {
@@ -329,10 +359,23 @@ static int open_(int user_id)
     uint8_t info[64];
     memset(info, 0, sizeof info);
     rc = sceHmd2GetDeviceInformation(info);
+    g.dev_status = *(uint32_t *)info;
+    g.dev_worn = info[20];
+    g.dev_lens = info[21];
     logf_("psvr2: sceHmd2Open -> 0x%08x; status %u worn %u lens %u mm", g.hmd, *(uint32_t *)info,
           info[20], info[21]);
     if (g.hmd < 0)
         return -1;
+    /* Without a headset Hmd2 still opens (status 2, lens 0 mm), and so do the
+     * tracker, the reprojection and VR mode: the title then sat in VR mode
+     * with nothing to show it in and the pad gone to the system. Connected,
+     * worn or not, reads status 0. */
+    if (g.require_headset && (rc != 0 || g.dev_status != 0)) {
+        logf_("psvr2: no PS VR2 headset (device information 0x%08x, status %u): not entering VR", rc,
+              g.dev_status);
+        g.no_headset = 1;
+        return -1;
+    }
 
     uint32_t qparam[8] = {0x20, 0};
     uint32_t qout[8] = {0};
@@ -389,9 +432,10 @@ int psvr2_open(int user_id)
         return 0;
     if (psvr2_preload() != 0)
         return -1;
+    g.no_headset = 0;
     if (open_(user_id) != 0) {
         teardown();
-        return -1;
+        return g.no_headset ? PSVR2_NO_HEADSET : -1;
     }
     g.open = 1;
     return 0;

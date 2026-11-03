@@ -1637,14 +1637,16 @@ minutes). In VR the whole pad belongs to it:
 | D-pad left / right | seek -10 s / +10 s |
 | Triangle | next projection: flat, 180 SBS, 180 TB, 180 mono, 360 mono, 360 TB, 360 SBS, fisheye SBS |
 | Square | recentre (the video's front goes where you look; yaw only) |
-| Options | show the hint again |
-| O or touchpad | back to the TV, playback continues |
+| O, Options or touchpad | back to the TV, playback continues (also while the headset is coming up) |
 
 The headset shows a hint for a few seconds after entering and after each
 press (projection, playing/paused and time, the controls); the TV shows
 "Playing in the PS VR2 headset", the page title, the projection and the
-controls. Without a headset the TV shows "No PS VR2 headset found..." and
-nothing else happens. Leaving a page, a WebProcess crash and the title's
+controls, and always "Back to the TV: ○, Options or the touchpad". Without a
+connected headset the TV shows "PS VR2 not connected..." for 8 s and nothing
+else happens (no VR mode; see *No headset* below). VR also ends by itself,
+with a message on the TV, when the headset is unplugged, when no head pose
+arrives within 15 s, and when the system holds the pad for 10 s. Leaving a page, a WebProcess crash and the title's
 wind-down (`tools/launch.sh --stop`) leave VR first; the wind-down waits for
 the headset to be released.
 
@@ -1786,8 +1788,12 @@ screen capture request reads them back (`[vr] SHOT`). `/data/ps5webkit/vr-selfte
 (only with `vr-sim`): after the first test URL loads, enters VR through the
 same path as the touchpad, captures the eye buffers looking front, right,
 back, left, up and down, cycles every projection, presses X, right, left, X,
-Square, Options and O, then enters and leaves three more times
-(`RESULT ps5browser vr-selftest`). `/data/ps5webkit/vr-guesstest` (only with
+Square and O, then enters with the touchpad and leaves three more times
+(touchpad, Options, O)
+(`RESULT ps5browser vr-selftest`). `/data/ps5webkit/vr-sim-untracked` (with
+`vr-sim` and `vr-selftest`): the simulated headset gives no head pose; the
+self-test enters and checks that VR ends by itself within 25 s
+(`RESULT ps5browser vr-selftest-untracked`). `/data/ps5webkit/vr-guesstest` (only with
 `vr-sim`; lines `<part of the address> <projection number>`): after every
 test URL, enters VR, checks the guess (`RESULT ps5browser vr-guess ... guess`),
 presses Triangle and leaves, enters again (`... remembered`: the choice is
@@ -1856,6 +1862,65 @@ MB, all rc 0). Two problems:
   back to software and plays; self-test PASS both times. Next: rewriting
   the SPS level (general_level_idc) to 6.1 for such streams could keep them
   on the hardware decoder.
+
+**No headset (2026-11-02, fixed 2026-11-03).** The owner pressed the
+touchpad by accident with the PS VR2 unplugged, twice (tv26, tv33): View in
+VR went all the way into VR mode and could not be left. Hmd2 opens without
+a headset (`sceHmd2Open` gives a handle, `status 2 worn 0 lens 0 mm`), and so
+do the tracker, the reprojection, `EnableVrMode`, `RegisterBuffers2` and 120 Hz
+output: the title then submitted 60 frames/s for 466 s with 0 tracked poses.
+No pad press reached View in VR in either session (nothing was logged, and an
+O or touchpad press would have logged `vr: back to the TV (pad)`; the
+controls worked in *Headset test 1*), so the system presumably had the pad
+(the TV may have shown a system notice instead of ours). The PS5's own close
+did not end the process either; only the launcher's `quit` (wind-down) did.
+The title handles no system events: its only clean exits are the launcher's
+`quit`, *Restart browser* and a SIGKILL; a system close is ShellUI's
+suspend-then-kill (FEASIBILITY R12), which apparently did not complete while
+the title held VR mode (not reproduced). Fixes:
+- *Connected* is device status 0 (every headset session: `status 0 worn 1
+  lens 63-68 mm`, once `status 0 worn 0 lens 66 mm` off the head); unplugged
+  is status 2, lens 0 (every `vr-probe` and both incidents). `psvr2_open`
+  with `psvr2_require_headset(1)` (the title) stops right after
+  `sceHmd2Open` when the status is not 0 (or the read fails), closes Hmd2 and
+  returns `PSVR2_NO_HEADSET`: no tracker, reprojection or VR mode. The TV
+  says "PS VR2 not connected. Connect the headset, turn it on and press the
+  touchpad again." and the log `[vr] PS VR2 not connected (device status 2,
+  ...): staying on the TV`. The spikes and `vr-probe` keep the old behaviour.
+- In VR the render thread reads the device status every second (`[vr]
+  headset device status 0, worn (lens 66 mm) after 1.0 s`, and on every
+  change); status not 0 twice in a row ends VR ("not connected any more").
+  No tracked pose at all within 15 s of entering ends VR too (a headset
+  that never shows up; 15 s leaves time to put it on after pressing the
+  touchpad).
+- The pad: every press in VR is logged (`vr: pad 0x2000 in VR`), and the
+  display logs when the pad read starts or stops failing, the system's
+  *intercepted* bit (0x80000000: its UI has the pad, the buttons read 0)
+  and the connected flag (`pad: read 0x0, intercepted by the system, ...;
+  View in VR has the pad`). While View in VR has the pad, the system holding
+  it (read failing or intercepted) for 10 s with no press getting through
+  ends VR ("The system had the controller for 10 s"), so a system menu or
+  close is never stuck behind VR mode. O, Options and the touchpad all leave
+  (Options used to show the hint again), also while the headset comes up;
+  the TV notice says so on its last line.
+- A stop asked while the headset was coming up could leave the title
+  thinking it was in VR (the start finished after the stop was queued):
+  the start's answer now carries the entry's number and a stale one stops
+  the headset again.
+- **`unregister 0x80290009`** is VideoOut's RESOURCE_BUSY: the buffer set on
+  screen cannot be unregistered (PS5VR's notes say the same of the TV). It
+  shows on every stop after frames were flipped, including all the
+  sessions of *Headset test 1*, which re-entered cleanly many times; the
+  `sceVideoOutClose` right after returns 0 and releases the set, then the
+  tracker, reprojection and Hmd2 close with 0 and the 129 MB go back. The
+  order (DisableVrMode, unregister with 0.5 s of retries, VideoOut close,
+  tracker unregister/finalize, reprojection terminate, Hmd2 close/terminate,
+  direct memory, then the GL eye buffers) is PS5VR's. Nothing in it points
+  at the console dropping off the network after the relaunch: the wind-down
+  released everything (all rc 0, `released in 878 ms`), main returned and the
+  launcher killed the title; the new process died while starting its network
+  process, before any VR call. Cause unknown; 466 s of VR mode without a
+  headset beforehand is the only unusual thing.
 
 Not done: YouTube's own 360/180 formats. Its player data says
 `projectionType` per format (read and logged; `EQUIRECTANGULAR` and
