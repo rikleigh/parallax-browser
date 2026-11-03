@@ -2,7 +2,8 @@
 # Upload a folder title to the console's /data/homebrew/<TITLE_ID> over
 # ftpsrv (port 2121). tools/launch.sh --install also registers and launches
 # it. A title that is already registered keeps a copy of its
-# param.json in /user/app/<TITLE_ID>/sce_sys, refreshed here too.
+# param.json, icon0.png and backgrounds in /user/app/<TITLE_ID>/sce_sys,
+# refreshed here too.
 #   tools/upload-title.sh spikes/08-title-ipc/build/titles/PPSA99009
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,6 +17,10 @@ ftp="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
     echo "  $f"
 done
 if curl -sS --max-time 5 "$ftp/user/app/$id/sce_sys/" >/dev/null 2>&1; then
-    curl -sS -T "$dir/sce_sys/param.json" "$ftp/user/app/$id/sce_sys/param.json" && echo "  (registered copy of param.json refreshed)"
+    for f in param.json icon0.png pic0.png pic0.dds pic1.dds; do
+        if [[ -f $dir/sce_sys/$f ]]; then
+            curl -sS -T "$dir/sce_sys/$f" "$ftp/user/app/$id/sce_sys/$f" && echo "  (registered copy of $f refreshed)"
+        fi
+    done
 fi
 echo "uploaded $id to /data/homebrew/$id"

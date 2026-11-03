@@ -18,7 +18,7 @@ ROOT="$(cd "$PORT/../.." && pwd)"
 . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
 
 TITLE="${TITLE:-PPSA99020}"
-NAME="${NAME:-ps5webkit browser}"
+NAME="${NAME:-Parallax Browser}"
 WK="$ROOT/toolchain/wpe-webkit"
 BLD="${BLD:-$WK/build}"
 OUT="${OUT:-$WK/titles}"
@@ -161,6 +161,15 @@ title_link "${defsyms[@]}" "$W/importcheck.o"
 app="$OUT/$TITLE"; rm -rf -- "$app"; mkdir -p "$app/sce_sys" "$app/sce_module"
 "$TOOL" self --sign --in "$W/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F
 cp "$NATIVE/runtime/libc.prx" "$app/sce_module/libc.prx"
+# Home screen icon (512x512 RGB PNG) and background: the system shows
+# pic0.dds/pic1.dds (3840x2160 BC7, as its own titles have), made here from
+# pic0.png (3840x2160) by tools/bc7dds.c.
+cp "$HERE/sce_sys/icon0.png" "$HERE/sce_sys/pic0.png" "$app/sce_sys/"
+BC7DDS="$W/bc7dds"
+[[ $BC7DDS -nt $ROOT/tools/bc7dds.c ]] || cc -O2 -o "$BC7DDS" "$ROOT/tools/bc7dds.c" -lm
+sips -s format bmp "$HERE/sce_sys/pic0.png" --out "$W/pic0.bmp" >/dev/null
+"$BC7DDS" "$W/pic0.bmp" "$app/sce_sys/pic0.dds" 3
+"$BC7DDS" "$W/pic0.bmp" "$app/sce_sys/pic1.dds" 1
 prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
 # The ad blocker (port/webkit/ADBLOCK.md): uBO Lite's rules converted for
 # WebKit (tools/ubol-convert.js, pinned release; generated, never committed)

@@ -1818,7 +1818,7 @@ int main(int argc, char** argv)
     g_log_set_default_handler(logHandler, NULL);
     spike_log("ps5browser: WPE WebKit %u.%u.%u, pid %d, build %s", webkit_get_major_version(), webkit_get_minor_version(),
         webkit_get_micro_version(), (int)getpid(), ps5wk_title_build_id ? ps5wk_title_build_id() : "(payload)");
-    spike_notify("ps5webkit browser starting");
+    spike_notify("Parallax Browser starting");
     memLog("main");
     if (ps5wk_title_check_imports) {
         static char names[1024];
