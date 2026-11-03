@@ -1,0 +1,258 @@
+diff --git a/Source/WebCore/html/HTMLMediaElement.cpp b/Source/WebCore/html/HTMLMediaElement.cpp
+index 8273619a1a..1678c1efa6 100644
+--- a/Source/WebCore/html/HTMLMediaElement.cpp
++++ b/Source/WebCore/html/HTMLMediaElement.cpp
+@@ -274,6 +274,10 @@ struct LogArgument<URL> {
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++static bool ps5QuietsHiddenPages();
++#endif
++
+ using TextTrackCueIntervalTree = PODIntervalTree<MediaTime, CheckedPtr<TextTrackCue>>;
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(HTMLMediaElement);
+@@ -739,6 +743,12 @@ void HTMLMediaElement::initializeMediaSession()
+ 
+     if (document->settings().requiresUserGestureToStartAudiblePlaybackWhenHidden())
+         mediaSession->addBehaviorRestriction(MediaElementSession::RequireUserGestureToStartAudiblePlaybackWhenHidden);
++#if defined(PS5_PAYLOAD_SDK)
++    // ... and a hidden page doesn't start playing with sound by itself (the
++    // next item of a playlist).
++    else if (ps5QuietsHiddenPages())
++        mediaSession->addBehaviorRestriction(MediaElementSession::RequireUserGestureToStartAudiblePlaybackWhenHidden);
++#endif
+ 
+     if (document->ownerElement() || !document->isMediaDocument()) {
+         if (m_shouldVideoPlaybackRequireUserGesture) {
+@@ -7446,8 +7456,31 @@ bool HTMLMediaElement::elementIsHidden() const
+     return protect(document())->hidden() && (!m_player || !m_player->isVisibleForCanvas());
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5 browser (live background tabs): media of a hidden page is quiet.
++// PS5WK_BACKGROUND_AUDIO=1 (child.env) lets it play on.
++static bool ps5QuietsHiddenPages()
++{
++    static const bool quiet = [] {
++        const char* text = getenv("PS5WK_BACKGROUND_AUDIO");
++        return !text || strcmp(text, "1");
++    }();
++    return quiet;
++}
++#endif
++
+ void HTMLMediaElement::visibilityStateChanged()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // A page hidden (its tab no longer shown) pauses what plays with sound,
++    // as the user's pause would: shown again it stays paused until played.
++    // Muted playback is left to the media session (suspended while hidden,
++    // resumed when shown), as before.
++    if (ps5QuietsHiddenPages() && protect(document())->hidden() && !paused() && !muted() && volume() > 0 && (!isVideo() || readyState() < HAVE_METADATA || hasAudio())) {
++        WTFLogAlways("[media] page hidden: pausing %s playing with sound at %.1f s", isVideo() ? "a video" : "an audio element", currentTime()); // NOLINT
++        pauseInternal();
++    }
++#endif
+     bool elementIsHidden = this->elementIsHidden();
+     if (elementIsHidden == m_elementIsHidden)
+         return;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 51c80bf26c..6e2f8e305c 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -983,19 +983,28 @@ void SceneHost::checkGLMemory()
+     if (!m_shownPage || m_glState == GLMemoryState::Fallback)
+         return;
+     // Hidden pages' scenes (the browser's live background tabs) hold
+-    // textures too: near the cap, the embedder is asked to let them go
++    // textures too: over the cap, the embedder is asked to let them go
+     // (ps5wk_wc_set_hidden_pages_callback) before the shown page loses
+-    // tile coverage; at most every 5 s.
+-    if (m_glState == GLMemoryState::Normal && mb > logMB && !m_hiddenScenes.empty() && s_hiddenPagesCallback
++    // tile coverage; at most every 5 s. Not at the log line (80% of the
++    // cap): a heavy page's texture pool alone passes it for a second or two
++    // while it scrolls (2026-11-03: 129 MB smoothed, 219 MB in one frame,
++    // 150 MB of it the pool, with a 16 MB hidden scene), and the hidden tab
++    // went every time that page was shown.
++    if (m_glState == GLMemoryState::Normal && mb > capMB && !m_hiddenScenes.empty() && s_hiddenPagesCallback
+         && (!m_hiddenPressureAt || now - m_hiddenPressureAt >= 5_s)) {
+         m_hiddenPressureAt = now;
+-        WTFLogAlways("[wc] GL textures %.1f MB with %zu hidden scenes: asking for the hidden pages to go", mb, m_hiddenScenes.size()); // NOLINT
++        WTFLogAlways("[wc] GL textures %.1f MB over the %.0f MB cap (texture pool %.1f MB) with %zu hidden scenes: asking for the hidden pages to go", mb, capMB, // NOLINT
++            BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, m_hiddenScenes.size());
+         RunLoop::mainSingleton().dispatch([mb] {
+             if (auto callback = s_hiddenPagesCallback.load())
+                 callback(mb);
+         });
+         return;
+     }
++    // Their textures go with their scenes, and the ~1 s average follows:
++    // the shown page keeps its coverage meanwhile.
++    if (m_glState == GLMemoryState::Normal && m_hiddenPressureAt && now - m_hiddenPressureAt < 2_s && mb < emergencyMB)
++        return;
+     uint64_t page = *m_shownPage;
+     auto post = [page](DrawingAreaProxyWCPS5::GLMemoryAction action) {
+         RunLoop::mainSingleton().dispatch([page, action] {
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 6b3704d9a9..ab536dcf2f 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -211,6 +211,11 @@ public:
+ 
+     bool isActive() const { return m_active; }
+ 
++    // The drawing area that drives this monitor (its replies and idle timer
++    // fire it); null while there is none.
++    DrawingAreaWC* drawingArea() const { return m_drawingArea.get(); }
++    void setDrawingArea(DrawingAreaWC* drawingArea) { m_drawingArea = drawingArea; }
++
+     void fire()
+     {
+         if (!m_active)
+@@ -249,12 +254,67 @@ private:
+     DisplayUpdate m_update { 0, FullSpeedFramesPerSecond };
+ };
+ 
++// The process's monitor (DisplayRefreshMonitorManager keeps it for good)
++// and the drawing areas alive, for handing it on.
++static RefPtr<DrawingAreaWC::DisplayRefreshMonitorWC>& sharedDisplayRefreshMonitorWC()
++{
++    static NeverDestroyed<RefPtr<DrawingAreaWC::DisplayRefreshMonitorWC>> monitor;
++    return monitor.get();
++}
++
++static Vector<DrawingAreaWC*>& liveDrawingAreasWC()
++{
++    static NeverDestroyed<Vector<DrawingAreaWC*>> areas;
++    return areas.get();
++}
++
+ RefPtr<DisplayRefreshMonitor> DrawingAreaWC::createDisplayRefreshMonitor(PlatformDisplayID displayID)
+ {
+     m_displayRefreshMonitor = DisplayRefreshMonitorWC::create(*this, displayID);
++    sharedDisplayRefreshMonitorWC() = m_displayRefreshMonitor;
+     return m_displayRefreshMonitor;
+ }
+ 
++// This drawing area drives the process's monitor from now on (its page was
++// shown, or the one that drove it went). Raw pointers only: it also runs
++// from ~DrawingAreaWC.
++void DrawingAreaWC::adoptDisplayRefreshMonitor(const char* why)
++{
++    auto* monitor = sharedDisplayRefreshMonitorWC().get();
++    if (!monitor)
++        return;
++    DrawingAreaWC* previous = monitor->drawingArea();
++    if (previous == this)
++        return;
++    if (previous) {
++        previous->m_displayRefreshMonitor = nullptr;
++        previous->m_idleDisplayRefreshTimer.stop();
++    }
++    m_displayRefreshMonitor = monitor;
++    monitor->setDrawingArea(this);
++    WTFLogAlways("[render] refresh clock (rAF): drawing area %llu drives it now (%s; it was %s, %s)", static_cast<unsigned long long>(identifier().toUInt64()), why, // NOLINT
++        previous ? "another page's" : "nobody's", monitor->isActive() ? "a refresh asked for" : "idle");
++    // A refresh asked for while the previous one drove it (or while nobody
++    // did) still comes.
++    if (monitor->isActive())
++        displayRefreshMonitorStarted();
++}
++
++void DrawingAreaWC::activityStateDidChange(OptionSet<ActivityState> changed, ActivityStateChangeID, CompletionHandler<void()>&& completionHandler)
++{
++    // The page shown (WebPage updated WebCore's page first): rAF follows its
++    // presents, not a hidden page's.
++    if ((changed & ActivityState::IsVisible) && isPageVisible())
++        adoptDisplayRefreshMonitor("page shown");
++    completionHandler();
++}
++
++bool DrawingAreaWC::isPageVisible() const
++{
++    auto* page = m_webPage.ptrAllowingHashTableEmptyValue();
++    return page && page->activityState().contains(ActivityState::IsVisible);
++}
++
+ // Whether a refresh asked for after a reply (nothing in flight) fires at
+ // once (the default) or a frame after the reply (the M2 behaviour,
+ // PS5WK_WC_REFRESH_NOW=0). An update asked for just after a reply (a wheel
+@@ -336,12 +396,42 @@ DrawingAreaWC::DrawingAreaWC(WebPage& webPage, const WebPageCreationParameters&
+     if (WCTilePainter::isEnabled())
+         m_tilePainter = makeUnique<WCTilePainter>();
+ #endif
++#if !ENABLE(GPU_PROCESS)
++    liveDrawingAreasWC().append(this);
++    // The process's monitor without a drawing area (the last one went): this
++    // one drives it.
++    if (auto* monitor = sharedDisplayRefreshMonitorWC().get(); monitor && !monitor->drawingArea())
++        adoptDisplayRefreshMonitor("no drawing area drove it");
++#endif
+ }
+ 
+ DrawingAreaWC::~DrawingAreaWC()
+ {
+     while (auto layer = m_liveGraphicsLayers.removeHead())
+         layer->clearObserver();
++#if !ENABLE(GPU_PROCESS)
++    liveDrawingAreasWC().removeFirst(this);
++    m_idleDisplayRefreshTimer.stop();
++    // This drawing area drove the process's monitor (a closed or discarded
++    // tab): another page's takes it, a shown page's first, so that rAF and
++    // the rendering updates of the pages left keep their clock (without
++    // this they lost it for good: rAF only ran when something else started
++    // a rendering update).
++    if (auto* monitor = sharedDisplayRefreshMonitorWC().get(); monitor && monitor->drawingArea() == this) {
++        m_displayRefreshMonitor = nullptr;
++        monitor->setDrawingArea(nullptr);
++        DrawingAreaWC* successor = nullptr;
++        for (auto* area : liveDrawingAreasWC()) {
++            bool visible = area->isPageVisible();
++            if (!successor || visible)
++                successor = area;
++            if (visible)
++                break;
++        }
++        if (successor)
++            successor->adoptDisplayRefreshMonitor("the page that drove it went");
++    }
++#endif
+ }
+ 
+ GraphicsLayerFactory* DrawingAreaWC::graphicsLayerFactory()
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index 65c58880a6..daa731eafb 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -93,10 +93,20 @@ private:
+     // update's reply (sent after the swap that shows it), or at most at
+     // 60 Hz by a timer while no update is in flight.
+     RefPtr<WebCore::DisplayRefreshMonitor> createDisplayRefreshMonitor(WebCore::PlatformDisplayID) override;
++public:
+     class DisplayRefreshMonitorWC;
++private:
+     void displayRefreshMonitorStarted();
+     void fireDisplayRefreshMonitor();
+     void idleDisplayRefreshTimerFired();
++    // WebCore keeps one DisplayRefreshMonitor per display for the whole
++    // process, made by the first drawing area that asked: with several pages
++    // (the PS5 browser's live tabs) it is driven by one drawing area at a
++    // time, the shown page's, and handed on when that one goes; the others
++    // keep their own m_displayRefreshMonitor null.
++    void adoptDisplayRefreshMonitor(const char* why);
++    bool isPageVisible() const;
++    void activityStateDidChange(OptionSet<WebCore::ActivityState>, ActivityStateChangeID, CompletionHandler<void()>&&) override;
+ #endif
+     // GraphicsLayerWC::Observer
+     void graphicsLayerAdded(GraphicsLayerWC&) override;
+@@ -150,7 +160,7 @@ private:
+     WebCore::IntSize m_scrollOffset;
+     CompletionHandler<void()> m_forceRepaintCompletionHandler;
+ #if !ENABLE(GPU_PROCESS)
+-    RefPtr<DisplayRefreshMonitorWC> m_displayRefreshMonitor; // detached in ~DrawingAreaWC
++    RefPtr<DisplayRefreshMonitorWC> m_displayRefreshMonitor; // the process's monitor while this drawing area drives it, else null
+     WebCore::Timer m_idleDisplayRefreshTimer;
+     MonotonicTime m_lastDisplayRefresh;
+     bool m_lastDisplayRefreshWasReply { false }; // the last monitor fire came from a reply
