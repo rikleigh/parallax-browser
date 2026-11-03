@@ -322,15 +322,16 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
     wpe_display_ps5_canvas_fill_gradient(c, 0, 0, screenW, BAR_H, 0, PX_A(PX_BASE, 0xf6), PX_A(PX_SURFACE, 0xee), TRUE);
     wpe_display_ps5_canvas_fill(c, 0, BAR_H - 1, screenW, 1, 0, PX_A(PX_LINE, 0xff));
 
-    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "+" };
-    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, s->canNewTab };
+    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "+", "⚙" };
+    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
     int x = EDGE;
     for (int i = TB_BACK; i <= TB_HOME; i++) {
         drawButton(c, x, BTN_Y, BTN_W, BTN_H, labels[i], enabled[i] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == i, interactive ? i : -1);
         x += BTN_W + GAP;
     }
-    /* the right: new tab, bookmark, the tab count */
-    const int newTabX = screenW - EDGE - BTN_W, starX = newTabX - GAP - BTN_W, countX = starX - GAP - 64;
+    /* the right: settings, new tab, bookmark, the tab count */
+    const int settingsX = screenW - EDGE - BTN_W, newTabX = settingsX - GAP - BTN_W, starX = newTabX - GAP - BTN_W, countX = starX - GAP - 64;
+    drawButton(c, settingsX, BTN_Y, BTN_W, BTN_H, labels[TB_SETTINGS], PX_TEXT, toolbar && s->toolbarFocus == TB_SETTINGS, interactive ? TB_SETTINGS : -1);
     drawButton(c, newTabX, BTN_Y, BTN_W, BTN_H, labels[TB_NEWTAB], enabled[TB_NEWTAB] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == TB_NEWTAB,
         interactive ? TB_NEWTAB : -1);
     drawButton(c, starX, BTN_Y, BTN_W, BTN_H, s->starred ? "★" : "☆", s->starred ? PX_PINK : PX_TEXT, toolbar && s->toolbarFocus == TB_STAR,

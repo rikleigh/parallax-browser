@@ -245,6 +245,10 @@ int main(int argc, char** argv)
     menuShot("menu-toolbar-star-loading", &s);
 
     s = baseState();
+    s.toolbarFocus = TB_SETTINGS;
+    menuShot("menu-toolbar-settings", &s);
+
+    s = baseState();
     s.section = SEC_BOOKMARKS;
     s.rowCount = bookmarkCount;
     s.zone = ZONE_LIST;

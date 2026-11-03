@@ -20,7 +20,7 @@
  *   - while a page loads, a bar at the top with its title, address and
  *     progress, gone 1.5 s after the load ends
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
- *     Stop, Home, the address, Bookmark, New tab) over a panel with three
+ *     Stop, Home, the address, Bookmark, New tab, Settings) over a panel with three
  *     lists: Tabs, Bookmarks, History. The pad is in UI mode while it is
  *     open (wpe_display_ps5_set_ui_mode): D-pad moves the focus, X
  *     picks, the left stick's pointer and X work too, the right stick
@@ -1160,6 +1160,10 @@ static void toolbarActivate(int index)
     case TB_NEWTAB:
         if (openInNewTab(NULL))
             setMenu(FALSE);
+        break;
+    case TB_SETTINGS: /* as R3 */
+        setMenu(FALSE);
+        ps5wk_open_settings();
         break;
     }
 }
