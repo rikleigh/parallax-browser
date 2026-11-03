@@ -296,6 +296,15 @@ private:
     unsigned m_uiTexture { 0 };
     bool m_uiAsTexture { false };
     int m_uiRect[4] { }; // x, y, width, height; width 0: none
+    // A layer that appears fades in, one removed fades out (render thread):
+    // its own small program (the page shader times an opacity).
+    unsigned m_uiProgram { 0 };
+    bool m_uiProgramTried { false };
+    int m_uUIRect { -1 }, m_uUINDC { -1 }, m_uUISize { -1 }, m_uUIStride { -1 }, m_uUIScreenHeight { -1 }, m_uUIOpacity { -1 };
+    int64_t m_uiFadeStartUS { 0 }; // 0: no fade
+    bool m_uiFadingOut { false };
+    bool uiFadeWanted();
+    void ensureUIProgram();
 
     // View in VR requests (guarded by m_lock).
     struct VRRequest {

@@ -90,6 +90,23 @@ void main()
 }
 )";
 
+// The application's UI layer: as the page, times an opacity (fades).
+static const char* kUIFragmentShader = R"(#version 430 core
+layout(std430, binding = 1) readonly buffer Page { uint px[]; };
+uniform vec4 pageRect;
+uniform ivec2 pageSize;
+uniform int pageStride;
+uniform int screenHeight;
+uniform float opacity;
+out vec4 color;
+void main()
+{
+    vec2 s = vec2(gl_FragCoord.x, float(screenHeight) - gl_FragCoord.y);
+    ivec2 p = clamp(ivec2((s - pageRect.xy) * vec2(pageSize) / pageRect.zw), ivec2(0), pageSize - 1);
+    color = unpackUnorm4x8(px[p.y * pageStride + p.x]).zyxw * opacity;
+}
+)";
+
 // A whole-target triangle (for the YUV -> RGBA pass).
 static const char* kFullscreenVertexShader = R"(#version 430 core
 void main()
@@ -634,7 +651,7 @@ void PS5Renderer::threadMain()
             int64_t now = nowUS();
             if (m_messageUntilUS && now >= m_messageUntilUS)
                 break; // take the message down
-            if (m_videoActive) {
+            if (m_videoActive || m_uiFadeStartUS) {
                 // Video: a frame every vsync. The swap returns at once and
                 // the next frame's first draw waits for that swap's flip, so
                 // the frame can start right after the swap (it waited 10 ms,
@@ -680,11 +697,21 @@ void PS5Renderer::threadMain()
         m_capturePath = nullptr;
         bool perfWanted = m_perfWanted;
         if (m_uiChanged) {
-            m_uiStaging.swap(m_uiPending);
-            m_uiPending.clear();
-            memcpy(m_uiRect, m_uiPendingRect, sizeof m_uiRect);
+            const bool shown = m_uiRect[2] > 0 && !m_uiFadingOut, removed = m_uiPending.empty();
+            if (removed && shown && uiFadeWanted()) {
+                // The last image stays and fades out (drawUILayer).
+                m_uiFadingOut = true;
+                m_uiFadeStartUS = nowUS();
+            } else {
+                m_uiStaging.swap(m_uiPending);
+                m_uiPending.clear();
+                memcpy(m_uiRect, m_uiPendingRect, sizeof m_uiRect);
+                m_uiStagingNew = true;
+                m_uiFadingOut = false;
+                // A layer where there was none fades in; a change to one shown doesn't.
+                m_uiFadeStartUS = !removed && !shown && uiFadeWanted() ? nowUS() : 0;
+            }
             m_uiChanged = false;
-            m_uiStagingNew = true;
         }
         g_mutex_unlock(&m_lock);
 
@@ -1298,11 +1325,71 @@ void PS5Renderer::applyUILayer()
     m_uiStaging.shrink_to_fit();
 }
 
+// Fades: a menu that opens or closes, the loading bar coming and going.
+// Off with /data/ps5webkit/no-ui-fade (a file), and on the texture path.
+// Under m_lock: no GL here.
+bool PS5Renderer::uiFadeWanted()
+{
+    static const bool wanted = [] {
+        struct stat st;
+        return stat("/data/ps5webkit/no-ui-fade", &st) != 0;
+    }();
+    return wanted && !m_uiAsTexture && m_pageProgram && (!m_uiProgramTried || m_uiProgram);
+}
+
+// The fade's program, made on first use (render thread, not under m_lock).
+void PS5Renderer::ensureUIProgram()
+{
+    if (m_uiProgramTried)
+        return;
+    m_uiProgramTried = true;
+    char error[512] = { };
+    m_uiProgram = link(kVertexShader, kUIFragmentShader, error, sizeof(error));
+    if (!m_uiProgram) {
+        g_message("[wpe-ps5] ui layer: fade shader failed (%s): no fades", error);
+        return;
+    }
+    m_uUINDC = glGetUniformLocation(m_uiProgram, "rect");
+    m_uUIRect = glGetUniformLocation(m_uiProgram, "pageRect");
+    m_uUISize = glGetUniformLocation(m_uiProgram, "pageSize");
+    m_uUIStride = glGetUniformLocation(m_uiProgram, "pageStride");
+    m_uUIScreenHeight = glGetUniformLocation(m_uiProgram, "screenHeight");
+    m_uUIOpacity = glGetUniformLocation(m_uiProgram, "opacity");
+}
+
 void PS5Renderer::drawUILayer()
 {
     const int x = m_uiRect[0], y = m_uiRect[1], w = m_uiRect[2], h = m_uiRect[3];
     if (w <= 0 || h <= 0 || (!m_uiMap && !m_uiTexture))
         return;
+    // In over 150 ms (ease out), out over 120 ms (ease in).
+    float opacity = 1;
+    if (m_uiFadeStartUS)
+        ensureUIProgram();
+    if (m_uiFadeStartUS && !m_uiProgram) {
+        m_uiFadeStartUS = 0;
+        if (m_uiFadingOut) {
+            m_uiFadingOut = false;
+            m_uiRect[2] = 0;
+            return;
+        }
+    }
+    if (m_uiFadeStartUS) {
+        const double t = std::min(1.0, (nowUS() - m_uiFadeStartUS) / (m_uiFadingOut ? 120000.0 : 150000.0));
+        if (m_uiFadingOut) {
+            if (t >= 1) {
+                m_uiRect[2] = 0;
+                m_uiFadingOut = false;
+                m_uiFadeStartUS = 0;
+                return;
+            }
+            opacity = static_cast<float>((1 - t) * (1 - t));
+        } else {
+            opacity = static_cast<float>(1 - (1 - t) * (1 - t) * (1 - t));
+            if (t >= 1)
+                m_uiFadeStartUS = 0;
+        }
+    }
     float r[4] = {
         static_cast<float>(static_cast<double>(x) / m_width * 2.0 - 1.0),
         static_cast<float>(1.0 - static_cast<double>(y + h) / m_height * 2.0),
@@ -1313,7 +1400,16 @@ void PS5Renderer::drawUILayer()
     glActiveTexture(GL_TEXTURE0);
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    if (!m_uiAsTexture) {
+    if (!m_uiAsTexture && m_uiProgram && opacity < 1) {
+        glUseProgram(m_uiProgram);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_uiBuffer);
+        glUniform4f(m_uUINDC, r[0], r[1], r[2], r[3]);
+        glUniform4f(m_uUIRect, static_cast<float>(x), static_cast<float>(y), static_cast<float>(w), static_cast<float>(h));
+        glUniform2i(m_uUISize, w, h);
+        glUniform1i(m_uUIStride, w);
+        glUniform1i(m_uUIScreenHeight, m_height);
+        glUniform1f(m_uUIOpacity, opacity);
+    } else if (!m_uiAsTexture) {
         glUseProgram(m_pageProgram);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_uiBuffer);
         glUniform4f(m_uPageNDC, r[0], r[1], r[2], r[3]);
