@@ -274,6 +274,29 @@ static unsigned liveAllowed(void)
     return memoryTight ? 1 : liveLimit;
 }
 
+/* Which tabs keep their pages, after every change (switch, new tab, close,
+ * discard): "[tabs] live (2 of 2 allowed): 1 shown, 3 hidden 12 s ago". */
+static void logLiveTabs(const char* why)
+{
+    if (!tabs)
+        return;
+    GString* line = g_string_new(NULL);
+    gint64 now = g_get_monotonic_time();
+    for (unsigned i = 0; i < tabs->len; i++) {
+        Tab* tab = g_ptr_array_index(tabs, i);
+        if (!tab->view)
+            continue;
+        if ((int)i == active)
+            g_string_append_printf(line, "%s%u shown", line->len ? ", " : "", i + 1);
+        else
+            g_string_append_printf(line, "%s%u hidden %.0f s ago", line->len ? ", " : "", i + 1, (now - tab->lastUsed) / 1e6);
+    }
+    unsigned live = liveCount();
+    spike_log("[tabs] live (%u of %u allowed%s) after %s: %s; %u discarded of %u tabs", live, liveAllowed(), memoryTight ? ", memory tight" : "", why,
+        line->len ? line->str : "none", tabs->len - live, tabs->len);
+    g_string_free(line, TRUE);
+}
+
 /* The display, the title's other parts (ps5browser.c: load handlers, VR,
  * the ad blocker) and the UI follow the active tab's view. */
 void ps5wk_set_active_web_view(WebKitWebView* view);
@@ -387,6 +410,7 @@ static void discardHidden(const char* why)
 void ps5wk_browser_discard_hidden(const char* why)
 {
     discardHidden(why);
+    logLiveTabs(why);
     redraw();
 }
 
@@ -407,7 +431,8 @@ static void scrollCaptureFinish(ScrollCapture* capture)
     if (capture->timeout)
         g_source_remove(capture->timeout);
     capture->timeout = 0;
-    capture->done(capture->data);
+    if (capture->done)
+        capture->done(capture->data);
 }
 
 static gboolean tabExists(Tab* tab)
@@ -423,7 +448,9 @@ static void scrollCaptured(GObject* object, GAsyncResult* result, gpointer data)
 {
     ScrollCapture* capture = data;
     JSCValue* value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, NULL);
-    if (value && !capture->finished && tabExists(capture->tab) && capture->tab->view == WEBKIT_WEB_VIEW(object)) {
+    /* Also after the timeout: while the tab still has this view (a hidden
+     * live tab), the answer is its page's. */
+    if (value && tabExists(capture->tab) && capture->tab->view == WEBKIT_WEB_VIEW(object)) {
         char* text = jsc_value_to_string(value);
         double x = 0, y = 0;
         if (text && sscanf(text, "%lf,%lf", &x, &y) == 2) {
@@ -447,7 +474,7 @@ static gboolean scrollCaptureTimeout(gpointer data)
 }
 
 /* The live tab's scroll position into its Tab, then done(data) (at most
- * ~400 ms later: a busy page answers late). */
+ * ~400 ms later: a busy page answers late); done NULL: nothing waits. */
 static void captureScroll(ScrollDone done, gpointer data)
 {
     ScrollCapture* capture = g_new0(ScrollCapture, 1);
@@ -471,6 +498,8 @@ static void switchNow(gpointer data)
     ps5wk_vr_stop(FALSE, "tab switch");
     Tab* old = activeTab();
     saveLive(); /* its record stays fresh while it is a hidden live tab */
+    if (old)
+        old->lastUsed = start; /* shown until now (the LRU order of hidden live tabs) */
     Tab* tab = g_ptr_array_index(tabs, target);
     gboolean live = tab->view != NULL;
     if (!live)
@@ -485,14 +514,28 @@ static void switchNow(gpointer data)
             webkit_web_view_get_uri(tab->view) ? webkit_web_view_get_uri(tab->view) : tab->url);
     else
         activate();
+    logLiveTabs(live ? "a switch to a live tab" : "a switch to a discarded tab");
     scheduleSessionSave();
     redraw();
+}
+
+/* The tab shown keeps its view (and its page) when another is shown: its
+ * scroll position can come later, nothing waits for it (a busy page
+ * answered up to 400 ms late, which every switch waited for). */
+static gboolean shownTabStaysLive(void)
+{
+    return liveAllowed() >= 2;
 }
 
 static void switchTo(int index)
 {
     if (!tabs || index < 0 || index >= (int)tabs->len || index == active || switching)
         return;
+    if (shownTabStaysLive()) {
+        captureScroll(NULL, NULL);
+        switchNow(GINT_TO_POINTER(index));
+        return;
+    }
     switching = TRUE;
     captureScroll(switchNow, GINT_TO_POINTER(index));
 }
@@ -508,6 +551,8 @@ static void newTabNow(gpointer data)
     ps5wk_vr_stop(FALSE, "new tab");
     Tab* old = activeTab();
     saveLive();
+    if (old)
+        old->lastUsed = g_get_monotonic_time();
     WebKitWebView* view = viewForNewlyShownTab(old);
     int at = tabs->len ? active + 1 : 0;
     Tab* tab = tabNew(job->url, "");
@@ -518,6 +563,7 @@ static void newTabNow(gpointer data)
     spike_log("browser: new tab %d of %u: %s (%u live)", active + 1, tabs->len, job->url, liveCount());
     showView(view);
     loadFresh(view, job->url);
+    logLiveTabs("a new tab");
     scheduleSessionSave();
     redraw();
     g_free(job->url);
@@ -538,6 +584,11 @@ static gboolean openInNewTab(const char* url)
         return FALSE;
     NewTabJob* job = g_new0(NewTabJob, 1);
     job->url = url ? g_strdup(url) : ps5wk_home_url();
+    if (shownTabStaysLive()) {
+        captureScroll(NULL, NULL);
+        newTabNow(job);
+        return TRUE;
+    }
     switching = TRUE;
     captureScroll(newTabNow, job);
     return TRUE;
@@ -584,6 +635,7 @@ static void closeTab(int index)
             active--;
         destroyView(freed);
     }
+    logLiveTabs("a tab closed");
     scheduleSessionSave();
     redraw();
 }
@@ -607,6 +659,7 @@ static gboolean memoryCheck(gpointer data)
         char why[160];
         snprintf(why, sizeof why, "memory: WebProcess %.0f of %.0f MB, title %.0f MB free", committed, limit, flexibleMB);
         discardHidden(why);
+        logLiveTabs("memory pressure");
         redraw();
     }
     gboolean tight = webHigh || titleLow || (memoryTight && limit > 0 && committed > limit * 0.45);
@@ -618,16 +671,21 @@ static gboolean memoryCheck(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-/* GPU compositing: the title's GL textures near their cap with hidden live
- * tabs' scenes among them (patch 0072): those tabs are discarded before the
- * shown page loses tile coverage. Weak: the CPU-only build has no WC host. */
+/* GPU compositing: the title's GL textures over their cap (~1 s average)
+ * with hidden live tabs' scenes among them (patches 0072, 0073): the least
+ * recently used one is discarded before the shown page loses tile coverage. Weak: the
+ * CPU-only build has no WC host. */
 void ps5wk_wc_set_hidden_pages_callback(void (*callback)(double mb)) __attribute__((weak));
 
 static void onGLPressure(double mb)
 {
     char why[96];
-    snprintf(why, sizeof why, "GL textures %.0f MB, near the cap", mb);
-    discardHidden(why);
+    snprintf(why, sizeof why, "GL textures %.0f MB, over the cap", mb);
+    /* The least recently used one; the host asks again 5 s later if the
+     * textures are still over. */
+    if (lruHidden())
+        discardTab(lruHidden(), why, FALSE);
+    logLiveTabs("GL texture pressure");
     redraw();
 }
 
