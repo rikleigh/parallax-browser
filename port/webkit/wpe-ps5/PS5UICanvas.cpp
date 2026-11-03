@@ -47,23 +47,28 @@ struct _WPEDisplayPS5Canvas {
 
 namespace {
 
-static const char* const kRegular = "/data/ps5webkit/fonts/NotoSans-Regular.ttf";
-static const char* const kBold = "/data/ps5webkit/fonts/NotoSans-Bold.ttf";
+// The fonts' folder (uipreview, the Mac harness, builds with its own).
+#ifndef PS5WK_FONT_DIR
+#define PS5WK_FONT_DIR "/data/ps5webkit/fonts"
+#endif
+
+static const char* const kRegular = PS5WK_FONT_DIR "/NotoSans-Regular.ttf";
+static const char* const kBold = PS5WK_FONT_DIR "/NotoSans-Bold.ttf";
 // Tried in order for a character Noto Sans lacks; opened on first need.
 static const char* const kFallbacks[] = {
-    "/data/ps5webkit/fonts/NotoSansSymbols2-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansSymbols-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansMath-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansCJK-Regular.ttc",
-    "/data/ps5webkit/fonts/NotoSansArabic-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansHebrew-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansDevanagari-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansThai-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansBengali-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansTamil-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansArmenian-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansGeorgian-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansEthiopic-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansSymbols2-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansSymbols-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansMath-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansCJK-Regular.ttc",
+    PS5WK_FONT_DIR "/NotoSansArabic-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansHebrew-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansDevanagari-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansThai-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansBengali-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansTamil-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansArmenian-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansGeorgian-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansEthiopic-Regular.ttf",
 };
 static constexpr unsigned kFallbackCount = sizeof(kFallbacks) / sizeof(kFallbacks[0]);
 static constexpr unsigned kFaceCount = 2 + kFallbackCount; // 0 regular, 1 bold, then the fallbacks

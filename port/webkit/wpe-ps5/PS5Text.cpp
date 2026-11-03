@@ -26,11 +26,16 @@
 #include <glib.h>
 #include <string>
 
+// The fonts' folder (uipreview, the Mac harness, builds with its own).
+#ifndef PS5WK_FONT_DIR
+#define PS5WK_FONT_DIR "/data/ps5webkit/fonts"
+#endif
+
 static const char* const kFontFiles[] = {
-    "/data/ps5webkit/fonts/NotoSans-Bold.ttf",
-    "/data/ps5webkit/fonts/NotoSansSymbols2-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansSymbols-Regular.ttf",
-    "/data/ps5webkit/fonts/NotoSansMath-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSans-Bold.ttf",
+    PS5WK_FONT_DIR "/NotoSansSymbols2-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansSymbols-Regular.ttf",
+    PS5WK_FONT_DIR "/NotoSansMath-Regular.ttf",
 };
 static constexpr unsigned kFontCount = sizeof(kFontFiles) / sizeof(kFontFiles[0]);
 

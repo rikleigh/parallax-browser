@@ -36,6 +36,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "browser.h"
+#include "browserdraw.h"
 #include "viewinvr.h"
 #include "../common/webmem.h"
 
@@ -759,28 +760,8 @@ void ps5wk_browser_save(void)
 
 /* ---------------------------------------------------------------- drawing */
 
-#define C_DIM 0xa0000000u
-#define C_BAR 0xf2161b24u
-#define C_PANEL 0xf51a202bu
-#define C_BUTTON 0xff252d3bu
-#define C_FOCUS_BG 0xff34445eu
-#define C_FOCUS 0xffffd54au
-#define C_TEXT 0xffe8ecf2u
-#define C_DIM_TEXT 0xff9aa4b2u
-#define C_ACCENT 0xff9cc7ffu
-#define C_PROGRESS 0xff4c9affu
-#define C_ROW 0xff212836u
-#define C_SECTION_ON 0xff2d3a52u
-
-enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_STAR, TB_NEWTAB, TB_COUNT };
-enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_COUNT };
-enum { ZONE_TOOLBAR, ZONE_LIST };
-enum { HOT_TOOLBAR, HOT_SECTION, HOT_ROW };
-
-typedef struct {
-    int x, y, w, h;
-    int kind, index;
-} Hot;
+/* browserdraw.c draws (the palette and sizes in brand.h); here the state it
+ * draws from. */
 
 static WPEDisplayPS5Canvas* menuCanvas;
 static WPEDisplayPS5Canvas* barCanvas;
@@ -795,22 +776,13 @@ static int listFocus;
 static int listTop;
 static double scrollAccumulator;
 static gboolean clearArmed; /* "Clear history" pressed once */
-static Hot hots[64];
-static unsigned hotCount;
 static int screenW = 1920, screenH = 1080;
 static gint64 lastBarDraw;
+/* What drawing the menu costs (main thread), logged when it closes. */
+static unsigned drawCount;
+static gint64 drawTotalUS, drawMaxUS;
 
-#define BAR_H 96
-#define PANEL_X 160
-#define PANEL_Y (BAR_H + 24)
-#define ROW_H 76
-#define SECTION_H 70
-
-static void addHot(int x, int y, int w, int h, int kind, int index)
-{
-    if (hotCount < G_N_ELEMENTS(hots))
-        hots[hotCount++] = (Hot) { x, y, w, h, kind, index };
-}
+#define ROW_H bui_row_height()
 
 static int rowCount(int sec)
 {
@@ -852,120 +824,80 @@ static const char* shownTitle(void)
     return title;
 }
 
-static void drawButton(WPEDisplayPS5Canvas* c, int x, int y, int w, int h, const char* label, gboolean focused, gboolean enabled, int index)
+/* A row of the list shown (BUIState.row). */
+static void listRow(int row, BUIRow* r, void* data)
 {
-    if (focused) {
-        wpe_display_ps5_canvas_fill(c, x - 3, y - 3, w + 6, h + 6, 14, C_FOCUS);
-        wpe_display_ps5_canvas_fill(c, x, y, w, h, 12, C_FOCUS_BG);
-    } else
-        wpe_display_ps5_canvas_fill(c, x, y, w, h, 12, C_BUTTON);
-    int size = 34;
-    int tw = wpe_display_ps5_canvas_text_width(c, size, TRUE, label);
-    wpe_display_ps5_canvas_text(c, x + (w - tw) / 2, y + h / 2 + size * 36 / 100, w - 8, size, TRUE,
-        enabled ? C_TEXT : 0xff5a6270u, label);
-    if (index >= 0)
-        addHot(x, y, w, h, HOT_TOOLBAR, index);
-}
-
-/* The bar: buttons (focusable in the menu), the address, progress. */
-static void drawBar(WPEDisplayPS5Canvas* c, gboolean interactive)
-{
-    const gboolean loading = webkit_web_view_is_loading(webView);
-    const int y = 16, h = 64, w = 84, gap = 12;
-    wpe_display_ps5_canvas_fill(c, 0, 0, screenW, BAR_H, 0, C_BAR);
-    int x = 24;
-    const char* labels[TB_COUNT] = { "◀", "▶", loading ? "✕" : "↻", "⌂", NULL, NULL, "+" };
-    gboolean enabled[TB_COUNT] = { canGoBack(), webkit_web_view_can_go_forward(webView), TRUE, TRUE, TRUE, TRUE, tabs->len < MAX_TABS };
-    for (int i = TB_BACK; i <= TB_HOME; i++) {
-        drawButton(c, x, y, w, h, labels[i], interactive && zone == ZONE_TOOLBAR && toolbarFocus == i, enabled[i], interactive ? i : -1);
-        x += w + gap;
-    }
-    /* right side: tab count, new tab, star */
-    const int right = screenW - 24;
-    const int newTabX = right - w, starX = newTabX - gap - w, countX = starX - gap - 96;
-    gboolean starred = ps5wk_bookmark_find(shownURI()) >= 0;
-    drawButton(c, newTabX, y, w, h, labels[TB_NEWTAB], interactive && zone == ZONE_TOOLBAR && toolbarFocus == TB_NEWTAB, enabled[TB_NEWTAB], interactive ? TB_NEWTAB : -1);
-    drawButton(c, starX, y, w, h, starred ? "★" : "☆", interactive && zone == ZONE_TOOLBAR && toolbarFocus == TB_STAR, TRUE, interactive ? TB_STAR : -1);
-    char count[32];
-    snprintf(count, sizeof count, "%u tab%s", tabs->len, tabs->len == 1 ? "" : "s");
-    int cw = wpe_display_ps5_canvas_text_width(c, 22, FALSE, count);
-    wpe_display_ps5_canvas_text(c, countX + (96 - cw) / 2, y + 40, 96, 22, FALSE, C_DIM_TEXT, count);
-
-    /* the address field */
-    const int ax = x + 8, aw = countX - 16 - ax;
-    gboolean addressFocused = interactive && zone == ZONE_TOOLBAR && toolbarFocus == TB_ADDRESS;
-    if (addressFocused)
-        wpe_display_ps5_canvas_fill(c, ax - 3, y - 3, aw + 6, h + 6, 14, C_FOCUS);
-    wpe_display_ps5_canvas_fill(c, ax, y, aw, h, 12, addressFocused ? C_FOCUS_BG : 0xff0f131au);
-    if (interactive)
-        addHot(ax, y, aw, h, HOT_TOOLBAR, TB_ADDRESS);
-    const char* title = shownTitle();
-    const char* uri = shownURI();
-    if (!strncmp(uri, "file:///data/ps5webkit/start.html", 33))
-        uri = "Start page";
-    if (*title) {
-        wpe_display_ps5_canvas_text(c, ax + 20, y + 28, aw - 40, 23, TRUE, C_TEXT, title);
-        wpe_display_ps5_canvas_text(c, ax + 20, y + 54, aw - 40, 19, FALSE, C_DIM_TEXT, uri);
-    } else
-        wpe_display_ps5_canvas_text(c, ax + 20, y + 42, aw - 40, 23, FALSE, C_TEXT, *uri ? uri : "Address or search");
-    if (addressFocused) {
-        const char* hint = "X: type an address or search";
-        int hw = wpe_display_ps5_canvas_text_width(c, 18, FALSE, hint);
-        wpe_display_ps5_canvas_fill(c, ax + aw - hw - 36, y + 14, hw + 24, 36, 8, 0xe0101520u);
-        wpe_display_ps5_canvas_text(c, ax + aw - hw - 24, y + 39, 0, 18, FALSE, C_FOCUS, hint);
-    }
-    /* progress */
-    if (loading) {
-        double progress = webkit_web_view_get_estimated_load_progress(webView);
-        if (progress < 0.05)
-            progress = 0.05;
-        wpe_display_ps5_canvas_fill(c, 0, BAR_H - 5, (int)(screenW * progress), 5, 0, C_PROGRESS);
-    }
-}
-
-static void listRowText(int sec, int row, const char** title, const char** url, gboolean* current, char* buffer, size_t size)
-{
-    *current = FALSE;
-    *title = *url = "";
-    if (sec == SEC_TABS) {
+    (void)data;
+    if (section == SEC_TABS) {
         if (row >= (int)tabs->len) {
-            *title = "+ New tab";
-            *url = "Opens the home page";
+            r->title = "+ New tab";
+            r->url = "Opens the home page";
+            r->action = TRUE;
             return;
         }
         Tab* tab = g_ptr_array_index(tabs, row);
-        *current = row == active;
-        *title = *current ? shownTitle() : tab->title;
-        *url = *current ? shownURI() : tab->url;
-        if (!**title)
-            *title = *url;
-        snprintf(buffer, size, "%d", row + 1);
-    } else if (sec == SEC_BOOKMARKS) {
+        r->current = row == active;
+        r->title = r->current ? shownTitle() : tab->title;
+        r->url = r->current ? shownURI() : tab->url;
+        if (!*r->title)
+            r->title = r->url;
+        r->number = row + 1;
+        /* a hidden tab whose page is still live: back at once */
+        if (!r->current && tab->view)
+            snprintf(r->note, sizeof r->note, "kept live");
+    } else if (section == SEC_BOOKMARKS) {
         PS5WKEntry* e = g_ptr_array_index(ps5wk_bookmarks(), row);
-        *title = *e->title ? e->title : e->url;
-        *url = e->url;
+        r->title = *e->title ? e->title : e->url;
+        r->url = e->url;
     } else {
         if (row == 0) {
-            *title = clearArmed ? "Press X again to clear all history" : "Clear all history";
-            *url = "Bookmarks and open tabs stay";
+            r->title = clearArmed ? "Press X again to clear all history" : "Clear all history";
+            r->url = "Bookmarks and open tabs stay";
+            r->action = TRUE;
+            r->armed = clearArmed;
             return;
         }
         PS5WKEntry* e = g_ptr_array_index(ps5wk_history(), row - 1);
-        *title = *e->title ? e->title : e->url;
-        *url = e->url;
+        r->title = *e->title ? e->title : e->url;
+        r->url = e->url;
         GDateTime* time = g_date_time_new_from_unix_local(e->time);
         char* when = time ? g_date_time_format(time, "%d %b %H:%M") : NULL;
-        snprintf(buffer, size, "%s", when ? when : "");
+        snprintf(r->note, sizeof r->note, "%s", when ? when : "");
         g_free(when);
         if (time)
             g_date_time_unref(time);
     }
 }
 
+static void fillState(BUIState* s)
+{
+    memset(s, 0, sizeof *s);
+    s->screenW = screenW;
+    s->screenH = screenH;
+    s->loading = webkit_web_view_is_loading(webView);
+    s->progress = webkit_web_view_get_estimated_load_progress(webView);
+    s->canBack = canGoBack();
+    s->canForward = webkit_web_view_can_go_forward(webView);
+    s->canNewTab = tabs->len < MAX_TABS;
+    s->starred = ps5wk_bookmark_find(shownURI()) >= 0;
+    s->title = shownTitle();
+    s->uri = shownURI();
+    s->tabCount = tabs->len;
+    s->maxTabs = MAX_TABS;
+    s->zone = zone;
+    s->toolbarFocus = toolbarFocus;
+    s->section = section;
+    s->bookmarkCount = ps5wk_bookmarks()->len;
+    s->historyCount = ps5wk_history()->len;
+    s->rowCount = rowCount(section);
+    s->listTop = listTop;
+    s->listFocus = listFocus;
+    s->row = listRow;
+}
+
 static int visibleRows(void)
 {
-    const int panelH = screenH - PANEL_Y - 40;
-    return (panelH - SECTION_H - 64) / ROW_H;
+    return bui_visible_rows(screenH);
 }
 
 static void keepFocusVisible(void)
@@ -985,85 +917,6 @@ static void keepFocusVisible(void)
         listTop = 0;
 }
 
-static void drawMenu(WPEDisplayPS5Canvas* c)
-{
-    hotCount = 0;
-    wpe_display_ps5_canvas_clear(c, C_DIM);
-    drawBar(c, TRUE);
-    const int px = PANEL_X, py = PANEL_Y, pw = screenW - 2 * PANEL_X, ph = screenH - PANEL_Y - 40;
-    wpe_display_ps5_canvas_fill(c, px, py, pw, ph, 18, C_PANEL);
-    /* the lists' names */
-    static const char* names[SEC_COUNT] = { "Tabs", "Bookmarks", "History" };
-    int sx = px + 24;
-    for (int s = 0; s < SEC_COUNT; s++) {
-        char label[48];
-        if (s == SEC_TABS)
-            snprintf(label, sizeof label, "%s  %u/%d", names[s], tabs->len, MAX_TABS);
-        else
-            snprintf(label, sizeof label, "%s  %u", names[s], s == SEC_BOOKMARKS ? ps5wk_bookmarks()->len : ps5wk_history()->len);
-        int lw = wpe_display_ps5_canvas_text_width(c, 26, TRUE, label) + 48;
-        if (s == section)
-            wpe_display_ps5_canvas_fill(c, sx, py + 14, lw, SECTION_H - 20, 10, C_SECTION_ON);
-        wpe_display_ps5_canvas_text(c, sx + 24, py + 14 + (SECTION_H - 20) / 2 + 9, 0, 26, TRUE, s == section ? C_TEXT : C_DIM_TEXT, label);
-        addHot(sx, py + 14, lw, SECTION_H - 20, HOT_SECTION, s);
-        sx += lw + 12;
-    }
-    const char* keys = "L1/R1 lists   □ remove   R2 new tab   △ address   O close";
-    int kw = wpe_display_ps5_canvas_text_width(c, 19, FALSE, keys);
-    wpe_display_ps5_canvas_text(c, px + pw - kw - 28, py + 50, 0, 19, FALSE, C_DIM_TEXT, keys);
-
-    /* the rows */
-    keepFocusVisible();
-    const int rows = rowCount(section), visible = visibleRows();
-    const int rx = px + 20, rw = pw - 40;
-    int ry = py + SECTION_H + 8;
-    if (!rows) {
-        const char* empty = section == SEC_BOOKMARKS ? "No bookmarks yet. ☆ in the bar (Options, then up and right) adds the page shown."
-                                                     : "No history yet.";
-        wpe_display_ps5_canvas_text(c, rx + 20, ry + 48, rw - 40, 24, FALSE, C_DIM_TEXT, empty);
-    }
-    for (int row = listTop; row < rows && row < listTop + visible; row++) {
-        const char* title;
-        const char* url;
-        gboolean current;
-        char extra[64] = "";
-        listRowText(section, row, &title, &url, &current, extra, sizeof extra);
-        gboolean focused = zone == ZONE_LIST && row == listFocus;
-        if (focused) {
-            wpe_display_ps5_canvas_fill(c, rx - 3, ry - 3, rw + 6, ROW_H - 8 + 6, 12, C_FOCUS);
-            wpe_display_ps5_canvas_fill(c, rx, ry, rw, ROW_H - 8, 10, C_FOCUS_BG);
-        } else
-            wpe_display_ps5_canvas_fill(c, rx, ry, rw, ROW_H - 8, 10, C_ROW);
-        addHot(rx, ry, rw, ROW_H - 8, HOT_ROW, row);
-        int tx = rx + 24;
-        if (section == SEC_TABS && row >= (int)tabs->len)
-            tx += 48;
-        if (section == SEC_TABS && row < (int)tabs->len) {
-            if (current)
-                wpe_display_ps5_canvas_fill(c, rx, ry, 8, ROW_H - 8, 4, C_ACCENT);
-            wpe_display_ps5_canvas_text(c, tx, ry + 44, 0, 24, TRUE, current ? C_ACCENT : C_DIM_TEXT, extra);
-            tx += 48;
-            /* a hidden tab whose page is still live: back at once */
-            snprintf(extra, sizeof extra, "%s", !current && ((Tab*)g_ptr_array_index(tabs, row))->view ? "kept live" : "");
-        }
-        int extraW = *extra ? wpe_display_ps5_canvas_text_width(c, 19, FALSE, extra) : 0;
-        int textW = rx + rw - 24 - tx - (extraW ? extraW + 24 : 0);
-        wpe_display_ps5_canvas_text(c, tx, ry + 30, textW, 23, TRUE, current ? C_ACCENT : C_TEXT, title);
-        wpe_display_ps5_canvas_text(c, tx, ry + 57, textW, 18, FALSE, C_DIM_TEXT, url);
-        if (extraW)
-            wpe_display_ps5_canvas_text(c, rx + rw - 24 - extraW, ry + 44, 0, 19, FALSE, C_DIM_TEXT, extra);
-        ry += ROW_H;
-    }
-    if (rows > visible) {
-        /* a scroll bar on the right */
-        int trackY = py + SECTION_H + 8, trackH = visible * ROW_H - 8;
-        int thumbH = trackH * visible / rows, thumbY = trackY + (trackH - thumbH) * listTop / (rows - visible);
-        wpe_display_ps5_canvas_fill(c, px + pw - 14, thumbY, 6, thumbH < 24 ? 24 : thumbH, 3, 0xff5a6478u);
-    }
-    wpe_display_ps5_canvas_text(c, px + 28, py + ph - 18, pw - 56, 18, FALSE, 0xff6c7686u,
-        "Left stick: pointer   Right stick: scroll   L3: home   R3: Settings   Touchpad: View in VR");
-}
-
 static void redrawNow(void)
 {
     if (menuOpen) {
@@ -1071,8 +924,19 @@ static void redrawNow(void)
             menuCanvas = wpe_display_ps5_canvas_new(screenW, screenH);
         if (!menuCanvas)
             return;
-        drawMenu(menuCanvas);
+        BUIState state;
+        fillState(&state);
+        gint64 start = g_get_monotonic_time();
+        bui_draw_menu(menuCanvas, &state);
+        gint64 drawn = g_get_monotonic_time();
         wpe_display_ps5_set_ui_layer(display, menuCanvas, 0, 0);
+        gint64 us = g_get_monotonic_time() - start;
+        drawCount++;
+        drawTotalUS += us;
+        if (us > drawMaxUS)
+            drawMaxUS = us;
+        if (drawCount == 1)
+            spike_log("browser: menu drawn in %.1f ms (+ %.1f ms to hand it over)", (drawn - start) / 1000.0, (us - (drawn - start)) / 1000.0);
         return;
     }
     if (menuCanvas) {
@@ -1081,11 +945,13 @@ static void redrawNow(void)
     }
     if (barShown && !ps5wk_vr_active()) {
         if (!barCanvas)
-            barCanvas = wpe_display_ps5_canvas_new(screenW, BAR_H);
+            barCanvas = wpe_display_ps5_canvas_new(screenW, bui_bar_height());
         if (!barCanvas)
             return;
+        BUIState state;
+        fillState(&state);
         wpe_display_ps5_canvas_clear(barCanvas, 0);
-        drawBar(barCanvas, FALSE);
+        bui_draw_bar(barCanvas, &state, FALSE);
         wpe_display_ps5_set_ui_layer(display, barCanvas, 0, 0);
         lastBarDraw = g_get_monotonic_time();
         return;
@@ -1188,8 +1054,14 @@ static void setMenu(gboolean open)
         listFocus = active;
         listTop = 0;
         keepFocusVisible();
-    }
-    spike_log("browser: menu %s", open ? "open" : "closed");
+        drawCount = 0;
+        drawTotalUS = drawMaxUS = 0;
+        spike_log("browser: menu open");
+    } else if (drawCount)
+        spike_log("browser: menu closed (drawn %u times, %.1f ms on average, %.1f ms at most)", drawCount,
+            drawTotalUS / 1000.0 / drawCount, drawMaxUS / 1000.0);
+    else
+        spike_log("browser: menu closed");
     redraw();
 }
 
@@ -1367,18 +1239,13 @@ static void setSection(int s)
         zone = ZONE_TOOLBAR;
 }
 
-static const Hot* hotAt(double x, double y)
+static const BUIHot* hotAt(double x, double y)
 {
-    for (unsigned i = hotCount; i-- > 0;) {
-        const Hot* h = &hots[i];
-        if (x >= h->x && x < h->x + h->w && y >= h->y && y < h->y + h->h)
-            return h;
-    }
-    return NULL;
+    return bui_hot_at(x, y);
 }
 
 /* Focus follows the pointer. */
-static gboolean focusHot(const Hot* hot)
+static gboolean focusHot(const BUIHot* hot)
 {
     if (!hot)
         return FALSE;
@@ -1434,7 +1301,7 @@ static void menuButtons(guint32 pressed)
     if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS) {
         double x, y;
         if (wpe_display_ps5_get_pointer(display, &x, &y)) {
-            const Hot* hot = hotAt(x, y);
+            const BUIHot* hot = hotAt(x, y);
             if (!hot)
                 return;
             if (hot->kind == HOT_SECTION) {
