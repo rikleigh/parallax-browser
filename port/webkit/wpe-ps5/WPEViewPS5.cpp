@@ -42,6 +42,7 @@ struct _WPEViewPS5Private {
     GRefPtr<GSource> focusSource;
     unsigned frames { 0 };
     gint64 firstFrameTime { 0 };
+    bool wholeNextFrame { false }; // just became the active view: the renderer still shows another page
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEViewPS5, wpe_view_ps5, WPE_TYPE_VIEW, WPEView)
 
@@ -72,6 +73,10 @@ static void wpeViewPS5Constructed(GObject* object)
         wpe_toplevel_get_size(toplevel, &width, &height);
         if (width && height)
             wpe_view_resized(view, width, height);
+        // Several views (the application chooses the active one): a new
+        // view waits, unmapped (its page hidden), until it is made active.
+        if (wpeDisplayPS5ChoosesActiveView(display) && wpeDisplayPS5GetActiveView(display) != view)
+            return;
         wpe_view_map(view);
         wpeDisplayPS5SetActiveView(display, view);
 
@@ -92,6 +97,21 @@ static void wpeViewPS5Constructed(GObject* object)
         }, view, nullptr);
         g_source_attach(priv->focusSource.get(), g_main_context_get_thread_default());
     }), nullptr);
+}
+
+void wpeViewPS5SetActive(WPEView* view, bool active)
+{
+    auto* priv = WPE_VIEW_PS5(view)->priv;
+    if (!active) {
+        wpe_view_focus_out(view);
+        wpe_view_unmap(view); // the page is hidden: WebKit stops painting it, throttles its timers
+        return;
+    }
+    priv->wholeNextFrame = true;
+    if (!wpe_view_get_toplevel(view))
+        return; // mapped when it gets one (notify::toplevel)
+    wpe_view_map(view);
+    wpe_view_focus_in(view);
 }
 
 static void wpeViewPS5Dispose(GObject* object)
@@ -116,6 +136,28 @@ static gboolean wpeViewPS5RenderBuffer(WPEView* view, WPEBuffer* buffer, const W
     gsize size = 0;
     const auto* data = static_cast<const uint8_t*>(g_bytes_get_data(wpe_buffer_shm_get_data(shm), &size));
     auto* display = WPE_DISPLAY_PS5(wpe_view_get_display(view));
+
+    // A view that is not shown (a hidden tab's last frame): not drawn, the
+    // buffer goes straight back.
+    if (wpeDisplayPS5ChoosesActiveView(display) && wpeDisplayPS5GetActiveView(display) != view) {
+        struct Held {
+            GRefPtr<WPEView> view;
+            GRefPtr<WPEBuffer> buffer;
+        };
+        g_idle_add_full(G_PRIORITY_DEFAULT, [](gpointer userData) -> gboolean {
+            auto* held = static_cast<Held*>(userData);
+            wpe_view_buffer_rendered(held->view.get(), held->buffer.get());
+            wpe_view_buffer_released(held->view.get(), held->buffer.get());
+            return G_SOURCE_REMOVE;
+        }, new Held { view, buffer }, [](gpointer userData) { delete static_cast<Held*>(userData); });
+        return TRUE;
+    }
+    // The first frame after becoming the active view replaces all of the
+    // other page's pixels, whatever its damage.
+    if (priv->wholeNextFrame) {
+        priv->wholeNextFrame = false;
+        damageCount = 0;
+    }
 
     if (!priv->frames++) {
         priv->firstFrameTime = g_get_monotonic_time();
@@ -159,9 +201,10 @@ static gboolean wpeViewPS5RenderBuffer(WPEView* view, WPEBuffer* buffer, const W
     return TRUE;
 }
 
-static gboolean wpeViewPS5CanBeMapped(WPEView*)
+static gboolean wpeViewPS5CanBeMapped(WPEView* view)
 {
-    return TRUE;
+    auto* display = WPE_DISPLAY_PS5(wpe_view_get_display(view));
+    return !wpeDisplayPS5ChoosesActiveView(display) || wpeDisplayPS5GetActiveView(display) == view;
 }
 
 static void wpe_view_ps5_class_init(WPEViewPS5Class* viewPS5Class)

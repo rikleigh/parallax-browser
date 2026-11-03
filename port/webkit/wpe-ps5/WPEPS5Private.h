@@ -25,9 +25,16 @@
 // Internal glue between the PS5 display, view, input method and process
 // manager. Main thread only.
 
-// The view that receives pad input (the last one mapped).
+// The view that receives pad input (the last one mapped, or the one the
+// application chose: wpe_display_ps5_set_active_view).
 void wpeDisplayPS5SetActiveView(WPEDisplayPS5*, WPEView*);
 WPEView* wpeDisplayPS5GetActiveView(WPEDisplayPS5*);
+// True once the application chooses the active view itself: views that are
+// not active stay unmapped.
+bool wpeDisplayPS5ChoosesActiveView(WPEDisplayPS5*);
+// WPEViewPS5: the view became the active one (map, focus, next frame whole)
+// or stopped being it (focus out, unmap).
+void wpeViewPS5SetActive(WPEView*, bool active);
 
 // Coalesced redraw (pointer moved, page updated).
 void wpeDisplayPS5ScheduleRedraw(WPEDisplayPS5*);

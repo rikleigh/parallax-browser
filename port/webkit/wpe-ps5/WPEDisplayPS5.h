@@ -163,6 +163,14 @@ WPE_API void                 wpe_display_ps5_set_ui_layer      (WPEDisplayPS5   
 WPE_API void                 wpe_display_ps5_set_ui_mode       (WPEDisplayPS5       *display,
                                                                 gboolean             enabled);
 WPE_API gboolean             wpe_display_ps5_get_ui_mode       (WPEDisplayPS5       *display);
+/* Several views (the browser's live tabs): only the active view is mapped
+ * (page visible: WebKit paints it, runs its timers and rAF at full rate),
+ * has the keyboard focus, is shown and gets the pad; the others are
+ * unmapped (page hidden). Once this has been called, a new view stays
+ * unmapped until it is made active. NULL is not allowed. */
+WPE_API void                 wpe_display_ps5_set_active_view   (WPEDisplayPS5       *display,
+                                                                WPEView             *view);
+
 /* The pointer position in TV pixels; returns whether it is shown (it shows
  * for a few seconds after the left stick moves). */
 WPE_API gboolean             wpe_display_ps5_get_pointer       (WPEDisplayPS5       *display,

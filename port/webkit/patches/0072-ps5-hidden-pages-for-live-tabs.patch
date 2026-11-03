@@ -1,0 +1,278 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index aafc0f3544..a376b4723f 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -500,6 +500,10 @@ DrawingAreaProxyWCPS5::DrawingAreaProxyWCPS5(WebPageProxy& webPageProxy, WebProc
+     WTFLogAlways("[wc] page %llu: WC compositor (drawing area %llu, %s host)", static_cast<unsigned long long>(webPageProxy.identifier().toUInt64()),
+         static_cast<unsigned long long>(identifier().toUInt64()), PS5WCNullHost::isInstalled() ? "null" : "GL");
+     liveDrawingAreas().set(identifier().toUInt64(), this);
++    // A page made in a hidden view (a background tab) never takes the screen
++    // until its view is shown.
++    if (!webPageProxy.isViewVisible() && !PS5WCNullHost::isInstalled())
++        PS5WCHost::singleton().setPageVisible(identifier().toUInt64(), false);
+ #if ENABLE(ASYNC_SCROLLING)
+     if (protect(webPageProxy.preferences())->threadedScrollingEnabled() && !PS5WCNullHost::isInstalled()) {
+         m_scrollingTree = PS5WCScrollingTree::create(identifier().toUInt64());
+@@ -581,6 +585,18 @@ DrawingAreaProxyWCPS5::~DrawingAreaProxyWCPS5()
+         PS5WCHost::singleton().removePage(identifier().toUInt64());
+ }
+ 
++void DrawingAreaProxyWCPS5::viewIsBecomingVisible()
++{
++    if (!PS5WCNullHost::isInstalled())
++        PS5WCHost::singleton().setPageVisible(identifier().toUInt64(), true);
++}
++
++void DrawingAreaProxyWCPS5::viewIsBecomingInvisible()
++{
++    if (!PS5WCNullHost::isInstalled())
++        PS5WCHost::singleton().setPageVisible(identifier().toUInt64(), false);
++}
++
+ void DrawingAreaProxyWCPS5::deviceScaleFactorDidChange(CompletionHandler<void()>&& completionHandler)
+ {
+     sizeDidChange();
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index 2253c4c691..357bf9cce2 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -102,6 +102,10 @@ private:
+     // DrawingAreaProxy
+     void deviceScaleFactorDidChange(CompletionHandler<void()>&&) override;
+     void sizeDidChange() override;
++    // The view hidden or shown (the browser's background tabs): only a
++    // shown page's scene is on screen.
++    void viewIsBecomingVisible() override;
++    void viewIsBecomingInvisible() override;
+ #if ENABLE(ASYNC_SCROLLING)
+     bool shouldSendWheelEventsToEventDispatcher() const final { return !m_scrollingTree; }
+ #else
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 47c42c94ab..51c80bf26c 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -52,6 +52,7 @@
+ #include <memory>
+ #include <sys/stat.h>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <wpe/ps5/PS5Compositor.h>
+ #include <glib.h>
+ #include <wtf/Condition.h>
+@@ -295,6 +296,8 @@ private:
+ 
+ // ---- The host ----
+ 
++static std::atomic<void (*)(double)> s_hiddenPagesCallback { nullptr };
++
+ class SceneHost final : public PS5CompositorClient {
+ public:
+     static SceneHost& singleton()
+@@ -315,7 +318,7 @@ public:
+         if (auto requestFrame = m_requestFrame.load())
+             requestFrame();
+     }
+-    void enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&&, CompletionHandler<void()>&&);
++    void enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&&, CompletionHandler<void()>&&, int8_t visibility = -1);
+     void startTestDriver();
+ 
+     // PS5CompositorClient.
+@@ -332,10 +335,13 @@ private:
+     enum class State : int { NotSetUp, Ready, Failed };
+     struct Job {
+         uint64_t pageID { 0 };
+-        std::unique_ptr<WCUpdateInfo> info; // null: remove the page
++        std::unique_ptr<WCUpdateInfo> info; // null: remove the page (unless visibility >= 0)
+         CompletionHandler<void()> didPresent;
+         MonotonicTime queuedAt;
++        int8_t visibility { -1 }; // 0 hidden, 1 shown: the page's view changed (no update)
+     };
++    // The newest scene with a root layer whose page is not hidden.
++    std::optional<uint64_t> newestShowableScene();
+ 
+     void fail(const char* why);
+     void completeOnMainThread(Vector<CompletionHandler<void()>>&&);
+@@ -359,7 +365,8 @@ private:
+     std::unique_ptr<WCSceneContext> m_sceneContext;
+     std::unique_ptr<TextureMapper> m_programHolder;
+     std::unordered_map<uint64_t, std::unique_ptr<WCScene>> m_scenes;
+-    std::optional<uint64_t> m_shownPage; // the most recently updated scene
++    std::optional<uint64_t> m_shownPage; // the most recently updated scene whose page is not hidden
++    std::unordered_set<uint64_t> m_hiddenScenes; // pages whose view is hidden (background tabs)
+     std::unordered_map<uint64_t, uint64_t> m_lastUpdate;
+     uint64_t m_updateSerial { 0 };
+     RefPtr<BitmapTexture> m_surface;
+@@ -389,6 +396,7 @@ private:
+     Seconds m_glRestoreAfter { 3_s };
+     double m_glPeakMB { 0 };
+     double m_glSmoothedMB { 0 }; // ~1 s average of the per-frame value
++    MonotonicTime m_hiddenPressureAt; // the embedder last asked to drop hidden pages
+     unsigned m_glOverLogCount { 0 };
+ 
+     struct {
+@@ -514,14 +522,27 @@ void SceneHost::ensureSetUp()
+         m_state.load() == State::Ready ? "ready" : m_state.load() == State::Failed ? "failed" : "STILL PENDING after 10 s");
+ }
+ 
+-void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, CompletionHandler<void()>&& didPresent)
++std::optional<uint64_t> SceneHost::newestShowableScene()
++{
++    std::optional<uint64_t> shown;
++    uint64_t newest = 0;
++    for (auto& entry : m_lastUpdate) {
++        if (entry.second > newest && !m_hiddenScenes.count(entry.first) && m_scenes.count(entry.first) && m_scenes[entry.first]->hasRootLayer()) {
++            newest = entry.second;
++            shown = entry.first;
++        }
++    }
++    return shown;
++}
++
++void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, CompletionHandler<void()>&& didPresent, int8_t visibility)
+ {
+     ensureSetUp();
+     bool queued = false;
+     {
+         Locker locker { m_lock };
+         if (m_state.load() != State::Failed) {
+-            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent), MonotonicTime::now() });
++            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent), MonotonicTime::now(), visibility });
+             queued = true;
+             m_stateChanged.notifyAll(); // a frame waiting for this update (paint)
+         }
+@@ -676,8 +697,30 @@ void SceneHost::applyPending()
+         jobs = std::exchange(m_queue, { });
+     }
+     for (auto& job : jobs) {
++        if (job.visibility >= 0) {
++            // A tab hidden or shown: which scene is on screen changes now.
++            if (job.visibility)
++                m_hiddenScenes.erase(job.pageID);
++            else
++                m_hiddenScenes.insert(job.pageID);
++            auto shownBefore = m_shownPage;
++            if (job.visibility) {
++                if (auto it = m_scenes.find(job.pageID); it != m_scenes.end() && it->second->hasRootLayer())
++                    m_shownPage = job.pageID;
++            } else if (m_shownPage == job.pageID)
++                m_shownPage = newestShowableScene();
++            if (m_shownPage != shownBefore) {
++                m_dirty = true;
++                if (!m_shownPage)
++                    m_surface = nullptr;
++            }
++            WTFLogAlways("[wc] scene %llu %s; scene shown: %lld (%zu scenes, %zu hidden)", static_cast<unsigned long long>(job.pageID), // NOLINT
++                job.visibility ? "shown" : "hidden", m_shownPage ? static_cast<long long>(*m_shownPage) : -1LL, m_scenes.size(), m_hiddenScenes.size());
++            continue;
++        }
+         if (!job.info) {
+             m_dirty = true;
++            m_hiddenScenes.erase(job.pageID);
+             if (auto it = m_scenes.find(job.pageID); it != m_scenes.end()) {
+                 // A drawing area went (page closed, WebProcess ended or
+                 // crashed, page restart): its layers, tiles, video layers and
+@@ -697,14 +740,7 @@ void SceneHost::applyPending()
+             if (m_shownPage == job.pageID) {
+                 // Show the most recently updated scene left, if any (an old
+                 // drawing area can go after its successor's first update).
+-                m_shownPage = std::nullopt;
+-                uint64_t newest = 0;
+-                for (auto& entry : m_lastUpdate) {
+-                    if (entry.second > newest && m_scenes.count(entry.first) && m_scenes[entry.first]->hasRootLayer()) {
+-                        newest = entry.second;
+-                        m_shownPage = entry.first;
+-                    }
+-                }
++                m_shownPage = newestShowableScene();
+                 if (!m_shownPage)
+                     m_surface = nullptr;
+             }
+@@ -718,7 +754,8 @@ void SceneHost::applyPending()
+             bool changed = !job.info->addedLayers.isEmpty() || !job.info->removedLayers.isEmpty() || !job.info->changedLayers.isEmpty()
+                 || job.info->viewport != scene.viewport() || !scene.hasRootLayer();
+             if (scene.apply(*job.info)) {
+-                m_shownPage = job.pageID;
++                if (!m_hiddenScenes.count(job.pageID))
++                    m_shownPage = job.pageID;
+                 m_lastUpdate[job.pageID] = ++m_updateSerial;
+             }
+             if (job.info->mainFrameScrollPosition && !hasScrollingTree(job.pageID)) {
+@@ -945,6 +982,20 @@ void SceneHost::checkGLMemory()
+     }
+     if (!m_shownPage || m_glState == GLMemoryState::Fallback)
+         return;
++    // Hidden pages' scenes (the browser's live background tabs) hold
++    // textures too: near the cap, the embedder is asked to let them go
++    // (ps5wk_wc_set_hidden_pages_callback) before the shown page loses
++    // tile coverage; at most every 5 s.
++    if (m_glState == GLMemoryState::Normal && mb > logMB && !m_hiddenScenes.empty() && s_hiddenPagesCallback
++        && (!m_hiddenPressureAt || now - m_hiddenPressureAt >= 5_s)) {
++        m_hiddenPressureAt = now;
++        WTFLogAlways("[wc] GL textures %.1f MB with %zu hidden scenes: asking for the hidden pages to go", mb, m_hiddenScenes.size()); // NOLINT
++        RunLoop::mainSingleton().dispatch([mb] {
++            if (auto callback = s_hiddenPagesCallback.load())
++                callback(mb);
++        });
++        return;
++    }
+     uint64_t page = *m_shownPage;
+     auto post = [page](DrawingAreaProxyWCPS5::GLMemoryAction action) {
+         RunLoop::mainSingleton().dispatch([page, action] {
+@@ -1632,6 +1683,23 @@ void PS5WCHost::removePage(uint64_t pageID)
+     SceneHost::singleton().enqueue(pageID, nullptr, { });
+ }
+ 
++void PS5WCHost::setPageVisible(uint64_t pageID, bool visible)
++{
++    SceneHost::singleton().enqueue(pageID, nullptr, { }, visible ? 1 : 0);
++}
++
++} // namespace WebKit
++
++// The title: called on the main thread when the GL textures near their cap
++// while hidden pages have scenes (their pages should be closed); mb: the
++// textures now.
++extern "C" __attribute__((visibility("default"))) void ps5wk_wc_set_hidden_pages_callback(void (*callback)(double mb))
++{
++    WebKit::s_hiddenPagesCallback = callback;
++}
++
++namespace WebKit {
++
+ void PS5WCHost::noteWheelEventRouting(bool async)
+ {
+     auto& host = SceneHost::singleton();
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+index 25579d17b2..5cc405e455 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -36,6 +36,10 @@ public:
+ 
+     void update(uint64_t pageID, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent);
+     void removePage(uint64_t pageID);
++    // The page's view was hidden or shown (the browser's tabs): a hidden
++    // page's scene keeps applying its updates but is never the one shown;
++    // shown again, it is at once (no update needed).
++    void setPageVisible(uint64_t pageID, bool visible);
+ 
+     // Async scrolling measurements (COMPOSITING-PLAN.md): a wheel event
+     // from the pad (main thread, before WebKit coalesces it), by its time.
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+index 408207d01c..92a7f55b31 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+@@ -357,6 +357,14 @@ void DrawingAreaCoordinatedGraphics::resumePainting()
+ 
+     if (m_renderer)
+         m_renderer->resume();
++#if defined(PS5_PAYLOAD_SDK)
++    // A page shown again (a live background tab on the PS5): the screen has
++    // another page's pixels, so the next frame is the whole page.
++    if (m_renderer) {
++        m_renderer->setNeedsDisplay();
++        m_renderer->scheduleRenderingUpdate();
++    }
++#endif
+ }
+ 
+ void DrawingAreaCoordinatedGraphics::sendEnterAcceleratedCompositingModeIfNeeded()

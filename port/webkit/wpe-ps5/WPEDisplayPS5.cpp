@@ -148,6 +148,7 @@ struct _WPEDisplayPS5Private {
     bool uiMode { false };
     uint32_t uiRepeatButton { 0 };
     double uiRepeatNext { 0 };
+    bool choosesActiveView { false }; // wpe_display_ps5_set_active_view was called
     WPEDisplayPS5UIPointerCallback uiPointerCallback { nullptr };
     gpointer uiPointerCallbackData { nullptr };
     WPEDisplayPS5PerfOverlayCallback perfOverlayCallback { nullptr };
@@ -212,6 +213,11 @@ void wpeDisplayPS5ScheduleRedraw(WPEDisplayPS5* display)
 void wpeDisplayPS5SetActiveView(WPEDisplayPS5* display, WPEView* view)
 {
     display->priv->activeView = view;
+}
+
+bool wpeDisplayPS5ChoosesActiveView(WPEDisplayPS5* display)
+{
+    return display->priv->choosesActiveView;
 }
 
 WPEView* wpeDisplayPS5GetActiveView(WPEDisplayPS5* display)
@@ -1090,6 +1096,35 @@ void wpe_display_ps5_set_ui_mode(WPEDisplayPS5* display, gboolean enabled)
     }
     wpeDisplayPS5ScheduleRedraw(display);
     PS5_LOG("pad %s", enabled ? "to the application's UI" : "back to the page");
+}
+
+void wpe_display_ps5_set_active_view(WPEDisplayPS5* display, WPEView* view)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    g_return_if_fail(WPE_IS_VIEW_PS5(view));
+    auto* priv = display->priv;
+    priv->choosesActiveView = true;
+    WPEView* old = priv->activeView;
+    if (old == view)
+        return;
+    // The old page sees the end of what it was pressed with; held buttons
+    // are ignored until released.
+    if (priv->pointerDown && old) {
+        priv->pointerDown = false;
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, old, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
+        wpe_view_event(old, event.get());
+    }
+    priv->ignoredButtons |= priv->buttons;
+    priv->buttons = 0;
+    priv->swallowedButtons = 0;
+    priv->repeatingKey = 0;
+    priv->activeView = view;
+    if (old)
+        wpeViewPS5SetActive(old, false);
+    wpeViewPS5SetActive(view, true);
+    wpeDisplayPS5ScheduleRedraw(display);
+    PS5_LOG("active view %p (was %p)", view, old);
 }
 
 gboolean wpe_display_ps5_get_ui_mode(WPEDisplayPS5* display)
