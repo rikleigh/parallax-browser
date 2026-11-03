@@ -14,7 +14,7 @@
  * tab gets a fresh back/forward list (an empty about:blank first entry that
  * Back skips). At most MAX_TABS tabs; memory stays that of one page.
  *
- * The UI is drawn by the title (wpe_display_ps5_set_ui_layer, a CPU canvas
+ * The UI is drawn by the title (browserdraw.c, wpe_display_ps5_set_ui_layer, a CPU canvas
  * shown over the page by PS5Renderer, the same with GPU compositing on or
  * off, not in the headset):
  *   - while a page loads, a bar at the top with its title, address and
@@ -22,7 +22,7 @@
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
  *     Stop, Home, the address, Bookmark, New tab) over a panel with three
  *     lists: Tabs, Bookmarks, History. The pad is in UI mode while it is
- *     open (wpe_display_ps5_set_ui_mode): D-pad moves the yellow focus, X
+ *     open (wpe_display_ps5_set_ui_mode): D-pad moves the focus, X
  *     picks, the left stick's pointer and X work too, the right stick
  *     scrolls the list, L1/R1 (or left/right in a list) switch lists,
  *     Square removes (closes a tab, deletes a bookmark or history entry),

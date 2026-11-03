@@ -170,7 +170,7 @@ served by the link server in `ps5browser.c`).
   R3 again, or O, or *Back to the page*, to go back to the page you were on.
   The start page also has a *Settings* tile. The page is
   `http://127.0.0.1:9040/settings` and is made for the D-pad: big buttons,
-  a yellow focus ring and a dark theme. X picks an option. For the home page
+  a pink focus ring and the browser's dark palette. X picks an option. For the home page
   field, X or Triangle brings up the keyboard. R3 does nothing while you are
   in View in VR, because the headset owns the pad there.
 - **On a Mac or phone:** open `http://192.168.1.50:9040/settings`. It
@@ -332,8 +332,8 @@ words to search for (DuckDuckGo Lite, as before).
 
 | In the menu | |
 | --- | --- |
-| D-pad | move the yellow focus: the bar's buttons (left/right), down into the list, up back to the bar; left/right in a list switch lists |
-| X | pick: a button, a tab (switch to it), a bookmark or history entry (open it in this tab), *+ New tab*; with the pointer shown, what is under the pointer |
+| D-pad | move the focus (a violet-to-magenta outline): the bar's buttons (left/right), down into the list, up back to the bar; left/right in a list switch lists |
+| X | pick: a button, a tab (switch to it), a bookmark or history entry (open it in this tab), *New tab*; with the pointer shown, what is under the pointer |
 | left stick | the pointer (the focus follows it) |
 | right stick | scroll the list |
 | L1 / R1 | previous / next list: Tabs, Bookmarks, History |
@@ -450,7 +450,36 @@ and renamed over the old one; no sync, no telemetry):
 | `start-data.js` | `window.ps5wkData = {bookmarks, top}`: the start page's *Bookmarks* and *Most visited* (pages visited at least twice). A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
 
 The start page (`runtime/start.html`, still the home page and what a new
-tab opens) shows the bookmarks and most visited pages above its links.
+tab opens) has the Parallax logo and wordmark, a field for an address or
+words to search for (as the bar's: an address with a dot and no spaces,
+else DuckDuckGo Lite), then tiles for the bookmarks, the most visited pages
+and the links, and the test pages as smaller pills. The D-pad moves between
+tiles (up from the first row: the field, which brings up the keyboard); L1/R1
+and X work as on any page. It needs `parallax-logo.png` next to it
+(`runtime/`, uploaded with it by `test/media/make-media.sh`; without it the
+wordmark stands alone). To update both by hand:
+`curl -T port/webkit/runtime/start.html ftp://192.168.1.50:2121/data/ps5webkit/start.html`,
+and the same for `parallax-logo.png`.
+
+**The look** (*Parallax Browser*). `apps/title/brand.h` holds the palette,
+sampled from the title's artwork (`sce_sys/icon0.png`, `pic0.png`: three
+glass panes, violet, cyan-edged blue and magenta, on a near-black navy),
+and the UI's radii and focus sizes; the start page has the same values as
+CSS variables. Ink `#01001A`, indigo `#3202C2`, violet `#6D0EFD`, blue
+`#156BFD`, cyan `#0EE3FE`, magenta `#FC0EC6`; surfaces base `#07061F`,
+surface `#0D0B2A`, raised `#161440`, raised-hi `#211D56`, hairline
+`#2B2766`; text `#F4F2FF`, `#B9B5E0`, `#8A86B8` (17:1, 9.8:1, 5.6:1 on the
+surface). The bar and menu are deep-navy glass over the page; the focused
+item is raised with a violet-to-magenta outline and a soft glow; the tab
+shown is marked in cyan; the progress line is the violet-to-magenta
+gradient. The menu's header has the Parallax mark (48 px, made from
+icon0.png by `apps/title/brand-assets.py`, shipped by `package.sh` as
+`/app0/ui/parallax-mark.bgra`) and wordmark, the lists between L1 and R1
+key caps; rows have a tile with the site's initial in one of the brand's
+tints; the footer shows what the buttons do for the list shown. Messages,
+the View in VR hint and the TV notice (`PS5Text.cpp`) are the same navy
+glass with a violet-to-magenta edge. The settings, crash and form pages
+use the palette too.
 
 **How it is drawn.** The title draws the bar and menu itself, like the
 performance overlay, instead of a second WebView (our platform has one view
@@ -466,7 +495,25 @@ the messages, the pointer and the performance overlay. So it is the same
 with GPU compositing on or off, and not shown in the headset (View in VR
 draws the TV notice instead). A menu frame is a 1920x1080 canvas (8 MB,
 freed when the menu closes; the renderer keeps one 8 MB GL buffer after
-the first use); the loading bar 1920x96 (0.7 MB).
+the first use); the loading bar 1920x104 (0.8 MB). The drawing itself is
+`apps/title/browserdraw.c`, from a plain state that `browserui.c` fills
+(no WebKit calls), on the canvas's rounded rectangles, gradients, outlines,
+glows, images and text; over a uniform area a translucent fill reuses the
+last blend, so the menu costs what the plainer one did (3.6 ms against
+3.7 ms on the Mac harness). The log says what it costs on the console:
+`browser: menu drawn in N ms (+ N ms to hand it over)` for the first frame,
+`browser: menu closed (drawn N times, N ms on average, N ms at most)`.
+The renderer fades a layer that appears in (150 ms) and one removed out
+(120 ms, from the image last shown): its own copy of the page shader
+times an opacity, frames at the vsync while it lasts, nothing for the main
+thread to redraw; a change to a layer already shown is drawn at once.
+`/data/ps5webkit/no-ui-fade` (a file) turns the fades off.
+**Seeing it on the Mac:** `port/webkit/apps/title/uipreview/build.sh [dir]`
+builds the canvas, the notices and browserdraw.c for the Mac (Homebrew's
+glib, freetype, libpng; the Noto fonts in `toolchain/wpe-deps/dl/fonts`)
+and renders every screen (the lists, focus on the bar and in a list, empty
+lists, the loading bar, notices) over a page screenshot to PNG, with sample
+data, and prints the draw cost.
 `wpe_display_ps5_set_ui_mode()` gives the pad to the application while the
 menu is open: every button to its handler (D-pad, L1/R1, L2/R2 repeat while
 held), the left stick moves the pointer without page events, the right
