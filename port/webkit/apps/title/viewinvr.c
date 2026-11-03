@@ -889,6 +889,13 @@ static gboolean onButtons(WPEDisplayPS5* display, guint32 pressed, gpointer data
     return TRUE;
 }
 
+/* The browser's tabs: the page shown is now this view's (VR's page
+ * commands and probes go to it). */
+void ps5wk_vr_set_web_view(WebKitWebView* webView)
+{
+    vrWebView = webView;
+}
+
 /* The browser's button handler (browserui.c) calls this first. */
 gboolean ps5wk_vr_buttons(guint32 pressed)
 {

@@ -1010,6 +1010,12 @@ static void removeUnusedSlot(const char* keep)
     }
 }
 
+/* The page shown changed (the browser's tabs share the content manager). */
+void ps5wk_adblock_set_web_view(WebKitWebView* view)
+{
+    webView = view;
+}
+
 void ps5wk_adblock_init(WebKitWebView* view)
 {
     webView = view;

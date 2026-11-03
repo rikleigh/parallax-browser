@@ -485,6 +485,8 @@ static gboolean memRestart(gpointer data)
         return G_SOURCE_REMOVE;
     memRestarting = TRUE;
     ps5wk_vr_stop(FALSE, "WebProcess restart");
+    /* Hidden live tabs share the WebProcess: their pages go first. */
+    ps5wk_browser_discard_hidden("the WebProcess restarts");
     /* No provisional load left for WebKit to continue in a process of its
      * own (it launched one that the load below then didn't use). */
     webkit_web_view_stop_loading(webView);
@@ -509,9 +511,10 @@ static gboolean memRestart(gpointer data)
  * so the latest result is what the click lands on. */
 static void onMouseTargetChanged(WebKitWebView* view, WebKitHitTestResult* hit, guint modifiers, gpointer data)
 {
-    (void)view;
     (void)modifiers;
     (void)data;
+    if (view != webView)
+        return;
     wpe_display_ps5_set_pointer_over_editable(WPE_DISPLAY_PS5(display), webkit_hit_test_result_context_is_editable(hit));
 }
 
@@ -519,9 +522,15 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
 {
     (void)data;
     static const char* names[] = { "started", "redirected", "committed", "finished" };
+    if (view != webView) {
+        /* A hidden live tab (browserui.c): nothing here is about it. */
+        spike_log("load %s (hidden tab): %s", names[event], webkit_web_view_get_uri(view));
+        ps5wk_browser_load_changed(view, event);
+        return;
+    }
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
     /* Tabs, history, the address bar (browserui.c). */
-    ps5wk_browser_load_changed(event);
+    ps5wk_browser_load_changed(view, event);
     /* The ad blocker's filter on or off for this page (allowed sites). */
     if (event != WEBKIT_LOAD_FINISHED)
         ps5wk_adblock_navigation(webkit_web_view_get_uri(view));
@@ -568,9 +577,10 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
 
 static gboolean onLoadFailed(WebKitWebView* view, WebKitLoadEvent event, const char* uri, GError* error, gpointer data)
 {
-    (void)view;
     (void)event;
     (void)data;
+    if (view != webView)
+        return FALSE;
     if (memRestartURI || memRestarting) {
         spike_log("[mem] load of %s ended by the WebProcess restart (%s)", uri, error->message);
         return FALSE;
@@ -603,6 +613,12 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
          * upload to elfldr just before the SIGKILL, and a title killed
          * mid-upload leaves a payload that never ends (CONSOLE-HEALTH.md). */
         spike_log("wind-down: the WebProcess ended (reason %d); no reload", reason);
+        return;
+    }
+    /* The one WebProcess serves every tab: a hidden live tab goes back to
+     * its record (browserui.c), only the shown page reloads. */
+    if (ps5wk_browser_view_terminated(view)) {
+        spike_log("[tabs] a hidden tab's page ended with the WebProcess (reason %d)", reason);
         return;
     }
     /* Any page, any reason but ours: more than 6 ends in 2 minutes is a
@@ -1130,6 +1146,26 @@ static void toggleSettings(void)
     spike_log("settings: R3, opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
     loadStart = g_get_monotonic_time();
     webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
+}
+
+/* Every tab's view gets these (browserui.c makes the views of live tabs). */
+void ps5wk_connect_web_view(WebKitWebView* view)
+{
+    g_signal_connect(webkit_web_view_get_wpe_view(view), "event", G_CALLBACK(onViewEvent), NULL);
+    g_signal_connect(view, "load-changed", G_CALLBACK(onLoadChanged), NULL);
+    g_signal_connect(view, "load-failed", G_CALLBACK(onLoadFailed), NULL);
+    g_signal_connect(view, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
+    g_signal_connect(view, "mouse-target-changed", G_CALLBACK(onMouseTargetChanged), NULL);
+}
+
+/* Another tab shown (browserui.c): everything here that acts on "the page"
+ * follows its view. */
+void ps5wk_set_active_web_view(WebKitWebView* view)
+{
+    webView = view;
+    ps5wk_adblock_set_web_view(view);
+    ps5wk_vr_set_web_view(view);
+    setShownURI(webkit_web_view_get_uri(view));
 }
 
 /* The browser menu's L3/R3 and Settings links: Settings, unless shown. */
@@ -1888,6 +1924,16 @@ int main(int argc, char** argv)
     if (orientation)
         webkit_settings_set_feature_enabled(settings, orientation, TRUE);
     spike_log("settings: Screen Orientation API %s", orientation ? "on" : "not found");
+    /* Hidden pages (live background tabs, browserui.c): timers throttled and
+     * CSS animations suspended, as WebKit does for hidden pages on its other
+     * ports (both off for WPE by default). */
+    static const char* const hiddenPageFeatures[] = { "HiddenPageDOMTimerThrottling", "HiddenPageCSSAnimationSuspension" };
+    for (unsigned i = 0; i < G_N_ELEMENTS(hiddenPageFeatures); i++) {
+        WebKitFeature* feature = webkit_feature_list_find(features, hiddenPageFeatures[i]);
+        if (feature)
+            webkit_settings_set_feature_enabled(settings, feature, TRUE);
+        spike_log("settings: %s %s", hiddenPageFeatures[i], feature ? "on" : "not found");
+    }
     webkit_feature_list_unref(features);
     WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
     networkSession = session;
@@ -1905,12 +1951,7 @@ int main(int argc, char** argv)
         "network-session", session,
         "website-policies", policies,
         NULL));
-    WPEView* view = webkit_web_view_get_wpe_view(webView);
-    g_signal_connect(view, "event", G_CALLBACK(onViewEvent), NULL);
-    g_signal_connect(webView, "load-changed", G_CALLBACK(onLoadChanged), NULL);
-    g_signal_connect(webView, "load-failed", G_CALLBACK(onLoadFailed), NULL);
-    g_signal_connect(webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
-    g_signal_connect(webView, "mouse-target-changed", G_CALLBACK(onMouseTargetChanged), NULL);
+    ps5wk_connect_web_view(webView);
     ps5wk_vr_init(display, webView);
     /* After View in VR: the browser's button handler chains it. */
     ps5wk_browser_init(display, webView);

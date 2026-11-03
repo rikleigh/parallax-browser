@@ -37,6 +37,7 @@
 #include "common/spike.h"
 #include "browser.h"
 #include "viewinvr.h"
+#include "../common/webmem.h"
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -62,13 +63,15 @@ gboolean ps5wk_vr_buttons(guint32 pressed);
 typedef struct {
     char* url;
     char* title;
-    GBytes* state; /* background tabs: the saved back/forward list */
+    GBytes* state; /* the saved back/forward list (a discarded tab's way back; refreshed when a live tab is hidden) */
     double scrollX, scrollY;
     gboolean fromForm; /* the page shown is a form's (POST) result */
+    WebKitWebView* view; /* live: its own web view (the active tab always has one), else NULL */
+    gint64 lastUsed;     /* monotonic us: last shown (LRU of live tabs) */
 } Tab;
 
 static WPEDisplayPS5* display;
-static WebKitWebView* webView;
+static WebKitWebView* webView; /* the active tab's view */
 static GPtrArray* tabs; /* Tab* */
 static int active;
 static gboolean sessionFrozen; /* a test run, or winding down: no session writes */
@@ -80,6 +83,9 @@ static gboolean switching; /* waiting for the scroll position before a switch */
 static char* postURI;      /* the last main-frame navigation that sent a form (POST) */
 static char* formPageURI;
 static char* formPlaceholderURI; /* the placeholder for a form result, until it commits */
+static unsigned liveLimit = 2;   /* live tabs (views), /data/ps5webkit/live-tabs */
+static gboolean memoryTight;     /* over the pressure line: one live tab until well under it */
+static guint memoryTimer;
 static gboolean showFormPage(gpointer data);
 
 /* ---------------------------------------------------------------- tabs */
@@ -153,26 +159,26 @@ static GBytes* craftState(const char* url, const char* title, double scrollX, do
     return bytes;
 }
 
-static gboolean restoreState(GBytes* bytes)
+static gboolean restoreState(WebKitWebView* view, GBytes* bytes)
 {
     WebKitWebViewSessionState* state = bytes ? webkit_web_view_session_state_new(bytes) : NULL;
     if (!state)
         return FALSE;
-    webkit_web_view_restore_session_state(webView, state);
+    webkit_web_view_restore_session_state(view, state);
     webkit_web_view_session_state_unref(state);
     return TRUE;
 }
 
-/* The shown page's back/forward list, serialized (NULL when too big). */
-static GBytes* captureState(void)
+/* A view's back/forward list, serialized (NULL when too big). */
+static GBytes* captureState(WebKitWebView* view)
 {
-    WebKitWebViewSessionState* state = webkit_web_view_get_session_state(webView);
+    WebKitWebViewSessionState* state = webkit_web_view_get_session_state(view);
     if (!state)
         return NULL;
     GBytes* bytes = webkit_web_view_session_state_serialize(state);
     webkit_web_view_session_state_unref(state);
     if (bytes && g_bytes_get_size(bytes) > STATE_MAX_BYTES) {
-        spike_log("browser: session state of %s is %zu KB: keeping its address only", webkit_web_view_get_uri(webView),
+        spike_log("browser: session state of %s is %zu KB: keeping its address only", webkit_web_view_get_uri(view),
             g_bytes_get_size(bytes) / 1024);
         g_bytes_unref(bytes);
         bytes = NULL;
@@ -183,29 +189,33 @@ static GBytes* captureState(void)
 static void scheduleSessionSave(void);
 static void redraw(void);
 static void showBar(void);
+static void connectView(WebKitWebView* view);
 
-/* The page in the web view becomes this tab's (a fresh list: about:blank,
- * which Back skips, then the page). */
-static void loadFresh(const char* url)
+/* The page in a view becomes this tab's (a fresh list: about:blank, which
+ * Back skips, then the page). */
+static void loadFresh(WebKitWebView* view, const char* url)
 {
     GBytes* blank = craftState("about:blank", "", 0, 0);
-    restoreState(blank);
+    restoreState(view, blank);
     g_bytes_unref(blank);
-    restoring = FALSE;
-    pendingScrollSet = FALSE;
-    webkit_web_view_load_uri(webView, url);
+    if (view == webView) {
+        restoring = FALSE;
+        pendingScrollSet = FALSE;
+    }
+    webkit_web_view_load_uri(view, url);
 }
 
-/* Shows the active tab from what was saved of it. */
+/* Loads the active tab's page into its view from what was saved of it. */
 static void activate(void)
 {
     Tab* tab = activeTab();
-    if (!tab)
+    if (!tab || !tab->view)
         return;
+    WebKitWebView* view = tab->view;
     GBytes* bytes = tab->state ? g_bytes_ref(tab->state) : craftState(tab->url, tab->title, tab->scrollX, tab->scrollY);
-    gboolean ok = restoreState(bytes);
+    gboolean ok = restoreState(view, bytes);
     g_bytes_unref(bytes);
-    WebKitBackForwardListItem* item = ok ? webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(webView)) : NULL;
+    WebKitBackForwardListItem* item = ok ? webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(view)) : NULL;
     pendingScrollSet = tab->scrollX > 1 || tab->scrollY > 1;
     pendingScrollX = tab->scrollX;
     pendingScrollY = tab->scrollY;
@@ -221,30 +231,163 @@ static void activate(void)
     } else if (item && !g_str_equal(webkit_back_forward_list_item_get_uri(item), "about:blank")) {
         spike_log("browser: tab %d: back to %s (scroll %.0f,%.0f%s)", active + 1, webkit_back_forward_list_item_get_uri(item),
             tab->scrollX, tab->scrollY, tab->state ? "" : ", no saved list");
-        webkit_web_view_go_to_back_forward_list_item(webView, item);
+        webkit_web_view_go_to_back_forward_list_item(view, item);
     } else {
         spike_log("browser: tab %d: loading %s (no saved entry)", active + 1, tab->url);
-        loadFresh(*tab->url ? tab->url : "about:blank");
+        loadFresh(view, *tab->url ? tab->url : "about:blank");
     }
-    g_clear_pointer(&tab->state, g_bytes_unref); /* the live list is the truth now */
 }
 
-/* Saves the live tab (state and address; the scroll position comes from
- * captureScroll). */
-static void saveLive(void)
+/* What a tab's view shows now into its record (address, title, list). */
+static void saveTab(Tab* tab)
 {
-    Tab* tab = activeTab();
-    if (!tab)
+    if (!tab || !tab->view)
         return;
-    const char* uri = webkit_web_view_get_uri(webView);
+    const char* uri = webkit_web_view_get_uri(tab->view);
     if (uri && *uri && strcmp(uri, "about:blank"))
         setString(&tab->url, uri);
-    const char* title = webkit_web_view_get_title(webView);
+    const char* title = webkit_web_view_get_title(tab->view);
     if (title && *title)
         setString(&tab->title, title);
     if (tab->state)
         g_bytes_unref(tab->state);
-    tab->state = captureState();
+    tab->state = captureState(tab->view);
+}
+
+static void saveLive(void)
+{
+    saveTab(activeTab());
+}
+
+/* ---- live tabs: one web view each, all in the one WebProcess ---- */
+
+static unsigned liveCount(void)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; tabs && i < tabs->len; i++)
+        n += ((Tab*)g_ptr_array_index(tabs, i))->view != NULL;
+    return n;
+}
+
+static unsigned liveAllowed(void)
+{
+    return memoryTight ? 1 : liveLimit;
+}
+
+/* The display, the title's other parts (ps5browser.c: load handlers, VR,
+ * the ad blocker) and the UI follow the active tab's view. */
+void ps5wk_set_active_web_view(WebKitWebView* view);
+
+static void showView(WebKitWebView* view)
+{
+    webView = view;
+    wpe_display_ps5_set_active_view(display, webkit_web_view_get_wpe_view(view));
+    ps5wk_set_active_web_view(view);
+}
+
+/* A new hidden web view sharing the first one's WebProcess (patch 0018:
+ * one WebProcess for everything), settings, content filters and policies. */
+static WebKitWebView* newView(void)
+{
+    /* From now on the display maps only the view made active. */
+    wpe_display_ps5_set_active_view(display, webkit_web_view_get_wpe_view(webView));
+    WebKitWebView* view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+        "related-view", webView,
+        "settings", webkit_web_view_get_settings(webView),
+        "user-content-manager", webkit_web_view_get_user_content_manager(webView),
+        "website-policies", webkit_web_view_get_website_policies(webView),
+        NULL));
+    connectView(view);
+    spike_log("[tabs] new web view %p (%u live)", view, liveCount() + 1);
+    return view;
+}
+
+static void viewGone(gpointer data, GObject* gone)
+{
+    (void)data;
+    spike_log("[tabs] web view %p gone", (void*)gone);
+}
+
+static void destroyView(WebKitWebView* view)
+{
+    if (!view)
+        return;
+    spike_log("[tabs] web view %p closing", view);
+    g_signal_handlers_disconnect_matched(view, G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, &tabs);
+    g_object_weak_ref(G_OBJECT(view), viewGone, NULL);
+    g_object_unref(view);
+}
+
+/* A hidden live tab gives up its view: back to its record (address, title,
+ * scroll, list), its page goes. Returns the view (still alive) when keep. */
+static WebKitWebView* discardTab(Tab* tab, const char* why, gboolean keep)
+{
+    if (!tab || !tab->view || tab == activeTab())
+        return NULL;
+    saveTab(tab);
+    WebKitWebView* view = tab->view;
+    tab->view = NULL;
+    int index = -1;
+    for (unsigned i = 0; i < tabs->len; i++) {
+        if (g_ptr_array_index(tabs, i) == tab)
+            index = (int)i;
+    }
+    spike_log("[tabs] tab %d discarded (%s): %s, scroll %.0f,%.0f%s", index + 1, why, tab->url, tab->scrollX, tab->scrollY,
+        keep ? "; its view is reused" : "");
+    if (keep)
+        return view;
+    destroyView(view);
+    return NULL;
+}
+
+/* The least recently used hidden live tab. */
+static Tab* lruHidden(void)
+{
+    Tab* lru = NULL;
+    for (unsigned i = 0; i < tabs->len; i++) {
+        Tab* tab = g_ptr_array_index(tabs, i);
+        if (tab->view && (int)i != active && (!lru || tab->lastUsed < lru->lastUsed))
+            lru = tab;
+    }
+    return lru;
+}
+
+/* A view for a tab that is about to be shown (the active tab, still the
+ * old one, keeps its view): a new one while under the limit, else the
+ * least recently used hidden tab's (that tab is discarded). With one live
+ * tab allowed, the old active tab's own view (it is discarded). */
+static WebKitWebView* viewForNewlyShownTab(Tab* old)
+{
+    while (liveCount() > liveAllowed() && lruHidden())
+        discardTab(lruHidden(), "over the live-tab limit", FALSE);
+    if (liveCount() < liveAllowed())
+        return newView();
+    if (lruHidden())
+        return discardTab(lruHidden(), "least recently used", TRUE);
+    /* One live tab: the old tab gives its view. */
+    if (old && old->view) {
+        saveTab(old);
+        WebKitWebView* view = old->view;
+        old->view = NULL;
+        return view;
+    }
+    return newView();
+}
+
+/* Hidden live tabs all go (memory, a WebProcess that ended). */
+static void discardHidden(const char* why)
+{
+    for (unsigned i = 0; tabs && i < tabs->len; i++) {
+        Tab* tab = g_ptr_array_index(tabs, i);
+        if (tab->view && (int)i != active)
+            discardTab(tab, why, FALSE);
+    }
+}
+
+void ps5wk_browser_discard_hidden(const char* why)
+{
+    discardHidden(why);
+    redraw();
 }
 
 typedef void (*ScrollDone)(gpointer data);
@@ -253,7 +396,7 @@ typedef struct {
     gpointer data;
     guint timeout;
     gboolean finished;
-    int tab;
+    Tab* tab;
 } ScrollCapture;
 
 static void scrollCaptureFinish(ScrollCapture* capture)
@@ -267,17 +410,25 @@ static void scrollCaptureFinish(ScrollCapture* capture)
     capture->done(capture->data);
 }
 
+static gboolean tabExists(Tab* tab)
+{
+    for (unsigned i = 0; tabs && i < tabs->len; i++) {
+        if (g_ptr_array_index(tabs, i) == tab)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static void scrollCaptured(GObject* object, GAsyncResult* result, gpointer data)
 {
     ScrollCapture* capture = data;
     JSCValue* value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, NULL);
-    if (value && !capture->finished && capture->tab == active) {
+    if (value && !capture->finished && tabExists(capture->tab) && capture->tab->view == WEBKIT_WEB_VIEW(object)) {
         char* text = jsc_value_to_string(value);
         double x = 0, y = 0;
-        Tab* tab = activeTab();
-        if (text && tab && sscanf(text, "%lf,%lf", &x, &y) == 2) {
-            tab->scrollX = x;
-            tab->scrollY = y;
+        if (text && sscanf(text, "%lf,%lf", &x, &y) == 2) {
+            capture->tab->scrollX = x;
+            capture->tab->scrollY = y;
         }
         g_free(text);
     }
@@ -302,7 +453,7 @@ static void captureScroll(ScrollDone done, gpointer data)
     ScrollCapture* capture = g_new0(ScrollCapture, 1);
     capture->done = done;
     capture->data = data;
-    capture->tab = active;
+    capture->tab = activeTab();
     capture->timeout = g_timeout_add(400, scrollCaptureTimeout, capture);
     webkit_web_view_evaluate_javascript(webView, "Math.round(scrollX)+','+Math.round(scrollY)", -1, SCROLL_WORLD, NULL, NULL,
         scrollCaptured, capture);
@@ -316,9 +467,24 @@ static void switchNow(gpointer data)
         redraw();
         return;
     }
-    saveLive();
+    gint64 start = g_get_monotonic_time();
+    ps5wk_vr_stop(FALSE, "tab switch");
+    Tab* old = activeTab();
+    saveLive(); /* its record stays fresh while it is a hidden live tab */
+    Tab* tab = g_ptr_array_index(tabs, target);
+    gboolean live = tab->view != NULL;
+    if (!live)
+        tab->view = viewForNewlyShownTab(old);
     active = target;
-    activate();
+    tab->lastUsed = g_get_monotonic_time();
+    showView(tab->view);
+    restoring = FALSE;
+    pendingScrollSet = FALSE;
+    if (live)
+        spike_log("[tabs] tab %d shown live in %.1f ms (%u live): %s", target + 1, (g_get_monotonic_time() - start) / 1000.0, liveCount(),
+            webkit_web_view_get_uri(tab->view) ? webkit_web_view_get_uri(tab->view) : tab->url);
+    else
+        activate();
     scheduleSessionSave();
     redraw();
 }
@@ -339,12 +505,19 @@ static void newTabNow(gpointer data)
 {
     NewTabJob* job = data;
     switching = FALSE;
+    ps5wk_vr_stop(FALSE, "new tab");
+    Tab* old = activeTab();
     saveLive();
+    WebKitWebView* view = viewForNewlyShownTab(old);
     int at = tabs->len ? active + 1 : 0;
-    g_ptr_array_insert(tabs, at, tabNew(job->url, ""));
+    Tab* tab = tabNew(job->url, "");
+    tab->view = view;
+    tab->lastUsed = g_get_monotonic_time();
+    g_ptr_array_insert(tabs, at, tab);
     active = at;
-    spike_log("browser: new tab %d of %u: %s", active + 1, tabs->len, job->url);
-    loadFresh(job->url);
+    spike_log("browser: new tab %d of %u: %s (%u live)", active + 1, tabs->len, job->url, liveCount());
+    showView(view);
+    loadFresh(view, job->url);
     scheduleSessionSave();
     redraw();
     g_free(job->url);
@@ -374,27 +547,87 @@ static void closeTab(int index)
 {
     if (!tabs || index < 0 || index >= (int)tabs->len || switching)
         return;
-    spike_log("browser: closing tab %d of %u (%s)", index + 1, tabs->len, ((Tab*)g_ptr_array_index(tabs, index))->url);
+    Tab* closing = g_ptr_array_index(tabs, index);
+    spike_log("browser: closing tab %d of %u (%s%s)", index + 1, tabs->len, closing->url, closing->view ? ", live" : "");
     if (tabs->len == 1) {
         /* The last tab: it becomes a new tab on the home page. */
         char* home = ps5wk_home_url();
-        Tab* tab = activeTab();
-        setString(&tab->url, home);
-        setString(&tab->title, "");
-        tab->scrollX = tab->scrollY = 0;
-        g_clear_pointer(&tab->state, g_bytes_unref);
-        loadFresh(home);
+        setString(&closing->url, home);
+        setString(&closing->title, "");
+        closing->scrollX = closing->scrollY = 0;
+        closing->fromForm = FALSE;
+        g_clear_pointer(&closing->state, g_bytes_unref);
+        loadFresh(closing->view, home);
         g_free(home);
     } else if (index == active) {
+        ps5wk_vr_stop(FALSE, "tab closed");
+        WebKitWebView* freed = closing->view;
+        closing->view = NULL;
         g_ptr_array_remove_index(tabs, (unsigned)index);
         active = index < (int)tabs->len ? index : (int)tabs->len - 1;
-        activate();
+        Tab* tab = activeTab();
+        tab->lastUsed = g_get_monotonic_time();
+        if (tab->view) {
+            /* Live: shown at once; the closed tab's view goes. */
+            showView(tab->view);
+            destroyView(freed);
+        } else {
+            /* The closed tab's view takes the next tab's page. */
+            tab->view = freed;
+            activate();
+        }
     } else {
+        WebKitWebView* freed = closing->view;
+        closing->view = NULL;
         g_ptr_array_remove_index(tabs, (unsigned)index);
         if (index < active)
             active--;
+        destroyView(freed);
     }
     scheduleSessionSave();
+    redraw();
+}
+
+/* Memory: hidden live tabs go when the WebProcess's libpas memory nears its
+ * limit (60% of PS5WK_MEM_RESTART_MB, default 3 GB: the limit itself restarts
+ * the WebProcess, every page in it) or the title's free flexible memory runs
+ * low; no new live tabs until well under (45%). */
+size_t ps5wk_title_flexible_free(void) __attribute__((weak));
+
+static gboolean memoryCheck(gpointer data)
+{
+    (void)data;
+    int webPid = 0;
+    double committed = 0, limit = 0;
+    ps5wk_webmem_over(&webPid, &committed, &limit);
+    double flexibleMB = ps5wk_title_flexible_free ? ps5wk_title_flexible_free() / 1048576.0 : -1;
+    gboolean webHigh = limit > 0 && committed > limit * 0.6;
+    gboolean titleLow = flexibleMB >= 0 && flexibleMB < 96;
+    if ((webHigh || titleLow) && liveCount() > 1) {
+        char why[160];
+        snprintf(why, sizeof why, "memory: WebProcess %.0f of %.0f MB, title %.0f MB free", committed, limit, flexibleMB);
+        discardHidden(why);
+        redraw();
+    }
+    gboolean tight = webHigh || titleLow || (memoryTight && limit > 0 && committed > limit * 0.45);
+    if (tight != memoryTight) {
+        memoryTight = tight;
+        spike_log("[tabs] memory %s: %u live tab%s allowed (WebProcess %.0f of %.0f MB, title %.0f MB free)", tight ? "tight" : "fine again",
+            liveAllowed(), liveAllowed() == 1 ? "" : "s", committed, limit, flexibleMB);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+/* GPU compositing: the title's GL textures near their cap with hidden live
+ * tabs' scenes among them (patch 0072): those tabs are discarded before the
+ * shown page loses tile coverage. Weak: the CPU-only build has no WC host. */
+void ps5wk_wc_set_hidden_pages_callback(void (*callback)(double mb)) __attribute__((weak));
+
+static void onGLPressure(double mb)
+{
+    char why[96];
+    snprintf(why, sizeof why, "GL textures %.0f MB, near the cap", mb);
+    discardHidden(why);
     redraw();
 }
 
@@ -414,13 +647,13 @@ static void sessionWrite(gpointer data)
         saved->scrollX = tab->scrollX;
         saved->scrollY = tab->scrollY;
         saved->fromForm = tab->fromForm;
-        if ((int)i == active) {
-            const char* uri = webkit_web_view_get_uri(webView);
+        if (tab->view) {
+            const char* uri = webkit_web_view_get_uri(tab->view);
             if (uri && *uri && strcmp(uri, "about:blank")) {
                 g_free(saved->url);
                 saved->url = g_strdup(uri);
             }
-            saved->state = captureState();
+            saved->state = captureState(tab->view);
         } else if (tab->state)
             saved->state = g_bytes_ref(tab->state);
         g_ptr_array_add(list, saved);
@@ -752,7 +985,8 @@ static void drawMenu(WPEDisplayPS5Canvas* c)
                 wpe_display_ps5_canvas_fill(c, rx, ry, 8, ROW_H - 8, 4, C_ACCENT);
             wpe_display_ps5_canvas_text(c, tx, ry + 44, 0, 24, TRUE, current ? C_ACCENT : C_DIM_TEXT, extra);
             tx += 48;
-            *extra = 0;
+            /* a hidden tab whose page is still live: back at once */
+            snprintf(extra, sizeof extra, "%s", !current && ((Tab*)g_ptr_array_index(tabs, row))->view ? "kept live" : "");
         }
         int extraW = *extra ? wpe_display_ps5_canvas_text_width(c, 19, FALSE, extra) : 0;
         int textW = rx + rw - 24 - tx - (extraW ? extraW + 24 : 0);
@@ -1270,9 +1504,27 @@ static void applyPendingScroll(void)
     g_free(script);
 }
 
-void ps5wk_browser_load_changed(WebKitLoadEvent event)
+static Tab* tabForView(WebKitWebView* view)
 {
-    const char* uri = webkit_web_view_get_uri(webView);
+    for (unsigned i = 0; tabs && i < tabs->len; i++) {
+        Tab* tab = g_ptr_array_index(tabs, i);
+        if (tab->view == view)
+            return tab;
+    }
+    return NULL;
+}
+
+void ps5wk_browser_load_changed(WebKitWebView* view, WebKitLoadEvent event)
+{
+    const char* uri = webkit_web_view_get_uri(view);
+    if (view != webView) {
+        /* A hidden live tab loading by itself (a page's own redirect or
+         * reload): its record follows, nothing is shown. */
+        Tab* tab = tabForView(view);
+        if (tab && event == WEBKIT_LOAD_COMMITTED && uri && *uri && strcmp(uri, "about:blank"))
+            setString(&tab->url, uri);
+        return;
+    }
     switch (event) {
     case WEBKIT_LOAD_STARTED:
         showBar();
@@ -1287,7 +1539,7 @@ void ps5wk_browser_load_changed(WebKitLoadEvent event)
             tab->fromForm = uri && ((postURI && !strcmp(postURI, uri)) || (formPlaceholderURI && !strcmp(formPlaceholderURI, uri)));
         g_clear_pointer(&postURI, g_free);
         g_clear_pointer(&formPlaceholderURI, g_free);
-        ps5wk_history_visit(uri, webkit_web_view_get_title(webView), TRUE);
+        ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
         scheduleSessionSave();
         break;
     }
@@ -1303,33 +1555,61 @@ void ps5wk_browser_load_changed(WebKitLoadEvent event)
     redraw();
 }
 
+/* The WebProcess ended: every view's page went with it. A hidden live tab
+ * goes back to its record (its page comes back when it is picked);
+ * ps5browser.c reloads the active one as before. */
+static guint discardEndedSource;
+
+static gboolean discardEndedViews(gpointer data)
+{
+    (void)data;
+    discardEndedSource = 0;
+    discardHidden("its WebProcess ended");
+    redraw();
+    return G_SOURCE_REMOVE;
+}
+
+/* TRUE: a hidden live tab's view (ps5browser.c then leaves it alone). */
+gboolean ps5wk_browser_view_terminated(WebKitWebView* view)
+{
+    if (view == webView || !tabForView(view))
+        return FALSE;
+    if (!discardEndedSource)
+        discardEndedSource = g_idle_add(discardEndedViews, NULL);
+    return TRUE;
+}
+
 static void onTitleChanged(GObject* object, GParamSpec* pspec, gpointer data)
 {
-    (void)object;
     (void)pspec;
     (void)data;
-    const char* title = webkit_web_view_get_title(webView);
-    Tab* tab = activeTab();
+    WebKitWebView* view = WEBKIT_WEB_VIEW(object);
+    const char* title = webkit_web_view_get_title(view);
+    Tab* tab = tabForView(view);
     if (tab && title && *title)
         setString(&tab->title, title);
-    ps5wk_history_set_title(webkit_web_view_get_uri(webView), title);
+    if (view != webView)
+        return;
+    ps5wk_history_set_title(webkit_web_view_get_uri(view), title);
     if (menuOpen || barShown)
         redraw();
 }
 
 static void onURIChanged(GObject* object, GParamSpec* pspec, gpointer data)
 {
-    (void)object;
     (void)pspec;
     (void)data;
+    WebKitWebView* view = WEBKIT_WEB_VIEW(object);
     /* Same-document navigations (pushState, fragments): no load events. */
-    if (webkit_web_view_is_loading(webView))
+    if (webkit_web_view_is_loading(view))
         return;
-    const char* uri = webkit_web_view_get_uri(webView);
-    Tab* tab = activeTab();
+    const char* uri = webkit_web_view_get_uri(view);
+    Tab* tab = tabForView(view);
     if (tab && uri && *uri && strcmp(uri, "about:blank"))
         setString(&tab->url, uri);
-    ps5wk_history_visit(uri, webkit_web_view_get_title(webView), TRUE);
+    if (view != webView)
+        return;
+    ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
     scheduleSessionSave();
     if (menuOpen || barShown)
         redraw();
@@ -1337,18 +1617,19 @@ static void onURIChanged(GObject* object, GParamSpec* pspec, gpointer data)
 
 static void onProgress(GObject* object, GParamSpec* pspec, gpointer data)
 {
-    (void)object;
     (void)pspec;
     (void)data;
-    progressRedraw();
+    if (WEBKIT_WEB_VIEW(object) == webView)
+        progressRedraw();
 }
 
 /* target=_blank links and window.open: a new tab (a page's own pop-ups,
  * without a click, are dropped). */
 static WebKitWebView* onCreate(WebKitWebView* view, WebKitNavigationAction* action, gpointer data)
 {
-    (void)view;
     (void)data;
+    if (view != webView)
+        return NULL; /* a hidden tab opens nothing */
     WebKitURIRequest* request = webkit_navigation_action_get_request(action);
     const char* uri = request ? webkit_uri_request_get_uri(request) : NULL;
     if (!uri || !*uri || !strcmp(uri, "about:blank")) {
@@ -1396,9 +1677,8 @@ static gboolean showFormPage(gpointer data)
  * sends a form again. */
 static gboolean onDecidePolicy(WebKitWebView* view, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data)
 {
-    (void)view;
     (void)data;
-    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION)
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION || view != webView)
         return FALSE;
     WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
     WebKitURIRequest* request = webkit_navigation_action_get_request(action);
@@ -1427,11 +1707,46 @@ static gboolean onDecidePolicy(WebKitWebView* view, WebKitPolicyDecision* decisi
 
 /* ---------------------------------------------------------------- start */
 
+/* ps5browser.c: its handlers on a new view (load events, crashes, keys). */
+void ps5wk_connect_web_view(WebKitWebView* view);
+
+/* The browser's own handlers on a view (data &tabs: destroyView takes them
+ * off by it). */
+static void connectView(WebKitWebView* view)
+{
+    g_signal_connect(view, "notify::title", G_CALLBACK(onTitleChanged), &tabs);
+    g_signal_connect(view, "notify::uri", G_CALLBACK(onURIChanged), &tabs);
+    g_signal_connect(view, "notify::estimated-load-progress", G_CALLBACK(onProgress), &tabs);
+    g_signal_connect(view, "notify::is-loading", G_CALLBACK(onProgress), &tabs);
+    g_signal_connect(view, "create", G_CALLBACK(onCreate), &tabs);
+    g_signal_connect(view, "decide-policy", G_CALLBACK(onDecidePolicy), &tabs);
+    if (view != webView)
+        ps5wk_connect_web_view(view);
+}
+
+static unsigned readLiveLimit(void)
+{
+    unsigned limit = 2;
+    gchar* text = NULL;
+    if (g_file_get_contents(DATA_DIR "/live-tabs", &text, NULL, NULL)) {
+        int value = atoi(g_strstrip(text));
+        if (value >= 1 && value <= 4)
+            limit = (unsigned)value;
+        g_free(text);
+    }
+    return limit;
+}
+
 void ps5wk_browser_init(WPEDisplay* d, WebKitWebView* view)
 {
     display = WPE_DISPLAY_PS5(d);
     webView = view;
     tabs = g_ptr_array_new_with_free_func(tabFree);
+    liveLimit = readLiveLimit();
+    spike_log("[tabs] up to %u live tab%s (/data/ps5webkit/live-tabs: 1-4, default 2)", liveLimit, liveLimit == 1 ? "" : "s");
+    memoryTimer = g_timeout_add_seconds(5, memoryCheck, NULL);
+    if (ps5wk_wc_set_hidden_pages_callback)
+        ps5wk_wc_set_hidden_pages_callback(onGLPressure);
     ps5wk_bdata_init(DATA_DIR);
     WPEView* wpeView = webkit_web_view_get_wpe_view(view);
     if (wpeView && wpe_view_get_width(wpeView) > 0) {
@@ -1440,12 +1755,7 @@ void ps5wk_browser_init(WPEDisplay* d, WebKitWebView* view)
     }
     wpe_display_ps5_set_button_handler(display, onButtons, NULL);
     wpe_display_ps5_set_ui_pointer_callback(display, onUIPointer, NULL);
-    g_signal_connect(view, "notify::title", G_CALLBACK(onTitleChanged), NULL);
-    g_signal_connect(view, "notify::uri", G_CALLBACK(onURIChanged), NULL);
-    g_signal_connect(view, "notify::estimated-load-progress", G_CALLBACK(onProgress), NULL);
-    g_signal_connect(view, "notify::is-loading", G_CALLBACK(onProgress), NULL);
-    g_signal_connect(view, "create", G_CALLBACK(onCreate), NULL);
-    g_signal_connect(view, "decide-policy", G_CALLBACK(onDecidePolicy), NULL);
+    connectView(view);
 }
 
 static gboolean fileExists(const char* path)
@@ -1462,7 +1772,9 @@ void ps5wk_browser_start(const char* startURI, const char* homeURI, gboolean tes
     if (testRun) {
         /* Test URL lists drive the view themselves; the owner's session stays. */
         sessionFrozen = TRUE;
-        g_ptr_array_add(tabs, tabNew(homeURI, ""));
+        Tab* only = tabNew(homeURI, "");
+        only->view = webView;
+        g_ptr_array_add(tabs, only);
         active = 0;
         spike_log("browser: test run: one tab, the saved session is neither restored nor written");
         return;
@@ -1484,7 +1796,10 @@ void ps5wk_browser_start(const char* startURI, const char* homeURI, gboolean tes
         savedActive = 0;
     if (!tabs->len) {
         const char* uri = startURI ? startURI : homeURI;
-        g_ptr_array_add(tabs, tabNew(uri, ""));
+        Tab* first = tabNew(uri, "");
+        first->view = webView;
+        first->lastUsed = g_get_monotonic_time();
+        g_ptr_array_add(tabs, first);
         active = 0;
         spike_log("browser: no saved tabs; loading %s", uri);
         webkit_web_view_load_uri(webView, uri);
@@ -1492,17 +1807,23 @@ void ps5wk_browser_start(const char* startURI, const char* homeURI, gboolean tes
     }
     active = savedActive;
     Tab* shown = activeTab();
+    shown->view = webView; /* the others come back when picked */
+    shown->lastUsed = g_get_monotonic_time();
     spike_log("browser: %u saved tab%s, tab %d shown (%s)", tabs->len, tabs->len == 1 ? "" : "s", active + 1, shown->url);
     if (startURI && strcmp(startURI, shown->url) && tabs->len < MAX_TABS) {
         /* A link sent while the browser was closed (ps5open, Restart browser
          * with another page): a new tab after the saved ones. */
-        g_ptr_array_add(tabs, tabNew(startURI, ""));
+        Tab* tab = tabNew(startURI, "");
+        g_ptr_array_add(tabs, tab);
+        shown->view = NULL;
+        tab->view = webView;
+        tab->lastUsed = g_get_monotonic_time();
         active = (int)tabs->len - 1;
         spike_log("browser: start link in a new tab %d: %s", active + 1, startURI);
-        loadFresh(startURI);
+        loadFresh(webView, startURI);
     } else if (startURI && strcmp(startURI, shown->url)) {
         spike_log("browser: start link in the shown tab (%d tabs is the most): %s", MAX_TABS, startURI);
-        loadFresh(startURI);
+        loadFresh(webView, startURI);
     } else
         activate();
     scheduleSessionSave();
@@ -1516,7 +1837,9 @@ static char* stateJSON(void)
     for (unsigned i = 0; i < tabs->len; i++) {
         Tab* tab = g_ptr_array_index(tabs, i);
         gboolean live = (int)i == active;
-        g_string_append(out, i ? ",{\"url\":" : "{\"url\":");
+        g_string_append(out, i ? ",{\"live\":" : "{\"live\":");
+        g_string_append(out, tab->view ? "true" : "false");
+        g_string_append(out, ",\"url\":");
         ps5wk_json_string(out, live ? shownURI() : tab->url);
         g_string_append(out, ",\"title\":");
         ps5wk_json_string(out, live ? shownTitle() : tab->title);
@@ -1525,11 +1848,12 @@ static char* stateJSON(void)
     }
     WebKitBackForwardList* list = webkit_web_view_get_back_forward_list(webView);
     g_string_append_printf(out, "],\"active\":%d,\"maxTabs\":%d,\"menu\":%s,\"bar\":%s,\"section\":%d,\"zone\":%d,\"toolbarFocus\":%d,"
-        "\"listFocus\":%d,\"canGoBack\":%s,\"canGoForward\":%s,\"backForwardLength\":%u,\"loading\":%s,\"progress\":%.2f,\"bookmarks\":",
+        "\"listFocus\":%d,\"canGoBack\":%s,\"canGoForward\":%s,\"backForwardLength\":%u,\"loading\":%s,\"progress\":%.2f,"
+        "\"liveLimit\":%u,\"liveAllowed\":%u,\"liveCount\":%u,\"memoryTight\":%s,\"bookmarks\":",
         active, MAX_TABS, menuOpen ? "true" : "false", barShown ? "true" : "false", section, zone, toolbarFocus, listFocus,
         canGoBack() ? "true" : "false", webkit_web_view_can_go_forward(webView) ? "true" : "false",
         webkit_back_forward_list_get_length(list), webkit_web_view_is_loading(webView) ? "true" : "false",
-        webkit_web_view_get_estimated_load_progress(webView));
+        webkit_web_view_get_estimated_load_progress(webView), liveLimit, liveAllowed(), liveCount(), memoryTight ? "true" : "false");
     ps5wk_entries_json(out, ps5wk_bookmarks(), 500);
     g_string_append_printf(out, ",\"historyLength\":%u,\"history\":", ps5wk_history()->len);
     ps5wk_entries_json(out, ps5wk_history(), 50);

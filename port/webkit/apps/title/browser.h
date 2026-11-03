@@ -66,14 +66,25 @@ void ps5wk_entries_json(GString* out, GPtrArray* entries, unsigned max);
 
 /* ---- browserui.c ---- */
 
+/* ps5browser.c, for browserui.c: the active tab's view changed (load
+ * handlers, View in VR, the ad blocker follow it); a new tab's view gets
+ * ps5browser.c's handlers. */
+void ps5wk_set_active_web_view(WebKitWebView* view);
+void ps5wk_connect_web_view(WebKitWebView* view);
+
 /* After the web view is made (and View in VR's button handler installed:
  * the browser chains it). */
 void ps5wk_browser_init(WPEDisplay* display, WebKitWebView* webView);
 /* The first page: restores the saved tabs (unless @testRun), then opens
  * @startURI in a new tab, or the home page when nothing was restored. */
 void ps5wk_browser_start(const char* startURI, const char* homeURI, gboolean testRun);
-/* ps5browser.c's load-changed handler calls this first. */
-void ps5wk_browser_load_changed(WebKitLoadEvent event);
+/* ps5browser.c's load-changed handler calls this first (any tab's view). */
+void ps5wk_browser_load_changed(WebKitWebView* view, WebKitLoadEvent event);
+/* A view's WebProcess ended: TRUE when it is a hidden live tab's (it goes
+ * back to its record; nothing to reload). */
+gboolean ps5wk_browser_view_terminated(WebKitWebView* view);
+/* Hidden live tabs give up their pages (before the WebProcess restarts). */
+void ps5wk_browser_discard_hidden(const char* why);
 /* Back as the pad's O does (not into the empty first entry of a new tab). */
 void ps5wk_browser_go_back(void);
 /* Options: the menu (with the address field focused). */

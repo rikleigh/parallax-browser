@@ -352,17 +352,45 @@ shows at the top with the page's title, address and a progress line, and
 goes 1.5 s after the load ends; the pad still drives the page.
 `/data/ps5webkit/no-load-bar` (a file) turns that off.
 
-**Tabs and memory.** All tabs share the one WebKitWebView and its one
-WebProcess: only the tab shown is a live page. A background tab is its
-address, title, scroll position and WebKit's serialized session state (its
-back/forward list, `webkit_web_view_get_session_state`, a few hundred bytes
-to a few KB; over 512 KB only the address is kept). Switching reads the
-page's scroll position (a script in an isolated world), saves its state,
-restores the other tab's state and goes to its current entry, then scrolls
-back to where it was (again while the page is still at the top, for 3 s).
-WebKit loads a restored entry as a normal load (the HTTP cache revalidates,
-`wasRestoredFromSession`), so a switch costs a page load, not memory. A
-page that came from a form (POST) is never sent again by a switch or a
+**Tabs and memory.** The tab shown and the most recently used other tab
+are **live**: each has its own WebKitWebView, all in the one WebProcess
+(patch 0018 keeps one WebProcess for everything), with the same settings,
+content filters (the ad blocker) and policies. Switching to a live tab is
+instant: nothing reloads, a feed keeps its place and its state. A hidden
+live tab's page is hidden as on a desktop browser: its view is unmapped
+(page visibility `hidden`, `requestAnimationFrame` stops), its timers are
+throttled and its CSS animations suspended (`HiddenPageDOMTimerThrottlingEnabled`
+and `HiddenPageCSSAnimationSuspensionEnabled`, which WPE leaves off), and
+media is left to WebKit (audio keeps playing). With GPU compositing its
+scene stays in the title but is never shown (patch 0072); on the CPU path
+its frames are handed back undrawn.
+
+The other tabs are **discarded**: their address, title, scroll position and
+WebKit's serialized session state (the back/forward list,
+`webkit_web_view_get_session_state`, a few hundred bytes to a few KB; over
+512 KB only the address is kept). Picking one restores its state into a
+view and goes to its current entry, then scrolls back to where it was
+(again while the page is still at the top, for 3 s). WebKit loads a
+restored entry as a normal load (the HTTP cache revalidates,
+`wasRestoredFromSession`), so it costs a page load, not memory. The view
+comes from the least recently used hidden live tab, which is discarded
+(`[tabs] tab N discarded (least recently used)`), so there are never more
+views than live tabs.
+
+- **How many live tabs:** `/data/ps5webkit/live-tabs` (a file holding 1-4,
+  default 2; 1 = every switch reloads, as before). Read at start.
+- **Memory:** every 5 s the title reads the WebProcess's libpas memory (the
+  memory limit's status file) and its own free flexible memory. Over 60% of
+  the page memory limit (`PS5WK_MEM_RESTART_MB`, default 3 GB) or under
+  96 MB free in the title, the hidden live tabs are discarded and only one
+  live tab is allowed until the WebProcess is under 45% again (`[tabs]
+  memory tight` / `fine again`). The limit itself restarts the WebProcess
+  (every page in it): the hidden live tabs are discarded first, and when
+  the WebProcess ends for any reason (crash, the GL texture cap's CPU
+  fallback) they go back to their records and only the shown page reloads.
+- The Tabs list marks live hidden tabs *kept live*.
+
+A page that came from a form (POST) is never sent again by a switch or a
 restore: the tab shows *This page came from a form* with a link that loads
 the address without the form. A new tab starts with a fresh back/forward
 list (an empty `about:blank` first entry, built in WebKit's session state
@@ -416,6 +444,23 @@ held), the left stick moves the pointer without page events, the right
 stick and pointer moves to `wpe_display_ps5_set_ui_pointer_callback()`.
 The browser's button handler chains View in VR's (`ps5wk_vr_buttons`).
 
+Live tabs on the platform: `wpe_display_ps5_set_active_view()` picks the
+view that is mapped (its page visible), focused, shown and given the pad;
+once it has been called a new view stays unmapped until it is made active
+(`WPEViewPS5`'s `can_be_mapped`). On the CPU path a hidden view's frames
+go straight back undrawn, and the first frame after a view becomes active
+replaces the whole screen whatever its damage; patch 0072 makes a page
+shown again repaint whole (WPE's drawing area only resumed painting). With
+GPU compositing the scene host shows the newest scene whose page is not
+hidden (patch 0072: `DrawingAreaProxyWCPS5::viewIsBecomingVisible` /
+`Invisible`, `[wc] scene N hidden` / `shown`), at once on a switch; a
+hidden page's scene keeps applying its updates and its GL textures (they
+count toward the 160 MB cap: near it, at 128 MB, the title is asked to let
+the hidden pages go before the shown page loses tile coverage,
+`ps5wk_wc_set_hidden_pages_callback`). ps5browser.c's handlers act on the
+active view only (`ps5wk_set_active_web_view`: the load handlers, View in
+VR's page commands, the ad blocker's reload).
+
 **API** (link server, the settings' rules: no CORS, the same Host and
 Origin, the PIN; for log-only tests, since the pad can't be driven
 remotely; indexes are 1-based as in the menu):
@@ -454,6 +499,23 @@ the WebProcess's memory cache kept the first copy). The open menu costs the
 title ~16 MB of heap (its canvas and the copy on its way to the renderer),
 given back when it closes. Not checked yet: the pad on the TV (focus,
 pointer, repeat, the keyboard from the address field).
+
+**Live tabs checked on the console** (2026-11-03, log only): a feed test
+page (`test/paint/wcfeed.html?videos=0`, scrolling itself with timers and
+`requestAnimationFrame`) and a long encyclopedia article as the two live
+tabs, GPU compositing on. Switching between them took 0.1 ms in the title
+(`[tabs] tab N shown live`), and the screen showed the other page's scene
+at once (screenshot 2 s after the switch). Hidden, the feed's rAF went
+from 60/s to 0 and its timer-driven scrolling from 150 px/s to 3 px/s
+(timer throttling); the WebProcess's CPU was 0.14 cores with the feed shown
+and 0.01 with the article shown and the feed hidden (0.05-0.06 with one
+static page). Memory with both live: one WebProcess, peak RSS 276 MB,
+libpas 316 MB committed; the hidden feed's scene held 49 MB of GL textures
+in the title (73 -> 24 MB when it was closed), which is most of the
+title's extra direct memory (699-714 vs 658 MB). A third tab discarded the
+least recently used one and reused its view. GPU compositing off: the
+first switch back to a live tab showed the old page until the repaint fix
+above; with it, each switch showed the right page.
 
 ## Build
 
@@ -581,6 +643,7 @@ the original messages.
 | 0069-ps5-wc-long-feed-title-costs | long feeds, the title: DOM-only wheel events paced by the WebProcess's updates (or 250 ms), events the root can't take not resent for 250 ms after the WebProcess found nothing to scroll (`wheelpace=0`, `unconsumedpace=0` in `wc-async-scroll`); scene paint skips subtrees whose bounds miss the clip, no coordinated "future" transforms (`wc-no-cull`) | (new) |
 | 0070-ps5-wc-feed-append-costs | feeds that load more (COMPOSITING-PLAN.md, *Feeds that load more*): a transform animation nested in an animating ancestor (loading spinners) gets its extent through the ancestor's keyframes instead of compositing every later layer; wheel events the root can't take at most one per WebProcess update, deltas carried; wheel transaction (kept target) for DOM-only wheel events; far or clipped-out intersection observer targets skipped for a bounded time; `[render] wc phases` line. A/B: `PS5WK_WC_NESTED_ANIM_EXTENT=0`, `PS5WK_WHEEL_TRANSACTION=0`, `PS5WK_IO_SKIP=0`, `unconsumedpace=0` | (new) |
 | 0071-ps5-input-multiline-hint | a multiline input hint for textarea and contenteditable elements (`InputMethodState::Hint::Multiline` -> `WEBKIT_INPUT_HINT_MULTILINE` -> `WPE_INPUT_HINT_MULTILINE`): the system keyboard's OK presses Return after the text only in single-line fields (*System keyboard*) | (new) |
+| 0072-ps5-hidden-pages-for-live-tabs | the browser's live background tabs: a page shown again repaints whole on the CPU path (`DrawingAreaCoordinatedGraphics::resumePainting`); the WC scene host never shows a hidden page's scene and shows a page's scene as soon as its view is shown (`viewIsBecomingVisible`/`Invisible`, `PS5WCHost::setPageVisible`); near the GL texture cap with hidden scenes, the title is asked to close the hidden pages first (`ps5wk_wc_set_hidden_pages_callback`) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS

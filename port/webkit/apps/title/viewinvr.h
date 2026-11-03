@@ -17,6 +17,8 @@ gboolean ps5wk_vr_active(void);
 /* View in VR's pad handling (the touchpad, the whole pad while in VR):
  * TRUE when it took the press. For a button handler that chains it. */
 gboolean ps5wk_vr_buttons(guint32 pressed);
+/* The page shown is now this view's (the browser's tabs). */
+void ps5wk_vr_set_web_view(WebKitWebView* webView);
 /* Log-only test sequence (/data/ps5webkit/vr-selftest with vr-sim): started
  * after a test page loaded. */
 void ps5wk_vr_selftest_schedule(unsigned delaySeconds);
