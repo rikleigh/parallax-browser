@@ -306,20 +306,23 @@ int main(int argc, char** argv)
     s.user = &s;
     WPEDisplayPS5Canvas* canvas = wpe_display_ps5_canvas_new(W, H);
     bui_draw_menu(canvas, &s);
-    const int runs = 40;
-    double start = nowMS();
-    for (int i = 0; i < runs; i++)
+    /* the best of 60 (the Mac's own noise out) */
+    const int runs = 60;
+    double menuMS = 1e9, barMS = 1e9;
+    for (int i = 0; i < runs; i++) {
+        double start = nowMS();
         bui_draw_menu(canvas, &s);
-    double menuMS = (nowMS() - start) / runs;
+        menuMS = MIN(menuMS, nowMS() - start);
+    }
     bar = wpe_display_ps5_canvas_new(W, bui_bar_height());
     s.loading = TRUE;
     s.progress = 0.5;
-    start = nowMS();
     for (int i = 0; i < runs; i++) {
+        double start = nowMS();
         wpe_display_ps5_canvas_clear(bar, 0);
         bui_draw_bar(bar, &s, FALSE);
+        barMS = MIN(barMS, nowMS() - start);
     }
-    double barMS = (nowMS() - start) / runs;
-    printf("draw cost on this Mac: menu %.2f ms, loading bar %.2f ms\n", menuMS, barMS);
+    printf("draw cost on this Mac (best of %d): menu %.2f ms, loading bar %.2f ms\n", runs, menuMS, barMS);
     return 0;
 }

@@ -499,8 +499,9 @@ the first use); the loading bar 1920x104 (0.8 MB). The drawing itself is
 `apps/title/browserdraw.c`, from a plain state that `browserui.c` fills
 (no WebKit calls), on the canvas's rounded rectangles, gradients, outlines,
 glows, images and text; over a uniform area a translucent fill reuses the
-last blend, so the menu costs what the plainer one did (3.6 ms against
-3.7 ms on the Mac harness). The log says what it costs on the console:
+last blend, so the menu costs less than the plainer one did (2.6 ms
+against 3.6 ms on the Mac harness, best of 60; the loading bar 0.5 ms
+against 0.4 ms). The log says what it costs on the console:
 `browser: menu drawn in N ms (+ N ms to hand it over)` for the first frame,
 `browser: menu closed (drawn N times, N ms on average, N ms at most)`.
 The renderer fades a layer that appears in (150 ms) and one removed out
