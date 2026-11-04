@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cosmetic filter test</title>
+<!--
+  Ad blocker phase 2 test (port/webkit/ADBLOCK.md): elements that uBO Lite's
+  generic cosmetic filters hide (an id and a class from the "lowly generic"
+  lists, a tag and an attribute from the "highly generic" one) and controls
+  that nothing hides. Served over http (e.g. tools/serve-media.py --port 8779
+  port/webkit/test/adblock) they should be hidden; opened as a file: page they
+  should not be (the browser's own pages are exempt). Result, one console
+  line the title relays:
+    [cosmetic-test] http: hidden 4/4 (#AD_160 .ez-sidebar-wall ad-slot [data-ad-name]), controls shown 2/2
+-->
+<style>
+:root{color-scheme:dark}
+body{margin:0;background:#10141c;color:#e8ecf2;font:20px/1.4 system-ui,sans-serif;padding:24px 32px}
+.box{display:block;border:1px solid #2e3644;padding:8px;margin:6px 0}
+</style>
+</head>
+<body>
+<h1>Cosmetic filter test</h1>
+<p id="summary">Running…</p>
+<div class="box" id="AD_160" data-test="ad">#AD_160 (lowly generic id)</div>
+<div class="box ez-sidebar-wall" data-test="ad">.ez-sidebar-wall (lowly generic class)</div>
+<ad-slot class="box" data-test="ad">AD-SLOT (highly generic tag)</ad-slot>
+<div class="box" data-ad-name="x" data-test="ad">[data-ad-name] (highly generic attribute)</div>
+<div class="box" id="content-160" data-test="control">control: #content-160</div>
+<div class="box sidebar-wall-paper" data-test="control">control: .sidebar-wall-paper</div>
+<script>
+setTimeout(function () {
+    var ads = document.querySelectorAll('[data-test=ad]'), controls = document.querySelectorAll('[data-test=control]');
+    var hidden = [], shownControls = 0;
+    ads.forEach(function (e) { if (getComputedStyle(e).display === 'none') hidden.push(e.id ? '#' + e.id : e.className.replace('box ', '.') || e.tagName); });
+    controls.forEach(function (e) { if (getComputedStyle(e).display !== 'none') shownControls++; });
+    var text = '[cosmetic-test] ' + location.protocol.replace(':', '') + ': hidden ' + hidden.length + '/' + ads.length + ' (' + hidden.join(' ') + '), controls shown ' + shownControls + '/' + controls.length;
+    document.getElementById('summary').textContent = text;
+    console.log(text);
+}, 1000);
+</script>
+</body>
+</html>

@@ -13,7 +13,8 @@
   var t0 = Date.now();
   var youtube = /(^|\.)youtube\.com$/.test(host);
   function nav() { return performance.getEntriesByType('navigation')[0] || {}; }
-  function shown(e) { return !!(e.getClientRects().length && getComputedStyle(e).display !== 'none' && getComputedStyle(e).visibility !== 'hidden'); }
+  /* On screen with a size (an empty container that takes no space doesn't count). */
+  function shown(e) { var r = e.getBoundingClientRect(); return r.width > 1 && r.height > 1 && getComputedStyle(e).visibility !== 'hidden'; }
   var samples = 0, adSamples = 0, adSeen = false, lastAdText = '';
   function sample() {
     var p = document.querySelector('.html5-video-player');
@@ -39,7 +40,7 @@
     var pr = window.ytInitialPlayerResponse;
     var v = document.querySelector('video');
     console.log('[phase2] ' + host + ' ads at ' + label + ': slots ' + slots.length + ' shown ' + visible.length +
-      (visible.length ? ' (' + visible.map(function (e) { return e.tagName.toLowerCase() + (e.id ? '#' + e.id : ''); }).slice(0, 4).join(' ') + ')' : '') +
+      (visible.length ? ' (' + visible.map(function (e) { var r = e.getBoundingClientRect(); return e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + ' ' + Math.round(r.width) + 'x' + Math.round(r.height); }).slice(0, 4).join(' ') + ')' : '') +
       ' | player ad-showing ' + (adSeen ? 'YES' : 'no') + ' (samples ' + samples + ', with ad ' + adSamples + (lastAdText ? ', "' + lastAdText + '"' : '') + ')' +
       ' | ytInitialPlayerResponse ' + (pr === undefined ? 'undefined' : 'adPlacements ' + (pr && pr.adPlacements ? pr.adPlacements.length : 'none') +
         ', playerAds ' + (pr && pr.playerAds ? pr.playerAds.length : 'none')) +
