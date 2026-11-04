@@ -1,0 +1,413 @@
+diff --git a/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp b/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
+index 07b62b590b..1da529e00d 100644
+--- a/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
+@@ -56,11 +56,42 @@
+ #include <wtf/glib/GMallocString.h>
+ #include <wtf/glib/RunLoopSourcePriority.h>
+ #include <wtf/text/MakeString.h>
++#include <wtf/text/StringToIntegerConversion.h>
++
++#if OS(UNIX)
++#include <sys/statvfs.h>
++#endif
+ 
+ namespace WebKit {
+ using namespace WebCore;
+ 
+ static const size_t gDefaultReadBufferSize = 8192;
++// Downloads read and write in bigger blocks, and tell the UI process about
++// progress at most every 100 ms or 1 MB.
++static const size_t gDownloadReadBufferSize = 65536;
++static const uint64_t gDownloadProgressBytes = 1024 * 1024;
++static constexpr Seconds gDownloadProgressInterval = 100_ms;
++
++// "bytes=N-" (a download resumed by the application): N, else nullopt.
++static std::optional<uint64_t> openEndedRangeStart(const String& range)
++{
++    auto value = range.trim(isASCIIWhitespace<char16_t>);
++    if (!value.startsWithIgnoringASCIICase("bytes="_s) || !value.endsWith('-'))
++        return std::nullopt;
++    return parseInteger<uint64_t>(StringView(value).substring(6, value.length() - 7));
++}
++
++// "bytes S-E/T" or "bytes S-E/*": S, else nullopt.
++static std::optional<uint64_t> contentRangeStart(const String& contentRange)
++{
++    auto value = contentRange.trim(isASCIIWhitespace<char16_t>);
++    if (!value.startsWithIgnoringASCIICase("bytes "_s))
++        return std::nullopt;
++    size_t dash = value.find('-', 6);
++    if (dash == notFound)
++        return std::nullopt;
++    return parseInteger<uint64_t>(StringView(value).substring(6, dash - 6).trim(isASCIIWhitespace<char16_t>));
++}
+ 
+ NetworkDataTaskSoup::NetworkDataTaskSoup(NetworkSession& session, NetworkDataTaskClient& client, const NetworkLoadParameters& parameters)
+     : NetworkDataTask(session, client, parameters.request, parameters.storedCredentialsPolicy, parameters.shouldClearReferrerOnHTTPSToHTTPRedirect, parameters.isMainFrameNavigation, parameters.isInitiatedByWorker)
+@@ -212,6 +243,11 @@ void NetworkDataTaskSoup::createRequest(ResourceRequest&& request, WasBlockingCo
+     }
+     soup_message_set_flags(m_soupMessage.get(), static_cast<SoupMessageFlags>(soup_message_get_flags(m_soupMessage.get()) | messageFlags));
+ 
++    // A byte range of a content-coded body can't be decoded on its own, and a
++    // resumed download must get the bytes the offsets count: no Accept-Encoding.
++    if (m_currentRequest.hasHTTPHeaderField(HTTPHeaderName::Range))
++        soup_message_disable_feature(m_soupMessage.get(), SOUP_TYPE_CONTENT_DECODER);
++
+     bool blockCookies = shouldBlockCookies(m_currentRequest, wasBlockingCookies);
+     if (blockCookies)
+         soup_message_disable_feature(m_soupMessage.get(), SOUP_TYPE_COOKIE_JAR);
+@@ -981,7 +1017,7 @@ void NetworkDataTaskSoup::read()
+ {
+     RefPtr<NetworkDataTaskSoup> protectedThis(this);
+     ASSERT(m_inputStream);
+-    m_readBuffer.grow(gDefaultReadBufferSize);
++    m_readBuffer.grow(m_downloadOutputStream ? gDownloadReadBufferSize : gDefaultReadBufferSize);
+     g_input_stream_read_async(m_inputStream.get(), m_readBuffer.mutableSpan().data(), m_readBuffer.size(), RunLoopSourcePriority::AsyncIONetwork, m_cancellable.get(),
+         reinterpret_cast<GAsyncReadyCallback>(readCallback), protectedThis.leakRef());
+ }
+@@ -1290,27 +1326,77 @@ void NetworkDataTaskSoup::download()
+         return;
+     }
+ 
++    // The data goes to <destination>.part, renamed to the destination when it
++    // is complete. The destination itself is not created before then.
+     auto downloadDestinationPath = m_pendingDownloadLocation.utf8();
+     m_downloadDestinationFile = gFileNewForPath(downloadDestinationPath);
+-    GRefPtr<GFileOutputStream> outputStream;
+     GUniqueOutPtr<GError> error;
+-    if (m_allowOverwriteDownload)
+-        outputStream = adoptGRef(g_file_replace(m_downloadDestinationFile.get(), nullptr, FALSE, G_FILE_CREATE_NONE, nullptr, &error.outPtr()));
+-    else
+-        outputStream = adoptGRef(g_file_create(m_downloadDestinationFile.get(), G_FILE_CREATE_NONE, nullptr, &error.outPtr()));
+-    if (!outputStream) {
+-        didFailDownload(downloadDestinationError(m_response, String::fromUTF8(error->message)));
++    if (!m_allowOverwriteDownload && g_file_query_exists(m_downloadDestinationFile.get(), nullptr)) {
++        m_downloadDestinationFile = nullptr;
++        didFailDownload(downloadDestinationError(m_response, "The destination already exists"_s));
+         return;
+     }
+ 
+-    auto intermediatePath = makeString(m_pendingDownloadLocation, ".wkdownload"_s).utf8();
++    auto intermediatePath = makeString(m_pendingDownloadLocation, ".part"_s).utf8();
+     m_downloadIntermediateFile = gFileNewForPath(intermediatePath);
+-    outputStream = adoptGRef(g_file_replace(m_downloadIntermediateFile.get(), nullptr, TRUE, G_FILE_CREATE_NONE, nullptr, &error.outPtr()));
++
++    // A download resumed by the application asks for "Range: bytes=N-" with N
++    // the size of the .part file. A 206 starting at exactly that size is
++    // appended; a 206 starting anywhere else is refused (mismatched data is
++    // never joined); any other success (200: no range support, or If-Range
++    // found a changed validator) starts the file over.
++    bool append = false;
++    if (auto rangeStart = openEndedRangeStart(m_currentRequest.httpHeaderField(HTTPHeaderName::Range))) {
++        if (m_response.httpStatusCode() == httpStatus206PartialContent) {
++            auto start = contentRangeStart(m_response.httpHeaderField(HTTPHeaderName::ContentRange));
++            GRefPtr<GFileInfo> info = adoptGRef(g_file_query_info(m_downloadIntermediateFile.get(), G_FILE_ATTRIBUTE_STANDARD_SIZE, G_FILE_QUERY_INFO_NONE, nullptr, nullptr));
++            uint64_t onDisk = info ? static_cast<uint64_t>(g_file_info_get_size(info.get())) : 0;
++            if (!start || *start != *rangeStart || *start != onDisk) {
++                m_downloadIntermediateFile = nullptr;
++                m_downloadDestinationFile = nullptr;
++                didFailDownload(downloadNetworkError(m_response.url(), makeString("The server's range does not match the partial file ("_s,
++                    m_response.httpHeaderField(HTTPHeaderName::ContentRange), ", "_s, onDisk, " bytes on disk)"_s)));
++                return;
++            }
++            append = true;
++        }
++    }
++
++#if OS(UNIX)
++    // Room for what is still to come, before anything is written.
++    long long expected = m_response.expectedContentLength();
++    struct statvfs fs;
++    GUniquePtr<char> directory(g_path_get_dirname(intermediatePath.legacyCStringPointer()));
++    if (expected > 0 && !statvfs(directory.get(), &fs)) {
++        uint64_t available = static_cast<uint64_t>(fs.f_bavail) * fs.f_frsize;
++        static constexpr uint64_t margin = 16 * 1024 * 1024;
++        if (static_cast<uint64_t>(expected) + margin > available) {
++            m_downloadIntermediateFile = nullptr;
++            m_downloadDestinationFile = nullptr;
++            didFailDownload(downloadDestinationError(m_response, makeString("Not enough space: needs "_s, (static_cast<uint64_t>(expected) + 1048575) / 1048576,
++                " MB, "_s, available / 1048576, " MB free"_s)));
++            return;
++        }
++    }
++#endif
++
++    GRefPtr<GFileOutputStream> outputStream;
++    if (append)
++        outputStream = adoptGRef(g_file_append_to(m_downloadIntermediateFile.get(), G_FILE_CREATE_NONE, nullptr, &error.outPtr()));
++    else {
++        // Not g_file_replace(): it writes to a temporary file renamed at the
++        // end, and the .part file must hold the data received so far.
++        g_file_delete(m_downloadIntermediateFile.get(), nullptr, nullptr);
++        outputStream = adoptGRef(g_file_create(m_downloadIntermediateFile.get(), G_FILE_CREATE_NONE, nullptr, &error.outPtr()));
++    }
+     if (!outputStream) {
+         didFailDownload(downloadDestinationError(m_response, String::fromUTF8(error->message)));
+         return;
+     }
+     m_downloadOutputStream = adoptGRef(G_OUTPUT_STREAM(outputStream.leakRef()));
++    m_downloadBytesNotSent = 0;
++    m_downloadBytesWritten = 0;
++    m_downloadProgressSentAt = MonotonicTime::now();
+ 
+     auto& downloadManager = m_session->networkProcess().downloadManager();
+     Ref download = Download::create(downloadManager, *m_pendingDownloadID, *this, *m_session, suggestedFilename());
+@@ -1349,12 +1435,24 @@ void NetworkDataTaskSoup::writeDownload()
+ void NetworkDataTaskSoup::didWriteDownload(gsize bytesWritten)
+ {
+     ASSERT(bytesWritten == m_readBuffer.size());
+-    auto* download = m_session->networkProcess().downloadManager().download(*m_pendingDownloadID);
+-    ASSERT(download);
+-    download->didReceiveData(bytesWritten, 0, 0);
++    m_downloadBytesNotSent += bytesWritten;
++    m_downloadBytesWritten += bytesWritten;
++    if (m_downloadBytesNotSent >= gDownloadProgressBytes || MonotonicTime::now() - m_downloadProgressSentAt >= gDownloadProgressInterval)
++        flushDownloadProgress();
+     read();
+ }
+ 
++void NetworkDataTaskSoup::flushDownloadProgress()
++{
++    if (!m_downloadBytesNotSent || !m_pendingDownloadID)
++        return;
++    auto* download = m_session->networkProcess().downloadManager().download(*m_pendingDownloadID);
++    if (!download)
++        return;
++    download->didReceiveData(std::exchange(m_downloadBytesNotSent, 0), 0, 0);
++    m_downloadProgressSentAt = MonotonicTime::now();
++}
++
+ void NetworkDataTaskSoup::didFinishDownload()
+ {
+     ASSERT(!m_response.isNull());
+@@ -1362,6 +1460,15 @@ void NetworkDataTaskSoup::didFinishDownload()
+     g_output_stream_close(m_downloadOutputStream.get(), nullptr, nullptr);
+     m_downloadOutputStream = nullptr;
+ 
++    // A body that ended before its Content-Length (a connection closed in the
++    // middle, which the body stream may report as a plain end) is not a
++    // complete file: it stays in the .part file, to be resumed.
++    long long expected = m_response.expectedContentLength();
++    if (expected > 0 && m_downloadBytesWritten < static_cast<uint64_t>(expected) && m_response.httpHeaderField(HTTPHeaderName::ContentEncoding).isEmpty()) {
++        didFailDownload(downloadNetworkError(m_response.url(), makeString("The connection closed after "_s, m_downloadBytesWritten, " of "_s, expected, " bytes"_s)));
++        return;
++    }
++
+     ASSERT(m_downloadDestinationFile);
+     ASSERT(m_downloadIntermediateFile);
+     GUniqueOutPtr<GError> error;
+@@ -1377,6 +1484,7 @@ void NetworkDataTaskSoup::didFinishDownload()
+     g_file_set_attributes_async(m_downloadDestinationFile.get(), info.get(), G_FILE_QUERY_INFO_NONE, RunLoopSourcePriority::AsyncIONetwork, nullptr, nullptr, nullptr);
+ 
+     clearRequest();
++    flushDownloadProgress();
+     auto* download = m_session->networkProcess().downloadManager().download(*m_pendingDownloadID);
+     ASSERT(download);
+     download->didFinish();
+@@ -1389,6 +1497,7 @@ void NetworkDataTaskSoup::didFailDownload(const ResourceError& error)
+     if (m_client)
+         dispatchDidCompleteWithError(error);
+     else {
++        flushDownloadProgress();
+         auto* download = m_session->networkProcess().downloadManager().download(*m_pendingDownloadID);
+         ASSERT(download);
+         download->didFail(error, { });
+@@ -1397,14 +1506,11 @@ void NetworkDataTaskSoup::didFailDownload(const ResourceError& error)
+ 
+ void NetworkDataTaskSoup::cleanDownloadFiles()
+ {
+-    if (m_downloadDestinationFile) {
+-        g_file_delete(m_downloadDestinationFile.get(), nullptr, nullptr);
+-        m_downloadDestinationFile = nullptr;
+-    }
+-    if (m_downloadIntermediateFile) {
+-        g_file_delete(m_downloadIntermediateFile.get(), nullptr, nullptr);
+-        m_downloadIntermediateFile = nullptr;
+-    }
++    // The destination is only made when the download is complete, and the
++    // .part file stays (paused or interrupted downloads resume from it; the
++    // application deletes it when the download is cancelled for good).
++    m_downloadDestinationFile = nullptr;
++    m_downloadIntermediateFile = nullptr;
+ }
+ 
+ void NetworkDataTaskSoup::didFail(const ResourceError& error)
+diff --git a/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.h b/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.h
+index 0a7e52d01d..4766f7cd3c 100644
+--- a/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.h
++++ b/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.h
+@@ -129,6 +129,7 @@ private:
+     void didFailDownload(const WebCore::ResourceError&);
+     void didFinishDownload();
+     void cleanDownloadFiles();
++    void flushDownloadProgress();
+ 
+     void didFail(const WebCore::ResourceError&);
+ 
+@@ -176,6 +177,10 @@ private:
+     GRefPtr<GFile> m_downloadIntermediateFile;
+     GRefPtr<GOutputStream> m_downloadOutputStream;
+     bool m_allowOverwriteDownload { false };
++    // Progress sent to the UI process in batches (a 2 GB file was ~250k messages of 8 KB).
++    uint64_t m_downloadBytesNotSent { 0 };
++    uint64_t m_downloadBytesWritten { 0 }; // in this transfer
++    MonotonicTime m_downloadProgressSentAt;
+     WebCore::NetworkLoadMetrics m_networkLoadMetrics;
+     bool m_isBlockingCookies { false };
+     const RefPtr<WebCore::SecurityOrigin> m_sourceOrigin;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitDownload.cpp b/Source/WebKit/UIProcess/API/glib/WebKitDownload.cpp
+index a77fe60b2f..8f6af59651 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitDownload.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitDownload.cpp
+@@ -483,6 +483,26 @@ WebKitURIRequest* webkit_download_get_request(WebKitDownload* download)
+     return priv->request.get();
+ }
+ 
++/**
++ * webkit_download_dup_original_uri:
++ * @download: a #WebKitDownload
++ *
++ * The address the download started from, before any redirect: for a
++ * navigation that became a download, the navigation's first URL (a link
++ * that redirects to an expiring signed URL gives the link). It is the
++ * address to ask again when the download is resumed later.
++ *
++ * Returns: (transfer full): the original URI, free with g_free()
++ */
++gchar* webkit_download_dup_original_uri(WebKitDownload* download)
++{
++    g_return_val_if_fail(WEBKIT_IS_DOWNLOAD(download), nullptr);
++
++    auto& chain = download->priv->download->redirectChain();
++    const URL& url = chain.isEmpty() ? download->priv->download->request().url() : chain.first();
++    return g_strdup(url.string().utf8().legacyCStringPointer());
++}
++
+ /**
+  * webkit_download_get_destination:
+  * @download: a #WebKitDownload
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitDownload.h.in b/Source/WebKit/UIProcess/API/glib/WebKitDownload.h.in
+index 1833ea0757..1cc64b88ef 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitDownload.h.in
++++ b/Source/WebKit/UIProcess/API/glib/WebKitDownload.h.in
+@@ -61,6 +61,9 @@ typedef struct _WebKitWebView WebKitWebView;
+ WEBKIT_API WebKitURIRequest *
+ webkit_download_get_request              (WebKitDownload *download);
+ 
++WEBKIT_API gchar *
++webkit_download_dup_original_uri         (WebKitDownload *download);
++
+ WEBKIT_API const gchar *
+ webkit_download_get_destination          (WebKitDownload *download);
+ 
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.cpp b/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.cpp
+index c1be21166c..18b4243ee3 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.cpp
+@@ -185,6 +185,23 @@ gboolean webkit_response_policy_decision_is_main_frame_main_resource(WebKitRespo
+     return decision->priv->navigationResponse->request().requester() == ResourceRequestRequester::Main;
+ }
+ 
++/**
++ * webkit_response_policy_decision_has_download_attribute:
++ * @decision: a #WebKitResponsePolicyDecision
++ *
++ * Gets whether the navigation came from a link with a `download`
++ * attribute (the page asks for the resource to be saved; the
++ * attribute's value, if any, becomes the download's suggested filename).
++ *
++ * Returns: %TRUE if the link had a download attribute
++ */
++gboolean webkit_response_policy_decision_has_download_attribute(WebKitResponsePolicyDecision* decision)
++{
++    g_return_val_if_fail(WEBKIT_IS_RESPONSE_POLICY_DECISION(decision), FALSE);
++
++    return !decision->priv->navigationResponse->downloadAttribute().isNull();
++}
++
+ WebKitPolicyDecision* webkitResponsePolicyDecisionCreate(Ref<API::NavigationResponse>&& response, Ref<WebKit::WebFramePolicyListenerProxy>&& listener)
+ {
+     WebKitResponsePolicyDecision* responseDecision = WEBKIT_RESPONSE_POLICY_DECISION(g_object_new(WEBKIT_TYPE_RESPONSE_POLICY_DECISION, nullptr));
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.h.in b/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.h.in
+index d94bd490c4..62f4f2ad19 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.h.in
++++ b/Source/WebKit/UIProcess/API/glib/WebKitResponsePolicyDecision.h.in
+@@ -63,6 +63,9 @@ webkit_response_policy_decision_is_mime_type_supported      (WebKitResponsePolic
+ WEBKIT_API gboolean
+ webkit_response_policy_decision_is_main_frame_main_resource (WebKitResponsePolicyDecision* decision);
+ 
++WEBKIT_API gboolean
++webkit_response_policy_decision_has_download_attribute      (WebKitResponsePolicyDecision* decision);
++
+ G_END_DECLS
+ 
+ #endif
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp b/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
+index 07428714a4..62ef92e104 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
+@@ -5348,6 +5348,48 @@ WebKitDownload* webkit_web_view_download_uri(WebKitWebView* webView, const char*
+     return download.leakRef();
+ }
+ 
++/**
++ * webkit_web_view_download_request:
++ * @web_view: a #WebKitWebView
++ * @request: the #WebKitURIRequest to download, with its HTTP headers
++ *
++ * Requests downloading of @request for @web_view, as webkit_web_view_download_uri()
++ * does, with the request's HTTP headers (for example a Range header to resume
++ * a download into the partial file it left: on soup, a 206 response whose
++ * Content-Range starts at the size of `<destination>.part` is appended to it).
++ *
++ * Returns: (transfer full): a new #WebKitDownload representing
++ *    the download operation.
++ */
++WebKitDownload* webkit_web_view_download_request(WebKitWebView* webView, WebKitURIRequest* request)
++{
++    g_return_val_if_fail(WEBKIT_IS_WEB_VIEW(webView), nullptr);
++    g_return_val_if_fail(WEBKIT_IS_URI_REQUEST(request), nullptr);
++
++    ResourceRequest resourceRequest;
++    webkitURIRequestGetResourceRequest(request, resourceRequest);
++    Ref page = getPage(webView);
++    auto downloadProxy = page->configuration().processPool().download(page->websiteDataStore(), page.ptr(), resourceRequest, { });
++    auto download = webkitDownloadCreate(downloadProxy, webView);
++#if ENABLE(2022_GLIB_API)
++    downloadProxy->setDidStartCallback([session = GRefPtr<WebKitNetworkSession> { webView->priv->networkSession }, download = download.get()](auto* downloadProxy) {
++#else
++    downloadProxy->setDidStartCallback([context = GRefPtr<WebKitWebContext> { webView->priv->context }, download = download.get()](auto* downloadProxy) {
++#endif
++        if (!downloadProxy)
++            return;
++
++        webkitDownloadStarted(download);
++#if ENABLE(2022_GLIB_API)
++        webkitNetworkSessionDownloadStarted(session.get(), download);
++#else
++        webkitWebContextDownloadStarted(context.get(), download);
++#endif
++    });
++
++    return download.leakRef();
++}
++
+ /**
+  * webkit_web_view_get_tls_info:
+  * @web_view: a #WebKitWebView
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebView.h.in b/Source/WebKit/UIProcess/API/glib/WebKitWebView.h.in
+index d768540302..c5a2227556 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebView.h.in
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebView.h.in
+@@ -779,6 +779,10 @@ WEBKIT_API WebKitDownload *
+ webkit_web_view_download_uri                         (WebKitWebView             *web_view,
+                                                       const char                *uri);
+ 
++WEBKIT_API WebKitDownload *
++webkit_web_view_download_request                     (WebKitWebView             *web_view,
++                                                      WebKitURIRequest          *request);
++
+ WEBKIT_API gboolean
+ webkit_web_view_get_tls_info                         (WebKitWebView             *web_view,
+                                                       GTlsCertificate          **certificate,
