@@ -41,6 +41,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "adblock.h"
+#include "adblock-scripting.h"
 #include "settings.h"
 #include "viewinvr.h"
 #include "WPEProcessManagerPS5.h"
@@ -383,6 +384,333 @@ void ps5wk_adblock_navigation(const char* uri)
     applyFilter(uri, "navigation");
 }
 
+/* ---- phase 2: per-site cosmetic filters and scriptlets ----
+ *
+ * uBO Lite's per-site data (adblock-scripting.txt next to the list it came
+ * with, made by ubol-scripting.js) is looked up for the host of every frame
+ * about to load: decide-policy (navigation action) comes before the frame's
+ * request, and the user content sent from here reaches the WebProcess
+ * before the policy answer, so it is there at document start. For each
+ * host (cached, AB_SITE_CACHE hosts): a user style sheet with its cosmetic
+ * filters, a main-world user script with its scriptlet calls and an
+ * isolated-world one ("ubol", uBO Lite's ISOLATED scriptlets and procedural
+ * filters), each with an allow list of that host only, all frames, document
+ * start. The scriptlets every site gets ("*") are one script for all
+ * http(s) frames, with the hosts that have their own script (which includes
+ * them, minus the host's exceptions) on its block list. Off with the
+ * setting, and on allowed sites (all of it is removed while one is shown,
+ * as the filter is). */
+
+#define AB_SCRIPTING_FILE "adblock-scripting.txt"
+#define AB_SCRIPTING_DEBUG_FLAG "/data/ps5webkit/adblock-scripting-debug" /* a call that throws is logged */
+#define AB_SCRIPTING_OFF_FLAG "/data/ps5webkit/adblock-scripting-off"     /* test knob: phase 1 only (read at start) */
+#define AB_SITE_CACHE 32
+#define AB_ISOLATED_WORLD "ubol"
+
+typedef struct {
+    char* host;
+    char* top;                       /* the top-level host its "site>>" calls are for, or NULL */
+    WebKitUserScript* script[2];
+    WebKitUserStyleSheet* css;
+    gboolean blocksGeneric[2];       /* the generic script must not run on this host */
+    gint64 used;
+} SiteEntry;
+
+static AbSiteData* siteData;
+static char* siteDataSource;         /* the directory it came from */
+static GHashTable* siteEntries;      /* host -> SiteEntry */
+static WebKitUserScript* genericScript[2];
+static char* genericSource[2];
+static gboolean scriptingOn;
+static gboolean scriptingDisabled;   /* AB_SCRIPTING_OFF_FLAG */
+static guint siteLookups;
+static double siteLookupMS;          /* the slowest */
+/* Under abLock (/settings.json reads them on the link server's thread). */
+static char* lastSite;               /* the last top-level host set up */
+static guint lastCalls[2], lastCSS, lastProcedurals;
+static AbSiteDataInfo siteInfo;      /* version points into siteData */
+static char* siteInfoVersion;
+static guint sitesSetUp;
+
+static void siteEntryFree(gpointer data)
+{
+    SiteEntry* entry = data;
+    for (int w = 0; w < 2; w++) {
+        if (entry->script[w]) {
+            webkit_user_content_manager_remove_script(contentManager, entry->script[w]);
+            webkit_user_script_unref(entry->script[w]);
+        }
+    }
+    if (entry->css) {
+        webkit_user_content_manager_remove_style_sheet(contentManager, entry->css);
+        webkit_user_style_sheet_unref(entry->css);
+    }
+    g_free(entry->host);
+    g_free(entry->top);
+    g_free(entry);
+}
+
+static gboolean scriptableHost(const char* host)
+{
+    if (!host || !*host || strlen(host) > 253)
+        return FALSE;
+    for (const char* c = host; *c; c++) {
+        if (!g_ascii_isalnum(*c) && *c != '.' && *c != '-' && *c != '_')
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* http://host/ and https://host/, any path and port (UserContentURLPattern). */
+static void addHostPatterns(GPtrArray* patterns, const char* host)
+{
+    g_ptr_array_add(patterns, g_strdup_printf("http://%s/*", host));
+    g_ptr_array_add(patterns, g_strdup_printf("https://%s/*", host));
+}
+
+static WebKitUserScript* newScript(const char* source, int world, const char* const* allow, const char* const* block)
+{
+    if (world == AB_WORLD_ISOLATED)
+        return webkit_user_script_new_for_world(source, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+            AB_ISOLATED_WORLD, allow, block);
+    return webkit_user_script_new(source, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, allow, block);
+}
+
+/* The generic scripts again, with the block list as the cache is now (the
+ * new one goes on before the old one comes off). */
+static void genericRebuild(void)
+{
+    static const char* const allow[] = { "http://*/*", "https://*/*", NULL };
+    for (int w = 0; w < 2; w++) {
+        WebKitUserScript* old = genericScript[w];
+        genericScript[w] = NULL;
+        if (genericSource[w]) {
+            GPtrArray* block = g_ptr_array_new_with_free_func(g_free);
+            GHashTableIter iter;
+            gpointer value;
+            g_hash_table_iter_init(&iter, siteEntries);
+            while (g_hash_table_iter_next(&iter, NULL, &value)) {
+                SiteEntry* entry = value;
+                if (entry->blocksGeneric[w])
+                    addHostPatterns(block, entry->host);
+            }
+            g_ptr_array_add(block, NULL);
+            genericScript[w] = newScript(genericSource[w], w, allow, block->len > 1 ? (const char* const*)block->pdata : NULL);
+            webkit_user_content_manager_add_script(contentManager, genericScript[w]);
+            g_ptr_array_unref(block);
+        }
+        if (old) {
+            webkit_user_content_manager_remove_script(contentManager, old);
+            webkit_user_script_unref(old);
+        }
+    }
+}
+
+/* Main loop: none of it on any page from now on. */
+static void scriptingOff(const char* why)
+{
+    if (!scriptingOn)
+        return;
+    guint hosts = siteEntries ? g_hash_table_size(siteEntries) : 0;
+    if (siteEntries)
+        g_hash_table_remove_all(siteEntries);
+    for (int w = 0; w < 2; w++) {
+        if (genericScript[w]) {
+            webkit_user_content_manager_remove_script(contentManager, genericScript[w]);
+            webkit_user_script_unref(genericScript[w]);
+            genericScript[w] = NULL;
+        }
+        g_clear_pointer(&genericSource[w], g_free);
+    }
+    scriptingOn = FALSE;
+    g_mutex_lock(&abLock);
+    sitesSetUp = 0;
+    g_clear_pointer(&lastSite, g_free);
+    g_mutex_unlock(&abLock);
+    spike_log("[adblock] cosmetic filters and scriptlets off (%s); %u site(s) removed", why, hosts);
+}
+
+static gboolean scriptingOnNow(void)
+{
+    if (scriptingOn)
+        return TRUE;
+    if (!siteData || !contentManager)
+        return FALSE;
+    if (!siteEntries)
+        siteEntries = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, siteEntryFree);
+    AbSiteScripts generic;
+    ab_site_data_generic(siteData, &generic);
+    for (int w = 0; w < 2; w++) {
+        genericSource[w] = generic.script[w];
+        generic.script[w] = NULL;
+    }
+    ab_site_scripts_clear(&generic);
+    scriptingOn = TRUE;
+    genericRebuild();
+    spike_log("[adblock] cosmetic filters and scriptlets on: generic scripts %.1f KB (main) + %.1f KB (isolated)",
+        genericSource[0] ? strlen(genericSource[0]) / 1024.0 : 0, genericSource[1] ? strlen(genericSource[1]) / 1024.0 : 0);
+    return TRUE;
+}
+
+static void evictOldest(const char* keep)
+{
+    while (g_hash_table_size(siteEntries) > AB_SITE_CACHE) {
+        SiteEntry* oldest = NULL;
+        GHashTableIter iter;
+        gpointer value;
+        g_hash_table_iter_init(&iter, siteEntries);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            SiteEntry* entry = value;
+            if ((!oldest || entry->used < oldest->used) && strcmp(entry->host, keep))
+                oldest = entry;
+        }
+        if (!oldest)
+            return;
+        g_hash_table_remove(siteEntries, oldest->host);
+    }
+}
+
+/* Main loop: user content for frames at host below the page at topHost. */
+static void siteSetUp(const char* host, const char* topHost, gboolean mainFrame)
+{
+    const char* variant = strcmp(host, topHost) && ab_site_data_has_ancestor_rules(siteData, topHost) ? topHost : NULL;
+    SiteEntry* entry = g_hash_table_lookup(siteEntries, host);
+    if (entry && !g_strcmp0(entry->top, variant)) {
+        entry->used = g_get_monotonic_time();
+        return;
+    }
+    gboolean blockedBefore[2] = { entry && entry->blocksGeneric[0], entry && entry->blocksGeneric[1] };
+    if (entry)
+        g_hash_table_remove(siteEntries, host);
+    gint64 start = g_get_monotonic_time();
+    AbSiteScripts scripts;
+    ab_site_data_for_host(siteData, host, variant ? topHost : NULL, &scripts);
+    double ms = msSince(start);
+    siteLookups++;
+    if (ms > siteLookupMS)
+        siteLookupMS = ms;
+    entry = g_new0(SiteEntry, 1);
+    entry->host = g_strdup(host);
+    entry->top = scripts.usesTop ? g_strdup(variant) : NULL;
+    entry->used = g_get_monotonic_time();
+    GPtrArray* allow = g_ptr_array_new_with_free_func(g_free);
+    addHostPatterns(allow, host);
+    g_ptr_array_add(allow, NULL);
+    const char* const* allowList = (const char* const*)allow->pdata;
+    for (int w = 0; w < 2; w++) {
+        entry->blocksGeneric[w] = !scripts.generic[w];
+        if (scripts.script[w]) {
+            entry->script[w] = newScript(scripts.script[w], w, allowList, NULL);
+            webkit_user_content_manager_add_script(contentManager, entry->script[w]);
+        }
+    }
+    if (scripts.css) {
+        entry->css = webkit_user_style_sheet_new(scripts.css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, allowList, NULL);
+        webkit_user_content_manager_add_style_sheet(contentManager, entry->css);
+    }
+    g_ptr_array_unref(allow);
+    g_hash_table_insert(siteEntries, entry->host, entry);
+    evictOldest(host);
+    if (blockedBefore[0] != entry->blocksGeneric[0] || blockedBefore[1] != entry->blocksGeneric[1])
+        genericRebuild();
+    g_mutex_lock(&abLock);
+    sitesSetUp = g_hash_table_size(siteEntries);
+    if (mainFrame) {
+        g_free(lastSite);
+        lastSite = g_strdup(host);
+        lastCalls[0] = scripts.calls[0];
+        lastCalls[1] = scripts.calls[1];
+        lastCSS = scripts.cssRules;
+        lastProcedurals = scripts.procedurals;
+    }
+    g_mutex_unlock(&abLock);
+    if (scripts.script[0] || scripts.script[1] || scripts.css || mainFrame)
+        spike_log("[adblock] site %s%s%s (%s): scriptlets %u main + %u isolated, %u CSS rules, %u procedural; scripts %.1f + %.1f KB, CSS %.1f KB; lookup %.2f ms",
+            host, variant ? " under " : "", variant ? variant : "", mainFrame ? "page" : "frame", scripts.calls[0], scripts.calls[1],
+            scripts.cssRules, scripts.procedurals, scripts.script[0] ? strlen(scripts.script[0]) / 1024.0 : 0,
+            scripts.script[1] ? strlen(scripts.script[1]) / 1024.0 : 0, scripts.css ? strlen(scripts.css) / 1024.0 : 0, ms);
+    ab_site_scripts_clear(&scripts);
+}
+
+static gboolean onDecidePolicyScripting(WebKitWebView* view, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data)
+{
+    (void)data;
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION || !siteData || scriptingDisabled)
+        return FALSE;
+    WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    WebKitURIRequest* request = action ? webkit_navigation_action_get_request(action) : NULL;
+    const char* uri = request ? webkit_uri_request_get_uri(request) : NULL;
+    WebKitFrameInfo* frame = webkit_navigation_action_get_target_frame_info(action);
+    gboolean mainFrame = !frame || webkit_frame_info_is_main_frame(frame);
+    char* host = hostForURI(uri);
+    const char* topURI = mainFrame ? uri : webkit_web_view_get_uri(view);
+    char* topHost = mainFrame ? g_strdup(host) : hostForURI(topURI);
+    if (!host || !topHost || isSettingsPage(topURI) || !scriptableHost(host) || !scriptableHost(topHost)) {
+        g_free(host);
+        g_free(topHost);
+        return FALSE;
+    }
+    g_mutex_lock(&abLock);
+    gboolean on = enabled;
+    const char* allowedBy = siteEntryFor(topHost);
+    char* allowed = allowedBy ? g_strdup(allowedBy) : NULL;
+    g_mutex_unlock(&abLock);
+    if (!on)
+        scriptingOff("ad blocking is off in Settings");
+    else if (allowed) {
+        char* why = g_strdup_printf("allowed site %s shown", allowed);
+        scriptingOff(why);
+        g_free(why);
+    } else if (scriptingOnNow())
+        siteSetUp(host, topHost, mainFrame);
+    g_free(allowed);
+    g_free(host);
+    g_free(topHost);
+    return FALSE;
+}
+
+void ps5wk_adblock_connect_view(WebKitWebView* view)
+{
+    g_signal_connect(view, "decide-policy", G_CALLBACK(onDecidePolicyScripting), NULL);
+}
+
+/* Main loop: the site data that came with the list in dir (bundled or
+ * downloaded). What was set up from the old data goes. */
+static void loadSiteData(const char* dir, const char* why)
+{
+    char* path = g_build_filename(dir, AB_SCRIPTING_FILE, NULL);
+    gint64 start = g_get_monotonic_time();
+    char* error = NULL;
+    AbSiteData* data = ab_site_data_load(path, &error);
+    double ms = msSince(start);
+    if (!data) {
+        spike_log("[adblock] no cosmetic filters or scriptlets from %s (%s): %s%s", path, why, error ? error : "?",
+            siteData ? "; keeping the ones in use" : "");
+        g_free(error);
+        g_free(path);
+        return;
+    }
+    ab_site_data_set_debug(fileExists(AB_SCRIPTING_DEBUG_FLAG));
+    scriptingOff("new site data");
+    ab_site_data_free(siteData);
+    siteData = data;
+    g_free(siteDataSource);
+    siteDataSource = g_strdup(dir);
+    AbSiteDataInfo info;
+    ab_site_data_info(data, &info);
+    g_mutex_lock(&abLock);
+    siteInfo = info;
+    g_free(siteInfoVersion);
+    siteInfoVersion = g_strdup(info.version);
+    siteInfo.version = NULL;
+    g_mutex_unlock(&abLock);
+    spike_log("[adblock] site data %s (uBO Lite %s, %s): %u hosts, scriptlet calls %u main + %u isolated, %u cosmetic filters (%u procedural), library %u + %u declarations; %.1f MB + %.1f MB index, read in %.0f ms",
+        path, info.version, why, info.hosts, info.calls[0], info.calls[1], info.cosmetics, info.procedurals, info.libraryItems[0],
+        info.libraryItems[1], info.bytes / 1048576.0, info.indexBytes / 1048576.0, ms);
+    memLog("adblock: site data loaded");
+    g_free(path);
+}
+
 /* Main loop: reload the page shown if it is an http(s) page (not Settings),
  * and, with site set, on that site. */
 static void reloadShownPage(const char* site, const char* why)
@@ -404,6 +732,7 @@ static gboolean settingChangedOnMain(gpointer data)
     gboolean on = GPOINTER_TO_INT(data);
     spike_log("[adblock] ad blocking turned %s in Settings", on ? "on" : "off");
     applyFilter(NULL, "setting");
+    scriptingOff("ad blocking setting changed"); /* set up again by the next page */
     reloadShownPage(NULL, "ad blocking setting changed");
     return G_SOURCE_REMOVE;
 }
@@ -429,6 +758,7 @@ static gboolean siteChangedOnMain(gpointer data)
 {
     SiteChange* change = data;
     applyFilter(NULL, "allow list changed");
+    scriptingOff("allow list changed"); /* set up again by the next page */
     if (change->reload)
         reloadShownPage(change->site, "allow list changed");
     g_free(change->site);
@@ -585,10 +915,15 @@ static gboolean copyFile(const char* from, const char* to)
     return ok;
 }
 
-/* The converter: the copy in /data/ps5webkit/adblock (tests) or the title's. */
+/* The converters: the copy in /data/ps5webkit/adblock (tests) or the title's. */
 static const char* converterPath(void)
 {
     return fileExists(AB_DIR "/dnr-to-webkit.js") ? AB_DIR "/dnr-to-webkit.js" : AB_BUNDLED "/dnr-to-webkit.js";
+}
+
+static const char* scriptingConverterPath(void)
+{
+    return fileExists(AB_DIR "/ubol-scripting.js") ? AB_DIR "/ubol-scripting.js" : AB_BUNDLED "/ubol-scripting.js";
 }
 
 static void removeJobFiles(void)
@@ -597,7 +932,9 @@ static void removeJobFiles(void)
     unlink(AB_WORK "/result.ini");
     unlink(AB_WORK "/bundled-rules.json");
     unlink(AB_WORK "/dnr-to-webkit.js");
+    unlink(AB_WORK "/ubol-scripting.js");
     unlink(AB_WORK "/update-rules.json"); /* left by a child that was ended */
+    unlink(AB_WORK "/update-scripting.txt");
 }
 
 static void jobLaunch(Job* job);
@@ -666,9 +1003,10 @@ static void* jobPrepare(void* data)
         g_key_file_set_string(file, "job", "version", job->info.version ? job->info.version : "");
     } else {
         const char* converter = converterPath();
-        ok = copyFile(converter, AB_WORK "/dnr-to-webkit.js");
-        failure = ok ? NULL : "the converter could not be copied";
+        ok = copyFile(converter, AB_WORK "/dnr-to-webkit.js") && copyFile(scriptingConverterPath(), AB_WORK "/ubol-scripting.js");
+        failure = ok ? NULL : "the converters could not be copied";
         g_key_file_set_string(file, "job", "converter", AB_WORK "/dnr-to-webkit.js");
+        g_key_file_set_string(file, "job", "scripting-converter", AB_WORK "/ubol-scripting.js");
         g_key_file_set_string(file, "job", "dest", AB_DIR);
         g_key_file_set_boolean(file, "job", "force", job->force);
         g_key_file_set_string(file, "job", "current-version", job->info.version ? job->info.version : "");
@@ -820,6 +1158,8 @@ static gboolean jobFinishedOnMain(gpointer data)
         load->jobSeconds = seconds;
         load->compileSeconds = compileSeconds;
         webkit_user_content_filter_store_load(store, load->identifier, NULL, newListLoaded, load);
+        if (update)
+            loadSiteData(AB_DIR, "updated list"); /* saved before the list's info file */
     } else if (outcome && !strcmp(outcome, "uptodate"))
         setStatus("%s", message && *message ? message : "The list is up to date.");
     else if (!job->launched)
@@ -1030,6 +1370,27 @@ void ps5wk_adblock_init(WebKitWebView* view)
         lastCheck = g_ascii_strtoll(last, NULL, 10);
     g_free(last);
     spike_log("[adblock] %s; %u allowed site(s); store %s", enabled ? "on" : "off in Settings", sites->len, AB_STORE);
+    scriptingDisabled = fileExists(AB_SCRIPTING_OFF_FLAG);
+    if (scriptingDisabled)
+        spike_log("[adblock] per-site cosmetic filters and scriptlets off (%s)", AB_SCRIPTING_OFF_FLAG);
+    /* Phase 2's site data: the one that came with the list in use. A list
+     * without it (downloaded before phase 2) gets the bundled site data and
+     * an update soon. */
+    {
+        ListInfo source;
+        char* path = NULL;
+        if (chooseSource(&source, &path)) {
+            char* dir = g_path_get_dirname(path);
+            loadSiteData(dir, !strcmp(dir, AB_BUNDLED) ? "bundled list" : "downloaded list");
+            if (!siteData && strcmp(dir, AB_BUNDLED)) {
+                loadSiteData(AB_BUNDLED, "the downloaded list has none");
+                lastCheck = 0;
+            }
+            g_free(dir);
+            listInfoClear(&source);
+        }
+        g_free(path);
+    }
 
     GKeyFile* file = g_key_file_new();
     char* identifier = NULL;
@@ -1105,7 +1466,13 @@ char* ps5wk_adblock_json(const char* uri)
     appendJSONString(out, active.origin);
     g_string_append(out, ",\"rulesets\":");
     appendJSONString(out, active.rulesets);
-    g_string_append(out, "},\"status\":");
+    g_string_append(out, "},\"scripting\":{\"version\":");
+    appendJSONString(out, siteInfoVersion);
+    g_string_append_printf(out, ",\"hosts\":%u,\"calls\":%u,\"isolatedCalls\":%u,\"cosmetics\":%u,\"procedurals\":%u,\"bytes\":%zu,\"sitesSetUp\":%u,\"site\":",
+        siteInfo.hosts, siteInfo.calls[0], siteInfo.calls[1], siteInfo.cosmetics, siteInfo.procedurals, siteInfo.bytes + siteInfo.indexBytes, sitesSetUp);
+    appendJSONString(out, lastSite);
+    g_string_append_printf(out, ",\"siteCalls\":%u,\"siteIsolatedCalls\":%u,\"siteCSS\":%u,\"siteProcedurals\":%u}", lastCalls[0], lastCalls[1], lastCSS, lastProcedurals);
+    g_string_append(out, ",\"status\":");
     appendJSONString(out, status);
     g_mutex_unlock(&abLock);
     g_string_append(out, "},");

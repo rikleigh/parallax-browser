@@ -181,9 +181,10 @@ prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
 # WebKit (tools/ubol-convert.js, pinned release; generated, never committed)
 # and the converter the title runs for on-console updates (/app0/adblock).
 AB="$ROOT/toolchain/adblock"
-[[ -f $AB/adblock-rules.json && -f $AB/adblock-info.ini ]] || node "$ROOT/tools/ubol-convert.js"
+[[ -f $AB/adblock-rules.json && -f $AB/adblock-info.ini && -f $AB/adblock-scripting.txt ]] || node "$ROOT/tools/ubol-convert.js"
 mkdir -p "$app/adblock"
-cp "$AB/adblock-rules.json" "$AB/adblock-info.ini" "$PORT/adblock/dnr-to-webkit.js" "$app/adblock/"
+cp "$AB/adblock-rules.json" "$AB/adblock-info.ini" "$AB/adblock-scripting.txt" "$PORT/adblock/dnr-to-webkit.js" \
+    "$PORT/adblock/ubol-scripting.js" "$app/adblock/"
 # View in VR: PS VR2 titles declare it in param.json (Hmd2 refuses a title
 # whose attribute words are 0 with 0x8a72001f, FEASIBILITY §3); PS5VR's
 # values, as Spikes 3b and 9 (both also drew on the TV with them).

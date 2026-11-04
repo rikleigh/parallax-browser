@@ -1247,6 +1247,7 @@ void ps5wk_connect_web_view(WebKitWebView* view)
     g_signal_connect(view, "load-failed", G_CALLBACK(onLoadFailed), NULL);
     g_signal_connect(view, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), NULL);
     g_signal_connect(view, "mouse-target-changed", G_CALLBACK(onMouseTargetChanged), NULL);
+    ps5wk_adblock_connect_view(view); /* per-site cosmetic filters and scriptlets */
 }
 
 /* Another tab shown (browserui.c): everything here that acts on "the page"

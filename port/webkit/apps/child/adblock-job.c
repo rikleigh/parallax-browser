@@ -13,8 +13,12 @@
  *            converter's) is newer than the list in use (or the job is
  *            forced), the default rulesets at that release tag (libsoup with
  *            the payloads' TLS), converts them with dnr-to-webkit.js in
- *            JavaScriptCore, compiles the result as above and only then
- *            saves it as adblock-rules.json + adblock-info.ini;
+ *            JavaScriptCore, and the cosmetic filters and scriptlets
+ *            (rulesets/scripting/, phase 2) with ubol-scripting.js: its
+ *            generic cosmetic rules go first in the content-blocker list,
+ *            its site data is saved as adblock-scripting.txt; compiles the
+ *            result as above and only then saves it as adblock-rules.json +
+ *            adblock-scripting.txt + adblock-info.ini;
  * and writes a result file last. The title reads the result when this
  * process's output closes; no result (a crash, a kill, the time limit) means
  * failure, and the title keeps the list in use. Everything this process
@@ -304,6 +308,9 @@ typedef struct {
     gint64 generated;
     char* sha256;
     char* rulesets;
+    int scripting;        /* ubol-scripting.js VERSION */
+    long cosmeticRules;   /* generic cosmetic rules in the list */
+    char* scriptingSHA256;
 } NewList;
 
 static void infoToKeyFile(GKeyFile* file, const NewList* info)
@@ -318,6 +325,142 @@ static void infoToKeyFile(GKeyFile* file, const NewList* info)
     g_key_file_set_int64(file, "list", "generated", info->generated);
     g_key_file_set_string(file, "list", "sha256", info->sha256 ? info->sha256 : "");
     g_key_file_set_string(file, "list", "origin", "update");
+    g_key_file_set_integer(file, "list", "scripting", info->scripting);
+    g_key_file_set_int64(file, "list", "cosmetic-rules", info->cosmeticRules);
+    g_key_file_set_string(file, "list", "scripting-file", "adblock-scripting.txt");
+    g_key_file_set_string(file, "list", "scripting-sha256", info->scriptingSHA256 ? info->scriptingSHA256 : "");
+}
+
+/* Writes parts (NULL-terminated, with lengths) to path (0666), atomically. */
+static gboolean writePartsAtomically(const char* path, const char* const* parts, const gsize* lengths)
+{
+    char* temporary = g_strdup_printf("%s.tmp", path);
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    gboolean ok = fd >= 0;
+    for (int p = 0; ok && parts[p]; p++) {
+        for (gsize done = 0; ok && done < lengths[p];) {
+            ssize_t n = write(fd, parts[p] + done, lengths[p] - done);
+            ok = n > 0;
+            done += n > 0 ? (gsize)n : 0;
+        }
+    }
+    if (fd >= 0) {
+        fchmod(fd, 0666);
+        fsync(fd);
+        ok = !close(fd) && ok;
+    }
+    if (ok)
+        ok = !rename(temporary, path);
+    if (!ok)
+        unlink(temporary);
+    g_free(temporary);
+    return ok;
+}
+
+/* The browser's own pages: no generic cosmetic filters there. */
+#define AB_EXEMPT_TOP_URLS "{\"exemptTopURLs\":[\"^file:\",\"^http://127\\\\.0\\\\.0\\\\.1:9040/\"]}"
+
+/* Phase 2: uBO Lite's rulesets/scripting/ files at version for ids,
+ * converted by ubol-scripting.js (already evaluated in js). Returns the
+ * converter's output (stats line, rules line, site data) or NULL with
+ * *message set. */
+static char* convertScripting(JSCContext* js, const char* version, GPtrArray* ids, char** message, size_t* fetchedBytes, int* filesFetched)
+{
+    char* failure = NULL;
+    char* output = NULL;
+    JSCValue* scripting = jsc_context_get_value(js, "UBOLScripting");
+    JSCValue* files = jsc_value_new_object(js, NULL, NULL);
+    GString* idsJSON = g_string_new("[");
+    for (guint i = 0; i < ids->len; i++)
+        g_string_append_printf(idsJSON, "%s\"%s\"", i ? "," : "", (char*)g_ptr_array_index(ids, i));
+    g_string_append_c(idsJSON, ']');
+    const char* details[] = { "rulesets/ruleset-details.json", "rulesets/scriptlet-details.json", "rulesets/generic-details.json" };
+    char* detailText[3] = { NULL, NULL, NULL };
+    for (int d = 0; d < 3 && !*message; d++) {
+        char* url = g_strdup_printf(AB_REPO "/%s/chromium/%s", version, details[d]);
+        gboolean missing = FALSE;
+        GBytes* body = fetch(url, d == 2, &missing, &failure);
+        if (body) {
+            gsize length = 0;
+            const char* data = g_bytes_get_data(body, &length);
+            detailText[d] = g_strndup(data, length);
+            JSCValue* text = jsc_value_new_string_from_bytes(js, body);
+            jsc_value_object_set_property(files, details[d], text);
+            g_object_unref(text);
+            *fetchedBytes += length;
+            (*filesFetched)++;
+            g_bytes_unref(body);
+        } else if (!missing)
+            *message = g_strdup_printf("Could not download the cosmetic filters: %s", failure ? failure : url);
+        g_clear_pointer(&failure, g_free);
+        g_free(url);
+    }
+    if (!*message) {
+        JSCValue* rd = jsc_value_new_string(js, detailText[0]);
+        JSCValue* sd = jsc_value_new_string(js, detailText[1]);
+        JSCValue* idsValue = jsc_value_new_string(js, idsJSON->str);
+        JSCValue* needed = jsc_value_object_invoke_method(scripting, "filesNeeded", JSC_TYPE_VALUE, rd, JSC_TYPE_VALUE, sd, JSC_TYPE_VALUE, idsValue, G_TYPE_NONE);
+        g_object_unref(rd);
+        g_object_unref(sd);
+        g_object_unref(idsValue);
+        char* jsFailure = jscError(js);
+        char* neededJSON = !jsFailure && needed && jsc_value_is_string(needed) ? jsc_value_to_string(needed) : NULL;
+        g_clear_object(&needed);
+        if (!neededJSON) {
+            *message = g_strdup_printf("uBO Lite's cosmetic filter list was not understood: %s", jsFailure ? jsFailure : "no answer");
+        } else {
+            JSCValue* list = jsc_value_new_from_json(js, neededJSON);
+            JSCValue* lengthValue = jsc_value_object_get_property(list, "length");
+            int count = jsc_value_to_int32(lengthValue);
+            g_object_unref(lengthValue);
+            for (int i = 0; i < count && !*message; i++) {
+                JSCValue* item = jsc_value_object_get_property_at_index(list, (guint)i);
+                char* path = jsc_value_to_string(item);
+                g_object_unref(item);
+                char* url = g_strdup_printf(AB_REPO "/%s/chromium/%s", version, path);
+                gboolean missing = FALSE;
+                GBytes* body = fetch(url, FALSE, &missing, &failure);
+                if (body) {
+                    JSCValue* text = jsc_value_new_string_from_bytes(js, body);
+                    jsc_value_object_set_property(files, path, text);
+                    g_object_unref(text);
+                    *fetchedBytes += g_bytes_get_size(body);
+                    (*filesFetched)++;
+                    g_bytes_unref(body);
+                } else
+                    *message = g_strdup_printf("Could not download the cosmetic filters: %s", failure ? failure : url);
+                g_clear_pointer(&failure, g_free);
+                g_free(url);
+                g_free(path);
+            }
+            g_object_unref(list);
+        }
+        g_free(jsFailure);
+        g_free(neededJSON);
+    }
+    if (!*message) {
+        JSCValue* idsValue = jsc_value_new_string(js, idsJSON->str);
+        char* optionsText = g_strdup_printf("{\"version\":\"%s\",%s", version, &AB_EXEMPT_TOP_URLS[1]);
+        JSCValue* options = jsc_value_new_string(js, optionsText);
+        g_free(optionsText);
+        JSCValue* result = jsc_value_object_invoke_method(scripting, "convertJSON", JSC_TYPE_VALUE, files, JSC_TYPE_VALUE, idsValue,
+            JSC_TYPE_VALUE, options, G_TYPE_NONE);
+        g_object_unref(idsValue);
+        g_object_unref(options);
+        char* jsFailure = jscError(js);
+        if (!jsFailure && result && jsc_value_is_string(result))
+            output = jsc_value_to_string(result);
+        else
+            *message = g_strdup_printf("The cosmetic filters could not be converted: %s", jsFailure ? jsFailure : "no result");
+        g_clear_object(&result);
+        g_free(jsFailure);
+    }
+    for (int d = 0; d < 3; d++)
+        g_free(detailText[d]);
+    g_string_free(idsJSON, TRUE);
+    g_object_unref(files);
+    g_object_unref(scripting);
+    return output;
 }
 
 /* Update: "ok" (a new list compiled and saved), "uptodate", or NULL with
@@ -327,6 +470,11 @@ static const char* runUpdate(GKeyFile* job, WebKitUserContentFilterStore* store,
 {
     const char* result = NULL;
     char* converterPath = g_key_file_get_string(job, "job", "converter", NULL);
+    char* scriptingPath = g_key_file_get_string(job, "job", "scripting-converter", NULL);
+    gchar* scriptingScript = NULL;
+    gsize scriptingLength = 0;
+    char* scripting = NULL; /* ubol-scripting.js's output */
+    char* scriptingDataPath = g_build_filename(work, "update-scripting.txt", NULL);
     char* dest = g_key_file_get_string(job, "job", "dest", NULL);
     char* currentVersion = g_key_file_get_string(job, "job", "current-version", NULL);
     int currentConverter = g_key_file_get_integer(job, "job", "current-converter", NULL);
@@ -370,6 +518,20 @@ static const char* runUpdate(GKeyFile* job, WebKitUserContentFilterStore* store,
         g_free(jsFailure);
         goto done;
     }
+    if (!scriptingPath || !g_file_get_contents(scriptingPath, &scriptingScript, &scriptingLength, &error)) {
+        *message = g_strdup_printf("The converter %s is missing: %s", scriptingPath ? scriptingPath : "(none)", error ? error->message : "?");
+        g_clear_error(&error);
+        goto done;
+    }
+    ignored = jsc_context_evaluate_with_source_uri(js, scriptingScript, (gssize)scriptingLength, scriptingPath, 1);
+    g_clear_object(&ignored);
+    g_clear_pointer(&scriptingScript, g_free);
+    jsFailure = jscError(js);
+    if (jsFailure) {
+        *message = g_strdup_printf("The converter %s did not load: %s", scriptingPath, jsFailure);
+        g_free(jsFailure);
+        goto done;
+    }
     converter = jsc_context_get_value(js, "DNRToWebKit");
     JSCValue* manifestText = jsc_value_new_string_from_bytes(js, manifest);
     JSCValue* manifestInfo = jsc_value_object_invoke_method(converter, "rulesetsFromManifest", JSC_TYPE_VALUE, manifestText, G_TYPE_NONE);
@@ -400,8 +562,14 @@ static const char* runUpdate(GKeyFile* job, WebKitUserContentFilterStore* store,
     g_object_unref(idsValue);
     g_object_unref(parsed);
     JSCValue* converterVersion = jsc_value_object_get_property(converter, "VERSION");
-    list->converter = jsc_value_to_int32(converterVersion);
+    JSCValue* scriptingObject = jsc_context_get_value(js, "UBOLScripting");
+    JSCValue* scriptingVersion = jsc_value_object_get_property(scriptingObject, "VERSION");
+    /* The list's converter version covers both converters (phase 1 lists: 1). */
+    list->scripting = jsc_value_to_int32(scriptingVersion);
+    list->converter = jsc_value_to_int32(converterVersion) * 1000 + list->scripting;
     g_object_unref(converterVersion);
+    g_object_unref(scriptingVersion);
+    g_object_unref(scriptingObject);
 
     int c = compareVersions(version, currentVersion);
     gboolean newer = c > 0 || (!c && list->converter > currentConverter);
@@ -444,6 +612,20 @@ static const char* runUpdate(GKeyFile* job, WebKitUserContentFilterStore* store,
     JOBLOG("downloaded uBO Lite %s: %s (%.1f MB) in %.0f ms", version, fetchedList->str, fetchedBytes / 1048576.0, msSince(downloadStart));
     memLine("downloaded");
 
+    /* Phase 2: the cosmetic filters and scriptlets, same release. */
+    status("Downloading uBO Lite %s's cosmetic filters and scriptlets…", version);
+    gint64 scriptingStart = g_get_monotonic_time();
+    size_t scriptingBytes = 0;
+    int scriptingFiles = 0;
+    scripting = convertScripting(js, version, ids, message, &scriptingBytes, &scriptingFiles);
+    if (!scripting) {
+        g_object_unref(inputs);
+        goto done;
+    }
+    JOBLOG("cosmetic filters and scriptlets of uBO Lite %s: %d files (%.1f MB) downloaded and converted in %.0f ms", version, scriptingFiles,
+        scriptingBytes / 1048576.0, msSince(scriptingStart));
+    memLine("scripting converted");
+
     status("Converting uBO Lite %s…", version);
     gint64 convertStart = g_get_monotonic_time();
     JSCValue* output = jsc_value_object_invoke_method(converter, "convertJSON", JSC_TYPE_VALUE, inputs, G_TYPE_NONE);
@@ -472,21 +654,47 @@ static const char* runUpdate(GKeyFile* job, WebKitUserContentFilterStore* store,
     const char* rulesText = newline + 1;
     size_t rulesLength = strlen(rulesText);
     JOBLOG("converted uBO Lite %s in %.0f ms: %s; %.1f MB of WebKit JSON", version, convertMS, converted, rulesLength / 1048576.0);
+    /* scripting: stats \n cosmetic rules \n site data */
+    char* cssStart = strchr(scripting, '\n');
+    char* cssEnd = cssStart ? strchr(cssStart + 1, '\n') : NULL;
+    if (!cssEnd || cssStart[1] != '[' || cssEnd[-1] != ']') {
+        *message = g_strdup("The cosmetic filter conversion gave no rules.");
+        goto done;
+    }
+    *cssStart++ = 0;
+    *cssEnd = 0;
+    const char* siteText = cssEnd + 1;
+    size_t siteLength = strlen(siteText);
+    long cosmeticRules = jsonNumber(scripting, "rules");
+    JOBLOG("cosmetic filters and scriptlets: %s; %.1f MB of site data", scripting, siteLength / 1048576.0);
+    /* One list: the cosmetic rules first (WebKit's shared style sheet takes
+     * the ones before the first ignore rule), then the network rules. */
+    gboolean haveCSS = cosmeticRules > 0 && strlen(cssStart) > 2;
+    const char* parts[] = { "[", haveCSS ? cssStart + 1 : "", haveCSS ? "," : "", rulesText + 1, NULL };
+    gsize lengths[] = { 1, haveCSS ? strlen(cssStart) - 2 : 0, haveCSS ? 1 : 0, rulesLength - 1 };
+    GChecksum* checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    for (int p = 0; parts[p]; p++)
+        g_checksum_update(checksum, (const guchar*)parts[p], (gssize)lengths[p]);
     list->version = g_strdup(version);
-    list->rules = rules;
+    list->rules = rules + (haveCSS ? cosmeticRules : 0);
+    list->cosmeticRules = haveCSS ? cosmeticRules : 0;
     list->dnrRules = jsonNumber(converted, "input");
     list->skipped = jsonNumber(converted, "skipped");
     list->generated = g_get_real_time() / G_USEC_PER_SEC;
-    list->sha256 = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar*)rulesText, rulesLength);
+    list->sha256 = g_strdup(g_checksum_get_string(checksum));
+    g_checksum_free(checksum);
+    list->scriptingSHA256 = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar*)siteText, siteLength);
     GString* joined = g_string_new(NULL);
     for (guint i = 0; i < ids->len; i++)
         g_string_append_printf(joined, "%s%s", i ? ";" : "", (char*)g_ptr_array_index(ids, i));
     list->rulesets = g_string_free(joined, FALSE);
-    if (!writeAtomically(rulesPath, rulesText, rulesLength)) {
-        *message = g_strdup_printf("The new list could not be written to %s (%s).", rulesPath, g_strerror(errno));
+    if (!writePartsAtomically(rulesPath, parts, lengths) || !writeAtomically(scriptingDataPath, siteText, siteLength)) {
+        *message = g_strdup_printf("The new list could not be written to %s (%s).", work, g_strerror(errno));
         goto done;
     }
     g_clear_pointer(&converted, g_free);
+    g_clear_pointer(&scripting, g_free);
+    rules = list->rules;
 
     status("Compiling uBO Lite %s (%ld rules)…", version, rules);
     char* why = compileList(store, storeDir, identifier, rulesPath, compileMS);
@@ -501,10 +709,12 @@ static const char* runUpdate(GKeyFile* job, WebKitUserContentFilterStore* store,
      * half pair is never chosen). */
     char* destRules = g_build_filename(dest, "adblock-rules.json", NULL);
     char* destInfo = g_build_filename(dest, "adblock-info.ini", NULL);
+    char* destScripting = g_build_filename(dest, "adblock-scripting.txt", NULL);
     unlink(destInfo);
     GKeyFile* file = g_key_file_new();
     infoToKeyFile(file, list);
-    gboolean ok = !rename(rulesPath, destRules) && writeKeyFile(file, destInfo);
+    gboolean ok = !rename(scriptingDataPath, destScripting) && !rename(rulesPath, destRules) && writeKeyFile(file, destInfo);
+    g_free(destScripting);
     g_key_file_unref(file);
     if (ok) {
         JOBLOG("saved uBO Lite %s (%ld rules) as %s", version, rules, destRules);
@@ -522,6 +732,11 @@ done:
     g_clear_object(&vm);
     unlink(rulesPath);
     g_free(rulesPath);
+    unlink(scriptingDataPath);
+    g_free(scriptingDataPath);
+    g_free(scriptingPath);
+    g_free(scriptingScript);
+    g_free(scripting);
     g_free(script);
     g_free(converted);
     g_free(version);

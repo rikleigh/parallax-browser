@@ -33,5 +33,10 @@ char* ps5wk_adblock_json(const char* uri);
 /* Main loop: the page shown is now this view's (the browser's tabs). */
 void ps5wk_adblock_set_web_view(WebKitWebView* view);
 
+/* Every web view (the browser's tabs): uBO Lite's per-site cosmetic
+ * filters and scriptlets are registered for each frame about to load
+ * (decide-policy; phase 2, adblock-scripting.c). */
+void ps5wk_adblock_connect_view(WebKitWebView* view);
+
 /* The host of an http(s) URI without "www.", or NULL (free it). */
 char* ps5wk_adblock_site_for_uri(const char* uri);
