@@ -12,7 +12,8 @@
  *     when it starts (no-compositing: WebKit in the title reads it whenever
  *     a page gets a new WebProcess). Opt-in flag files (perf-overlay):
  *     present = that feature on.
- *   home-url.txt: the page the browser opens when it starts.
+ *   home-url.txt: the page the browser opens when it starts, in the PS5
+ *     user's own folder (profile.c), as KIND_FILE settings are.
  * Each setting says what applies it: a page restart (a new WebProcess), a
  * browser restart (the title) or nothing. The values in use are remembered
  * (ps5wk_settings_applied), so the page can say what waits for a restart.
@@ -96,6 +97,7 @@ static const Setting settings[] = {
 
 static GMutex lock;
 static char* dataDir;
+static char* userDir; /* KIND_FILE settings: the PS5 user's own */
 static PS5WKSettingsNormalize normalizeURL;
 static char* applied[SETTING_COUNT];
 static char* status;
@@ -104,6 +106,11 @@ static unsigned statusSerial;
 static char* pathFor(const char* name)
 {
     return g_build_filename(dataDir ? dataDir : "/data/ps5webkit", name, NULL);
+}
+
+static char* pathOf(const Setting* s)
+{
+    return s->kind == KIND_FILE && userDir ? g_build_filename(userDir, s->name, NULL) : pathFor(s->name);
 }
 
 /* open(), not access(): access() reports existing files as missing in a title. */
@@ -162,13 +169,13 @@ static char* envValue(const char* contents, const char* key)
 static char* currentValue(const Setting* s, const char* env)
 {
     if (s->kind == KIND_FLAG || s->kind == KIND_FLAG_ON) {
-        char* path = pathFor(s->name);
+        char* path = pathOf(s);
         gboolean present = fileExists(path);
         g_free(path);
         return g_strdup(present == (s->kind == KIND_FLAG_ON) ? "1" : "0");
     }
     if (s->kind == KIND_FILE) {
-        char* path = pathFor(s->name);
+        char* path = pathOf(s);
         gchar* contents = NULL;
         if (!g_file_get_contents(path, &contents, NULL, NULL))
             contents = g_strdup(s->fallback);
@@ -218,11 +225,13 @@ static void recordApplied(int scopes)
     g_free(env);
 }
 
-void ps5wk_settings_init(const char* dir, PS5WKSettingsNormalize normalize)
+void ps5wk_settings_init(const char* dir, const char* user, PS5WKSettingsNormalize normalize)
 {
     g_mutex_lock(&lock);
     g_free(dataDir);
     dataDir = g_strdup(dir);
+    g_free(userDir);
+    userDir = g_strdup(user);
     normalizeURL = normalize;
     recordApplied(PS5WK_SETTINGS_PAGE | PS5WK_SETTINGS_BROWSER);
     g_mutex_unlock(&lock);
@@ -605,7 +614,7 @@ gboolean ps5wk_settings_update(const char* body, gboolean json, char** message, 
         if (same)
             continue;
         gboolean ok = TRUE;
-        char* path = s->kind == KIND_ENV ? NULL : pathFor(s->name);
+        char* path = s->kind == KIND_ENV ? NULL : pathOf(s);
         if (s->kind == KIND_ENV) {
             char* next = setEnvLine(newEnv, s->name, strcmp(values[i], s->fallback) ? values[i] : NULL);
             g_free(newEnv);
@@ -716,6 +725,8 @@ const char ps5wk_settings_page[] =
     "#banner{border-color:var(--warn)}\n"
     ".note{color:var(--muted)}\n"
     "code{word-break:break-all}\n"
+    ".sizes{width:100%;border-collapse:collapse;margin:.2rem 0 .6rem}.sizes td{padding:.3rem 0;border-bottom:1px solid var(--line)}\n"
+    ".sizes td:last-child{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;padding-left:1rem}.sizes tr.total td{font-weight:600;border-bottom:0}\n"
     "</style></head><body><main>\n"
     "<header><img src=\"/logo.png\" alt=\"\" onerror=\"this.remove()\"><h1><span>Parallax</span>Browser settings</h1><button id=\"back\" hidden>Back to the page</button></header>\n"
     "<p id=\"status\" role=\"status\">Loading…</p>\n"
@@ -732,9 +743,12 @@ const char ps5wk_settings_page[] =
     "<div class=\"card\" id=\"dlCard\"><div class=\"row\"><span class=\"name\">Downloads folder</span><span class=\"badge\" id=\"dlFree\"></span></div>"
     "<p class=\"help\"><code id=\"dlFolder\"></code></p><p class=\"help\" id=\"dlCount\"></p>"
     "<div class=\"seg\"><button id=\"dlClear\" class=\"danger\">Clear finished downloads</button></div></div>\n"
-    "<h2>Website data</h2>\n"
-    "<div class=\"card\"><p class=\"help\">Clearing cookies logs you out of every site. Clearing all data also removes the cache, local storage and site databases.</p>\n"
-    "<div class=\"seg\"><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
+    "<h2>Storage</h2>\n"
+    "<div class=\"card\" id=\"stCard\"><div class=\"row\"><span class=\"name\" id=\"stUser\"></span><span class=\"badge\" id=\"stFree\"></span></div>"
+    "<p class=\"help\">Each PS5 user has their own cookies, cache, history, bookmarks, tabs and downloads.</p>"
+    "<table class=\"sizes\" id=\"stMine\"></table><p class=\"help\">On this PS5, shared by every user:</p><table class=\"sizes\" id=\"stShared\"></table>"
+    "<p class=\"help\">Clearing the cache only makes pages load more slowly the next time. Clearing cookies logs you out of every site. Clearing all website data also removes the cache, local storage and site databases. Your history, bookmarks and downloads stay.</p>\n"
+    "<div class=\"seg\"><button id=\"clearCache\">Clear cache</button><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
     "<h2>Restart</h2>\n"
     "<div class=\"card\"><p class=\"help\">Restart page: the page's process starts again with the settings above (Pages). Restart browser: the browser closes and opens again on the page you were on (Browser settings).</p>\n"
     "<div class=\"seg\"><button id=\"restartPage\">Restart page</button><button id=\"restartBrowser\">Restart browser</button></div></div>\n"
@@ -799,7 +813,7 @@ const char ps5wk_settings_page[] =
     "  var p=S.pending.page,w=S.pending.browser;\n"
     "  $('banner').hidden=!p&&!w;$('bannerPage').hidden=!p;$('bannerBrowser').hidden=!w;\n"
     "  $('bannerText').textContent=p&&w?'Some changes wait for a page restart, others for a browser restart.':p?'Changes wait for a page restart.':'Changes wait for a browser restart.';\n"
-    "  $('actions').hidden=false;$('back').hidden=!onPS5;renderAdblock();renderPhone();renderDownloads();\n"
+    "  $('actions').hidden=false;$('back').hidden=!onPS5;renderAdblock();renderPhone();renderDownloads();renderStorage();\n"
     "  $('where').textContent=S.uri?'The PS5 is showing '+S.uri:'';\n"
     "  var f=focus=='first'?list.querySelector('button[aria-pressed=true]'):focus&&$(focus);if(f)f.focus();\n"
     "}\n"
@@ -837,6 +851,15 @@ const char ps5wk_settings_page[] =
     "$('restartBrowser').onclick=function(){restartBrowser(this)};$('bannerBrowser').onclick=function(){restartBrowser(this)};\n"
     "$('clearCookies').onclick=function(){arm(this,'Press again: log out of every site',function(){action('/clear?what=cookies','Clearing cookies…',function(){setTimeout(function(){load('clearCookies')},1500)})})};\n"
     "$('clearAll').onclick=function(){arm(this,'Press again: clear all website data',function(){action('/clear?what=all','Clearing website data…',function(){setTimeout(function(){load('clearAll')},2000)})})};\n"
+    "$('clearCache').onclick=function(){action('/clear?what=cache','Clearing the cache…',function(){setTimeout(function(){load('clearCache')},2000)})};\n"
+    "function size(b){return b>=1e9?(b/1e9).toFixed(1)+' GB':b>=1e6?(b/1e6).toFixed(b>=1e8?0:1)+' MB':b>=1e3?Math.round(b/1e3)+' KB':b>0?b+' bytes':'Nothing'}\n"
+    "function sizeRows(t,items,total){t.textContent='';var sum=0;items.forEach(function(i){var r=el('tr');r.appendChild(el('td',null,i.label));r.appendChild(el('td',null,size(i.bytes)));t.appendChild(r);sum+=i.bytes});\n"
+    "  if(total){var r=el('tr','total');r.appendChild(el('td',null,total));r.appendChild(el('td',null,size(sum)));t.appendChild(r)}}\n"
+    "function renderStorage(){var s=S.storage;$('stCard').hidden=!s;if(!s)return;$('stUser').textContent=s.user;\n"
+    "  $('stFree').textContent=s.free>=0?gb(s.free)+' free on the PS5':'free space unknown';\n"
+    "  sizeRows($('stMine'),s.items,'Total for '+s.user);\n"
+    "  sizeRows($('stShared'),s.shared.filter(function(i){return i.id!='others'||s.otherUsers}).map(function(i){return i.id=='others'?{label:s.otherUsers==1?'1 other user':s.otherUsers+' other users',bytes:i.bytes}:i}));\n"
+    "  var c=s.items.filter(function(i){return i.id=='cache'})[0];$('clearCache').textContent=c&&c.bytes?'Clear cache ('+size(c.bytes)+')':'Clear cache'}\n"
     "function gb(b){return b>=1073741824?(b/1073741824).toFixed(1)+' GB':Math.round(b/1048576)+' MB'}\n"
     "function renderDownloads(){var d=S.downloads;$('dlCard').hidden=!d;if(!d)return;$('dlFolder').textContent=d.folder;\n"
     "  $('dlFree').textContent=d.free>=0?gb(d.free)+' free':'free space unknown';\n"

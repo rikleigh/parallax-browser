@@ -476,8 +476,19 @@ static void drawHeader(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         addHot(x - 12, py + 12, w + 24, HEADER_H - 24, HOT_SECTION, sec);
         x += w + 36;
     }
-    keyCap(c, x - 14, cy, "R1");
-    (void)pw;
+    x += keyCap(c, x - 14, cy, "R1");
+
+    /* on the right: whose bookmarks, history and tabs these are */
+    if (s->userName && *s->userName) {
+        const int right = px + pw - 32;
+        const int nameW = wpe_display_ps5_canvas_text_width(c, 21, TRUE, s->userName);
+        const int labelW = wpe_display_ps5_canvas_text_width(c, 19, FALSE, "PS5 user");
+        if (right - nameW - 10 - labelW > x + 24) {
+            wpe_display_ps5_canvas_text(c, right - nameW - 10 - labelW, cy + 8, 0, 19, FALSE, PX_TEXT_3, "PS5 user");
+            wpe_display_ps5_canvas_text(c, right - nameW, cy + 8, 0, 21, TRUE, PX_TEXT_2, s->userName);
+        } else if (right - nameW > x + 24)
+            wpe_display_ps5_canvas_text(c, right - nameW, cy + 8, 0, 21, TRUE, PX_TEXT_2, s->userName);
+    }
 }
 
 static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py, int pw, int ph)
@@ -737,7 +748,7 @@ void bui_draw_menu(WPEDisplayPS5Canvas* c, const BUIState* s)
         textCentred(c, cx, cy + 6, 0, 30, TRUE, PX_TEXT_2, bookmarks ? "No bookmarks yet" : downloads ? "No downloads yet" : "No history yet");
         textCentred(c, cx, cy + 52, pw - 96, 22, FALSE, PX_TEXT_3,
             bookmarks ? "☆ in the bar (Options, then up and right) adds the page shown."
-            : downloads ? "Files a page can't show (archives, packages) are saved to /data/ps5webkit/downloads." : "The pages you visit come here.");
+            : downloads ? "Files a page can't show (archives, packages) are saved to your downloads folder." : "The pages you visit come here.");
     }
     int ry = LIST_TOP;
     for (int row = s->listTop; row < rows && row < s->listTop + visible; row++) {

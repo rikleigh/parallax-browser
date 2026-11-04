@@ -33,6 +33,7 @@
 #include "downloads.h"
 #include "qrcode.h"
 #include "settings.h"
+#include "profile.h"
 #include "viewinvr.h"
 
 #include <arpa/inet.h>
@@ -701,7 +702,10 @@ char* ps5wk_home_url(void)
 static char* homeURL(void)
 {
     gchar* contents = NULL;
-    if (g_file_get_contents("/data/ps5webkit/home-url.txt", &contents, NULL, NULL)) {
+    char* path = g_build_filename(ps5wk_profile_dir(), "home-url.txt", NULL); /* settings.c: the user's */
+    gboolean found = g_file_get_contents(path, &contents, NULL, NULL);
+    g_free(path);
+    if (found) {
         g_strstrip(contents);
         if (*contents)
             return contents;
@@ -1240,7 +1244,7 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  *       shown (reads child.env); browser: the title starts again
  *   POST /restart?scope=crash   test only: SIGKILL to the WebProcess, which
  *       then looks like a crash to WebKit (the page reloads as after one)
- *   POST /clear?what=cookies|all       WebKit's website data
+ *   POST /clear?what=cookies|cache|all WebKit's website data
  *   POST /adblock?do=update            the ad blocker's lists, now (adblock.c)
  *   POST /adblock?do=allow|block&site=<host>   ads allowed on a site (and
  *       its subdomains) or blocked there again; the page reloads if it is
@@ -1353,6 +1357,7 @@ static void dataCleared(GObject* manager, GAsyncResult* result, gpointer data)
 {
     const char* what = data;
     GError* error = NULL;
+    ps5wk_profile_storage_changed();
     if (webkit_website_data_manager_clear_finish(WEBKIT_WEBSITE_DATA_MANAGER(manager), result, &error)) {
         spike_log("settings: %s cleared", what);
         ps5wk_settings_set_status("%s cleared.", what);
@@ -1367,19 +1372,24 @@ static gboolean clearDownloadsOnMain(gpointer data)
 {
     (void)data;
     ps5wk_downloads_clear_finished();
+    ps5wk_profile_storage_changed();
     ps5wk_settings_set_status("Finished downloads cleared.");
     return G_SOURCE_REMOVE;
 }
 
+enum { CLEAR_COOKIES, CLEAR_ALL, CLEAR_CACHE };
+
 static gboolean clearDataOnMain(gpointer data)
 {
-    gboolean all = GPOINTER_TO_INT(data);
+    int what = GPOINTER_TO_INT(data);
     if (!networkSession || windDownStart)
         return G_SOURCE_REMOVE;
+    static const WebKitWebsiteDataTypes types[] = { WEBKIT_WEBSITE_DATA_COOKIES, WEBKIT_WEBSITE_DATA_ALL,
+        WEBKIT_WEBSITE_DATA_DISK_CACHE | WEBKIT_WEBSITE_DATA_MEMORY_CACHE };
+    static const char* const names[] = { "Cookies", "All website data", "The webpage cache" };
     /* Timespan 0: everything, however old. */
     webkit_website_data_manager_clear(webkit_network_session_get_website_data_manager(networkSession),
-        all ? WEBKIT_WEBSITE_DATA_ALL : WEBKIT_WEBSITE_DATA_COOKIES, 0, NULL, dataCleared,
-        (gpointer)(all ? "All website data" : "Cookies"));
+        types[what], 0, NULL, dataCleared, (gpointer)names[what]);
     return G_SOURCE_REMOVE;
 }
 
@@ -1470,9 +1480,12 @@ static char* settingsState(const char* message)
     /* For the "Send from your phone" card (on the PS5 only). */
     char* link = linkJSON();
     char* downloads = ps5wk_downloads_summary_json();
-    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,\"downloads\":%s,%s%s%s%s",
-        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link, downloads,
+    char* storage = ps5wk_profile_storage_json();
+    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,\"downloads\":%s,"
+        "\"storage\":%s,%s%s%s%s",
+        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link, downloads, storage,
         message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock);
+    g_free(storage);
     g_free(downloads);
     g_free(link);
     g_free(adblock);
@@ -1586,17 +1599,18 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
             if (!error)
                 ps5wk_settings_set_status("Restarting the browser…");
             settingsReplyJSON(client, error ? 503 : 200, !error, error ? error : "Restarting the browser.");
-        } else if (!strcmp(path, "/clear") && scope && (!strcmp(scope, "cookies") || !strcmp(scope, "all"))) {
-            gboolean all = !strcmp(scope, "all");
-            spike_log("settings: clearing %s, asked by %s", all ? "all website data" : "cookies", from);
-            g_idle_add(clearDataOnMain, GINT_TO_POINTER(all));
-            settingsReplyJSON(client, 200, TRUE, all ? "Clearing all website data." : "Clearing cookies.");
+        } else if (!strcmp(path, "/clear") && scope && (!strcmp(scope, "cookies") || !strcmp(scope, "all") || !strcmp(scope, "cache"))) {
+            int what = !strcmp(scope, "all") ? CLEAR_ALL : !strcmp(scope, "cache") ? CLEAR_CACHE : CLEAR_COOKIES;
+            static const char* const names[] = { "cookies", "all website data", "the webpage cache" };
+            spike_log("settings: clearing %s, asked by %s", names[what], from);
+            g_idle_add(clearDataOnMain, GINT_TO_POINTER(what));
+            settingsReplyJSON(client, 200, TRUE, what == CLEAR_ALL ? "Clearing all website data." : what == CLEAR_CACHE ? "Clearing the webpage cache." : "Clearing cookies.");
         } else if (!strcmp(path, "/clear") && scope && !strcmp(scope, "downloads")) {
             spike_log("settings: clearing finished downloads, asked by %s", from);
             g_idle_add(clearDownloadsOnMain, NULL);
             settingsReplyJSON(client, 200, TRUE, "Deleting the finished downloads.");
         } else
-            settingsReplyJSON(client, 400, FALSE, !strcmp(path, "/restart") ? "scope=page or scope=browser" : "what=cookies, what=all or what=downloads");
+            settingsReplyJSON(client, 400, FALSE, !strcmp(path, "/restart") ? "scope=page or scope=browser" : "what=cookies, what=cache, what=all or what=downloads");
         g_free(scope);
     }
 }
@@ -2207,8 +2221,10 @@ int main(int argc, char** argv)
      * initializes JSC (the web context below); the WebProcesses do not see
      * this environment. */
     setenv("JSC_useJIT", "false", 0);
+    /* Whose data: before anything reads it (README: "Users and storage"). */
+    ps5wk_profile_init();
     /* The values in use until something restarts (the settings page). */
-    ps5wk_settings_init("/data/ps5webkit", pushNormalize);
+    ps5wk_settings_init("/data/ps5webkit", ps5wk_profile_dir(), pushNormalize);
 
     /* open(), not access(): access() said no for an existing file here. */
     int flag = open("/data/ps5webkit/debug-screenshot", O_RDONLY);
@@ -2294,13 +2310,18 @@ int main(int argc, char** argv)
         spike_log("settings: %s %s", hiddenPageFeatures[i], feature ? "on" : "not found");
     }
     webkit_feature_list_unref(features);
-    WebKitNetworkSession* session = webkit_network_session_new("/data/ps5webkit/browser/data", "/data/ps5webkit/browser/cache");
+    char* websiteData = g_build_filename(ps5wk_profile_dir(), "browser", "data", NULL);
+    char* websiteCache = g_build_filename(ps5wk_profile_dir(), "browser", "cache", NULL);
+    char* cookieFile = g_build_filename(websiteData, "cookies.sqlite", NULL);
+    WebKitNetworkSession* session = webkit_network_session_new(websiteData, websiteCache);
     networkSession = session;
     /* Without this WPE keeps cookies in memory only: every site logged out
      * and YouTube's consent dialog back after each restart. */
     cookieManager = webkit_network_session_get_cookie_manager(session);
-    webkit_cookie_manager_set_persistent_storage(cookieManager,
-        "/data/ps5webkit/browser/data/cookies.sqlite", WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    webkit_cookie_manager_set_persistent_storage(cookieManager, cookieFile, WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    g_free(cookieFile);
+    g_free(websiteCache);
+    g_free(websiteData);
     /* A TV browser: media may start without a gesture (YouTube, players
      * that autoplay; the pad's X is not always on the video). */
     WebKitWebsitePolicies* policies = webkit_website_policies_new_with_policies("autoplay", WEBKIT_AUTOPLAY_ALLOW, NULL);

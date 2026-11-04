@@ -1,0 +1,22 @@
+diff --git a/Source/WebKit/Shared/CacheModel.cpp b/Source/WebKit/Shared/CacheModel.cpp
+index be8032d88b..556e7f99c2 100644
+--- a/Source/WebKit/Shared/CacheModel.cpp
++++ b/Source/WebKit/Shared/CacheModel.cpp
+@@ -139,13 +139,10 @@ uint64_t calculateURLCacheDiskCapacity(CacheModel cacheModel, uint64_t diskFreeS
+     case CacheModel::DocumentBrowser: {
+ #if defined(PS5_PAYLOAD_SDK)
+         // PS5: the browser picks DocumentBrowser for its process model (one
+-        // WebProcess, no process cache), not to save disk: /data has room for
+-        // a desktop-sized cache (the PrimaryWebBrowser sizes).
+-        if (diskFreeSize >= 16384)
+-            urlCacheDiskCapacity = 1 * GB;
+-        else if (diskFreeSize >= 8192)
+-            urlCacheDiskCapacity = 500 * MB;
+-        else if (diskFreeSize >= 4096)
++        // WebProcess, no process cache), not to save disk. Each PS5 user has
++        // their own cache, so at most 250 MB each (the Storage settings show
++        // it), 100 MB with under 4 GB free.
++        if (diskFreeSize >= 4096)
+             urlCacheDiskCapacity = 250 * MB;
+         else
+             urlCacheDiskCapacity = 100 * MB;

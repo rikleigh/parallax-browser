@@ -1,5 +1,6 @@
 /*
- * Downloads (ps5browser): files saved to /data/ps5webkit/downloads through
+ * Downloads (ps5browser): files saved to the PS5 user's downloads folder
+ * (/data/ps5webkit/users/<id>/downloads, profile.c) through
  * WebKit's download path (the NetworkProcess streams them to disk), the
  * list in downloads.json, pause, resume (patch 0075: a Range request for
  * the original address, appended to the .part file on a matching 206),
@@ -11,12 +12,13 @@
 #pragma once
 
 #include "browserdraw.h"
+#include "profile.h"
 
 #include <glib.h>
 #include <wpe/ps5/wpe-ps5.h>
 #include <wpe/webkit.h>
 
-#define PS5WK_DOWNLOADS_DIR "/data/ps5webkit/downloads"
+#define PS5WK_DOWNLOADS_DIR ps5wk_profile_downloads_dir()
 
 /* At start, after browserui.c's init (it gives the active view). */
 void ps5wk_downloads_init(WPEDisplayPS5* display, WebKitNetworkSession* session);

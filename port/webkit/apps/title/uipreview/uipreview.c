@@ -184,6 +184,7 @@ static BUIState baseState(void)
     s.uri = kTabs[0].url;
     s.tabCount = (unsigned)tabCount;
     s.maxTabs = 12;
+    s.userName = "Player 1";
     s.zone = ZONE_TOOLBAR;
     s.toolbarFocus = TB_ADDRESS;
     s.section = SEC_TABS;

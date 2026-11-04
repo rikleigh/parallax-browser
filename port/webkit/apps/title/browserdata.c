@@ -1,6 +1,7 @@
 /*
  * Browser data (ps5browser): bookmarks, history and the saved tabs, as JSON
- * files under /data/ps5webkit, plus start-data.js for the start page. See
+ * files in the PS5 user's folder (/data/ps5webkit/users/<id>, profile.c),
+ * plus /data/ps5webkit/start-data.js for the start page. See
  * browser.h and port/webkit/README.md ("Tabs, bookmarks, history").
  *
  *   bookmarks.json  {"version":1,"bookmarks":[{"url","title","added"}]}, newest first
@@ -34,6 +35,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* Next to start.html (a file: page loads it by a relative URL), not in the
+ * user's folder: written at every start for the user who started it. */
+#define START_DATA "/data/ps5webkit/start-data.js"
 #define HISTORY_MAX 1000
 #define BOOKMARKS_MAX 500
 #define START_BOOKMARKS 24
@@ -281,7 +285,7 @@ static JNode* readJSONFile(const char* name)
 
 static gboolean writeFileAtomically(const char* name, const char* contents, gsize length)
 {
-    char* path = g_build_filename(dataDir, name, NULL);
+    char* path = g_path_is_absolute(name) ? g_strdup(name) : g_build_filename(dataDir, name, NULL);
     char* temporary = g_strdup_printf("%s.tmp", path);
     gboolean ok = FALSE;
     int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -386,7 +390,7 @@ static void writeStartData(void)
     g_string_append(out, ",\"top\":");
     ps5wk_entries_json(out, top, START_TOP);
     g_string_append(out, "};\n");
-    writeFileAtomically("start-data.js", out->str, out->len);
+    writeFileAtomically(START_DATA, out->str, out->len);
     g_string_free(out, TRUE);
     g_ptr_array_unref(top);
 }
@@ -460,10 +464,7 @@ void ps5wk_bdata_init(const char* dir)
     loadEntries(bookmarks, "bookmarks.json", "bookmarks", "added", BOOKMARKS_MAX);
     loadEntries(history, "history.json", "history", "last", HISTORY_MAX);
     spike_log("browser: %u bookmarks, %u history entries", bookmarks->len, history->len);
-    char* path = g_build_filename(dataDir, "start-data.js", NULL);
-    if (!g_file_test(path, G_FILE_TEST_EXISTS))
-        writeStartData();
-    g_free(path);
+    writeStartData(); /* the last user's until now */
 }
 
 /* ---------------------------------------------------------------- bookmarks */

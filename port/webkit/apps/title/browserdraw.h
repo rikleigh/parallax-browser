@@ -59,7 +59,8 @@ typedef struct {
     const char* title;
     const char* uri;
     unsigned tabCount, maxTabs;
-    /* the menu */
+    /* the menu; userName: whose data it shows (the PS5 user's name) */
+    const char* userName;
     int zone, toolbarFocus, section;
     unsigned bookmarkCount, historyCount, downloadCount;
     /* downloads: how many are receiving (the bar's ring) and their progress

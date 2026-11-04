@@ -31,7 +31,8 @@
  * the list in use.
  *
  * Off switches: the "Ad blocking" setting (/data/ps5webkit/adblock-off) and
- * the per-site allow list (/data/ps5webkit/adblock-allow.txt, one site per
+ * the per-site allow list (adblock-allow.txt in the PS5 user's folder,
+ * /data/ps5webkit/users/<id> (profile.c), one site per
  * line: a host and its subdomains). WebKit applies each filter on its own
  * (an exception in a second filter cannot undo a block in this one), so the
  * filter is taken off the user content manager while an allowed site is
@@ -43,6 +44,7 @@
 #include "adblock.h"
 #include "adblock-scripting.h"
 #include "settings.h"
+#include "profile.h"
 #include "viewinvr.h"
 #include "WPEProcessManagerPS5.h"
 
@@ -56,7 +58,7 @@
 #define AB_STORE "/data/ps5webkit/browser/contentfilters"
 #define AB_BUNDLED "/app0/adblock"
 #define AB_OFF_FLAG "/data/ps5webkit/adblock-off"
-#define AB_ALLOW_FILE "/data/ps5webkit/adblock-allow.txt"
+#define AB_ALLOW_NAME "adblock-allow.txt" /* in the PS5 user's folder (profile.c) */
 #define AB_NO_UPDATE_FLAG "/data/ps5webkit/adblock-noupdate"
 #define AB_FIRST_CHECK_S 120
 #define AB_RECHECK_S (30 * 60)
@@ -307,11 +309,19 @@ static const char* siteEntryFor(const char* host)
     return NULL;
 }
 
+static char* allowFile(void)
+{
+    return g_build_filename(ps5wk_profile_dir(), AB_ALLOW_NAME, NULL);
+}
+
 static void readSites(void)
 {
     gchar* contents = NULL;
     GPtrArray* list = g_ptr_array_new_with_free_func(g_free);
-    if (g_file_get_contents(AB_ALLOW_FILE, &contents, NULL, NULL)) {
+    char* path = allowFile();
+    gboolean found = g_file_get_contents(path, &contents, NULL, NULL);
+    g_free(path);
+    if (found) {
         char** lines = g_strsplit(contents, "\n", -1);
         for (char** line = lines; *line; line++) {
             char* site = **line == '#' ? NULL : cleanSite(*line);
@@ -335,7 +345,9 @@ static gboolean writeSites(void)
     GString* text = g_string_new("# Sites where the ad blocker is off (Settings), one per line: a host and its subdomains.\n");
     for (guint i = 0; i < sites->len; i++)
         g_string_append_printf(text, "%s\n", (char*)g_ptr_array_index(sites, i));
-    gboolean ok = writeAtomically(AB_ALLOW_FILE, text->str, text->len);
+    char* path = allowFile();
+    gboolean ok = writeAtomically(path, text->str, text->len);
+    g_free(path);
     g_string_free(text, TRUE);
     return ok;
 }
@@ -793,7 +805,7 @@ const char* ps5wk_adblock_set_allowed(const char* host, gboolean allowed, gboole
     spike_log("[adblock] %s %s%s", allowed ? "ads allowed on" : "ads blocked again on", site, !changed ? " (no change)" : ok ? "" : " (could not save the list)");
     if (!ok) {
         g_free(site);
-        return "could not save " AB_ALLOW_FILE;
+        return "could not save the list of sites where ads are allowed";
     }
     SiteChange* change = g_new0(SiteChange, 1);
     change->site = site;

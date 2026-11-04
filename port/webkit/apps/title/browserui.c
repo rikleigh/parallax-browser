@@ -37,6 +37,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "browser.h"
+#include "profile.h"
 #include "browserdraw.h"
 #include "downloads.h"
 #include "viewinvr.h"
@@ -901,6 +902,7 @@ static void fillState(BUIState* s)
     s->uri = shownURI();
     s->tabCount = tabs->len;
     s->maxTabs = MAX_TABS;
+    s->userName = ps5wk_profile_name();
     s->zone = zone;
     s->toolbarFocus = toolbarFocus;
     s->section = section;
@@ -1812,7 +1814,7 @@ void ps5wk_browser_init(WPEDisplay* d, WebKitWebView* view)
     memoryTimer = g_timeout_add_seconds(5, memoryCheck, NULL);
     if (ps5wk_wc_set_hidden_pages_callback)
         ps5wk_wc_set_hidden_pages_callback(onGLPressure);
-    ps5wk_bdata_init(DATA_DIR);
+    ps5wk_bdata_init(ps5wk_profile_dir());
     WPEView* wpeView = webkit_web_view_get_wpe_view(view);
     if (wpeView && wpe_view_get_width(wpeView) > 0) {
         screenW = wpe_view_get_width(wpeView);

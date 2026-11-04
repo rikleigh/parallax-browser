@@ -20,6 +20,8 @@ play the video on a page in the **PS VR2** headset.
   The layout is detected from the page and the picture, and the video is
   centred where you look.
 - **Tabs** (recent tabs stay loaded), **bookmarks**, **history** and a start page.
+- **A profile for each PS5 user:** cookies, history, bookmarks, tabs and
+  downloads are kept apart, and Settings shows how much storage each uses.
 - **Downloads** with pause and resume, which survive a browser restart, and
   SHA-256 checksums.
 - **Ad blocking** with the uBlock Origin Lite rule lists: network rules,
@@ -74,9 +76,9 @@ play the video on a page in the **PS VR2** headset.
 3. Register `/data/homebrew/PPSA99020` with your homebrew tool. Parallax
    Browser then appears on the home screen.
 
-To update, copy the new `data` folder over the old one. Bookmarks, history,
-settings and downloads live in `/data/ps5webkit` too, and the zip doesn't
-contain any of them, so they're kept.
+To update, copy the new `data` folder over the old one. Each PS5 user's
+bookmarks, history, settings and downloads live in `/data/ps5webkit/users`,
+which the zip doesn't contain, so they're kept.
 
 ## Building
 

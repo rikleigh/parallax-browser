@@ -89,9 +89,9 @@ Install
      Browser then appears on the home screen.
 
 Update
-  Copy the data folder again, replacing files. Bookmarks, history, settings
-  and downloads are kept: they live in /data/ps5webkit next to the runtime
-  files, which the archive doesn't contain.
+  Copy the data folder again, replacing files. Each PS5 user's bookmarks,
+  history, settings and downloads are kept: they live in
+  /data/ps5webkit/users, which the archive doesn't contain.
 
 Uninstall
   Remove the title with your homebrew tool, then delete /data/homebrew/PPSA99020

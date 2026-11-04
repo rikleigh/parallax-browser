@@ -15,9 +15,10 @@ enum {
 /* Checks a URL typed for the home page: a new string, or NULL and *error. */
 typedef char* (*PS5WKSettingsNormalize)(const char* text, const char** error);
 
-/* dir: where child.env and the flag files live (/data/ps5webkit). Records
+/* dir: where child.env and the flag files live (/data/ps5webkit); user: the
+ * PS5 user's folder, for the files that are theirs (the Home page). Records
  * the values found as the ones in use. */
-void ps5wk_settings_init(const char* dir, PS5WKSettingsNormalize normalize);
+void ps5wk_settings_init(const char* dir, const char* user, PS5WKSettingsNormalize normalize);
 
 /* The values now on disk are in use for these scopes (a new WebProcess
  * started: PS5WK_SETTINGS_PAGE). */

@@ -211,13 +211,15 @@ are saved as soon as you press a button.
 | Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
-| Home page (empty = the built-in start page) | `/data/ps5webkit/home-url.txt` | next start |
+| Home page (empty = the built-in start page) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | next start |
 
-The page also has these actions: *Clear cookies* and *Clear all website
-data* (`webkit_website_data_manager_clear` on the browser's network session:
-cookies, or every type, of any age), *Restart page* and *Restart browser*.
-Clearing data, turning the link server off from another device and
-restarting the browser each ask for a second press.
+The page also has these actions: *Clear cache*, *Clear cookies* and *Clear
+all website data* in the Storage card (`webkit_website_data_manager_clear`
+on the browser's network session: the disk and memory caches, cookies, or
+every type, of any age; `POST /clear?what=cache|cookies|all`), *Restart
+page* and *Restart browser*. Clearing cookies or all data, turning the link
+server off from another device and restarting the browser each ask for a
+second press.
 
 - **child.env** is rewritten in place. Comments, `JSC_*`, `WEBKIT_DEBUG` and
   any other lines stay as they were. The first line of a setting gets the
@@ -268,7 +270,7 @@ restarting the browser each ask for a second press.
   overflow boxes scrolled in the title too) works on the test pages but
   hasn't been checked on the TV.
 - **Downloads** (a card, not a setting): the folder
-  (`/data/ps5webkit/downloads`), its free space, how many downloads are
+  (`/data/ps5webkit/users/<id>/downloads`), its free space, how many downloads are
   finished or running, and *Clear finished downloads* (second press:
   deletes the finished files and their entries; `POST /clear?what=downloads`).
   *Restart browser* with downloads running asks for the second press with
@@ -339,6 +341,44 @@ PS5's WebKit (the script ran, focus was on the selected JIT button). Not
 checked yet: R3 and D-pad navigation on the TV, the PIN box, and *Clear all
 website data* (skipped so the owner's site data was kept; same code path
 as cookies).
+
+## Users and storage
+
+Each PS5 user has their own browser data: cookies and site data, the
+webpage cache, history, bookmarks, open tabs, downloads, the Home page and
+the sites where ads are allowed. The title asks the system who started it
+(`sceUserServiceGetInitialUser`, `sceUserServiceGetUserName`; profile.c)
+before it reads any of that, and uses that user's folder for the whole run.
+The menu shows the name on the right of its header ("PS5 user"). The
+runtime files, the ad-block lists, `child.env` and the other switches in
+`/data/ps5webkit` are shared by everyone.
+
+| Path | What |
+| --- | --- |
+| `/data/ps5webkit/users/<id>/` | one user's folder (`<id>`: the system's user ID, 8 hex digits; `default` if the system gave none) |
+| `…/name.txt` | the user's name, for someone looking over FTP |
+| `…/bookmarks.json`, `history.json`, `session.json`, `downloads.json`, `downloads/` | see *Tabs, bookmarks, history* and *Downloads* |
+| `…/browser/data/`, `…/browser/cache/` | WebKit's website data (`cookies.sqlite`, local storage, IndexedDB, HSTS) and its HTTP cache |
+| `…/home-url.txt`, `…/adblock-allow.txt` | the Home page setting; the sites where ads are allowed |
+| `/data/ps5webkit/start-data.js` | the start page's bookmarks and most visited, rewritten at every start for the user who started the browser (next to `start.html`, which loads it) |
+
+**Moving to users.** Before this, all of it was in `/data/ps5webkit` itself,
+one set for everyone. The first start that creates `/data/ps5webkit/users`
+moves that data into the folder of the user who started it (a rename each,
+nothing is copied; `[user] first start with users: N items ... moved`).
+Users who start the browser later begin with nothing: no bookmarks, no
+history, no cookies.
+
+**Storage** (Settings, the Storage card): this user's webpage cache,
+cookies and site data, downloads, and history, bookmarks and tabs, with a
+total; then what every user shares (the browser's files in `/data/ps5webkit`
+outside `users/`: fonts, Unicode data, the ad-block lists, logs) and the
+other users' folders together; and the free space on `/data`. The sizes come
+with `/settings.json` (`"storage"`), counted on the link server's thread at
+most every 5 s, again after something is cleared (`[user] storage counted in
+N ms` in the log). The webpage cache holds at most 250 MB per user (100 MB
+with under 4 GB free; patch 0076; it was up to 1 GB for the one shared
+cache).
 
 ## Tabs, bookmarks, history
 
@@ -463,8 +503,9 @@ runs (`test-urls.txt`) neither restore nor write the session.
 `/data/ps5webkit/no-session-restore` (a file) starts with one tab (the
 session is still written).
 
-**Files** (`/data/ps5webkit`, JSON, each written to `<name>.tmp`, synced
-and renamed over the old one; no sync, no telemetry):
+**Files** (the PS5 user's folder, `/data/ps5webkit/users/<id>`, see *Users
+and storage*; JSON, each written to `<name>.tmp`, synced and renamed over
+the old one; no sync, no telemetry):
 
 | File | Contents |
 | --- | --- |
@@ -472,7 +513,7 @@ and renamed over the old one; no sync, no telemetry):
 | `bookmarks.json` | `{"version":1,"bookmarks":[{"url","title","added"}]}`, newest first, at most 500 |
 | `history.json` | `{"version":1,"history":[{"url","title","last","visits"}]}`, newest first, at most 1000 pages; http/https only (not the start page, Settings or files); written 10 s after a change |
 | `downloads.json` | the Downloads list (see *Downloads*); the files are in `downloads/` |
-| `start-data.js` | `window.ps5wkData = {bookmarks, top}`: the start page's *Bookmarks* and *Most visited* (pages visited at least twice). A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
+| `start-data.js` | in `/data/ps5webkit`, not the user's folder: `window.ps5wkData = {bookmarks, top}`, the start page's *Bookmarks* and *Most visited* (pages visited at least twice), written at every start for the user who started the browser. A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
 
 The start page (`runtime/start.html`, still the home page and what a new
 tab opens) has the Parallax logo and wordmark, the *Send from your phone*
@@ -638,7 +679,7 @@ sits in memory, and the title only follows its signals
 (`apps/title/downloads.c`). Stage 1 only saves files: nothing is opened,
 run or installed.
 
-- **Where:** `/data/ps5webkit/downloads/<name>`, the name the server
+- **Where:** the PS5 user's `downloads/<name>` (`/data/ps5webkit/users/<id>/downloads`), the name the server
   suggests (`Content-Disposition`, the download attribute, else the
   address's last part) without `/ \ : * ? " < > |`, control characters or
   leading dots, at most 180 bytes; a name in use gets " (1)", " (2)"...
@@ -889,6 +930,7 @@ the original messages.
 | 0073-ps5-live-tabs-refresh-clock-media-and-gl-pressure | live tabs: the process's one `DisplayRefreshMonitor` follows the shown page's WC drawing area and is handed on when its drawing area goes (it stayed bound to the first view's: rAF and rendering updates of every other page lost their clock once that view went); a hidden page pauses its media playing with sound and can't start any (`PS5WK_BACKGROUND_AUDIO=1` turns it off); hidden pages are dropped only over the GL texture cap (was 80% of it), with a 2 s hold-off before the shown page's coverage is reduced |
 | 0074-ps5-wc-feed-scroll-costs | scrolling a long feed (COMPOSITING-PLAN.md, *Feeds that slow down as they grow*): descendant style invalidation looks an element up in the invalidation rule set's id/class/tag/attribute buckets before building an `ElementRuleCollector` (and pushes the selector filter lazily); leaf render layers whose bounding box misses the dirty rect are skipped while tiles are painted (answer kept for the rendering update); the post-layout hover update waits for the pending fake mouse move while the page scrolls; intersection observer targets visited in place, renderer-less targets not recomputed; backing-sharing containing-block chain walked once; `[render] style invalidation`, `paint cull` and `compositing requirements per traversal` lines. A/B: `PS5WK_STYLE_INVALIDATION_PREFILTER=0`, `PS5WK_PAINT_CULL=0`, `PS5WK_HOVER_AFTER_SCROLL=0` |
 | 0075-ps5-downloads-resume-on-soup | downloads on soup (see *Downloads*): `<destination>.part` renamed when complete (no placeholder), the `.part` kept on cancel and failure, a body shorter than its `Content-Length` a failure (not a short file), the free space (`statvfs`) checked before writing; a download asked with `Range: bytes=N-` appends a 206 starting at the `.part` file's size, refuses another start, starts over on a 200; Range requests without the content decoder; 64 KB reads and progress IPC every 100 ms / 1 MB; API `webkit_web_view_download_request`, `webkit_download_dup_original_uri`, `webkit_response_policy_decision_has_download_attribute` |
+| 0076-ps5-disk-cache-per-user | PS5 only: the disk cache (DocumentBrowser) holds at most 250 MB, 100 MB with under 4 GB free (0034 gave it up to 1 GB); each PS5 user has their own cache (see *Users and storage*) | (new) |
 
 0011 also carries: WTF FreeBSD sources, VIDEO=OFF build fixes (media sources,
 TextExtraction, AudioEncoder/PlatformRawAudioData), Skia `malloc_np.h`, DNS

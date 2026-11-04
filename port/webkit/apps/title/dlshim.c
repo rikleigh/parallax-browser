@@ -70,6 +70,7 @@ void* __wrap_dlsym(void* handle, const char* symbol)
  * libScePad/libSceUserService not linked" at the first launch). */
 extern int sceUserServiceInitialize(const void*);
 extern int sceUserServiceGetInitialUser(int*);
+extern int sceUserServiceGetUserName(int, char*, size_t);
 extern int scePadInit(void);
 extern int scePadOpen(int, int, int, const void*);
 extern int scePadClose(int);
@@ -80,7 +81,7 @@ extern int sceImeDialogGetResult(void*);
 extern int sceImeDialogTerm(void);
 extern int sceImeDialogAbort(void);
 __attribute__((used)) void* const ps5wk_title_sce_imports[] = {
-    (void*)sceUserServiceInitialize, (void*)sceUserServiceGetInitialUser,
+    (void*)sceUserServiceInitialize, (void*)sceUserServiceGetInitialUser, (void*)sceUserServiceGetUserName,
     (void*)scePadInit, (void*)scePadOpen, (void*)scePadClose, (void*)scePadReadState,
     (void*)sceImeDialogInit, (void*)sceImeDialogGetStatus, (void*)sceImeDialogGetResult,
     (void*)sceImeDialogTerm, (void*)sceImeDialogAbort,
