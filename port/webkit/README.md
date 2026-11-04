@@ -1997,9 +1997,23 @@ the headset to be released.
   stereo layouts pick the eye's half (left/top = left eye). The hint is
   head-locked at the same tangents in both eyes. The video's front starts
   at the tracking space's forward (-z, where the system centres its own VR
-  views, as PS5VR does); Square moves it to where the head looks (yaw
-  only). Not recentred on the head at entry: the tracker's first poses
-  after it registers are a stale default (see *Headset test 1*).
+  views, as PS5VR does), then moves to where the head faces once tracking
+  is live and the head keeps still (within 4 degrees for 0.5 s, given up
+  after 5 s; `[vr] recentred at entry`). Poses only count once the yaw has
+  left the first pose's by more than 4 degrees, or after 2 s: the tracker's
+  first poses after it registers are a stale default that jitters by a
+  degree or so for over 0.6 s (see *Headset test 1*; the first build of
+  this recentred onto it). The stale default ends with the whole
+  tracking space turning about 90 degrees in one frame (2026-11-04: -88 to
+  0 in 16 ms, at 1.3 to 2 s); when that comes after the entry recentre (the
+  head moved during the stale poses), a yaw step over 15 degrees at over
+  1500 degrees/s moves the front with it (`head yaw stepped ...: tracking
+  jump`; real head turns logged at most 8 degrees per frame). Square moves
+  the front to where the head looks (yaw only) at any time.
+- The pad watchdog (the system holding the pad for 10 s with no press
+  ends VR) ignores the pad's intercepted bit while the headset tracks: in
+  VR mode the system sets it for the whole session while presses still
+  arrive, so just watching for 10 s ended VR.
 - Leaving: `psvr2_close` leaves VR mode, unregisters, closes the tracker,
   reprojection and Hmd2 and now **releases the ~130 MB of direct memory**
   psvr2 took (Spike 3b/9 leaked it per session); a failed open undoes

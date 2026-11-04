@@ -78,6 +78,12 @@ static constexpr int kSamples = 4;        // rotated-grid supersampling per eye 
 static constexpr float kOverscan = 1.15f; // reprojection margin (Spike 3b/9)
 static constexpr int64_t kFrameUS = 16667; // 60 frames/s rendered, 120 Hz out
 static constexpr float kFlatHalfWidth = 0.70f; // flat screen: tan(35 deg), a 70 degree wide screen
+static constexpr float kStillRadians = 0.07f;  // entry recentre: the head within 4 degrees...
+static constexpr unsigned kStillFrames = 30;   // ...for 0.5 s
+static constexpr int64_t kEntryRecenterUS = 5000000; // given up after 5 s
+static constexpr int64_t kStalePoseUS = 2000000; // the stale first poses: live after leaving them or 2 s
+static constexpr float kJumpRadians = 0.26f;       // tracking jump: the yaw moving over 15 degrees...
+static constexpr float kJumpRadiansPerSecond = 26; // ...at over 1500 degrees/s (no head turns that fast)
 static constexpr int64_t kNoTrackingUS = 15000000; // no tracked pose at all this long after entering: back to the TV
 static constexpr int64_t kStatusPollUS = 1000000;  // Hmd2's device status (connected, worn) while in VR
 static constexpr unsigned kDisconnectedPolls = 2;  // status not 0 this many polls in a row: back to the TV
@@ -98,6 +104,18 @@ struct PS5VRState {
     float fisheyeHalf { static_cast<float>(M_PI / 2) };
     bool recenter { false };
     float yaw0 { 0 };
+    // entry recentre
+    bool entryRecenter { true };
+    bool haveFirstPose { false }, poseLive { false };
+    float firstYaw { 0 };
+    int64_t liveUS { 0 };
+    float stillYaw { 0 };
+    unsigned stillFrames { 0 };
+    // tracking jumps (the front follows them)
+    bool havePrevYaw { false };
+    float prevYaw { 0 };
+    int64_t prevYawUS { 0 };
+    unsigned yawStepLogs { 0 };
     int sourceStream { -1 };
     int sourceWidth { 0 }, sourceHeight { 0 };
     PS5Renderer::VREnded ended { nullptr };
@@ -405,6 +423,14 @@ bool PS5Renderer::vrActive()
     bool active = m_vrActiveShared;
     g_mutex_unlock(&m_lock);
     return active;
+}
+
+bool PS5Renderer::vrTracking()
+{
+    g_mutex_lock(&m_lock);
+    bool tracking = m_vrActiveShared && nowUS() - m_vrTrackedUS < 1000000;
+    g_mutex_unlock(&m_lock);
+    return tracking;
 }
 
 void PS5Renderer::setVRProjection(int projection, float fisheyeDegrees)
@@ -767,17 +793,77 @@ void PS5Renderer::vrRenderEyes(unsigned buffer, const void* framePointer)
         glUniform4f(s_uHintRect, 0, 0, 0, 0);
 
     // The video's front starts at the tracking space's forward (-z), where
-    // the system centres its own VR views. Not on the head at entry: the
-    // tracker's first poses after it registers are a stale default (yaw
-    // about -91 degrees here; PS5VR saw "always 90.5" in its convention),
-    // which put LEFT 90 in front in the first headset test. Square
-    // recentres on the live pose (yaw only, so the horizon stays level).
+    // the system centres its own VR views, and moves to where the head
+    // faces once tracking is live and the head keeps still (within 4
+    // degrees for 0.5 s): a viewer facing elsewhere started at the edge of
+    // a 180 video. The tracker's first poses after it registers are a stale
+    // default (yaw about -91 degrees here, jittering by a degree or so for
+    // over 0.6 s; PS5VR saw "always 90.5" in its convention), which put
+    // LEFT 90 in front in the first headset test, so poses only count once
+    // the yaw has left the first pose's by more than the still radius, or
+    // after 2 s (a viewer who happens to face that way). Given up after 5 s;
+    // Square cancels it. Square recentres on the live pose (yaw only,
+    // so the horizon stays level).
+    // The tracking space itself can turn under the head after entry: on
+    // 2026-11-04, re-entering VR recentred at entry on a live, still pose
+    // (yaw -107 degrees), and half a second later the same head read about
+    // 0 (a turn of 100 degrees no head makes that fast), leaving the video's
+    // front off to the side. Once the entry recentre is over, a jump like
+    // that moves the front with it, so the video stays where the head left it.
+    if (frame.tracked && !vr->sim) {
+        const float y = yawOf(frame.head.quat);
+        const int64_t t = nowUS();
+        if (vr->havePrevYaw) {
+            const float step = remainderf(y - vr->prevYaw, static_cast<float>(2 * M_PI));
+            const float seconds = std::max<int64_t>(t - vr->prevYawUS, kFrameUS / 2) / 1e6f;
+            const bool jump = fabsf(step) > kJumpRadians && fabsf(step) / seconds > kJumpRadiansPerSecond;
+            if (fabsf(step) > 0.09f && vr->yawStepLogs < 12 && t - vr->startUS < 10000000) {
+                vr->yawStepLogs++;
+                VRLOG("head yaw stepped %.1f degrees in %.0f ms at %.2f s (%.1f -> %.1f)%s", step * 180 / M_PI, seconds * 1000,
+                    (t - vr->startUS) / 1e6, vr->prevYaw * 180 / M_PI, y * 180 / M_PI,
+                    jump && !vr->entryRecenter ? ": tracking jump, the front moves with it" : "");
+            }
+            if (jump && !vr->entryRecenter)
+                vr->yaw0 = remainderf(vr->yaw0 + step, static_cast<float>(2 * M_PI));
+        }
+        vr->havePrevYaw = true;
+        vr->prevYaw = y;
+        vr->prevYawUS = t;
+    }
     if (frame.tracked && vr->recenter) {
         vr->yaw0 = yawOf(frame.head.quat);
         vr->recenter = false;
+        vr->entryRecenter = false;
         VRLOG("recentred (head yaw %.1f degrees, positive = left)", vr->yaw0 * 180 / M_PI);
     }
-    if (frame.tracked && !vr->sim && (vr->frames == 2 || vr->frames == 60 || vr->frames == 300))
+    if (vr->entryRecenter && !vr->sim && frame.tracked) {
+        const float y = yawOf(frame.head.quat);
+        if (!vr->haveFirstPose) {
+            vr->firstYaw = y;
+            vr->haveFirstPose = true;
+        } else if (!vr->poseLive && (fabsf(remainderf(y - vr->firstYaw, static_cast<float>(2 * M_PI))) > kStillRadians
+            || nowUS() - vr->startUS > kStalePoseUS)) {
+            vr->poseLive = true;
+            vr->liveUS = nowUS();
+        }
+        if (vr->poseLive) {
+            if (!vr->stillFrames || fabsf(remainderf(y - vr->stillYaw, static_cast<float>(2 * M_PI))) > kStillRadians) {
+                vr->stillYaw = y;
+                vr->stillFrames = 1;
+            } else if (++vr->stillFrames >= kStillFrames) {
+                vr->yaw0 = y;
+                vr->entryRecenter = false;
+                VRLOG("recentred at entry after %.2f s (head yaw %.1f degrees, positive = left; poses live after %.2f s, first yaw %.1f)",
+                    (nowUS() - vr->startUS) / 1e6, y * 180 / M_PI, (vr->liveUS - vr->startUS) / 1e6, vr->firstYaw * 180 / M_PI);
+            }
+        }
+    }
+    if (vr->entryRecenter && nowUS() - vr->startUS > kEntryRecenterUS) {
+        vr->entryRecenter = false;
+        VRLOG("not recentred at entry: %s within %.0f s", vr->poseLive ? "the head did not keep still" : "no live head pose",
+            kEntryRecenterUS / 1e6);
+    }
+    if (frame.tracked && !vr->sim && (vr->frames == 2 || vr->frames == 20 || vr->frames == 40 || vr->frames == 60 || vr->frames == 90 || vr->frames == 300))
         VRLOG("head yaw %.1f degrees at headset frame %llu (positive = left; the front is at yaw %.1f)", yawOf(frame.head.quat) * 180 / M_PI,
             static_cast<unsigned long long>(vr->frames), vr->yaw0 * 180 / M_PI);
     const float yawQuat[4] = { 0, sinf(-vr->yaw0 / 2), 0, cosf(-vr->yaw0 / 2) };
@@ -911,6 +997,11 @@ void PS5Renderer::vrFrame()
     int64_t renderStart = nowUS();
     vr->tracked += frame.tracked != 0;
     vr->windowTracked += frame.tracked != 0;
+    if (frame.tracked) {
+        g_mutex_lock(&m_lock);
+        m_vrTrackedUS = renderStart;
+        g_mutex_unlock(&m_lock);
+    }
 
     // Video: the newest frame due by the display time (older ones dropped,
     // slots released), converted into its stream's texture.

@@ -605,7 +605,11 @@ static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, uint32_t now,
 // title at all. While View in VR has the pad, the system holding it for
 // kSystemHeldEndsVR seconds with no press getting through ends VR: on
 // 2026-11-02 the title entered VR mode with the PS VR2 unplugged and no
-// O/touchpad press ever reached it (nothing was logged in 466 s).
+// O/touchpad press ever reached it (nothing was logged in 466 s). The
+// intercepted bit alone does not count while the headset is tracking: in VR
+// mode the system sets it for the whole session (2026-11-04: from 0.1 s
+// after entry until the end) while presses still reach the title, so a
+// viewer who just watched for 10 s was sent back to the TV.
 static void padSystemState(WPEDisplayPS5* display, int readResult, const PS5PadData& data)
 {
     auto* priv = display->priv;
@@ -622,7 +626,7 @@ static void padSystemState(WPEDisplayPS5* display, int readResult, const PS5PadD
         priv->padConnected = connected;
     }
     const double t = nowSeconds();
-    const bool held = readResult || intercepted;
+    const bool held = readResult || (intercepted && priv->padCaptured && !PS5Renderer::singleton().vrTracking());
     if (!held || !priv->padCaptured) {
         priv->systemHeldSince = -1;
         if (!priv->padCaptured)

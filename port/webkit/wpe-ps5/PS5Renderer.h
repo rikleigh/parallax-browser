@@ -128,6 +128,8 @@ public:
     // (the pad's owner gave up: the system held the pad in VR).
     void endVR(const char* why);
     bool vrActive();
+    // In VR with the headset tracking (a tracked pose in the last second).
+    bool vrTracking();
     void setVRProjection(int projection, float fisheyeDegrees);
     void recenterVR();
     // hint: shown in the headset for `seconds` (empty: none); tvText: the
@@ -327,6 +329,7 @@ private:
         std::string tvText;
     } m_vrRequest;
     bool m_vrActiveShared { false }; // guarded by m_lock (vrActive(), stopVR(wait))
+    int64_t m_vrTrackedUS { 0 }; // guarded by m_lock: the last tracked headset frame (vrTracking())
     struct ThumbnailRequest {
         bool pending { false };
         unsigned count { 0 };
