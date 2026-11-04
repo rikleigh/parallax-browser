@@ -53,7 +53,10 @@ rsync -aL --exclude .DS_Store "$RUNTIME/" "$out/data/ps5webkit/"
 mkdir -p "$out/data/ps5webkit/cache/fontconfig"
 : > "$out/data/ps5webkit/cache/fontconfig/.keep"   # FTP clients skip empty folders
 cp "$ICUDAT" "$out/data/ps5webkit/share/icu/icudt76l.dat"
-cp "$ROOT/port/webkit/runtime/start.html" "$out/data/ps5webkit/start.html"
+cp "$ROOT/port/webkit/runtime/parallax-logo.png" "$out/data/ps5webkit/"
+# The start page without its test links (they play local test media).
+sed '/<!-- tests:/,/<!-- \/tests -->/d' "$ROOT/port/webkit/runtime/start.html" > "$out/data/ps5webkit/start.html"
+! grep -q 'media/' "$out/data/ps5webkit/start.html" || { echo "start.html still links test media" >&2; exit 1; }
 cp "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$out/"
 
 # Nothing from Sony and no media: only our ELFs and the clean-room libc.prx.
