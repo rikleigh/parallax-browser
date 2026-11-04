@@ -644,8 +644,12 @@ run or installed.
   leading dots, at most 180 bytes; a name in use gets " (1)", " (2)"...
   (before the extension; `.tar.gz` stays whole). While it runs the data is
   in `<name>.part`, renamed when complete (patch 0075). Before any data is
-  written the free space (`statfs`) is checked against the size when the
-  server gives one (`Not enough space: needs 2.00 GB, 1.10 GB free`).
+  written the free space is checked against the size when the server gives
+  one (`Not enough space: needs 2.00 GB, 1.10 GB free`), by the title and
+  again by the NetworkProcess (`statvfs`). A title can't call `statfs`
+  (only libkernel_sys has it), so the NetworkProcess writes the free space
+  of `/data` every 5 s to `/system_tmp/ps5wk/datafree-<title pid>`
+  (`ps5wk-child.cpp`), which the title and Settings read.
 - **The list** (`downloads.json`, like `history.json`; written on every
   change of state, every 5 s while something runs, and at the wind-down):
   `{"version":1,"downloads":[{"id","url","finalUrl","file","mime","size",
@@ -727,6 +731,33 @@ changes the checksum; `--sha SIZE` prints the right one) with Range,
 ETag/Last-Modified, attachments, a slow mode, dropped connections, a stall,
 no range support, a changed version (`/version?v=2`) and release links that
 redirect to an address valid for 20 s; `/page` links every case.
+
+**Checked on the console** (2026-11-03/04, log and API only, files from
+`serve.py` on the Mac, every SHA-256 the server's): a 1 MB octet-stream, a
+text attachment, a `download` attribute link and a `blob:` file a page made
+were saved, a small text page was shown; pause and resume of a 50 MB file
+(206 from the byte on disk); a 30 MB file whose connection was dropped 3
+times (each failed as *The connection closed after N of M bytes* and
+resumed 2 s later); a stall at 2 MB retried after 45 s; a server without
+ranges and a changed ETag both started over from zero (*Restarted from
+zero*); a release link paused until its 20 s signed address had expired
+resumed from the original address (302 to a new signed one, the Range
+kept); a 40 MB download and a 1 GB one survived title restarts (wound
+down as paused at 6.6 MB and at 298/368 MB, resumed after the next start;
+the 1 GB file's SHA-256 right, computed in 5.1 s, 201 MB/s); 2 TB refused
+(*Not enough space: needs 2048.00 GB, 560.89 GB free*); a download in a
+closed tab went on, a tab opened only for a file closed itself; *Clear
+finished downloads* emptied the folder; a real release asset from GitHub
+(187 KB, redirected to its signed address) matched the checksum the Mac
+got. From the phone page: `GET /downloads/slow.bin` (50 MB) right, a range
+206, `..%2F` and `.part` names 404, a range past the end 416. Memory stayed
+flat for 1 GB: the NetworkProcess's peak RSS 152-169 MB and the title's
+direct memory constant (646 / 682 MB) for the whole download; the
+WebProcess isn't involved. Throughput was the link's that night,
+0.4-1.0 MB/s from the Mac to the PS5 (FTP uploads ran at the same speed,
+and the PS5 sent the 50 MB file back at 0.2 MB/s), so the download path's
+own ceiling wasn't reached. Not checked yet: the pad on the TV (the list,
+focus, X/Square/R2), the phone page in a real phone browser, a PIN set.
 
 ## Build
 
