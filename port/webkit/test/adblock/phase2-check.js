@@ -42,7 +42,10 @@
     console.log('[phase2] ' + host + ' ads at ' + label + ': slots ' + slots.length + ' shown ' + visible.length +
       (visible.length ? ' (' + visible.map(function (e) { var r = e.getBoundingClientRect(); return e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + ' ' + Math.round(r.width) + 'x' + Math.round(r.height); }).slice(0, 4).join(' ') + ')' : '') +
       ' | player ad-showing ' + (adSeen ? 'YES' : 'no') + ' (samples ' + samples + ', with ad ' + adSamples + (lastAdText ? ', "' + lastAdText + '"' : '') + ')' +
-      ' | ytInitialPlayerResponse ' + (pr === undefined ? 'undefined' : 'adPlacements ' + (pr && pr.adPlacements ? pr.adPlacements.length : 'none') +
+      ' | ytInitialPlayerResponse ' + (pr === undefined ? 'undefined' : 'adPlacements ' + (pr && pr.adPlacements ? pr.adPlacements.length + ' (' + pr.adPlacements.map(function (p) {
+        var c = p && p.adPlacementRenderer && p.adPlacementRenderer.config && p.adPlacementRenderer.config.adPlacementConfig;
+        return c ? String(c.kind).replace('AD_PLACEMENT_KIND_', '') + (c.adTimeOffset ? '@' + c.adTimeOffset.offsetStartMilliseconds : '') : '?';
+      }).join(' ') + ')' : 'none') +
         ', playerAds ' + (pr && pr.playerAds ? pr.playerAds.length : 'none')) +
       (v ? ' | video t=' + v.currentTime.toFixed(1) + ' paused=' + v.paused + ' size=' + v.videoWidth + 'x' + v.videoHeight +
         ' duration=' + (isFinite(v.duration) ? v.duration.toFixed(0) : v.duration) : ''));
