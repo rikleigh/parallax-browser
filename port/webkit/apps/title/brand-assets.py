@@ -22,8 +22,8 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ICON = os.path.join(HERE, "sce_sys", "icon0.png")
-BG = (0x01, 0x00, 0x1A)       # the icon's background
-CROP = (76, 72, 360, 360)     # x, y, w, h: the panes and their glow, square
+BG = (0x01, 0x01, 0x1A)       # the icon's background
+CROP = (71, 69, 368, 368)     # x, y, w, h: the panes and their glow, square
 
 
 def read_icon():
