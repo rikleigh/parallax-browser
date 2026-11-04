@@ -10,6 +10,10 @@
  *                   "scrollY","form","state"}]}; state: WebKit's serialized
  *                   session state of the tab (its back/forward list), base64;
  *                   form 1: the page shown is a form's (POST) result
+ *   downloads.json  {"version":1,"downloads":[{"id","url","finalUrl","file","mime",
+ *                   "size","received","state","etag","lastModified","started",
+ *                   "finished","error","sha256","restarted"}]}, newest first
+ *                   (downloads.c keeps the list and decides when to write it)
  *   start-data.js   window.ps5wkData = {bookmarks:[...], top:[...]}: what the
  *                   start page (a file: page, the only kind that can load it)
  *                   shows; web pages can't read file: URLs
@@ -655,5 +659,110 @@ void ps5wk_session_save(GPtrArray* tabs, int active)
     }
     g_string_append(out, "]}\n");
     writeFileAtomically("session.json", out->str, out->len);
+    g_string_free(out, TRUE);
+}
+
+/* ---------------------------------------------------------------- downloads */
+
+static const char* const downloadStates[] = { "running", "paused", "failed", "done", "cancelled" };
+
+const char* ps5wk_download_state_name(int state)
+{
+    return state >= 0 && state < (int)G_N_ELEMENTS(downloadStates) ? downloadStates[state] : "failed";
+}
+
+void ps5wk_download_record_clear(PS5WKDownloadRecord* r)
+{
+    g_free(r->url);
+    g_free(r->finalURL);
+    g_free(r->file);
+    g_free(r->mime);
+    g_free(r->etag);
+    g_free(r->lastModified);
+    g_free(r->error);
+    g_free(r->sha256);
+    memset(r, 0, sizeof *r);
+}
+
+void ps5wk_download_record_free(gpointer data)
+{
+    if (!data)
+        return;
+    ps5wk_download_record_clear(data);
+    g_free(data);
+}
+
+static char* jdup(JNode* item, const char* key)
+{
+    const char* value = jstr(item, key);
+    return value && *value ? g_strdup(value) : NULL;
+}
+
+GPtrArray* ps5wk_downloads_load(void)
+{
+    GPtrArray* records = g_ptr_array_new_with_free_func(ps5wk_download_record_free);
+    JNode* root = readJSONFile("downloads.json");
+    JNode* list = jget(root, "downloads");
+    for (unsigned i = 0; list && list->type == J_ARRAY && i < list->items->len; i++) {
+        JNode* item = g_ptr_array_index(list->items, i);
+        const char* file = jstr(item, "file");
+        const char* url = jstr(item, "url");
+        /* a name in the folder, nothing else */
+        if (!file || !*file || !url || strchr(file, '/') || file[0] == '.')
+            continue;
+        PS5WKDownloadRecord* r = g_new0(PS5WKDownloadRecord, 1);
+        r->id = (unsigned)jnum(item, "id", 0);
+        r->url = g_strdup(url);
+        r->finalURL = jdup(item, "finalUrl");
+        r->file = g_strdup(file);
+        r->mime = jdup(item, "mime");
+        r->size = (gint64)jnum(item, "size", -1);
+        r->received = (gint64)jnum(item, "received", 0);
+        r->state = PS5WK_DL_FAILED;
+        const char* state = jstr(item, "state");
+        for (unsigned s = 0; state && s < G_N_ELEMENTS(downloadStates); s++) {
+            if (!strcmp(state, downloadStates[s]))
+                r->state = (int)s;
+        }
+        r->etag = jdup(item, "etag");
+        r->lastModified = jdup(item, "lastModified");
+        r->started = (gint64)jnum(item, "started", 0);
+        r->finished = (gint64)jnum(item, "finished", 0);
+        r->error = jdup(item, "error");
+        r->sha256 = jdup(item, "sha256");
+        r->restarted = jnum(item, "restarted", 0) != 0;
+        g_ptr_array_add(records, r);
+    }
+    jfree(root);
+    return records;
+}
+
+static void jsonMember(GString* out, const char* key, const char* value)
+{
+    g_string_append_printf(out, ",\"%s\":", key);
+    ps5wk_json_string(out, value ? value : "");
+}
+
+void ps5wk_downloads_save(GPtrArray* records)
+{
+    GString* out = g_string_new("{\"version\":1,\"downloads\":[");
+    for (unsigned i = 0; records && i < records->len; i++) {
+        PS5WKDownloadRecord* r = g_ptr_array_index(records, i);
+        g_string_append_printf(out, "%s{\"id\":%u", i ? ",\n" : "\n", r->id);
+        jsonMember(out, "url", r->url);
+        jsonMember(out, "finalUrl", r->finalURL);
+        jsonMember(out, "file", r->file);
+        jsonMember(out, "mime", r->mime);
+        g_string_append_printf(out, ",\"size\":%" G_GINT64_FORMAT ",\"received\":%" G_GINT64_FORMAT ",\"state\":\"%s\"", r->size, r->received,
+            ps5wk_download_state_name(r->state));
+        jsonMember(out, "etag", r->etag);
+        jsonMember(out, "lastModified", r->lastModified);
+        g_string_append_printf(out, ",\"started\":%" G_GINT64_FORMAT ",\"finished\":%" G_GINT64_FORMAT, r->started, r->finished);
+        jsonMember(out, "error", r->error);
+        jsonMember(out, "sha256", r->sha256);
+        g_string_append_printf(out, ",\"restarted\":%d}", r->restarted ? 1 : 0);
+    }
+    g_string_append(out, "]}\n");
+    writeFileAtomically("downloads.json", out->str, out->len);
     g_string_free(out, TRUE);
 }

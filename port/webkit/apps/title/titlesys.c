@@ -132,10 +132,21 @@ pid_t fork(void)
     return -1;
 }
 
+/* libkernel_sys has statfs, the app libkernel's stub doesn't: looked up at
+ * run time (the downloads' free space), ENOSYS when the console says no. */
+int sceKernelDlsym(int handle, const char* name, void** addr);
 int statfs(const char* path, struct statfs* buf)
 {
-    (void)path;
-    (void)buf;
+    static int (*real)(const char*, struct statfs*);
+    static int looked;
+    if (!looked) {
+        looked = 1;
+        void* address = NULL;
+        if (!sceKernelDlsym(0x2001, "statfs", &address) && address)
+            real = (int (*)(const char*, struct statfs*))address;
+    }
+    if (real)
+        return real(path, buf);
     errno = ENOSYS;
     return -1;
 }

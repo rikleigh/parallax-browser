@@ -103,6 +103,23 @@ static const char* const kHistoryURLs[] = { "https://en.wikipedia.org/wiki/PlayS
     "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "https://example.com/", "https://en.wikipedia.org/", "https://old.reddit.com/r/PS5/", "https://html5test.co/" };
 #define HISTORY_COUNT 40
 
+typedef struct {
+    const char *file, *host, *kind, *detail, *state;
+    double progress;
+    int running, tone;
+} DownloadSample;
+static const DownloadSample kDownloads[] = {
+    { "etaHEN-2.1B.bin", "github.com", "BIN", "48.2 MB of 131 MB · 11.6 MB/s · 7 s left", "37%", 0.368, 1, BUI_TONE_ACTIVE },
+    { "ps5-homebrew-store-1.4.pkg", "cdn.example.org", "PKG", "1.18 GB of 2.00 GB · 21.4 MB/s · 39 s left", "Restarted from zero", 0.59, 1, BUI_TONE_WARN },
+    { "Big_Buck_Bunny_1080p.zip", "download.blender.org", "ZIP", "312 MB of 1.21 GB · Paused when the browser closed", "Paused", 0.25, 0, BUI_TONE_PLAIN },
+    { "kstuff.elf", "github.com", "ELF", "84.0 KB of 412 KB · Connection lost", "Retrying in 5 s", 0.20, 0, BUI_TONE_WARN },
+    { "firmware-notes.txt", "example.com", "TXT", "Not enough space: needs 2.00 GB, 1.10 GB free", "Failed", -1, 0, BUI_TONE_WARN },
+    { "ftpsrv-ps5.elf", "github.com", "ELF", "412 KB · 03 Nov 14:22", "Done", -1, 0, BUI_TONE_DONE },
+    { "wpe-sysroot.tar.gz", "files.example.net", "GZ", "96.4 MB · 03 Nov 11:05", "Done", -1, 0, BUI_TONE_DONE },
+};
+#define DOWNLOAD_COUNT 7
+static int deleteArmedRow = -1;
+
 static int tabCount = 5, shownTab = 0, armed = 0, bookmarkCount = 6;
 
 static void row(int index, BUIRow* r, void* user)
@@ -124,6 +141,21 @@ static void row(int index, BUIRow* r, void* user)
     } else if (s->section == SEC_BOOKMARKS) {
         r->title = kBookmarks[index].title;
         r->url = kBookmarks[index].url;
+    } else if (s->section == SEC_DOWNLOADS) {
+        const DownloadSample* d = &kDownloads[index % DOWNLOAD_COUNT];
+        r->title = d->file;
+        r->url = d->host;
+        snprintf(r->kind, sizeof r->kind, "%s", d->kind);
+        snprintf(r->detail, sizeof r->detail, "%s", d->detail);
+        snprintf(r->state, sizeof r->state, "%s", d->state);
+        r->progress = d->progress;
+        r->running = d->running;
+        r->tone = d->tone;
+        if (index == deleteArmedRow) {
+            r->armed = TRUE;
+            snprintf(r->state, sizeof r->state, "Press \xE2\x96\xA1 again to delete the file");
+            r->tone = BUI_TONE_WARN;
+        }
     } else {
         if (!index) {
             r->title = armed ? "Press X again to clear all history" : "Clear all history";
@@ -157,6 +189,7 @@ static BUIState baseState(void)
     s.section = SEC_TABS;
     s.bookmarkCount = (unsigned)bookmarkCount;
     s.historyCount = HISTORY_COUNT;
+    s.downloadCount = DOWNLOAD_COUNT;
     s.rowCount = tabCount + 1;
     s.row = row;
     return s;
@@ -278,6 +311,59 @@ int main(int argc, char** argv)
     menuShot("menu-history-clear", &s);
     armed = 0;
 
+    /* downloads */
+    s = baseState();
+    s.section = SEC_DOWNLOADS;
+    s.rowCount = DOWNLOAD_COUNT;
+    s.downloadsActive = 2;
+    s.downloadsProgress = 0.52;
+    s.zone = ZONE_LIST;
+    s.listFocus = 0;
+    s.downloadCross = "Pause";
+    s.downloadSquare = "Cancel";
+    menuShot("menu-downloads", &s);
+
+    s.listFocus = 2;
+    s.downloadCross = "Resume";
+    menuShot("menu-downloads-paused", &s);
+
+    deleteArmedRow = 5;
+    s.listFocus = 5;
+    s.downloadCross = "Details";
+    s.downloadSquare = "Delete file";
+    menuShot("menu-downloads-delete", &s);
+    deleteArmedRow = -1;
+
+    {
+        BUIDetails d;
+        memset(&d, 0, sizeof d);
+        d.title = "ftpsrv-ps5.elf";
+        const char* labels[] = { "Address", "Came from", "File", "Size", "SHA-256", "Validator", "Started", "State" };
+        const char* values[] = { "https://github.com/ps5-payload-dev/ftpsrv/releases/download/v0.11/ftpsrv-ps5.elf",
+            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/512345678/0a1b2c3d-4e5f-6789-abcd-ef0123456789?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=releaseassetproduction%2F20261103%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261103T142201Z&X-Amz-Expires=300&X-Amz-Signature=5f2b",
+            "/data/ps5webkit/downloads/ftpsrv-ps5.elf", "412 KB (421 888 bytes)", "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "\"0x8DCF2A1B3C4D5E6\"  ·  Mon, 02 Nov 2026 18:04:11 GMT", "03 Nov 2026 14:22:01, done 14:22:03", "Done" };
+        for (int i = 0; i < 8; i++) {
+            d.labels[i] = labels[i];
+            d.values[i] = values[i];
+        }
+        d.count = 8;
+        s.details = &d;
+        menuShot("menu-downloads-details", &s);
+        s.details = NULL;
+    }
+
+    s = baseState();
+    s.section = SEC_DOWNLOADS;
+    s.downloadCount = 0;
+    s.rowCount = 0;
+    menuShot("menu-downloads-empty", &s);
+
+    s = baseState();
+    s.downloadsActive = 1;
+    s.downloadsProgress = 0.37;
+    menuShot("menu-tabs-downloading", &s);
+
     /* the loading bar, alone over the page */
     s = baseState();
     s.loading = TRUE;
@@ -293,9 +379,23 @@ int main(int argc, char** argv)
     wpe_display_ps5_canvas_clear(bar, 0);
     bui_draw_bar(bar, &s, FALSE);
     shot("loadbar-titled", bar);
+    s.downloadsActive = 1;
+    s.downloadsProgress = 0.62;
+    wpe_display_ps5_canvas_clear(bar, 0);
+    bui_draw_bar(bar, &s, FALSE);
+    shot("loadbar-downloading", bar);
+    s.downloadsActive = 3;
+    s.downloadsProgress = -1;
+    wpe_display_ps5_canvas_clear(bar, 0);
+    bui_draw_bar(bar, &s, FALSE);
+    shot("loadbar-downloading-3", bar);
+    s.downloadsActive = 0;
     wpe_display_ps5_canvas_free(bar);
 
     noticeShot("notice-bookmarked", "Bookmarked", 40, 0);
+    noticeShot("notice-download-started", "Download started: ftpsrv-ps5.elf\n(Options, then R1: Downloads)", 40, 0);
+    noticeShot("notice-downloaded", "Downloaded ftpsrv-ps5.elf", 40, 0);
+    noticeShot("notice-download-failed", "Download failed: firmware-notes.txt\nNot enough space: needs 2.00 GB, 1.10 GB free", 40, 0);
     noticeShot("notice-vr", "PS VR2 not connected\nConnect the headset and press the touchpad again", 40, 0);
     noticeShot("notice-tv-vr",
         "Playing in the PS VR2 headset\nBig Buck Bunny 60fps 4K\n180\xC2\xB0 3D side by side  \xC2\xB7  The guess\n"

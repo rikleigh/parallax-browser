@@ -6,6 +6,7 @@
 #include "browserdraw.h"
 #include "brand.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -315,6 +316,58 @@ static void drawProgress(WPEDisplayPS5Canvas* c, int screenW, double progress)
     wpe_display_ps5_canvas_glow(c, w - 48, y, 48, 4, 2, 10, PX_A(head, 0x00), PX_A(head, 0xa0));
 }
 
+/* The bar's download indicator: a ring that fills clockwise from the top in
+ * the brand's gradient (violet to magenta along the arc) around an arrow;
+ * the number of downloads when more than one. Drawn into a small image
+ * (the canvas has no arcs). */
+#define RING 44
+static void downloadRing(WPEDisplayPS5Canvas* c, int x, int y, unsigned count, double progress)
+{
+    static guint32 px[RING * RING];
+    const double cx = RING / 2.0, cy = RING / 2.0, outer = RING / 2.0 - 3, width = 4.5, inner = outer - width;
+    /* unknown size: a quarter arc */
+    const double filled = progress < 0 ? 0.25 : progress;
+    for (int j = 0; j < RING; j++) {
+        for (int i = 0; i < RING; i++) {
+            double dx = i + 0.5 - cx, dy = j + 0.5 - cy, r = sqrt(dx * dx + dy * dy);
+            /* coverage of the ring (1 px of anti-aliasing at both edges) */
+            double cover = fmin(fmax(outer + 0.5 - r, 0), 1) * fmin(fmax(r - inner + 0.5, 0), 1);
+            guint32 out = 0;
+            if (cover > 0) {
+                double angle = atan2(dx, -dy); /* 0 at the top, clockwise */
+                if (angle < 0)
+                    angle += 2 * G_PI;
+                double t = angle / (2 * G_PI);
+                guint32 color;
+                unsigned alpha;
+                if (t <= filled) {
+                    double k = filled > 0 ? t / filled : 0;
+                    guint32 a = PX_FOCUS_FROM, b = PX_FOCUS_TO;
+                    color = 0;
+                    for (int shift = 0; shift < 24; shift += 8) {
+                        int ca = (a >> shift) & 0xff, cb = (b >> shift) & 0xff;
+                        color |= (guint32)(ca + (cb - ca) * k) << shift;
+                    }
+                    alpha = 255;
+                } else {
+                    color = 0xffffff;
+                    alpha = 0x30;
+                }
+                unsigned a8 = (unsigned)(alpha * cover + 0.5);
+                out = (a8 << 24) | ((((color >> 16) & 0xff) * a8 / 255) << 16) | ((((color >> 8) & 0xff) * a8 / 255) << 8) | ((color & 0xff) * a8 / 255);
+            }
+            px[j * RING + i] = out;
+        }
+    }
+    wpe_display_ps5_canvas_image(c, x, y, RING, RING, px, 255);
+    if (count > 1) {
+        char number[8];
+        snprintf(number, sizeof number, "%u", count > 9 ? 9 : count);
+        textCentred(c, x + RING / 2, y + RING / 2, 0, 18, TRUE, PX_TEXT, number);
+    } else
+        textCentred(c, x + RING / 2, y + RING / 2, 0, 20, TRUE, PX_TEXT, "↓");
+}
+
 void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactive)
 {
     const int screenW = s->screenW;
@@ -344,8 +397,16 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
         textCentred(c, bx + box / 2, by + box / 2, box, 18, TRUE, PX_TEXT, count);
     }
 
+    /* downloads running: the ring left of the tab count */
+    int fieldEnd = countX - 8;
+    if (s->downloadsActive) {
+        const int ringX = countX - 4 - RING;
+        downloadRing(c, ringX, BTN_Y + (BTN_H - RING) / 2, s->downloadsActive, s->downloadsProgress);
+        fieldEnd = ringX - 10;
+    }
+
     /* the address field */
-    const int ax = x + 4, aw = countX - 8 - ax, ay = BTN_Y, ah = BTN_H;
+    const int ax = x + 4, aw = fieldEnd - ax, ay = BTN_Y, ah = BTN_H;
     const gboolean addressFocused = toolbar && s->toolbarFocus == TB_ADDRESS;
     if (addressFocused)
         focusBox(c, ax, ay, aw, ah, PX_RADIUS);
@@ -396,13 +457,13 @@ static void drawHeader(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
 
     /* the lists, between L1 and R1 */
     x += keyCap(c, x, cy, "L1") + 22;
-    static const char* names[SEC_COUNT] = { "Tabs", "Bookmarks", "History" };
+    static const char* names[SEC_COUNT] = { "Tabs", "Bookmarks", "History", "Downloads" };
     for (int sec = 0; sec < SEC_COUNT; sec++) {
         char count[32];
         if (sec == SEC_TABS)
             snprintf(count, sizeof count, "%u/%u", s->tabCount, s->maxTabs);
         else
-            snprintf(count, sizeof count, "%u", sec == SEC_BOOKMARKS ? s->bookmarkCount : s->historyCount);
+            snprintf(count, sizeof count, "%u", sec == SEC_BOOKMARKS ? s->bookmarkCount : sec == SEC_HISTORY ? s->historyCount : s->downloadCount);
         const gboolean on = sec == s->section;
         const int nw = wpe_display_ps5_canvas_text_width(c, T_SECTION, TRUE, names[sec]);
         const int cw = wpe_display_ps5_canvas_text_width(c, 21, FALSE, count);
@@ -426,9 +487,23 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
     const int cy = fy + FOOTER_H / 2;
     int x = px + 32;
     const gboolean list = s->zone == ZONE_LIST;
+    if (s->details) {
+        x += hint(c, x, cy, "○", "Back to the list") + 32;
+        hint(c, x, cy, "Options", "Close the menu");
+        return;
+    }
     if (s->section == SEC_TABS) {
         x += hint(c, x, cy, "✕", list ? "Switch" : "Select") + 32;
         x += hint(c, x, cy, "□", "Close tab") + 32;
+    } else if (s->section == SEC_DOWNLOADS) {
+        if (!list)
+            x += hint(c, x, cy, "✕", "Select") + 32;
+        if (list && s->downloadCross)
+            x += hint(c, x, cy, "✕", s->downloadCross) + 32;
+        if (list && s->downloadSquare)
+            x += hint(c, x, cy, "□", s->downloadSquare) + 32;
+        if (list && s->rowCount && !(s->downloadCross && !strcmp(s->downloadCross, "Details")))
+            x += hint(c, x, cy, "R2", "Details") + 32;
     } else {
         x += hint(c, x, cy, "✕", list ? "Open" : "Select") + 32;
         x += hint(c, x, cy, "R2", "New tab") + 32;
@@ -448,8 +523,152 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         x += hint(c, x, cy, keys[i], labels[i]) + 28;
 }
 
+/* The file-type tile: the extension in a tile tinted by it. */
+static void kindTile(WPEDisplayPS5Canvas* c, int x, int y, int size, const char* kind)
+{
+    static const guint32 tints[] = { PX_VIOLET, PX_BLUE, PX_MAGENTA, PX_CYAN, 0xffb30cdeu };
+    guint hash = 5381;
+    for (const char* p = kind; *p; p++)
+        hash = hash * 33 + (unsigned char)*p;
+    guint32 tint = tints[hash % G_N_ELEMENTS(tints)];
+    wpe_display_ps5_canvas_fill(c, x, y, size, size, PX_RADIUS_CHIP + 2, PX_A(tint, 0x60));
+    wpe_display_ps5_canvas_stroke(c, x, y, size, size, PX_RADIUS_CHIP + 2, 1, PX_A(tint, 0xe0), PX_A(tint, 0xe0), FALSE);
+    int textSize = strlen(kind) <= 3 ? 16 : 14;
+    textCentred(c, x + size / 2, y + size / 2, size - 6, textSize, TRUE, PX_TEXT, kind);
+}
+
+static guint32 toneColor(int tone)
+{
+    return tone == BUI_TONE_ACTIVE ? PX_CYAN_TEXT : tone == BUI_TONE_WARN ? PX_PINK : tone == BUI_TONE_DONE ? PX_TEXT_2 : PX_TEXT_3;
+}
+
+/* A download: name, then where from and how far, a progress bar in the
+ * brand's gradient, the state on the right. */
+static void drawDownloadRow(WPEDisplayPS5Canvas* c, const BUIRow* r, int rx, int ry, int rw, gboolean focused)
+{
+    if (focused)
+        focusBox(c, rx, ry, rw, ROW_BOX, PX_RADIUS);
+    else
+        wpe_display_ps5_canvas_fill(c, rx, ry, rw, ROW_BOX, PX_RADIUS, PX_A(PX_RAISED, 0xb0));
+    int x = rx + 20;
+    const int tile = 48;
+    kindTile(c, x, ry + (ROW_BOX - tile) / 2, tile, r->kind[0] ? r->kind : "FILE");
+    x += tile + 20;
+
+    /* on the right: the state ("Done" with a tick) */
+    int stateW = 0;
+    if (r->state[0]) {
+        const gboolean done = r->tone == BUI_TONE_DONE;
+        char text[80];
+        snprintf(text, sizeof text, "%s%s", done ? "✓ " : "", r->state);
+        stateW = wpe_display_ps5_canvas_text_width(c, T_URL, r->tone != BUI_TONE_PLAIN, text);
+        wpe_display_ps5_canvas_text(c, rx + rw - 24 - stateW, ry + 37, 0, T_URL, r->tone != BUI_TONE_PLAIN, toneColor(r->tone), text);
+    }
+    const int right = rx + rw - 24 - (stateW ? stateW + 28 : 0);
+    const int textW = right - x;
+    wpe_display_ps5_canvas_text(c, x, ry + 30, textW, T_TITLE, TRUE, r->armed ? PX_PINK : PX_TEXT, r->title ? r->title : "");
+    /* the host, then how far */
+    int w = 0;
+    if (r->url && *r->url)
+        w = wpe_display_ps5_canvas_text(c, x, ry + 55, textW, T_URL - 1, FALSE, PX_TEXT_2, r->url);
+    if (r->detail[0] && textW - w > 40) {
+        char line[140];
+        snprintf(line, sizeof line, "%s%s", w ? "  ·  " : "", r->detail);
+        wpe_display_ps5_canvas_text(c, x + w, ry + 55, textW - w, T_URL - 1, FALSE, r->tone == BUI_TONE_WARN && !r->running ? PX_PINK : PX_TEXT_3, line);
+    }
+    /* the bar: a track, the received part in the gradient, a light at its head */
+    if (r->progress >= 0) {
+        const int bx = x, by = ry + ROW_BOX - 12, bw = rx + rw - 24 - x, bh = 4;
+        wpe_display_ps5_canvas_fill(c, bx, by, bw, bh, 2, PX_A(WHITE, 0x18));
+        int fw = (int)(bw * r->progress);
+        if (fw > 0) {
+            if (fw < 6)
+                fw = 6;
+            guint32 head = PX_FOCUS_FROM;
+            guint32 a = PX_FOCUS_FROM, b = PX_FOCUS_TO, out = 0xff000000u;
+            for (int shift = 0; shift < 24; shift += 8) {
+                int ca = (a >> shift) & 0xff, cb = (b >> shift) & 0xff;
+                out |= (guint32)(ca + (cb - ca) * r->progress) << shift;
+            }
+            head = out;
+            wpe_display_ps5_canvas_fill_gradient(c, bx, by, fw, bh, 2, r->running ? PX_FOCUS_FROM : PX_A(PX_FOCUS_FROM, 0x90),
+                r->running ? head : PX_A(head, 0x90), FALSE);
+            if (r->running)
+                wpe_display_ps5_canvas_glow(c, bx + fw - 24, by, 24, bh, 2, 8, PX_A(head, 0x00), PX_A(head, 0xa0));
+        }
+    }
+}
+
+/* Breaks @text into lines of at most @width px (at UTF-8 boundaries, at a
+ * space when there is one near the end); up to @max lines, the last cut
+ * with an ellipsis. Returns the lines drawn. */
+static int drawWrapped(WPEDisplayPS5Canvas* c, int x, int baseline, int width, int size, guint32 color, const char* text, int lineH, int max)
+{
+    int lines = 0;
+    const char* p = text ? text : "";
+    while (*p && lines < max) {
+        if (lines == max - 1 || wpe_display_ps5_canvas_text_width(c, size, FALSE, p) <= width) {
+            wpe_display_ps5_canvas_text(c, x, baseline + lines * lineH, width, size, FALSE, color, p);
+            return lines + 1;
+        }
+        /* the longest prefix that fits */
+        size_t lo = 1, hi = strlen(p), best = 1;
+        char piece[1024];
+        while (lo <= hi) {
+            size_t mid = (lo + hi) / 2;
+            const char* end = g_utf8_find_prev_char(p, p + mid + 1);
+            size_t n = end && end > p ? (size_t)(end - p) : mid;
+            if (n >= sizeof piece)
+                n = sizeof piece - 1;
+            memcpy(piece, p, n);
+            piece[n] = 0;
+            if (wpe_display_ps5_canvas_text_width(c, size, FALSE, piece) <= width) {
+                best = n;
+                lo = mid + 1;
+            } else
+                hi = mid - 1;
+        }
+        /* a break after a space, a slash or a dash in the last third */
+        for (size_t i = best; i > best * 2 / 3; i--) {
+            if (p[i - 1] == ' ' || p[i - 1] == '/' || p[i - 1] == '-' || p[i - 1] == '&' || p[i - 1] == '?') {
+                best = i;
+                break;
+            }
+        }
+        memcpy(piece, p, best);
+        piece[best] = 0;
+        wpe_display_ps5_canvas_text(c, x, baseline + lines * lineH, width, size, FALSE, color, piece);
+        p += best;
+        lines++;
+    }
+    return lines;
+}
+
+/* A download's details: a card over the list. */
+static void drawDetails(WPEDisplayPS5Canvas* c, const BUIDetails* d, int px, int pw, int screenH)
+{
+    const int x = px + 64, y = LIST_TOP + 4, w = pw - 128, h = listBottom(screenH) - LIST_TOP - 8;
+    wpe_display_ps5_canvas_glow(c, x, y, w, h, PX_RADIUS_PANEL, PX_FOCUS_GLOW, PX_A(PX_FOCUS_FROM, 0x60), PX_A(PX_FOCUS_TO, 0x60));
+    wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_SURFACE, 0xff));
+    wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_RAISED, 0xc0));
+    wpe_display_ps5_canvas_stroke(c, x, y, w, h, PX_RADIUS_PANEL, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    wpe_display_ps5_canvas_text(c, x + 40, y + 60, w - 80, 30, TRUE, PX_TEXT, d->title ? d->title : "");
+    wpe_display_ps5_canvas_fill_gradient(c, x + 40, y + 78, 96, 4, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    int ly = y + 130;
+    const int labelW = 170, vx = x + 40 + labelW, vw = w - 80 - labelW, lineH = 30;
+    for (int i = 0; i < d->count && ly < y + h - 20; i++) {
+        wpe_display_ps5_canvas_text(c, x + 40, ly, labelW - 16, T_URL, TRUE, PX_TEXT_3, d->labels[i]);
+        int lines = drawWrapped(c, vx, ly, vw, 22, PX_TEXT, d->values[i], lineH, 3);
+        ly += lines * lineH + 16;
+    }
+}
+
 static void drawRow(WPEDisplayPS5Canvas* c, const BUIState* s, const BUIRow* r, int rx, int ry, int rw, gboolean focused)
 {
+    if (s->section == SEC_DOWNLOADS) {
+        drawDownloadRow(c, r, rx, ry, rw, focused);
+        return;
+    }
     if (focused)
         focusBox(c, rx, ry, rw, ROW_BOX, PX_RADIUS);
     else
@@ -512,12 +731,13 @@ void bui_draw_menu(WPEDisplayPS5Canvas* c, const BUIState* s)
     const int rows = s->rowCount, visible = bui_visible_rows(screenH);
     const int rx = px + 24, rw = pw - 48 - 16;
     if (!rows) {
-        const gboolean bookmarks = s->section == SEC_BOOKMARKS;
+        const gboolean bookmarks = s->section == SEC_BOOKMARKS, downloads = s->section == SEC_DOWNLOADS;
         const int cx = px + pw / 2, cy = (LIST_TOP + listBottom(screenH)) / 2;
-        textCentred(c, cx, cy - 72, 0, 64, FALSE, PX_TEXT_3, bookmarks ? "☆" : "↺");
-        textCentred(c, cx, cy + 6, 0, 30, TRUE, PX_TEXT_2, bookmarks ? "No bookmarks yet" : "No history yet");
+        textCentred(c, cx, cy - 72, 0, 64, FALSE, PX_TEXT_3, bookmarks ? "☆" : downloads ? "↓" : "↺");
+        textCentred(c, cx, cy + 6, 0, 30, TRUE, PX_TEXT_2, bookmarks ? "No bookmarks yet" : downloads ? "No downloads yet" : "No history yet");
         textCentred(c, cx, cy + 52, pw - 96, 22, FALSE, PX_TEXT_3,
-            bookmarks ? "☆ in the bar (Options, then up and right) adds the page shown." : "The pages you visit come here.");
+            bookmarks ? "☆ in the bar (Options, then up and right) adds the page shown."
+            : downloads ? "Files a page can't show (archives, packages) are saved to /data/ps5webkit/downloads." : "The pages you visit come here.");
     }
     int ry = LIST_TOP;
     for (int row = s->listTop; row < rows && row < s->listTop + visible; row++) {
@@ -538,5 +758,7 @@ void bui_draw_menu(WPEDisplayPS5Canvas* c, const BUIState* s)
         wpe_display_ps5_canvas_fill(c, trackX, trackY, 4, trackH, 2, PX_A(PX_LINE, 0xc0));
         wpe_display_ps5_canvas_fill(c, trackX, thumbY, 4, thumbH, 2, PX_TEXT_3);
     }
+    if (s->details)
+        drawDetails(c, s->details, px, pw, screenH);
     drawFooter(c, s, px, py, pw, ph);
 }

@@ -267,6 +267,12 @@ restarting the browser each ask for a second press.
   (*Async scrolling*) has what each one does; `overflow=1` (carousels and
   overflow boxes scrolled in the title too) works on the test pages but
   hasn't been checked on the TV.
+- **Downloads** (a card, not a setting): the folder
+  (`/data/ps5webkit/downloads`), its free space, how many downloads are
+  finished or running, and *Clear finished downloads* (second press:
+  deletes the finished files and their entries; `POST /clear?what=downloads`).
+  *Restart browser* with downloads running asks for the second press with
+  "1 download in progress; it will pause".
 - **Link server off** (`push-off`): the server now listens on 127.0.0.1 only,
   instead of not running at all. R3 still opens Settings, but phones,
   `ps5open` and the bookmarklet can't reach the PS5. Turn it back on from the
@@ -353,9 +359,9 @@ words to search for (DuckDuckGo Lite, as before).
 | X | pick: a button, a tab (switch to it), a bookmark or history entry (open it in this tab), *New tab*; with the pointer shown, what is under the pointer |
 | left stick | the pointer (the focus follows it) |
 | right stick | scroll the list |
-| L1 / R1 | previous / next list: Tabs, Bookmarks, History |
-| Square | close the tab / delete the bookmark / delete the history entry |
-| R2 | open the bookmark or history entry in a new tab |
+| L1 / R1 | previous / next list: Tabs, Bookmarks, History, Downloads |
+| Square | close the tab / delete the bookmark / delete the history entry (Downloads: see *Downloads*) |
+| R2 | open the bookmark or history entry in a new tab (Downloads: the details) |
 | Triangle | the keyboard for the address |
 | O or Options | close the menu |
 | L3 / R3 | close the menu, then home page / Settings |
@@ -465,6 +471,7 @@ and renamed over the old one; no sync, no telemetry):
 | `session.json` | `{"version":1,"active":N,"tabs":[{"url","title","scrollX","scrollY","form","state"}]}`; `state`: the session state, base64; `form` 1: the page is a form's result |
 | `bookmarks.json` | `{"version":1,"bookmarks":[{"url","title","added"}]}`, newest first, at most 500 |
 | `history.json` | `{"version":1,"history":[{"url","title","last","visits"}]}`, newest first, at most 1000 pages; http/https only (not the start page, Settings or files); written 10 s after a change |
+| `downloads.json` | the Downloads list (see *Downloads*); the files are in `downloads/` |
 | `start-data.js` | `window.ps5wkData = {bookmarks, top}`: the start page's *Bookmarks* and *Most visited* (pages visited at least twice). A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
 
 The start page (`runtime/start.html`, still the home page and what a new
@@ -617,6 +624,109 @@ title's extra direct memory (699-714 vs 658 MB). A third tab discarded the
 least recently used one and reused its view. GPU compositing off: the
 first switch back to a live tab showed the old page until the repaint fix
 above; with it, each switch showed the right page.
+
+## Downloads
+
+A response becomes a download when it is an attachment
+(`Content-Disposition: attachment`), when the main frame gets a type the
+browser can't show (`webkit_response_policy_decision_is_mime_type_supported`
+false: .zip, .elf, .pkg, .bin, `application/octet-stream`...), or when the
+link has a `download` attribute (also `blob:` files a page makes). It goes
+through WebKit's own download path (`WebKitNetworkSession::download-started`,
+`WebKitDownload`): the NetworkProcess streams it to disk, so a big file never
+sits in memory, and the title only follows its signals
+(`apps/title/downloads.c`). Stage 1 only saves files: nothing is opened,
+run or installed.
+
+- **Where:** `/data/ps5webkit/downloads/<name>`, the name the server
+  suggests (`Content-Disposition`, the download attribute, else the
+  address's last part) without `/ \ : * ? " < > |`, control characters or
+  leading dots, at most 180 bytes; a name in use gets " (1)", " (2)"...
+  (before the extension; `.tar.gz` stays whole). While it runs the data is
+  in `<name>.part`, renamed when complete (patch 0075). Before any data is
+  written the free space (`statfs`) is checked against the size when the
+  server gives one (`Not enough space: needs 2.00 GB, 1.10 GB free`).
+- **The list** (`downloads.json`, like `history.json`; written on every
+  change of state, every 5 s while something runs, and at the wind-down):
+  `{"version":1,"downloads":[{"id","url","finalUrl","file","mime","size",
+  "received","state","etag","lastModified","started","finished","error",
+  "sha256","restarted"}]}`, newest first, at most 200 (the oldest finished
+  entries go; their files stay). `url` is the address the download started
+  from, before redirects (`webkit_download_dup_original_uri`: the
+  navigation's first URL), `finalUrl` where the data came from.
+- **Pause and resume:** pause cancels the transfer and keeps the `.part`
+  file. Resume, and every automatic retry, asks the **original** address
+  again (a release link's signed CDN address expires within minutes) with
+  `Range: bytes=N-`, N the size of the `.part` file on disk, and `If-Range`
+  with the first response's validator (a strong `ETag`, else
+  `Last-Modified`), through `webkit_web_view_download_request` (patch 0075).
+  The NetworkProcess appends a 206 that starts at exactly N; a 206 that
+  starts anywhere else is refused, and the title also checks the range's
+  start and total against the file before any data is written, so
+  mismatched data is never joined. A 200 (no range support, or the file
+  changed) starts over from zero, and the row says *Restarted from zero*;
+  a mismatch or a 416 deletes the `.part` and starts over the same way.
+- **Retries:** a network error, or no data for 45 s, is retried 4 times,
+  2, 5, 15 and 30 s later (*Retrying in 5 s*); a transfer that gets 1 MB
+  through resets the count. HTTP errors (4xx but 408/429), a full disk and
+  non-http addresses fail at once (*Failed*, with the reason).
+- **Lifetime:** downloads don't belong to a tab: closing it, a discarded
+  tab or a WebProcess restart leaves them running. The wind-down (launcher
+  `stop`, *Restart browser*) saves what runs as paused; the system's own
+  close (PS button) gives the title no warning, so a download still marked
+  running when the browser starts (killed or crashed) shows as *Paused when
+  the browser closed*, and Resume continues it from its `.part` file.
+- **SHA-256:** read from the finished file on a worker thread (one file at
+  a time, 1 MB reads), shown in the details and on the phone page, to
+  compare with a release's checksum.
+
+**On the TV.** The menu's fourth list, **Downloads** (L1/R1, or left/right
+in a list): a tile with the file's extension, the name, the host, a
+progress bar in the brand's gradient (its head glows while data arrives),
+bytes of the size, speed and time left, and the state on the right (a
+percentage, *Connecting…*, *Paused*, *Retrying in N s*, *Failed* with the
+reason under the name, *Restarted from zero*, *✓ Done*, *Cancelled*).
+
+| In Downloads | |
+| --- | --- |
+| X | pause / resume / retry; a finished file: the details; a cancelled one: download again |
+| Square | cancel (the `.part` goes); a finished file: delete the file and its entry (press twice); a failed or cancelled entry: remove it |
+| R2 | the details: the address, where it came from, the file's path, size, SHA-256, validator, times, state (O closes them) |
+
+The bar shows a ring left of the tab count while anything downloads (the
+received part of every running download together, from the top clockwise
+in the gradient; the number of downloads when more than one; a quarter arc
+when a size isn't known). Notices: *Download started: <name>*, *Downloaded
+<name>*, *Download failed: <name>* with the reason. The uipreview harness
+renders the list, the details, the empty list, the ring and the notices.
+
+**Getting files off the PS5.** The link server's page
+(`http://<ps5>:9040/`) has a *Downloads* section: the finished downloads,
+each a link to `GET /downloads/<name>` (size, date and SHA-256 under it).
+Only names of finished downloads in the list are served (no `/`, `\`,
+leading dot; `O_NOFOLLOW`, regular files in the folder), with
+`Content-Length`, `Accept-Ranges` and one `Range` (206, 416 outside the
+file), as `application/octet-stream` with the name in
+`Content-Disposition`. Each transfer has a thread of its own (at most 4;
+the server goes on answering Settings and `/open`). The link server's rules
+apply: a PIN set in `push-pin.txt` is needed (`?pin=`, the page passes it
+on), and with `push-off` nothing outside the PS5 reaches it.
+`GET /downloads.json` lists them.
+
+**API** (as `/browser`): `/browser/state` has `downloads` (with `speed`,
+`onDisk`, `retryIn`, `transfer`), `POST
+/browser/download?action=pause|resume|cancel|remove|x|square&index=N` (or
+`action=start&url=...`), and `/browser/key` drives the list as the pad
+does. The log has `[dl]` lines (the request and its `Range`/`If-Range`, the
+HTTP status, `resumed at N bytes`, `starting over from zero`, retries,
+`done`, the SHA-256 and its speed) and `push: <name> to <ip>: ... MB/s`.
+
+**Test server:** `port/webkit/test/downloads/serve.py [--port 8781]`
+generates files of any size (each 4 KB block numbered, so a wrong join
+changes the checksum; `--sha SIZE` prints the right one) with Range,
+ETag/Last-Modified, attachments, a slow mode, dropped connections, a stall,
+no range support, a changed version (`/version?v=2`) and release links that
+redirect to an address valid for 20 s; `/page` links every case.
 
 ## Build
 

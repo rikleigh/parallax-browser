@@ -60,6 +60,40 @@ GPtrArray* ps5wk_session_load(int* active);
 void ps5wk_session_save(GPtrArray* tabs, int active);
 void ps5wk_session_tab_free(gpointer tab);
 
+/* Downloads (downloads.json): the list downloads.c keeps, newest first. */
+typedef enum {
+    PS5WK_DL_RUNNING, /* receiving, or about to (a retry, a resume asked) */
+    PS5WK_DL_PAUSED,  /* the .part file stays; Resume continues it */
+    PS5WK_DL_FAILED,  /* error says why; the .part file stays (Retry) */
+    PS5WK_DL_DONE,
+    PS5WK_DL_CANCELLED, /* the .part file is gone */
+} PS5WKDownloadState;
+
+typedef struct {
+    unsigned id;
+    char* url;      /* the original address, before redirects: a resume asks it again */
+    char* finalURL; /* where the data came from last (after redirects) */
+    char* file;     /* the name in the downloads folder (the .part has ".part" after it) */
+    char* mime;
+    gint64 size;     /* total bytes, -1: not known */
+    gint64 received; /* bytes in the file or its .part */
+    int state;       /* PS5WKDownloadState */
+    char* etag;      /* the validator for If-Range */
+    char* lastModified;
+    gint64 started, finished; /* Unix seconds (finished: 0 until done) */
+    char* error;     /* why it failed, or a note ("started over from zero") */
+    char* sha256;    /* lowercase hex, once the finished file was read */
+    gboolean restarted; /* the last resume started over from zero */
+} PS5WKDownloadRecord;
+
+/* downloads.json: the records (PS5WKDownloadRecord*, free with
+ * ps5wk_download_record_free), or an empty array. */
+GPtrArray* ps5wk_downloads_load(void);
+void ps5wk_downloads_save(GPtrArray* records);
+void ps5wk_download_record_clear(PS5WKDownloadRecord* record);
+void ps5wk_download_record_free(gpointer record);
+const char* ps5wk_download_state_name(int state);
+
 /* JSON helpers for browserui.c's API. */
 void ps5wk_json_string(GString* out, const char* s);
 void ps5wk_entries_json(GString* out, GPtrArray* entries, unsigned max);

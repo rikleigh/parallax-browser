@@ -30,6 +30,7 @@
 #include "common/title.h"
 #include "adblock.h"
 #include "browser.h"
+#include "downloads.h"
 #include "qrcode.h"
 #include "settings.h"
 #include "viewinvr.h"
@@ -124,6 +125,9 @@ static gboolean beginWindDown(gpointer data)
     /* The open tabs, before about:blank replaces the page. */
     ps5wk_browser_close_menu();
     ps5wk_browser_save();
+    /* Downloads still running are saved as paused (Resume continues them
+     * from their .part files at the next start). */
+    ps5wk_downloads_wind_down();
     spike_log("wind-down: quit requested; %d audio stream(s) open; loading about:blank", ps5wk_audio_server_active_streams());
     if (webView)
         webkit_web_view_load_uri(webView, "about:blank");
@@ -725,6 +729,10 @@ static int fileExists(const char* path);
  *       "pin", "url", "qr": rows of "0"/"1"}; no url without an address or
  *       with push-off
  *   GET /logo.png   Parallax's logo (/app0/ui), for these pages
+ *   GET /downloads/<name>  a finished download (only names in the list,
+ *       inside /data/ps5webkit/downloads), with Range support, streamed on
+ *       a thread of its own (the server goes on answering); the PIN as for
+ *       /open. GET /downloads.json: the finished downloads
  * The control socket takes "open <url>" too. Bare hosts get https://, other
  * words a search; only http, https and file:///data/ps5webkit/ URLs load.
  * Loading a page also leaves View in VR (onLoadChanged).
@@ -1110,14 +1118,51 @@ static const char pushPageStyle[] =
     "background:linear-gradient(90deg,#6d0efd,#a50ccf)}button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
     "p,li{color:var(--muted)}code{word-break:break-all;color:var(--fg)}a{color:var(--accent)}"
     "a.bm{display:inline-block;padding:9px 16px;border:1.5px dashed var(--accent);border-radius:999px;color:var(--accent);"
-    "text-decoration:none;font-weight:700}#status{color:var(--fg);margin:12px 0 0}#status:empty{display:none}</style>";
+    "text-decoration:none;font-weight:700}#status{color:var(--fg);margin:12px 0 0}#status:empty{display:none}"
+    ".dls{padding:6px 16px}.dl{display:flex;flex-direction:column;gap:2px;padding:12px 0;border-top:1px solid var(--line)}.dl:first-child{border-top:0}"
+    ".dlname{font-weight:700;color:var(--accent);word-break:break-all;text-decoration:none}.dlname:hover{text-decoration:underline}"
+    ".dlmeta{color:var(--muted);font-size:.9rem}.dlsha{color:var(--muted);font:12px/1.4 ui-monospace,Menlo,monospace;word-break:break-all}</style>";
 
 static const char pushBrand[] =
     "<div class=\"brand\"><img src=\"/logo.png\" alt=\"\" onerror=\"this.remove()\"><div><b>Parallax</b><span>Browser on your PS5</span></div></div>";
 
-/* The page with the text box; host: what the bookmarklet calls. */
-static char* pushIndexPage(const char* host, const char* pin)
+/* The page's Downloads section: the finished downloads (the list as JSON
+ * in the page, drawn by its script with textContent), each a link to
+ * /downloads/<name>. With a PIN and none given, a line that says so. */
+static char* pushDownloadsSection(const char* pin, gboolean pinOK)
 {
+    if (!pinOK)
+        return g_strdup("<h2>Downloads</h2><p>Open this page with <code>?pin=&lt;PIN&gt;</code> to see the files downloaded on the PS5.</p>");
+    char* list = ps5wk_downloads_finished_json();
+    /* inside a <script>: no "</" can end it early */
+    GString* safe = g_string_new(NULL);
+    for (const char* c = list; *c; c++) {
+        if (c[0] == '<' && c[1] == '/')
+            g_string_append(safe, "<\\/");
+        else
+            g_string_append_c(safe, *c);
+    }
+    char* pinJS = pin ? jsonString(pin) : g_strdup("null");
+    char* section = g_strdup_printf("<h2>Downloads</h2><div class=\"card dls\" id=\"dls\"></div>"
+        "<script>(function(){var list=%s,pin=%s,box=document.getElementById('dls');"
+        "function size(b){return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(1)+' MB':b>=1024?Math.round(b/1024)+' KB':b+' B'}"
+        "if(!list.length){var p=document.createElement('p');p.textContent='Nothing yet. Files you download in the PS5 browser come here, to save on this device.';box.appendChild(p);return}"
+        "list.forEach(function(d){var row=document.createElement('div');row.className='dl';"
+        "var a=document.createElement('a');a.className='dlname';a.href='/downloads/'+encodeURIComponent(d.file)+(pin?'?pin='+encodeURIComponent(pin):'');"
+        "a.setAttribute('download',d.file);a.textContent=d.file;row.appendChild(a);"
+        "var m=document.createElement('span');m.className='dlmeta';m.textContent=size(d.size)+' \\u00b7 '+new Date(d.finished*1000).toLocaleString();row.appendChild(m);"
+        "if(d.sha256){var h=document.createElement('code');h.className='dlsha';h.textContent='SHA-256 '+d.sha256;row.appendChild(h)}"
+        "box.appendChild(row)})})()</script>", safe->str, pinJS);
+    g_free(pinJS);
+    g_string_free(safe, TRUE);
+    g_free(list);
+    return section;
+}
+
+/* The page with the text box; host: what the bookmarklet calls. */
+static char* pushIndexPage(const char* host, const char* pin, gboolean pinOK)
+{
+    char* downloads = pushDownloadsSection(pin, pinOK);
     char* shown = copyShownURI();
     char* shownHTML = g_markup_escape_text(shown, -1);
     char* pinPart = pin ? g_strdup_printf("+'&pin=%s'", pin) : g_strdup("");
@@ -1132,13 +1177,14 @@ static char* pushIndexPage(const char* host, const char* pin)
         "<p>Showing now: <code>%s</code></p>"
         "<h2>Bookmarklet</h2><p>Drag this to the bookmarks bar, then click it on any page to open that page on the PS5:</p>"
         "<p><a class=\"bm\" href=\"%s\">Send to PS5</a></p>"
-        "<p>From a terminal: <code>curl 'http://%s/open?url=example.com'</code></p>"
+        "<p>From a terminal: <code>curl 'http://%s/open?url=example.com'</code></p>%s"
         "<script>document.getElementById('f').onsubmit=function(e){e.preventDefault();var s=document.getElementById('status');"
         "s.textContent='Sending…';fetch('/open',{method:'POST',headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(this))})"
         ".then(function(r){return r.json()}).then(function(j){s.textContent=j.ok?'Opening '+j.url:'Not sent: '+j.error})"
         ".catch(function(){s.textContent='The PS5 did not answer'})}</script></main></body></html>",
         pushPageStyle, pushBrand, pushPIN ? "<input name=\"pin\" placeholder=\"PIN\" inputmode=\"numeric\" autocomplete=\"off\">" : "",
-        shownHTML, bookmarkletHTML, host);
+        shownHTML, bookmarkletHTML, host, downloads);
+    g_free(downloads);
     g_free(shown);
     g_free(shownHTML);
     g_free(pinPart);
@@ -1315,6 +1361,14 @@ static void dataCleared(GObject* manager, GAsyncResult* result, gpointer data)
     }
 }
 
+static gboolean clearDownloadsOnMain(gpointer data)
+{
+    (void)data;
+    ps5wk_downloads_clear_finished();
+    ps5wk_settings_set_status("Finished downloads cleared.");
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean clearDataOnMain(gpointer data)
 {
     gboolean all = GPOINTER_TO_INT(data);
@@ -1413,9 +1467,11 @@ static char* settingsState(const char* message)
     char* adblock = ps5wk_adblock_json(isSettingsURI(shown) ? back : shown);
     /* For the "Send from your phone" card (on the PS5 only). */
     char* link = linkJSON();
-    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,%s%s%s%s",
-        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link,
+    char* downloads = ps5wk_downloads_summary_json();
+    char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,\"downloads\":%s,%s%s%s%s",
+        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link, downloads,
         message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock);
+    g_free(downloads);
     g_free(link);
     g_free(adblock);
     char* state = ps5wk_settings_json(extra);
@@ -1533,13 +1589,175 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
             spike_log("settings: clearing %s, asked by %s", all ? "all website data" : "cookies", from);
             g_idle_add(clearDataOnMain, GINT_TO_POINTER(all));
             settingsReplyJSON(client, 200, TRUE, all ? "Clearing all website data." : "Clearing cookies.");
+        } else if (!strcmp(path, "/clear") && scope && !strcmp(scope, "downloads")) {
+            spike_log("settings: clearing finished downloads, asked by %s", from);
+            g_idle_add(clearDownloadsOnMain, NULL);
+            settingsReplyJSON(client, 200, TRUE, "Deleting the finished downloads.");
         } else
-            settingsReplyJSON(client, 400, FALSE, !strcmp(path, "/restart") ? "scope=page or scope=browser" : "what=cookies or what=all");
+            settingsReplyJSON(client, 400, FALSE, !strcmp(path, "/restart") ? "scope=page or scope=browser" : "what=cookies, what=all or what=downloads");
         g_free(scope);
     }
 }
 
-static void pushServe(int client, const char* from, gboolean loopback)
+/* ---- Finished downloads to another device (GET /downloads/<name>) ----
+ * A thread per transfer (at most 4), so a 2 GB file to a phone doesn't stop
+ * the link server (Settings, /open) for minutes. Range: bytes=a-b, a- and
+ * -n (one range); 416 outside the file. */
+#define PS5WK_FILE_SENDERS 4
+static gint fileSenders;
+
+typedef struct {
+    int client;
+    int fd;
+    gint64 size, start, length;
+    gboolean partial, head;
+    char* name;
+    char* from;
+} FileSend;
+
+static void* fileSendThread(void* data)
+{
+    FileSend* job = data;
+    struct timeval timeout = { .tv_sec = 30 };
+    setsockopt(job->client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+    char* escaped = g_uri_escape_string(job->name, NULL, FALSE);
+    char* range = job->partial ? g_strdup_printf("Content-Range: bytes %" G_GINT64_FORMAT "-%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT "\r\n", job->start,
+        job->start + job->length - 1, job->size) : g_strdup("");
+    char* head = g_strdup_printf("HTTP/1.1 %s\r\nContent-Type: application/octet-stream\r\nContent-Length: %" G_GINT64_FORMAT "\r\n%s"
+        "Accept-Ranges: bytes\r\nContent-Disposition: attachment; filename*=UTF-8''%s\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        job->partial ? "206 Partial Content" : "200 OK", job->length, range, escaped);
+    g_free(range);
+    gboolean ok = send(job->client, head, strlen(head), 0) == (ssize_t)strlen(head);
+    gint64 sent = 0, startTime = g_get_monotonic_time();
+    if (ok && !job->head && lseek(job->fd, job->start, SEEK_SET) == job->start) {
+        const size_t size = 256 * 1024;
+        char* buffer = g_malloc(size);
+        while (sent < job->length) {
+            ssize_t n = read(job->fd, buffer, (size_t)MIN((gint64)size, job->length - sent));
+            if (n <= 0)
+                break;
+            ssize_t done = 0;
+            while (done < n) {
+                ssize_t w = send(job->client, buffer + done, (size_t)(n - done), 0);
+                if (w <= 0)
+                    break;
+                done += w;
+            }
+            if (done < n)
+                break;
+            sent += n;
+        }
+        g_free(buffer);
+    }
+    double seconds = (g_get_monotonic_time() - startTime) / 1e6;
+    spike_log("push: %s to %s: %" G_GINT64_FORMAT " of %" G_GINT64_FORMAT " bytes%s in %.1f s (%.1f MB/s)", job->name, job->from, sent, job->head ? 0 : job->length,
+        job->partial ? " (a range)" : "", seconds, seconds > 0 ? sent / 1048576.0 / seconds : 0);
+    g_free(head);
+    g_free(escaped);
+    close(job->fd);
+    close(job->client);
+    g_free(job->name);
+    g_free(job->from);
+    g_free(job);
+    g_atomic_int_add(&fileSenders, -1);
+    return NULL;
+}
+
+/* "bytes=a-b", "bytes=a-", "bytes=-n": the range in a file of size bytes;
+ * FALSE when it can't be served (416). */
+static gboolean parseByteRange(const char* value, gint64 size, gint64* start, gint64* length)
+{
+    if (g_ascii_strncasecmp(value, "bytes=", 6) || strchr(value, ','))
+        return FALSE;
+    const char* p = value + 6;
+    char* end = NULL;
+    if (*p == '-') {
+        gint64 n = g_ascii_strtoll(p + 1, &end, 10);
+        if (end == p + 1 || n <= 0)
+            return FALSE;
+        *start = n >= size ? 0 : size - n;
+    } else {
+        *start = g_ascii_strtoll(p, &end, 10);
+        if (end == p || *end != '-' || *start >= size)
+            return FALSE;
+        p = end + 1;
+        if (*p) {
+            gint64 last = g_ascii_strtoll(p, &end, 10);
+            if (end == p || last < *start)
+                return FALSE;
+            *length = MIN(last, size - 1) - *start + 1;
+            return TRUE;
+        }
+    }
+    *length = size - *start;
+    return *length > 0;
+}
+
+/* TRUE: the client socket was handed to a sending thread. */
+static gboolean serveDownloadFile(int client, const char* from, const char* encodedName, const char* rangeHeader, gboolean head)
+{
+    char* name = g_uri_unescape_string(encodedName, NULL);
+    char* path = name ? ps5wk_downloads_finished_path(name) : NULL;
+    int fd = path ? open(path, O_RDONLY | O_NOFOLLOW) : -1;
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+        spike_log("push: %s asked for /downloads/%s: no such finished download", from, encodedName);
+        pushReply(client, 404, "text/plain", "ERR no such finished download\n");
+        if (fd >= 0)
+            close(fd);
+        g_free(name);
+        g_free(path);
+        return FALSE;
+    }
+    FileSend* job = g_new0(FileSend, 1);
+    job->client = client;
+    job->fd = fd;
+    job->size = st.st_size;
+    job->start = 0;
+    job->length = st.st_size;
+    job->head = head;
+    job->name = name;
+    job->from = g_strdup(from);
+    g_free(path);
+    if (rangeHeader && *rangeHeader) {
+        if (!parseByteRange(rangeHeader, job->size, &job->start, &job->length)) {
+            char* reply = g_strdup_printf("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */%" G_GINT64_FORMAT "\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n", job->size);
+            send(client, reply, strlen(reply), 0);
+            g_free(reply);
+            close(fd);
+            g_free(job->name);
+            g_free(job->from);
+            g_free(job);
+            return FALSE;
+        }
+        job->partial = TRUE;
+    }
+    if (g_atomic_int_add(&fileSenders, 1) >= PS5WK_FILE_SENDERS) {
+        g_atomic_int_add(&fileSenders, -1);
+        pushReply(client, 503, "text/plain", "ERR too many downloads at once; try again\n");
+        close(fd);
+        g_free(job->name);
+        g_free(job->from);
+        g_free(job);
+        return FALSE;
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, fileSendThread, job)) {
+        g_atomic_int_add(&fileSenders, -1);
+        pushReply(client, 503, "text/plain", "ERR no thread\n");
+        close(fd);
+        g_free(job->name);
+        g_free(job->from);
+        g_free(job);
+        return FALSE;
+    }
+    pthread_detach(thread);
+    return TRUE;
+}
+
+/* TRUE: the client socket is someone else's now (a file transfer). */
+static gboolean pushServe(int client, const char* from, gboolean loopback)
 {
     char* request = g_malloc(PS5WK_PUSH_MAX + 1);
     size_t used = 0, headerEnd = 0, contentLength = 0;
@@ -1583,7 +1801,7 @@ static void pushServe(int client, const char* from, gboolean loopback)
         if (status != 400 || used)
             pushReply(client, status, "text/plain", status == 408 ? "ERR request too slow\n" : status == 413 ? "ERR request too large\n" : "ERR bad request\n");
         g_free(request);
-        return;
+        return FALSE;
     }
     request[headerEnd - 2] = 0; /* headers end with one \r\n */
     const char* body = request + headerEnd;
@@ -1593,7 +1811,7 @@ static void pushServe(int client, const char* from, gboolean loopback)
     if (sscanf(request, "%7s %2047s", method, target) != 2) {
         pushReply(client, 400, "text/plain", "ERR bad request\n");
         g_free(request);
-        return;
+        return FALSE;
     }
     const char* headers = strchr(request, '\n') ? strchr(request, '\n') + 1 : "";
     char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "", keyHeader[128] = "", origin[160] = "";
@@ -1603,6 +1821,8 @@ static void pushServe(int client, const char* from, gboolean loopback)
     headerValue(headers, "Content-Type", type, sizeof type);
     headerValue(headers, "Host", host, sizeof host);
     headerValue(headers, "X-PS5-PIN", pinHeader, sizeof pinHeader);
+    char rangeHeader[128] = "";
+    headerValue(headers, "Range", rangeHeader, sizeof rangeHeader);
     char* query = strchr(target, '?');
     if (query)
         *query++ = 0;
@@ -1615,7 +1835,7 @@ static void pushServe(int client, const char* from, gboolean loopback)
         /* No CORS for the settings: a page elsewhere can't send them JSON. */
         pushReplyCORS(client, 204, "text/plain", NULL, !settingsPath && !browserPath);
         g_free(request);
-        return;
+        return FALSE;
     }
     gboolean get = !strcmp(method, "GET") || !strcmp(method, "HEAD");
     gboolean post = !strcmp(method, "POST");
@@ -1653,6 +1873,26 @@ static void pushServe(int client, const char* from, gboolean loopback)
                 spike_log("browser API from %s: %s %s%s%s", from, method, path, query ? "?" : "", query ? query : "");
             pushReplyCORS(client, code, "application/json", reply, FALSE);
             g_free(reply);
+        }
+    } else if (g_str_has_prefix(path, "/downloads/") && get) {
+        /* A finished download: the PIN as for /open (not for the PS5 itself). */
+        if (!pinOK && !loopback)
+            pushReply(client, 403, "text/plain", "ERR wrong or missing PIN\n");
+        else if (serveDownloadFile(client, from, path + strlen("/downloads/"), rangeHeader, !strcmp(method, "HEAD"))) {
+            g_free(url);
+            g_free(pin);
+            g_free(request);
+            return TRUE;
+        }
+    } else if (!strcmp(path, "/downloads.json") && get) {
+        if (!pinOK && !loopback)
+            pushReply(client, 403, "application/json", "{\"ok\":false,\"error\":\"wrong or missing PIN\"}\n");
+        else {
+            char* list = ps5wk_downloads_finished_json();
+            char* reply = g_strdup_printf("{\"ok\":true,\"downloads\":%s}\n", list);
+            pushReply(client, 200, "application/json", reply);
+            g_free(reply);
+            g_free(list);
         }
     } else if (!strcmp(path, "/status") && get) {
         char* shown = copyShownURI();
@@ -1731,7 +1971,7 @@ static void pushServe(int client, const char* from, gboolean loopback)
                 inet_ntop(AF_INET, &local.sin_addr, ip, sizeof ip);
             snprintf(host, sizeof host, "%s:%d", ip, PS5WK_PUSH_PORT);
         }
-        char* page = pushIndexPage(host, pushPIN && pinOK ? pushPIN : NULL);
+        char* page = pushIndexPage(host, pushPIN && pinOK ? pushPIN : NULL, pinOK);
         pushReply(client, 200, "text/html; charset=utf-8", page);
         g_free(page);
     } else if (!strcmp(path, "/") || !strcmp(path, "/open") || !strcmp(path, "/status") || !strcmp(path, "/cookies")) {
@@ -1742,6 +1982,7 @@ static void pushServe(int client, const char* from, gboolean loopback)
     g_free(url);
     g_free(pin);
     g_free(request);
+    return FALSE;
 }
 
 static void* pushThread(void* unused)
@@ -1793,8 +2034,8 @@ static void* pushThread(void* unused)
             if (!getsockname(client, (struct sockaddr*)&local, &localLength))
                 inet_ntop(AF_INET, &local.sin_addr, pushLastLocal, sizeof pushLastLocal);
         }
-        pushServe(client, from, peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
-        close(client);
+        if (!pushServe(client, from, peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)))
+            close(client);
     }
     return NULL;
 }
@@ -2071,6 +2312,7 @@ int main(int argc, char** argv)
     ps5wk_vr_init(display, webView);
     /* After View in VR: the browser's button handler chains it. */
     ps5wk_browser_init(display, webView);
+    ps5wk_downloads_init(WPE_DISPLAY_PS5(display), session);
     ps5wk_adblock_init(webView);
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 

@@ -20,8 +20,9 @@
  *   - while a page loads, a bar at the top with its title, address and
  *     progress, gone 1.5 s after the load ends
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
- *     Stop, Home, the address, Bookmark, New tab, Settings) over a panel with three
- *     lists: Tabs, Bookmarks, History. The pad is in UI mode while it is
+ *     Stop, Home, the address, Bookmark, New tab, Settings) over a panel with four
+ *     lists: Tabs, Bookmarks, History, Downloads (downloads.c: X pauses,
+ *     resumes or retries, Square cancels or deletes, R2 shows the details). The pad is in UI mode while it is
  *     open (wpe_display_ps5_set_ui_mode): D-pad moves the focus, X
  *     picks, the left stick's pointer and X work too, the right stick
  *     scrolls the list, L1/R1 (or left/right in a list) switch lists,
@@ -37,6 +38,7 @@
 #include "common/spike.h"
 #include "browser.h"
 #include "browserdraw.h"
+#include "downloads.h"
 #include "viewinvr.h"
 #include "../common/webmem.h"
 
@@ -776,6 +778,12 @@ static int listFocus;
 static int listTop;
 static double scrollAccumulator;
 static gboolean clearArmed; /* "Clear history" pressed once */
+static int deleteArmed = -1; /* the download whose Square was pressed once (its file goes on the second) */
+static gboolean detailsOpen; /* a download's details over the list */
+static int detailsIndex;
+static BUIDetails details;
+static guint downloadsRedrawTimer;
+static gint64 lastDownloadsRedraw;
 static int screenW = 1920, screenH = 1080;
 static gint64 lastBarDraw;
 /* What drawing the menu costs (main thread), logged when it closes. */
@@ -793,6 +801,8 @@ static int rowCount(int sec)
         return (int)ps5wk_bookmarks()->len;
     case SEC_HISTORY:
         return ps5wk_history()->len ? (int)ps5wk_history()->len + 1 : 0; /* row 0: clear history */
+    case SEC_DOWNLOADS:
+        return (int)ps5wk_downloads_count();
     }
     return 0;
 }
@@ -849,6 +859,13 @@ static void listRow(int row, BUIRow* r, void* data)
         PS5WKEntry* e = g_ptr_array_index(ps5wk_bookmarks(), row);
         r->title = *e->title ? e->title : e->url;
         r->url = e->url;
+    } else if (section == SEC_DOWNLOADS) {
+        ps5wk_downloads_row((unsigned)row, r);
+        if (row == deleteArmed) {
+            r->armed = TRUE;
+            snprintf(r->state, sizeof r->state, "Press □ again to delete the file");
+            r->tone = BUI_TONE_WARN;
+        }
     } else {
         if (row == 0) {
             r->title = clearArmed ? "Press X again to clear all history" : "Clear all history";
@@ -889,6 +906,15 @@ static void fillState(BUIState* s)
     s->section = section;
     s->bookmarkCount = ps5wk_bookmarks()->len;
     s->historyCount = ps5wk_history()->len;
+    s->downloadCount = ps5wk_downloads_count();
+    s->downloadsActive = ps5wk_downloads_active(&s->downloadsProgress);
+    if (section == SEC_DOWNLOADS && zone == ZONE_LIST && listFocus < (int)s->downloadCount)
+        ps5wk_downloads_hints((unsigned)listFocus, &s->downloadCross, &s->downloadSquare);
+    if (detailsOpen && section == SEC_DOWNLOADS && detailsIndex < (int)s->downloadCount) {
+        ps5wk_downloads_details((unsigned)detailsIndex, &details);
+        s->details = &details;
+    } else
+        detailsOpen = FALSE;
     s->rowCount = rowCount(section);
     s->listTop = listTop;
     s->listFocus = listFocus;
@@ -1038,6 +1064,33 @@ static void hideBarSoon(void)
         barHideTimer = g_timeout_add(BAR_HIDE_MS, barHide, NULL);
 }
 
+/* downloads.c: progress or a state changed. The menu (and the bar's ring)
+ * redraw at most 4 times a second for progress. */
+static gboolean downloadsRedrawDue(gpointer data)
+{
+    (void)data;
+    downloadsRedrawTimer = 0;
+    lastDownloadsRedraw = g_get_monotonic_time();
+    redraw();
+    return G_SOURCE_REMOVE;
+}
+
+void ps5wk_browser_downloads_changed(void)
+{
+    if (!tabs || (!menuOpen && !barShown) || downloadsRedrawTimer)
+        return;
+    gint64 since = (g_get_monotonic_time() - lastDownloadsRedraw) / 1000;
+    if (since >= 250)
+        downloadsRedrawDue(NULL);
+    else
+        downloadsRedrawTimer = g_timeout_add((guint)(250 - since), downloadsRedrawDue, NULL);
+}
+
+WebKitWebView* ps5wk_browser_active_view(void)
+{
+    return webView;
+}
+
 /* ---------------------------------------------------------------- the menu */
 
 static void setMenu(gboolean open)
@@ -1050,6 +1103,8 @@ static void setMenu(gboolean open)
         zone = ZONE_TOOLBAR;
         toolbarFocus = TB_ADDRESS;
         clearArmed = FALSE;
+        deleteArmed = -1;
+        detailsOpen = FALSE;
         section = SEC_TABS;
         listFocus = active;
         listTop = 0;
@@ -1189,6 +1244,21 @@ static void rowActivate(int row, gboolean newTab)
         }
         return;
     }
+    if (section == SEC_DOWNLOADS) {
+        if (row < 0 || row >= (int)ps5wk_downloads_count())
+            return;
+        const char* cross = NULL;
+        const char* square = NULL;
+        ps5wk_downloads_hints((unsigned)row, &cross, &square);
+        deleteArmed = -1;
+        if (newTab || (cross && !strcmp(cross, "Details"))) {
+            detailsOpen = TRUE;
+            detailsIndex = row;
+        } else
+            ps5wk_downloads_primary((unsigned)row);
+        redraw();
+        return;
+    }
     if (section == SEC_HISTORY && row == 0) {
         if (!clearArmed) {
             clearArmed = TRUE;
@@ -1225,6 +1295,15 @@ static void rowRemove(int row)
             spike_log("browser: bookmark removed: %s", rowURL(row));
             ps5wk_bookmark_remove((unsigned)row);
         }
+    } else if (section == SEC_DOWNLOADS) {
+        if (row < (int)ps5wk_downloads_count()) {
+            if (ps5wk_downloads_square_needs_confirm((unsigned)row) && deleteArmed != row)
+                deleteArmed = row; /* a finished file: deleted on the second press */
+            else {
+                deleteArmed = -1;
+                ps5wk_downloads_square((unsigned)row);
+            }
+        }
     } else if (row >= 1) {
         ps5wk_history_remove((unsigned)(row - 1));
     }
@@ -1238,6 +1317,8 @@ static void setSection(int s)
     listFocus = section == SEC_TABS ? active : 0;
     listTop = 0;
     clearArmed = FALSE;
+    deleteArmed = -1;
+    detailsOpen = FALSE;
     keepFocusVisible();
     if (zone == ZONE_LIST && !rowCount(section))
         zone = ZONE_TOOLBAR;
@@ -1302,6 +1383,16 @@ static void onUIPointer(WPEDisplayPS5* d, double x, double y, double scrollY, gp
 /* The pad while the menu is open (UI mode: every press comes here). */
 static void menuButtons(guint32 pressed)
 {
+    if (detailsOpen) {
+        /* the details card: X, O or R2 closes it; Options closes the menu */
+        if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS)
+            setMenu(FALSE);
+        else if (pressed & (WPE_DISPLAY_PS5_BUTTON_CROSS | WPE_DISPLAY_PS5_BUTTON_CIRCLE | WPE_DISPLAY_PS5_BUTTON_R2 | WPE_DISPLAY_PS5_BUTTON_SQUARE)) {
+            detailsOpen = FALSE;
+            redraw();
+        }
+        return;
+    }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS) {
         double x, y;
         if (wpe_display_ps5_get_pointer(display, &x, &y)) {
@@ -1386,6 +1477,8 @@ static void menuButtons(guint32 pressed)
         }
         if (section == SEC_HISTORY && listFocus != 0)
             clearArmed = FALSE;
+        if (listFocus != deleteArmed)
+            deleteArmed = -1;
         keepFocusVisible();
     }
     redraw();
@@ -1602,11 +1695,54 @@ static gboolean showFormPage(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* Nothing shown in the view yet: its current entry is a new tab's empty
+ * about:blank (webkit_web_view_get_uri already says the address loading). */
+static gboolean viewIsEmpty(WebKitWebView* view)
+{
+    WebKitBackForwardListItem* item = webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(view));
+    return !item || !strcmp(webkit_back_forward_list_item_get_uri(item), "about:blank");
+}
+
+static WebKitWebView* closeAfterDownload;
+
+static gboolean closeEmptyDownloadTab(gpointer data)
+{
+    for (unsigned i = 0; tabs && i < tabs->len; i++) {
+        Tab* tab = g_ptr_array_index(tabs, i);
+        if (tab->view == data && viewIsEmpty(tab->view) && tabs->len > 1) {
+            spike_log("browser: tab %u was opened only for a download: closing it", i + 1);
+            closeTab((int)i);
+            break;
+        }
+    }
+    return G_SOURCE_REMOVE;
+}
+
+/* downloads.c: a download from this view has its destination (the
+ * transfer is the NetworkProcess's now, whatever happens to the page). */
+void ps5wk_browser_download_started(WebKitWebView* view)
+{
+    if (view && view == closeAfterDownload) {
+        closeAfterDownload = NULL;
+        g_idle_add(closeEmptyDownloadTab, view);
+    }
+}
+
 /* Notes which pages are form (POST) results, and a tab coming back never
  * sends a form again. */
 static gboolean onDecidePolicy(WebKitWebView* view, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data)
 {
     (void)data;
+    if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
+        if (!ps5wk_downloads_response_policy(view, WEBKIT_RESPONSE_POLICY_DECISION(decision)))
+            return FALSE;
+        /* A tab opened only for the file (a target=_blank link): it would
+         * stay empty, so it goes (the download goes on). */
+        if (webkit_response_policy_decision_is_main_frame_main_resource(WEBKIT_RESPONSE_POLICY_DECISION(decision)) && tabs->len > 1
+            && viewIsEmpty(view) && tabForView(view))
+            closeAfterDownload = view; /* once the NetworkProcess has the download (closing now cancels it) */
+        return TRUE;
+    }
     if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION || view != webView)
         return FALSE;
     WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
@@ -1786,6 +1922,8 @@ static char* stateJSON(void)
     ps5wk_entries_json(out, ps5wk_bookmarks(), 500);
     g_string_append_printf(out, ",\"historyLength\":%u,\"history\":", ps5wk_history()->len);
     ps5wk_entries_json(out, ps5wk_history(), 50);
+    g_string_append_printf(out, ",\"detailsOpen\":%s,\"deleteArmed\":%d,\"downloads\":", detailsOpen ? "true" : "false", deleteArmed);
+    ps5wk_downloads_json(out);
     g_string_append(out, "}\n");
     return g_string_free(out, FALSE);
 }
@@ -1896,6 +2034,11 @@ static char* apiRun(ApiCall* call, int* status)
             if (!onButtons(display, button, NULL))
                 error = g_strdup("not taken by the browser (the page would get it)");
         }
+    } else if (!strcmp(path, "/browser/download")) {
+        const char* why = ps5wk_downloads_action(action, n, url);
+        if (why)
+            error = g_strdup(why);
+        redraw();
     } else if (!strcmp(path, "/browser/address")) {
         if (!text)
             error = g_strdup("text=<address or search words>");
@@ -1917,7 +2060,7 @@ static char* apiRun(ApiCall* call, int* status)
         g_free(file);
     } else {
         *status = 404;
-        error = g_strdup("not found (/browser/state, tab, bookmark, history, key, address, save, shot)");
+        error = g_strdup("not found (/browser/state, tab, bookmark, history, download, key, address, save, shot)");
     }
     char* reply;
     if (error) {

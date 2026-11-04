@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/statvfs.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -674,6 +675,22 @@ static void* memLogger(void* data)
                 rename(temporary, statusPath);
             }
         }
+        if (const char* freeStatus = getenv("PS5WK_DATA_FREE_STATUS")) {
+            // "free <bytes>" of /data (the downloads folder), every 5 s
+            struct statvfs fs;
+            if (!statvfs("/data/ps5webkit", &fs)) {
+                char line[64], temporary[280];
+                int length = snprintf(line, sizeof line, "free %llu\n", (unsigned long long)fs.f_bavail * fs.f_frsize);
+                snprintf(temporary, sizeof temporary, "%s.tmp", freeStatus);
+                int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd >= 0) {
+                    write(fd, line, length);
+                    fchmod(fd, 0666);
+                    close(fd);
+                    rename(temporary, freeStatus);
+                }
+            }
+        }
         if (seconds <= 0 || (tick * 5) % (unsigned)seconds >= 5)
             continue;
         size_t flexible = 0;
@@ -887,6 +904,18 @@ int main(int, char**)
     // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):
     // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock; hole-punch video frames
     // to its video server (wpe-ps5/PS5VideoServer.cpp): <dir>/video-<pid>.sock.
+    if (network) {
+        // The downloads folder's free space for the UIProcess (memLogger): a
+        // title can't call statfs (libkernel_sys only), a payload can.
+        char freePath[256];
+        snprintf(freePath, sizeof(freePath), "%s", path);
+        int uiPid = 0;
+        char* slash = strrchr(freePath, '/');
+        if (slash && sscanf(slash + 1, "ui-%d.sock", &uiPid) == 1) {
+            snprintf(slash + 1, sizeof(freePath) - (slash + 1 - freePath), "datafree-%d", uiPid);
+            setenv("PS5WK_DATA_FREE_STATUS", freePath, 1);
+        }
+    }
     if (!network) {
         char audioPath[256];
         snprintf(audioPath, sizeof(audioPath), "%s", path);

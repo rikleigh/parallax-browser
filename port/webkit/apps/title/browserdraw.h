@@ -12,7 +12,7 @@
 #include <wpe/ps5/wpe-ps5.h>
 
 enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_STAR, TB_NEWTAB, TB_SETTINGS, TB_COUNT };
-enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_COUNT };
+enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_DOWNLOADS, SEC_COUNT };
 enum { ZONE_TOOLBAR, ZONE_LIST };
 enum { HOT_TOOLBAR, HOT_SECTION, HOT_ROW };
 
@@ -31,7 +31,24 @@ typedef struct {
     gboolean current; /* the tab shown */
     gboolean action;  /* "+ New tab", "Clear all history" */
     gboolean armed;   /* "Clear all history" pressed once */
+    /* the Downloads list: title = the file's name, url = the address it came from */
+    char kind[8];      /* the file-type tile: "ZIP", "ELF", "PKG" */
+    double progress;   /* 0..1 for the bar under the name; < 0: no bar */
+    gboolean running;  /* receiving: the bar's head glows */
+    char detail[112];  /* "312 MB of 1.2 GB · 18.4 MB/s · 48 s left" */
+    char state[64];    /* on the right: "Paused", "Failed: connection lost" */
+    int tone;          /* the state's colour: BUI_TONE_* */
 } BUIRow;
+
+enum { BUI_TONE_PLAIN, BUI_TONE_ACTIVE, BUI_TONE_WARN, BUI_TONE_DONE };
+
+/* The details card over the list (a download's): label and value lines. */
+typedef struct {
+    const char* title;
+    const char* labels[10];
+    const char* values[10];
+    int count;
+} BUIDetails;
 
 typedef struct {
     int screenW, screenH;
@@ -44,7 +61,17 @@ typedef struct {
     unsigned tabCount, maxTabs;
     /* the menu */
     int zone, toolbarFocus, section;
-    unsigned bookmarkCount, historyCount;
+    unsigned bookmarkCount, historyCount, downloadCount;
+    /* downloads: how many are receiving (the bar's ring) and their progress
+     * together (0..1, < 0: sizes not known) */
+    unsigned downloadsActive;
+    double downloadsProgress;
+    /* the footer in the Downloads list: what X and Square do for the row
+     * focused (NULL: nothing) */
+    const char* downloadCross;
+    const char* downloadSquare;
+    /* a details card over the list, or NULL */
+    const BUIDetails* details;
     int rowCount, listTop, listFocus;
     void (*row)(int index, BUIRow* out, void* user);
     void* user;
