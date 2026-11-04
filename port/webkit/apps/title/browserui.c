@@ -195,6 +195,101 @@ static void redraw(void);
 static void showBar(void);
 static void connectView(WebKitWebView* view);
 
+/* WebKit's session state, version 3 (WebKitWebViewSessionState.cpp):
+ * (version, [(title, frame state, navigated frame, policy)], current). */
+#define STATE_ITEM_TYPE "(s(ssssasmayxx(ii)dm(sa(uaysxmxmds))av)mtu)"
+#define STATE_TYPE "(qa" STATE_ITEM_TYPE "mu)"
+
+/* A back/forward list without the entries for url (NULL: every entry),
+ * except the one shown. NULL when nothing is dropped, or for a state in
+ * another format (kept as it is). */
+static GBytes* stateWithout(GBytes* bytes, const char* url)
+{
+    GVariant* state = g_variant_ref_sink(g_variant_new_from_bytes(G_VARIANT_TYPE(STATE_TYPE), bytes, FALSE));
+    if (!g_variant_is_normal_form(state)) {
+        g_variant_unref(state);
+        return NULL;
+    }
+    GVariant* version = g_variant_get_child_value(state, 0);
+    GVariant* items = g_variant_get_child_value(state, 1);
+    GVariant* current = g_variant_get_child_value(state, 2);
+    GVariant* currentValue = g_variant_get_maybe(current);
+    gsize count = g_variant_n_children(items), shown = currentValue ? g_variant_get_uint32(currentValue) : count;
+    GVariant** kept = g_new0(GVariant*, count ? count : 1);
+    gsize keptCount = 0, newShown = 0;
+    for (gsize i = 0; i < count; i++) {
+        GVariant* item = g_variant_get_child_value(items, i);
+        GVariant* frame = g_variant_get_child_value(item, 1);
+        GVariant* itemURL = g_variant_get_child_value(frame, 0);
+        gboolean keep = i == shown || (url && strcmp(g_variant_get_string(itemURL, NULL), url));
+        g_variant_unref(itemURL);
+        g_variant_unref(frame);
+        if (i == shown)
+            newShown = keptCount;
+        if (keep)
+            kept[keptCount++] = item;
+        else
+            g_variant_unref(item);
+    }
+    GBytes* result = NULL;
+    if (keptCount < count && keptCount) {
+        GVariant* top[3] = { version, g_variant_new_array(G_VARIANT_TYPE(STATE_ITEM_TYPE), kept, keptCount),
+            currentValue ? g_variant_new_maybe(NULL, g_variant_new_uint32((guint32)newShown)) : nothing("u") };
+        GVariant* filtered = g_variant_ref_sink(g_variant_new_tuple(top, 3));
+        result = g_variant_get_data_as_bytes(filtered);
+        g_variant_unref(filtered);
+    } else
+        g_variant_unref(version);
+    for (gsize i = 0; i < keptCount; i++)
+        g_variant_unref(kept[i]);
+    g_free(kept);
+    if (currentValue)
+        g_variant_unref(currentValue);
+    g_variant_unref(current);
+    g_variant_unref(items);
+    g_variant_unref(state);
+    return result;
+}
+
+/* A page taken out of the history (url; NULL: the whole history) leaves
+ * every tab's way back too, or Back would still reach it. The page a tab
+ * shows stays. Live views get their list restored without it (no load). */
+static void forgetInTabs(const char* url)
+{
+    unsigned changed = 0;
+    for (guint i = 0; i < tabs->len; i++) {
+        Tab* tab = g_ptr_array_index(tabs, i);
+        if (tab->view) {
+            WebKitWebViewSessionState* state = webkit_web_view_get_session_state(tab->view);
+            GBytes* bytes = state ? webkit_web_view_session_state_serialize(state) : NULL;
+            if (state)
+                webkit_web_view_session_state_unref(state);
+            GBytes* filtered = bytes ? stateWithout(bytes, url) : NULL;
+            if (filtered) {
+                restoreState(tab->view, filtered);
+                changed++;
+            }
+            if (filtered && tab->state) {
+                g_bytes_unref(tab->state);
+                tab->state = g_bytes_ref(filtered);
+            }
+            if (filtered)
+                g_bytes_unref(filtered);
+            if (bytes)
+                g_bytes_unref(bytes);
+        }
+        GBytes* filtered = tab->state ? stateWithout(tab->state, url) : NULL;
+        if (filtered) {
+            g_bytes_unref(tab->state);
+            tab->state = filtered;
+            changed++;
+        }
+    }
+    spike_log("browser: %s taken out of %u %s way back", url ? url : "the history", changed, changed == 1 ? "tab's" : "tabs'");
+    if (changed)
+        scheduleSessionSave();
+}
+
 /* The page in a view becomes this tab's (a fresh list: about:blank, which
  * Back skips, then the page). */
 static void loadFresh(WebKitWebView* view, const char* url)
@@ -1266,6 +1361,7 @@ static void rowActivate(int row, gboolean newTab)
             clearArmed = TRUE;
         } else {
             ps5wk_history_clear();
+            forgetInTabs(NULL);
             clearArmed = FALSE;
             spike_log("browser: history cleared");
             wpe_display_ps5_show_message(display, "History cleared", 1.5);
@@ -1307,7 +1403,11 @@ static void rowRemove(int row)
             }
         }
     } else if (row >= 1) {
+        char* url = g_strdup(rowURL(row));
         ps5wk_history_remove((unsigned)(row - 1));
+        if (url)
+            forgetInTabs(url);
+        g_free(url);
     }
     keepFocusVisible();
     redraw();
@@ -2016,11 +2116,15 @@ static char* apiRun(ApiCall* call, int* status)
         ps5wk_bookmark_toggle(uri, url ? url : shownTitle());
         redraw();
     } else if (!strcmp(path, "/browser/history")) {
-        if (action && !strcmp(action, "clear"))
+        if (action && !strcmp(action, "clear")) {
             ps5wk_history_clear();
-        else if (action && !strcmp(action, "remove") && n >= 0)
+            forgetInTabs(NULL);
+        } else if (action && !strcmp(action, "remove") && n >= 0 && n < (int)ps5wk_history()->len) {
+            char* removed = g_strdup(((PS5WKEntry*)g_ptr_array_index(ps5wk_history(), n))->url);
             ps5wk_history_remove((unsigned)n);
-        else
+            forgetInTabs(removed);
+            g_free(removed);
+        } else
             error = g_strdup("action=clear|remove&index=N");
         redraw();
     } else if (!strcmp(path, "/browser/key")) {
