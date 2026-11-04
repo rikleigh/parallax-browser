@@ -82,6 +82,7 @@ wait_for_server() {
 # Copy Chrome's cookies for the site of $1 to the PS5 browser (running).
 send_cookies() {
     local cookies reply key=()
+    [[ -f "$ROOT/tools/chrome-cookies.py" ]] || { echo "tools/chrome-cookies.py is a local tool, not in the repo" >&2; return 1; }
     cookies="$(python3 -I "$ROOT/tools/chrome-cookies.py" "$1" ${PS5_CHROME_PROFILE:+--profile "$PS5_CHROME_PROFILE"})" || return 1
     [[ -n "${PS5_COOKIE_KEY:-}" ]] && key=(-H "X-PS5-Key: $PS5_COOKIE_KEY")
     reply="$(printf '%s\n' "$cookies" | curl -sS --max-time 10 -H 'Content-Type: text/plain' ${key[@]+"${key[@]}"} \

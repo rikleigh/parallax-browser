@@ -149,7 +149,7 @@ default it asks for no password.
 
 `tools/ps5open --cookies [url]` copies Chrome's cookies for that site to the
 PS5 browser, then opens the page there (no url: the front Chrome tab).
-`tools/chrome-cookies.py <site>` reads them: cookies of the whole site (e.g.
+`tools/chrome-cookies.py <site>`, a local tool that isn't in the repo, reads them: cookies of the whole site (e.g.
 `bbc.co.uk` and every subdomain, for `www.bbc.co.uk`), from the Chrome profile whose cookies changed
 last (`PS5_CHROME_PROFILE="Profile 1"` picks another; `--list-profiles`).
 Chrome encrypts cookie values with the "Chrome Safe Storage" key in the login

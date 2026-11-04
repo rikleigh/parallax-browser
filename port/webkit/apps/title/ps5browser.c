@@ -52,8 +52,10 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 
+/* The Mac running tools/logserver.sh (the build sets it from
+ * PS5WK_LOG_HOST; empty: no TCP log, /data/ps5webkit/log-sink can name one). */
 #ifndef LOG_HOST
-#define LOG_HOST "192.168.1.20"
+#define LOG_HOST ""
 #define LOG_PORT 9999
 #endif
 

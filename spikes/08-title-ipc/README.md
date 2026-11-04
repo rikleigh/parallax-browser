@@ -31,7 +31,7 @@ launching. The title then skips `spawn-from-title`.
 
 ## Results (13.60, 2026-10-27, two runs)
 
-[`evidence/2026-10-27/08-title-ipc.log`](../../evidence/2026-10-27/08-title-ipc.log)
+`evidence/2026-10-27/08-title-ipc.log` (kept locally, not published)
 
 | Test | Result |
 | --- | --- |

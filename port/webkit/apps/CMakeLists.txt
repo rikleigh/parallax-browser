@@ -110,7 +110,7 @@ target_link_libraries(ps5wk-shot PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEP
 add_dependencies(ps5wk-shot ps5wk-objects)
 add_dependencies(ps5wk-shot WebKit)
 
-set(PS5WK_LOG_HOST "192.168.1.20" CACHE STRING "Mac address for the title's TCP log (tools/logserver.sh)")
+set(PS5WK_LOG_HOST "$ENV{PS5WK_LOG_HOST}" CACHE STRING "Mac address for the title's TCP log (tools/logserver.sh; empty: none)")
 set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
 # The title gets ps5locks too: package.sh relinks these objects and copies
 # the --wrap options from this link line (its heap, Spike 10's dlmalloc

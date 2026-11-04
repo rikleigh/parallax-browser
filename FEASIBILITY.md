@@ -151,7 +151,7 @@ process out of the box, while WebKit needs a patch (§4.8).
 | 7 WebXR e2e | design ([README](spikes/07-webxr-e2e/README.md)); §4.8 picks the single-title option (OpenXR and WebGL in one process) | — | port work |
 
 Console logs for every run above are in
-[`evidence/2026-10-27/`](evidence/2026-10-27/): `00-sysinfo`, `01-*` (incl.
+`evidence/2026-10-27/` (raw console logs, kept locally and not published): `00-sysinfo`, `01-*` (incl.
 the run that panicked), `02b-draw-bench`, `03a-hmd2-probe-payload`,
 `titles-02-03b` (Spikes 2 and 3b over TCP), `04-jsc-*`, `08-title-ipc` and `09-*`.
 
@@ -247,7 +247,7 @@ the run that panicked), `02b-draw-bench`, `03a-hmd2-probe-payload`,
 
 Spike 2's `webgl-load` ran 2000 small draws in 132 ms. `gl_draw_bench`
 (title, `build-bench.sh`) splits that cost; logs in
-[`evidence/2026-10-27/02b-draw-bench.log`](evidence/2026-10-27/02b-draw-bench.log).
+`evidence/2026-10-27/02b-draw-bench.log` (kept locally).
 
 | 2000 draws (strip + 2 `glUniform4f`), 1080p target | per draw | frame |
 | --- | --- | --- |
