@@ -84,7 +84,7 @@ static const Setting settings[] = {
         "Lets a phone or Mac send links here and open this page (port 9040). Off: only the PS5 itself can open Settings (R3).",
         NULL, 0, 0 },
     { "adblock", KIND_FLAG, TYPE_BOOL, "adblock-off", "1", 0, "Ad blocking",
-        "Blocks ads and trackers with uBlock Origin Lite's network rules. Applies at once; sites where ads are allowed, and the lists, are below.",
+        "Blocks ads and trackers with uBlock Origin Lite's network rules, cosmetic filters and scriptlets. Applies at once; sites where ads are allowed, and the lists, are below.",
         NULL, 0, 0 },
     { "perf_overlay", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
         "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",
@@ -868,7 +868,7 @@ const char ps5wk_settings_page[] =
     "  a.sites.forEach(function(s,i){var b=el('button',null,'Remove '+s);b.id='ab-rm-'+i;b.onclick=function(){adblock('block',s,a.sites.length>1?'ab-rm-'+(i?i-1:0):'abUpdate')};list.appendChild(b)});\n"
     "  $('abSitesHelp').textContent=a.sites.length?'Remove a site to block ads there again.':'None yet. Allow ads on a site from its page: R3, then the button above.';\n"
     "  var l=a.list;\n"
-    "  $('abList').textContent=l.version?'uBlock Origin Lite '+l.version+': '+l.rules+' rules, '+(l.origin=='update'?'downloaded '+when(l.generated):'bundled with the browser')+'. Last check for a new list: '+when(a.lastCheck)+' (once a day by itself).':'No list yet.';\n"
+    "  $('abList').textContent=l.version?'uBlock Origin Lite '+l.version+': '+l.rules+' rules, '+(l.origin=='update'?'downloaded '+when(l.generated):'bundled with the browser')+'. Last check for a new list: '+when(a.lastCheck)+' (once a day by itself).'+(a.scripting&&a.scripting.version?' Cosmetic filters for '+a.scripting.hosts+' site entries, '+(a.scripting.calls+a.scripting.isolatedCalls)+' scriptlet calls'+(a.scripting.site?'; on '+a.scripting.site+': '+(a.scripting.siteCalls+a.scripting.siteIsolatedCalls)+' scriptlets, '+a.scripting.siteCSS+' hiding rules'+(a.scripting.siteProcedurals?', '+a.scripting.siteProcedurals+' procedural':''):'')+'.':''):'No list yet.';\n"
     "  $('abStatus').textContent=a.status||'';\n"
     "  var u=$('abUpdate');u.disabled=a.updating||a.compiling;u.textContent=a.updating?'Checking…':a.compiling?'Compiling…':'Update lists now';\n"
     "}\n"
