@@ -9,6 +9,7 @@ export PS5_HOST="${PS5_HOST:-ps5}"
 export PS5_PORT="${PS5_PORT:-9021}"
 # Port the Mac listens on for spike logs (tools/logserver.sh)
 export PS5WK_LOG_PORT="${PS5WK_LOG_PORT:-9999}"
-# This Mac's address as the console sees it; compiled into title builds
-export PS5WK_LOG_HOST="${PS5WK_LOG_HOST:-$(ipconfig getifaddr en0 2>/dev/null || echo 192.168.1.100)}"
+# This Mac's address as the console sees it; compiled into title builds (set
+# it empty for none: tools/make-release.sh)
+export PS5WK_LOG_HOST="${PS5WK_LOG_HOST-$(ipconfig getifaddr en0 2>/dev/null || echo 192.168.1.100)}"
 if [ -f "$PS5WK_ROOT/env.local.sh" ]; then . "$PS5WK_ROOT/env.local.sh"; fi

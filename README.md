@@ -63,7 +63,20 @@ play the video on a page in the **PS VR2** headset.
   ShadowMount+). The title ID is `PPSA99020`.
 - For View in VR: a PS VR2, paired and set up in the system settings.
 
-Prebuilt releases aren't available yet. To build from source, see below.
+## Installing
+
+1. Download the zip from [Releases](https://github.com/rikleigh/parallax-browser/releases)
+   and unpack it.
+2. Copy its `data` folder onto the console's `/data` over FTP, merging
+   folders. That puts the title in `/data/homebrew/PPSA99020` and its runtime
+   files (fonts, certificates, Unicode data, the start page) in
+   `/data/ps5webkit`.
+3. Register `/data/homebrew/PPSA99020` with your homebrew tool. Parallax
+   Browser then appears on the home screen.
+
+To update, copy the new `data` folder over the old one. Bookmarks, history,
+settings and downloads live in `/data/ps5webkit` too, and the zip doesn't
+contain any of them, so they're kept.
 
 ## Building
 
@@ -88,9 +101,13 @@ the PS5 on macOS (Apple silicon). The steps, roughly:
    WebKit and builds it. `port/webkit/apps/title/package.sh` then writes the
    title folder ([port/webkit/README.md](port/webkit/README.md#build)).
 5. `tools/upload-title.sh toolchain/wpe-webkit/titles/PPSA99020` copies it
-   to the console. `tools/launch.sh` registers, starts and stops it.
+   to the console. `tools/launch.sh` registers, starts and stops it. The
+   runtime files need copying to `/data/ps5webkit` once: take the
+   `data/ps5webkit` folder from a zip made by `tools/make-release.sh`.
 
 `tools/logserver.sh` collects the browser's log on the Mac.
+`tools/make-release.sh <version>` builds the release zip: the title with no
+log address built in, and the runtime files.
 
 ## Repository layout
 
