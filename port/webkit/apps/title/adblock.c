@@ -552,8 +552,10 @@ static gboolean scriptingOnNow(void)
     return TRUE;
 }
 
-static void evictOldest(const char* keep)
+/* Whether an entry that kept the generic scripts off its host went. */
+static gboolean evictOldest(const char* keep)
 {
+    gboolean blocked = FALSE;
     while (g_hash_table_size(siteEntries) > AB_SITE_CACHE) {
         SiteEntry* oldest = NULL;
         GHashTableIter iter;
@@ -565,9 +567,11 @@ static void evictOldest(const char* keep)
                 oldest = entry;
         }
         if (!oldest)
-            return;
+            break;
+        blocked = blocked || oldest->blocksGeneric[0] || oldest->blocksGeneric[1];
         g_hash_table_remove(siteEntries, oldest->host);
     }
+    return blocked;
 }
 
 /* Main loop: user content for frames at host below the page at topHost. */
@@ -610,8 +614,8 @@ static void siteSetUp(const char* host, const char* topHost, gboolean mainFrame)
     }
     g_ptr_array_unref(allow);
     g_hash_table_insert(siteEntries, entry->host, entry);
-    evictOldest(host);
-    if (blockedBefore[0] != entry->blocksGeneric[0] || blockedBefore[1] != entry->blocksGeneric[1])
+    gboolean evictedBlocking = evictOldest(host);
+    if (evictedBlocking || blockedBefore[0] != entry->blocksGeneric[0] || blockedBefore[1] != entry->blocksGeneric[1])
         genericRebuild();
     g_mutex_lock(&abLock);
     sitesSetUp = g_hash_table_size(siteEntries);
