@@ -25,6 +25,9 @@ h1 { font-size: 26px; margin: 24px 40px; }
 .trans.on { transform: translateX(220px) rotate(45deg); opacity: .4; }
 .waapi { background: #e0a020; color: #222; }
 .js { background: #555; }
+.strip { margin: 40px 40px 0; width: 1340px; height: 90px; overflow: hidden; border-radius: 14px; background: #ddd; }
+.strip div { width: 2600px; height: 90px; display: flex; align-items: center; font-size: 28px; font-weight: bold; color: #fff; background: repeating-linear-gradient(90deg, #2d3b55 0 200px, #4a6fa5 200px 400px); animation: strip 6s linear infinite alternate; }
+@keyframes strip { from { transform: translateX(0); } to { transform: translateX(-1260px); } }
 button { margin: 24px 40px; font-size: 22px; padding: 10px 22px; }
 #status { margin: 0 40px; font-size: 18px; }
 </style></head><body>
@@ -37,12 +40,17 @@ button { margin: 24px 40px; font-size: 22px; padding: 10px 22px; }
   <div class="cell"><div class="box waapi" id="waapi">Web<br>Animations</div><span>element.animate() transform + opacity</span></div>
   <div class="cell"><div class="box js" id="js">JS<br>rAF</div><span>style.transform from requestAnimationFrame</span></div>
 </div>
+<div class="strip"><div id="strip"></div></div>
 <button id="block">Block main thread (100 ms every 300 ms): off</button>
 <div id="status"></div>
 <script>
 (function () {
     var trans = document.getElementById("trans"), js = document.getElementById("js"), button = document.getElementById("block"), status = document.getElementById("status");
     setInterval(function () { trans.classList.toggle("on"); }, 1000);
+    var strip = "";
+    for (var i = 0; i < 13; i++)
+        strip += '<span style="width:200px;text-align:center;flex:none">' + (i * 200) + ' px</span>';
+    document.getElementById("strip").innerHTML = strip;
     document.getElementById("waapi").animate([
         { transform: "translateX(0) scale(1)", opacity: 1 },
         { transform: "translateX(220px) scale(.7)", opacity: .5 }
