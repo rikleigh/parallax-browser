@@ -245,7 +245,8 @@ static void removeStaleRuntimeFiles(int uiPid)
         const char* name = entry->d_name;
         int pid = 0, length = 0;
         if ((sscanf(name, "ui-%d.sock%n", &pid, &length) != 1 && sscanf(name, "audio-%d.sock%n", &pid, &length) != 1
-            && sscanf(name, "video-%d.sock%n", &pid, &length) != 1 && sscanf(name, "webmem-%d%n", &pid, &length) != 1)
+            && sscanf(name, "video-%d.sock%n", &pid, &length) != 1 && sscanf(name, "webmem-%d%n", &pid, &length) != 1
+                && sscanf(name, "storage-%d%n", &pid, &length) != 1 && sscanf(name, "storage-want-%d%n", &pid, &length) != 1)
             || name[length] || pid <= 0 || pid == uiPid)
             continue;
         auto it = alive.find(pid);
@@ -633,6 +634,79 @@ static long residentKB()
     return info.ki_rssize * (long)(getpagesize() / 1024);
 }
 
+// Settings' Storage card (NetworkProcess): a title can't list folders
+// (getdirentries: EPERM), a payload can. The UIProcess writes
+// PS5WK_STORAGE_REQUEST, "gen <n>" then one "<id>\t<skip or ->\t<path>" line per
+// folder; this answers in PS5WK_STORAGE_STATUS, "gen <n>" then "<id> <bytes>
+// <files> <folders>" (folders: those at the top level, not entered for skip),
+// and removes the request.
+static void addFolderUsage(const char* path, const char* skip, unsigned long long& bytes, unsigned long long& files, unsigned& folders, int depth)
+{
+    struct stat st;
+    if (lstat(path, &st))
+        return;
+    if (!S_ISDIR(st.st_mode)) {
+        bytes += st.st_size;
+        files++;
+        return;
+    }
+    DIR* dir = depth < 32 ? opendir(path) : nullptr;
+    if (!dir)
+        return;
+    while (struct dirent* entry = readdir(dir)) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") || (skip && !strcmp(entry->d_name, skip)))
+            continue;
+        std::string child = std::string(path) + "/" + entry->d_name;
+        if (!depth && entry->d_type == DT_DIR)
+            folders++;
+        unsigned ignored = 0;
+        addFolderUsage(child.c_str(), nullptr, bytes, files, ignored, depth + 1);
+    }
+    closedir(dir);
+}
+
+static void answerStorageRequest()
+{
+    const char* requestPath = getenv("PS5WK_STORAGE_REQUEST");
+    const char* statusPath = getenv("PS5WK_STORAGE_STATUS");
+    FILE* request = requestPath && statusPath ? fopen(requestPath, "r") : nullptr;
+    if (!request)
+        return;
+    double start = nowMS();
+    std::string out;
+    char line[1200];
+    while (fgets(line, sizeof line, request)) {
+        line[strcspn(line, "\n")] = 0;
+        if (!strncmp(line, "gen ", 4)) {
+            out += std::string(line) + "\n";
+            continue;
+        }
+        char* skip = strchr(line, '\t');
+        char* folder = skip ? strchr(skip + 1, '\t') : nullptr;
+        if (!folder)
+            continue;
+        *skip++ = 0;
+        *folder++ = 0;
+        unsigned long long bytes = 0, files = 0;
+        unsigned folders = 0;
+        addFolderUsage(folder, strcmp(skip, "-") ? skip : nullptr, bytes, files, folders, 0);
+        char result[128];
+        snprintf(result, sizeof result, "%s %llu %llu %u\n", line, bytes, files, folders);
+        out += result;
+    }
+    fclose(request);
+    std::string temporary = std::string(statusPath) + ".tmp";
+    int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        write(fd, out.data(), out.size());
+        fchmod(fd, 0666);
+        close(fd);
+        rename(temporary.c_str(), statusPath);
+    }
+    unlink(requestPath);
+    LOG("[storage] counted %zu bytes of answers in %.0f ms", out.size(), nowMS() - start);
+}
+
 // The memory watchdog: one [mem] line per minute (PS5WK_MEM_LOG=<seconds>
 // changes the period, 0 turns it off), for watching long sessions.
 static size_t startFlexible;
@@ -651,8 +725,11 @@ static void* memLogger(void* data)
     double limitMB = limitText ? atof(limitText) : 3072;
     bool over = false;
     for (unsigned tick = 1;; tick++) {
-        struct timespec ts { 5, 0 };
-        while (nanosleep(&ts, &ts) && errno == EINTR) { } // signals (the profiler's SIGPROF) cut sleeps short
+        for (int second = 0; second < 5; second++) {
+            struct timespec ts { 1, 0 };
+            while (nanosleep(&ts, &ts) && errno == EINTR) { } // signals (the profiler's SIGPROF) cut sleeps short
+            answerStorageRequest(); // Settings waits for it: every second
+        }
         double mapped = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : 0;
         double givenBack = &pas_page_malloc_ps5_decommitted_bytes && pas_page_malloc_ps5_decommitted_bytes > 0
             ? pas_page_malloc_ps5_decommitted_bytes / 1048576.0 : 0;
@@ -914,6 +991,11 @@ int main(int, char**)
         if (slash && sscanf(slash + 1, "ui-%d.sock", &uiPid) == 1) {
             snprintf(slash + 1, sizeof(freePath) - (slash + 1 - freePath), "datafree-%d", uiPid);
             setenv("PS5WK_DATA_FREE_STATUS", freePath, 1);
+            // The folder sizes for Settings (answerStorageRequest).
+            snprintf(slash + 1, sizeof(freePath) - (slash + 1 - freePath), "storage-want-%d", uiPid);
+            setenv("PS5WK_STORAGE_REQUEST", freePath, 1);
+            snprintf(slash + 1, sizeof(freePath) - (slash + 1 - freePath), "storage-%d", uiPid);
+            setenv("PS5WK_STORAGE_STATUS", freePath, 1);
         }
     }
     if (!network) {

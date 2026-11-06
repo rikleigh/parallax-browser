@@ -374,9 +374,18 @@ cookies and site data, downloads, and history, bookmarks and tabs, with a
 total; then what every user shares (the browser's files in `/data/ps5webkit`
 outside `users/`: fonts, Unicode data, the ad-block lists, logs) and the
 other users' folders together; and the free space on `/data`. The sizes come
-with `/settings.json` (`"storage"`), counted on the link server's thread at
-most every 5 s, again after something is cleared (`[user] storage counted in
-N ms` in the log). The webpage cache holds at most 250 MB per user (100 MB
+with `/settings.json` (`"storage"`). The title can open a folder but not
+list it (`opendir`: EPERM, `sceKernelGetdents`: EINVAL), so the NetworkProcess
+counts the folders: the title writes `/system_tmp/ps5wk/storage-want-<pid>`
+(a generation number, then id, a top-level name to skip and the path per
+line), ps5wk-child checks for it every second and answers in
+`storage-<pid>` (`[storage] counted` in its log). Until an answer newer than
+the last change arrives, `"counting": true` and the page shows *Counting…*
+and asks again every second. The list files are counted in the title (lstat
+works). The free space is the downloads' (`statfs` looked up in libkernel_sys,
+else the NetworkProcess's `datafree-<pid>`): the first version called
+`statvfs`, which the title's libraries don't have, and the browser closed as
+soon as Settings opened. The webpage cache holds at most 250 MB per user (100 MB
 with under 4 GB free; patch 0076; it was up to 1 GB for the one shared
 cache).
 

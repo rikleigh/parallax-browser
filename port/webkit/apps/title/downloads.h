@@ -51,6 +51,9 @@ void ps5wk_downloads_json(GString* out);
 
 /* Settings: the folder, its free space, the finished ones. */
 void ps5wk_downloads_clear_finished(void);
+/* Any thread: the free space on /data in bytes, -1 if not known (the title
+ * can't call statvfs: see downloads.c). */
+gint64 ps5wk_downloads_free_space(void);
 /* Any thread: {"folder","free","finished","active","total"} for settings.json. */
 char* ps5wk_downloads_summary_json(void);
 /* Any thread: the finished downloads for the link server's page:

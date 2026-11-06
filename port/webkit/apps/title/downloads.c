@@ -139,8 +139,8 @@ static void removeFile(const char* file, gboolean part)
 /* The downloads folder's free space: statfs where the console allows it,
  * else what the NetworkProcess (a payload, which may call it) writes every
  * 5 s to /system_tmp/ps5wk/datafree-<this pid> (ps5wk-child.cpp). -1: not
- * known. */
-static gint64 freeSpace(void)
+ * known. Settings' Storage card uses it too (/data is one file system). */
+gint64 ps5wk_downloads_free_space(void)
 {
     struct statfs fs;
     if (!statfs(PS5WK_DOWNLOADS_DIR, &fs))
@@ -397,7 +397,7 @@ char* ps5wk_downloads_summary_json(void)
     char* counts = g_strdup(snapSummaryJSON ? snapSummaryJSON : "\"finished\":0,\"active\":0,\"total\":0");
     g_mutex_unlock(&snapLock);
     /* the free space now (any thread: a file read) */
-    char* json = g_strdup_printf("{\"folder\":\"%s\",\"free\":%" G_GINT64_FORMAT ",%s}", PS5WK_DOWNLOADS_DIR, freeSpace(), counts);
+    char* json = g_strdup_printf("{\"folder\":\"%s\",\"free\":%" G_GINT64_FORMAT ",%s}", PS5WK_DOWNLOADS_DIR, ps5wk_downloads_free_space(), counts);
     g_free(counts);
     return json;
 }
@@ -626,7 +626,7 @@ static gboolean onDecideDestination(WebKitDownload* download, const char* sugges
 
     /* room for what is still to come */
     gint64 needed = partial ? (rangeTotal >= 0 ? rangeTotal - rangeStart : length) : length;
-    gint64 free = freeSpace();
+    gint64 free = ps5wk_downloads_free_space();
     if (needed > 0 && free >= 0 && needed + FREE_MARGIN > free) {
         char a[32], b[32];
         formatBytes(a, sizeof a, needed);

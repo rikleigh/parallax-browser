@@ -22,6 +22,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "browser.h" /* ps5wk_json_string */
+#include "downloads.h" /* ps5wk_downloads_free_space */
 #include "profile.h"
 
 #include <errno.h>
@@ -30,7 +31,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <unistd.h>
 
 int sceUserServiceInitialize(const void* params) __attribute__((weak));
@@ -132,103 +132,134 @@ const char* ps5wk_profile_name(void)
 /* ---------------------------------------------------------------- storage */
 
 typedef struct {
-    guint64 bytes, files;
+    gint64 bytes, files; /* bytes < 0: not counted yet */
 } Usage;
 
-/* Every file under path (not following links); skip: a name not to enter
- * at the top level. */
-static void addUsage(Usage* usage, const char* path, const char* skip)
-{
-    struct stat st;
-    if (lstat(path, &st))
-        return;
-    if (!S_ISDIR(st.st_mode)) {
-        usage->bytes += (guint64)st.st_size;
-        usage->files++;
-        return;
-    }
-    GDir* dir = g_dir_open(path, 0, NULL);
-    if (!dir)
-        return;
-    for (const char* name; (name = g_dir_read_name(dir));) {
-        if (skip && !strcmp(name, skip))
-            continue;
-        char* child = g_build_filename(path, name, NULL);
-        addUsage(usage, child, NULL);
-        g_free(child);
-    }
-    g_dir_close(dir);
-}
-
-static Usage usageOf(const char* name)
-{
-    Usage usage = { 0, 0 };
-    char* path = g_build_filename(profileDir, name, NULL);
-    addUsage(&usage, path, NULL);
-    g_free(path);
-    return usage;
-}
+/* The folders are counted by the NetworkProcess: the title can open a
+ * folder but not list it (getdirentries: EPERM), a payload can. Settings
+ * writes a request, the NetworkProcess answers within a second
+ * (answerStorageRequest in ps5wk-child.cpp; /system_tmp/ps5wk/storage-want-
+ * <pid>, storage-<pid>), and settings.json says "counting" until an answer
+ * newer than the last change comes, which the page polls for. Single files
+ * (the lists) are counted here: lstat works. */
+enum { FOLDER_CACHE, FOLDER_SITE, FOLDER_DOWNLOADS, FOLDER_OTHERS, FOLDER_SHARED, FOLDER_COUNT };
+static const char* const folderIds[FOLDER_COUNT] = { "cache", "site", "downloads", "others", "shared" };
 
 static GMutex storageLock;
 static char* storageJSON;
 static gint64 storageTime;
+static unsigned requestGen, changedGen, answerGen; /* storageLock */
+static Usage folders[FOLDER_COUNT];
+static unsigned otherCount;
+
+static char* storagePath(const char* name)
+{
+    return g_strdup_printf("/system_tmp/ps5wk/%s-%d", name, (int)getpid());
+}
+
+/* The NetworkProcess's answer, if newer than the one we have. */
+static void readAnswer(void)
+{
+    char* path = storagePath("storage");
+    char* text = NULL;
+    if (g_file_get_contents(path, &text, NULL, NULL)) {
+        unsigned gen = 0;
+        if (sscanf(text, "gen %u", &gen) == 1 && gen > answerGen) {
+            answerGen = gen;
+            char** lines = g_strsplit(text, "\n", -1);
+            for (char** line = lines; *line; line++) {
+                char id[16];
+                long long bytes, files;
+                unsigned count;
+                if (sscanf(*line, "%15s %lld %lld %u", id, &bytes, &files, &count) != 4)
+                    continue;
+                for (int i = 0; i < FOLDER_COUNT; i++) {
+                    if (strcmp(id, folderIds[i]))
+                        continue;
+                    folders[i].bytes = bytes;
+                    folders[i].files = files;
+                    if (i == FOLDER_OTHERS)
+                        otherCount = count;
+                }
+            }
+            g_strfreev(lines);
+        }
+        g_free(text);
+    }
+    g_free(path);
+}
+
+/* A new request, unless one is waiting. */
+static void requestCount(void)
+{
+    char* path = storagePath("storage-want");
+    if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+        const char* mine = strrchr(profileDir, '/') + 1;
+        GString* request = g_string_new(NULL);
+        g_string_append_printf(request, "gen %u\n", ++requestGen);
+        g_string_append_printf(request, "cache\t-\t%s/browser/cache\n", profileDir);
+        g_string_append_printf(request, "site\t-\t%s/browser/data\n", profileDir);
+        g_string_append_printf(request, "downloads\t-\t%s/downloads\n", profileDir);
+        g_string_append_printf(request, "others\t%s\t%s\n", mine, USERS_DIR);
+        g_string_append_printf(request, "shared\tusers\t%s\n", PS5WK_DATA_DIR);
+        char* temporary = g_strconcat(path, ".tmp", NULL);
+        if (g_file_set_contents(temporary, request->str, request->len, NULL))
+            rename(temporary, path);
+        g_free(temporary);
+        g_string_free(request, TRUE);
+    }
+    g_free(path);
+}
 
 static void appendItem(GString* out, const char* id, const char* label, Usage usage)
 {
     g_string_append_printf(out, "%s{\"id\":\"%s\",\"label\":", out->str[out->len - 1] == '[' ? "" : ",", id);
     ps5wk_json_string(out, label);
-    g_string_append_printf(out, ",\"bytes\":%" G_GUINT64_FORMAT ",\"files\":%" G_GUINT64_FORMAT "}", usage.bytes, usage.files);
+    g_string_append_printf(out, ",\"bytes\":%" G_GINT64_FORMAT ",\"files\":%" G_GINT64_FORMAT "}", usage.bytes, usage.files);
 }
 
-static char* countStorage(void)
+/* storageLock held. */
+static char* storageState(gboolean* counting)
 {
-    gint64 start = g_get_monotonic_time();
-    Usage cache = usageOf("browser/cache"), site = usageOf("browser/data"), downloads = usageOf("downloads");
+    readAnswer();
+    requestCount();
+    *counting = answerGen <= changedGen;
     Usage lists = { 0, 0 };
     static const char* const listFiles[] = { "bookmarks.json", "history.json", "session.json", "downloads.json", "home-url.txt", "adblock-allow.txt" };
     for (unsigned i = 0; i < G_N_ELEMENTS(listFiles); i++) {
-        Usage u = usageOf(listFiles[i]);
-        lists.bytes += u.bytes;
-        lists.files += u.files;
-    }
-    /* The other users' folders, and everything outside users/. */
-    Usage others = { 0, 0 }, shared = { 0, 0 };
-    unsigned otherCount = 0;
-    const char* mine = strrchr(profileDir, '/') + 1;
-    GDir* dir = g_dir_open(USERS_DIR, 0, NULL);
-    for (const char* name; dir && (name = g_dir_read_name(dir));) {
-        if (!strcmp(name, mine))
-            continue;
-        char* path = g_build_filename(USERS_DIR, name, NULL);
+        char* path = g_build_filename(profileDir, listFiles[i], NULL);
         struct stat st;
-        if (!lstat(path, &st) && S_ISDIR(st.st_mode)) {
-            addUsage(&others, path, NULL);
-            otherCount++;
+        if (!lstat(path, &st) && S_ISREG(st.st_mode)) {
+            lists.bytes += st.st_size;
+            lists.files++;
         }
         g_free(path);
     }
-    if (dir)
-        g_dir_close(dir);
-    addUsage(&shared, PS5WK_DATA_DIR, "users");
+    Usage shown[FOLDER_COUNT];
+    for (int i = 0; i < FOLDER_COUNT; i++)
+        shown[i] = *counting ? (Usage) { -1, 0 } : folders[i];
 
-    struct statvfs fs;
-    long long freeBytes = !statvfs(PS5WK_DATA_DIR, &fs) ? (long long)fs.f_bavail * (long long)fs.f_frsize : -1;
+    /* Not statvfs: the title's system libraries don't have it (the browser
+     * closed when Settings opened). */
+    long long freeBytes = ps5wk_downloads_free_space();
     GString* out = g_string_new("{\"user\":");
     ps5wk_json_string(out, ps5wk_profile_name());
     g_string_append(out, ",\"folder\":");
     ps5wk_json_string(out, profileDir);
-    g_string_append_printf(out, ",\"free\":%lld,\"otherUsers\":%u,\"items\":[", freeBytes, otherCount);
-    appendItem(out, "cache", "Webpage cache", cache);
-    appendItem(out, "site", "Cookies and site data", site);
-    appendItem(out, "downloads", "Downloads", downloads);
+    g_string_append_printf(out, ",\"free\":%lld,\"counting\":%s,\"otherUsers\":%u,\"items\":[", freeBytes, *counting ? "true" : "false", otherCount);
+    appendItem(out, "cache", "Webpage cache", shown[FOLDER_CACHE]);
+    appendItem(out, "site", "Cookies and site data", shown[FOLDER_SITE]);
+    appendItem(out, "downloads", "Downloads", shown[FOLDER_DOWNLOADS]);
     appendItem(out, "lists", "History, bookmarks and tabs", lists);
     g_string_append(out, "],\"shared\":[");
-    appendItem(out, "browser", "Browser files (fonts, ad-block lists, settings)", shared);
-    appendItem(out, "others", "Other users", others);
+    appendItem(out, "browser", "Browser files (fonts, ad-block lists, settings)", shown[FOLDER_SHARED]);
+    appendItem(out, "others", "Other users", shown[FOLDER_OTHERS]);
     g_string_append(out, "]}");
-    spike_log("[user] storage counted in %.0f ms: cache %.1f MB (%" G_GUINT64_FORMAT " files), site data %.1f MB, downloads %.1f MB, "
-        "shared %.1f MB, %u other user%s %.1f MB", (g_get_monotonic_time() - start) / 1000.0, cache.bytes / 1e6, cache.files,
-        site.bytes / 1e6, downloads.bytes / 1e6, shared.bytes / 1e6, otherCount, otherCount == 1 ? "" : "s", others.bytes / 1e6);
+    if (!*counting)
+        spike_log("[user] storage (answer %u): cache %.1f MB (%" G_GINT64_FORMAT " files), site data %.1f MB, downloads %.1f MB, "
+            "shared %.1f MB, %u other user%s %.1f MB", answerGen, folders[FOLDER_CACHE].bytes / 1e6, folders[FOLDER_CACHE].files,
+            folders[FOLDER_SITE].bytes / 1e6, folders[FOLDER_DOWNLOADS].bytes / 1e6, folders[FOLDER_SHARED].bytes / 1e6, otherCount,
+            otherCount == 1 ? "" : "s", folders[FOLDER_OTHERS].bytes / 1e6);
     return g_string_free(out, FALSE);
 }
 
@@ -238,8 +269,9 @@ char* ps5wk_profile_storage_json(void)
     gint64 now = g_get_monotonic_time();
     if (!storageJSON || now - storageTime > 5 * G_USEC_PER_SEC) {
         g_free(storageJSON);
-        storageJSON = countStorage();
-        storageTime = g_get_monotonic_time();
+        gboolean counting;
+        storageJSON = storageState(&counting);
+        storageTime = counting ? 0 : g_get_monotonic_time(); /* the page polls until the answer */
     }
     char* json = g_strdup(storageJSON);
     g_mutex_unlock(&storageLock);
@@ -250,5 +282,6 @@ void ps5wk_profile_storage_changed(void)
 {
     g_mutex_lock(&storageLock);
     storageTime = 0;
+    changedGen = requestGen; /* only a request made after this counts */
     g_mutex_unlock(&storageLock);
 }
