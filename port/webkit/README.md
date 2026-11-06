@@ -1979,9 +1979,10 @@ software path) on a sphere, dome or big flat screen. Nothing changes in
 WebKit (no patch): it is all in the title (`wpe-ps5/PS5RendererVR.cpp`,
 `apps/title/viewinvr.c`, its panel in `apps/title/browserdraw.c`).
 
-**Pad.** On a page: **touchpad button** = View in VR (a message on the TV
-says so for 4 s when a video of 640 px or more starts, at most every 2
-minutes). In VR the
+**Pad.** On a page: **touchpad button** = View in VR (the menu's footer
+says so; a TV message when any video of 640 px or more started was taken
+out on 2026-11-04: nothing tells a VR video from a flat one reliably on
+every site, so it came up for flat videos most of the time). In VR the
 whole pad belongs to it:
 
 | button | in VR |

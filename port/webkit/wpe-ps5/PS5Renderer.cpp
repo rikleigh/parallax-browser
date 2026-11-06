@@ -1003,13 +1003,6 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
                 g_message("[wpe-ps5] video stream %d: framebuffer for %dx%d incomplete (0x%x)", stream.id, w, h, status);
                 ok = false;
             } else {
-                // The shortcut, once in a while, when a real video starts
-                // (not while it is in the headset already).
-                static int64_t lastShortcutHintUS;
-                if (!gl->width && w >= 640 && !m_vr && (!lastShortcutHintUS || start - lastShortcutHintUS > 120000000)) {
-                    lastShortcutHintUS = start;
-                    showMessage("Touchpad: watch in the PS VR2 headset", 4);
-                }
                 gl->width = w;
                 gl->height = h;
                 g_message("[wpe-ps5] video stream %d: %dx%d %s", stream.id, w, h,
