@@ -126,6 +126,7 @@ struct PS5VRState {
     // text
     GLuint hintTexture { 0 };
     int hintWidth { 0 }, hintHeight { 0 };
+    bool hintIsPanel { false }; // the application's panel (setVRPanel), not text
     int64_t hintUntilUS { 0 };
     GLuint tvTexture { 0 };
     int tvWidth { 0 }, tvHeight { 0 };
@@ -453,11 +454,51 @@ void PS5Renderer::setVRText(const char* hint, double seconds, const char* tvText
 {
     g_mutex_lock(&m_lock);
     m_vrRequest.textChanged = true;
+    m_vrRequest.panel = false;
     m_vrRequest.hint = hint ? hint : "";
     m_vrRequest.hintSeconds = seconds;
     if (tvText) {
         m_vrRequest.tvTextChanged = true;
+        m_vrRequest.tvPanel = false;
         m_vrRequest.tvText = tvText;
+    }
+    g_mutex_unlock(&m_lock);
+}
+
+// 0xAARRGGBB words (bytes B G R A) to RGBA bytes, both premultiplied.
+static void canvasToRGBA(const uint32_t* px, int width, int height, std::vector<uint8_t>& out)
+{
+    out.resize(static_cast<size_t>(width) * height * 4);
+    for (size_t i = 0, n = static_cast<size_t>(width) * height; i < n; i++) {
+        const uint32_t p = px[i];
+        out[i * 4] = (p >> 16) & 0xff;
+        out[i * 4 + 1] = (p >> 8) & 0xff;
+        out[i * 4 + 2] = p & 0xff;
+        out[i * 4 + 3] = p >> 24;
+    }
+}
+
+void PS5Renderer::setVRPanel(const uint32_t* panel, int width, int height, double seconds, const uint32_t* tv, int tvWidth, int tvHeight)
+{
+    std::vector<uint8_t> panelRGBA, tvRGBA;
+    const bool havePanel = panel && width > 0 && height > 0 && seconds > 0;
+    if (havePanel)
+        canvasToRGBA(panel, width, height, panelRGBA);
+    if (tv && tvWidth > 0 && tvHeight > 0)
+        canvasToRGBA(tv, tvWidth, tvHeight, tvRGBA);
+    g_mutex_lock(&m_lock);
+    m_vrRequest.textChanged = true;
+    m_vrRequest.panel = true;
+    m_vrRequest.panelRGBA.swap(panelRGBA);
+    m_vrRequest.panelWidth = havePanel ? width : 0;
+    m_vrRequest.panelHeight = havePanel ? height : 0;
+    m_vrRequest.hintSeconds = havePanel ? seconds : 0;
+    if (!tvRGBA.empty()) {
+        m_vrRequest.tvTextChanged = true;
+        m_vrRequest.tvPanel = true;
+        m_vrRequest.tvRGBA.swap(tvRGBA);
+        m_vrRequest.tvPanelWidth = tvWidth;
+        m_vrRequest.tvPanelHeight = tvHeight;
     }
     g_mutex_unlock(&m_lock);
 }
@@ -536,15 +577,27 @@ void PS5Renderer::vrHandleRequests()
         vrUpdateText(nowUS());
 }
 
-// The hint and TV notice textures from the texts the main thread set.
+// The hint and TV notice textures from the texts (or the panels) the main
+// thread set.
 void PS5Renderer::vrUpdateText(int64_t now)
 {
+    PS5TextImage image, tvImage;
     g_mutex_lock(&m_lock);
     std::string hint = m_vrRequest.hint, tvText = m_vrRequest.tvText;
     double seconds = m_vrRequest.hintSeconds;
+    const bool panel = m_vrRequest.panel, tvPanel = m_vrRequest.tvPanel;
+    if (panel) {
+        image.rgba = m_vrRequest.panelRGBA;
+        image.width = m_vrRequest.panelWidth;
+        image.height = m_vrRequest.panelHeight;
+    }
+    if (tvPanel) {
+        tvImage.rgba = m_vrRequest.tvRGBA;
+        tvImage.width = m_vrRequest.tvPanelWidth;
+        tvImage.height = m_vrRequest.tvPanelHeight;
+    }
     g_mutex_unlock(&m_lock);
-    PS5TextImage image;
-    if (!hint.empty() && seconds > 0 && ps5RenderTextPanel(hint.c_str(), 64, image)) {
+    if (seconds > 0 && (panel ? image.width > 0 : !hint.empty() && ps5RenderTextPanel(hint.c_str(), 64, image))) {
         ps5RendererUploadPanel(m_vr->hintTexture, image);
         // Shown at about half size in the eye buffer: mipmaps against shimmer.
         glBindTexture(GL_TEXTURE_2D, m_vr->hintTexture);
@@ -552,13 +605,14 @@ void PS5Renderer::vrUpdateText(int64_t now)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
         m_vr->hintWidth = image.width;
         m_vr->hintHeight = image.height;
+        m_vr->hintIsPanel = panel;
         m_vr->hintUntilUS = now + static_cast<int64_t>(seconds * 1e6);
     } else
         m_vr->hintUntilUS = 0;
-    if (!tvText.empty() && ps5RenderTextPanel(tvText.c_str(), 52, image)) {
-        ps5RendererUploadPanel(m_vr->tvTexture, image);
-        m_vr->tvWidth = image.width;
-        m_vr->tvHeight = image.height;
+    if (tvPanel ? tvImage.width > 0 : !tvText.empty() && ps5RenderTextPanel(tvText.c_str(), 52, tvImage)) {
+        ps5RendererUploadPanel(m_vr->tvTexture, tvImage);
+        m_vr->tvWidth = tvImage.width;
+        m_vr->tvHeight = tvImage.height;
     }
     m_vr->tvDirty = true;
 }
@@ -787,7 +841,10 @@ void PS5Renderer::vrRenderEyes(unsigned buffer, const void* framePointer)
     if (vr->hintTexture && vr->hintUntilUS && nowUS() < vr->hintUntilUS) {
         // Text about 2.5 degrees tall (the panel's 40 px lines), at most 60
         // degrees wide, centred about 22 degrees below the view's centre.
-        const float w = std::clamp(vr->hintWidth * 0.0016f, 0.5f, 1.15f), h = w * vr->hintHeight / std::max(1, vr->hintWidth), cy = -0.40f;
+        // The application's panel: 1240 px 0.95 tangent wide (about 50
+        // degrees), its 30 px hint text about 1.3 degrees tall.
+        const float w = vr->hintIsPanel ? std::min(vr->hintWidth * (0.95f / 1240), 1.15f) : std::clamp(vr->hintWidth * 0.0016f, 0.5f, 1.15f);
+        const float h = w * vr->hintHeight / std::max(1, vr->hintWidth), cy = vr->hintIsPanel ? -0.42f : -0.40f;
         glUniform4f(s_uHintRect, -w / 2, cy - h / 2, w / 2, cy + h / 2);
     } else
         glUniform4f(s_uHintRect, 0, 0, 0, 0);

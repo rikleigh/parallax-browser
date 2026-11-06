@@ -198,17 +198,22 @@ static BUIState baseState(void)
 
 static const char* outDir;
 
-static void shot(const char* name, WPEDisplayPS5Canvas* canvas)
+static void shotAt(const char* name, WPEDisplayPS5Canvas* canvas, int x, int y)
 {
     uint32_t* frame = malloc((size_t)W * H * 4);
     memcpy(frame, background, (size_t)W * H * 4);
-    wpe_display_ps5_set_ui_layer((WPEDisplayPS5*)1, canvas, 0, 0);
+    wpe_display_ps5_set_ui_layer((WPEDisplayPS5*)1, canvas, x, y);
     over(frame, W, H, uipreview_layer, uipreview_layer_rect[0], uipreview_layer_rect[1], uipreview_layer_rect[2], uipreview_layer_rect[3], 0);
     char path[1024];
     snprintf(path, sizeof path, "%s/%s.png", outDir, name);
     savePNG(path, frame, W, H);
     free(frame);
     printf("  %s\n", path);
+}
+
+static void shot(const char* name, WPEDisplayPS5Canvas* canvas)
+{
+    shotAt(name, canvas, 0, 0);
 }
 
 static void menuShot(const char* name, BUIState* s)
@@ -236,6 +241,29 @@ static void noticeShot(const char* name, const char* text, int size, int centred
     savePNG(path, frame, W, H);
     free(frame);
     printf("  %s\n", path);
+}
+
+static void vrShot(const char* name, const BUIVRState* v)
+{
+    WPEDisplayPS5Canvas* panel = wpe_display_ps5_canvas_new(BUI_VR_PANEL_W, BUI_VR_PANEL_H);
+    bui_draw_vr_panel(panel, v);
+    shotAt(name, panel, (W - BUI_VR_PANEL_W) / 2, H - BUI_VR_PANEL_H - 80);
+    wpe_display_ps5_canvas_free(panel);
+}
+
+static void vrTVShot(const char* name, const BUIVRState* v)
+{
+    uint32_t* saved = background;
+    uint32_t* black = calloc((size_t)W * H, 4);
+    for (size_t i = 0; i < (size_t)W * H; i++)
+        black[i] = 0xff000000u;
+    background = black;
+    WPEDisplayPS5Canvas* card = wpe_display_ps5_canvas_new(BUI_VR_TV_W, BUI_VR_TV_H);
+    bui_draw_vr_tv(card, v);
+    shotAt(name, card, (W - BUI_VR_TV_W) / 2, (H - BUI_VR_TV_H) / 2);
+    wpe_display_ps5_canvas_free(card);
+    background = saved;
+    free(black);
 }
 
 static double nowMS(void)
@@ -403,6 +431,56 @@ int main(int argc, char** argv)
         "\xE2\x9C\x95 play/pause   \xE2\x97\x80 \xE2\x96\xB6 seek 10 s   \xE2\x96\xB3 projection   \xE2\x96\xA1 recentre\n"
         "Back to the TV: \xE2\x97\x8B, Options or the touchpad",
         52, 1);
+
+    /* View in VR: the headset's panel (over the page picture, as a stand-in
+     * for the video, where the headset shows it: below the centre), and
+     * the TV's card on black */
+    {
+        BUIVRState v;
+        memset(&v, 0, sizeof v);
+        v.title = "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film";
+        v.projection = "180\xC2\xB0 3D side by side";
+        v.message = "The guess: \xE2\x96\xB3 picks another, remembered for this site";
+        v.controls = TRUE;
+        v.time = 83;
+        v.duration = 634;
+        v.buffered = 121;
+        vrShot("vr-panel-playing", &v);
+        v.paused = TRUE;
+        v.message = "Recentred";
+        vrShot("vr-panel-paused", &v);
+        v.paused = FALSE;
+        v.seeking = TRUE;
+        v.target = 263;
+        vrShot("vr-panel-seeking", &v);
+        v.target = 23;
+        vrShot("vr-panel-seeking-back", &v);
+        v.seeking = FALSE;
+        v.time = 3725;
+        v.duration = 5410;
+        v.buffered = 3760;
+        v.message = NULL;
+        vrShot("vr-panel-long", &v);
+        v.duration = 1.0 / 0.0;
+        v.time = 1834;
+        vrShot("vr-panel-live", &v);
+        v.controls = FALSE;
+        v.message = "No <video> in the page: the headset shows the stream the page plays";
+        vrShot("vr-panel-nocontrols", &v);
+
+        memset(&v, 0, sizeof v);
+        v.title = "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film";
+        v.projection = "180\xC2\xB0 3D side by side";
+        v.message = "The guess";
+        v.controls = TRUE;
+        v.time = 83;
+        v.duration = 634;
+        v.buffered = 121;
+        vrTVShot("vr-tv", &v);
+        v.seeking = TRUE;
+        v.target = 263;
+        vrTVShot("vr-tv-seeking", &v);
+    }
 
     /* the cost of drawing the menu (fonts and glyphs warm) */
     s = baseState();

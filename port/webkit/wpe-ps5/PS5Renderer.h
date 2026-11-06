@@ -135,6 +135,9 @@ public:
     // hint: shown in the headset for `seconds` (empty: none); tvText: the
     // notice on the TV while in VR (nullptr: keep).
     void setVRText(const char* hint, double seconds, const char* tvText);
+    // The application's drawing instead (premultiplied 0xAARRGGBB words): the
+    // headset's panel (null or 0 s: none) and the TV's card (null: unchanged).
+    void setVRPanel(const uint32_t* panel, int width, int height, double seconds, const uint32_t* tv, int tvWidth, int tvHeight);
     // Log-only tests (/data/ps5webkit/vr-sim: no headset, the eye buffers
     // are rendered with this head direction, degrees, right and up positive).
     void setVRSimLook(float yawDegrees, float pitchDegrees);
@@ -327,6 +330,10 @@ private:
         double hintSeconds { 0 };
         bool tvTextChanged { false };
         std::string tvText;
+        // setVRPanel: premultiplied RGBA, row 0 = top (empty: none)
+        bool panel { false }, tvPanel { false };
+        std::vector<uint8_t> panelRGBA, tvRGBA;
+        int panelWidth { 0 }, panelHeight { 0 }, tvPanelWidth { 0 }, tvPanelHeight { 0 };
     } m_vrRequest;
     bool m_vrActiveShared { false }; // guarded by m_lock (vrActive(), stopVR(wait))
     int64_t m_vrTrackedUS { 0 }; // guarded by m_lock: the last tracked headset frame (vrTracking())

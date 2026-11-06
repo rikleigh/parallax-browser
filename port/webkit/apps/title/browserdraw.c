@@ -135,41 +135,64 @@ static void glass(WPEDisplayPS5Canvas* c, int x, int y, int w, int h, int radius
 }
 
 /* A key cap for the pad's button (✕ ○ △ □, "touchpad", or a label such
- * as L1), centred on cy. Returns its width. */
-static int keyCap(WPEDisplayPS5Canvas* c, int x, int cy, const char* key)
+ * as L1), centred on cy, @k times the menu's size. Returns its width. */
+static int keyCapScaled(WPEDisplayPS5Canvas* c, int x, int cy, const char* key, double k)
 {
     if (!strcmp(key, "touchpad")) {
-        const int w = 46, h = 28;
-        wpe_display_ps5_canvas_fill(c, x, cy - h / 2, w, h, 8, PX_A(WHITE, 0x14));
-        wpe_display_ps5_canvas_stroke(c, x, cy - h / 2, w, h, 8, 2, PX_TEXT_2, PX_TEXT_2, FALSE);
+        const int w = (int)(46 * k), h = (int)(28 * k);
+        wpe_display_ps5_canvas_fill(c, x, cy - h / 2, w, h, (int)(8 * k), PX_A(WHITE, 0x14));
+        wpe_display_ps5_canvas_stroke(c, x, cy - h / 2, w, h, (int)(8 * k), 2, PX_TEXT_2, PX_TEXT_2, FALSE);
         return w;
     }
     const gboolean face = !strcmp(key, "✕") || !strcmp(key, "○") || !strcmp(key, "△") || !strcmp(key, "□");
     if (face) {
-        const int d = 34;
+        const int d = (int)(34 * k);
         wpe_display_ps5_canvas_fill(c, x, cy - d / 2, d, d, d / 2, PX_A(WHITE, 0x1f));
-        textCentred(c, x + d / 2, cy, 0, 19, FALSE, PX_TEXT, key);
+        textCentred(c, x + d / 2, cy, 0, (int)(19 * k), FALSE, PX_TEXT, key);
         return d;
     }
-    const int h = 30, w = wpe_display_ps5_canvas_text_width(c, T_CAP, TRUE, key) + 20;
-    wpe_display_ps5_canvas_fill(c, x, cy - h / 2, w, h, 8, PX_A(WHITE, 0x1f));
-    textCentred(c, x + w / 2, cy, 0, T_CAP, TRUE, PX_TEXT, key);
+    const int size = (int)(T_CAP * k), h = (int)(30 * k), w = wpe_display_ps5_canvas_text_width(c, size, TRUE, key) + (int)(20 * k);
+    wpe_display_ps5_canvas_fill(c, x, cy - h / 2, w, h, (int)(8 * k), PX_A(WHITE, 0x1f));
+    textCentred(c, x + w / 2, cy, 0, size, TRUE, PX_TEXT, key);
     return w;
 }
 
+static int keyCap(WPEDisplayPS5Canvas* c, int x, int cy, const char* key)
+{
+    return keyCapScaled(c, x, cy, key, 1);
+}
+
+static int keyCapWidth(WPEDisplayPS5Canvas* c, const char* key, double k)
+{
+    if (!strcmp(key, "touchpad"))
+        return (int)(46 * k);
+    if (!strcmp(key, "✕") || !strcmp(key, "○") || !strcmp(key, "△") || !strcmp(key, "□"))
+        return (int)(34 * k);
+    return wpe_display_ps5_canvas_text_width(c, (int)(T_CAP * k), TRUE, key) + (int)(20 * k);
+}
+
 /* A key cap and what it does. Returns the width used. */
+static int hintScaled(WPEDisplayPS5Canvas* c, int x, int cy, const char* key, const char* label, double k)
+{
+    const int size = (int)(T_HINT * k);
+    int w = keyCapScaled(c, x, cy, key, k) + (int)(10 * k);
+    w += wpe_display_ps5_canvas_text(c, x + w, cy + size * 36 / 100, 0, size, FALSE, PX_TEXT_2, label);
+    return w;
+}
+
 static int hint(WPEDisplayPS5Canvas* c, int x, int cy, const char* key, const char* label)
 {
-    int w = keyCap(c, x, cy, key) + 10;
-    w += wpe_display_ps5_canvas_text(c, x + w, cy + T_HINT * 36 / 100, 0, T_HINT, FALSE, PX_TEXT_2, label);
-    return w;
+    return hintScaled(c, x, cy, key, label, 1);
+}
+
+static int hintWidthScaled(WPEDisplayPS5Canvas* c, const char* key, const char* label, double k)
+{
+    return keyCapWidth(c, key, k) + (int)(10 * k) + wpe_display_ps5_canvas_text_width(c, (int)(T_HINT * k), FALSE, label);
 }
 
 static int hintWidth(WPEDisplayPS5Canvas* c, const char* key, const char* label)
 {
-    int cap = !strcmp(key, "touchpad") ? 46 : (!strcmp(key, "✕") || !strcmp(key, "○") || !strcmp(key, "△") || !strcmp(key, "□")) ? 34
-                                                                                                                             : wpe_display_ps5_canvas_text_width(c, T_CAP, TRUE, key) + 20;
-    return cap + 10 + wpe_display_ps5_canvas_text_width(c, T_HINT, FALSE, label);
+    return hintWidthScaled(c, key, label, 1);
 }
 
 static gboolean isStartPage(const char* uri)
@@ -772,4 +795,260 @@ void bui_draw_menu(WPEDisplayPS5Canvas* c, const BUIState* s)
     if (s->details)
         drawDetails(c, s->details, px, pw, screenH);
     drawFooter(c, s, px, py, pw, ph);
+}
+
+/* ---------------------------------------------------------------- View in VR */
+
+void bui_format_time(double seconds, char* out, size_t size)
+{
+    if (!isfinite(seconds) || seconds < 0 || seconds > 1e9) {
+        snprintf(out, size, "--:--");
+        return;
+    }
+    long s = (long)seconds;
+    if (s >= 3600)
+        snprintf(out, size, "%ld:%02ld:%02ld", s / 3600, (s / 60) % 60, s % 60);
+    else
+        snprintf(out, size, "%ld:%02ld", s / 60, s % 60);
+}
+
+/* @a to @b at @t (0..1), alpha from @a. */
+static guint32 mixColor(guint32 a, guint32 b, double t)
+{
+    guint32 out = a & 0xff000000u;
+    for (int shift = 0; shift < 24; shift += 8) {
+        int ca = (a >> shift) & 0xff, cb = (b >> shift) & 0xff;
+        out |= (guint32)(ca + (cb - ca) * t) << shift;
+    }
+    return out;
+}
+
+static gboolean vrSeekable(const BUIVRState* s)
+{
+    return s->controls && isfinite(s->duration) && s->duration > 0;
+}
+
+/* The seek bar from @x to @x + @w on @cy: the track, what is buffered, the
+ * played part in the brand's gradient with a thumb at its head; while a
+ * seek target is chosen, the played part stays where the video is (dim)
+ * and the target gets a raised thumb and a bubble above it with its time
+ * and how far it is from now. @k: the size (1 on the TV's card). */
+static void vrSeekBar(WPEDisplayPS5Canvas* c, const BUIVRState* s, int x, int cy, int w, double k)
+{
+    const int h = (int)(8 * k), y = cy - h / 2;
+    wpe_display_ps5_canvas_fill(c, x, y, w, h, h / 2, PX_A(WHITE, 0x1c));
+    if (!vrSeekable(s)) {
+        /* live, or no length: a full track in the gradient, dim */
+        wpe_display_ps5_canvas_fill_gradient(c, x, y, w, h, h / 2, PX_A(PX_FOCUS_FROM, 0x70), PX_A(PX_FOCUS_TO, 0x70), FALSE);
+        return;
+    }
+    const double d = s->duration;
+    const double now = fmin(fmax(s->time, 0), d) / d;
+    if (s->buffered > s->time) {
+        const int bw = (int)(w * fmin(s->buffered, d) / d);
+        wpe_display_ps5_canvas_fill(c, x, y, bw, h, h / 2, PX_A(WHITE, 0x30));
+    }
+    const int pw = (int)(w * now);
+    const guint32 head = mixColor(PX_FOCUS_FROM, PX_FOCUS_TO, now);
+    if (pw > 0)
+        wpe_display_ps5_canvas_fill_gradient(c, x, y, pw < h ? h : pw, h, h / 2, s->seeking ? PX_A(PX_FOCUS_FROM, 0x90) : PX_FOCUS_FROM,
+            s->seeking ? PX_A(head, 0x90) : head, FALSE);
+    if (!s->seeking) {
+        const int t = (int)(24 * k);
+        wpe_display_ps5_canvas_glow(c, x + pw - t / 2, cy - t / 2, t, t, t / 2, (int)(12 * k), PX_A(head, 0x70), PX_A(head, 0x70));
+        wpe_display_ps5_canvas_fill(c, x + pw - t / 2, cy - t / 2, t, t, t / 2, PX_TEXT);
+        return;
+    }
+    /* the target */
+    const double target = fmin(fmax(s->target, 0), d) / d;
+    const int tx = x + (int)(w * target), t = (int)(30 * k);
+    const guint32 targetColor = mixColor(PX_FOCUS_FROM, PX_FOCUS_TO, target);
+    if (tx > x + pw)
+        wpe_display_ps5_canvas_fill(c, x + pw, y, tx - x - pw, h, h / 2, PX_A(targetColor, 0x60));
+    else if (tx < x + pw)
+        wpe_display_ps5_canvas_fill(c, tx, y, x + pw - tx, h, h / 2, PX_A(WHITE, 0x50));
+    wpe_display_ps5_canvas_fill(c, x + pw - (int)(3 * k), cy - (int)(10 * k), (int)(6 * k), (int)(20 * k), (int)(3 * k), PX_A(WHITE, 0xa0));
+    wpe_display_ps5_canvas_glow(c, tx - t / 2, cy - t / 2, t, t, t / 2, (int)(16 * k), PX_A(PX_FOCUS_FROM, 0xa0), PX_A(PX_FOCUS_TO, 0xa0));
+    wpe_display_ps5_canvas_fill(c, tx - t / 2, cy - t / 2, t, t, t / 2, PX_TEXT);
+    wpe_display_ps5_canvas_stroke(c, tx - t / 2, cy - t / 2, t, t, t / 2, (int)(3 * k), PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+
+    char when[24], delta[32], text[64];
+    bui_format_time(s->target, when, sizeof when);
+    const double by = s->target - s->time;
+    char amount[24];
+    bui_format_time(fabs(by), amount, sizeof amount);
+    snprintf(delta, sizeof delta, "%s%s", by < 0 ? "−" : "+", amount);
+    snprintf(text, sizeof text, "%s", when);
+    const int big = (int)(26 * k), small = (int)(20 * k);
+    const int ww = wpe_display_ps5_canvas_text_width(c, big, TRUE, text), dw = wpe_display_ps5_canvas_text_width(c, small, FALSE, delta);
+    const int bw = ww + dw + (int)(44 * k), bh = (int)(44 * k);
+    int bx = tx - bw / 2;
+    bx = bx < x - (int)(20 * k) ? x - (int)(20 * k) : bx;
+    bx = bx + bw > x + w + (int)(20 * k) ? x + w + (int)(20 * k) - bw : bx;
+    const int byTop = cy - t / 2 - (int)(14 * k) - bh;
+    wpe_display_ps5_canvas_fill(c, bx, byTop, bw, bh, bh / 2, PX_A(PX_RAISED_HI, 0xf8));
+    wpe_display_ps5_canvas_stroke(c, bx, byTop, bw, bh, bh / 2, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    const int baseline = byTop + bh / 2 + big * 36 / 100;
+    wpe_display_ps5_canvas_text(c, bx + (int)(18 * k), baseline, 0, big, TRUE, PX_TEXT, text);
+    wpe_display_ps5_canvas_text(c, bx + (int)(26 * k) + ww, baseline, 0, small, FALSE, by < 0 ? PX_PINK : PX_CYAN_TEXT, delta);
+}
+
+/* Play state, time, the bar, the length, across @x..@x + @w on @cy. */
+static void vrSeekRow(WPEDisplayPS5Canvas* c, const BUIVRState* s, int x, int cy, int w, double k)
+{
+    const int right = x + w;
+    if (!s->controls) {
+        wpe_display_ps5_canvas_text(c, x, cy + (int)(22 * k) * 36 / 100, w, (int)(22 * k), FALSE, PX_TEXT_3,
+            "No player controls on this page: the video plays as the page plays it.");
+        return;
+    }
+    /* play / pause: a round button in the gradient */
+    const int d = (int)(60 * k);
+    wpe_display_ps5_canvas_glow(c, x, cy - d / 2, d, d, d / 2, (int)(10 * k), PX_A(PX_FOCUS_FROM, 0x60), PX_A(PX_FOCUS_TO, 0x60));
+    wpe_display_ps5_canvas_fill_gradient(c, x, cy - d / 2, d, d, d / 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    textCentred(c, x + d / 2 + (s->paused ? (int)(3 * k) : 0), cy, 0, (int)(26 * k), FALSE, PX_TEXT, s->paused ? "▶" : "❚❚");
+    int bx = x + d + (int)(28 * k);
+    const int size = (int)(26 * k);
+    char now[24], total[24];
+    bui_format_time(s->time, now, sizeof now);
+    bui_format_time(s->duration, total, sizeof total);
+    const gboolean seekable = vrSeekable(s);
+    /* both times as wide as the longer, so the bar keeps still */
+    int tw = wpe_display_ps5_canvas_text_width(c, size, TRUE, seekable && s->duration >= 3600 ? "0:00:00" : "00:00");
+    wpe_display_ps5_canvas_text(c, bx, cy + size * 36 / 100, 0, size, TRUE, PX_TEXT, now);
+    bx += tw + (int)(24 * k);
+    int ex = right;
+    if (seekable) {
+        const int lw = wpe_display_ps5_canvas_text_width(c, size, FALSE, total);
+        wpe_display_ps5_canvas_text(c, right - lw, cy + size * 36 / 100, 0, size, FALSE, PX_TEXT_2, total);
+        ex = right - (lw > tw ? lw : tw) - (int)(24 * k);
+    } else {
+        /* LIVE (or no length): a pill */
+        const int ps = (int)(18 * k), pw = wpe_display_ps5_canvas_text_width(c, ps, TRUE, "LIVE") + (int)(40 * k), ph = (int)(34 * k);
+        wpe_display_ps5_canvas_fill(c, right - pw, cy - ph / 2, pw, ph, ph / 2, PX_A(PX_MAGENTA, 0x40));
+        wpe_display_ps5_canvas_fill(c, right - pw + (int)(12 * k), cy - (int)(4 * k), (int)(8 * k), (int)(8 * k), (int)(4 * k), PX_PINK);
+        wpe_display_ps5_canvas_text(c, right - pw + (int)(26 * k), cy + ps * 36 / 100, 0, ps, TRUE, PX_PINK, "LIVE");
+        ex = right - pw - (int)(24 * k);
+    }
+    vrSeekBar(c, s, bx, cy, ex - bx, k);
+}
+
+/* A row of hints centred on @cx. */
+static void vrHints(WPEDisplayPS5Canvas* c, int cx, int cy, const char* const* keys, const char* const* labels, int count, double k)
+{
+    const int gap = (int)(36 * k);
+    int w = 0;
+    for (int i = 0; i < count; i++)
+        w += hintWidthScaled(c, keys[i], labels[i], k) + (i ? gap : 0);
+    int x = cx - w / 2;
+    for (int i = 0; i < count; i++)
+        x += hintScaled(c, x, cy, keys[i], labels[i], k) + gap;
+}
+
+/* The projection, as a chip with the key that changes it. Returns its width;
+ * @right: its right edge. */
+static int vrProjectionChip(WPEDisplayPS5Canvas* c, int right, int cy, const char* projection, double k)
+{
+    const int size = (int)(21 * k), h = (int)(44 * k), cap = keyCapWidth(c, "△", k * 0.8);
+    const int w = cap + wpe_display_ps5_canvas_text_width(c, size, FALSE, projection) + (int)(42 * k);
+    const int x = right - w;
+    wpe_display_ps5_canvas_fill(c, x, cy - h / 2, w, h, h / 2, PX_A(WHITE, 0x10));
+    wpe_display_ps5_canvas_stroke(c, x, cy - h / 2, w, h, h / 2, 1, PX_A(PX_LINE, 0xff), PX_A(PX_LINE, 0xff), FALSE);
+    keyCapScaled(c, x + (int)(8 * k), cy, "△", k * 0.8);
+    wpe_display_ps5_canvas_text(c, x + (int)(8 * k) + cap + (int)(14 * k), cy + size * 36 / 100, 0, size, FALSE, PX_TEXT_2, projection);
+    return w;
+}
+
+#define VR_K 1.4 /* the headset's sizes: the menu's, larger (it is seen small, below the view's centre) */
+
+void bui_draw_vr_panel(WPEDisplayPS5Canvas* c, const BUIVRState* s)
+{
+    const double k = VR_K;
+    const int W = wpe_display_ps5_canvas_get_width(c), H = wpe_display_ps5_canvas_get_height(c);
+    const int m = 20, px = m, py = m, pw = W - 2 * m, ph = H - 2 * m, pad = 40;
+    wpe_display_ps5_canvas_clear(c, 0);
+    /* opaque enough to read over any video */
+    glass(c, px, py, pw, ph, PX_RADIUS_PANEL + 4, PX_A(PX_SURFACE, 0xf6));
+
+    /* the title, the projection chip on the right; the message under them */
+    const int x = px + pad, right = px + pw - pad, headCY = py + 50;
+    const int chipW = vrProjectionChip(c, right, headCY, s->projection ? s->projection : "", k);
+    const int titleSize = (int)(24 * k);
+    wpe_display_ps5_canvas_text(c, x, headCY + titleSize * 36 / 100, right - chipW - 24 - x, titleSize, TRUE, PX_TEXT,
+        s->title && *s->title ? s->title : "Video");
+    if (s->message && *s->message && !s->seeking)
+        wpe_display_ps5_canvas_text(c, x, headCY + 52, right - x, (int)(17 * k), FALSE, PX_TEXT_3, s->message);
+
+    vrSeekRow(c, s, x, py + 190, right - x, k);
+
+    const int lineY = py + ph - 92;
+    wpe_display_ps5_canvas_fill(c, px + 24, lineY, pw - 48, 1, 0, PX_A(PX_LINE, 0xc0));
+    const int hintCY = lineY + 46;
+    if (s->controls && vrSeekable(s)) {
+        /* ○ cancels a seek being chosen */
+        static const char* const keys[] = { "✕", "◀ ▶", "R stick", "□", "○" };
+        const char* labels[] = { s->paused ? "Play" : "Pause", "30 s", "Scrub", "Recentre", s->seeking ? "Cancel" : "Exit" };
+        vrHints(c, px + pw / 2, hintCY, keys, labels, 5, k * 0.85);
+    } else if (s->controls) {
+        static const char* const keys[] = { "✕", "□", "○" };
+        const char* labels[] = { s->paused ? "Play" : "Pause", "Recentre", "Exit" };
+        vrHints(c, px + pw / 2, hintCY, keys, labels, 3, k * 0.85);
+    } else {
+        static const char* const keys[] = { "□", "○" };
+        static const char* const labels[] = { "Recentre", "Exit" };
+        vrHints(c, px + pw / 2, hintCY, keys, labels, 2, k * 0.85);
+    }
+}
+
+void bui_draw_vr_tv(WPEDisplayPS5Canvas* c, const BUIVRState* s)
+{
+    const double k = 1;
+    const int W = wpe_display_ps5_canvas_get_width(c), H = wpe_display_ps5_canvas_get_height(c);
+    const int m = 24, px = m, py = m, pw = W - 2 * m, ph = H - 2 * m, pad = 56;
+    wpe_display_ps5_canvas_clear(c, 0);
+    wpe_display_ps5_canvas_glow(c, px, py, pw, ph, PX_RADIUS_PANEL, PX_FOCUS_GLOW, PX_A(PX_FOCUS_FROM, 0x50), PX_A(PX_FOCUS_TO, 0x50));
+    glass(c, px, py, pw, ph, PX_RADIUS_PANEL, PX_A(PX_SURFACE, 0xff));
+
+    /* "Playing in the PS VR2 headset", with the logo */
+    int x = px + pad;
+    const int right = px + pw - pad;
+    int cy = py + 64;
+    loadMark();
+    if (mark) {
+        wpe_display_ps5_canvas_image(c, x, cy - markSize / 2, markSize, markSize, mark, 255);
+        x += markSize + 16;
+    }
+    wpe_display_ps5_canvas_fill(c, x, cy - 6, 12, 12, 6, PX_CYAN);
+    wpe_display_ps5_canvas_text(c, x + 24, cy + 9, 0, 24, TRUE, PX_CYAN_TEXT, "Playing in the PS VR2 headset");
+    if (s->projection && *s->projection) {
+        const int w = wpe_display_ps5_canvas_text_width(c, 22, FALSE, s->projection);
+        wpe_display_ps5_canvas_text(c, right - w, cy + 8, 0, 22, FALSE, PX_TEXT_2, s->projection);
+    }
+
+    x = px + pad;
+    wpe_display_ps5_canvas_text(c, x, py + 168, right - x, 40, TRUE, PX_TEXT, s->title && *s->title ? s->title : "Video");
+    wpe_display_ps5_canvas_fill_gradient(c, x, py + 192, 120, 4, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    if (s->message && *s->message)
+        wpe_display_ps5_canvas_text(c, x, py + 240, right - x, 22, FALSE, PX_TEXT_3, s->message);
+
+    vrSeekRow(c, s, x, py + 330, right - x, k);
+
+    const int lineY = py + ph - 96;
+    wpe_display_ps5_canvas_fill(c, px + 24, lineY, pw - 48, 1, 0, PX_A(PX_LINE, 0xc0));
+    cy = lineY + 48;
+    x = px + pad;
+    x += keyCap(c, x, cy, "○") + 8;
+    x += keyCap(c, x, cy, "Options") + 8;
+    x += keyCap(c, x, cy, "touchpad") + 14;
+    wpe_display_ps5_canvas_text(c, x, cy + T_HINT * 36 / 100, 0, T_HINT, FALSE, PX_TEXT_2, "Back to the TV (the video keeps playing)");
+    if (s->controls) {
+        static const char* const keys[] = { "✕", "◀ ▶", "△" };
+        static const char* const labels[] = { "Play / pause", "30 s", "Projection" };
+        int w = 0;
+        for (int i = 0; i < 3; i++)
+            w += hintWidth(c, keys[i], labels[i]) + (i ? 28 : 0);
+        int hx = right - w;
+        for (int i = 0; i < 3; i++)
+            hx += hint(c, hx, cy, keys[i], labels[i]) + 28;
+    }
 }

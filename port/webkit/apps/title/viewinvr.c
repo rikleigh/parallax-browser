@@ -18,13 +18,24 @@
  *
  *   X                play / pause (the page's video element, so the site's
  *                    player stays in sync)
- *   D-pad left/right seek -10 s / +10 s
+ *   D-pad left/right skip -30 s / +30 s (held: on and on, faster after 1.5 s)
+ *   right stick      scrub: left and right move the seek target, at full
+ *                    tilt a twelfth of the video a second (at least 1 min/s)
  *   Triangle         next projection
  *   Square           recentre (the video's front where you look)
+ *   O                cancels a seek being chosen, else as below
  *   O, Options or    back to the TV (playback continues)
  *   touchpad
  *
- * The TV shows a notice meanwhile, saying how to get back. Without a
+ * Skips and scrubbing choose a target first, shown on the seek bar with its
+ * time; it is sent to the page 0.6 s after the last skip, or 0.5 s after the
+ * stick is let go (YouTube's seeks are slow: one seek, not one per press).
+ * The player panel (browserdraw.c bui_draw_vr_panel: the title, the
+ * projection, play state, the seek bar, the controls) shows in the headset
+ * on entry and for 4 s after a press, and stays while paused or seeking;
+ * the page is asked for its time every second while it shows (every 2 s
+ * otherwise, for the TV). The TV shows a card meanwhile (bui_draw_vr_tv):
+ * the same bar and how to get back. Without a
  * connected headset the shortcut shows "PS VR2 not connected" on the TV and
  * stays there. VR also ends by itself when the headset is unplugged, when no
  * head pose arrives within 15 s, and when the system holds the pad for 10 s
@@ -36,6 +47,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "viewinvr.h"
+#include "browserdraw.h"
 #include "vrlayout.h"
 
 #include <ctype.h>
@@ -80,6 +92,28 @@ static char* vrOrigin;
 static char vrAspect[8];
 static char vrShown[128];           /* why, for the hint and the TV */
 static unsigned vrRefines;          /* thumbnails asked for again in VR */
+
+/* The player: the page's last answer (the time moves on from vrTimeAt while
+ * playing), the seek target being chosen, the panel and the TV's card. */
+static gboolean vrPaused;
+static double vrTime, vrDuration = NAN, vrBuffered = -1;
+static gint64 vrTimeAt;
+static gboolean vrSeeking;   /* a target is being chosen or was sent */
+static gboolean vrSeekSent;  /* sent: waiting for the page's answer */
+static unsigned vrSeekSeq;   /* the answer of the newest send ends the seek */
+static double vrTarget;
+static gint64 vrCommitAt;    /* sent then; 0 while the stick holds it */
+static guint32 vrHeld;       /* the buttons held (onCapturedPad) */
+static gint64 vrHoldSince, vrHoldNext, vrStickAt;
+static gboolean vrPolling;
+static gint64 vrPolledAt;
+static char vrMessage[160];
+static gint64 vrMessageUntil;
+static gint64 vrPanelUntil;  /* the panel shows until then (and while paused or seeking) */
+static guint vrTick;         /* every 50 ms in VR */
+static WPEDisplayPS5Canvas* vrPanel;
+static WPEDisplayPS5Canvas* vrCard;
+static char vrDrawn[512];    /* what the panel and card show: redrawn when it changes */
 
 /* ---------------------------------------------------------------- the page's video */
 
@@ -138,9 +172,9 @@ static const char kProbeScript[] =
     "  return out.join('\\n');\n"
     "})()";
 
-/* Play/pause or seek the remembered video (found again if it went away);
- * YouTube's player API when there is one, so its UI follows. %s = command,
- * %d = seconds. */
+/* Play/pause, seek (by seconds) or seekto (a time) the remembered video
+ * (found again if it went away), or just its state; YouTube's player API
+ * when there is one, so its UI follows. %s = command, %.3f = seconds. */
 static const char kCommandScript[] =
     "(function (cmd, arg) {\n"
     "  let v = window.__ps5wkVRVideo;\n"
@@ -159,13 +193,18 @@ static const char kCommandScript[] =
     "    else if (api) api.playVideo();\n"
     "    else { const p = v.play(); if (p && p.catch) p.catch(() => {}); }\n"
     "    paused = playing;\n"
-    "  } else if (cmd === 'seek') {\n"
+    "  } else if (cmd === 'seek' || cmd === 'seekto') {\n"
     "    const d = isFinite(v.duration) ? v.duration : Infinity;\n"
-    "    time = Math.max(0, Math.min(d - 0.5, v.currentTime + arg));\n"
+    "    time = Math.max(0, Math.min(d - 0.5, cmd === 'seek' ? v.currentTime + arg : arg));\n"
     "    if (api) api.seekTo(time, true); else v.currentTime = time;\n"
     "  }\n"
-    "  return ['found=1', 'paused=' + (paused ? 1 : 0), 'time=' + time, 'duration=' + v.duration].join('\\n');\n"
-    "})('%s', %d)";
+    "  let buffered = -1;\n"
+    "  try {\n"
+    "    for (let i = 0; i < v.buffered.length; i++)\n"
+    "      if (v.buffered.start(i) <= time + 0.5 && v.buffered.end(i) >= time) buffered = v.buffered.end(i);\n"
+    "  } catch (e) {}\n"
+    "  return ['found=1', 'paused=' + (paused ? 1 : 0), 'time=' + time, 'duration=' + v.duration, 'buffered=' + buffered].join('\\n');\n"
+    "})('%s', %.3f)";
 
 /* The value of "key=" in a key=value-per-line reply (newly allocated), or NULL. */
 static char* field(const char* reply, const char* key)
@@ -521,82 +560,278 @@ static char* originOf(const char* url)
     return lower;
 }
 
-/* ---------------------------------------------------------------- hint and TV notice */
+/* ---------------------------------------------------------------- the player panel and the TV's card */
 
-static void formatTime(double seconds, char* out, size_t size)
+static gboolean seekable(void)
 {
-    if (seconds != seconds || seconds < 0 || seconds > 1e9) { /* NaN, Infinity (live) */
-        snprintf(out, size, "--:--");
-        return;
-    }
-    long s = (long)seconds;
-    if (s >= 3600)
-        snprintf(out, size, "%ld:%02ld:%02ld", s / 3600, (s / 60) % 60, s % 60);
-    else
-        snprintf(out, size, "%ld:%02ld", s / 60, s % 60);
+    return vrControls && isfinite(vrDuration) && vrDuration > 0;
 }
 
-#define CONTROLS_PLAYER "\xE2\x9C\x95 play/pause   \xE2\x97\x80 \xE2\x96\xB6 seek 10 s"
-#define CONTROLS_VIEW "\xE2\x96\xB3 projection   \xE2\x96\xA1 recentre   \xE2\x97\x8B exit"
-#define CONTROLS CONTROLS_PLAYER "    " CONTROLS_VIEW
-/* On the TV, whatever else it says: how to get back. */
-#define TV_BACK "Back to the TV: \xE2\x97\x8B, Options or the touchpad"
-
-/* status: e.g. "Playing  1:23 / 10:00" (NULL: none). */
-static void showHint(const char* status, double seconds)
+/* The video's time now: the last answer, moved on while playing. */
+static double currentTime(void)
 {
-    char* label = projectionLabel(vrProjection, vrFisheye);
-    char* hint = g_strdup_printf("%s\n%s%s%s%s%s", label, vrShown, *vrShown ? "\n" : "", status ? status : "", status ? "\n" : "",
-        vrControls ? CONTROLS_PLAYER "\n" CONTROLS_VIEW : CONTROLS_VIEW "\n(no player controls on this page)");
-    char* tv = g_strdup_printf("Playing in the PS VR2 headset\n%s\n%s%s%s\n%s%s" TV_BACK, vrTitle && *vrTitle ? vrTitle : "Video", label,
-        *vrShown ? "  \xC2\xB7  " : "", vrShown, vrControls ? CONTROLS_PLAYER "   \xE2\x96\xB3 projection   \xE2\x96\xA1 recentre" : "",
-        vrControls ? "\n" : "");
-    wpe_display_ps5_vr_set_text(vrDisplay, hint, seconds, tv);
-    g_free(hint);
-    g_free(tv);
-    g_free(label);
+    double t = vrTime;
+    if (!vrPaused && vrTimeAt)
+        t += (g_get_monotonic_time() - vrTimeAt) / 1e6;
+    return isfinite(vrDuration) && vrDuration > 0 ? fmin(t, vrDuration) : t;
+}
+
+static gboolean panelVisible(gint64 now)
+{
+    return vrOn && (now < vrPanelUntil || vrSeeking || (vrControls && vrPaused));
+}
+
+/* Draws the panel and the card when what they show changed (the time to
+ * the second, the bar to the pixel), or always when @force. */
+static void updatePanel(gboolean force)
+{
+    if (!vrOn || !vrDisplay)
+        return;
+    const gint64 now = g_get_monotonic_time();
+    const gboolean visible = panelVisible(now);
+    const char* message = now < vrMessageUntil ? vrMessage : NULL;
+    char* projection = projectionLabel(vrProjection, vrFisheye);
+    BUIVRState v = { .title = vrTitle && *vrTitle ? vrTitle : "Video", .projection = projection, .message = message,
+        .controls = vrControls, .paused = vrPaused, .time = currentTime(), .duration = vrDuration, .buffered = vrBuffered,
+        .seeking = vrSeeking, .target = vrTarget };
+    char key[sizeof vrDrawn];
+    const double frac = seekable() ? v.time / vrDuration : 0, targetFrac = seekable() ? vrTarget / vrDuration : 0;
+    snprintf(key, sizeof key, "%d|%s|%s|%d%d%d|%ld|%d|%ld|%ld|%d|%ld|%.40s", visible, projection, message ? message : "", vrControls, vrPaused,
+        vrSeeking, (long)v.time, (int)(frac * 1100), isfinite(vrDuration) ? (long)vrDuration : -1L, (long)vrBuffered, (int)(targetFrac * 1100),
+        (long)vrTarget, vrTitle ? vrTitle : "");
+    if (!force && !strcmp(key, vrDrawn)) {
+        g_free(projection);
+        return;
+    }
+    snprintf(vrDrawn, sizeof vrDrawn, "%s", key);
+    if (!vrPanel) {
+        vrPanel = wpe_display_ps5_canvas_new(BUI_VR_PANEL_W, BUI_VR_PANEL_H);
+        vrCard = wpe_display_ps5_canvas_new(BUI_VR_TV_W, BUI_VR_TV_H);
+    }
+    if (visible)
+        bui_draw_vr_panel(vrPanel, &v);
+    /* the TV: why this projection, unless something newer is said */
+    v.message = message ? message : vrShown;
+    bui_draw_vr_tv(vrCard, &v);
+    /* "until changed": hidden by sending none */
+    wpe_display_ps5_vr_set_panel(vrDisplay, visible ? vrPanel : NULL, visible ? 3600 : 0, vrCard);
+    g_free(projection);
+}
+
+static void showPanel(double seconds)
+{
+    gint64 until = g_get_monotonic_time() + (gint64)(seconds * 1e6);
+    if (until > vrPanelUntil)
+        vrPanelUntil = until;
+    updatePanel(FALSE);
+}
+
+/* A line under the title for @seconds (the panel shows as long). */
+static void setMessage(const char* text, double seconds)
+{
+    snprintf(vrMessage, sizeof vrMessage, "%s", text ? text : "");
+    vrMessageUntil = *vrMessage ? g_get_monotonic_time() + (gint64)(seconds * 1e6) : 0;
+    showPanel(seconds);
 }
 
 static void statusFromReply(const char* reply, const char* prefix, char* out, size_t size)
 {
     char now[16], total[16];
-    formatTime(fieldNumber(reply, "time", -1), now, sizeof now);
-    formatTime(fieldNumber(reply, "duration", -1), total, sizeof total);
+    bui_format_time(fieldNumber(reply, "time", -1), now, sizeof now);
+    bui_format_time(fieldNumber(reply, "duration", -1), total, sizeof total);
     gboolean paused = fieldNumber(reply, "paused", 0) != 0;
     snprintf(out, size, "%s%s%s  %s / %s", prefix ? prefix : "", prefix ? "  \xC2\xB7  " : "", paused ? "Paused" : "Playing", now, total);
 }
 
+/* The player's state from a reply (the probe's or a command's). */
+static void stateFromReply(const char* reply)
+{
+    vrPaused = fieldNumber(reply, "paused", 0) != 0;
+    vrTime = fieldNumber(reply, "time", 0);
+    vrDuration = fieldNumber(reply, "duration", NAN);
+    vrBuffered = fieldNumber(reply, "buffered", -1);
+    vrTimeAt = g_get_monotonic_time();
+}
+
 /* ---------------------------------------------------------------- commands */
+
+typedef struct {
+    char* label;      /* for the log */
+    unsigned seekSeq; /* a seekto's: its answer ends the seek */
+    gboolean poll;    /* the state, every second or two: not logged */
+} CommandCall;
 
 static void onCommandDone(GObject* object, GAsyncResult* result, gpointer data)
 {
-    char* prefix = data;
+    CommandCall* call = data;
     GError* error = NULL;
     JSCValue* value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
     char* reply = value ? jsc_value_to_string(value) : NULL;
+    if (call->poll)
+        vrPolling = FALSE;
+    const gboolean endsSeek = call->seekSeq && call->seekSeq == vrSeekSeq && vrSeekSent;
     if (!reply || fieldNumber(reply, "found", 0) == 0) {
-        spike_log("vr: command: %s", error ? error->message : "the video is gone");
-        if (vrOn)
-            showHint("The page's video is gone", 4);
+        if (!call->poll) {
+            spike_log("vr: command: %s", error ? error->message : "the video is gone");
+            if (vrOn)
+                setMessage("The page's video is gone", 4);
+        }
+        if (endsSeek)
+            vrSeeking = vrSeekSent = FALSE;
     } else {
-        char status[160];
-        statusFromReply(reply, prefix, status, sizeof status);
-        spike_log("vr: %s", status);
-        if (vrOn)
-            showHint(status, 4);
+        if (endsSeek)
+            vrSeeking = vrSeekSent = FALSE;
+        /* a poll answered while a seek is chosen or on its way has the old time */
+        if (!(call->poll && vrSeeking))
+            stateFromReply(reply);
+        if (!call->poll) {
+            char status[160];
+            statusFromReply(reply, call->label, status, sizeof status);
+            spike_log("vr: %s", status);
+        }
     }
+    updatePanel(FALSE);
     g_free(reply);
     if (value)
         g_object_unref(value);
     g_clear_error(&error);
-    g_free(prefix);
+    g_free(call->label);
+    g_free(call);
 }
 
-static void pageCommand(const char* command, int seconds, const char* prefix)
+static void runCommand(const char* command, double seconds, const char* label, gboolean poll, unsigned seekSeq)
 {
     char script[sizeof kCommandScript + 64];
     snprintf(script, sizeof script, kCommandScript, command, seconds);
-    webkit_web_view_evaluate_javascript(vrWebView, script, -1, NULL, "ps5wk-vr-command.js", NULL, onCommandDone, g_strdup(prefix));
+    CommandCall* call = g_new0(CommandCall, 1);
+    call->label = g_strdup(label);
+    call->poll = poll;
+    call->seekSeq = seekSeq;
+    webkit_web_view_evaluate_javascript(vrWebView, script, -1, NULL, "ps5wk-vr-command.js", NULL, onCommandDone, call);
+}
+
+static void pageCommand(const char* command, int seconds, const char* label)
+{
+    runCommand(command, seconds, label, FALSE, 0);
+}
+
+/* The seek target chosen: to the page. */
+static void commitSeek(void)
+{
+    if (!vrSeeking || vrSeekSent)
+        return;
+    vrSeekSent = TRUE;
+    vrCommitAt = 0;
+    char label[48], when[16];
+    bui_format_time(vrTarget, when, sizeof when);
+    snprintf(label, sizeof label, "seek to %s", when);
+    runCommand("seekto", vrTarget, label, FALSE, ++vrSeekSeq);
+}
+
+/* Starts choosing a target at the time now (or goes on from the one chosen). */
+static void beginSeek(void)
+{
+    if (!vrSeeking)
+        vrTarget = currentTime();
+    vrSeeking = TRUE;
+    vrSeekSent = FALSE;
+}
+
+static void moveTarget(double by)
+{
+    vrTarget = fmax(0, fmin(vrDuration - 0.5, vrTarget + by));
+}
+
+/* D-pad left/right: 30 s, sent 0.6 s after the last one. */
+static void skip(double seconds)
+{
+    beginSeek();
+    moveTarget(seconds);
+    vrCommitAt = g_get_monotonic_time() + 600000;
+    showPanel(4);
+}
+
+static void cancelSeek(void)
+{
+    vrSeeking = vrSeekSent = FALSE;
+    vrCommitAt = 0;
+    spike_log("vr: seek cancelled");
+    showPanel(3);
+}
+
+/* Held D-pad (on and on) and the right stick (scrubbing), at every pad
+ * read while VR has the pad. */
+static void onCapturedPad(WPEDisplayPS5* display, guint32 held, double rightX, double rightY, gpointer data)
+{
+    (void)display;
+    (void)rightY;
+    (void)data;
+    const guint32 lr = WPE_DISPLAY_PS5_BUTTON_LEFT | WPE_DISPLAY_PS5_BUTTON_RIGHT;
+    const guint32 dir = held & lr, was = vrHeld & lr;
+    vrHeld = held;
+    if (!vrOn || !seekable())
+        return;
+    const gint64 now = g_get_monotonic_time();
+    if (dir != was) {
+        vrHoldSince = now;
+        vrHoldNext = now + 400000; /* the press itself went to onButtons */
+    } else if ((dir == WPE_DISPLAY_PS5_BUTTON_LEFT || dir == WPE_DISPLAY_PS5_BUTTON_RIGHT) && now >= vrHoldNext) {
+        skip(dir == WPE_DISPLAY_PS5_BUTTON_LEFT ? -30 : 30);
+        vrHoldNext = now + (now - vrHoldSince > 1500000 ? 70000 : 150000);
+    }
+    if (rightX != 0) {
+        const double dt = vrStickAt ? fmin((now - vrStickAt) / 1e6, 0.05) : 0;
+        if (!vrStickAt)
+            spike_log("vr: scrubbing with the right stick");
+        beginSeek();
+        moveTarget(rightX * fmax(60, vrDuration / 12) * dt);
+        vrCommitAt = 0; /* held by the stick */
+        vrStickAt = now;
+        vrPanelUntil = MAX(vrPanelUntil, now + 3000000);
+    } else if (vrStickAt) {
+        vrStickAt = 0;
+        if (vrSeeking && !vrSeekSent)
+            vrCommitAt = now + 500000;
+    }
+}
+
+/* Every 50 ms in VR: a chosen target sent when due, the page asked for its
+ * time, the panel redrawn when what it shows changed. */
+static gboolean onTick(gpointer data)
+{
+    (void)data;
+    if (!vrOn) {
+        vrTick = 0;
+        return G_SOURCE_REMOVE;
+    }
+    const gint64 now = g_get_monotonic_time();
+    if (vrSeeking && !vrSeekSent && vrCommitAt && now >= vrCommitAt)
+        commitSeek();
+    if (vrControls && !vrPolling && now - vrPolledAt >= (panelVisible(now) ? 1000000 : 2000000)) {
+        vrPolling = TRUE;
+        vrPolledAt = now;
+        runCommand("state", 0, NULL, TRUE, 0);
+    }
+    updatePanel(FALSE);
+    return G_SOURCE_CONTINUE;
+}
+
+/* Entering: the probe's answer is the first state. */
+static void resetPlayer(const char* reply)
+{
+    vrSeeking = vrSeekSent = vrPolling = FALSE;
+    vrCommitAt = vrStickAt = vrPolledAt = 0;
+    vrHeld = 0;
+    vrMessage[0] = 0;
+    vrMessageUntil = vrPanelUntil = 0;
+    vrDrawn[0] = 0;
+    vrPaused = FALSE;
+    vrTime = 0;
+    vrDuration = NAN;
+    vrBuffered = -1;
+    vrTimeAt = 0;
+    if (reply && fieldNumber(reply, "found", 0) != 0)
+        stateFromReply(reply);
 }
 
 static void setProjection(int projection, double fisheye)
@@ -607,7 +842,7 @@ static void setProjection(int projection, double fisheye)
     char* label = projectionLabel(projection, fisheye);
     spike_log("vr: projection %s", label);
     g_free(label);
-    showHint(NULL, 4);
+    setMessage(vrShown, 4);
 }
 
 static void nextProjection(void)
@@ -650,7 +885,9 @@ static void onVRState(WPEDisplayPS5* display, gboolean active, const char* messa
     vrOn = active;
     if (active) {
         SPIKE_PASS("vr", "headset shows the video (%s)", message && *message ? message : "up");
-        showHint(NULL, 6);
+        setMessage(vrShown, 6);
+        if (!vrTick)
+            vrTick = g_timeout_add(50, onTick, NULL);
         return;
     }
     rememberChoice();
@@ -714,6 +951,7 @@ static void startWhenReady(void)
     vrProbeReply = NULL;
     readHints(reply, &vrHints);
     vrControls = fieldNumber(reply, "found", 0) != 0;
+    resetPlayer(reply);
     if (!vrVideoWidth) { /* no thumbnails: the page's size of the element's video */
         char* size = field(reply, "size");
         if (size)
@@ -770,7 +1008,7 @@ static void onThumbnails(WPEDisplayPS5* display, const guint8* luma, guint frame
     int projection = decide(&fisheye, " (looked again)");
     if (projection != vrProjection || fisheye != vrFisheye) {
         setProjection(projection, fisheye);
-        showHint("Projection guessed again", 4);
+        setMessage("Projection guessed again", 4);
     }
     if (!vrGuessConclusive && !vrRemembered && vrRefines < 3)
         g_timeout_add_seconds(5, refineGuess, GUINT_TO_POINTER(vrSeq));
@@ -868,24 +1106,34 @@ static gboolean onButtons(WPEDisplayPS5* display, guint32 pressed, gpointer data
     /* Every press in VR is logged: whether presses reach the title at all
      * (2026-11-02: none was seen in 466 s of VR mode without a headset). */
     spike_log("vr: pad 0x%x in VR%s", (unsigned)pressed, vrStarting ? " (headset coming up)" : "");
+    if ((pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE) && vrOn && vrSeeking && !vrSeekSent) {
+        cancelSeek(); /* O with a target chosen: back to where it was */
+        return TRUE;
+    }
     if (pressed & LEAVE_BUTTONS) {
         ps5wk_vr_stop(FALSE, vrStarting ? "pad, while the headset came up" : "pad");
         return TRUE;
     }
     if (vrStarting)
         return TRUE; /* the headset is coming up: the pad is ours already */
-    if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS)
-        vrControls ? pageCommand("toggle", 0, NULL) : showHint(NULL, 4);
-    else if (pressed & WPE_DISPLAY_PS5_BUTTON_LEFT)
-        vrControls ? pageCommand("seek", -10, "-10 s") : showHint(NULL, 4);
-    else if (pressed & WPE_DISPLAY_PS5_BUTTON_RIGHT)
-        vrControls ? pageCommand("seek", 10, "+10 s") : showHint(NULL, 4);
-    else if (pressed & WPE_DISPLAY_PS5_BUTTON_TRIANGLE)
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS) {
+        if (vrControls) {
+            commitSeek(); /* a target chosen goes first */
+            pageCommand("toggle", 0, NULL);
+        }
+        showPanel(4);
+    } else if (pressed & (WPE_DISPLAY_PS5_BUTTON_LEFT | WPE_DISPLAY_PS5_BUTTON_RIGHT)) {
+        if (seekable())
+            skip(pressed & WPE_DISPLAY_PS5_BUTTON_LEFT ? -30 : 30);
+        else
+            showPanel(4);
+    } else if (pressed & WPE_DISPLAY_PS5_BUTTON_TRIANGLE)
         nextProjection();
     else if (pressed & WPE_DISPLAY_PS5_BUTTON_SQUARE) {
         wpe_display_ps5_vr_recenter(vrDisplay);
-        showHint("Recentred", 2);
-    }
+        setMessage("Recentred", 3);
+    } else
+        showPanel(4);
     return TRUE;
 }
 
@@ -907,6 +1155,7 @@ void ps5wk_vr_init(WPEDisplay* display, WebKitWebView* webView)
     vrDisplay = WPE_DISPLAY_PS5(display);
     vrWebView = webView;
     wpe_display_ps5_set_button_handler(vrDisplay, onButtons, NULL);
+    wpe_display_ps5_set_captured_pad_callback(vrDisplay, onCapturedPad, NULL);
 }
 
 /* ---------------------------------------------------------------- log-only self-test */
@@ -1030,8 +1279,8 @@ static gboolean selftestTick(gpointer data)
     /* player controls and recentre */
     switch (step) {
     case 0: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_CROSS, NULL); return G_SOURCE_CONTINUE;    /* pause */
-    case 1: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_RIGHT, NULL); return G_SOURCE_CONTINUE;    /* +10 s */
-    case 2: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_LEFT, NULL); return G_SOURCE_CONTINUE;     /* -10 s */
+    case 1: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_RIGHT, NULL); return G_SOURCE_CONTINUE;    /* +30 s (sent 0.6 s later) */
+    case 2: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_LEFT, NULL); return G_SOURCE_CONTINUE;     /* -30 s */
     case 3: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_CROSS, NULL); return G_SOURCE_CONTINUE;    /* play */
     case 4: wpe_display_ps5_vr_sim_look(vrDisplay, 45, 0); return G_SOURCE_CONTINUE;
     case 5: onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_SQUARE, NULL); return G_SOURCE_CONTINUE;   /* recentre at 45 */

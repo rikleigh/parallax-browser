@@ -51,10 +51,16 @@ play the video on a page in the **PS VR2** headset.
 | Button | In VR |
 | --- | --- |
 | X | Play / pause |
-| D-pad left / right | Seek -10 s / +10 s |
+| D-pad left / right | Skip back / forward 30 s (hold to keep going) |
+| Right stick left / right | Scrub along the seek bar |
 | Triangle | Next projection |
 | Square | Recentre on where you look |
+| O | Cancel a seek you're choosing |
 | O, Options or touchpad | Back to the TV (playback continues) |
+
+Any button shows the player panel in the headset: the seek bar, the time
+and the controls. It stays while the video is paused. A skip or scrub
+moves a marker on the bar first; the video seeks when you stop.
 
 ## Requirements
 

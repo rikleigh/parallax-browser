@@ -523,6 +523,13 @@ int wpe_display_ps5_canvas_text(WPEDisplayPS5Canvas* canvas, int x, int baseline
     return penX - x;
 }
 
+void wpe_display_ps5_vr_set_panel(WPEDisplayPS5* display, WPEDisplayPS5Canvas* panel, double seconds, WPEDisplayPS5Canvas* tv)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().setVRPanel(panel ? panel->px.data() : nullptr, panel ? panel->width : 0, panel ? panel->height : 0, seconds,
+        tv ? tv->px.data() : nullptr, tv ? tv->width : 0, tv ? tv->height : 0);
+}
+
 void wpe_display_ps5_set_ui_layer(WPEDisplayPS5* display, WPEDisplayPS5Canvas* canvas, int x, int y)
 {
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));

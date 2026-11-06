@@ -543,9 +543,10 @@ gradient. The menu's header has the Parallax mark (48 px, made from
 icon0.png by `apps/title/brand-assets.py`, shipped by `package.sh` as
 `/app0/ui/parallax-mark.bgra`) and wordmark, the lists between L1 and R1
 key caps; rows have a tile with the site's initial in one of the brand's
-tints; the footer shows what the buttons do for the list shown. Messages,
-the View in VR hint and the TV notice (`PS5Text.cpp`) are the same navy
-glass with a violet-to-magenta edge. The settings, crash and form pages
+tints; the footer shows what the buttons do for the list shown. View in
+VR's player panel and TV card are drawn the same way (`bui_draw_vr_panel`,
+`bui_draw_vr_tv`). Messages (`PS5Text.cpp`) are the same navy glass with a
+violet-to-magenta edge. The settings, crash and form pages
 use the palette too.
 
 **How it is drawn.** The title draws the bar and menu itself, like the
@@ -560,7 +561,8 @@ it in a persistent GL buffer (a memcpy on the render thread, the page's own
 shader reads it) and draws it over the page or the composited scene, under
 the messages, the pointer and the performance overlay. So it is the same
 with GPU compositing on or off, and not shown in the headset (View in VR
-draws the TV notice instead). A menu frame is a 1920x1080 canvas (8 MB,
+hands its panel and TV card over with `wpe_display_ps5_vr_set_panel()`
+instead). A menu frame is a 1920x1080 canvas (8 MB,
 freed when the menu closes; the renderer keeps one 8 MB GL buffer after
 the first use); the loading bar 1920x104 (0.8 MB). The drawing itself is
 `apps/title/browserdraw.c`, from a plain state that `browserui.c` fills
@@ -1975,24 +1977,43 @@ The `<video>` playing in the page goes into the PS VR2 headset; the page
 keeps playing it and the title draws the same decoded frames (hardware or
 software path) on a sphere, dome or big flat screen. Nothing changes in
 WebKit (no patch): it is all in the title (`wpe-ps5/PS5RendererVR.cpp`,
-`PS5Text.cpp`, `apps/title/viewinvr.c`).
+`apps/title/viewinvr.c`, its panel in `apps/title/browserdraw.c`).
 
 **Pad.** On a page: **touchpad button** = View in VR (a message on the TV
 says so for 4 s when a video of 640 px or more starts, at most every 2
-minutes). In VR the whole pad belongs to it:
+minutes). In VR the
+whole pad belongs to it:
 
 | button | in VR |
 | --- | --- |
 | X | play / pause (the page's video element, or YouTube's player API) |
-| D-pad left / right | seek -10 s / +10 s |
+| D-pad left / right | skip -30 s / +30 s; held, on and on (every 0.15 s, every 0.07 s after 1.5 s) |
+| right stick left / right | scrub: the target moves at up to a twelfth of the video a second (at least 1 min/s) |
 | Triangle | next projection: flat, 180 SBS, 180 TB, 180 mono, 360 mono, 360 TB, 360 SBS, fisheye SBS |
 | Square | recentre (the video's front goes where you look; yaw only) |
+| O | cancels a seek being chosen (else as below) |
 | O, Options or touchpad | back to the TV, playback continues (also while the headset is coming up) |
 
-The headset shows a hint for a few seconds after entering and after each
-press (projection, playing/paused and time, the controls); the TV shows
-"Playing in the PS VR2 headset", the page title, the projection and the
-controls, and always "Back to the TV: ○, Options or the touchpad". Without a
+Skips and scrubbing move a target on the seek bar (with its time and how far
+from now in a bubble); the page gets one seek, 0.6 s after the last skip or
+0.5 s after the stick is let go, not one per press (YouTube's seeks take a
+while). X sends a chosen target before it plays or pauses. Held buttons and
+the stick come from `wpe_display_ps5_set_captured_pad_callback()` (every
+pad read while VR has the pad).
+
+The headset shows the player panel (`bui_draw_vr_panel`, 1240x400 px, head-
+locked about 23 degrees below the view's centre and 50 degrees wide): the
+title, the projection with △, a message line (why this projection,
+"Recentred"), a play/pause button, the time, the seek bar (played in the
+violet-to-magenta gradient, buffered lighter, the thumb), the length (LIVE
+for a live stream: no seeking) and the controls. It shows on entry and for
+4 s after a press, and stays while paused or seeking. The page is asked for
+its time, length and buffered range every second while it shows (2 s
+otherwise); between answers the time moves on by the clock, and the panel is
+redrawn only when the second or the bar's pixel changes. The TV shows a card
+(`bui_draw_vr_tv`): "Playing in the PS VR2 headset", the title, the
+projection, the same seek bar, and "Back to the TV" with ○, Options and the
+touchpad. Without a
 connected headset the TV shows "PS VR2 not connected..." for 8 s and nothing
 else happens (no VR mode; see *No headset* below). VR also ends by itself,
 with a message on the TV, when the headset is unplugged, when no head pose

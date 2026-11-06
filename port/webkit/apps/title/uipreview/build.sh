@@ -39,6 +39,7 @@ class PS5Renderer {
 public:
     static PS5Renderer& singleton();
     void setUILayer(const uint8_t* bgra, int x, int y, int width, int height);
+    void setVRPanel(const uint32_t*, int, int, double, const uint32_t*, int, int) { }
 };
 H
 # Copies, so their quoted includes find the stand-ins.

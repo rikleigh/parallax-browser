@@ -128,6 +128,8 @@ struct _WPEDisplayPS5Private {
     // handler gets it) while the video plays in the headset.
     WPEDisplayPS5ButtonHandler buttonHandler { nullptr };
     gpointer buttonHandlerData { nullptr };
+    WPEDisplayPS5CapturedPadCallback capturedPadCallback { nullptr };
+    gpointer capturedPadCallbackData { nullptr };
     uint32_t swallowedButtons { 0 };
     bool padCaptured { false };
     // What the pad read says about the system (logged on change): the read's
@@ -724,6 +726,8 @@ static void padTick(WPEDisplayPS5* display)
     }
     if (priv->padCaptured) {
         priv->repeatingKey = 0;
+        if (priv->capturedPadCallback)
+            priv->capturedPadCallback(display, now, stickValue(data.sticks[2]), stickValue(data.sticks[3]), priv->capturedPadCallbackData);
         return;
     }
     if (priv->uiMode) {
@@ -1053,6 +1057,13 @@ void wpe_display_ps5_set_button_handler(WPEDisplayPS5* display, WPEDisplayPS5But
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
     display->priv->buttonHandler = handler;
     display->priv->buttonHandlerData = userData;
+}
+
+void wpe_display_ps5_set_captured_pad_callback(WPEDisplayPS5* display, WPEDisplayPS5CapturedPadCallback callback, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->capturedPadCallback = callback;
+    display->priv->capturedPadCallbackData = userData;
 }
 
 // Buttons held while the owner changes are ignored until released, so

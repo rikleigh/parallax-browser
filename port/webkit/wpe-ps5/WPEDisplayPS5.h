@@ -94,6 +94,18 @@ typedef gboolean (* WPEDisplayPS5ButtonHandler) (WPEDisplayPS5 *display,
 WPE_API void        wpe_display_ps5_set_button_handler (WPEDisplayPS5             *display,
                                                         WPEDisplayPS5ButtonHandler handler,
                                                         gpointer                   user_data);
+/* While View in VR has the pad: called at every pad read (about 120 a
+ * second) with the buttons held and the right stick (-1..1, right and down
+ * positive, 0 in the dead zone), for held buttons and scrubbing. Presses
+ * still go to the button handler first. Main thread. */
+typedef void (* WPEDisplayPS5CapturedPadCallback) (WPEDisplayPS5 *display,
+                                                   guint32        held,
+                                                   double         right_x,
+                                                   double         right_y,
+                                                   gpointer       user_data);
+WPE_API void        wpe_display_ps5_set_captured_pad_callback (WPEDisplayPS5                   *display,
+                                                               WPEDisplayPS5CapturedPadCallback callback,
+                                                               gpointer                         user_data);
 
 /* A short message over the page on the TV (bottom centre), for @seconds. */
 WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
@@ -298,6 +310,14 @@ WPE_API void        wpe_display_ps5_vr_set_text (WPEDisplayPS5 *display,
                                                  const char    *hint,
                                                  double         seconds,
                                                  const char    *tv_text);
+/* The same with the application's own drawing (copied): @panel in the
+ * headset for @seconds (NULL or 0 s: none), head-locked below the view's
+ * centre, 1240 px about 50 degrees wide; @tv: the TV's card while in VR,
+ * centred on black (NULL: unchanged). */
+WPE_API void        wpe_display_ps5_vr_set_panel (WPEDisplayPS5       *display,
+                                                  WPEDisplayPS5Canvas *panel,
+                                                  double               seconds,
+                                                  WPEDisplayPS5Canvas *tv);
 /* Small luma pictures of the playing video, for guessing its layout: up
  * to @frames decoded frames about 200 ms apart (fewer when it is paused),
  * each @size x @size bytes (128), every byte the mean luma of its part of

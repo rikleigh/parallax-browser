@@ -91,3 +91,30 @@ void bui_draw_menu(WPEDisplayPS5Canvas* canvas, const BUIState* state);
 
 /* The pointer target under (x, y) from the last bui_draw_menu, or NULL. */
 const BUIHot* bui_hot_at(double x, double y);
+
+/* ---- View in VR (viewinvr.c): the player panel in the headset and the
+ * card on the TV meanwhile. */
+typedef struct {
+    const char* title;      /* the video's (the page's title) */
+    const char* projection; /* "180° 3D side by side" */
+    const char* message;    /* a line under the title (why this projection, "Recentred"); NULL: none */
+    gboolean controls;      /* the page's video element was found: play/pause and seeking */
+    gboolean paused;
+    double time;            /* seconds */
+    double duration;        /* seconds; not finite or <= 0: live or not known (no seek bar) */
+    double buffered;        /* buffered up to (seconds), < 0: not known */
+    gboolean seeking;       /* a seek target being chosen (not sent yet) */
+    double target;          /* its time */
+} BUIVRState;
+
+/* The panel's canvas size: the headset shows it head-locked, below the
+ * view's centre (wpe-ps5 PS5RendererVR.cpp). */
+#define BUI_VR_PANEL_W 1240
+#define BUI_VR_PANEL_H 400
+void bui_draw_vr_panel(WPEDisplayPS5Canvas* canvas, const BUIVRState* state);
+/* The TV's card while the video plays in the headset (shown centred on black). */
+#define BUI_VR_TV_W 1400
+#define BUI_VR_TV_H 560
+void bui_draw_vr_tv(WPEDisplayPS5Canvas* canvas, const BUIVRState* state);
+/* "1:23", "1:02:03"; "--:--" when not known. */
+void bui_format_time(double seconds, char* out, size_t size);
