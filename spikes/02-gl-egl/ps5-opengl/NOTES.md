@@ -599,3 +599,30 @@ present untouched).
 `busy.html`: 2000 cubes 46.4 -> 56.3 fps (textured 43.6 -> 53.2); 1000 and
 below 59.9. `msaa-clear.html` 0 failures, `webgl.html` PASS, video formats all
 20 page checks PASS, three.js's cube right on the TV.
+
+## Patch 0015: batched draws fence their descriptor tables once (2026-11-07)
+
+A draw flushed its three descriptor tables (vertex buffers, vertex stage,
+fragment stage) with a fence each. A fence waits for every older flush on its
+thread, so after 0014 the three were most of what remained of the draw's own
+time (~13% of the WebGL thread at 2000 draws per frame). A batched draw
+(`flush_cache` set: the deferred queue and multi-draw chunks) now flushes the
+first two unfenced (`ps5_flush_draw_table`), and the fragment table's flush,
+where the draw has always fenced last, fences for all three; with no fragment
+table, a lone fence there. Nothing between them submits work, and every exit
+between them drops the draw. Unbatched draws are unchanged.
+
+A first version left all three unfenced and relied on the runtime draw's fence
+before queueing. It reached 59.9 fps but the video formats page stalled once in
+its second round (the title kept presenting; the page's WebGL went idle) and
+the console needed a power-off. Why is not known: the runtime does fence on
+the same thread before queueing. This version keeps a Gallium fence before the
+runtime draw, as before.
+
+Host test: `test_batched_draw_fences.py` (the helper; the two deferred sites,
+the fragment fence and its lone-fence fallback, nothing submitted or kept
+between them; only batched callers pass a flush cache).
+
+`busy.html`: 2000 cubes 56.3 -> 59.8 fps (textured 53.2 -> 56.3); 1000 and
+below 59.9. Video formats page 3 of 3 runs, all 20 page checks PASS and the
+second round finished each time.
