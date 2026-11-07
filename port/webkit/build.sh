@@ -31,6 +31,9 @@
 #      time); WC=0 builds without it (default build dir build-cpu).
 #      `build` reconfigures first when the build dir was configured with
 #      the other WC setting.
+#      WEBGL=1: WebGL through the GPU process, hosted in the title (ANGLE over
+#      ps5-opengl; spikes/11-webgl). Default build dir build-webgl, source
+#      worktree src-webgl (branch ps5-webgl).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +43,12 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 WK="$ROOT/toolchain/wpe-webkit"
 WC="${WC:-1}"
+WEBGL="${WEBGL:-0}"
+if [ "$WEBGL" = 1 ]; then
+    SRC="${SRC:-$WK/src-webgl}"
+    BLD="${BLD:-$WK/build-webgl}"
+    LOGDIR="${LOGDIR:-$BLD}"
+fi
 SRC="${SRC:-$WK/src}"
 if [ "$WC" = 1 ]; then
     BLD="${BLD:-$WK/build}"
@@ -170,6 +179,9 @@ WEBKIT_OPTIONS=(
     -DLD_PACK_RELATIVE_RELOCS=OFF
     -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF -DCLANGD_AUTO_SETUP=OFF -DCMAKE_VERBOSE_MAKEFILE=OFF
 )
+if [ "$WEBGL" = 1 ]; then
+    WEBKIT_OPTIONS+=(-DENABLE_WEBGL=ON -DENABLE_GPU_PROCESS=ON)
+fi
 if [ "$WC" = 1 ]; then
     WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=ON -DUSE_GRAPHICS_LAYER_WC=ON)
 else

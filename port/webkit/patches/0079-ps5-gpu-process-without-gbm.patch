@@ -1,0 +1,17 @@
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 88dcb79cbf..fd02a0aee6 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -160,7 +160,11 @@ endif ()
+ 
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_SKIA PRIVATE ON)
+ 
+-WEBKIT_OPTION_DEPEND(ENABLE_GPU_PROCESS USE_GBM)
++# The PS5 has no GBM: its GPU process is a host for remote WebGL inside the
++# UI process (the title), drawing with ANGLE over ps5-opengl (spikes/11-webgl).
++if (NOT ENABLE_WPE_PLATFORM_PS5)
++    WEBKIT_OPTION_DEPEND(ENABLE_GPU_PROCESS USE_GBM)
++endif ()
+ WEBKIT_OPTION_DEPEND(ENABLE_WPE_PLATFORM_DRM USE_GBM)
+ WEBKIT_OPTION_DEPEND(USE_GBM USE_LIBDRM)
+ WEBKIT_OPTION_DEPEND(USE_EXTERNAL_HOLEPUNCH ENABLE_VIDEO)
