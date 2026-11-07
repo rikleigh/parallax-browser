@@ -505,3 +505,26 @@ flushed again, `mfence` (the repeat is a workaround for Atom's clflush
 ordering). On this AMD CPU `clflushopt` is ordered after older stores to its
 line, so the range and one `mfence` publish it; each draw makes several of
 these flushes (descriptor and constant tables, backing stores).
+
+## Patch 0011: clear only the descriptor slots a shader lists (2026-11-07)
+
+`ps5_prepare_constant` zeroed the whole 4 KiB descriptor prefix of each
+stage's (recycled) descriptor storage on every draw, before the UBO, texture,
+storage and image writers filled their slots; the batch snapshot skips that
+prefix because of this clear. A shader reads only the slots in its metadata's
+descriptor bindings, and each writer clears and rewrites its own slot, so
+`ps5_clear_descriptor_prefix` now zeroes just each listed binding
+(`offset .. offset + array_size * stride`): ~16 bytes for a one-UBO shader
+instead of 4 KiB, which also stops the clear re-reading lines the previous
+draw had flushed out of cache. The whole prefix is still cleared with a
+geometry or tessellation stage (merged layouts), a binding in a non-zero set,
+or a binding reaching past the prefix. Host test:
+`tests/ps5/test_descriptor_prefix_clear.py`.
+
+`busy.html`: 2000 cubes 38.8 -> 41.1 fps (textured 39.0), 1000 cubes 13.35 ->
+12.75 ms per frame on the WebGL thread. `msaa-clear.html` 0 failures,
+`webgl.html` PASS, video formats 23 PASS / 0 FAIL, three.js's cube right on
+the TV. Profile at 2000 cubes: `ps5_prepare_constant` 6% -> under 1% of the
+WebGL thread; the libc/AGC time left is led by `ps5_agc_set_cx_mrt` (5%),
+`ps5_render_arena_allocate` (3.4%), `ps5_agc_gate2_run` (3.3%) and
+`runtime_shader_pair_get` (2.3%).
