@@ -1,0 +1,61 @@
+<!doctype html>
+<!-- WebGL M3 check (spikes/11-webgl): a three.js 360 player, as VR sites
+     build them: a VideoTexture on the inside of a sphere, the camera turning
+     slowly. The clip is the synthetic equirectangular grid
+     (test/media/make-vr-media.sh, vrtest_360_mono.mp4, 3840x1920 HEVC,
+     hardware-decoded): on the TV, labelled grid cells (FRONT, RIGHT, ...)
+     drift past, upright, the clock in the FRONT cell running. three.js
+     r160 from unpkg. Upload to /data/ps5webkit/webgl-pano.html and open
+     file:///data/ps5webkit/webgl-pano.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL 360</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #out { position: fixed; left: 24px; bottom: 16px; color: #eee; font: 24px sans-serif; text-shadow: 0 0 4px #000; }
+</style>
+</head>
+<body>
+<div id="out">loading three.js</div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+const out = document.getElementById('out');
+function log(text) { console.log('[webgl-pano] ' + text); }
+
+const video = document.createElement('video');
+video.src = '/data/ps5webkit/media/vrtest_360_mono.mp4';
+video.muted = true;
+video.loop = true;
+video.playsInline = true;
+video.crossOrigin = 'anonymous';
+video.play().then(() => log('playing'), err => log('play failed: ' + err));
+
+const renderer = new THREE.WebGLRenderer();
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 1, 1100);
+const geometry = new THREE.SphereGeometry(500, 60, 40);
+geometry.scale(-1, 1, 1);
+const texture = new THREE.VideoTexture(video);
+const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: texture }));
+scene.add(mesh);
+log('three.js r' + THREE.REVISION + ', ' + (renderer.capabilities.isWebGL2 ? 'WebGL 2' : 'WebGL 1'));
+
+let frames = 0, last = performance.now();
+renderer.setAnimationLoop(now => {
+  const lon = now / 100 % 360, lat = Math.sin(now / 4000) * 20;
+  const phi = THREE.MathUtils.degToRad(90 - lat), theta = THREE.MathUtils.degToRad(lon);
+  camera.lookAt(500 * Math.sin(phi) * Math.cos(theta), 500 * Math.cos(phi), 500 * Math.sin(phi) * Math.sin(theta));
+  renderer.render(scene, camera);
+  frames++;
+  if (now - last >= 2000) {
+    out.textContent = (frames * 1000 / (now - last)).toFixed(1) + ' fps, video ' + video.videoWidth + 'x' + video.videoHeight + ' at ' + video.currentTime.toFixed(1) + ' s';
+    log(out.textContent);
+    frames = 0; last = now;
+  }
+});
+</script>
+</body>
+</html>

@@ -43,6 +43,17 @@ struct PS5CompositorContext {
     // counts the frames converted into it so far. A stream drawn this way
     // is not drawn under the page (hole punch is the CPU path's).
     unsigned (*videoTexture)(uint64_t key, int* width, int* height, uint32_t* frames);
+    // WebGL's video textures (M3, spikes/11-webgl). Any thread but the
+    // render thread, with a GL context of the compositor's share group
+    // current that nothing else uses meanwhile: copies the newest converted
+    // frame of the stream `key` into `texture` (GL_TEXTURE_2D, RGBA8, at
+    // least videoFrameSize), upside down if flipY. The copy waits for the
+    // conversion on the GPU and the next conversion waits for the copy.
+    // Returns a GL sync object after the copy (the caller waits on it in the
+    // context that reads the texture, then deletes it), or null: no frame.
+    void* (*copyVideoFrame)(uint64_t key, unsigned texture, bool flipY);
+    // Any thread: the size of the stream's newest converted frame; false: none.
+    bool (*videoFrameSize)(uint64_t key, int* width, int* height);
 };
 
 // Counters for the performance overlay (PS5PerfOverlay.cpp). Totals since

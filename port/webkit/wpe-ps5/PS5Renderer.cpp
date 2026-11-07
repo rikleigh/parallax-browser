@@ -476,7 +476,7 @@ void PS5Renderer::setUpCompositorIfWanted()
     m_compositorSetUpDone = true;
     {
         PS5CompositorContext compositorContext { m_eglDisplay, m_eglConfig, m_eglContext, m_eglSurface, m_width, m_height,
-            [] { PS5Renderer::singleton().requestCompositorFrame(); }, compositorVideoTexture };
+            [] { PS5Renderer::singleton().requestCompositorFrame(); }, compositorVideoTexture, copyVideoFrame, videoFrameSize };
         int64_t compositorStart = nowUS();
         m_compositorReady = m_compositor->setUp(compositorContext);
         // The compositor's GL state must not leak into ours.
@@ -935,10 +935,132 @@ struct PS5VideoGL {
     uint32_t frames { 0 }; // converted so far (video layers repaint when it moves)
 };
 
+// WebGL's copies of video frames (M3, spikes/11-webgl): the newest
+// converted frame of each stream, by key, for other threads. `written`: a
+// fence after the conversion (a copy waits for it on the GPU); `read`: a
+// fence after the last copy (the next conversion into the texture waits for
+// it). Guarded by s_sharedVideoLock; the GL calls under it only queue work.
+namespace {
+struct SharedVideoFrame {
+    uint64_t key { 0 }; // 0: free
+    GLuint texture { 0 };
+    int width { 0 }, height { 0 };
+    GLsync written { nullptr };
+    GLsync read { nullptr };
+};
+GMutex s_sharedVideoLock;
+SharedVideoFrame s_sharedVideo[16];
+
+SharedVideoFrame* sharedVideoFrame(uint64_t key, bool create)
+{
+    SharedVideoFrame* free = nullptr;
+    for (auto& entry : s_sharedVideo) {
+        if (entry.key == key)
+            return &entry;
+        if (!entry.key && !free)
+            free = &entry;
+    }
+    if (create && free)
+        free->key = key;
+    return create ? free : nullptr;
+}
+
+void clearSharedVideoFrame(SharedVideoFrame& entry)
+{
+    if (entry.written)
+        glDeleteSync(entry.written);
+    if (entry.read)
+        glDeleteSync(entry.read);
+    entry = { };
+}
+} // namespace
+
+// Render thread: before the stream's texture is written again, the GPU waits
+// for WebGL's last copy out of it.
+static void waitForVideoFrameCopies(uint64_t key)
+{
+    if (!key)
+        return;
+    g_mutex_lock(&s_sharedVideoLock);
+    if (auto* entry = sharedVideoFrame(key, false); entry && entry->read) {
+        glWaitSync(entry->read, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(entry->read);
+        entry->read = nullptr;
+    }
+    g_mutex_unlock(&s_sharedVideoLock);
+}
+
+// Render thread: the stream's texture holds a new frame (or the stream went: texture 0).
+static void publishVideoFrame(uint64_t key, GLuint texture, int width, int height)
+{
+    if (!key)
+        return;
+    g_mutex_lock(&s_sharedVideoLock);
+    if (!texture) {
+        if (auto* entry = sharedVideoFrame(key, false))
+            clearSharedVideoFrame(*entry);
+    } else if (auto* entry = sharedVideoFrame(key, true)) {
+        entry->texture = texture;
+        entry->width = width;
+        entry->height = height;
+        if (entry->written)
+            glDeleteSync(entry->written);
+        entry->written = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush(); // other contexts wait on it
+    }
+    g_mutex_unlock(&s_sharedVideoLock);
+}
+
+bool PS5Renderer::videoFrameSize(uint64_t key, int* width, int* height)
+{
+    *width = *height = 0;
+    if (!key)
+        return false;
+    g_mutex_lock(&s_sharedVideoLock);
+    if (auto* entry = sharedVideoFrame(key, false); entry && entry->written) {
+        *width = entry->width;
+        *height = entry->height;
+    }
+    g_mutex_unlock(&s_sharedVideoLock);
+    return *width > 0 && *height > 0;
+}
+
+void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
+{
+    if (!key || !texture)
+        return nullptr;
+    GLsync done = nullptr;
+    g_mutex_lock(&s_sharedVideoLock);
+    if (auto* entry = sharedVideoFrame(key, false); entry && entry->written) {
+        glWaitSync(entry->written, 0, GL_TIMEOUT_IGNORED);
+        GLuint fbos[2] = { };
+        glGenFramebuffers(2, fbos);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbos[0]);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, entry->texture, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbos[1]);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        const int w = entry->width, h = entry->height;
+        // The stream's row 0 is the picture's top, as texImage2D's without
+        // UNPACK_FLIP_Y.
+        glBlitFramebuffer(0, 0, w, h, 0, flipY ? h : 0, w, flipY ? 0 : h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(2, fbos);
+        if (entry->read)
+            glDeleteSync(entry->read);
+        entry->read = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        done = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+    }
+    g_mutex_unlock(&s_sharedVideoLock);
+    return done;
+}
+
 void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame, const uint8_t* data)
 {
     auto* gl = static_cast<PS5VideoGL*>(stream.consumerData);
     if (stream.closed) {
+        publishVideoFrame(stream.key, 0, 0, 0);
         if (gl) {
             if (gl->buffer)
                 glDeleteBuffers(1, &gl->buffer);
@@ -960,6 +1082,7 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
         frame = nullptr; // not GPU memory (fake decoder): nothing to draw
     if (frame && frame->width && frame->height && frame->width <= 8192 && frame->height <= 8192) {
         int64_t start = nowUS();
+        waitForVideoFrameCopies(stream.key);
         const int w = static_cast<int>(frame->width), h = static_cast<int>(frame->height), ch = (h + 1) / 2;
         const bool remote = frame->remote;
         size_t needed = remote ? 0 : frame->format == PS5WK_VFMT_NV12
@@ -1041,6 +1164,7 @@ void PS5Renderer::handleVideo(PS5VideoStream& stream, const PS5VideoFrame* frame
             gl->valid = true;
             gl->lastFrameUS = start;
             gl->frames++;
+            publishVideoFrame(stream.key, gl->texture, w, h);
         }
         double ms = (nowUS() - start) / 1000.0;
         stats.videoFrames++;

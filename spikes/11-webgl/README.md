@@ -421,6 +421,42 @@ stays blank: its model is Draco-compressed and three.js's Draco decoder
 needs WebAssembly, which this build doesn't have (the page logs `DRACOLoader:
 WebAssembly is required`), not a WebGL fault.
 
+**M3 on the console (2026-11-07).** `texImage2D(TEXTURE_2D, 0, RGBA[8],
+RGBA, UNSIGNED_BYTE, video)` for a video the title decodes in hardware:
+
+- WebCore asks the context (`GraphicsContextGL::ps5CopyTextureFromVideoStream`)
+  with the player's ps5videosink stream key; the proxy sends
+  `CopyTextureFromVideoStreamPS5(key, texture, flipY)` in the stream, in
+  order with the page's other calls.
+- In the title (`RemoteGraphicsContextGLPS5.cpp`) a small ANGLE entry point
+  (`ANGLE_PS5PrepareExternalTexture2D`, `src/libANGLE/renderer/gl/ps5/`)
+  defines level 0 as the frame's size in RGBA8, marks it initialized (robust
+  resource init would otherwise clear the copy at first use) and returns the
+  native texture. A separate native ES context of the share group
+  (`PS5WebGLVideoCopy.cpp`) is made current just for the copy, so ANGLE's
+  native context keeps the state ANGLE thinks it has; ANGLE's context then
+  waits for the copy on the GPU.
+- PS5Renderer publishes each stream's newest converted frame with a fence
+  after the conversion; `copyVideoFrame` waits for it on the GPU, blits
+  (flipped for `UNPACK_FLIP_Y`), and leaves a fence the next conversion into
+  the texture waits for. No CPU waits on either side.
+- WebKit's GStreamer player suspends muted video that isn't visible in the
+  viewport, and a `<video>` never put in a document counts as invisible: it
+  stopped at its first frame. On PS5 a detached video now counts as visible
+  (`HTMLMediaElement::playerViewportVisibility`); muted videos in the page
+  scrolled away are still suspended (one hardware decoder).
+
+Seen on the TV: `test/webgl/video.html` (1080p H.264, detached and in the
+page) upright with its clock running at 60 fps; `test/webgl/pano.html`, the
+4K 360 grid, upright, clock running, 60 fps.
+
+**WebAssembly (2026-11-07).** On in WebProcesses with the JIT
+(ps5wk-child; `PS5WK_WASM=0` in child.env turns it off), bounds-checked
+memories. `test/wasm/wasm.html` passes (compile 9 ms; a 1M-step loop 0.41 ms
+in wasm, 0.53 ms in JS; memory grown to 64 MB) and threejs.org's
+`webgl_animation_keyframes`, blank before (Draco needs WebAssembly), shows its
+animated scene.
+
 Take option 1. Option 2 only if the owner wants WebGL-only players to run
 at any speed before the title work is done; it shares M1 below.
 
@@ -429,6 +465,6 @@ at any speed before the title work is done; it shares M1 below.
 | M0 | **Done 2026-11-07.** Register PPSA99006, run the Spike 11 title; add the share-group probe (ANGLE external context sharing with GL 4.6 core) | `angle-triangle PASS`, 8.3 µs per draw; all `share-*` PASS |
 | M1 | **Done 2026-11-07** (patches 0077–0083). `ENABLE_WEBGL` + ANGLE in the WPE build (patches carried in `port/webkit/patches`), `ENABLE_GPU_PROCESS` without GBM, `IPC::Semaphore` on `_umtx_op`, ANGLE linked into the title. Also the title host: WebKit's `GPUProcess` made in the title (`PS5GPUProcessInTitle.cpp`), each context a `GraphicsContextGLCoordinated` on the `RemoteGraphicsContextGL` work queue | a page creates a WebGL context and the stream connects (log only). `test/webgl/webgl.html`: WebGL 1 and 2 contexts, a triangle in each read back 0,255,0,255, no GL error, ~50 ms each |
 | M2 | **Done 2026-11-07** (patch 0084). The coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps. `test/webgl/spin.html` (a WebGL 2 and a WebGL 1 canvas redrawn every frame) and three.js's `webgl_geometry_cube` example: both shown, 60 fps, compositor paint 0.7 ms |
-| M3 | `CopyTextureFromVideoStream` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip; a VR tube site's own WebGL player works |
+| M3 | **Partly done 2026-11-07** (patch 0085). `CopyTextureFromVideoStreamPS5` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip: **done** (`test/webgl/pano.html`, three.js r160, `vrtest_360_mono.mp4` 3840x1920 HEVC, 60 fps, upright, clock running); a VR tube site's own WebGL player: for the owner to check (not tested here); sRGB video textures (`SRGB8_ALPHA8`) not yet |
 | M4 | Cost: ANGLE/driver state caching (§4.2c), glthread, the texture cap with WebGL buffers, memory lines for the host | busy scenes stay above 30 fps; `[mem]` flat |
 | later | WebXR on the same process (Spike 5 runtime + §4.8) | — |
