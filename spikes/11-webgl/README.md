@@ -396,6 +396,31 @@ Three things the first runs showed, now fixed:
 - 0083: `shouldUseRemoteRenderingForWebGL()` is false with coordinated
   graphics and no GBM; on PS5 it follows the preference.
 
+**M2 on the console (2026-11-07).** How the frames reach the screen:
+
+- The title's WebGL sharing context (the one ANGLE wraps) is an ES context
+  made with the compositor's GL 4.6 core context as its share context
+  (`PS5GPUProcessInTitle.cpp`, share-group rule 1); the work queue binds ES
+  before each context (rule 2). Log: `WebGL shares GL names with the
+  compositor`.
+- Each context is a `GraphicsContextGLCoordinated` subclass whose display
+  delegate hands every finished frame (native texture, size, GL fence) to a
+  `PS5WebGLLayer` (`GPUProcess/graphics/ps5/PS5WebGLLayers.h`), registered by
+  (WebProcess, `RemoteGraphicsContextGLIdentifier`).
+- In the WebProcess the proxy's delegate only carries that identifier;
+  `GraphicsLayerWC` sends it as `webGLLayerKey` in the layer update and
+  `WCScene` sets the found layer as the contents layer, as for video. The
+  scene now knows its page's WebProcess (`DrawingAreaProxyWCPS5` passes it).
+- Buffers and their fences are only destroyed on the render thread
+  (`collectGarbage()` each frame); a context going away stops its layer
+  drawing before its textures are deleted.
+
+Seen on the TV: both spin canvases turning at 59.9-60 fps, and three.js's
+textured cube "very smooth". threejs.org's `webgl_animation_keyframes`
+stays blank: its model is Draco-compressed and three.js's Draco decoder
+needs WebAssembly, which this build doesn't have (the page logs `DRACOLoader:
+WebAssembly is required`), not a WebGL fault.
+
 Take option 1. Option 2 only if the owner wants WebGL-only players to run
 at any speed before the title work is done; it shares M1 below.
 
@@ -403,7 +428,7 @@ at any speed before the title work is done; it shares M1 below.
 | --- | --- | --- |
 | M0 | **Done 2026-11-07.** Register PPSA99006, run the Spike 11 title; add the share-group probe (ANGLE external context sharing with GL 4.6 core) | `angle-triangle PASS`, 8.3 µs per draw; all `share-*` PASS |
 | M1 | **Done 2026-11-07** (patches 0077–0083). `ENABLE_WEBGL` + ANGLE in the WPE build (patches carried in `port/webkit/patches`), `ENABLE_GPU_PROCESS` without GBM, `IPC::Semaphore` on `_umtx_op`, ANGLE linked into the title. Also the title host: WebKit's `GPUProcess` made in the title (`PS5GPUProcessInTitle.cpp`), each context a `GraphicsContextGLCoordinated` on the `RemoteGraphicsContextGL` work queue | a page creates a WebGL context and the stream connects (log only). `test/webgl/webgl.html`: WebGL 1 and 2 contexts, a triangle in each read back 0,255,0,255, no GL error, ~50 ms each |
-| M2 | The coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps |
+| M2 | **Done 2026-11-07** (patch 0084). The coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps. `test/webgl/spin.html` (a WebGL 2 and a WebGL 1 canvas redrawn every frame) and three.js's `webgl_geometry_cube` example: both shown, 60 fps, compositor paint 0.7 ms |
 | M3 | `CopyTextureFromVideoStream` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip; a VR tube site's own WebGL player works |
 | M4 | Cost: ANGLE/driver state caching (§4.2c), glthread, the texture cap with WebGL buffers, memory lines for the host | busy scenes stay above 30 fps; `[mem]` flat |
 | later | WebXR on the same process (Spike 5 runtime + §4.8) | — |
