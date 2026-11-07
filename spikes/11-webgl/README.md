@@ -378,14 +378,32 @@ without it, plus maps and the occasional WebGL2-only site viewer.
 
 ### Recommendation and milestones
 
+**M1 on the console (2026-11-07).** The WebGL build, packaged as PPSA99006
+with the noprof driver, on `file:///data/ps5webkit/webgl.html`: the title
+logs `GPU process side started`, `GPU connection for WebProcess 4`, `ANGLE
+context for WebGL 1` / `2` (max texture 16384) and `first frame finished`;
+the page reads both triangles back green. The canvases stay blank (M2).
+Three things the first runs showed, now fixed:
+
+- 0082: `WebChromeClient::createGraphicsContextGL` opened a GL display in the
+  WebProcess before going remote; the payload has no libEGL and libepoxy
+  aborted. On PS5 WebGL there is remote only.
+- 0082: `BitmapTexturePool` kept its main-thread timer off on PS5 only
+  without the GPU process. With it on, removing the last scene stopped the
+  timer from the render thread and the title aborted. (In WebCore,
+  `ENABLE(WC_GPU_PROCESS)` isn't defined; the PS5 condition there is WC on
+  PS5.) The console dropped off the network about a minute after that abort.
+- 0083: `shouldUseRemoteRenderingForWebGL()` is false with coordinated
+  graphics and no GBM; on PS5 it follows the preference.
+
 Take option 1. Option 2 only if the owner wants WebGL-only players to run
 at any speed before the title work is done; it shares M1 below.
 
 | Milestone | Work | Done when |
 | --- | --- | --- |
 | M0 | **Done 2026-11-07.** Register PPSA99006, run the Spike 11 title; add the share-group probe (ANGLE external context sharing with GL 4.6 core) | `angle-triangle PASS`, 8.3 µs per draw; all `share-*` PASS |
-| M1 | `ENABLE_WEBGL` + ANGLE in the WPE build (patches carried in `port/webkit/patches`), `ENABLE_GPU_PROCESS` without GBM, `IPC::Semaphore` on `_umtx_op`, ANGLE linked into the title | a page creates a WebGL context and the stream connects (log only) |
-| M2 | The title host (`RemoteGraphicsContextGL` on a work queue), the coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps |
+| M1 | **Done 2026-11-07** (patches 0077–0083). `ENABLE_WEBGL` + ANGLE in the WPE build (patches carried in `port/webkit/patches`), `ENABLE_GPU_PROCESS` without GBM, `IPC::Semaphore` on `_umtx_op`, ANGLE linked into the title. Also the title host: WebKit's `GPUProcess` made in the title (`PS5GPUProcessInTitle.cpp`), each context a `GraphicsContextGLCoordinated` on the `RemoteGraphicsContextGL` work queue | a page creates a WebGL context and the stream connects (log only). `test/webgl/webgl.html`: WebGL 1 and 2 contexts, a triangle in each read back 0,255,0,255, no GL error, ~50 ms each |
+| M2 | The coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps |
 | M3 | `CopyTextureFromVideoStream` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip; a VR tube site's own WebGL player works |
 | M4 | Cost: ANGLE/driver state caching (§4.2c), glthread, the texture cap with WebGL buffers, memory lines for the host | busy scenes stay above 30 fps; `[mem]` flat |
 | later | WebXR on the same process (Spike 5 runtime + §4.8) | — |
