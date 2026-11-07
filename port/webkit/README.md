@@ -1011,6 +1011,8 @@ decoding, sound, the link server, the home page) can be changed on the
 | | |
 | --- | --- |
 | `/data/ps5webkit/audio-null` | title: consume audio silently (no sceAudioOut) |
+| `/data/ps5webkit/gl-thread` | title: Mesa's glthread for its GL contexts (the compositor's and WebGL's; `PS5_GLTHREAD=1` before `eglInitialize`); off by default, to measure (spikes/11-webgl M4) |
+| `/data/ps5webkit/title-profile` | title: the sampling profiler (`apps/common/profiler.c`) in the title, first line the `PS5WK_PROFILE` mode (empty: CPU time per thread); `/data/ps5webkit/prof/title-<pid>.prof`, `test/prof/prof.py --elf <package work dir>/llvm-pie.elf` |
 | `/data/ps5webkit/audio-silent` | title: real sceAudioOut ports at volume 0 (log-only runs) |
 | `/data/ps5webkit/audio-selftest` | title: open a port at start, 0.1 s of silence, leave it open (`RESULT ps5browser audio-selftest`) |
 | `[ps5audio]` lines | per stream: `sceAudioOutGetPortState` when the port opens and after 2 s (output bits, channels, volume, reroute count), failed `sceAudioOutOpen`/`SetVolume` calls, and at close the samples' peak and RMS and the count of failed `sceAudioOutOutput` calls (is the WebProcess sending silence? is the port refusing data?) |

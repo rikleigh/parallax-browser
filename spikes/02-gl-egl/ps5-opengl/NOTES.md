@@ -400,3 +400,60 @@ public sources.
 - `examples/gles3_probe.c`: minimal ES 3 plus export consumer, used for the
   link and package probes.
 - `build/` (gitignored): variant trees, logs, venv, title output.
+
+## Patch 0004: GPU blits into sRGB textures (2026-11-07, WebGL M4)
+
+`patches/0004-srgb-gpu-blit-through-linear-view.patch`: `ps5_blit_gpu_color`
+also takes an RGBA8 source into an `R8G8B8A8_SRGB` texture when the blit asks
+for the destination's linear format (GL_FRAMEBUFFER_SRGB off), drawing
+through an `R8G8B8A8_UNORM` surface of it. Before, that blit took the CPU
+fallback: the title's copy of a 1080p video frame into an SRGB8_ALPHA8 WebGL
+texture cost tens of ms (spikes/11-webgl, *M3 formats*). Built for trial with
+`PS5_OPENGL_PREFIX=$PS5WK_ROOT/toolchain/ps5-opengl-gles-noprof-m4 build.sh
+gles-noprof` (the new `PS5_OPENGL_PREFIX` installs a variant elsewhere, so
+the browser's own `toolchain/ps5-opengl-gles-noprof` stays as it was). Not
+run on the console yet. The `build/gles` tree has it applied (by hand, `git
+apply`); a `--clean` build applies it with the others.
+
+
+## Patch 0005: AGC register defaults fetched once (2026-11-07)
+
+`append_target_state` takes `sceAgcGetRegisterDefaults()`'s table, and every
+native draw (`ps5_agc_gate2_run`) called it again. Under the title profiler
+(`busy.html?n=1000`, WebGL 2) that call was 28% of the title's CPU, all at
+one address in the system library. `runtime_register_defaults` keeps the
+pointer after the first call, calls the function again every 4096th use and,
+if the pointer ever changes, logs `[ps5-agc] register defaults moved` and
+stops caching. 1000 draws per frame went from 32.7 to 47.0 fps (30 -> 21 µs
+per draw on the WebGL thread). The rest of the measured split is in
+`spikes/11-webgl/README.md` (M4).
+
+## Patch 0006: no restart conversion when no index is the restart index (2026-11-07)
+
+WebGL 2 has primitive restart on for every indexed draw, and `ps5_draw_vbo`
+sent every such draw through a `util_primconvert` context made and freed per
+draw, its indices rewritten and uploaded, and it never reached the deferred
+batch. `ps5_draws_contain_restart_index` scans the draw's indices in the
+buffer's CPU copy (`resource->data`); when none equals `restart_index` the
+draw goes on with `primitive_restart` off (user indices, out-of-range draws
+and indirect draws convert as before). `busy.html` (WebGL 2): 1000 cubes
+47.0 -> 54.7 fps, 2000 cubes 24.5 -> 29.9 (16 µs per draw on the WebGL
+thread); textured 52.7 and 28.6; GL error 0.
+
+## Patch 0007: a four-entry MRT register cache for every large table (2026-11-07)
+
+`ps5_agc_set_cx_mrt` cached its rewritten register table in one entry, and
+only for tables holding both 0x318 and 0x2d5 (the initial graphics table).
+After 0006 the prepared draws' per-draw table lacks them, so it was rewritten
+on every draw (8% of the title's CPU at 1000 draws per frame), and the WebGL
+thread alternates two large tables (101 and 85 records), which evicted each
+other. The rewrite depends only on the input records and the backend draw
+state, so the cache now holds four entries for any table of 16 or more
+records (keyed on all input bytes and on the draw state after the call:
+with `PS5_DYNAMIC_SCANOUT` the call fills in an unset depth size).
+`busy.html`: 1000 cubes 54.7 -> 59.8 fps (the 60 Hz cap), 2000 cubes 29.9
+-> 32.9 (~15 µs per draw); GL error 0.
+
+Note: `PS5_RUNTIME_QUIET` makes `printf` a no-op in `ps5_screen.c` and
+`ps5_agc_runtime_backend.c`, and the title logs stderr, not stdout:
+diagnostics go to `fprintf(stderr, ...)` (0005's warning does).

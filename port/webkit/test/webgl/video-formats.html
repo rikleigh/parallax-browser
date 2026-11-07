@@ -1,0 +1,239 @@
+<!doctype html>
+<!-- WebGL M3 check (spikes/11-webgl): video frames into WebGL textures of
+     each format the title copies into: texImage2D as RGBA8 (the reference),
+     RGB8, unsized RGB, SRGB8_ALPHA8, and texSubImage2D at 0,0 into
+     texStorage2D textures of the frame's size and of 2048x2048. The video is
+     paused for each check so every texture gets the same frame; each texture
+     is read back through a framebuffer (stored bytes, no sRGB conversion)
+     and compared to the RGBA8 one at five 8x8 blocks. Also checked: flipY
+     off is flipY on upside down. ?gl=1: the same in WebGL 1 (RGBA, RGB,
+     EXT_sRGB's SRGB_ALPHA_EXT, texSubImage2D into texImage2D(null)
+     textures). Log lines: RESULT webgl-video-formats <case> PASS|FAIL.
+     On the TV: the frame twice, left from the RGBA8 texture, right from the
+     SRGB8_ALPHA8 one (decoded by the sampler, encoded again in the shader):
+     the two halves look the same. Upload to
+     /data/ps5webkit/webgl-video-formats.html and open
+     file:///data/ps5webkit/webgl-video-formats.html[?gl=1][&clip=...][&show=rgba|srgb]. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL video formats</title>
+<style>
+  body { background: #111; color: #eee; font: 24px/1.4 sans-serif; margin: 40px; }
+  canvas { width: 1280px; height: 360px; border: 2px solid #555; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>WebGL video formats</h1>
+<canvas id="c" width="1280" height="360"></canvas>
+<div id="out">starting</div>
+<script>
+const params = new URLSearchParams(location.search);
+const out = document.getElementById('out');
+const lines = [];
+function log(text) { console.log('[webgl-video-formats] ' + text); }
+function result(name, pass, detail) {
+  const line = 'RESULT webgl-video-formats ' + name + ' ' + (pass ? 'PASS' : 'FAIL') + (detail ? ' ' + detail : '');
+  lines.push(line);
+  out.textContent = lines.join('\n');
+  log(line);
+}
+
+const clip = params.get('clip') || 'sync-1080p30-h264.mp4';
+const webGL1 = params.get('gl') === '1';
+const show = params.get('show') || 'both';
+const video = document.createElement('video');
+video.src = '/data/ps5webkit/media/' + clip;
+video.muted = true;
+video.loop = true;
+video.playsInline = true;
+video.play().then(() => log('playing ' + clip), err => log('play failed: ' + err));
+
+const gl = document.getElementById('c').getContext(webGL1 ? 'webgl' : 'webgl2', { antialias: false });
+const srgbExt = webGL1 ? gl.getExtension('EXT_sRGB') : null;
+log('WebGL ' + (webGL1 ? 1 : 2) + (webGL1 ? ', EXT_sRGB ' + !!srgbExt : ''));
+
+function makeTexture() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+// The cases: how the texture is made and filled.
+function cases(w, h) {
+  const list = [];
+  const image = (name, internal, format) => list.push({ name, upload: () => gl.texImage2D(gl.TEXTURE_2D, 0, internal, format, gl.UNSIGNED_BYTE, video) });
+  const sub = (name, internal, format, tw, th) => list.push({ name, size: [tw, th], upload: first => {
+    if (first) {
+      if (webGL1)
+        gl.texImage2D(gl.TEXTURE_2D, 0, internal, tw, th, 0, format, gl.UNSIGNED_BYTE, null);
+      else
+        gl.texStorage2D(gl.TEXTURE_2D, 1, internal, tw, th);
+    }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, format, gl.UNSIGNED_BYTE, video);
+  } });
+  if (webGL1) {
+    image('rgba', gl.RGBA, gl.RGBA);
+    image('rgb', gl.RGB, gl.RGB);
+    if (srgbExt)
+      image('srgb-alpha-ext', srgbExt.SRGB_ALPHA_EXT, srgbExt.SRGB_ALPHA_EXT);
+    sub('rgba-sub', gl.RGBA, gl.RGBA, w, h);
+    sub('rgba-sub-2048', gl.RGBA, gl.RGBA, 2048, 2048);
+  } else {
+    image('rgba8', gl.RGBA8, gl.RGBA);
+    image('rgba', gl.RGBA, gl.RGBA);
+    image('rgb8', gl.RGB8, gl.RGB);
+    image('rgb', gl.RGB, gl.RGB);
+    image('srgb8-alpha8', gl.SRGB8_ALPHA8, gl.RGBA);
+    sub('rgba8-storage-sub', gl.RGBA8, gl.RGBA, w, h);
+    sub('srgb8-alpha8-storage-sub', gl.SRGB8_ALPHA8, gl.RGBA, w, h);
+    if (w <= 2048 && h <= 2048)
+      sub('rgba8-storage-sub-2048', gl.RGBA8, gl.RGBA, 2048, 2048);
+  }
+  return list;
+}
+
+// Stored bytes of blocks of a texture, through a framebuffer.
+const fbo = gl.createFramebuffer();
+function readBlocks(texture, blocks) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  const pixels = blocks.map(([x, y]) => {
+    const px = new Uint8Array(8 * 8 * 4);
+    if (status === gl.FRAMEBUFFER_COMPLETE)
+      gl.readPixels(x, y, 8, 8, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return px;
+  });
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { status, pixels };
+}
+function maxDiff(a, b, alpha) {
+  let d = 0;
+  for (let i = 0; i < a.length; i++)
+    if (alpha || i % 4 !== 3)
+      d = Math.max(d, Math.abs(a[i] - b[i]));
+  return d;
+}
+function spread(blocks) {
+  let lo = 255, hi = 0;
+  for (const px of blocks)
+    for (let i = 0; i < px.length; i++)
+      if (i % 4 !== 3) { lo = Math.min(lo, px[i]); hi = Math.max(hi, px[i]); }
+  return hi - lo;
+}
+
+let display = null; // [rgba texture, srgb texture] shown on the canvas
+function check(round) {
+  const w = video.videoWidth, h = video.videoHeight;
+  const blocks = [[w / 4, h / 4], [3 * w / 4, h / 4], [w / 2, h / 2], [w / 4, 3 * h / 4], [3 * w / 4 - 8, 3 * h / 4]].map(([x, y]) => [Math.floor(x), Math.floor(y)]);
+  // The same blocks of a frame flipped upside down.
+  const flippedBlocks = blocks.map(([x, y]) => [x, h - y - 8]);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  const list = cases(w, h);
+  const textures = list.map(c => { const t = makeTexture(); c.upload(true); return t; });
+  // texImage2D(video) a second time into the same textures: the redefinition is skipped.
+  list.forEach((c, i) => { gl.bindTexture(gl.TEXTURE_2D, textures[i]); c.upload(false); });
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  const unflipped = makeTexture();
+  gl.texImage2D(gl.TEXTURE_2D, 0, webGL1 ? gl.RGBA : gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+  const reference = readBlocks(textures[0], blocks);
+  const contrast = spread(reference.pixels);
+  result(round + '-' + list[0].name, reference.status === gl.FRAMEBUFFER_COMPLETE && contrast > 32,
+    'framebuffer 0x' + reference.status.toString(16) + ', contrast ' + contrast + ' (a frame, not a blank texture), video ' + w + 'x' + h);
+  for (let i = 1; i < list.length; i++) {
+    const read = readBlocks(textures[i], blocks);
+    const diff = Math.max(...read.pixels.map((px, b) => maxDiff(px, reference.pixels[b], false)));
+    result(round + '-' + list[i].name, read.status === gl.FRAMEBUFFER_COMPLETE && diff <= 1,
+      'framebuffer 0x' + read.status.toString(16) + ', max difference from ' + list[0].name + ' ' + diff);
+  }
+  const flipped = readBlocks(unflipped, flippedBlocks);
+  let flipDiff = 0;
+  flipped.pixels.forEach((px, b) => {
+    // Rows of the block in reverse order.
+    for (let row = 0; row < 8; row++)
+      for (let i = 0; i < 32; i++)
+        if (i % 4 !== 3)
+          flipDiff = Math.max(flipDiff, Math.abs(px[row * 32 + i] - reference.pixels[b][(7 - row) * 32 + i]));
+  });
+  result(round + '-flipY-off', flipped.status === gl.FRAMEBUFFER_COMPLETE && flipDiff <= 1, 'max difference from flipY on, upside down, ' + flipDiff);
+  const error = gl.getError();
+  result(round + '-gl-error', error === gl.NO_ERROR, '0x' + error.toString(16));
+
+  const srgbIndex = list.findIndex(c => c.name.startsWith('srgb'));
+  if (display)
+    display.forEach(t => t && gl.deleteTexture(t));
+  display = [textures[0], srgbIndex >= 0 ? textures[srgbIndex] : null];
+  textures.forEach((t, i) => { if (i !== 0 && i !== srgbIndex) gl.deleteTexture(t); });
+  gl.deleteTexture(unflipped);
+}
+
+// Display: the RGBA texture on the left, the sRGB one on the right.
+const vs = gl.createShader(gl.VERTEX_SHADER);
+gl.shaderSource(vs, 'attribute vec2 p; varying vec2 uv; uniform float side; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4((p.x * 0.5 + side) , p.y, 0.0, 1.0); }');
+gl.compileShader(vs);
+const fs = gl.createShader(gl.FRAGMENT_SHADER);
+gl.shaderSource(fs, `precision mediump float; varying vec2 uv; uniform sampler2D t; uniform float encode;
+vec3 toSRGB(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c)); }
+void main() { vec4 c = texture2D(t, uv); gl_FragColor = vec4(encode > 0.5 ? toSRGB(c.rgb) : c.rgb, 1.0); }`);
+gl.compileShader(fs);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+gl.bindAttribLocation(prog, 0, 'p');
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  log('link failed: ' + gl.getProgramInfoLog(prog) + gl.getShaderInfoLog(vs) + gl.getShaderInfoLog(fs));
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const side = gl.getUniformLocation(prog, 'side'), encode = gl.getUniformLocation(prog, 'encode');
+
+function draw() {
+  gl.clearColor(0.1, 0.1, 0.15, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (display) {
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    display.forEach((t, i) => {
+      // ?show=rgba / ?show=srgb: only that half (to time each copy).
+      if (!t || (show === 'rgba' && i) || (show === 'srgb' && !i))
+        return;
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      // The live frame into the shown textures (as a player does).
+      gl.texImage2D(gl.TEXTURE_2D, 0, i ? (webGL1 ? srgbExt.SRGB_ALPHA_EXT : gl.SRGB8_ALPHA8) : (webGL1 ? gl.RGBA : gl.RGBA8),
+        i && webGL1 ? srgbExt.SRGB_ALPHA_EXT : gl.RGBA, gl.UNSIGNED_BYTE, video);
+      gl.uniform1f(side, i ? 0.5 : -0.5);
+      gl.uniform1f(encode, i ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    });
+  }
+  requestAnimationFrame(draw);
+}
+
+async function run() {
+  await new Promise(resolve => video.readyState >= video.HAVE_CURRENT_DATA ? resolve() : video.addEventListener('loadeddata', resolve, { once: true }));
+  for (const round of [1, 2]) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    video.pause();
+    // Let the last decoded frame be the one shown.
+    await new Promise(resolve => setTimeout(resolve, 500));
+    check('round' + round);
+    await video.play();
+  }
+  log('done');
+}
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+requestAnimationFrame(draw);
+run();
+</script>
+</body>
+</html>

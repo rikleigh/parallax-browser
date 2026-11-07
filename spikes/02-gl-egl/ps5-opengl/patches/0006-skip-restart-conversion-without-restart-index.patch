@@ -1,0 +1,77 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 4f8a38a..fa06195 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -9317,6 +9317,50 @@ ps5_index_value(const void *indices, unsigned index_size, unsigned index)
+                             ((const uint32_t *)indices)[index];
+ }
+ 
++/* Whether any index of these draws equals info->restart_index. True (convert
++ * as before) when the indices are not in a CPU-visible buffer or a range is
++ * out of bounds. */
++static bool
++ps5_draws_contain_restart_index(const struct pipe_draw_info *info,
++                                const struct pipe_draw_start_count_bias *draws,
++                                unsigned num_draws)
++{
++   const struct ps5_resource *resource =
++      (const struct ps5_resource *)info->index.resource;
++   const unsigned size = info->index_size;
++   const uint32_t restart = info->restart_index;
++
++   if (info->has_user_indices || !resource || !resource->data ||
++       resource->base.target != PIPE_BUFFER ||
++       (size != 1 && size != 2 && size != 4))
++      return true;
++   if ((size == 1 && restart > UINT8_MAX) || (size == 2 && restart > UINT16_MAX))
++      return false; /* no index of this size can equal it */
++   for (unsigned d = 0; d < num_draws; ++d) {
++      const uint64_t offset = (uint64_t)draws[d].start * size;
++      const uint64_t bytes = (uint64_t)draws[d].count * size;
++      if (offset > resource->size || bytes > resource->size - offset)
++         return true;
++      const uint8_t *indices = (const uint8_t *)resource->data + offset;
++      const unsigned count = draws[d].count;
++      if (size == 1) {
++         if (memchr(indices, (int)restart, count))
++            return true;
++      } else if (size == 2) {
++         const uint16_t *v = (const uint16_t *)indices;
++         for (unsigned i = 0; i < count; ++i)
++            if (v[i] == restart)
++               return true;
++      } else {
++         const uint32_t *v = (const uint32_t *)indices;
++         for (unsigned i = 0; i < count; ++i)
++            if (v[i] == restart)
++               return true;
++      }
++   }
++   return false;
++}
++
+ /* Keep the original uint32 base-vertex wrap semantics. Only a range straddling
+  * the positive-bias wrap point needs per-index effective-bound calculation. */
+ static bool
+@@ -12868,6 +12912,21 @@ ps5_draw_vbo(struct pipe_context *base, const struct pipe_draw_info *info,
+       return;
+    }
+ 
++   /* WebGL 2 (and ANGLE's ES 3 backend) turn primitive restart on for every
++    * indexed draw, and a restart draw used to go through a util_primconvert
++    * context made, used and freed per draw, its indices rewritten and
++    * uploaded (and it never reached the deferred batch). When no index of
++    * the draw is the restart index, restart changes nothing: draw it as an
++    * ordinary indexed draw. */
++   struct pipe_draw_info no_restart_info;
++   if (info && info->primitive_restart && info->index_size && draws &&
++       num_draws && !ps5_draws_contain_restart_index(info, draws, num_draws)) {
++      no_restart_info = *info;
++      no_restart_info.primitive_restart = false;
++      no_restart_info.restart_index = 0;
++      info = &no_restart_info;
++   }
++
+    if (context->legacy_primitive_conversion && info && draws &&
+        num_draws == 1 && info->mode == MESA_PRIM_TRIANGLES &&
+        draws[0].count == 3) {

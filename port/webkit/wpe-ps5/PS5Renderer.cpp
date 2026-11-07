@@ -30,9 +30,11 @@
 #include <epoxy/egl.h>
 #include <epoxy/gl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 // GL is reached through libepoxy. In the title its dlopen()/dlsym() resolve
 // to the statically linked ps5-opengl (port/webkit/apps/title/dlshim.c).
@@ -393,6 +395,14 @@ void* PS5Renderer::threadEntry(void* data)
 
 bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
 {
+    // Mesa's glthread for every context of the title (the compositor's and
+    // WebGL's): ps5-opengl reads PS5_GLTHREAD when the display is initialized
+    // and each context is made (FEASIBILITY §4.2c). Off unless
+    // /data/ps5webkit/gl-thread exists (spikes/11-webgl M4, to measure).
+    if (!getenv("PS5_GLTHREAD") && !access("/data/ps5webkit/gl-thread", F_OK)) {
+        setenv("PS5_GLTHREAD", "1", 1);
+        g_message("[wpe-ps5] glthread on for the title's GL contexts (/data/ps5webkit/gl-thread)");
+    }
     EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (display == EGL_NO_DISPLAY || !eglInitialize(display, nullptr, nullptr)) {
         snprintf(error, errorSize, "eglInitialize failed (0x%04x)", eglGetError());
@@ -1040,9 +1050,23 @@ void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbos[1]);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
         const int w = entry->width, h = entry->height;
+        // An sRGB texture gets the frame's bytes as they are, as texImage2D
+        // stores them: no linear-to-sRGB encoding on the write (on by
+        // default in ES contexts; EXT_sRGB_write_control turns it off).
+        static bool checkedSRGB;
+        if (!checkedSRGB) {
+            while (glGetError() != GL_NO_ERROR) { }
+        }
+        glDisable(GL_FRAMEBUFFER_SRGB);
+        if (!checkedSRGB) {
+            checkedSRGB = true;
+            if (GLenum error = glGetError())
+                g_message("[wpe-ps5] video frame copy: sRGB writes can't be turned off (GL error 0x%x): sRGB WebGL textures get encoded twice", error);
+        }
         // The stream's row 0 is the picture's top, as texImage2D's without
         // UNPACK_FLIP_Y.
         glBlitFramebuffer(0, 0, w, h, 0, flipY ? h : 0, w, flipY ? 0 : h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glEnable(GL_FRAMEBUFFER_SRGB);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDeleteFramebuffers(2, fbos);

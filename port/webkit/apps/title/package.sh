@@ -68,6 +68,10 @@ prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$PORT/wpe-ps5
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlesys.c" -o "$W/obj/titlesys.o"
 # abort() logs the thread and a backtrace first (--wrap=abort below).
 prospero-clang -std=gnu11 -O2 -Wall -fno-omit-frame-pointer "${TF[@]}" -c "$HERE/titleabort.c" -o "$W/obj/titleabort.o"
+# The sampling profiler (off unless /data/ps5webkit/title-profile exists;
+# ps5browser.c startTitleProfiler).
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/../common/profiler.c" -o "$W/obj/profiler.o"
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/../common/ps5unwind.c" -o "$W/obj/ps5unwind.o"
 cp "$SYS/lib/libc.a" "$W/libc-title.a"
 /opt/homebrew/opt/llvm@18/bin/llvm-ar d "$W/libc-title.a" syscalls.o
 /opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |

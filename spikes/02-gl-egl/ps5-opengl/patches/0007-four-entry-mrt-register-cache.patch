@@ -1,0 +1,71 @@
+diff --git a/src/platform/ps5_agc_runtime_backend.c b/src/platform/ps5_agc_runtime_backend.c
+index ab7c915..a1b8b2a 100644
+--- a/src/platform/ps5_agc_runtime_backend.c
++++ b/src/platform/ps5_agc_runtime_backend.c
+@@ -577,36 +577,47 @@ ps5_agc_set_cx_mrt_uncached(void *command, const void *table, uint32_t count,
+ static uint32_t *
+ ps5_agc_set_cx_mrt(void *command, const void *table, uint32_t count)
+ {
+-   /* Cache only full graphics tables. Small dynamic overrides must not evict
+-    * them. Key all input bytes and backend state: no pointer-identity shortcut. */
++   /* The rewritten table depends only on the input records and the backend
++    * draw state, so key on all input bytes and that state (no pointer
++    * identity). Four entries: a draw sets more than one large table (the
++    * WebGL thread alternates two), and the per-draw graphics table of
++    * prepared draws lacks the initial-table registers, so it went uncached
++    * on every draw (8% of the title's CPU at 1000 draws per frame). Small
++    * dynamic overrides are cheap to rewrite and are left out so they never
++    * evict a large table. */
++   enum { ENTRIES = 4, MIN_RECORDS = 16 };
+    static _Thread_local struct {
+       bool valid;
+       uint32_t input_count, output_count;
+       struct ps5_agc_backend_draw_state state;
+       struct ps5_agc_register input[PS5_AGC_CX_RECORD_CAPACITY];
+       struct ps5_agc_register output[PS5_AGC_CX_RECORD_CAPACITY];
+-   } cache;
+-   const bool eligible = table && count <= PS5_AGC_CX_RECORD_CAPACITY &&
+-      ps5_agc_find_register(table, count, 0x0318u) >= 0 &&
+-      ps5_agc_find_register(table, count, 0x02d5u) >= 0;
++   } cache[ENTRIES];
++   static _Thread_local unsigned next;
+    uint32_t output_count = 0;
+-   if (!eligible)
++   if (!table || count < MIN_RECORDS || count > PS5_AGC_CX_RECORD_CAPACITY)
+       return ps5_agc_set_cx_mrt_uncached(command, table, count, &output_count);
+-   if (cache.valid && cache.input_count == count &&
+-       !memcmp(&cache.state, &ps5_agc_draw_state, sizeof(cache.state)) &&
+-       !memcmp(cache.input, table, count * sizeof(cache.input[0]))) {
+-      memcpy((void *)table, cache.output, cache.output_count * sizeof(cache.output[0]));
+-      return ps5_agc_set_cx(command, table, cache.output_count);
++   for (unsigned i = 0; i < ENTRIES; ++i) {
++      if (cache[i].valid && cache[i].input_count == count &&
++          !memcmp(cache[i].input, table, count * sizeof(cache[i].input[0])) &&
++          !memcmp(&cache[i].state, &ps5_agc_draw_state, sizeof(cache[i].state))) {
++         memcpy((void *)table, cache[i].output,
++                cache[i].output_count * sizeof(cache[i].output[0]));
++         return ps5_agc_set_cx(command, table, cache[i].output_count);
++      }
+    }
+-   cache.valid = false;
+-   cache.input_count = count;
+-   cache.state = ps5_agc_draw_state;
+-   memcpy(cache.input, table, count * sizeof(cache.input[0]));
++   unsigned slot = next++ % ENTRIES;
++   cache[slot].valid = false;
++   cache[slot].input_count = count;
++   memcpy(cache[slot].input, table, count * sizeof(cache[slot].input[0]));
+    uint32_t *result = ps5_agc_set_cx_mrt_uncached(command, table, count, &output_count);
+    if (result && output_count <= PS5_AGC_CX_RECORD_CAPACITY) {
+-      memcpy(cache.output, table, output_count * sizeof(cache.output[0]));
+-      cache.output_count = output_count;
+-      cache.valid = true;
++      /* The state after the call: with PS5_DYNAMIC_SCANOUT it fills in an
++       * unset depth size (before using it), so a hit needs that done. */
++      cache[slot].state = ps5_agc_draw_state;
++      memcpy(cache[slot].output, table, output_count * sizeof(cache[slot].output[0]));
++      cache[slot].output_count = output_count;
++      cache[slot].valid = true;
+    }
+    return result;
+ }

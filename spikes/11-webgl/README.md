@@ -450,6 +450,58 @@ Seen on the TV: `test/webgl/video.html` (1080p H.264, detached and in the
 page) upright with its clock running at 60 fps; `test/webgl/pano.html`, the
 4K 360 grid, upright, clock running, 60 fps.
 
+**M3 formats (2026-11-07, afternoon).** The copy now takes what players
+upload: `texImage2D` as RGBA/RGBA8, RGB/RGB8, SRGB8_ALPHA8 (WebGL 2) and
+EXT_sRGB's SRGB_ALPHA_EXT (WebGL 1), and `texSubImage2D` of the whole frame
+at 0,0 into an existing level 0 of one of those formats at least the
+frame's size (`texStorage2D` textures, power-of-two textures). The ANGLE
+entry point takes the page's internal format, format and type and defines
+level 0 through `glTexImage2D`'s own validation; a copy into part of a
+level clears the rest first (robust init), as `texSubImage2D` does. The
+blit writes sRGB textures through their linear view (`GL_FRAMEBUFFER_SRGB`
+off in the copy context: EXT_sRGB_write_control), so they get the frame's
+bytes as `texImage2D` stores them. `test/webgl/video-formats.html` checks
+each against the RGBA8 copy by reading the textures back through a
+framebuffer (stored bytes) with the video paused: on the console, WebGL 2,
+1080p H.264, two rounds, every case **PASS** with a maximum difference of 0
+(RGBA8, RGBA, RGB8, RGB, SRGB8_ALPHA8, RGBA8 and SRGB8_ALPHA8
+`texStorage2D` + `texSubImage2D`, 2048x2048 `texStorage2D` + `texSubImage2D`,
+flipY off = flipY on upside down), no GL error. The WebGL 1 run (`?gl=1`)
+hasn't run yet.
+
+The same run found the sRGB copy slow: with an RGBA8 and an SRGB8_ALPHA8
+texture filled from the video every frame the page ran at ~13 fps, the
+WebGL thread at 76 ms of CPU per frame (`video.html`'s single RGBA8 copy
+holds 60 fps). ps5-opengl's GPU blit (`ps5_blit_gpu_color`) wants the
+resource's own format on both sides; a linear view of an sRGB texture took
+the CPU fallback. `spikes/02-gl-egl/ps5-opengl/patches/0004` lets it draw
+through the linear view (RGBA8 linear and sRGB share the native tiled
+layout, as the driver's clear path notes). Built into
+`toolchain/ps5-opengl-gles-noprof-m4` (the browser's own driver build is
+unchanged) and packaged as PPSA99006 in `toolchain/wpe-webkit/titles-webgl-m4`;
+not run yet (the console went off the network, below). RGB8 has no RGBX
+format in this driver, so Mesa should store it as RGBA8 and take the GPU
+path already; the `?show=` switch of `video-formats.html` times each half.
+
+**Console incident (2026-11-07 14:30).** After the formats run ended
+cleanly (wind-down, `main returned 0`), the next launch of PPSA99006 could
+not create `/system_tmp/ps5wk` or its sockets: `errno 28` (ENOSPC) on
+`ui-`, `video-` and `audio-<pid>.sock`. The children never connected, and
+about two minutes later the console dropped off the network (ping: host
+down). Nothing in the first run wrote to `/system_tmp` that the log shows;
+what filled it is not known yet (to look at when the console is back:
+`/system_tmp` listing over FTP, before launching anything).
+It happened again at 19:39 after ~15 launches since the reboot (the same
+ENOSPC on `ui-<pid>.sock`, then the console crashed during `--stop`).
+Cause, found by listing `/system_tmp/ps5wk` after each launch: every run
+leaves `datafree-<UIProcess pid>` (the child's free-space status for the
+title, `downloads.c`), and `removeStaleRuntimeFiles` in `ps5wk-child.cpp`,
+which already clears the other pid-named files of dead titles for exactly
+this ENOSPC (a small tmpfs, ~14 launches), did not know that name. Fixed:
+`datafree-<pid>` is in its list (the next launch logged `stale files:
+removed 6`, the old `datafree-` files gone). Builds without the fix,
+PPSA99020's among them, still leave one file per launch until a reboot.
+
 **WebAssembly (2026-11-07).** On in WebProcesses with the JIT
 (ps5wk-child; `PS5WK_WASM=0` in child.env turns it off), bounds-checked
 memories. `test/wasm/wasm.html` passes (compile 9 ms; a 1M-step loop 0.41 ms
@@ -465,6 +517,87 @@ at any speed before the title work is done; it shares M1 below.
 | M0 | **Done 2026-11-07.** Register PPSA99006, run the Spike 11 title; add the share-group probe (ANGLE external context sharing with GL 4.6 core) | `angle-triangle PASS`, 8.3 µs per draw; all `share-*` PASS |
 | M1 | **Done 2026-11-07** (patches 0077–0083). `ENABLE_WEBGL` + ANGLE in the WPE build (patches carried in `port/webkit/patches`), `ENABLE_GPU_PROCESS` without GBM, `IPC::Semaphore` on `_umtx_op`, ANGLE linked into the title. Also the title host: WebKit's `GPUProcess` made in the title (`PS5GPUProcessInTitle.cpp`), each context a `GraphicsContextGLCoordinated` on the `RemoteGraphicsContextGL` work queue | a page creates a WebGL context and the stream connects (log only). `test/webgl/webgl.html`: WebGL 1 and 2 contexts, a triangle in each read back 0,255,0,255, no GL error, ~50 ms each |
 | M2 | **Done 2026-11-07** (patch 0084). The coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps. `test/webgl/spin.html` (a WebGL 2 and a WebGL 1 canvas redrawn every frame) and three.js's `webgl_geometry_cube` example: both shown, 60 fps, compositor paint 0.7 ms |
-| M3 | **Partly done 2026-11-07** (patch 0085). `CopyTextureFromVideoStreamPS5` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip: **done** (`test/webgl/pano.html`, three.js r160, `vrtest_360_mono.mp4` 3840x1920 HEVC, 60 fps, upright, clock running); a VR tube site's own WebGL player: for the owner to check (not tested here); sRGB video textures (`SRGB8_ALPHA8`) not yet |
-| M4 | Cost: ANGLE/driver state caching (§4.2c), glthread, the texture cap with WebGL buffers, memory lines for the host | busy scenes stay above 30 fps; `[mem]` flat |
+| M3 | **Partly done 2026-11-07** (patch 0085, formats: uncommitted). `CopyTextureFromVideoStreamPS5` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip: **done** (`test/webgl/pano.html`, three.js r160, `vrtest_360_mono.mp4` 3840x1920 HEVC, 60 fps, upright, clock running); a VR tube site's own WebGL player: for the owner to check (not tested here); sRGB, RGB and `texSubImage2D` video textures: **correct** (`test/webgl/video-formats.html`, all PASS), the sRGB copy fast with driver patch 0004 (`?show=srgb` 60 fps, 0.35 ms per frame on the WebGL thread); WebGL 1 formats (`?gl=1`, incl. `SRGB_ALPHA_EXT`): all PASS, 60 fps; the software-frame fallback not run yet |
+| M4 | **Started 2026-11-07** (uncommitted; profiled, first driver fix run). Cost: ANGLE/driver state caching (§4.2c), glthread, the texture cap with WebGL buffers, memory lines for the host. Done so far: the measurements (below) and `test/webgl/busy.html`; glthread as a knob; WebGL drawing buffers in the cap and the `[wc]`/`[mem]` lines; the title profiler. Profiled `busy.html`; driver patch 0005 (register defaults fetched once): 1000 cubes 32.7 -> 47.0 fps, 2000 16.8 -> 24.5; patch 0006 (no restart conversion when no index is the restart index): 54.7 and 29.9 (textured 52.7, 28.6); patch 0007 (four-entry MRT register cache): 59.8 and 32.9, so busy scenes stay above 30 fps to ~2000 draws per frame. `[mem]`: the title flat over 6 min of the sweep (direct memory 750-759 MB, no trend); web4's peak RSS +20 MB in 5 min (the page allocates every frame; a longer run to see it level). Next: the rest of the measured list below | busy scenes stay above 30 fps; `[mem]` flat |
 | later | WebXR on the same process (Spike 5 runtime + §4.8) | — |
+
+**M4 so far (2026-11-07):**
+
+- `[webgl] title: <n> frames/s; the WebGL thread <ms> CPU per frame (max),
+  <%> of a core; <n> contexts, drawing buffers ~<MB>` every 5 s while
+  frames come (the thread CPU time between `prepareForDisplay`s: stream
+  decoding, ANGLE and the driver for every context on that thread). The
+  formats run above gave the first figures.
+- WebGL drawing buffers (3 RGBA8 textures per context; the default
+  framebuffer's depth, stencil and multisample buffers are GL objects WebCore
+  makes like the page's own, not counted) in the `[wc]` stats (`WebGL <n>
+  contexts (<n> made), <n> layers shown, drawing buffers ~<MB>`), in the
+  title's `[mem]` line, and in the GL texture cap's total. Over the cap a
+  page showing WebGL loses tile coverage as before but never goes to the
+  CPU path (its canvases would go blank).
+- glthread for the title's contexts while `/data/ps5webkit/gl-thread`
+  exists (`PS5_GLTHREAD=1` before `eglInitialize`; logged). Off by default.
+- The sampling profiler (`apps/common/profiler.c`) in the title while
+  `/data/ps5webkit/title-profile` exists (its first line the
+  `PS5WK_PROFILE` mode, empty = CPU time per thread); every thread made
+  through titlemem's `pthread_create` wrapper is sampled (WebKit's WebGL
+  work queue among them). Output `/data/ps5webkit/prof/title-<pid>.prof`;
+  `test/prof/prof.py --elf <the package's llvm-pie.elf>` names the frames.
+- What the draw path does (from reading ps5-opengl's draw path; the
+  measured split is above). Each draw rebuilds its native command stream from scratch
+  (`ps5_agc_gate2_run`, `ps5_agc_native_runtime.c` ~3573-4994): a 16 KiB
+  work block memset and then clflushed, both shader packages parsed again
+  and compared byte for byte against the cache, AGC's default register
+  table scanned, ~180 graphics/viewport registers (16 viewports always),
+  an L2 ACQUIRE_MEM, two RELEASE_MEMs, a walk over the stream to validate
+  it, and a `getenv` and `sceKernelGetDirectMemorySize` call. On the
+  Gallium side (`ps5_screen.c`): no dirty bits at all
+  (`framebuffer_valid`/`viewport_valid` are validity flags);
+  `ps5_encode_graphics_state` over 16 viewports, vertex layout and shader
+  variant lookups, texture descriptors rebuilt and re-validated, each
+  stage's 4 KiB constant block memset, rebuilt and clflushed
+  (`ps5_prepare_constant`, including the whole bound range of every
+  non-copied UBO), the eligibility loops, a CPU scan of every index for
+  min/max, and ~10 atomic retains per draw. The likely order: clflush
+  traffic first, then the per-draw register tables and command build,
+  then package parse/compare and the work memset, then Gallium's
+  re-encoding. The fix the notes call "state caching": dirty bits in the
+  bind/set hooks, cached encodings on the context, and a prepared native
+  work block per (shader pair, framebuffer, state) where a draw only
+  writes user data, CB0 and the draw packet.
+- **Measured** (`busy.html?n=1000`, WebGL 2, title profiler, 52 s; the
+  WebGL work queue 94% of a core, 30 µs per draw; the page's JS ~1 µs per
+  object). Of the title's CPU: `sceAgcGetRegisterDefaults`, called by
+  every draw's `append_target_state`, **28%**, a single address in the
+  system library (patch 0005 caches the pointer, checked again every 4096
+  uses: 30 -> 21 µs per draw); clflush (`util_flush_inval_range`,
+  `util_clflushopt_range`) ~14%; the kernel submit
+  (`ps5_agc_gate2_batch_submit` -> `runtime_batch_api.submit`) 8.5%;
+  `ps5_agc_set_cx_mrt_uncached` 5%; the 16 KiB work memset
+  (`runtime_prepared_work_clear`) 4% and the 4 KiB constant memset
+  (`ps5_prepare_constant`) 3%; primitive restart (always on in WebGL 2:
+  every indexed draw goes through a `util_primconvert` context made and
+  freed per draw, its indices rewritten and uploaded) ~4% plus its share
+  of the flushes. ANGLE and IPC decode together under 10%. Sweep before
+  and after 0005 (fps; WebGL thread ms per frame): 250: 59.9 (8.6) ->
+  59.9 (6.2); 500: 59.8 (15.8) -> 59.9 (11.0); 1000: 32.7 (30.4) -> 47.0
+  (20.9); 2000: 16.8 (59.2) -> 24.5 (39.4). GL error 0 throughout.
+  With patch 0006 as well (restart conversion skipped when no index is
+  the restart index): 500: 59.9 (10.1); 1000: 54.7 (17.9); 2000: 29.9
+  (32.6); `?tex=1` 52.7 and 28.6 at 1000 and 2000.
+  After 0006 the kernel submit fell from 8.5% to 0.7% (the draws reach the
+  deferred batch). Profile after 0006: system code 35% (`gate2_run`'s
+  16 KiB work memset 8%, `ps5_render_arena_allocate` 4.6%, the constant
+  memset 4.3%), clflush 18% (`runtime_prepared_work_publish` 8%,
+  `ps5_draw_vbo_locked` 6%), `ps5_agc_set_cx_mrt_uncached` 8% (fixed by
+  0007: 1000 59.8 fps, 2000 32.9 fps, ~15 µs per draw).
+- threejs.org `webgl_geometry_cube` (antialias, 1080p): 60 fps but 2.2 ms
+  per frame on the WebGL thread, nearly all in `glClear`: the 4x MSAA
+  depth/stencil clear takes the CPU path (`ps5_clear_words`, ~14%, plus
+  ~14% clflush), after draining the GPU queue (spinning on completion,
+  ~40%). A GPU depth/stencil clear for MSAA4 is the fix; not done.
+- `test/webgl/busy.html`: lit cubes drawn as three.js draws meshes (per
+  object a VAO bind, two matrix uniforms, a colour, optionally a texture,
+  `drawElements` of 36), 100 to 2000 objects, 5 s each, one `RESULT
+  webgl-busy n=<count> <fps> fps, JS <ms> per frame ...` line per step.
+

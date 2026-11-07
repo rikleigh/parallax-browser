@@ -47,6 +47,7 @@
 #include <pthread.h>
 #include <sys/filio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <wpe/ps5/wpe-ps5.h>
@@ -2164,6 +2165,32 @@ void ps5wk_title_vdec_install(void) __attribute__((weak));
 /* titlelog.c: the log queue no thread waits on (CONSOLE-HEALTH.md, "Logging"). */
 void ps5wk_titlelog_install(const char* dir);
 
+/* The sampling profiler in the title (apps/common/profiler.c; WebGL's
+ * ANGLE and GL driver run here, spikes/11-webgl M4): on while
+ * /data/ps5webkit/title-profile exists, its first line the PS5WK_PROFILE
+ * mode (empty: 1, CPU time per thread). Profiles go to
+ * /data/ps5webkit/prof/title-<pid>.prof (test/prof/prof.py). Every thread
+ * made through titlemem.c's pthread_create wrapper is in its table, those
+ * made before this call too; threads with their own stacks (libc's path)
+ * and the system libraries' own threads are not sampled. */
+void ps5wk_profiler_start(const char* tag) __attribute__((weak));
+static void startTitleProfiler(void)
+{
+    if (!ps5wk_profiler_start)
+        return;
+    FILE* file = fopen("/data/ps5webkit/title-profile", "r");
+    if (!file)
+        return;
+    char mode[32] = "";
+    if (!fgets(mode, sizeof mode, file))
+        mode[0] = 0;
+    fclose(file);
+    mode[strcspn(mode, " \t\r\n")] = 0;
+    setenv("PS5WK_PROFILE", mode[0] ? mode : "1", 1);
+    ps5wk_profiler_start("title");
+    spike_log("[prof] title profiler started, mode %s (/data/ps5webkit/title-profile)", mode[0] ? mode : "1");
+}
+
 int main(int argc, char** argv)
 {
     /* Before the unjail in spike_title_init (PS5VR: libSceVideodec2 does
@@ -2193,6 +2220,7 @@ int main(int argc, char** argv)
         webkit_get_micro_version(), (int)getpid(), ps5wk_title_build_id ? ps5wk_title_build_id() : "(payload)");
     spike_notify("Parallax Browser starting");
     memLog("main");
+    startTitleProfiler();
     if (ps5wk_title_check_imports) {
         static char names[1024];
         unsigned total = 0;

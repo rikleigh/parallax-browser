@@ -1,0 +1,67 @@
+diff --git a/src/platform/ps5_agc_native_runtime.c b/src/platform/ps5_agc_native_runtime.c
+index a5a0803..1e0687f 100644
+--- a/src/platform/ps5_agc_native_runtime.c
++++ b/src/platform/ps5_agc_native_runtime.c
+@@ -3061,6 +3061,35 @@ static int load_apis(void *agc_module, void *driver_module,
+ #endif
+ }
+ 
++/* sceAgcGetRegisterDefaults returns the same table every call, but the call
++ * itself cost a third of the WebGL thread in a 1000-draw scene (every draw
++ * builds its target state from it). Fetch it once; every 4096th use calls it
++ * again and, should the pointer ever differ, logs that and stops caching. */
++static void *runtime_register_defaults(void *(*get_defaults)(void))
++{
++    static void *cached;
++    static unsigned uses;
++    static int disabled;
++    void *defaults = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
++    if (__atomic_load_n(&disabled, __ATOMIC_RELAXED))
++        return get_defaults();
++    if (!defaults) {
++        defaults = get_defaults();
++        __atomic_store_n(&cached, defaults, __ATOMIC_RELEASE);
++        return defaults;
++    }
++    if (!(__atomic_fetch_add(&uses, 1, __ATOMIC_RELAXED) & 4095)) {
++        void *fresh = get_defaults();
++        if (fresh != defaults) {
++            fprintf(stderr, "[ps5-agc] register defaults moved (%p -> %p): no longer cached\n",
++                   defaults, fresh);
++            __atomic_store_n(&disabled, 1, __ATOMIC_RELAXED);
++            return fresh;
++        }
++    }
++    return defaults;
++}
++
+ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
+                                void *defaults, void *target)
+ {
+@@ -3390,7 +3419,7 @@ static int build_frame_slot_command(const agc_api_t *agc, int video_handle,
+     uint32_t vertex_user_data[GATE3_BIND_USER_SGPR_COUNT];
+     uint32_t pixel_user_data[GATE3_TEXTURE_PS_USER_SGPR_COUNT];
+ 
+-    if (append_target_state(cx, &cx_count, agc->get_defaults(), target) != 0 ||
++    if (append_target_state(cx, &cx_count, runtime_register_defaults(agc->get_defaults), target) != 0 ||
+         append_shader_state(shared_memory, vertex, pixel, cx, &cx_count,
+                             sh, &sh_count) != 0)
+         return -1;
+@@ -4355,7 +4384,7 @@ int main(void)
+     cx = (agc_register_t *)(memory + 0x7000);
+     sh = (agc_register_t *)(memory + 0x7800);
+     words = (uint32_t *)(memory + 0x8000);
+-    if (append_target_state(cx, &cx_count, agc.get_defaults(),
++    if (append_target_state(cx, &cx_count, runtime_register_defaults(agc.get_defaults),
+ #ifdef AGC_OFFSCREEN_COLOR_VARIANT
+                             offscreen) != 0 ||
+ #else
+@@ -4385,7 +4414,7 @@ int main(void)
+ #ifdef AGC_RENDER_TO_TEXTURE_VARIANT
+     scanout_cx = (agc_register_t *)(memory + 0x4800);
+     if (append_target_state(scanout_cx, &scanout_cx_count,
+-                            agc.get_defaults(), framebuffer) != 0)
++                            runtime_register_defaults(agc.get_defaults), framebuffer) != 0)
+         goto receipt;
+ #endif
+ #ifdef AGC_DEPTH_TEST_VARIANT
