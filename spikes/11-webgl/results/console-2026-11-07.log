@@ -1,0 +1,25 @@
+ps5webkit spike 11: ANGLE over ps5-opengl (pid 101, unjailed 1)
+  ANGLE client extensions: EGL_EXT_client_extensions EGL_EXT_device_query EGL_EXT_platform_base EGL_MESA_platform_surfaceless EGL_ANGLE_platform_angle EGL_ANGLE_platform_angle_device_type_egl_angle EGL_ANGLE_platform_angle_opengl EGL_ANGLE_platform_angle_display_key EGL_KHR_client_get_all_proc_addresses EGL_KHR_debug EGL_ANGLE_feature_control EGL_ANGLE_no_error 
+RESULT 11-webgl angle-display PASS EGL 1.5 vendor "Google Inc. (PS5 homebrew)" version "1.5 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" apis "OpenGL_ES" (12 ms)
+  ANGLE display extensions: EGL_EXT_create_context_robustness EGL_KHR_create_context EGL_KHR_get_all_proc_addresses EGL_ANGLE_create_context_webgl_compatibility EGL_CHROMIUM_create_context_bind_generates_resource EGL_KHR_swap_buffers_with_damage EGL_EXT_pixel_format_float EGL_KHR_surfaceless_context EGL_ANGLE_display_texture_share_group EGL_ANGLE_display_semaphore_share_group EGL_ANGLE_create_context_client_arrays EGL_ANGLE_program_cache_control EGL_ANGLE_robust_resource_initialization EGL_ANGLE_create_context_extensions_enabled EGL_ANDROID_blob_cache EGL_ANDROID_recordable EGL_ANGLE_create_context_backwards_compatible EGL_KHR_no_config_context EGL_KHR_create_context_no_error EGL_KHR_reusable_sync EGL_ANGLE_external_context_and_surface EGL_ANGLE_context_virtualization EGL_ANGLE_memory_usage_report EGL_ANGLE_create_context_passthrough_shaders 
+RESULT 11-webgl angle-config PASS config id 2 renderable 0x4d, surfaceless 1
+RESULT 11-webgl angle-context-es3 PASS GL "OpenGL ES 3.0 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" renderer "ANGLE (PS5 homebrew, PS5 AGC, OpenGL ES 3.2 Mesa 26.2.0)" GLSL "OpenGL ES GLSL ES 3.00 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)", 110 extensions, surfaceless (0 ms)
+  WebGL-relevant: +OES_texture_float -OES_texture_float_linear +OES_texture_half_float +EXT_color_buffer_float +OES_element_index_uint +OES_standard_derivatives +EXT_texture_filter_anisotropic +OES_vertex_array_object +ANGLE_instanced_arrays +EXT_sRGB +OES_EGL_image +OES_EGL_image_external +KHR_debug +ANGLE_framebuffer_blit +ANGLE_framebuffer_multisample +EXT_disjoint_timer_query +OES_texture_npot +OES_rgb8_rgba8 +EXT_texture_compression_s3tc
+  limits: max texture 16384, renderbuffer 16384, vertex texture units 16, vertex attribs 16
+RESULT 11-webgl angle-shader PASS ESSL 300 es compiled + linked in 4.9 ms; uniforms xform 0 color 1
+RESULT 11-webgl angle-fbo PASS RGBA8 256x256 texture FBO status 0x8cd5
+RESULT 11-webgl angle-triangle PASS centre 255,0,0 (want red) corner 0,0,255 apex+ 0,0,255 (want blue), GL error 0x0
+RESULT 11-webgl angle-texture PASS 64x64 checker sampled: bl 0,255,0 (want green) br 255,0,0 (want red), GL error 0x0
+RESULT 11-webgl angle-fence PASS ClientWaitSync 0x911a in 0.00 ms, status 0x9119
+RESULT 11-webgl angle-draw-bench PASS 2000 draws: frame 17.54 ms = issue 16.53 (cpu 16.52) + finish 1.01; per draw 8.3 us (cpu 8.3); first frame 26.6 ms
+RESULT 11-webgl angle-tex-upload-1080p PASS 34.50 ms per 1920x1080 RGBA texSubImage2D+finish
+RESULT 11-webgl angle-readpixels-256 PASS 1.05 ms per 256x256 readPixels
+RESULT 11-webgl angle-context-es2 PASS GL "OpenGL ES 3.0 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" GLSL "OpenGL ES GLSL ES 3.00 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)": #version 100 triangle centre 0,255,0 (want green) corner 0,0,0 (want black)
+angle tests done
+RESULT 11-webgl native-init PASS EGL 1.4, GL "OpenGL ES 3.2 Mesa 26.2.0" GLSL "OpenGL ES GLSL ES 3.20"
+RESULT 11-webgl native-draw-bench PASS 2000 draws: frame 17.48 ms = issue 16.43 (cpu 16.42) + finish 1.05; per draw 8.2 us (cpu 8.2); first frame 19.7 ms; GL error 0x0
+RESULT 11-webgl native-tex-upload-1080p PASS 34.29 ms per 1920x1080 RGBA texSubImage2D+finish (GL error 0x0)
+RESULT 11-webgl native-readpixels-256 PASS 1.05 ms per 256x256 readPixels (GL error 0x0)
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

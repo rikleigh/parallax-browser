@@ -4,20 +4,42 @@ _2026-11-07. Branch `spike/webgl`. Owner's question: can Parallax Browser get
 full WebGL? Part 1 builds ANGLE for the PS5 and runs it over ps5-opengl in a
 test title. Part 2 assesses every other route and ranks them._
 
-## Part 1 result: ANGLE on ps5-opengl builds and initialises; the console draw is pending
+## Part 1 result: ANGLE on ps5-opengl draws on the console at native speed
 
 | Step | Status | Evidence |
 | --- | --- | --- |
 | ANGLE (WebKit's vendored copy, 2.1.29096) cross-compiled for the PS5 title with its GL backend over EGL | **PASS** (Mac) | `build/angle-ps5/lib/libangle_ps5.a`, 17 MB, 306 objects, 3 small patches ([patches/](patches/)) |
 | Test title linked against ANGLE + ps5-opengl (gles-async) + libc++ 19, packaged | **PASS** (Mac) | `build/titles/PPSA99006/eboot.bin`, 26 MB, fake-signed, integrity valid |
 | ANGLE over ps5-opengl's real EGL facade + driver caps + Mesa (Spike 2's Rosetta harness, no GPU) | **PASS** (Mac host) | [results/hostcheck-2026-11-07.log](results/hostcheck-2026-11-07.log): EGL 1.5 ANGLE display, surfaceless, ES 3.0 context, 110 extensions, ESSL 300 es / 100 compiled |
-| Triangle, FBO, texture, readPixels, draw-call timing on the console | **NOT RUN** | PPSA99006 and PPSA99010 are no longer registered on the console (`/user/app/` has neither); registration needs the owner (`tools/launch.sh --register`), so the run stopped here per the rules |
+| Triangle, FBO, texture, readPixels, fence, draw-call timing on the console | **PASS** (PS5, 2026-11-07) | [results/console-2026-11-07.log](results/console-2026-11-07.log): all 13 ANGLE checks and 4 native checks pass; per draw 8.3 µs through ANGLE vs 8.2 µs native |
 
-So the go/no-go for "piece 1" is **go as far as a Mac can take it**: ANGLE
-needs nothing from ps5-opengl that it does not have, once three things are
-shimmed (below). What the console still has to show is the draw itself and
-the per-draw cost through ANGLE's state manager; both are measured by the
-title that is built and waiting.
+So piece 1 is a **go**: ANGLE needs nothing from ps5-opengl that it does not
+have, once three things are shimmed (below), and on the console it draws
+correctly with no measurable overhead.
+
+### Console run (2026-11-07)
+
+| Check | ANGLE | Native ps5-opengl |
+| --- | --- | --- |
+| Display / context | EGL 1.5, ES 3.0, 110 extensions, surfaceless | EGL 1.4, ES 3.2 |
+| ESSL 300 es program | compiled + linked in 4.9 ms | |
+| Triangle into an RGBA8 FBO, read back | right colours, GL error 0 | |
+| Texture sampling (64x64 checker) | right colours | |
+| `glFenceSync` / `glClientWaitSync` | signalled at once | |
+| `#version 100` (WebGL 1) shader | right colours | |
+| 2000 draws, one frame | 17.54 ms, **8.3 µs per draw** | 17.48 ms, **8.2 µs per draw** |
+| 1920x1080 RGBA `texSubImage2D` + finish | 34.5 ms | 34.3 ms |
+| 256x256 `readPixels` | 1.05 ms | 1.05 ms |
+
+ANGLE's validation and state tracking cost about 0.1 µs per draw here, well
+under the 20 µs that would have pointed at redundant state. The draw cost is
+ps5-opengl's own (about 8 µs, as in Spike 2b), so a WebGL page gets the same
+draw budget as native GLES on this driver: about 2000 draws per 60 Hz frame.
+The 1080p upload (35 ms) is slow, as it is natively; it matters for video
+textures and big canvases, which is why Part 2 copies video on the GPU.
+
+The share-group probe (ANGLE sharing with the title's GL 4.6 core context)
+is not in this run; it is the next test.
 
 ### Host check (what passed)
 
