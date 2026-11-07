@@ -457,3 +457,22 @@ with `PS5_DYNAMIC_SCANOUT` the call fills in an unset depth size).
 Note: `PS5_RUNTIME_QUIET` makes `printf` a no-op in `ps5_screen.c` and
 `ps5_agc_runtime_backend.c`, and the title logs stderr, not stdout:
 diagnostics go to `fprintf(stderr, ...)` (0005's warning does).
+
+## Patch 0008: GPU depth/stencil clears for 4x MSAA (2026-11-07)
+
+`ps5_clear_gpu_depth_stencil` (the blitter's depth quad) refused
+multisampled targets, so every clear of a 4x depth/stencil buffer (the
+default framebuffer of an antialiased WebGL canvas, as three.js makes it)
+drained the GPU queue and filled and flushed the tiled depth and stencil
+planes on the CPU: three.js's `webgl_geometry_cube` spent ~2.2 ms per frame
+in `glClear`. The GPU path now admits 4x targets with 4x storage, sizing the
+depth and stencil planes for 4 samples. The blitter draws with multisample
+rasterization off, which on this hardware (as on radeonsi) gives each covered
+pixel all its samples; the 4x colour clears already relied on it.
+`tests/ps5/test_gpu_clear_state.py` covers the new bounds (on macOS run it
+with `-no-pie` removed). On the console:
+`port/webkit/test/webgl/msaa-clear.html` (every sample primed, cleared,
+probed, resolved; also passes in desktop Chrome).
+Result: all 43 cases PASS on the console; three.js `webgl_geometry_cube`
+2.2 -> 0.24 ms per frame on the WebGL thread at 60 fps; `busy.html`
+unchanged (1000 cubes 59.8, 2000 32.9 fps).
