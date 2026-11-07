@@ -528,3 +528,21 @@ the TV. Profile at 2000 cubes: `ps5_prepare_constant` 6% -> under 1% of the
 WebGL thread; the libc/AGC time left is led by `ps5_agc_set_cx_mrt` (5%),
 `ps5_render_arena_allocate` (3.4%), `ps5_agc_gate2_run` (3.3%) and
 `runtime_shader_pair_get` (2.3%).
+
+## Patch 0012: descriptor snapshots skip the arena clear (2026-11-07)
+
+Each deferred draw takes three 16 KiB descriptor snapshots. Up to 8 batches of
+256 draws are in flight but the retired-snapshot cache keeps 256 per stage,
+so at 2000 draws per frame most snapshots are new `resource_create`s from the
+render arena, and the arena zeroed each one (the 3.4% of the WebGL thread in
+libc under `ps5_render_arena_allocate`). A snapshot's readable bytes are all
+rewritten before use, exactly as for a recycled snapshot (which already holds
+the previous draw's bytes), so `ps5_batch_copy_descriptors` creates them with
+the driver-private `PS5_RESOURCE_FLAG_UNCLEARED` and the arena skips the
+memset for them. Every other arena allocation is still cleared; the direct
+memory fallback still clears.
+
+`busy.html`: 2000 cubes 41.1 -> 42.9 fps (textured 39.0 -> 40.5), 22.4 ms per
+frame on the WebGL thread. `msaa-clear.html` 0 failures, `webgl.html` PASS,
+video formats 23 PASS / 0 FAIL. Not done: a larger snapshot cache (it would
+pin up to ~108 MiB of arena per context at this depth).
