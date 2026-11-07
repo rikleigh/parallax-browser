@@ -1,0 +1,36 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 285ade5..11caade 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -2563,7 +2563,12 @@ ps5_flush_gpu_data(const void *address, size_t bytes)
+ {
+    if (!bytes)
+       return;
+-   util_flush_inval_range((void *)address, bytes);
++   /* util_flush_inval_range fences twice and flushes the last line again
++    * (a workaround for Atom's clflush ordering). On this AMD CPU clflushopt
++    * is ordered after older stores to its line, and one fence after the
++    * range publishes it; the fence waits for the flushes, so each one costs. */
++   util_flush_range_no_fence((void *)address, bytes);
++   __builtin_ia32_mfence();
+ #ifdef PS5_DRAW_PROFILE
+    __atomic_fetch_add(&ps5_cpu_flush_calls, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ps5_cpu_flush_bytes, bytes, __ATOMIC_RELAXED);
+diff --git a/src/platform/ps5_agc_native_runtime.c b/src/platform/ps5_agc_native_runtime.c
+index 21e99ea..21fa49f 100644
+--- a/src/platform/ps5_agc_native_runtime.c
++++ b/src/platform/ps5_agc_native_runtime.c
+@@ -2839,8 +2839,11 @@ static int dump_depth_register_template(void *agc_module)
+ static void (flush_gpu_data)(const void *address, size_t bytes)
+ {
+ #ifdef PS5_NATIVE_TITLE_RUNTIME
+-    if (bytes)
+-        util_flush_inval_range((void *)address, bytes);
++    if (bytes) {
++        /* One fence per range (see ps5_flush_gpu_data in ps5_screen.c). */
++        util_flush_range_no_fence((void *)address, bytes);
++        __builtin_ia32_mfence();
++    }
+ #else
+     const uintptr_t end = (uintptr_t)address + bytes;
+     uintptr_t at = (uintptr_t)address & ~(uintptr_t)63;

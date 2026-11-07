@@ -476,3 +476,32 @@ probed, resolved; also passes in desktop Chrome).
 Result: all 43 cases PASS on the console; three.js `webgl_geometry_cube`
 2.2 -> 0.24 ms per frame on the WebGL thread at 60 fps; `busy.html`
 unchanged (1000 cubes 59.8, 2000 32.9 fps).
+
+## Patch 0009: prepared draws clear and flush only what the GPU reads (2026-11-07)
+
+Every prepared draw zeroed its 16 KiB state pages (`memory + 0x4000`) and
+clflushed all of them (8% and 8% of the title's CPU at 1000 draws per frame
+after 0006). The GPU reads those pages only through the indirect register
+loads in the draw's stream (`0x63`/`0x64`/`0x9f`, each reading exactly its
+count of records; the packets `validate_indirect_register_tables` checks)
+and writes only the completion marker at 0x6ff0, and every table is built
+from scratch per draw. So the clear now zeroes the marker only, and the
+publish walks the finished stream and flushes each loaded table and the
+marker line; a stream it cannot read, or a table outside the 64 KiB work
+block, flushes the 16 KiB whole as before. The ranges are flushed with
+`clflushopt` unfenced and fenced once per draw: a first version flushing each
+range with `util_flush_inval_range` (two `mfence`s per call, and the fence
+waits for every flush in flight) gained nothing, the publish going from 8% to
+14% of the WebGL thread with a sixth of the lines. Host test:
+`tests/ps5/test_prepared_shader_pairs.py`. `busy.html`: 2000 cubes 32.9 ->
+37.7 fps (~12.6 µs per draw), 1000 cubes 15.8 -> 13.8 ms per frame on the
+WebGL thread; `msaa-clear.html`, `webgl.html` and three.js's cube unchanged.
+
+## Patch 0010: one fence per CPU flush (2026-11-07)
+
+`ps5_flush_gpu_data` (Gallium) and the runtime's `flush_gpu_data` used
+`util_flush_inval_range`: `clflushopt` over the range, `mfence`, the last line
+flushed again, `mfence` (the repeat is a workaround for Atom's clflush
+ordering). On this AMD CPU `clflushopt` is ordered after older stores to its
+line, so the range and one `mfence` publish it; each draw makes several of
+these flushes (descriptor and constant tables, backing stores).

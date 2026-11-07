@@ -1,0 +1,213 @@
+diff --git a/src/platform/ps5_agc_native_runtime.c b/src/platform/ps5_agc_native_runtime.c
+index 1e0687f..21e99ea 100644
+--- a/src/platform/ps5_agc_native_runtime.c
++++ b/src/platform/ps5_agc_native_runtime.c
+@@ -922,6 +922,11 @@ static uint8_t command_out_of_space(agc_command_buffer_t *, uint32_t, void *);
+ 
+ #if defined(AGC_RUNTIME_PACKAGES)
+ static void flush_gpu_data(const void *address, size_t bytes);
++/* clflushopt with no fence, and the fence: a draw's ranges are flushed
++ * unfenced and fenced once. flush_gpu_data fences twice per call, and the
++ * fence waits for every flush in flight, so its cost is per call. */
++static void flush_gpu_data_unfenced(const void *address, size_t bytes);
++static void flush_gpu_data_fence(void);
+ #include "ps5_cache_profile.h"
+ #ifdef PS5_DRAW_PROFILE
+ #define flush_gpu_data(address, bytes) PS5_CACHE_MEASURE(flush_gpu_data, address, bytes)
+@@ -1102,9 +1107,69 @@ static uint64_t runtime_pair_scan_hits, runtime_pair_full;
+ /* Prepared draws write every emitted command and own only these mutable state
+  * pages. Shader code lives in the pair allocation; unused command capacity is
+  * neither executed nor an upload. Downward scratch is published separately. */
++/* The GPU reads these pages only through the indirect register loads in the
++ * command stream (each reads exactly its count of records) and writes only the
++ * completion marker. Every table is built from scratch per draw, so only the
++ * marker needs clearing, and only the tables the stream loads need flushing:
++ * zeroing and flushing all 16 KiB per draw was ~16% of the title's CPU at
++ * 1000 draws per frame. */
++#define RUNTIME_PREPARED_MARKER_OFFSET 0x6ff0u
+ static void runtime_prepared_work_clear(uint8_t *memory)
+ {
+-    memset(memory + 0x4000, 0, 0x4000);
++    memset(memory + RUNTIME_PREPARED_MARKER_OFFSET, 0, sizeof(uint64_t));
++}
++
++/* Flush every indirect register table the stream loads (the packets
++ * validate_indirect_register_tables checks, all in the 64 KiB work block),
++ * and the marker. A stream this cannot read flushes the state pages whole,
++ * as before. */
++static void runtime_prepared_work_flush_tables(uint8_t *memory,
++                                               const uint32_t *words,
++                                               uint32_t word_count)
++{
++    enum { MAX_TABLES = 32 };
++    const uint64_t begin = (uint64_t)(uintptr_t)memory;
++    const uint64_t end = begin + 0x10000u;
++    uint64_t address[MAX_TABLES], bytes[MAX_TABLES];
++    unsigned tables = 0;
++    uint32_t at = 0;
++
++    while (at < word_count) {
++        const uint32_t header = words[at];
++        const uint32_t type = header >> 30;
++        uint32_t packet_words;
++
++        if (type == 2)
++            packet_words = 1;
++        else if (type == 0 || type == 3)
++            packet_words = ((header >> 16) & UINT32_C(0x3fff)) + 2u;
++        else
++            goto whole;
++        if (packet_words > word_count - at)
++            goto whole;
++        if (type == 3) {
++            const uint32_t opcode = (header >> 8) & 0xffu;
++            if (opcode == 0x63u || opcode == 0x64u || opcode == 0x9fu) {
++                uint64_t table, size;
++
++                if (packet_words < 5u || tables == MAX_TABLES)
++                    goto whole;
++                table = (uint64_t)words[at + 1u] | ((uint64_t)words[at + 2u] << 32);
++                size = (uint64_t)words[at + 4u] * sizeof(agc_register_t);
++                if (table < begin || table > end || size > end - table)
++                    goto whole;
++                address[tables] = table;
++                bytes[tables++] = size;
++            }
++        }
++        at += packet_words;
++    }
++    for (unsigned i = 0; i < tables; ++i)
++        flush_gpu_data_unfenced((const void *)(uintptr_t)address[i], (size_t)bytes[i]);
++    flush_gpu_data_unfenced(memory + RUNTIME_PREPARED_MARKER_OFFSET, sizeof(uint64_t));
++    return;
++whole:
++    flush_gpu_data_unfenced(memory + 0x4000, 0x4000);
+ }
+ 
+ static int runtime_prepared_work_publish(uint8_t *memory,
+@@ -1115,9 +1180,11 @@ static int runtime_prepared_work_publish(uint8_t *memory,
+         command->up < command->bottom || command->down < command->up ||
+         command->down > command->top)
+         return -1;
+-    flush_gpu_data(memory + 0x4000, 0x4000);
+-    flush_gpu_data(command->bottom, (size_t)(command->up - command->bottom) * 4);
+-    flush_gpu_data(command->down, (size_t)(command->top - command->down) * 4);
++    runtime_prepared_work_flush_tables(memory, command->bottom,
++                                       (uint32_t)(command->up - command->bottom));
++    flush_gpu_data_unfenced(command->bottom, (size_t)(command->up - command->bottom) * 4);
++    flush_gpu_data_unfenced(command->down, (size_t)(command->top - command->down) * 4);
++    flush_gpu_data_fence();
+     return 0;
+ }
+ 
+@@ -2783,6 +2850,24 @@ static void (flush_gpu_data)(const void *address, size_t bytes)
+ #endif
+ }
+ 
++static void flush_gpu_data_unfenced(const void *address, size_t bytes)
++{
++#ifdef PS5_NATIVE_TITLE_RUNTIME
++    if (bytes)
++        util_flush_range_no_fence((void *)address, bytes);
++#else
++    const uintptr_t end = (uintptr_t)address + bytes;
++    uintptr_t at = (uintptr_t)address & ~(uintptr_t)63;
++    for (; bytes && at < end; at += 64)
++        __asm__ volatile("clflush (%0)" : : "r"(at) : "memory");
++#endif
++}
++
++static void flush_gpu_data_fence(void)
++{
++    __asm__ volatile("mfence" ::: "memory");
++}
++
+ #if (defined(AGC_RENDER_TO_TEXTURE_VARIANT) || \
+      defined(AGC_CLEAR_TEST_VARIANT)) && defined(AGC_TRIANGLE_SUBMIT)
+ static size_t tiled_rgba8_offset(uint32_t x, uint32_t y,
+diff --git a/tests/ps5/test_prepared_shader_pairs.py b/tests/ps5/test_prepared_shader_pairs.py
+index 4bed5bb..422046f 100644
+--- a/tests/ps5/test_prepared_shader_pairs.py
++++ b/tests/ps5/test_prepared_shader_pairs.py
+@@ -33,18 +33,21 @@ static int munmap(void *p,size_t n) { ++unmaps; free(p); return 0; }
+ static int sceKernelReleaseDirectMemory(int64_t p,size_t n) { ++releases; return 0; }
+ typedef struct { uint32_t *bottom,*top,*up,*down; } agc_command_buffer_t;
+ static int spy;
+-static const void *ranges[3]; static size_t lengths[3];
++static const void *ranges[8]; static size_t lengths[8];
+ static void flush_gpu_data(const void *p,size_t n) {
+-    if(spy) { assert(flushes<3); ranges[flushes]=p; lengths[flushes]=n; }
++    if(spy) { assert(flushes<8); ranges[flushes]=p; lengths[flushes]=n; }
+     ++flushes;
+ }
++static int fences;
++static void flush_gpu_data_unfenced(const void *p,size_t n) { flush_gpu_data(p,n); }
++static void flush_gpu_data_fence(void) { ++fences; }
+ typedef struct { int (*create_shader)(void **,void *,void *); int (*link_shaders)(void *,void *,void *,void *,void *,uint32_t); } agc_api_t;
+ static int create(void **p,void *header,void *code) { ++creates; *p=header; return fail_create ? -1 : 0; }
+ static int link_pair(void *out,void *scratch,void *unused,void *vs,void *ps,uint32_t primitive) {
+     ++links; memset(out,primitive,34*8); memset(scratch,0x5a,3*8); return 0;
+ }
+-''' + s[a:b] + r'''
+ typedef uint64_t agc_register_t;
++''' + s[a:b] + r'''
+ static void restore(struct runtime_shader_pair *prepared, uint8_t *memory) {
+     void *vertex, *pixel;
+ ''' + s[s.index('        vertex = prepared->vertex;'):s.index('        hull_rc = vertex_rc = pixel_rc = link_rc = 0;')] + r'''
+@@ -107,22 +110,50 @@ int main(void) {
+     assert(runtime_shader_pair_count==8 && creates==old_creates+16 && links==old_links+8);
+     assert(!runtime_shader_pair_clear() && allocations==releases && maps==unmaps);
+     uint8_t work[0x10000]; memset(work,0xa5,sizeof(work));
+-    runtime_prepared_work_clear(work);
++    runtime_prepared_work_clear(work); /* Only the completion marker. */
+     for(unsigned i=0;i<sizeof(work);++i)
+-        assert(work[i]==(i>=0x4000 && i<0x8000 ? 0 : 0xa5));
++        assert(work[i]==(i>=0x6ff0 && i<0x6ff8 ? 0 : 0xa5));
++    /* A stream of two indirect loads, a NOP, a plain packet and a load of a
++     * table in the command region: each table flushed, then the marker. */
++    uint32_t *w=(uint32_t*)(work+0x8000); unsigned n=0;
++#define LOAD(op,at,count) do { uint64_t a=(uint64_t)(uintptr_t)(work+(at)); \
++    w[n++]=(3u<<30)|(3u<<16)|((op)<<8); w[n++]=(uint32_t)a; w[n++]=(uint32_t)(a>>32); \
++    w[n++]=0; w[n++]=(count); } while (0)
++    LOAD(0x63u,0x7000,10); LOAD(0x9fu,0x6800,3);
++    w[n++]=2u<<30;
++    w[n++]=(3u<<30)|(0u<<16)|(0x10u<<8); w[n++]=7;
++    LOAD(0x64u,0xbf00,4);
+     agc_command_buffer_t c={(uint32_t*)(work+0x8000),(uint32_t*)(work+0xc000),
+-        (uint32_t*)(work+0x8100),(uint32_t*)(work+0xbfc0)};
++        w+n,(uint32_t*)(work+0xbfc0)};
+     spy=1; flushes=0;
++    assert(!runtime_prepared_work_publish(work,&c) && flushes==6 && fences==1);
++    assert(ranges[0]==work+0x7000 && lengths[0]==80);
++    assert(ranges[1]==work+0x6800 && lengths[1]==24);
++    assert(ranges[2]==work+0xbf00 && lengths[2]==32);
++    assert(ranges[3]==work+0x6ff0 && lengths[3]==8);
++    assert(ranges[4]==work+0x8000 && lengths[4]==n*4u);
++    assert(ranges[5]==work+0xbfc0 && lengths[5]==64);
++    /* Unreadable streams and tables outside the work block: the state pages whole. */
++    uint32_t saved_word=w[0]; w[0]=1u<<30; flushes=0;
+     assert(!runtime_prepared_work_publish(work,&c) && flushes==3);
+     assert(ranges[0]==work+0x4000 && lengths[0]==0x4000);
+-    assert(ranges[1]==work+0x8000 && lengths[1]==0x100);
+-    assert(ranges[2]==work+0xbfc0 && lengths[2]==64);
++    w[0]=saved_word; w[2]^=0x100u; flushes=0; /* A table far outside. */
++    assert(!runtime_prepared_work_publish(work,&c) && flushes==3);
++    assert(ranges[0]==work+0x4000 && lengths[0]==0x4000);
++    w[2]^=0x100u; w[4]=0x2000; flushes=0; /* 64 KiB of records: past the end. */
++    assert(!runtime_prepared_work_publish(work,&c) && flushes==3);
++    assert(ranges[0]==work+0x4000 && lengths[0]==0x4000);
++    w[4]=10; w[n-5]=(3u<<30)|(9u<<16)|(0x64u<<8); flushes=0; /* Overruns the stream. */
++    assert(!runtime_prepared_work_publish(work,&c) && flushes==3);
++    assert(ranges[0]==work+0x4000 && lengths[0]==0x4000);
++    w[n-5]=(3u<<30)|(3u<<16)|(0x64u<<8);
++    assert(fences==5); /* One per publish. */
+     flushes=0; c.down=c.up-1;
+     assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
+     c.down=c.top; c.bottom++;
+     assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
+     c.bottom--; c.top++;
+-    assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
++    assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0 && fences==5);
+     return 0;
+ }
+ '''
