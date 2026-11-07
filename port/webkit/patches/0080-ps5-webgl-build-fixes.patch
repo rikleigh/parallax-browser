@@ -313,7 +313,7 @@ index 35a872c262..cdaa424d7a 100644
          // the frame, and the view gets no buffers to wait for.
          if (RefPtr drawingArea = protectedThis->m_drawingArea; drawingArea && drawingArea->isDrawingAreaProxyWCPS5())
 diff --git a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
-index 94d8204075..cd70d18a02 100644
+index 94d8204075..00cd55b551 100644
 --- a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
 +++ b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
 @@ -26,7 +26,7 @@
@@ -334,6 +334,22 @@ index 94d8204075..cd70d18a02 100644
      // Or composited by the WC compositor in the title (GL in the UI process
      // only) when the compositing switch is on (opt-in). This is the first
      // guess; PageClientImpl::createDrawingAreaProxy settles it for each new
+@@ -52,6 +52,15 @@ void WebPreferences::platformInitializeStore()
+     setForceCompositingMode(false);
+ #endif
+     setThreadedScrollingEnabled(false);
++#if ENABLE(GPU_PROCESS)
++    // The PS5's GPU process side is only remote WebGL, hosted in the title
++    // (spikes/11-webgl). Canvas, page painting and media stay in the
++    // WebProcess; under WC upstream would send canvas and DOM drawing there.
++    setUseGPUProcessForCanvasRenderingEnabled(false);
++    setUseGPUProcessForDOMRenderingEnabled(false);
++    setUseGPUProcessForMediaEnabled(false);
++    setUseGPUProcessForWebGLEnabled(true);
++#endif
+ #else
+     setAcceleratedCompositingEnabled(true);
+     setForceCompositingMode(true);
 diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
 index a376b4723f..39abccd8c7 100644
 --- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
