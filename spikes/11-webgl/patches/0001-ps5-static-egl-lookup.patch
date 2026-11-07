@@ -1,0 +1,50 @@
+--- a/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
++++ b/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+@@ -10,6 +10,14 @@
+ 
+ #include <dlfcn.h>
+ 
++#if defined(ANGLE_PLATFORM_PS5)
++// PS5 (ps5webkit spike 11): the native EGL (ps5-opengl) is a static archive in
++// the same executable; there is no libEGL.so to dlopen. The host program
++// supplies a lookup over the egl* symbols it linked, which falls back to
++// ps5-opengl's eglGetProcAddress for the GL entry points.
++extern "C" void *angle_ps5_egl_get_proc_address(const char *name);
++#endif
++
+ namespace rx
+ {
+ namespace
+@@ -33,7 +41,11 @@
+                                       const char *libName,
+                                       void *eglHandle)
+ {
+-
++#if defined(ANGLE_PLATFORM_PS5)
++    mGetProcAddressPtr =
++        reinterpret_cast<PFNEGLGETPROCADDRESSPROC>(angle_ps5_egl_get_proc_address);
++    return FunctionsEGL::initialize(platformType, nativeDisplay);
++#else
+     if (eglHandle)
+     {
+         // If the handle is provided, use it.
+@@ -60,6 +72,7 @@
+     }
+ 
+     return FunctionsEGL::initialize(platformType, nativeDisplay);
++#endif
+ }
+ 
+ void *FunctionsEGLDL::getProcAddress(const char *name) const
+@@ -69,7 +82,11 @@
+     {
+         return f;
+     }
++#if defined(ANGLE_PLATFORM_PS5)
++    return nullptr;
++#else
+     return dlsym(nativeEGLHandle, name);
++#endif
+ }
+ 
+ }  // namespace rx

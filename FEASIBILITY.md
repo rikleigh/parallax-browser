@@ -146,6 +146,7 @@ process out of the box, while WebKit needs a patch (§4.8).
 | 8 title ↔ payload IPC | **verified:** builds as title PPSA99009 with the server payload embedded | **PASS** ([README](spikes/08-title-ipc/README.md)): **the title spawns the payload through the local elfldr** (listening after 1.6–5.2 s); title → payload unix `connect` **EPERM**; **reversed works: the title listens in a 0777 directory the payload made (`/system_tmp/ps5wk`), the payload connects, shm fds pass both ways with SCM_RIGHTS**; named shm both ways; loopback TCP. RTT 131 µs (unix) / 186–249 µs (tcp); in-process baseline 18 µs in the title vs 73 µs in a payload; 112 MB/s (unix), 350 MB/s (tcp). `sceShellCoreUtilExitApp` returns 0 and the title closes **with no debug error** (user-checked) | **go** |
 | 9 hardware video decode | **verified:** `libSceVideodec2` bound through a 13.60 export table (dlsym refuses it); AUs from Annex-B, IVF and fMP4; zero-copy GL path | **PASS (title)** ([README](spikes/09-hw-decode/README.md)): VR clip **8K HEVC 93 fps**, 6K 130, 4K 90; H.264 4K 87; VP9 4K 84, 5.7K 68, Profile 2 88; HEVC Main10 8K 59, 8192x4096 60 (80 Mbit/s noisy clips); 0 errors. Linear NV12 (10-bit: LSB-aligned 16-bit) written into **GL buffer storage**, converted on the GPU in 3.2 ms at 8K with no CPU copy (readback matches). 8K decoder takes 223 MB flexible memory (139 MB at depth 2, 79 fps). **Payload: blocks in the first call.** No AV1 in the decoder; dav1d in software: 4K 92 fps, 8K 34. FFmpeg HEVC in software: 4K 46–51, 8K 20 (8 threads; 16 threads collapse). Headset run plays (0 submit errors) but **visual check open** | **go** |
 | 10 title direct-memory heap | **verified:** `dheap.c` (dlmalloc 2.8.6, MIT-0) over a 16 GiB `sceKernelReserveVirtualRange`, commits via `sceKernelAllocateMainDirectMemory` type 12 + `sceKernelMapDirectMemory` prot 0x03 | **PASS (title PPSA99015)** ([README](spikes/10-title-dmem/README.md)): 4 GB of direct memory committed with **flexible memory unchanged (440.0 MB)**; malloc, C++ new, glib all land in it; 8-thread stress 1.5 GB live, 0 bad, 21 M alloc/free pairs/s vs libc's 0.04 M/s; **8K HEVC decoder at depth 4 next to a 1.5 GB heap: 92.3 fps, 0 errors**; 64 direct-memory thread stacks cost no flexible memory (libc stacks: 128 MB, never returned); RW→RX `sceKernelMprotect` JIT works. **The title image costs flexible memory 1:1** (100 MB padding: 440 → 340 MB at the first constructor); title text is execute-only | **go** (R8) |
+| 11 WebGL (ANGLE on ps5-opengl) | **verified (Mac):** ANGLE 2.1.29096 (WebKit's copy) cross-compiled for the title with its GL backend over EGL (3 small patches: a static `egl*` lookup, no futex, FreeBSD clocks); test title PPSA99006 built; **host check PASS** under Spike 2's Rosetta harness (real EGL facade + driver caps + Mesa): EGL 1.5 ANGLE display, surfaceless, ES 3.0 contexts, 110 extensions, ESSL 300 es/100 compiled | **not run:** the test titles are no longer registered (owner's `--register` needed). The title measures triangle/FBO/texture/readPixels and ANGLE vs native per-draw cost ([README](spikes/11-webgl/README.md)) | **go for the build; console pending** |
 | 5 OpenXR runtime | **verified:** `libopenxr_psvr2` covers all ~50 calls WebKit makes (+ the rest of 1.0 core); host smoke test replaying WebKit's sequence **18/18 PASS** via dlopen, static link and the official Khronos loader (1.1.65); PS5 backend cross-compiles (`libopenxr_psvr2.a`) | not run; the study closed without it. Its PS5 backend is Spike 3b's code path, which passed. The first port task | — (not a gate) |
 | 6 MiniBrowser | design ([README](spikes/06-wpe-minibrowser/README.md)); superseded in part by §4.8 (WC mode, CPU-painted WebProcess, no GL in payloads) | — | port work |
 | 7 WebXR e2e | design ([README](spikes/07-webxr-e2e/README.md)); §4.8 picks the single-title option (OpenXR and WebGL in one process) | — | port work |
@@ -465,6 +466,41 @@ are upstream WebKit bugs.
 - **Title memory:** with the UIProcess and the GPU process in the title, its
   251 MB of flexible memory is tight. Heaps need a direct-memory backend
   (risk R8).
+
+### 4.9 WebGL (Spike 11, 2026-11-07)
+
+Full write-up: [spikes/11-webgl/README.md](spikes/11-webgl/README.md).
+
+- **ANGLE runs on ps5-opengl.** WebKit's vendored ANGLE builds for the
+  title with its GL-over-EGL backend; ps5-opengl's facade gives it what it
+  asks for (EGL 1.4, `KHR_create_context`, surfaceless contexts, ES 3.2
+  native contexts from Spike 2's patch) once three things are shimmed:
+  the `egl*` entry points (the facade's `eglGetProcAddress` only knows GL,
+  and a static title has nothing to `dlopen`), no `linux/futex.h`, and
+  FreeBSD clock/thread-name names. No EGLImage and no EGL fences are needed
+  for WebGL itself (ANGLE uses GL sync objects). ANGLE caps the client at
+  **ES 3.0**, which is WebGL 2. Checked on the Mac against the real EGL
+  facade, driver caps and Mesa; the console draw and the per-draw cost are
+  measured by the built test title, which waits for a registered test
+  title ID.
+- **The route (ranked in the spike):** WebKit's remote WebGL with the
+  receiver hosted in the title: `IPC::Semaphore` on `_umtx_op` (small),
+  `ENABLE_GPU_PROCESS` without GBM and ANGLE in the build (medium), a host
+  object in place of `GPUConnectionToWebProcess` (medium: no process-global
+  state is needed, so R14 shrinks), and the drawing buffer into `WCScene`
+  through `GraphicsContextGLCoordinated`'s texture + `glFenceSync` buffer
+  (the large piece: upstream's WC WebGL layer is compiled out under
+  coordinated graphics). Video textures come from the title's own video
+  texture by a GPU copy in the same share group. First risk to test: ANGLE's
+  GLES contexts sharing with the title's GL 4.6 core context on ps5-opengl.
+  R15 therefore no longer needs EGLImage.
+- **Fallback:** llvmpipe + ANGLE in the WebProcess, painted through
+  WebKit's readPixels path (medium; software speed; no hardware video).
+  A separate GPU process or GPU use from payloads is not a route today (every
+  homebrew GPU stack runs as a title; Sony's launcher is a private API).
+- **Why it matters now:** three.js r163+ and A-Frame are WebGL2-only and
+  fail outright without a context; most VR video sites show flat video
+  instead, and "View in VR" covers those.
 
 ## 5. Risk register
 

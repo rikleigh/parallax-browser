@@ -1,0 +1,16 @@
+--- a/src/common/system_utils_linux.cpp
++++ b/src/common/system_utils_linux.cpp
+@@ -18,6 +18,13 @@
+ 
+ #include <array>
+ 
++// PS5 (ps5webkit spike 11): FreeBSD libc: no CLOCK_MONOTONIC_RAW, no pthread_setname_np.
++#if defined(ANGLE_PLATFORM_PS5)
++#    include <pthread_np.h>
++#    define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
++#    define pthread_setname_np pthread_set_name_np
++#endif
++
+ namespace angle
+ {
+ std::string GetExecutablePath()
