@@ -1,0 +1,267 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 0f215ed..ad83d82 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -2580,6 +2580,7 @@ ps5_flush_gpu_data(const void *address, size_t bytes)
+ }
+ 
+ #include "../../platform/ps5_cache_profile.h"
++#include "../../platform/ps5_memeq.h"
+ #ifdef PS5_DRAW_PROFILE
+ #define ps5_flush_gpu_data(address, bytes) PS5_CACHE_MEASURE(ps5_flush_gpu_data, address, bytes)
+ #endif
+@@ -14959,7 +14960,7 @@ ps5_select_shader_variant(struct ps5_shader *shader, uint32_t address32_hi,
+           variant->exports.ignore_sample_mask == exports->ignore_sample_mask &&
+           variant->exports.rasterization_samples == exports->rasterization_samples &&
+           variant->exports.ps_iter_samples == exports->ps_iter_samples &&
+-          !memcmp(&variant->layout, layout, sizeof(*layout))) {
++          ps5_memeq(&variant->layout, layout, sizeof(*layout))) {
+          shader->active = variant;
+          return true;
+       }
+diff --git a/src/platform/ps5_agc_native_runtime.c b/src/platform/ps5_agc_native_runtime.c
+index 21fa49f..8e8e2ee 100644
+--- a/src/platform/ps5_agc_native_runtime.c
++++ b/src/platform/ps5_agc_native_runtime.c
+@@ -34,6 +34,7 @@
+ #ifdef PS5_NATIVE_TITLE_RUNTIME
+ #include "util/cache_ops.h"
+ #endif
++#include "ps5_memeq.h"
+ 
+ #if defined(PS5_DRAW_PROFILE) && (!defined(AGC_RUNTIME_PACKAGES) || !defined(AGC_TRIANGLE_SUBMIT))
+ #error "Draw profiling requires the submitting runtime backend"
+@@ -1212,8 +1213,8 @@ static struct runtime_shader_pair *runtime_shader_pair_get_unlocked(
+         hot->vs_size == runtime_vs_package_len &&
+         hot->ps_size == runtime_ps_package_len &&
+         hot->primitive == runtime_primitive_type &&
+-        !memcmp(hot->source, runtime_vs_package, hot->vs_size) &&
+-        !memcmp(hot->source + hot->vs_size, runtime_ps_package, hot->ps_size)) {
++        ps5_memeq(hot->source, runtime_vs_package, hot->vs_size) &&
++        ps5_memeq(hot->source + hot->vs_size, runtime_ps_package, hot->ps_size)) {
+         ++runtime_pair_hot_hits;
+         return hot;
+     }
+@@ -1222,8 +1223,8 @@ static struct runtime_shader_pair *runtime_shader_pair_get_unlocked(
+         if (p->vs_key == runtime_vs_package && p->ps_key == runtime_ps_package &&
+             p->vs_size == runtime_vs_package_len && p->ps_size == runtime_ps_package_len &&
+             p->primitive == runtime_primitive_type &&
+-            !memcmp(p->source, runtime_vs_package, p->vs_size) &&
+-            !memcmp(p->source + p->vs_size, runtime_ps_package, p->ps_size)) {
++            ps5_memeq(p->source, runtime_vs_package, p->vs_size) &&
++            ps5_memeq(p->source + p->vs_size, runtime_ps_package, p->ps_size)) {
+             runtime_shader_pair_hot[slot] = p;
+             ++runtime_pair_scan_hits;
+             return p; /* Byte comparison also covers freed/reused package addresses. */
+diff --git a/src/platform/ps5_agc_runtime_backend.c b/src/platform/ps5_agc_runtime_backend.c
+index a1b8b2a..4126e34 100644
+--- a/src/platform/ps5_agc_runtime_backend.c
++++ b/src/platform/ps5_agc_runtime_backend.c
+@@ -8,6 +8,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include "ps5_screen.h"
++#include "ps5_memeq.h"
+ 
+ #ifdef PS5_RUNTIME_QUIET
+ static int
+@@ -599,8 +600,8 @@ ps5_agc_set_cx_mrt(void *command, const void *table, uint32_t count)
+       return ps5_agc_set_cx_mrt_uncached(command, table, count, &output_count);
+    for (unsigned i = 0; i < ENTRIES; ++i) {
+       if (cache[i].valid && cache[i].input_count == count &&
+-          !memcmp(cache[i].input, table, count * sizeof(cache[i].input[0])) &&
+-          !memcmp(&cache[i].state, &ps5_agc_draw_state, sizeof(cache[i].state))) {
++          ps5_memeq(cache[i].input, table, count * sizeof(cache[i].input[0])) &&
++          ps5_memeq(&cache[i].state, &ps5_agc_draw_state, sizeof(cache[i].state))) {
+          memcpy((void *)table, cache[i].output,
+                 cache[i].output_count * sizeof(cache[i].output[0]));
+          return ps5_agc_set_cx(command, table, cache[i].output_count);
+diff --git a/src/platform/ps5_memeq.h b/src/platform/ps5_memeq.h
+new file mode 100644
+index 0000000..cd33001
+--- /dev/null
++++ b/src/platform/ps5_memeq.h
+@@ -0,0 +1,72 @@
++/*
++ * PS5 OpenGL - OpenGL implementation for PlayStation 5.
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Inline byte equality for per-draw cache checks. The system libc memcmp
++ * is an out-of-module call and showed up at ~7% of the WebGL thread for
++ * compares of a few hundred bytes to a few KiB that almost always match;
++ * this compares 64 bytes per step with SSE2 (8 without it) and stops at the first
++ * difference. Equality only: no ordering.
++ */
++#ifndef PS5_MEMEQ_H
++#define PS5_MEMEQ_H
++
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++static inline bool
++ps5_memeq(const void *a, const void *b, size_t bytes)
++{
++   const uint8_t *x = (const uint8_t *)a;
++   const uint8_t *y = (const uint8_t *)b;
++
++#if defined(__SSE2__)
++   while (bytes >= 64) {
++      __m128i d = _mm_xor_si128(_mm_loadu_si128((const __m128i *)x),
++                                _mm_loadu_si128((const __m128i *)y));
++      d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128((const __m128i *)(x + 16)),
++                                        _mm_loadu_si128((const __m128i *)(y + 16))));
++      d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128((const __m128i *)(x + 32)),
++                                        _mm_loadu_si128((const __m128i *)(y + 32))));
++      d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128((const __m128i *)(x + 48)),
++                                        _mm_loadu_si128((const __m128i *)(y + 48))));
++      if (_mm_movemask_epi8(_mm_cmpeq_epi8(d, _mm_setzero_si128())) != 0xffff)
++         return false;
++      x += 64;
++      y += 64;
++      bytes -= 64;
++   }
++   while (bytes >= 16) {
++      __m128i d = _mm_xor_si128(_mm_loadu_si128((const __m128i *)x),
++                                _mm_loadu_si128((const __m128i *)y));
++      if (_mm_movemask_epi8(_mm_cmpeq_epi8(d, _mm_setzero_si128())) != 0xffff)
++         return false;
++      x += 16;
++      y += 16;
++      bytes -= 16;
++   }
++#endif
++   while (bytes >= 8) {
++      uint64_t u, v;
++      memcpy(&u, x, 8);
++      memcpy(&v, y, 8);
++      if (u != v)
++         return false;
++      x += 8;
++      y += 8;
++      bytes -= 8;
++   }
++   while (bytes) {
++      if (*x++ != *y++)
++         return false;
++      --bytes;
++   }
++   return true;
++}
++
++#endif
+diff --git a/tests/ps5/test_command_state_cache.py b/tests/ps5/test_command_state_cache.py
+index 1b07f5a..fad7452 100644
+--- a/tests/ps5/test_command_state_cache.py
++++ b/tests/ps5/test_command_state_cache.py
+@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory() as tmp:
+         flags = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-no-pie'] if sanitize else []
+         subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                         '-Wno-unused-function', '-Wno-unused-variable', *flags,
+-                        '-I', str(root / 'src/gallium/ps5'), '-x', 'c', '-', '-o', binary],
++                        '-I', str(root / 'src/gallium/ps5'), '-I', str(root / 'src/platform'), '-x', 'c', '-', '-o', binary],
+                        input=code, text=True, check=True, timeout=60)
+         print('sanitized' if sanitize else 'optimized host timing (not PS5)', flush=True)
+         subprocess.run([binary], check=True, timeout=30)
+diff --git a/tests/ps5/test_linear_color_targets.py b/tests/ps5/test_linear_color_targets.py
+index c5ba38c..8bb3396 100644
+--- a/tests/ps5/test_linear_color_targets.py
++++ b/tests/ps5/test_linear_color_targets.py
+@@ -383,7 +383,8 @@ with tempfile.TemporaryDirectory(prefix="ps5-linear-color-") as directory:
+         "-Wno-unused-function", "-Wno-unused-variable",
+         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+         "-fno-sanitize-recover=all", "-fno-pie", "-no-pie",
+-        "-I", str(ROOT / "src/gallium/ps5"), "-x", "c", "-o", str(binary), "-",
++        "-I", str(ROOT / "src/gallium/ps5"), "-I", str(ROOT / "src/platform"),
++        "-x", "c", "-o", str(binary), "-",
+     ]
+     subprocess.run(command, input=code, text=True, check=True, timeout=60)
+     subprocess.run([str(binary)], check=True, timeout=30)
+diff --git a/tests/ps5/test_memeq.py b/tests/ps5/test_memeq.py
+new file mode 100644
+index 0000000..918eeb3
+--- /dev/null
++++ b/tests/ps5/test_memeq.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""ps5_memeq agrees with memcmp == 0 for every length, offset and difference position.
++
++Builds natively and, where the host can run it, as x86_64 so the SSE2 path
++(the one the title uses) is exercised too.
++"""
++from pathlib import Path
++import platform
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++header = root / 'src/platform/ps5_memeq.h'
++code = '#include "%s"\n' % header + r'''
++#include <assert.h>
++#include <stdio.h>
++static unsigned char a[512 + 32], b[512 + 32];
++int main(void) {
++ unsigned long cases = 0;
++ for (unsigned i = 0; i < sizeof(a); ++i) a[i] = b[i] = (unsigned char)(i * 37 + 11);
++ for (unsigned oa = 0; oa < 17; ++oa)
++  for (unsigned ob = 0; ob < 17; ob += 4)
++   for (unsigned n = 0; n <= 300; ++n) {
++    memcpy(b + ob, a + oa, n);
++    assert(ps5_memeq(a + oa, b + ob, n));
++    ++cases;
++    for (unsigned at = 0; at < n; ++at) {
++     unsigned char saved = b[ob + at];
++     for (unsigned bit = 0; bit < 8; bit += 7) {
++      b[ob + at] = saved ^ (unsigned char)(1u << bit);
++      assert(!ps5_memeq(a + oa, b + ob, n));
++      ++cases;
++     }
++     b[ob + at] = saved;
++    }
++    // Bytes just outside the range never matter.
++    b[ob + n] ^= 0xff;
++    if (ob) b[ob - 1] ^= 0xff;
++    assert(ps5_memeq(a + oa, b + ob, n));
++    b[ob + n] ^= 0xff;
++    if (ob) b[ob - 1] ^= 0xff;
++   }
++ printf("%lu\n", cases);
++}
++'''
++runs = []
++with tempfile.TemporaryDirectory() as directory:
++    targets = [('native', [])]
++    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
++        targets.append(('x86_64', ['-arch', 'x86_64']))
++    elif platform.machine() in ('x86_64', 'AMD64'):
++        targets[0] = ('x86_64', [])
++    for name, flags in targets:
++        exe = str(Path(directory) / name)
++        sanitize = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all'] if not flags else []
++        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', *sanitize, *flags,
++                        '-x', 'c', '-', '-o', exe], input=code, text=True, check=True)
++        try:
++            out = subprocess.run([exe], check=True, timeout=60, capture_output=True, text=True).stdout.strip()
++        except OSError:
++            print(f'skip {name}: cannot run on this host')
++            continue
++        runs.append(f'{name} {out}')
++print('PASS memeq vs memcmp: lengths 0-300, offsets, every byte position; ' + ', '.join(runs))
+diff --git a/tests/ps5/test_prepared_shader_pairs.py b/tests/ps5/test_prepared_shader_pairs.py
+index 422046f..b3d2901 100644
+--- a/tests/ps5/test_prepared_shader_pairs.py
++++ b/tests/ps5/test_prepared_shader_pairs.py
+@@ -6,7 +6,8 @@ root = Path(__file__).resolve().parents[2]
+ s = (root/'src/platform/ps5_agc_native_runtime.c').read_text()
+ a = s.index('static struct runtime_shader_pair {')
+ b = s.index('\nstatic int runtime_work_take', a)
+-code = r'''
++# The pair lookup compares packages with the production inline helper.
++code = '#include "%s"\n' % (root/'src/platform/ps5_memeq.h') + r'''
+ #include <assert.h>
+ #include <inttypes.h>
+ #include <stdint.h>

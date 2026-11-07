@@ -546,3 +546,21 @@ memory fallback still clears.
 frame on the WebGL thread. `msaa-clear.html` 0 failures, `webgl.html` PASS,
 video formats 23 PASS / 0 FAIL. Not done: a larger snapshot cache (it would
 pin up to ~108 MiB of arena per context at this depth).
+
+## Patch 0013: inline equality for per-draw cache checks (2026-11-07)
+
+The per-draw cache hits compare bytes with the system libc `memcmp`, an
+out-of-module call through the GOT: the `set_cx_mrt` table cache (input
+records and draw state), the prepared shader-pair lookup (both shader
+packages, every draw) and the shader-variant layout match. Together ~7% of the
+WebGL thread at 2000 draws per frame, nearly all on compares that match.
+`src/platform/ps5_memeq.h` adds `ps5_memeq`, an inline equality check (SSE2,
+64 bytes per step; 8-byte words without SSE2 for host tests), used at those
+sites. Host test `tests/ps5/test_memeq.py` checks it against `memcmp` for
+lengths 0-300, offsets and every byte position, natively and as x86_64 (the
+SSE2 path) where the host runs it. Three host tests that compile the backend
+from stdin gained `-I src/platform`.
+
+`busy.html`: 2000 cubes 42.9 -> 46.4 fps (textured 40.5 -> 43.6), 20.6 ms
+per frame on the WebGL thread. `msaa-clear.html` 0 failures, `webgl.html`
+PASS, video formats 23 PASS / 0 FAIL, three.js's cube right on the TV.
