@@ -28,6 +28,12 @@ ninja -C "$B" -j"${JOBS:-8}" angle_ps5 2>&1 | grep -E "error|FAILED|\[[0-9]+/[0-
 cc() { /usr/bin/clang "${arch[@]}" "$@"; }
 cc -std=c11 -O1 -g -DEGL_NO_PLATFORM_SPECIFIC_TYPES=1 -I"$M/include" -c "$ROOT/spikes/11-webgl/src/egl_lookup.c" -o "$O/egl_lookup.o"
 cc -std=c11 -O1 -g -c "$HERE/hostcheck_main.c" -o "$O/hostcheck_main.o"
+cc -std=c11 -O1 -g -DEGL_NO_PLATFORM_SPECIFIC_TYPES=1 -I"$M/include" -c "$ROOT/spikes/11-webgl/src/share_native.c" -o "$O/share_native.o"
+/usr/bin/clang++ "${arch[@]}" -std=c++20 -O1 -g -I"$SRC/include" -I"$SRC/include/KHR" -I"$SRC/src" \
+    -I"$SRC/src/common/base" -I"$SRC/src/common/third_party/xxhash" -DANGLE_ENABLE_ESSL -DANGLE_ENABLE_GLSL \
+    -DANGLE_ENABLE_OPENGL -DANGLE_PLATFORM_LINUX -DANGLE_PLATFORM_PS5 -DANGLE_USE_STATIC_THREAD_LOCAL_VARIABLES \
+    -DEGL_NO_PLATFORM_SPECIFIC_TYPES -DGL_GLES_PROTOTYPES=0 -DEGL_EGL_PROTOTYPES=0 -DLIBANGLE_IMPLEMENTATION -DNDEBUG \
+    -c "$ROOT/spikes/11-webgl/src/angle_native.cpp" -o "$O/angle_native.o"
 /usr/bin/clang++ "${arch[@]}" -std=c++20 -O1 -g -DHOST_CHECK=1 -I"$SRC/include" -I"$SRC/src" \
     -c "$ROOT/spikes/11-webgl/src/angle_tests.cpp" -o "$O/angle_tests.o"
 
@@ -44,7 +50,7 @@ weak=(); for w in $(/opt/homebrew/opt/llvm@18/bin/llvm-nm "$T"/build/core33-nati
 objs=("$O2"/obj/ps5_screen.o "$O2"/obj/ps5_egl.o "$O2"/obj/u_framebuffer.o "$O2"/obj/platform_stubs.o)
 for f in ac_formats gfx10_format_table; do [[ -f $O2/obj/$f.o ]] && objs+=("$O2/obj/$f.o"); done
 [[ -f $O2/gen_stubs.o ]] && objs+=("$O2/gen_stubs.o")
-/usr/bin/clang++ "${arch[@]}" -o "$O/hostcheck_angle" "$O/hostcheck_main.o" "$O/angle_tests.o" "$O/egl_lookup.o" \
+/usr/bin/clang++ "${arch[@]}" -o "$O/hostcheck_angle" "$O/hostcheck_main.o" "$O/angle_tests.o" "$O/egl_lookup.o" "$O/share_native.o" "$O/angle_native.o" \
     "${objs[@]}" "$B/libangle_ps5.a" "${mlibs[@]}" "${weak[@]}" -lz -framework Foundation 2> "$O/link.log" \
     || { grep -E "Undefined|symbol|error" "$O/link.log" | head -30; exit 1; }
 echo "running $O/hostcheck_angle under Rosetta"

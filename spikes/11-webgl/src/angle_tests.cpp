@@ -12,6 +12,8 @@
 //   angle-draw-bench     2000 strip draws + 2 uniform4f per draw, per-draw us
 //   angle-tex-upload     1920x1080 RGBA texSubImage2D (video-as-texture cost)
 //   angle-readpixels     256x256 readPixels
+//   share-*              share_probe_run: WebGL sharing with a GL 4.6 core
+//                        context the way WebKit sets it up (see below)
 #define EGL_NO_PLATFORM_SPECIFIC_TYPES 1
 #define GL_GLES_PROTOTYPES 0
 #define EGL_EGL_PROTOTYPES 0
@@ -36,6 +38,25 @@ void spike11_result(const char *test, int pass, const char *fmt, ...);
 double spike11_now_ms(void);
 double spike11_cpu_ms(void);
 void angle_tests_run(void);
+void share_probe_run(void);
+// share_native.c (ps5-opengl directly) and angle_native.cpp (ANGLE internals)
+int share_native_create(char *info, unsigned n);
+int share_native_make_current(void);
+int share_native_create_anchor(char *info, unsigned n);
+int share_native_make_anchor_current(void);
+int share_native_core_is_current(void);
+void share_native_release(void);
+void share_native_bind_es(void);
+void share_native_bind_gl(void);
+int share_native_current(char *info, unsigned n);
+unsigned share_native_texture(int w, int h, uint8_t r, uint8_t g, uint8_t b);
+int share_native_read(unsigned tex, int x, int y, uint8_t out[4]);
+int share_native_copy(unsigned src, unsigned dst, int w, int h);
+void *share_native_fence(void);
+unsigned share_native_wait(void *sync, double *ms);
+void share_native_delete(unsigned tex);
+void share_native_destroy(void);
+unsigned angle_ps5_native_texture(unsigned name);
 }
 
 namespace {
@@ -571,4 +592,191 @@ void angle_tests_run(void)
     // ps5-opengl's one display, and EGL_Terminate would tear it down.
     EGL_MakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     spike11_log("angle tests done");
+}
+
+// --- share group -------------------------------------------------------------
+// The browser's compositor draws with one GL 4.6 core context (PS5Renderer).
+// WebKit shares WebGL with such a context as PlatformDisplay::
+// angleSharingGLContext() and GraphicsContextGLEGL do: an ANGLE context that
+// wraps the native context (EGL_EXTERNAL_CONTEXT_ANGLE, made while it is
+// current), then WebGL contexts in virtualization group 0 that share with it.
+// ANGLE then makes the group's native ES context with the wrapped context as
+// its share context. ANGLE here has no desktop GL backend, so it can't wrap
+// the 4.6 core context itself (it would have no GL functions): it wraps an ES
+// 3.2 "anchor" made in the core context's share group, which share groups
+// being transitive comes to the same. Checked here: that the native context is ES although the
+// thread has EGL_OPENGL_API bound (ANGLE binds ES once, at display set-up),
+// that the core context sees what ANGLE drew under ANGLE's native name, that
+// a fence from ANGLE's context can be waited on in the core one, and that the
+// core context can copy into ANGLE's texture (the video path).
+
+namespace {
+
+EGLContext share_webgl_context(EGLContext ext, bool *es, char *info, size_t n)
+{
+    const EGLint attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3,
+                            EGL_CONTEXT_WEBGL_COMPATIBILITY_ANGLE, EGL_TRUE,
+                            EGL_ROBUST_RESOURCE_INITIALIZATION_ANGLE, EGL_TRUE,
+                            EGL_CONTEXT_CLIENT_ARRAYS_ENABLED_ANGLE, EGL_FALSE,
+                            EGL_CONTEXT_BIND_GENERATES_RESOURCE_CHROMIUM, EGL_FALSE,
+                            EGL_CONTEXT_VIRTUALIZATION_GROUP_ANGLE, 0,
+                            EGL_NONE};
+    *es = false;
+    EGLContext ctx = EGL_CreateContext(g_dpy, g_cfg, ext, attrs);
+    if (ctx == EGL_NO_CONTEXT) {
+        snprintf(info, n, "EGL_CreateContext 0x%04x", EGL_GetError());
+        return EGL_NO_CONTEXT;
+    }
+    const bool coreStillCurrent = share_native_core_is_current();
+    if (!make_current(ctx)) {
+        snprintf(info, n, "EGL_MakeCurrent 0x%04x", EGL_GetError());
+        EGL_DestroyContext(g_dpy, ctx);
+        return EGL_NO_CONTEXT;
+    }
+    char native[160];
+    *es = share_native_current(native, sizeof native);
+    snprintf(info, n, "GL \"%s\"; %s; core context %s current after EGL_CreateContext", GL_GetString(GL_VERSION),
+             native, coreStillCurrent ? "still" : "no longer");
+    return ctx;
+}
+
+} // namespace
+
+void share_probe_run(void)
+{
+    if (g_dpy == EGL_NO_DISPLAY)
+        return;
+    char info[512];
+    EGL_MakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (!share_native_create(info, sizeof info)) {
+        spike11_result("share-core-context", 0, "%s", info);
+        return;
+    }
+    spike11_result("share-core-context", 1, "%s", info);
+    spike11_log("  share: a texture in the core context");
+    const unsigned green = share_native_texture(64, 64, 0, 255, 0);
+
+    const int anchored = share_native_create_anchor(info, sizeof info);
+    spike11_result("share-anchor", anchored, "%s", info);
+    if (!anchored) {
+        share_native_destroy();
+        return;
+    }
+    spike11_log("  share: core texture %u; the ANGLE external context around the anchor", green);
+    share_native_make_anchor_current();
+    const EGLint extAttrs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_EXTERNAL_CONTEXT_ANGLE, EGL_TRUE, EGL_NONE};
+    EGLContext ext = EGL_CreateContext(g_dpy, g_cfg, EGL_NO_CONTEXT, extAttrs);
+    share_native_make_current();
+    spike11_result("share-external-context", ext != EGL_NO_CONTEXT, "EGL_EXTERNAL_CONTEXT_ANGLE around the anchor: %s 0x%04x",
+                   ext != EGL_NO_CONTEXT ? "created" : "failed", EGL_GetError());
+    if (ext == EGL_NO_CONTEXT) {
+        share_native_destroy();
+        return;
+    }
+
+    // ANGLE binds EGL_OPENGL_ES_API once, at display set-up, and creates each
+    // virtualization group's native context with whatever API the thread has
+    // bound. The compositor's thread has EGL_OPENGL_API bound, which gives a
+    // desktop GL context and the same null-function crash as above. A port
+    // binds ES first (or patches DisplayEGL::initializeContext to); so does this.
+    if (getenv("SPIKE11_SHARE_GL_BOUND"))
+        spike11_log("  share: leaving EGL_OPENGL_API bound (expect a crash)");
+    else
+        share_native_bind_es();
+    bool es = false;
+    spike11_log("  share: the WebGL context");
+    EGLContext webgl = share_webgl_context(ext, &es, info, sizeof info);
+    spike11_result("share-webgl-context", webgl != EGL_NO_CONTEXT && es, "%s", info);
+    if (webgl == EGL_NO_CONTEXT) {
+        EGL_DestroyContext(g_dpy, ext);
+        share_native_destroy();
+        return;
+    }
+    share_native_bind_gl();
+
+#ifdef HOST_CHECK
+    // No PS5 shader compiler on the Mac: linking a program would abort.
+    EGL_MakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    EGL_DestroyContext(g_dpy, webgl);
+    EGL_DestroyContext(g_dpy, ext);
+    share_native_destroy();
+    spike11_log("share probe done (host: contexts only)");
+    return;
+#endif
+    // Draw in ANGLE: blue, with a red triangle.
+    spike11_log("  share: drawing through ANGLE");
+    char log[512];
+    GLuint prog = program(kVs300, kFs300, log, sizeof log);
+    if (!prog) {
+        spike11_result("share-draw", 0, "shader: %s", log);
+        EGL_MakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        EGL_DestroyContext(g_dpy, webgl);
+        EGL_DestroyContext(g_dpy, ext);
+        share_native_destroy();
+        return;
+    }
+    Fbo fbo = make_fbo(256, 256, true);
+    GLuint vao = 0, vbo = 0;
+    GL_GenVertexArrays(1, &vao);
+    GL_BindVertexArray(vao);
+    GL_GenBuffers(1, &vbo);
+    GL_BindBuffer(GL_ARRAY_BUFFER, vbo);
+    GL_BufferData(GL_ARRAY_BUFFER, sizeof kTri, kTri, GL_STATIC_DRAW);
+    GL_EnableVertexAttribArray(0);
+    GL_VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    GL_UseProgram(prog);
+    GL_Uniform4f(GL_GetUniformLocation(prog, "xform"), 0, 0, 1, 1);
+    GL_Uniform4f(GL_GetUniformLocation(prog, "color"), 1, 0, 0, 1);
+    GL_ClearColor(0, 0, 1, 1);
+    GL_Clear(GL_COLOR_BUFFER_BIT);
+    GL_DrawArrays(GL_TRIANGLES, 0, 3);
+    GL_Flush();
+    void *fence = share_native_fence();
+    uint8_t c[4], k[4];
+    pixel(128, 100, c);
+    pixel(4, 250, k);
+    const unsigned nativeTex = angle_ps5_native_texture(fbo.tex);
+    GLenum e = err_of("share draw");
+    spike11_result("share-draw", e == GL_NO_ERROR && is(c, 255, 0, 0) && is(k, 0, 0, 255) && nativeTex,
+                   "ANGLE texture %u is native texture %u; ANGLE reads centre %d,%d,%d corner %d,%d,%d, GL error 0x%x", fbo.tex,
+                   nativeTex, c[0], c[1], c[2], k[0], k[1], k[2], e);
+
+    // The compositor's side: wait for ANGLE's fence, then read ANGLE's texture.
+    EGL_MakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    share_native_make_current();
+    double ms = 0;
+    const unsigned w = fence ? share_native_wait(fence, &ms) : 0;
+    spike11_result("share-fence", w == GL_ALREADY_SIGNALED || w == GL_CONDITION_SATISFIED,
+                   "fence from ANGLE's native context waited on in the core context: status 0x%x in %.2f ms", w, ms);
+    int r1 = share_native_read(nativeTex, 128, 100, c), r2 = share_native_read(nativeTex, 4, 250, k);
+    spike11_result("share-texture", !r1 && !r2 && is(c, 255, 0, 0) && is(k, 0, 0, 255),
+                   "core context reads native texture %u: centre %d,%d,%d (want red) corner %d,%d,%d (want blue), errors %d %d",
+                   nativeTex, c[0], c[1], c[2], k[0], k[1], k[2], r1, r2);
+
+    // The video path: the core context copies its own texture into ANGLE's.
+    const int ce = green ? share_native_copy(green, nativeTex, 64, 64) : -1;
+    share_native_release();
+    make_current(webgl);
+    GL_BindFramebuffer(GL_FRAMEBUFFER, fbo.fbo);
+    uint8_t g[4];
+    pixel(10, 10, g);
+    pixel(128, 100, c);
+    e = err_of("share copy read");
+    spike11_result("share-copy", !ce && e == GL_NO_ERROR && is(g, 0, 255, 0) && is(c, 255, 0, 0),
+                   "glCopyImageSubData core texture %u -> native %u (error %d); ANGLE reads 10,10 %d,%d,%d (want green) "
+                   "centre %d,%d,%d (want red)",
+                   green, nativeTex, ce, g[0], g[1], g[2], c[0], c[1], c[2]);
+
+    GL_DeleteBuffers(1, &vbo);
+    GL_DeleteVertexArrays(1, &vao);
+    GL_DeleteFramebuffers(1, &fbo.fbo);
+    GL_DeleteTextures(1, &fbo.tex);
+    GL_DeleteProgram(prog);
+    EGL_MakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    EGL_DestroyContext(g_dpy, webgl);
+    EGL_DestroyContext(g_dpy, ext);
+    if (share_native_make_current() && green)
+        share_native_delete(green);
+    share_native_destroy();
+    spike11_log("share probe done");
 }

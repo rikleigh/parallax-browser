@@ -38,8 +38,56 @@ draw budget as native GLES on this driver: about 2000 draws per 60 Hz frame.
 The 1080p upload (35 ms) is slow, as it is natively; it matters for video
 textures and big canvases, which is why Part 2 copies video on the GPU.
 
-The share-group probe (ANGLE sharing with the title's GL 4.6 core context)
-is not in this run; it is the next test.
+### Share group (2026-11-07): works, with two rules for the port
+
+`share_probe_run` ([src/angle_tests.cpp](src/angle_tests.cpp), native side in
+[src/share_native.c](src/share_native.c)) sets up sharing the way WebKit does
+(`PlatformDisplay::angleSharingGLContext()` and `GraphicsContextGLEGL`)
+against a GL 4.6 core context made like the browser's compositor context.
+Console log: [results/console-share-2026-11-07.log](results/console-share-2026-11-07.log).
+
+| Check | Result |
+| --- | --- |
+| GL 4.6 core context, `EGL_OPENGL_API` bound (as `PS5Renderer::initializeGL`) | PASS |
+| ES 3.2 context created with the core context as its share context | PASS |
+| `EGL_EXTERNAL_CONTEXT_ANGLE` around that ES context | PASS |
+| WebGL 2 context (WebKit's attributes, virtualization group 0) sharing with it | PASS: native ES 3.2 context |
+| Red triangle drawn through ANGLE; ANGLE texture 1 is native texture 9 | PASS |
+| `glFenceSync` in ANGLE's native context, waited on in the core context | PASS |
+| Core context reads native texture 9: red centre, blue corner | PASS |
+| Core context `glCopyImageSubData`s its own texture into it (the video path); ANGLE reads it back | PASS |
+
+So the compositor can show what WebGL draws, and give WebGL its video frames,
+with no copies beyond the one for video, no EGLImage and no DMA-buf. Two
+things failed first (both reproduced on the Mac under the host harness, where
+lldb gave the backtrace) and are rules for the port:
+
+1. **Wrap an ES context, not the 4.6 core context.** ANGLE is built without
+   `ANGLE_ENABLE_GL_DESKTOP_BACKEND`, so a renderer around a desktop GL
+   context loads no GL functions and calls a null `genTextures` in
+   `GenerateCaps` (the first console run died there with no report). The
+   host makes an ES 3.2 "anchor" context with the compositor's context as its
+   share context and wraps that; share groups are transitive. (Building the
+   desktop backend in would also do, at the cost of a larger ANGLE.)
+2. **Bind `EGL_OPENGL_ES_API` before creating a WebGL context.** ANGLE binds
+   ES once, when the display is set up, then creates each virtualization
+   group's native context with the thread's bound API. On the compositor's
+   thread that is `EGL_OPENGL_API`, so the "ES" context comes out desktop GL
+   and crashes as in 1 (`SPIKE11_SHARE_GL_BOUND=1` on the host shows it). The
+   host binds ES around the call, or ANGLE's `DisplayEGL::initializeContext`
+   is patched to.
+
+Also seen: creating the WebGL context leaves no native context current
+(ANGLE restores what it thinks was current), so the host makes the
+compositor's context current again afterwards. The probe reads ANGLE's
+native texture name through ANGLE's internals
+([src/angle_native.cpp](src/angle_native.cpp)); the port needs the same, as
+a small exported function.
+
+This run used the browser's driver build (`gles`), where a draw costs 27 µs
+through ANGLE and natively alike (the 8 µs above is `gles-async`; FEASIBILITY
+§4.2c has the builds and why the async one costs two cores). WebGL in the
+browser gets whichever build the browser ships.
 
 ### Host check (what passed)
 
@@ -201,7 +249,8 @@ What the WebKit source says it takes:
    identifier (PS5WCHost uses the title's own), and a lock or a single
    thread for the GL work queue and the render thread (upstream runs the
    scene and WebGL on one queue).
-5. **Share group: test first.** ANGLE's contexts must share GL object names
+5. **Share group: tested, works** (see Part 1, with the two rules found
+   there). ANGLE's contexts must share GL object names
    with the title's compositor context (`PlatformDisplay::angleSharingGLContext()`
    wraps it with `EGL_EXTERNAL_CONTEXT_ANGLE`). The title's context is GL
    4.6 core created with `EGL_NO_CONTEXT` (PS5Renderer.cpp:420); ANGLE makes
@@ -215,7 +264,7 @@ throws without it, A-Frame stays blank), hardware speed, zero-copy video
 textures (§Video below), and WebXR later in the same process (FEASIBILITY
 §4.8 stays valid).
 
-Risks: the share group; draw cost (ANGLE's state manager on top of a driver
+Risks: draw cost (ANGLE's state manager on top of a driver
 without dirty tracking, §4.2c; the built title measures it); the sync WebGL
 calls (`getError`, `readPixels`, `getParameter`, `finish`) are round trips
 at ~131 µs each (R13), though WebKit's proxy batches and three.js issues
@@ -321,7 +370,7 @@ without it, plus maps and the occasional WebGL2-only site viewer.
 
 | Rank | Option | Unlocks | Effort | Main risk |
 | --- | --- | --- | --- | --- |
-| 1 | Remote WebGL hosted in the title on ANGLE/ps5-opengl | WebGL 2 at hardware speed, zero-copy video textures, WebXR later | large (2-4 days + 1 for video) | share group; draw cost; sync IPC |
+| 1 | Remote WebGL hosted in the title on ANGLE/ps5-opengl | WebGL 2 at hardware speed, zero-copy video textures, WebXR later | large (2-4 days + 1 for video) | draw cost; sync IPC |
 | 2 | llvmpipe + ANGLE in the WebProcess | WebGL 2 everywhere, software speed | medium (1-2 days) | too slow for 3D scenes; no hardware video |
 | 3 | ANGLE on RADV in the title | as 1 with a better backend | large | moves the whole compositor |
 | 4 | separate GPU process / payload GPU | process isolation | unknown | unknown rights; output still a bitmap |
@@ -334,7 +383,7 @@ at any speed before the title work is done; it shares M1 below.
 
 | Milestone | Work | Done when |
 | --- | --- | --- |
-| M0 | Register PPSA99006, run the Spike 11 title; add the share-group probe (ANGLE external context sharing with GL 4.6 core) | `RESULT ... angle-triangle PASS`, per-draw figures, share-group PASS/FAIL in `webgl.log` |
+| M0 | **Done 2026-11-07.** Register PPSA99006, run the Spike 11 title; add the share-group probe (ANGLE external context sharing with GL 4.6 core) | `angle-triangle PASS`, 8.3 µs per draw; all `share-*` PASS |
 | M1 | `ENABLE_WEBGL` + ANGLE in the WPE build (patches carried in `port/webkit/patches`), `ENABLE_GPU_PROCESS` without GBM, `IPC::Semaphore` on `_umtx_op`, ANGLE linked into the title | a page creates a WebGL context and the stream connects (log only) |
 | M2 | The title host (`RemoteGraphicsContextGL` on a work queue), the coordinated buffer as a WC content layer, scene keyed per WebProcess | a WebGL triangle page and a three.js demo on the TV at 60 fps |
 | M3 | `CopyTextureFromVideoStream` for hardware frames; software frames via the existing fallback | a three.js 360 player plays a 4K clip; a VR tube site's own WebGL player works |

@@ -7,6 +7,7 @@
 #include <time.h>
 
 void angle_tests_run(void);
+void share_probe_run(void);
 
 /* psbc (the PS5 shader compiler) is not built for the host; Mesa only stores
  * the options pointer at screen creation (as in spike 2's hostcheck.c). */
@@ -52,6 +53,7 @@ double spike11_cpu_ms(void) { return spike11_now_ms(); }
 int main(void)
 {
     angle_tests_run();
+    share_probe_run();
     printf("%d failure(s)\n", failures);
     return failures != 0;
 }

@@ -6,15 +6,28 @@
  *
  *   angle-*       ANGLE's GLES front end over ps5-opengl's EGL (angle_tests.cpp)
  *   native-*      the same workload straight through ps5-opengl (native_bench.c)
+ *   share-*       WebGL sharing with a GL 4.6 core context (angle_tests.cpp)
  */
 #define SPIKE_NAME "11-webgl"
 #include "../../common/title.h"
+
+#include "crashguard.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
 
 void angle_tests_run(void);
 void native_bench_run(void);
+void share_probe_run(void);
+
+/* The crash guard's weak hooks; the packager wants every symbol defined. */
+void ps5wk_jit_memory(void **start, void **end, size_t *allocated, size_t *committed)
+{
+    (void)allocated;
+    (void)committed;
+    *start = *end = NULL;
+}
+void ps5wk_profiler_thread(int starting) { (void)starting; }
 
 /* C-linkage helpers for the C++ side (spike.h is header-only C). */
 void spike11_log(const char *fmt, ...)
@@ -58,6 +71,14 @@ int main(void)
         mkdir("/data/ps5webkit-spike", 0777);
         spike_log_file_fd = open("/data/ps5webkit-spike/webgl.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     }
+    /* The browser's crash report (signal, pc as an ELF offset, stack scan)
+     * goes to stderr: send it, and ps5-opengl's own stdout, to the log. */
+    if (spike_log_file_fd >= 0) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        dup2(spike_log_file_fd, 1);
+        dup2(spike_log_file_fd, 2);
+    }
+    ps5wk_crash_guard_install("spike11");
     snprintf(line, sizeof line, "[ps5webkit] spike11 unjailed %d log fd %d\n", unjailed, spike_log_file_fd);
     spike_klog(line);
     spike_notify("ps5webkit: spike 11 (ANGLE) running");
@@ -68,6 +89,8 @@ int main(void)
         angle_tests_run();
     if (!only || !strcmp(only, "native"))
         native_bench_run();
+    if (!only || !strcmp(only, "share"))
+        share_probe_run();
 
     spike_log("done");
     spike_notify("ps5webkit: spike 11 done");
