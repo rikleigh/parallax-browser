@@ -564,3 +564,38 @@ from stdin gained `-I src/platform`.
 `busy.html`: 2000 cubes 42.9 -> 46.4 fps (textured 40.5 -> 43.6), 20.6 ms
 per frame on the WebGL thread. `msaa-clear.html` 0 failures, `webgl.html`
 PASS, video formats 23 PASS / 0 FAIL, three.js's cube right on the TV.
+
+## Patch 0014: repeated draws skip unchanged state (2026-11-07)
+
+A batched draw carried its whole state every time: render target, shader,
+depth, blend, viewport and rasterizer register tables, rebuilt on the CPU and
+loaded indirectly (~10% of the WebGL thread at 2000 draws per frame, in
+`ps5_agc_gate2_run`, `set_cx_mrt`, `append_target_state` and the table
+publication). Within a command group the draws run as one stream and the
+context/SH/UC registers keep their last values, so `runtime_repeat_draw` emits
+only a draw's own commands (upload acquire, user data, the draw, its releases
+and completion) when everything the full path builds the tables from equals
+the previous queued draw's: all of `runtime_draw_inputs` except the per-draw
+fields (user data, index buffer/count/size, draw count), the backend draw
+state, the NGG control and the shader package bytes (an address can be reused
+for new bytecode). Anything else (first draw of a batch, tessellation, an
+unprepared pair, a dispatch or other entry in between, a changed scanout
+registration) takes the full path.
+
+A repeat must directly follow its predecessor in one submitted stream, so
+grouping is now decided as entries are appended (`joins` on the entry) and
+`runtime_batch_combine` follows the recorded decisions (a mismatch aborts). A
+repeat joins only with room left for a presentation tail
+(`RUNTIME_PRESENT_TAIL_WORDS`); `ps5_agc_gate2_batch_present` extends the last
+entry through `runtime_batch_extend_last`, which keeps the decision valid (a
+full draw that no longer fits starts its own group, as the submit-time
+grouping did). Disabled for async preparation and the diagnostic builds.
+Host tests: `test_repeat_draws.py` (every byte of the inputs and backend state,
+shader bytes, batch position; the per-draw commands match the full path's),
+`test_command_groups.py` (append-time decisions, presentation extension,
+headroom, fail-stop), `test_gpu_present.py` (a refused extension fails the
+present untouched).
+
+`busy.html`: 2000 cubes 46.4 -> 56.3 fps (textured 43.6 -> 53.2); 1000 and
+below 59.9. `msaa-clear.html` 0 failures, `webgl.html` PASS, video formats all
+20 page checks PASS, three.js's cube right on the TV.
