@@ -22,7 +22,10 @@ NAME="${NAME:-Parallax Browser}"
 WK="$ROOT/toolchain/wpe-webkit"
 BLD="${BLD:-$WK/build}"
 OUT="${OUT:-$WK/titles}"
-PREFIX="${PS5_OPENGL:-$ROOT/toolchain/ps5-opengl-gles}"
+# ps5-opengl with its per-draw profiling compiled out: about 20 us per draw
+# instead of 27 (FEASIBILITY.md 4.2c). gles-async is faster still but keeps
+# two cores spinning and takes draws from one thread only.
+PREFIX="${PS5_OPENGL:-$ROOT/toolchain/ps5-opengl-gles-noprof}"
 LIBCXX="$ROOT/toolchain/libcxx19/install"
 NATIVE="$ROOT/ref/PS5VR/app/tools/native-app"
 PSGL="$ROOT/ref/ps5-opengl/native-app"

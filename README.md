@@ -103,7 +103,9 @@ the PS5 on macOS (Apple silicon). The steps, roughly:
    the SDK into `toolchain/ps5-payload-sdk` (see [Setup](#setup-for-the-spikes)).
 3. `spikes/04-jsc/build.sh` builds libc++ 19 and ICU, and
    `spikes/02-gl-egl/ps5-opengl/build.sh gles` builds ps5-opengl with
-   OpenGL ES. Then `port/deps/build.sh all` builds the libraries into
+   OpenGL ES, and `build.sh gles-noprof` then installs the build the browser
+   links (the same with its per-draw profiling compiled out). Then
+   `port/deps/build.sh all` builds the libraries into
    `toolchain/wpe-sysroot` ([port/deps/README.md](port/deps/README.md)).
 4. `port/webkit/build.sh` applies the patches in `port/webkit/patches/` to
    WebKit and builds it. `port/webkit/apps/title/package.sh` then writes the
