@@ -2347,8 +2347,11 @@ WebProcesses (`PS5WK_JIT`, see *Knobs*; the log says `JIT: on (...)`).
   HSTS writes*.
 - **WebAssembly** is compiled in, because B3 (the FTL backend) doesn't build
   without it upstream (`B3WasmStruct*`), and `ENABLE_WEBASSEMBLY_BBQJIT` alone
-  didn't compile either. It is off at run time (`useWasm=false`, no fast
-  memory: 4 GB+ reservations); `JSC_useWasm=true` turns it on, untested.
+  didn't compile either. Patch 0030 leaves it off by default (`useWasm=false`, no fast
+  memory: 4 GB+ reservations); ps5wk-child turns it on for WebProcesses
+  whenever the JIT is on (`PS5WK_WASM=0` in child.env turns it off;
+  `JSC_useWasm` wins). Checked on the console with `test/wasm/wasm.html` and
+  a three.js page whose Draco decoder needs it (spikes/11-webgl, 2026-11-07).
 - **Signal contexts:** everything in JSC that reads registers from a signal
   goes through WTF's `registersFromUContext` (VM traps, thread suspension for
   GC and the sampling profiler, the wasm fault handler). 0019 already moved it

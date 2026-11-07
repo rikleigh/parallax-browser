@@ -433,10 +433,19 @@ static void configureJIT()
         setenv("JSC_jitMemoryReservationSize", bytes, 0);
         snprintf(pool, sizeof pool, "%u MB (/data/ps5webkit/no-bigjitpool: 128 MB)", ps5wkJITPoolMB);
     }
+    // WebAssembly (patch 0030 builds it, off by default): on with the JIT,
+    // for pages that need it (three.js's Draco and Basis decoders, game
+    // engines, ffmpeg.wasm). Memories are bounds-checked (patch 0030: no
+    // fast memory, whose 4 GB+ reservations cost page tables).
+    // PS5WK_WASM=0 in child.env turns it off; JSC_useWasm wins.
+    const char* wasmKnob = getenv("PS5WK_WASM");
+    const bool wasm = !off && !(wasmKnob && !strcmp(wasmKnob, "0"));
+    setenv("JSC_useWasm", wasm ? "true" : "false", 0);
     const char* dfg = getenv("JSC_useDFGJIT");
     const char* ftl = getenv("JSC_useFTLJIT");
-    LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s), executable pool %s", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),
-        dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "", ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "", pool);
+    LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s), executable pool %s; WebAssembly %s", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),
+        dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "", ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "", pool,
+        !strcmp(getenv("JSC_useWasm"), "true") ? "on" : "off");
 }
 
 // Asks the title's video server what it decodes in hardware (HELLO with
