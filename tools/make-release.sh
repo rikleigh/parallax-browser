@@ -12,7 +12,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
-BLD="$ROOT/toolchain/wpe-webkit/build"
+# The WebKit build with WebGL and every patch (port/webkit/build.sh default).
+BLD="${BLD:-$ROOT/toolchain/wpe-webkit/build-webgl}"
 RUNTIME="$ROOT/toolchain/wpe-sysroot/share/ps5webkit-runtime"
 ICUDAT="$ROOT/toolchain/icu/src-76.1/icu/source/data/in/icudt76l.dat"
 version="${1:-$(git -C "$ROOT" describe --tags --always --dirty)}"
@@ -35,7 +36,7 @@ echo "==> building with no log host"
 cmake -DPS5WK_LOG_HOST= "$BLD" >/dev/null
 ninja -C "$BLD" ps5wk-child ps5browser
 rm -rf "$stage"
-PS5WK_LOG_HOST= OUT="$stage" "$ROOT/port/webkit/apps/title/package.sh"
+PS5WK_LOG_HOST= BLD="$BLD" OUT="$stage" "$ROOT/port/webkit/apps/title/package.sh"
 TITLE="$stage/PPSA99020"
 # No address of this Mac or the console in the binaries.
 for host in "$devhost" "${PS5WK_LOG_HOST:-}" "${PS5_HOST:-}"; do

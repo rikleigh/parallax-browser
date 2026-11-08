@@ -20,7 +20,8 @@ ROOT="$(cd "$PORT/../.." && pwd)"
 TITLE="${TITLE:-PPSA99020}"
 NAME="${NAME:-Parallax Browser}"
 WK="$ROOT/toolchain/wpe-webkit"
-BLD="${BLD:-$WK/build}"
+# The WebKit build with WebGL and every patch (port/webkit/build.sh default).
+BLD="${BLD:-$WK/build-webgl}"
 OUT="${OUT:-$WK/titles}"
 # ps5-opengl built with the browser's patches (spikes/02-gl-egl/ps5-opengl/
 # patches, through 0017: WebGL draw batching, the VAO fast path, video copies

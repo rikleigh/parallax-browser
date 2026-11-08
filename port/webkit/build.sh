@@ -11,7 +11,14 @@
 #   port/webkit/build.sh export-patches  # clone commits -> port/webkit/patches
 #   port/webkit/build.sh status          # disk use, deps found
 #
-# Layout:
+# Layout (the default is WEBGL=1: src-webgl + build-webgl, the tree the
+# browser ships from, with WebGL and every patch; WEBGL=0 selects the older
+# src + build below, without WebGL):
+#   toolchain/wpe-webkit/src-webgl  worktree of src, branch with the WebGL
+#                                and later patches; build-webgl its build
+#                                (logs in build-webgl/). A full "build" fails
+#                                linking WPEWebProcess there: build
+#                                NINJA_TARGETS="ps5wk-child ps5wk-shot ps5browser"
 #   toolchain/wpe-webkit/src     private clone of ref/WebKit (shared objects,
 #                                sparse checkout), branch "ps5" = 15486a0178 +
 #                                one commit per patches/*.patch
@@ -43,7 +50,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 WK="$ROOT/toolchain/wpe-webkit"
 WC="${WC:-1}"
-WEBGL="${WEBGL:-0}"
+WEBGL="${WEBGL:-1}"
 if [ "$WEBGL" = 1 ]; then
     SRC="${SRC:-$WK/src-webgl}"
     BLD="${BLD:-$WK/build-webgl}"
