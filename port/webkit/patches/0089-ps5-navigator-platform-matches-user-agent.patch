@@ -1,0 +1,18 @@
+diff --git a/Source/WebCore/page/NavigatorBase.cpp b/Source/WebCore/page/NavigatorBase.cpp
+index 68a2e9109c..3f43a79b02 100644
+--- a/Source/WebCore/page/NavigatorBase.cpp
++++ b/Source/WebCore/page/NavigatorBase.cpp
+@@ -110,6 +110,13 @@ String NavigatorBase::platform() const
+     return "Win32"_s;
+ #elif OS(HAIKU)
+     return "Haiku"_s;
++#elif OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // The PS5 browser title sends a macOS Safari user agent
++    // (port/webkit/apps/title/ps5browser.c), so the platform must agree:
++    // an empty one beside a Mac user agent is an inconsistency that bot
++    // checks (Cloudflare Turnstile) fail. WebGL already reports Apple's
++    // masked renderer and vendor.
++    return "MacIntel"_s;
+ #else
+     return ""_s;
+ #endif

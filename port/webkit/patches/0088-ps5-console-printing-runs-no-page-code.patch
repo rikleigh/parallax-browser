@@ -1,0 +1,53 @@
+diff --git a/Source/JavaScriptCore/runtime/ConsoleClient.cpp b/Source/JavaScriptCore/runtime/ConsoleClient.cpp
+index 1d49d1e2ff..a833b6773a 100644
+--- a/Source/JavaScriptCore/runtime/ConsoleClient.cpp
++++ b/Source/JavaScriptCore/runtime/ConsoleClient.cpp
+@@ -26,7 +26,9 @@
+ #include "config.h"
+ #include "ConsoleClient.h"
+ 
++#include "ErrorInstance.h"
+ #include "JSCJSValueInlines.h"
++#include "JSObjectInlines.h"
+ #include "JSGlobalObject.h"
+ #include "ScriptArguments.h"
+ #include "ScriptCallStack.h"
+@@ -206,6 +208,29 @@ void ConsoleClient::printConsoleMessage(MessageSource source, MessageType type,
+     SAFE_WTFLOGALWAYS("%s", builder.toString().utf8());
+ }
+ 
++// PS5: printing a console argument must not run page code. toWTFString calls
++// an object's toString/valueOf/Symbol.toPrimitive and reads Symbol.toStringTag,
++// all of which a page can define, so a page can tell that its console is being
++// read; challenge pages (Cloudflare Turnstile) log such objects and fail the
++// check. Primitives convert without page code (a Symbol throws, which the
++// caller clears); an object prints its internal class name, and an Error its
++// own message when that is a plain string data property.
++static String consoleArgumentString(JSGlobalObject* globalObject, JSValue value)
++{
++    if (!value.isObject())
++        return value.toWTFString(globalObject);
++    JSObject* object = asObject(value);
++    String className = String(object->classInfo()->className);
++    if (auto* error = dynamicDowncast<ErrorInstance>(object)) {
++        VM& vm = globalObject->vm();
++        unsigned attributes = 0;
++        JSValue message = error->getDirect(vm, vm.propertyNames->message, attributes);
++        if (message && message.isString() && !(attributes & PropertyAttribute::Accessor))
++            return makeString("[object "_s, className, "] "_s, message.toWTFString(globalObject));
++    }
++    return makeString("[object "_s, className, ']');
++}
++
+ void ConsoleClient::printConsoleMessageWithArguments(MessageSource source, MessageType type, MessageLevel level, JSC::JSGlobalObject* globalObject, Ref<ScriptArguments>&& arguments)
+ {
+     bool isTraceMessage = type == MessageType::Trace;
+@@ -225,7 +250,7 @@ void ConsoleClient::printConsoleMessageWithArguments(MessageSource source, Messa
+         builder.append(' ');
+         auto* globalObject = arguments->globalObject();
+         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(globalObject->vm());
+-        builder.append(arguments->argumentAt(i).toWTFString(globalObject));
++        builder.append(consoleArgumentString(globalObject, arguments->argumentAt(i)));
+         scope.clearException();
+     }
+ 
