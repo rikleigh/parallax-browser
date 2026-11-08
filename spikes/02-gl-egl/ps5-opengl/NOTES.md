@@ -626,3 +626,23 @@ between them; only batched callers pass a flush cache).
 `busy.html`: 2000 cubes 56.3 -> 59.8 fps (textured 53.2 -> 56.3); 1000 and
 below 59.9. Video formats page 3 of 3 runs, all 20 page checks PASS and the
 second round finished each time.
+
+## Patch 0016: Mesa's VAO fast path (2026-11-08)
+
+The screen fills its caps without `u_init_pipe_screen_caps`, so
+`allow_dynamic_vao_fastpath` stayed false and the state tracker took the slow
+array path: on every draw after a VAO change it ran
+`_mesa_update_vao_derived_arrays`, rescanning the VAO to merge attributes that
+share a buffer (3.3% of the WebGL thread at 2000 draws per frame, each with its
+own VAO). With the fast path (the default for Gallium drivers) each enabled
+attribute is its own vertex buffer at binding offset + relative offset, source
+offset 0: the same fetched addresses; an interleaved array takes a descriptor
+and a flush range per attribute. `max_vertex_buffers` (16) covers the 16
+vertex inputs. Host test: `test_vao_fast_path.py`.
+
+With WebKit patch 0087 (ANGLE binds a VAO without a map search for its state):
+`busy.html` 3000 cubes 39.5 -> 40.9 fps (textured 36.6 -> 37.8); 2000 and below
+59.9 (vsync). Profile at 2000: the rescan gone, the array update 2.2% (was
+3.7% with the rescan); ANGLE's bind 2.8% -> 1.7% (one read of the VAO state
+left). `msaa-clear.html` 0 failures, `webgl.html` PASS, video formats page 3 of
+3 runs (20 PASS, second round finished), three.js's cube right on the TV.

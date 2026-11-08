@@ -1,0 +1,45 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 5629eb2..4c9ac42 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -18337,6 +18337,14 @@ ps5_screen_create(void)
+    caps->vertex_element_instance_divisor = true;
+    /* The compiler lowers narrow fetches with their actual element alignment. */
+    caps->vertex_input_alignment = PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
++   /* Mesa's VAO fast path (u_init_pipe_screen_caps' default, which this
++    * screen does not start from): each enabled attribute is its own vertex
++    * buffer at binding offset + relative offset, with source offset 0, so
++    * nothing rescans a VAO to merge its bindings on every draw that changes
++    * VAOs (~4% of the WebGL thread at 2000 draws per frame). The fetched
++    * addresses are the same; interleaved arrays take one descriptor each.
++    * max_vertex_buffers (16) covers every attribute. */
++   caps->allow_dynamic_vao_fastpath = true;
+    caps->texture_swizzle = PS5_ENABLE_TEXTURE_SWIZZLE_CANDIDATE;
+    caps->fragment_shader_texture_lod = PS5_ENABLE_SHADER_TEXTURE_LOD_CANDIDATE;
+    caps->max_texture_lod_bias =
+diff --git a/tests/ps5/test_vao_fast_path.py b/tests/ps5/test_vao_fast_path.py
+new file mode 100644
+index 0000000..be50c38
+--- /dev/null
++++ b/tests/ps5/test_vao_fast_path.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""The screen allows Mesa's VAO fast path (one vertex buffer per enabled
++attribute), and has a vertex buffer for every vertex input it reports."""
++from pathlib import Path
++import re
++
++root = Path(__file__).resolve().parents[2]
++screen = (root / "src/gallium/ps5/ps5_screen.c").read_text()
++mesa = (root / "third_party/mesa-26.2.0/src/mesa/state_tracker/st_extensions.c").read_text()
++
++assert screen.count("caps->allow_dynamic_vao_fastpath = true;") == 1
++assert "c->UseVAOFastPath =\n         screen->caps.allow_dynamic_vao_fastpath;" in mesa
++buffers = int(re.search(r"caps->max_vertex_buffers = (\d+);", screen).group(1))
++inputs = int(re.search(r"vs_caps->max_inputs = (\d+);", screen).group(1))
++assert buffers >= inputs, (buffers, inputs)
++# The fast path fills vertex buffers and elements up to these limits.
++for decl in ("struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];",
++             "struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];"):
++    assert decl in screen, decl
++print(f"PASS: VAO fast path allowed; {buffers} vertex buffers for {inputs} vertex inputs")

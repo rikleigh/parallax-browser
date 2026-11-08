@@ -1,0 +1,101 @@
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.cpp
+index 43fede7cb6..210fdb5829 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.cpp
+@@ -1890,9 +1890,23 @@ void StateManagerGL::bindVertexArray(GLuint vao)
+     }
+ }
+ 
++void StateManagerGL::bindVertexArray(GLuint vao, VertexArrayStateGL *vaoState)
++{
++    if (mState.vao != vao)
++    {
++        ASSERT(!mFeatures.syncAllVertexArraysToDefault.enabled);
++        forceBindVertexArray(vao, vaoState);
++    }
++}
++
+ void StateManagerGL::forceBindVertexArray(GLuint vao)
+ {
+-    VertexArrayStateGL *vaoState = getVAOState(vao);
++    forceBindVertexArray(vao, getVAOState(vao));
++}
++
++void StateManagerGL::forceBindVertexArray(GLuint vao, VertexArrayStateGL *vaoState)
++{
++    ASSERT(vaoState == getVAOState(vao));
+ 
+     mState.vao                                      = vao;
+     mState.buffers[gl::BufferBinding::ElementArray] = vaoState ? vaoState->elementArrayBuffer : 0;
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.h b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.h
+index 1b3cdb7f5b..d1c7f32e26 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.h
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/StateManagerGL.h
+@@ -258,6 +258,10 @@ class StateManagerGL final : angle::NonCopyable
+     void useProgram(GLuint program);
+     void forceUseProgram(GLuint program);
+     void bindVertexArray(GLuint vao);
++    // For a caller that holds the VAO's state (getOrCreateVAOState): skips
++    // the lookup, which is a map search per bind (PS5: ~3% of the WebGL
++    // thread at 2000 draws per frame, each with its own VAO).
++    void bindVertexArray(GLuint vao, VertexArrayStateGL *vaoState);
+     void bindBuffer(gl::BufferBinding target, GLuint buffer, bool isHardenedContext);
+     void bindBufferBase(gl::BufferBinding target, size_t index, GLuint buffer);
+     void bindBufferRange(gl::BufferBinding target,
+@@ -421,6 +425,7 @@ class StateManagerGL final : angle::NonCopyable
+ 
+   private:
+     void forceBindVertexArray(GLuint vao);
++    void forceBindVertexArray(GLuint vao, VertexArrayStateGL *vaoState);
+ 
+     void setTextureCubemapSeamlessEnabled(bool enabled);
+ 
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/VertexArrayGL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/VertexArrayGL.cpp
+index c60fe23da2..10ed1cbb75 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/VertexArrayGL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/VertexArrayGL.cpp
+@@ -272,7 +272,7 @@ angle::Result VertexArrayGL::syncIndexData(const gl::Context *context,
+             mStreamingElementArrayBufferSize = 0;
+         }
+ 
+-        stateManager->bindVertexArray(mVertexArrayID);
++        stateManager->bindVertexArray(mVertexArrayID, mNativeState);
+ 
+         stateManager->bindBuffer(gl::BufferBinding::ElementArray, mStreamingElementArrayBuffer,
+                                  context->isHardenedContext());
+@@ -389,7 +389,7 @@ angle::Result VertexArrayGL::streamAttributes(
+         mStreamingArrayBufferSize = requiredBufferSize;
+     }
+ 
+-    stateManager->bindVertexArray(mVertexArrayID);
++    stateManager->bindVertexArray(mVertexArrayID, mNativeState);
+ 
+     // Unmapping a buffer can return GL_FALSE to indicate that the system has corrupted the data
+     // somehow (such as by a screen change), retry writing the data a few times and return
+@@ -563,7 +563,7 @@ angle::Result VertexArrayGL::recoverForcedStreamingAttributesForDrawArraysInstan
+ 
+     StateManagerGL *stateManager = GetStateManagerGL(context);
+ 
+-    stateManager->bindVertexArray(mVertexArrayID);
++    stateManager->bindVertexArray(mVertexArrayID, mNativeState);
+ 
+     const auto &attribs  = mState.getVertexAttributes();
+     const auto &bindings = mState.getVertexBindings();
+@@ -972,7 +972,7 @@ angle::Result VertexArrayGL::syncState(const gl::Context *context,
+                                        gl::VertexArray::DirtyBindingBitsArray *bindingBits)
+ {
+     StateManagerGL *stateManager = GetStateManagerGL(context);
+-    stateManager->bindVertexArray(mVertexArrayID);
++    stateManager->bindVertexArray(mVertexArrayID, mNativeState);
+ 
+     for (size_t dirtyBit : dirtyBits)
+     {
+@@ -1003,7 +1003,7 @@ angle::Result VertexArrayGL::applyNumViewsToDivisor(const gl::Context *context,
+     if (numViews != mAppliedNumViews)
+     {
+         StateManagerGL *stateManager = GetStateManagerGL(context);
+-        stateManager->bindVertexArray(mVertexArrayID);
++        stateManager->bindVertexArray(mVertexArrayID, mNativeState);
+         mAppliedNumViews = numViews;
+         for (size_t index = 0u; index < mNativeState->bindings.size(); ++index)
+         {
