@@ -1,0 +1,124 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 4c9ac42..70651d4 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -7929,7 +7929,7 @@ ps5_blit_gpu_color(struct ps5_context *context, const struct pipe_blit_info *inf
+        !info->src.resource || !info->dst.resource ||
+        info->mask != PIPE_MASK_RGBA ||
+        (info->filter != PIPE_TEX_FILTER_NEAREST && info->filter != PIPE_TEX_FILTER_LINEAR) ||
+-       info->num_window_rectangles || info->alpha_blend || info->swizzle_enable ||
++       info->num_window_rectangles || info->alpha_blend ||
+        info->sample0_only || info->dst_sample || context->render_condition_query ||
+        context->stream_output_target_count ||
+        !info->src.box.width || !info->src.box.height ||
+@@ -7959,6 +7959,17 @@ ps5_blit_gpu_color(struct ps5_context *context, const struct pipe_blit_info *inf
+ 
+    const bool resolve = info->src.resource->nr_samples == 4 &&
+                         info->src.resource->nr_storage_samples == 4;
++   /* ps5webkit: a swizzled blit samples through a view with that swizzle,
++    * as u_blitter's own util_blitter_blit does. Mesa adds one when the base
++    * formats differ: {X,Y,Z,1} from an RGBA texture into a GL_RGB one (this
++    * driver has no RGBX format, so both are stored as R8G8B8A8). Before: the
++    * CPU fallback, ~550 ms for a 2160x1080 video frame into a WebGL 1 RGB
++    * texture. Only selectors the texture descriptor has (X..W, 0, 1). */
++   if (info->swizzle_enable &&
++       (resolve || info->swizzle[0] > PIPE_SWIZZLE_1 ||
++        info->swizzle[1] > PIPE_SWIZZLE_1 || info->swizzle[2] > PIPE_SWIZZLE_1 ||
++        info->swizzle[3] > PIPE_SWIZZLE_1))
++      return false;
+    /* Equal-sized color resolves accept either filter; no scaling occurs. */
+    if (resolve && (!PS5_ENABLE_MSAA4_CANDIDATE ||
+                    abs(info->src.box.width) != info->dst.box.width ||
+@@ -8066,6 +8077,12 @@ ps5_blit_gpu_color(struct ps5_context *context, const struct pipe_blit_info *inf
+     * written without encoding, see above). */
+    surface.format = info->dst.format;
+    util_blitter_default_src_texture(blitter, &templ, info->src.resource, info->src.level);
++   if (info->swizzle_enable) {
++      templ.swizzle_r = info->swizzle[0];
++      templ.swizzle_g = info->swizzle[1];
++      templ.swizzle_b = info->swizzle[2];
++      templ.swizzle_a = info->swizzle[3];
++   }
+    struct pipe_sampler_view *view = context->base.create_sampler_view(
+       &context->base, info->src.resource, &templ);
+    if (!view)
+diff --git a/tests/ps5/test_gpu_blit.py b/tests/ps5/test_gpu_blit.py
+index 113a75a..834ebb8 100644
+--- a/tests/ps5/test_gpu_blit.py
++++ b/tests/ps5/test_gpu_blit.py
+@@ -59,6 +59,8 @@ enum { PIPE_TEXTURE_2D=2, PIPE_TEXTURE_3D=3, PIPE_TEXTURE_2D_ARRAY=4,
+        PIPE_FORMAT_R8G8B8A8_SNORM=11, PIPE_FORMAT_R16G16_FLOAT=12,
+        PIPE_MASK_RGBA=15, PIPE_TEX_FILTER_NEAREST=0, PIPE_TEX_FILTER_LINEAR=1,
+        PIPE_BIND_RENDER_TARGET=1, PIPE_BIND_DISPLAY_TARGET=2 };
++enum { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W,
++       PIPE_SWIZZLE_0, PIPE_SWIZZLE_1, PIPE_SWIZZLE_NONE };
+ struct pipe_resource { unsigned target, last_level, depth0, array_size,
+     nr_samples, nr_storage_samples, format, bind, width0, height0; };
+ struct ps5_resource { struct pipe_resource base; size_t render_staging_size,
+@@ -66,6 +68,7 @@ struct ps5_resource { struct pipe_resource base; size_t render_staging_size,
+     unsigned level_stride[16]; uint8_t *data; bool linear; };
+ struct pipe_surface { struct pipe_resource *texture; unsigned format,level,first_layer,last_layer; };
+ struct pipe_sampler_view { struct pipe_resource *texture; unsigned format,target;
++    unsigned swizzle_r,swizzle_g,swizzle_b,swizzle_a;
+     union { struct { unsigned first_level,last_level,first_layer,last_layer; } tex; } u; };
+ struct pipe_box { int x,y,z,width,height,depth; };
+ struct pipe_scissor_state { unsigned minx,miny,maxx,maxy; };
+@@ -73,6 +76,7 @@ struct pipe_blit_info {
+     struct { struct pipe_resource *resource; unsigned format,level; struct pipe_box box; } src,dst;
+     unsigned mask,filter,num_window_rectangles,dst_sample;
+     bool scissor_enable,alpha_blend,swizzle_enable,sample0_only;
++    uint8_t swizzle[4];
+     struct pipe_scissor_state scissor;
+ };
+ struct pipe_context { struct pipe_sampler_view *(*create_sampler_view)(
+@@ -115,6 +119,8 @@ static void util_blitter_default_src_texture(struct blitter_context *b,struct pi
+                                             struct pipe_resource *r,unsigned level)
+ {
+     assert(b); memset(v,0,sizeof(*v)); v->format=r->format; v->target=r->target;
++    v->swizzle_r=PIPE_SWIZZLE_X; v->swizzle_g=PIPE_SWIZZLE_Y;
++    v->swizzle_b=PIPE_SWIZZLE_Z; v->swizzle_a=PIPE_SWIZZLE_W;
+     v->u.tex.first_level=v->u.tex.last_level=level; v->u.tex.last_layer=r->array_size-1;
+ }
+ static struct pipe_sampler_view *create_view(struct pipe_context *p,struct pipe_resource *r,
+@@ -138,6 +144,11 @@ static void util_blitter_blit_generic(struct blitter_context *b,const struct pip
+     assert(s->level==expected.dst.level && s->first_layer==(unsigned)dst->z && s->last_layer==s->first_layer);
+     assert(!memcmp(dst,&expected.dst.box,sizeof(*dst)) && !memcmp(src,&expected.src.box,sizeof(*src)));
+     assert(v->texture==expected.src.resource && v->format==expected.src.format);
++    /* A swizzled blit samples through a view with that swizzle. */
++    { const uint8_t identity[4]={PIPE_SWIZZLE_X,PIPE_SWIZZLE_Y,PIPE_SWIZZLE_Z,PIPE_SWIZZLE_W};
++      const uint8_t *want=expected.swizzle_enable ? expected.swizzle : identity;
++      assert(v->swizzle_r==want[0] && v->swizzle_g==want[1] &&
++             v->swizzle_b==want[2] && v->swizzle_a==want[3]); }
+     assert(v->u.tex.first_level==expected.src.level && v->u.tex.last_level==expected.src.level);
+     assert(width0==v->texture->width0 && height0==v->texture->height0);
+     assert(mask==expected.mask && filter==expected.filter && !alpha && !sample0 && !sample && !override);
+@@ -214,7 +225,17 @@ int main(void) {
+     REJECT(src.resource,NULL); REJECT(dst.resource,NULL); REJECT(mask,7); REJECT(filter,2);
+     REJECT(src.format,2); REJECT(dst.format,2); REJECT(src.level,1); REJECT(dst.level,1);
+     REJECT(scissor_enable,true); REJECT(num_window_rectangles,1); REJECT(alpha_blend,true);
+-    REJECT(swizzle_enable,true); REJECT(sample0_only,true); REJECT(dst_sample,1);
++    REJECT(sample0_only,true); REJECT(dst_sample,1);
++    /* Mesa's RGBA -> GL_RGB blit (both stored R8G8B8A8): {X,Y,Z,1} through
++     * the view; a selector the descriptor lacks stays on the CPU path. */
++    { struct pipe_blit_info rgb=b; rgb.swizzle_enable=true;
++      rgb.swizzle[0]=PIPE_SWIZZLE_X; rgb.swizzle[1]=PIPE_SWIZZLE_Y;
++      rgb.swizzle[2]=PIPE_SWIZZLE_Z; rgb.swizzle[3]=PIPE_SWIZZLE_1;
++      assert(ps5_blit_gpu_color(&c,&rgb));
++      rgb.swizzle[3]=PIPE_SWIZZLE_0; assert(ps5_blit_gpu_color(&c,&rgb));
++      rgb.swizzle[3]=PIPE_SWIZZLE_NONE; assert(!ps5_blit_gpu_color(&c,&rgb));
++      rgb.swizzle[3]=PIPE_SWIZZLE_1; rgb.swizzle[0]=PIPE_SWIZZLE_NONE;
++      assert(!ps5_blit_gpu_color(&c,&rgb)); }
+     REJECT(src.box.x,-1); REJECT(src.box.z,1); REJECT(dst.box.depth,2);
+     /* A destination box clipped by the surface edge is drawn, however small:
+      * the CPU fallback cannot map a box outside the surface. */
+@@ -262,6 +283,10 @@ int main(void) {
+     struct pipe_blit_info resolved=b; resolved.src.resource=&msaa.base;
+     assert(ps5_blit_gpu_color(&c,&resolved));
+     msaa.allocation_size--; assert(!ps5_blit_gpu_color(&c,&resolved)); msaa.allocation_size++;
++    { struct pipe_blit_info swizzled=resolved; swizzled.swizzle_enable=true;
++      swizzled.swizzle[0]=PIPE_SWIZZLE_X; swizzled.swizzle[1]=PIPE_SWIZZLE_Y;
++      swizzled.swizzle[2]=PIPE_SWIZZLE_Z; swizzled.swizzle[3]=PIPE_SWIZZLE_1;
++      assert(!ps5_blit_gpu_color(&c,&swizzled)); }
+     assert(cpu_resolve_accepts(&resolved));
+     resolved.filter=PIPE_TEX_FILTER_LINEAR;
+     assert(cpu_resolve_accepts(&resolved));
