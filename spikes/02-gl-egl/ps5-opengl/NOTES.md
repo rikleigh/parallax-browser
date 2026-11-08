@@ -646,3 +646,20 @@ With WebKit patch 0087 (ANGLE binds a VAO without a map search for its state):
 3.7% with the rescan); ANGLE's bind 2.8% -> 1.7% (one read of the VAO state
 left). `msaa-clear.html` 0 failures, `webgl.html` PASS, video formats page 3 of
 3 runs (20 PASS, second round finished), three.js's cube right on the TV.
+
+## Patch 0017: swizzled blits on the GPU (2026-11-08)
+
+Mesa adds a swizzle to a colour blit when the base formats differ: from an
+RGBA texture into a GL_RGB one it asks for {X,Y,Z,1}. This driver has no RGBX
+format, so both are stored as R8G8B8A8, but `ps5_blit_gpu_color` refused any
+blit with `swizzle_enable` and the copy took the CPU fallback. A WebGL 1 video
+player that uploads each frame as `texImage2D(RGB, video)` (the title copies
+the decoded frame into the page's texture with `glBlitFramebuffer`) spent
+~550 ms of the WebGL thread per 2160x1080 frame: 1.8 fps, and the title's own
+video conversion stalled behind it. The GPU blit now samples through a view
+with the blit's swizzle, as u_blitter's `util_blitter_blit` does; only the
+selectors the texture descriptor has (X..W, 0, 1), and not for MSAA resolves.
+Host test: `test_gpu_blit.py` (swizzled blit accepted with the view swizzle
+set, NONE selectors and resolves refused). Built into
+`toolchain/ps5-opengl-gles-noprof-m4`; not yet timed on the console with the
+player that showed it.
