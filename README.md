@@ -94,13 +94,28 @@ the PS5 on macOS (Apple silicon). The steps, roughly:
 1. `brew install llvm@18 socat cmake ninja wget nasm bison glib gperf`, then
    `. ./env.sh`. Put the console's and Mac's addresses in `env.local.sh`
    (git-ignored): `PS5_HOST` and `PS5WK_LOG_HOST`.
-2. Clone the reference checkouts into `ref/` (git-ignored):
-   [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk),
-   [PS5VR](https://github.com/kavera001-dev/PS5VR),
-   [ps5-opengl](https://github.com/mihawk-99/ps5-opengl) at `ec06d8c`,
-   [pacbrew-repo](https://github.com/ps5-payload-dev/pacbrew-repo) and
-   [WebKit](https://github.com/WebKit/WebKit) at commit `15486a0178`. Build
-   the SDK into `toolchain/ps5-payload-sdk` (see [Setup](#setup-for-the-spikes)).
+2. Clone the reference checkouts into `ref/` (git-ignored). The scripts
+   expect exactly these folder names. Each fetch takes only the commit the
+   build was tested with; `ps5-opengl` and `WebKit` must be at these
+   commits, since the build scripts check them out by hash. A plain
+   `git clone --depth 1` would get the latest commit instead, and a full
+   WebKit clone is very large.
+
+   ```sh
+   refclone() {  # folder, URL, commit
+       git init -q "ref/$1" &&
+       git -C "ref/$1" fetch -q --depth 1 "$2" "$3" &&
+       git -C "ref/$1" checkout -q FETCH_HEAD
+   }
+   refclone ps5-payload-sdk https://github.com/ps5-payload-dev/sdk a7685ce8e97ce1f8a4f38253a41d54241c9124f1
+   refclone PS5VR https://github.com/kavera001-dev/PS5VR 110f9a795eec413d174571f65ce2fe4233c49424
+   refclone ps5-opengl https://github.com/mihawk-99/ps5-opengl ec06d8c2da0359e274e409046f0a9586965e4010
+   refclone pacbrew-repo https://github.com/ps5-payload-dev/pacbrew-repo 722187f0ee246c0d7d57401c8a97de1c7f4e2ff0
+   refclone WebKit https://github.com/WebKit/WebKit 15486a017817cad93f25fdffeb013278866970fc
+   ```
+
+   Then build the SDK into `toolchain/ps5-payload-sdk` (see
+   [Setup](#setup-for-the-spikes)).
 3. `spikes/04-jsc/build.sh` builds libc++ 19 and ICU, and
    `spikes/02-gl-egl/ps5-opengl/build.sh gles` builds ps5-opengl with
    OpenGL ES, and `build.sh gles-noprof` then installs the build the browser
@@ -131,8 +146,9 @@ log address built in, and the runtime files.
 
 ## Setup for the spikes
 
+With `ref/ps5-payload-sdk` cloned as in step 2 above:
+
 ```sh
-git clone --depth 1 https://github.com/ps5-payload-dev/sdk ref/ps5-payload-sdk
 make -C ref/ps5-payload-sdk DESTDIR=$PWD/toolchain/ps5-payload-sdk install
 TMPDIR=$PWD/build ref/ps5-payload-sdk/libcxx.sh    # libc++ for C++ code
 ```

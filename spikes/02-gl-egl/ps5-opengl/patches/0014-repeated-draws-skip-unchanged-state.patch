@@ -1,0 +1,810 @@
+diff --git a/src/platform/ps5_agc_native_runtime.c b/src/platform/ps5_agc_native_runtime.c
+index 8e8e2ee..12ca276 100644
+--- a/src/platform/ps5_agc_native_runtime.c
++++ b/src/platform/ps5_agc_native_runtime.c
+@@ -51,6 +51,14 @@
+ #if defined(PS5_GPU_PRESENT_BATCH) && !defined(PS5_DEFERRED_DRAW_BATCH)
+ #error "GPU presentation batching requires the deferred native draw queue"
+ #endif
++/* Batched draws repeating the previous draw's state emit only their own
++ * commands (runtime_repeat_draw). Async workers build draws out of order, and
++ * the diagnostic builds keep every draw's full stream. */
++#if defined(PS5_MULTIDRAW_BATCH) && defined(PS5_GPU_PRESENT_BATCH) && \
++    defined(PS5_AGC_POST_DRAW_BARRIER_WORDS) && !defined(PS5_ASYNC_NATIVE_PREP) && !defined(PS5_DRAW_GPU_TIMESTAMPS) && \
++    !defined(AGC_RUNTIME_DIAGNOSTICS)
++#define RUNTIME_REPEAT_DRAWS 1
++#endif
+ #ifdef PS5_DRAW_BATCH_PROBE
+ #if !defined(PS5_NATIVE_TITLE_RUNTIME) || !defined(AGC_RUNTIME_PACKAGES) || !defined(AGC_TRIANGLE_SUBMIT)
+ #error "Batch probe requires the native submitting runtime"
+@@ -85,6 +93,9 @@ struct runtime_draw_inputs {
+     unsigned vs_package_len, ps_package_len, hs_package_len;
+     uint8_t *framebuffer;
+     size_t framebuffer_size;
++    /* Per-draw values, from vertex_user_data to index_size, and draw_count.
++     * A repeated draw (runtime_repeat_draw) emits only these; every other
++     * field is state it requires to equal the previous draw's. */
+     uint32_t vertex_user_data[32], hull_user_data[32], pixel_user_data[32];
+     unsigned vertex_user_data_count, hull_user_data_count, pixel_user_data_count;
+     const void *index_buffer;
+@@ -1462,6 +1473,9 @@ static struct runtime_batch_entry {
+     volatile uint64_t *marker;
+     uint32_t expected;
+     uint32_t completion_offset, command_capacity, upload_prefix_words;
++    /* Set by runtime_batch_append: appended to the open group's stream. */
++    uint8_t joins;
++    uint8_t repeat; /* Carries no state: must join (runtime_repeat_draw). */
+ } runtime_batch_entries[PS5_MULTIDRAW_BATCH_CAPACITY];
+ static struct runtime_pending_batch {
+     struct runtime_batch_entry entries[PS5_MULTIDRAW_BATCH_CAPACITY];
+@@ -1478,6 +1492,92 @@ static int runtime_batch_active, runtime_batch_faulted;
+ static int runtime_batch_fixed_framebuffer;
+ static int runtime_batch_append(const agc_api_t *, const struct runtime_batch_entry *);
+ 
++/* Groups are decided as entries are appended: an entry joins the open group
++ * (its words are appended to the leader's stream at submit) or starts one.
++ * Deciding here, not at submit, lets a draw know before it is queued that it
++ * will directly follow the previous draw in one stream (runtime_repeat_draw). */
++static struct runtime_batch_entry *runtime_batch_group_leader;
++static uint32_t runtime_batch_group_offset; /* The leader's offset after its group. */
++
++static int runtime_batch_groupable(const struct runtime_batch_entry *entry)
++{
++    return entry->completion_offset &&
++           entry->completion_offset < entry->submit.word_count &&
++           entry->submit.word_count <= entry->command_capacity;
++}
++
++/* Every upload is published before the group is submitted, so the leader's
++ * acquire covers the later entries' prefixes. */
++static uint32_t runtime_batch_join_skip(const struct runtime_batch_entry *leader,
++                                        const struct runtime_batch_entry *entry)
++{
++    return leader->upload_prefix_words &&
++           entry->upload_prefix_words < entry->completion_offset
++               ? entry->upload_prefix_words : 0;
++}
++
++/* Headroom a queued presentation requires after the last entry (its flip
++ * and completion are far shorter). */
++#define RUNTIME_PRESENT_TAIL_WORDS 128u
++
++/* reserve: words the entry may still grow by (a presentation tail). */
++static int runtime_batch_would_join(const struct runtime_batch_entry *entry,
++                                    uint32_t reserve)
++{
++    const struct runtime_batch_entry *leader = runtime_batch_group_leader;
++    if (!leader || !runtime_batch_groupable(entry) ||
++        entry->submit.flag != leader->submit.flag ||
++        entry->command_capacity - entry->submit.word_count < reserve)
++        return 0;
++    uint32_t words = entry->submit.word_count - runtime_batch_join_skip(leader, entry);
++    uint32_t room = leader->command_capacity - runtime_batch_group_offset;
++    return words <= room && room - words >= reserve;
++}
++
++#ifdef PS5_GPU_PRESENT_BATCH
++/* A presentation appends its flip to the last queued entry. Keep that
++ * entry's group decision valid for the longer stream: a draw that no longer
++ * fits its group starts one (it carries its full state). */
++static int runtime_batch_extend_last(uint32_t word_count)
++{
++    if (!runtime_batch_count)
++        return -1;
++    struct runtime_batch_entry *entry = &runtime_batch_entries[runtime_batch_count - 1];
++    if (word_count < entry->submit.word_count)
++        return -1;
++    if (entry->joins) {
++        const struct runtime_batch_entry *leader = runtime_batch_group_leader;
++        const uint32_t skip = runtime_batch_join_skip(leader, entry);
++        const uint32_t before = runtime_batch_group_offset - (entry->completion_offset - skip);
++        if (word_count > entry->command_capacity ||
++            word_count - skip > leader->command_capacity - before) {
++            if (entry->repeat)
++                return -1; /* It reserved the tail when queued. */
++            entry->joins = 0;
++            runtime_batch_group_leader = entry;
++            runtime_batch_group_offset = entry->completion_offset;
++        }
++    }
++    entry->submit.word_count = word_count;
++    if (!entry->joins && !runtime_batch_groupable(entry))
++        runtime_batch_group_leader = NULL;
++    return 0;
++}
++#endif
++
++#ifdef RUNTIME_REPEAT_DRAWS
++/* The last queued draw's state (runtime_repeat_draw). Valid only within the
++ * batch that queued it, and only while no other entry follows it. */
++static struct {
++    int valid;
++    unsigned queued; /* runtime_batch_count right after that draw. */
++    const struct runtime_shader_pair *pair;
++    struct runtime_draw_inputs draw;
++    struct ps5_agc_backend_draw_state backend;
++    uint32_t ngg_valid, ngg_value;
++} runtime_repeat;
++#endif
++
+ #ifdef PS5_ASYNC_NATIVE_PREP
+ /* The producer keeps translating GL draws while this worker prepares native
+  * commands. Submission/retirement stays ordered at the existing batch edge. */
+@@ -1701,6 +1801,11 @@ int ps5_agc_gate2_batch_begin(void)
+         return -1;
+     runtime_batch_active = 1;
+     runtime_batch_fixed_framebuffer = 0;
++    runtime_batch_group_leader = NULL;
++    runtime_batch_group_offset = 0;
++#ifdef RUNTIME_REPEAT_DRAWS
++    runtime_repeat.valid = 0;
++#endif
+     return 0;
+ }
+ 
+@@ -1728,7 +1833,19 @@ static int runtime_batch_append(const agc_api_t *api,
+          runtime_batch_api.suspend_point != api->suspend_point))
+         return -1;
+     runtime_batch_api = *api;
+-    runtime_batch_entries[runtime_batch_count++] = *entry;
++    struct runtime_batch_entry *stored = &runtime_batch_entries[runtime_batch_count++];
++    *stored = *entry;
++    stored->joins = (uint8_t)runtime_batch_would_join(entry, 0);
++    if (stored->repeat && !stored->joins)
++        abort(); /* runtime_repeat_draw checked first. */
++    if (stored->joins)
++        runtime_batch_group_offset += entry->completion_offset -
++            runtime_batch_join_skip(runtime_batch_group_leader, entry);
++    else if (runtime_batch_groupable(entry)) {
++        runtime_batch_group_leader = stored;
++        runtime_batch_group_offset = entry->completion_offset;
++    } else
++        runtime_batch_group_leader = NULL; /* Submitted alone. */
+     return 0; /* Ownership transfers only on success. No GPU work yet. */
+ }
+ 
+@@ -1757,26 +1874,21 @@ static unsigned runtime_batch_combine(void)
+     struct runtime_batch_entry *leader = NULL;
+     for (unsigned i = 0; i < runtime_batch_count; ++i) {
+         struct runtime_batch_entry *entry = &runtime_batch_entries[i];
+-        if (!entry->completion_offset ||
+-            entry->completion_offset >= entry->submit.word_count ||
+-            entry->submit.word_count > entry->command_capacity) {
+-            leader = NULL;
++        if (!entry->joins) {
++            leader = runtime_batch_groupable(entry) ? entry : NULL;
+             ++groups;
+             continue;
+         }
+-        /* Every upload is published before this group is submitted. Its first
+-         * acquire covers all retained allocations; preserve subsequent draw
+-         * bodies and their explicit GPU-to-GPU dependency barriers. */
+-        uint32_t skip = leader && leader->upload_prefix_words &&
+-            entry->upload_prefix_words < entry->completion_offset
+-                ? entry->upload_prefix_words : 0;
++        /* Preserve the draw bodies after the first acquire and their explicit
++         * GPU-to-GPU dependency barriers. Joining was decided on append from
++         * these same values; a repeated draw depends on it (it carries no
++         * state of its own), so a mismatch is a broken invariant. */
++        uint32_t skip = leader ? runtime_batch_join_skip(leader, entry) : 0;
+         uint32_t append_words = entry->submit.word_count - skip;
+-        if (!leader || entry->submit.flag != leader->submit.flag ||
+-            append_words > leader->command_capacity - leader->completion_offset) {
+-            leader = entry;
+-            ++groups;
+-            continue;
+-        }
++        if (!leader || !runtime_batch_groupable(entry) ||
++            entry->submit.flag != leader->submit.flag ||
++            append_words > leader->command_capacity - leader->completion_offset)
++            abort();
+         uint32_t offset = leader->completion_offset;
+         memcpy((uint32_t *)leader->submit.words + offset,
+                (const uint32_t *)entry->submit.words + skip,
+@@ -1865,6 +1977,7 @@ int ps5_agc_gate2_batch_submit(void)
+         printf("[ps5-inflight] peak=%u capacity=%u\n", runtime_pending_peak, PS5_INFLIGHT_BATCH_CAPACITY);
+     }
+     runtime_batch_count = 0;
++    runtime_batch_group_leader = NULL;
+ #ifdef PS5_DRAW_PROFILE
+     pending->profile = profile;
+     pending->start_ns = ticks[0];
+@@ -2154,7 +2267,7 @@ int ps5_agc_gate2_batch_present(unsigned buffer_index)
+     if (!words || (uintptr_t)words < (uintptr_t)entry->memory ||
+         (uintptr_t)words - (uintptr_t)entry->memory > entry->bytes ||
+         entry->bytes - ((uintptr_t)words - (uintptr_t)entry->memory) < COMMAND_BYTES ||
+-        entry->submit.word_count > COMMAND_BYTES / sizeof(*words) - 128)
++        entry->submit.word_count > COMMAND_BYTES / sizeof(*words) - RUNTIME_PRESENT_TAIL_WORDS)
+         return -1;
+     agc_command_buffer_t command = {0};
+     command.bottom = words;
+@@ -2173,7 +2286,8 @@ int ps5_agc_gate2_batch_present(unsigned buffer_index)
+         out_of_space || command.up <= words + entry->submit.word_count ||
+         command.up > command.top)
+         return -1;
+-    entry->submit.word_count = (uint32_t)(command.up - words);
++    if (runtime_batch_extend_last((uint32_t)(command.up - words)) != 0)
++        return -1;
+     entry->expected = (uint32_t)marker;
+     flush_gpu_data(words, entry->submit.word_count * sizeof(*words));
+     runtime_gpu_present_buffer = (int)buffer_index;
+@@ -3688,12 +3802,195 @@ static int run_frame_slot_test(const agc_api_t *agc, const video_api_t *video,
+ }
+ #endif
+ 
++#ifdef RUNTIME_REPEAT_DRAWS
++/* A batched draw normally carries its whole state: render target, shader,
++ * depth, blend, viewport and rasterizer register tables, rebuilt by the CPU
++ * for every draw (~10% of the WebGL thread at 2000 draws per frame). In one
++ * group the draws run as one stream, and context, SH and UC registers keep
++ * the last written values, so a draw whose state equals the draw before it
++ * in that stream needs only its own commands: the upload acquire, its user
++ * data, the draw and its completion. The state compared is everything the
++ * full path builds those tables from (all of runtime_draw_inputs but the
++ * per-draw values, the backend draw state, the NGG control and the shader
++ * bytes), and the draw must join the previous draw's group. Anything else
++ * takes the full path. */
++static uint64_t runtime_repeat_lookups, runtime_repeat_hits;
++
++static void runtime_repeat_record(const struct runtime_shader_pair *pair)
++{
++    runtime_repeat.valid = pair && !runtime_hs_package;
++    if (!runtime_repeat.valid)
++        return;
++    runtime_repeat.queued = runtime_batch_count;
++    runtime_repeat.pair = pair;
++    runtime_repeat.draw = runtime_draw_state;
++    runtime_repeat.backend = ps5_agc_draw_state;
++    runtime_repeat.ngg_valid = runtime_ngg_ge_pc_alloc_valid;
++    runtime_repeat.ngg_value = runtime_ngg_ge_pc_alloc;
++}
++
++_Static_assert(offsetof(struct runtime_draw_inputs, framebuffer_size) <
++                   offsetof(struct runtime_draw_inputs, vertex_user_data) &&
++               offsetof(struct runtime_draw_inputs, index_size) <
++                   offsetof(struct runtime_draw_inputs, primitive_type) &&
++               offsetof(struct runtime_draw_inputs, primitive_type) <
++                   offsetof(struct runtime_draw_inputs, draw_count) &&
++               offsetof(struct runtime_draw_inputs, draw_count) <
++                   offsetof(struct runtime_draw_inputs, depth_buffer),
++               "runtime_repeat_matches skips the per-draw fields by position");
++
++static int runtime_repeat_matches(void)
++{
++    enum {
++        USER = offsetof(struct runtime_draw_inputs, vertex_user_data),
++        PRIMITIVE = offsetof(struct runtime_draw_inputs, primitive_type),
++        COUNT = offsetof(struct runtime_draw_inputs, draw_count),
++        DEPTH = offsetof(struct runtime_draw_inputs, depth_buffer),
++    };
++    const uint8_t *previous = (const uint8_t *)&runtime_repeat.draw;
++    const uint8_t *current = (const uint8_t *)&runtime_draw_state;
++    const struct runtime_shader_pair *pair = runtime_repeat.pair;
++
++    if (++runtime_repeat_lookups % 100000 == 0)
++        printf("[ps5-repeat-draws] lookups=%" PRIu64 " repeated=%" PRIu64 "\n",
++               runtime_repeat_lookups, runtime_repeat_hits);
++    if (!runtime_repeat.valid || !runtime_batch_active ||
++        runtime_batch_count != runtime_repeat.queued || runtime_hs_package ||
++        runtime_ngg_ge_pc_alloc_valid != runtime_repeat.ngg_valid ||
++        runtime_ngg_ge_pc_alloc != runtime_repeat.ngg_value)
++        return 0;
++    /* Also compares the package addresses and sizes, the pair's key. */
++    if (!ps5_memeq(previous, current, USER) ||
++        !ps5_memeq(previous + PRIMITIVE, current + PRIMITIVE, COUNT - PRIMITIVE) ||
++        !ps5_memeq(previous + DEPTH, current + DEPTH, sizeof(runtime_draw_state) - DEPTH) ||
++        !ps5_memeq(&runtime_repeat.backend, &ps5_agc_draw_state, sizeof(ps5_agc_draw_state)))
++        return 0;
++    /* A package address can be reused for different bytecode. */
++    return ps5_memeq(pair->source, runtime_vs_package, pair->vs_size) &&
++           ps5_memeq(pair->source + pair->vs_size, runtime_ps_package, pair->ps_size);
++}
++
++/* 0: queued. 1: not a repeat (or it could not be queued as one); nothing was
++ * queued and the caller builds the full draw. The per-draw commands are the
++ * full path's (main), in the same order. */
++static int runtime_repeat_draw(void)
++{
++    agc_api_t agc = {0};
++    video_api_t video = {0};
++    uint8_t *memory = NULL;
++    int64_t work_start = -1;
++    agc_command_buffer_t command = {0};
++    struct runtime_batch_entry entry = {0};
++    uint32_t *words, draw_words, final_words, completion_offset = 0;
++    uint32_t bad_packet, bad_opcode, bad_count;
++    uint64_t bad_address;
++    volatile uint64_t *completion_marker;
++    int64_t render_marker;
++    const size_t pool = runtime_framebuffer_size < FRAMEBUFFER_POOL_BYTES
++                            ? FRAMEBUFFER_BYTES : FRAMEBUFFER_POOL_BYTES;
++
++    if (!runtime_repeat_matches())
++        return 1;
++    /* The previous draw found this pool registered (runtime_video_acquire
++     * returns at once); a change of registration takes the full path. */
++    if (!runtime_agc_initialized || !runtime_video_registered ||
++        runtime_framebuffer != runtime_video_framebuffer ||
++        pool > runtime_video_framebuffer_size ||
++        load_apis(NULL, NULL, NULL, &agc, &video) != 0 ||
++        runtime_video_prepare_draw() != 0)
++        return 1;
++    if (!runtime_work_take(WORK_BYTES, (void **)&memory, &work_start))
++        return 1;
++    runtime_prepared_work_clear(memory);
++    completion_marker = (volatile uint64_t *)(memory + 0x6ff0);
++    words = (uint32_t *)(memory + 0x8000);
++    command.bottom = words;
++    command.top = words + COMMAND_BYTES / sizeof(*words);
++    command.up = words;
++    command.down = command.top;
++    command.callback = (uintptr_t)command_out_of_space;
++    if (!runtime_acquire_cpu_uploads(&command, memory, WORK_BYTES))
++        goto fail;
++    entry.upload_prefix_words = (uint32_t)(command.up - words);
++    if (runtime_vertex_user_data_count)
++        agc.set_sh_direct(&command, 0x8c, runtime_vertex_user_data,
++                          runtime_vertex_user_data_count);
++    if (runtime_pixel_user_data_count)
++        agc.set_sh_direct(&command, 0x0c, runtime_pixel_user_data,
++                          runtime_pixel_user_data_count);
++    if (runtime_index_buffer) {
++        uint8_t agc_index_size = runtime_index_size == sizeof(uint32_t) ?
++                                     AGC_INDEX_SIZE_32 : AGC_INDEX_SIZE_16;
++
++        agc.set_index_size(&command, agc_index_size, 0);
++        agc.set_index_buffer(&command, (void *)runtime_index_buffer);
++        agc.set_index_count(&command, runtime_index_count);
++        agc.draw_index(&command, runtime_index_count,
++                       (void *)runtime_index_buffer, 0);
++    } else {
++        agc.draw_auto(&command, runtime_draw_count, 2);
++    }
++    draw_words = (uint32_t)(command.up - words);
++    if (out_of_space || command.up < command.bottom ||
++        command.up > command.top || draw_words == 0)
++        goto fail;
++    if (runtime_batch_fixed_framebuffer &&
++        PS5_AGC_POST_DRAW_BARRIER_WORDS < draw_words)
++        completion_offset = draw_words - PS5_AGC_POST_DRAW_BARRIER_WORDS;
++    if (!agc.release_mem(&command, 45, 12, 1, 0, NULL, 0, 0,
++                         0, 1, 0, 0))
++        goto fail;
++    if (!completion_offset)
++        completion_offset = (uint32_t)(command.up - words);
++    if (!agc.release_mem(&command, 43, 12, 1, 0, NULL, 0, 0,
++                         0, 1, 0, 0))
++        goto fail;
++    render_marker = runtime_next_render_marker();
++    if (!runtime_release_completion(&agc, &command, completion_marker,
++                                    (uint32_t)render_marker))
++        goto fail;
++    final_words = (uint32_t)(command.up - words);
++    if (validate_indirect_register_tables(words, final_words, memory, WORK_BYTES,
++                                          &bad_packet, &bad_opcode,
++                                          &bad_address, &bad_count) != 0 ||
++        command.down < command.up || command.down > command.top)
++        goto fail;
++    entry.submit.words = words;
++    entry.submit.word_count = final_words;
++    entry.memory = memory;
++    entry.direct = work_start;
++    entry.bytes = WORK_BYTES;
++    entry.marker = completion_marker;
++    entry.expected = (uint32_t)render_marker;
++    entry.completion_offset = completion_offset;
++    entry.command_capacity = (uint32_t)(command.down - words);
++    /* It has no state of its own: it must follow the previous draw, also
++     * once a presentation extends it. */
++    entry.repeat = 1;
++    if (!runtime_batch_would_join(&entry, RUNTIME_PRESENT_TAIL_WORDS) ||
++        runtime_prepared_work_publish(memory, &command) != 0 ||
++        runtime_batch_queue(&agc, &entry) != 0)
++        goto fail;
++    runtime_repeat.queued = runtime_batch_count;
++    ++runtime_repeat_hits;
++    return 0;
++fail:
++    if (runtime_work_put(memory, work_start, WORK_BYTES) != 0)
++        runtime_require_retirement(0);
++    return 1;
++}
++#endif
++
+ int main(void)
+ {
+ #ifdef PS5_MULTIDRAW_BATCH
+     if (runtime_batch_faulted)
+         return 1;
+ #endif
++#ifdef RUNTIME_REPEAT_DRAWS
++    if (!runtime_repeat_draw())
++        return 0;
++#endif
+ #ifdef PS5_DRAW_BATCH_PROBE
+     const unsigned batch_repeats = runtime_batch_probe_repeats();
+     int64_t batch_wait_ns = 0;
+@@ -5105,6 +5402,9 @@ int main(void)
+         }
+         if (runtime_batch_queue(&agc, &entry) != 0)
+             goto receipt;
++#ifdef RUNTIME_REPEAT_DRAWS
++        runtime_repeat_record(prepared);
++#endif
+         memory = NULL;
+         work_start = -1;
+         result = 0;
+diff --git a/tests/ps5/test_command_groups.py b/tests/ps5/test_command_groups.py
+index 29ecbaf..9fc0030 100644
+--- a/tests/ps5/test_command_groups.py
++++ b/tests/ps5/test_command_groups.py
+@@ -17,12 +17,17 @@ assert tail.index('if (!completion_offset)') < tail.index('release_mem(&command,
+ assert 'if (command.down >= command.up && command.down <= command.top)' in source
+ assert 'entry.command_capacity = (uint32_t)(command.down - words);' in source
+ code = r'''
++#define _POSIX_C_SOURCE 200809L
++#define PS5_GPU_PRESENT_BATCH 1 /* runtime_batch_extend_last */
+ #include <assert.h>
++#include <signal.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <setjmp.h>
++#include <sys/wait.h>
++#include <unistd.h>
+ #include "ps5_screen.h"
+ typedef struct { void *words; uint32_t word_count; uint8_t flag, padding[3]; } agc_submit_description_t;
+ typedef struct { int (*submit)(void *); int (*suspend_point)(void); } agc_api_t;
+@@ -74,6 +79,7 @@ static int sceKernelReleaseDirectMemory(int64_t p,size_t n) {
+     assert(p>=0 && n==64 && unmaps>releases); ++releases; return 0;
+ }
+ ''' + body + r'''
++static void (*tweak)(unsigned, struct runtime_batch_entry *);
+ static void reset(unsigned count) {
+     memset(runtime_batch_entries,0,sizeof(runtime_batch_entries));
+     memset(runtime_pending,0,sizeof(runtime_pending));
+@@ -88,12 +94,39 @@ static void reset(unsigned count) {
+     for (unsigned i=0;i<count;++i) {
+         memory[i][0]=1000+i; memory[i][1]=2000+i; memory[i][2]=3000+i;
+         agc_submit_description_t d={memory[i],3,0,{0}};
+-        struct runtime_batch_entry entry={d,memory[i],i*64,64,&markers[i],101+i,2,16,0};
++        struct runtime_batch_entry entry={d,memory[i],i*64,64,&markers[i],101+i,2,16,0,0,0};
++        if (tweak) tweak(i,&entry); /* Grouping is decided as each entry is queued. */
++        struct runtime_batch_entry expected=entry;
+         assert(!runtime_batch_queue(&api,&entry));
+         memset(&entry,0,sizeof(entry)); /* Batch owns a complete value snapshot. */
+-        assert(runtime_batch_entries[i].completion_offset==2);
+-        assert(runtime_batch_entries[i].command_capacity==16);
++        assert(runtime_batch_entries[i].completion_offset==expected.completion_offset);
++        assert(runtime_batch_entries[i].command_capacity==expected.command_capacity);
+     }
++    tweak=NULL;
++}
++static unsigned tweak_mode;
++static void split(unsigned i, struct runtime_batch_entry *e) {
++    if (tweak_mode==0 && i==0) e->command_capacity=5;
++    if (tweak_mode==1 && i==1) e->completion_offset=0;
++    if (tweak_mode==2 && i==1) e->submit.flag=1;
++    if (tweak_mode==3 && i==1) e->command_capacity=2;
++}
++static void presented(unsigned i, struct runtime_batch_entry *e) {
++    if (i==2) { memory[2][3]=4000; memory[2][4]=5000; e->submit.word_count=5; }
++}
++static void narrow(unsigned i, struct runtime_batch_entry *e) {
++    if (i==0) e->command_capacity=8;
++    if (i==2) e->repeat=(uint8_t)tweak_mode;
++}
++static void unjoinable_repeat(unsigned i, struct runtime_batch_entry *e) {
++    if (i==1) { e->repeat=1; e->submit.flag=1; }
++}
++static void acquired(unsigned i, struct runtime_batch_entry *e) {
++    memmove(memory[i]+1,memory[i],3*sizeof(uint32_t));
++    memory[i][0]=999;
++    e->submit.word_count=4;
++    e->completion_offset=3;
++    e->upload_prefix_words=1;
+ }
+ int main(void) {
+     assert(!ps5_agc_gate2_batch_begin_framebuffer() && runtime_batch_fixed_framebuffer);
+@@ -111,31 +144,63 @@ int main(void) {
+     }
+     /* Exact-fit capacity, opt-out, submit flags and invalid metadata split groups. */
+     for (unsigned mode=0;mode<4;++mode) {
++        tweak=split; tweak_mode=mode;
+         reset(3);
+-        if (mode==0) runtime_batch_entries[0].command_capacity=5;
+-        if (mode==1) runtime_batch_entries[1].completion_offset=0;
+-        if (mode==2) runtime_batch_entries[1].submit.flag=1;
+-        if (mode==3) runtime_batch_entries[1].command_capacity=2;
++        assert(!runtime_batch_entries[0].joins);
++        assert(runtime_batch_entries[1].joins==(mode==0));
++        assert(!runtime_batch_entries[2].joins); /* Mode 0: the first group is full. */
+         assert(!ps5_agc_gate2_batch_submit());
+         assert(submits==(mode==0?2:3));
+         assert(ps5_agc_gate2_batch_retire(1)==1 && releases==3);
+     }
++    tweak=presented;
+     reset(3);
+-    memory[2][3]=4000; memory[2][4]=5000;
+-    runtime_batch_entries[2].submit.word_count=5;
+     assert(!ps5_agc_gate2_batch_submit() && submits==1);
+     assert(ps5_agc_gate2_batch_retire(1)==1 && releases==3);
+     /* One acquire per group; preserve every draw and dependency barrier. */
++    tweak=acquired;
+     reset(3);
+-    for (unsigned i=0;i<3;++i) {
+-        memmove(memory[i]+1,memory[i],3*sizeof(uint32_t));
+-        memory[i][0]=999;
+-        runtime_batch_entries[i].submit.word_count=4;
+-        runtime_batch_entries[i].completion_offset=3;
+-        runtime_batch_entries[i].upload_prefix_words=1;
+-    }
+     assert(!ps5_agc_gate2_batch_submit() && submits==1 && consumed==3);
+     assert(ps5_agc_gate2_batch_retire(1)==1 && releases==3);
++    /* A presentation extends the last entry after its group was decided. */
++    reset(3);
++    memory[2][3]=4000; memory[2][4]=5000;
++    assert(!runtime_batch_extend_last(5) && runtime_batch_entries[2].joins);
++    assert(runtime_batch_extend_last(4)!=0); /* Never shrinks. */
++    assert(!ps5_agc_gate2_batch_submit() && submits==1);
++    assert(ps5_agc_gate2_batch_retire(1)==1 && releases==3);
++    /* No longer fitting its group (8 words: 2+2 used before it, 4 left), a
++     * full draw starts its own group; a repeated draw has no state of its
++     * own, so the presentation fails and the entry is unchanged. */
++    for (tweak_mode=0;tweak_mode<2;++tweak_mode) {
++        tweak=narrow;
++        reset(3);
++        assert(runtime_batch_entries[1].joins && runtime_batch_entries[2].joins);
++        memory[2][3]=4000; memory[2][4]=5000;
++        if (tweak_mode) {
++            assert(runtime_batch_extend_last(5)!=0);
++            assert(runtime_batch_entries[2].joins && runtime_batch_entries[2].submit.word_count==3);
++        } else {
++            assert(!runtime_batch_extend_last(5) && !runtime_batch_entries[2].joins);
++            assert(runtime_batch_group_leader==&runtime_batch_entries[2]);
++        }
++        assert(!ps5_agc_gate2_batch_submit() && submits==(tweak_mode ? 1u : 2u));
++        assert(ps5_agc_gate2_batch_retire(1)==1 && releases==3);
++    }
++    /* Joining with headroom: 16-word leader, 4 used, a 3-word candidate. */
++    reset(2);
++    struct runtime_batch_entry candidate=runtime_batch_entries[1];
++    assert(runtime_batch_would_join(&candidate,0) && runtime_batch_would_join(&candidate,9));
++    assert(!runtime_batch_would_join(&candidate,10));
++    candidate.command_capacity=4; /* Its own stream must also have the room. */
++    assert(runtime_batch_would_join(&candidate,1) && !runtime_batch_would_join(&candidate,2));
++    assert(!ps5_agc_gate2_batch_submit() && ps5_agc_gate2_batch_retire(1)==1);
++    /* A repeated draw that would not join is a broken invariant: fail-stop. */
++    pid_t child=fork();
++    assert(child>=0);
++    if (!child) { tweak=unjoinable_repeat; reset(2); _exit(0); }
++    int status;
++    assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
+     for (unsigned mode=0;mode<3;++mode) {
+         reset(9);
+         fail_submit=mode==0; fail_suspend=mode==1; never_complete=mode==2;
+diff --git a/tests/ps5/test_gpu_present.py b/tests/ps5/test_gpu_present.py
+index 17a9af0..e92c556 100644
+--- a/tests/ps5/test_gpu_present.py
++++ b/tests/ps5/test_gpu_present.py
+@@ -114,6 +114,15 @@ static struct {
+     int (*submit_flip)(int, int, uint32_t, int64_t);
+ } runtime_video_api = {status, pending, vblank, cpu_flip};
+ static int runtime_video_wait_idle(void) { ++idle_calls; return idle_error; }
++#define RUNTIME_PRESENT_TAIL_WORDS 128u
++static int extend_error;
++/* Its group bookkeeping is covered by test_command_groups. */
++static int runtime_batch_extend_last(uint32_t word_count) {
++    assert(runtime_batch_count == 1 && word_count == 12);
++    if (extend_error) return -1;
++    runtime_batch_entries[0].submit.word_count = word_count;
++    return 0;
++}
+ ''' + body + present + lock_support + present_lock + r'''
+ static void reset(void) {
+     runtime_video_registered = 1; runtime_video_handle = 7;
+@@ -129,6 +138,7 @@ static void reset(void) {
+     tails = releases = flushes = cpu_flips = waits = idle_calls = 0;
+     runtime_present_count = runtime_gpu_present_count = 0;
+     idle_error = flip_error = status_error = pending_error = wait_error = tail_error = 0;
++    extend_error = 0;
+     finish_after = pending_after = polls = 0;
+     runtime_video_framebuffer_size = runtime_gpu_present_deferred = runtime_gpu_present_is_cpu = 0;
+ }
+@@ -199,7 +209,7 @@ int main(void) {
+     assert(ps5_agc_gate2_present(1, 1) == 0); status_error = -21;
+     assert(ps5_agc_gate2_wait_present() == -21 && runtime_gpu_present_deferred);
+     assert(ps5_agc_gate2_present(1, 1) != 0 && !cpu_flips && runtime_gpu_present_buffer == 1);
+-    for (int error = 0; error < 10; ++error) {
++    for (int error = 0; error < 11; ++error) {
+         reset();
+         if (error == 0) runtime_batch_entries[0].submit.word_count = COMMAND_BYTES / 4;
+         if (error == 1) runtime_batch_entries[0].bytes = COMMAND_BYTES - 1;
+@@ -208,7 +218,8 @@ int main(void) {
+         if (error == 4) runtime_batch_faulted = 1;
+         if (error == 5) runtime_video_registered = 0;
+         if (error == 6) runtime_batch_count = 0;
+-        if (error >= 7) tail_error = error - 6;
++        if (error >= 7 && error < 10) tail_error = error - 6;
++        if (error == 10) extend_error = 1; /* The tail would break a repeated draw's group. */
+         assert(ps5_agc_gate2_batch_present(1) != 0 && !flushes);
+         assert(runtime_batch_entries[0].expected == 17);
+     }
+diff --git a/tests/ps5/test_multidraw_lifetime.py b/tests/ps5/test_multidraw_lifetime.py
+index 2c9645c..2fa12a3 100644
+--- a/tests/ps5/test_multidraw_lifetime.py
++++ b/tests/ps5/test_multidraw_lifetime.py
+@@ -276,7 +276,7 @@ static void queue(unsigned n) {
+     assert(ps5_agc_gate2_batch_begin() != 0);
+     for (unsigned i = 0; i < n; ++i) {
+         agc_submit_description_t d = {memory[i], 1, 0, {0}};
+-        const struct runtime_batch_entry entry={d,memory[i],i*64,64,&markers[i],101+i,0,0,0};
++        const struct runtime_batch_entry entry={d,memory[i],i*64,64,&markers[i],101+i,0,0,0,0,0};
+         assert(runtime_batch_queue(&api, &entry) == 0);
+     }
+     assert(!submits && !unmaps && !releases); /* Staging is not execution. */
+@@ -293,7 +293,7 @@ int main(void) {
+     reset(); queue(PS5_MULTIDRAW_BATCH_CAPACITY);
+     const agc_api_t api = {submit, suspend_point};
+     agc_submit_description_t d = {memory[0], 1, 0, {0}};
+-    const struct runtime_batch_entry entry={d,memory[0],0,64,&markers[0],101,0,0,0};
++    const struct runtime_batch_entry entry={d,memory[0],0,64,&markers[0],101,0,0,0,0,0};
+     assert(runtime_batch_queue(&api, &entry) != 0);
+     assert(ps5_agc_gate2_batch_end() == 0);
+     reset(); delay=5; queue(3);
+@@ -347,7 +347,7 @@ static void queue_one(unsigned i) {
+     const agc_api_t api={submit,suspend_point};
+     assert(ps5_agc_gate2_batch_begin()==0);
+     agc_submit_description_t d={memory[i],1,0,{0}};
+-    const struct runtime_batch_entry entry={d,memory[i],i*64,64,&markers[i],101+i,0,0,0};
++    const struct runtime_batch_entry entry={d,memory[i],i*64,64,&markers[i],101+i,0,0,0,0,0};
+     assert(runtime_batch_queue(&api,&entry)==0);
+ }
+ int main(void) {
+diff --git a/tests/ps5/test_repeat_draws.py b/tests/ps5/test_repeat_draws.py
+new file mode 100644
+index 0000000..bc5e4c0
+--- /dev/null
++++ b/tests/ps5/test_repeat_draws.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python3
++"""A repeated draw (runtime_repeat_draw) must match every input of the state it
++skips and nothing per-draw, and must emit the full path's per-draw commands."""
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / "src/platform/ps5_agc_native_runtime.c").read_text()
++
++
++def between(start, end, at=0):
++    a = source.index(start, at)
++    return source[a:source.index(end, a)]
++
++
++inputs = between("#define RUNTIME_MAX_VIEWPORTS 16", "\nint ps5_agc_gate2_set_packages")
++state = between("#ifdef RUNTIME_REPEAT_DRAWS\n/* The last queued draw's state",
++                "\n#endif\n") + "\n#endif\n"
++functions = between("static uint64_t runtime_repeat_lookups", "\n/* 0: queued.")
++
++code = r'''
++#define RUNTIME_REPEAT_DRAWS 1
++#define AGC_RUNTIME_PACKAGES 1
++#include <assert.h>
++#include <inttypes.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "%s"
++struct runtime_shader_pair { uint8_t *source; size_t vs_size, ps_size; };
++struct ps5_agc_backend_draw_state { uint32_t instance_count; void *targets[8]; uint32_t mask; };
++static _Thread_local struct ps5_agc_backend_draw_state ps5_agc_draw_state;
++static _Thread_local uint32_t runtime_ngg_ge_pc_alloc, runtime_ngg_ge_pc_alloc_valid;
++static int runtime_batch_active;
++static unsigned runtime_batch_count;
++''' % (root / "src/platform/ps5_memeq.h") + inputs + state + functions + r'''
++static uint8_t vs[96] = {1}, ps[64] = {2};
++static uint8_t pair_source[160];
++static struct runtime_shader_pair pair = {pair_source, sizeof(vs), sizeof(ps)};
++static void base(void) {
++    runtime_vs_package = vs; runtime_vs_package_len = sizeof(vs);
++    runtime_ps_package = ps; runtime_ps_package_len = sizeof(ps);
++    memcpy(pair_source, vs, sizeof(vs)); memcpy(pair_source + sizeof(vs), ps, sizeof(ps));
++    runtime_batch_active = 1; runtime_batch_count = 7;
++    runtime_ngg_ge_pc_alloc_valid = 1; runtime_ngg_ge_pc_alloc = 9;
++    ps5_agc_draw_state.mask = 0xf;
++    runtime_repeat_record(&pair);
++    assert(runtime_repeat.valid && runtime_repeat.queued == 7 && runtime_repeat_matches());
++}
++int main(void) {
++    const size_t user = offsetof(struct runtime_draw_inputs, vertex_user_data);
++    const size_t per_draw_end = offsetof(struct runtime_draw_inputs, index_size) + sizeof(unsigned);
++    const size_t count = offsetof(struct runtime_draw_inputs, draw_count);
++    base();
++    /* Every byte: only the per-draw values may differ. */
++    for (size_t i = 0; i < sizeof(runtime_draw_state); ++i) {
++        uint8_t *byte = (uint8_t *)&runtime_draw_state + i;
++        int per_draw = (i >= user && i < per_draw_end) || (i >= count && i < count + sizeof(unsigned));
++        *byte ^= 0x40;
++        if (i < offsetof(struct runtime_draw_inputs, framebuffer)) {
++            /* Package pointers and sizes: never read through when they differ. */
++            assert(!runtime_repeat_matches());
++        } else
++            assert(runtime_repeat_matches() == per_draw);
++        *byte ^= 0x40;
++        assert(runtime_repeat_matches());
++    }
++    for (size_t i = 0; i < sizeof(ps5_agc_draw_state); ++i) {
++        ((uint8_t *)&ps5_agc_draw_state)[i] ^= 1;
++        assert(!runtime_repeat_matches());
++        ((uint8_t *)&ps5_agc_draw_state)[i] ^= 1;
++    }
++    runtime_ngg_ge_pc_alloc = 8; assert(!runtime_repeat_matches()); runtime_ngg_ge_pc_alloc = 9;
++    runtime_ngg_ge_pc_alloc_valid = 0; assert(!runtime_repeat_matches()); runtime_ngg_ge_pc_alloc_valid = 1;
++    /* Same addresses and sizes, new bytecode. */
++    vs[95] = 5; assert(!runtime_repeat_matches()); vs[95] = 0;
++    ps[0] = 7; assert(!runtime_repeat_matches()); ps[0] = 2;
++    assert(runtime_repeat_matches());
++    /* Only directly after the recorded draw, in an open batch. */
++    runtime_batch_count = 8; assert(!runtime_repeat_matches()); runtime_batch_count = 7;
++    runtime_batch_active = 0; assert(!runtime_repeat_matches()); runtime_batch_active = 1;
++    /* Tessellation and unprepared draws are never recorded. */
++    static uint8_t hs[4];
++    runtime_hs_package = hs; assert(!runtime_repeat_matches());
++    runtime_repeat_record(&pair); assert(!runtime_repeat.valid);
++    runtime_hs_package = NULL; assert(!runtime_repeat_matches());
++    base();
++    runtime_repeat_record(NULL); assert(!runtime_repeat.valid && !runtime_repeat_matches());
++    puts("PASS: repeated draws match all skipped state (each byte), shader bytes and batch position, and no per-draw value");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory() as tmp:
++    exe = Path(tmp) / "repeat-draws"
++    subprocess.run(["cc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
++                    "-fsanitize=address,undefined", "-x", "c", "-o", str(exe), "-"],
++                   input=code, text=True, check=True)
++    subprocess.run([str(exe)], check=True)
++
++# The repeated draw's per-draw commands are the full path's, in its order.
++repeat = between("static int runtime_repeat_draw(void)\n{", "\n#endif\n\nint main(void)")
++main = source[source.index("\nint main(void)\n{"):]
++
++
++def normal(text):
++    return re.sub(r"\s+", " ", text).strip()
++
++
++def block(text, start, end):
++    a = text.index(start)
++    return normal(text[a:text.index(end, a) + len(end)])
++
++
++user_data = ("    if (runtime_vertex_user_data_count)", "runtime_pixel_user_data_count);")
++assert block(repeat, *user_data) == block(main, *user_data)
++draw = ("    if (runtime_index_buffer) {", "agc.draw_auto(&command, runtime_draw_count, 2);\n    }")
++assert block(repeat, *draw) == block(main, *draw)
++for call in ("release_mem(&command, 45, 12, 1, 0, NULL, 0, 0,",
++             "release_mem(&command, 43, 12, 1, 0, NULL, 0, 0,",
++             "runtime_release_completion(&agc, &command, completion_marker,"):
++    assert call in repeat and call in main, call
++# Prepared draws (all a repeat follows) use the WORK_BYTES layout.
++assert "runtime_acquire_cpu_uploads(&command, memory, work_bytes)" in main
++assert "work_bytes = WORK_BYTES;" in main[:main.index("runtime_acquire_cpu_uploads(")]
++assert "runtime_acquire_cpu_uploads(&command, memory, WORK_BYTES)" in repeat
++order = [repeat.index(s) for s in ("runtime_acquire_cpu_uploads(", "runtime_vertex_user_data_count)",
++                                   "if (runtime_index_buffer)", "release_mem(&command, 45",
++                                   "release_mem(&command, 43", "runtime_release_completion(",
++                                   "validate_indirect_register_tables(", "runtime_batch_would_join(",
++                                   "runtime_prepared_work_publish(", "runtime_batch_queue(")]
++assert order == sorted(order)
++assert "RUNTIME_PRESENT_TAIL_WORDS" in repeat and "entry.repeat = 1;" in repeat
++# The full path tries the repeat first and records the state of what it queued.
++assert main.index("if (!runtime_repeat_draw())") < main.index("shader_sections(")
++queued = main.index("if (runtime_batch_queue(&agc, &entry) != 0)")
++assert main.index("runtime_repeat_record(prepared);", queued) < main.index("memory = NULL;", queued)
++print("PASS: repeated draws emit the full path's user data, draw, releases and completion in order")

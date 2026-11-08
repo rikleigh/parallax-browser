@@ -1,0 +1,1007 @@
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+index b6c86a49b0..2c7149090c 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+@@ -14,8 +14,9 @@
+ // PS5 (ps5webkit spike 11): the native EGL (ps5-opengl) is a static archive in
+ // the same executable; there is no libEGL.so to dlopen. The host program
+ // supplies a lookup over the egl* symbols it linked, which falls back to
+-// ps5-opengl's eglGetProcAddress for the GL entry points.
+-extern "C" void *angle_ps5_egl_get_proc_address(const char *name);
++// ps5-opengl's eglGetProcAddress for the GL entry points. Weak: only the
++// title has a native EGL; in the other processes ANGLE fails to initialise.
++extern "C" __attribute__((weak)) void *angle_ps5_egl_get_proc_address(const char *name);
+ #endif
+ 
+ namespace rx
+@@ -42,6 +43,8 @@ egl::Error FunctionsEGLDL::initialize(EGLAttrib platformType,
+                                       void *eglHandle)
+ {
+ #if defined(ANGLE_PLATFORM_PS5)
++    if (!angle_ps5_egl_get_proc_address)
++        return egl::Error(EGL_NOT_INITIALIZED, "No native EGL in this process");
+     mGetProcAddressPtr =
+         reinterpret_cast<PFNEGLGETPROCADDRESSPROC>(angle_ps5_egl_get_proc_address);
+     return FunctionsEGL::initialize(platformType, nativeDisplay);
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+index e341fa3152..e988ddd7a1 100644
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+@@ -56,7 +56,9 @@ PlatformDisplaySurfaceless::PlatformDisplaySurfaceless(Ref<GLDisplay>&& glDispla
+ {
+ #if ENABLE(WEBGL)
+     m_anglePlatform = EGL_PLATFORM_SURFACELESS_MESA;
+-    m_angleNativeDisplay = EGL_DEFAULT_DISPLAY;
++    // Null means EGL_DEFAULT_DISPLAY (angleEGLDisplay()); EGLNativeDisplayType
++    // is an integer in some EGL headers (the PS5's), so it can't be assigned.
++    m_angleNativeDisplay = nullptr;
+ #endif
+ }
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp
+index 82d0161635..64290cae20 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp
+@@ -75,7 +75,7 @@ IPC::StreamConnectionWorkQueue& remoteGraphicsContextGLStreamWorkQueueSingleton(
+     return instance.get();
+ }
+ 
+-#if !PLATFORM(COCOA) && !USE(GRAPHICS_LAYER_WC) && !USE(GBM)
++#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM)
+ Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& gpuConnectionToWebProcess, GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier graphicsContextGLIdentifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+ {
+     ASSERT_NOT_REACHED();
+@@ -243,7 +243,7 @@ void RemoteGraphicsContextGL::reshape(int32_t width, int32_t height)
+         forceContextLost();
+ }
+ 
+-#if !PLATFORM(COCOA) && !USE(GRAPHICS_LAYER_WC) && !USE(GBM)
++#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM)
+ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& completionHandler)
+ {
+     assertIsCurrent(workQueue());
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+index 4dc47a76f2..2361622dc7 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+@@ -122,7 +122,7 @@ protected:
+     void reshape(int32_t width, int32_t height);
+ #if PLATFORM(COCOA)
+     virtual void prepareForDisplay(IPC::Semaphore&&, CompletionHandler<void(WTF::MachSendRight&&)>&&) = 0;
+-#elif USE(GRAPHICS_LAYER_WC)
++#elif ENABLE(WC_WEBGL)
+     virtual void prepareForDisplay(CompletionHandler<void(std::optional<WCContentBufferIdentifier>)>&&) = 0;
+ #elif USE(GBM)
+     virtual void prepareForDisplay(Vector<uint64_t>&&, CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, UnixFileDescriptor&&, Vector<uint64_t>&&)>&&) = 0;
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+index 3238e0532a..b777b0ed4b 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+@@ -34,13 +34,13 @@ messages -> RemoteGraphicsContextGL Stream {
+ #if PLATFORM(COCOA)
+     void PrepareForDisplay(IPC::Semaphore finishedFence) -> (MachSendRight displayBuffer) Synchronous NotStreamEncodable NotStreamEncodableReply
+ #endif
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_WEBGL)
+     void PrepareForDisplay() -> (std::optional<WebKit::WCContentBufferIdentifier> contentBuffer) Synchronous
+ #endif
+ #if USE(GBM)
+     void PrepareForDisplay(Vector<uint64_t> inUseBuffers) -> (uint64_t bufferID, std::optional<WebCore::DMABufBufferAttributes> dmabufAttributes, UnixFileDescriptor fenceFD, Vector<uint64_t> drawingBufferIDs) Synchronous NotStreamEncodableReply
+ #endif
+-#if !PLATFORM(COCOA) && !USE(GRAPHICS_LAYER_WC) && !USE(GBM)
++#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM)
+     void PrepareForDisplay() -> () Synchronous
+ #endif
+     void EnsureExtensionEnabled(WebCore::GCGLExtension extension) StreamBatched
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index f8c98e2347..e72e43c3e3 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -25,10 +25,10 @@ list(APPEND WebKit_SERIALIZATION_IN_FILES
+     WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+ )
+ 
+-# The layer tree host in the GPU process. Without a GPU process (WPE on PS5)
+-# the scene is hosted by the UI process and DrawingAreaWC talks to it over the
+-# WebProcess connection.
+-if (ENABLE_GPU_PROCESS)
++# The layer tree host in the GPU process. Without a GPU process, and on the
++# PS5 (whose GPU process side only hosts remote WebGL), the scene is hosted by
++# the UI process and DrawingAreaWC talks to it over the WebProcess connection.
++if (ENABLE_GPU_PROCESS AND NOT ENABLE_WPE_PLATFORM_PS5)
+     list(APPEND WebKit_SOURCES
+         GPUProcess/graphics/RemoteGraphicsContextGLWC.cpp
+ 
+@@ -45,12 +45,19 @@ endif ()
+ 
+ # WPE on PS5: the scene is hosted in the UI process (the title), which gets
+ # the WebProcess's updates through DrawingAreaProxyWCPS5 (UpdateWC message).
+-if (PORT STREQUAL "WPE" AND NOT ENABLE_GPU_PROCESS)
++if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+     list(APPEND WebKit_SOURCES
+         UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+         UIProcess/wpe/ps5/PS5WCNullHost.cpp
+     )
+ 
++    # Remote WebGL (spikes/11-webgl): the WebProcess's side.
++    if (ENABLE_GPU_PROCESS AND ENABLE_WEBGL)
++        list(APPEND WebKit_SOURCES
++            WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
++        )
++    endif ()
++
+     # Async scrolling (COMPOSITING-PLAN.md): the scrolling state tree goes
+     # with UpdateWC to the title's scrolling tree, as UI-side compositing does.
+     if (ENABLE_ASYNC_SCROLLING)
+diff --git a/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.cpp b/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.cpp
+index a8943662a7..314a9b5784 100644
+--- a/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.cpp
++++ b/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.cpp
+@@ -25,7 +25,7 @@
+ 
+ #include "config.h"
+ 
+-#if ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)) // PS5: the WC scrolling tree in the title
++#if ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)) // PS5: the WC scrolling tree in the title
+ 
+ #include "RemoteScrollingCoordinatorTransaction.h"
+ 
+@@ -326,4 +326,4 @@ void RemoteScrollingCoordinatorTransaction::dump() const
+ 
+ } // namespace WebKit
+ 
+-#endif // ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS))
++#endif // ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS))
+diff --git a/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.h b/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.h
+index 9ec009c293..3c063b5260 100644
+--- a/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.h
++++ b/Source/WebKit/Shared/RemoteLayerTree/RemoteScrollingCoordinatorTransaction.h
+@@ -25,7 +25,7 @@
+ 
+ #pragma once
+ 
+-#if ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)) // PS5: the WC scrolling tree in the title
++#if ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)) // PS5: the WC scrolling tree in the title
+ 
+ #include <WebCore/FrameIdentifier.h>
+ #include <wtf/Markable.h>
+@@ -72,4 +72,4 @@ private:
+ 
+ } // namespace WebKit
+ 
+-#endif // ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS))
++#endif // ENABLE(UI_SIDE_COMPOSITING) || (USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS))
+diff --git a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
+index bb6cdcdb24..04d6760cfe 100644
+--- a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
+@@ -28,7 +28,7 @@
+ 
+ #include "APIViewClient.h"
+ #include "DrawingAreaProxyCoordinatedGraphics.h"
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ #include "DrawingAreaProxyWCPS5.h"
+ #include "WebPreferences.h"
+ #endif
+@@ -112,7 +112,7 @@ UnixFileDescriptor PageClientImpl::hostFileDescriptor()
+ 
+ Ref<DrawingAreaProxy> PageClientImpl::createDrawingAreaProxy(WebProcessProxy& webProcessProxy)
+ {
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     // PS5: the WC compositor hosted in this process when the compositing
+     // switch is on and the scene host is up, else the CPU path. The
+     // WebProcess follows the accelerated-compositing preference
+diff --git a/Source/WebKit/UIProcess/DrawingAreaProxy.h b/Source/WebKit/UIProcess/DrawingAreaProxy.h
+index 3fa271ce63..03d9ced2a8 100644
+--- a/Source/WebKit/UIProcess/DrawingAreaProxy.h
++++ b/Source/WebKit/UIProcess/DrawingAreaProxy.h
+@@ -66,7 +66,7 @@ class WebProcessProxy;
+ #if !PLATFORM(WPE) && !PLATFORM(GTK) && (USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER))
+ struct UpdateInfo;
+ #endif
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ struct WCUpdateInfo;
+ #endif
+ 
+@@ -83,7 +83,7 @@ public:
+ 
+     virtual bool isRemoteLayerTreeDrawingAreaProxyMac() const { return false; }
+     virtual bool isDrawingAreaProxyCoordinatedGraphics() const { return false; }
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     virtual bool isDrawingAreaProxyWCPS5() const { return false; }
+ #endif
+     virtual bool isRemoteLayerTreeDrawingAreaProxyIOS() const { return false; }
+@@ -187,7 +187,7 @@ private:
+     virtual void update(uint64_t /* backingStoreStateID */, UpdateInfo&&) { }
+     virtual void exitAcceleratedCompositingMode(uint64_t /* backingStoreStateID */, UpdateInfo&&) { }
+ #endif
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     // Only DrawingAreaProxyWCPS5 shows these; anything else lets the frame complete.
+     virtual void updateWC(WCUpdateInfo&&, CompletionHandler<void()>&& completionHandler) { completionHandler(); }
+ #endif
+diff --git a/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in b/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in
+index 2aac96e7f5..588fc632fc 100644
+--- a/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in
++++ b/Source/WebKit/UIProcess/DrawingAreaProxy.messages.in
+@@ -36,7 +36,7 @@ messages -> DrawingAreaProxy {
+     ExitAcceleratedCompositingMode(uint64_t backingStoreStateID, struct WebKit::UpdateInfo updateInfo)
+ #endif
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     # WPE (PS5): a WC layer-tree update for the scene hosted in the UI process.
+     # The reply comes once the frame that shows it has been presented.
+     UpdateWC(struct WebKit::WCUpdateInfo updateInfo) -> ()
+diff --git a/Source/WebKit/UIProcess/WebPageProxy.cpp b/Source/WebKit/UIProcess/WebPageProxy.cpp
+index 129316163c..fef0fbaf23 100644
+--- a/Source/WebKit/UIProcess/WebPageProxy.cpp
++++ b/Source/WebKit/UIProcess/WebPageProxy.cpp
+@@ -483,7 +483,7 @@
+ #include "DrawingAreaProxyCoordinatedGraphics.h"
+ #endif
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ #include "DrawingAreaProxyWCPS5.h"
+ #include "PS5WCHost.h"
+ #endif
+@@ -5201,7 +5201,7 @@ void WebPageProxy::handleNativeWheelEvent(Ref<NativeWebWheelEvent>&& nativeWheel
+ 
+     closeOverlayedViews();
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     // PS5 async scrolling measurements (COMPOSITING-PLAN.md): pad input time.
+     if (RefPtr drawingArea = dynamicDowncast<DrawingAreaProxyWCPS5>(this->drawingArea())) {
+         PS5WCHost::noteScrollInput(MonotonicTime::now());
+@@ -5250,7 +5250,7 @@ void WebPageProxy::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
+     if (!hasRunningProcess())
+         return;
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     // PS5 async scrolling (COMPOSITING-PLAN.md): the title's scrolling tree.
+     if (RefPtr drawingArea = dynamicDowncast<DrawingAreaProxyWCPS5>(this->drawingArea()); drawingArea && drawingArea->handleWheelEvent(wheelEvent.copyRef()))
+         return;
+@@ -5354,7 +5354,7 @@ void WebPageProxy::handleWheelEventReply(IPC::Connection* connection, const WebW
+ 
+     MESSAGE_CHECK_BASE(wheelEventCoalescer().hasEventsBeingProcessed(), connection);
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     if (RefPtr drawingArea = dynamicDowncast<DrawingAreaProxyWCPS5>(this->drawingArea()); drawingArea && drawingArea->hasScrollingTree()) {
+         drawingArea->wheelEventHandlingCompleted(platform(event), nodeID, gestureState, wasHandledForScrolling || wasHandledByWebProcess);
+         return;
+@@ -5374,7 +5374,7 @@ void WebPageProxy::handleWheelEventReply(IPC::Connection* connection, const WebW
+     wheelEventHandlingCompleted(wasHandledForScrolling || wasHandledByWebProcess);
+ }
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ // PS5 async scrolling: a wheel event the title's tree scrolled, for the page's
+ // (passive) wheel listeners only; no scrolling, not cancelable.
+ void WebPageProxy::ps5DispatchWheelEventToDOM(Ref<WebWheelEvent>&& event, CompletionHandler<void()>&& completionHandler)
+diff --git a/Source/WebKit/UIProcess/WebPageProxy.h b/Source/WebKit/UIProcess/WebPageProxy.h
+index 8d88d37b24..808ef3a73c 100644
+--- a/Source/WebKit/UIProcess/WebPageProxy.h
++++ b/Source/WebKit/UIProcess/WebPageProxy.h
+@@ -1588,7 +1588,7 @@ public:
+     void interruptSyntheticMomentumScrolling();
+     void continueWheelEventHandling(Ref<WebWheelEvent>&&, const WebCore::WheelEventHandlingResult&, std::optional<bool> willStartSwipe);
+     void wheelEventHandlingCompleted(bool wasHandled);
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     void ps5DispatchWheelEventToDOM(Ref<WebWheelEvent>&&, CompletionHandler<void()>&&);
+ #endif
+     void didEndSyntheticMomentumScrolling();
+diff --git a/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
+index 35a872c262..cdaa424d7a 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPageProxyWPE.cpp
+@@ -243,7 +243,7 @@ void WebPageProxy::callAfterNextPresentationUpdate(CompletionHandler<void()>&& c
+         if (!protectedThis)
+             return callback();
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+         // PS5 WC compositor: DrawingAreaWC replied after the title presented
+         // the frame, and the view gets no buffers to wait for.
+         if (RefPtr drawingArea = protectedThis->m_drawingArea; drawingArea && drawingArea->isDrawingAreaProxyWCPS5())
+diff --git a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+index 94d8204075..00cd55b551 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include "WebPreferences.h"
+ 
+-#if defined(PS5_PAYLOAD_SDK) && USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if defined(PS5_PAYLOAD_SDK) && USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ #include "DrawingAreaProxyWCPS5.h"
+ #endif
+ 
+@@ -39,7 +39,7 @@ void WebPreferences::platformInitializeStore()
+     // painted with Skia on the CPU and sent as shared memory
+     // (NonCompositedFrameRenderer + RenderTargetSHMImage).
+     setHardwareAccelerationEnabled(false);
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     // Or composited by the WC compositor in the title (GL in the UI process
+     // only) when the compositing switch is on (opt-in). This is the first
+     // guess; PageClientImpl::createDrawingAreaProxy settles it for each new
+@@ -52,6 +52,15 @@ void WebPreferences::platformInitializeStore()
+     setForceCompositingMode(false);
+ #endif
+     setThreadedScrollingEnabled(false);
++#if ENABLE(GPU_PROCESS)
++    // The PS5's GPU process side is only remote WebGL, hosted in the title
++    // (spikes/11-webgl). Canvas, page painting and media stay in the
++    // WebProcess; under WC upstream would send canvas and DOM drawing there.
++    setUseGPUProcessForCanvasRenderingEnabled(false);
++    setUseGPUProcessForDOMRenderingEnabled(false);
++    setUseGPUProcessForMediaEnabled(false);
++    setUseGPUProcessForWebGLEnabled(true);
++#endif
+ #else
+     setAcceleratedCompositingEnabled(true);
+     setForceCompositingMode(true);
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index a376b4723f..39abccd8c7 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -7,7 +7,7 @@
+ #include "config.h"
+ #include "DrawingAreaProxyWCPS5.h"
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "DrawingAreaMessages.h"
+ #include "DrawingAreaProxyMessages.h"
+@@ -740,4 +740,4 @@ extern "C" __attribute__((visibility("default"))) void ps5wk_compositing_set_ove
+     WebKit::s_compositingOverride = mode < 0 ? -1 : !!mode;
+ }
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+index 357bf9cce2..fe98a49c25 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.h
+@@ -17,7 +17,7 @@
+ 
+ #pragma once
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "DrawingAreaProxy.h"
+ #include <WebCore/ScrollingCoordinatorTypes.h>
+@@ -176,4 +176,4 @@ SPECIALIZE_TYPE_TRAITS_BEGIN(WebKit::DrawingAreaProxyWCPS5)
+     static bool isType(const WebKit::DrawingAreaProxy& proxy) { return proxy.isDrawingAreaProxyWCPS5(); }
+ SPECIALIZE_TYPE_TRAITS_END()
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 6e2f8e305c..496252497b 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -21,7 +21,7 @@
+ #include "config.h"
+ #include "PS5WCHost.h"
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "DrawingAreaProxyWCPS5.h"
+ #if ENABLE(ASYNC_SCROLLING)
+@@ -1786,4 +1786,4 @@ PS5CompositorClient* ps5wkWCCompositorClient()
+     return &host;
+ }
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+index 5cc405e455..adea7bd148 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -15,7 +15,7 @@
+ 
+ #pragma once
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include <wtf/CompletionHandler.h>
+ #include <wtf/MonotonicTime.h>
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp
+index aeab1265a4..fbd01e18da 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.cpp
+@@ -5,7 +5,7 @@
+ #include "config.h"
+ #include "PS5WCNullHost.h"
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "WCUpdateInfo.h"
+ #include <wtf/HashMap.h>
+@@ -140,4 +140,4 @@ extern "C" __attribute__((visibility("default"))) void ps5wk_wc_null_host_instal
+     WebKit::PS5WCNullHost::s_installed = true;
+ }
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h
+index 8e64f75a05..0f00aa69fd 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCNullHost.h
+@@ -10,7 +10,7 @@
+ 
+ #pragma once
+ 
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include <wtf/CompletionHandler.h>
+ 
+@@ -28,4 +28,4 @@ void removePage(uint64_t pageID);
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index 343141c453..7aca3bec83 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -19,7 +19,7 @@
+ #include "config.h"
+ #include "PS5WCScrollingTree.h"
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "DrawingAreaProxyWCPS5.h"
+ #include "PS5WCHost.h"
+@@ -1161,4 +1161,4 @@ void PS5WCScrollingTree::didAddPendingScrollUpdate()
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+index 97d32ee8d9..4e39236412 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+@@ -18,7 +18,7 @@
+ 
+ #pragma once
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include <WebCore/FloatPoint.h>
+ #include <WebCore/FloatRect.h>
+@@ -237,4 +237,4 @@ private:
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+new file mode 100644
+index 0000000000..31bc6eb1fc
+--- /dev/null
++++ b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+@@ -0,0 +1,62 @@
++/*
++ * PS5: the WebProcess side of remote WebGL (spikes/11-webgl). The context
++ * itself lives in the title, which draws with ANGLE over ps5-opengl; this
++ * proxy only completes the display round trip so far. Showing the drawing
++ * buffer as a WC content layer is milestone M2.
++ */
++
++#include "config.h"
++#include "RemoteGraphicsContextGLProxy.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++
++#include "RemoteGraphicsContextGLMessages.h"
++#include <wtf/text/WTFString.h>
++
++namespace WebKit {
++using namespace WebCore;
++
++class RemoteGraphicsContextGLProxyPS5 final : public RemoteGraphicsContextGLProxy {
++    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(RemoteGraphicsContextGLProxyPS5);
++    WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(RemoteGraphicsContextGLProxyPS5);
++public:
++    virtual ~RemoteGraphicsContextGLProxyPS5() = default;
++
++private:
++    friend class RemoteGraphicsContextGLProxy;
++    RemoteGraphicsContextGLProxyPS5(const GraphicsContextGLAttributes& attributes, RemoteRenderingBackendProxy& renderingBackend)
++        : RemoteGraphicsContextGLProxy(attributes, renderingBackend)
++    {
++        WTFLogAlways("[webgl] remote context: WebGL %d, alpha %d", attributes.isWebGL2 ? 2 : 1, attributes.alpha);
++    }
++
++    // WebCore::GraphicsContextGL
++    RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() final { return nullptr; }
++    void prepareForDisplay() final;
++
++    unsigned m_frames { 0 };
++};
++
++void RemoteGraphicsContextGLProxyPS5::prepareForDisplay()
++{
++    if (isContextLost())
++        return;
++    auto sendResult = sendSync(Messages::RemoteGraphicsContextGL::PrepareForDisplay());
++    if (!sendResult.succeeded()) {
++        WTFLogAlways("[webgl] PrepareForDisplay failed: the stream to the title is gone");
++        markContextLost();
++        return;
++    }
++    if (!m_frames++)
++        WTFLogAlways("[webgl] first frame prepared for display");
++    m_hasPreparedForDisplay = true;
++}
++
++Ref<RemoteGraphicsContextGLProxy> RemoteGraphicsContextGLProxy::platformCreate(const GraphicsContextGLAttributes& attributes, RemoteRenderingBackendProxy& renderingBackend)
++{
++    return adoptRef(*new RemoteGraphicsContextGLProxyPS5(attributes, renderingBackend));
++}
++
++} // namespace WebKit
++
++#endif // ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
+diff --git a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+index a4256c6f03..f789c48aaf 100644
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+@@ -191,7 +191,7 @@
+ #include "ScrollingCoordinatorCoordinated.h"
+ #endif
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ #include "WCScrollingCoordinator.h"
+ #endif
+ 
+@@ -1606,7 +1606,7 @@ RefPtr<WebCore::ScrollingCoordinator> WebChromeClient::createScrollingCoordinato
+ #elif PLATFORM(COCOA)
+     return RemoteScrollingCoordinator::create(page.get());
+ #elif USE(COORDINATED_GRAPHICS)
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+     // PS5: the WC compositor's scrolling tree is in the title (async
+     // scrolling, COMPOSITING-PLAN.md); only made with threaded scrolling on.
+     if (RefPtr drawingArea = page->drawingArea(); drawingArea && drawingArea->isDrawingAreaWC())
+diff --git a/Source/WebKit/WebProcess/WebPage/WebPage.cpp b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+index 9cbbea4d1c..42ba919ee7 100644
+--- a/Source/WebKit/WebProcess/WebPage/WebPage.cpp
++++ b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+@@ -76,7 +76,7 @@
+ #include "ProvisionalFrameCreationParameters.h"
+ #include "RemoteRenderingBackendProxy.h"
+ #include "RemoteScrollingCoordinator.h"
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ #include "WCScrollingCoordinator.h"
+ #endif
+ #include "RemoteSnapshotRecorderProxy.h"
+@@ -4470,7 +4470,7 @@ void WebPage::handleWheelEvent(FrameIdentifier frameID, Ref<WebWheelEvent>&& eve
+ #endif
+ 
+     auto [handleWheelEventResult, _] = wheelEvent(frameID, event, processingSteps);
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     // PS5 async scrolling: the node the main thread picked; the title's tree scrolls it.
+     if (auto* wcScrollingCoordinator = WCScrollingCoordinator::forPage(*this)) {
+         auto gestureInfo = wcScrollingCoordinator->takeCurrentWheelGestureInfo();
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+index 3d54f6ac16..952193c08f 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.cpp
+@@ -32,7 +32,7 @@
+ #include "GraphicsLayerWC.h"
+ #include "ImageBufferShareableBitmapBackend.h"
+ #include "MessageSenderInlines.h"
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+ #include "RemoteRenderingBackendProxy.h"
+ #include "RemoteWCLayerTreeHostProxy.h"
+ #endif
+@@ -43,7 +43,7 @@
+ #include "WebPageInlines.h"
+ #include "WebPreferencesKeys.h"
+ #include "WebProcess.h"
+-#if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ #include "WCScrollingCoordinator.h"
+ #endif
+ #include <WebCore/AnimationFrameRate.h>
+@@ -235,7 +235,7 @@ static WCRenderStats& wcRenderStats()
+ }
+ #endif
+ 
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+ class DrawingAreaWC::DisplayRefreshMonitorWC final : public DisplayRefreshMonitor {
+ public:
+     static Ref<DisplayRefreshMonitorWC> create(DrawingAreaWC& drawingArea, PlatformDisplayID displayID)
+@@ -412,25 +412,25 @@ void DrawingAreaWC::fireDisplayRefreshMonitor()
+     if (monitor->isActive() && !m_waitDidUpdate && !m_updateRenderingTimer.isActive() && !m_idleDisplayRefreshTimer.isActive())
+         m_idleDisplayRefreshTimer.startOneShot(Seconds(1.0 / FullSpeedFramesPerSecond));
+ }
+-#endif // !ENABLE(GPU_PROCESS)
++#endif // !ENABLE(WC_GPU_PROCESS)
+ 
+ DrawingAreaWC::DrawingAreaWC(WebPage& webPage, const WebPageCreationParameters& parameters)
+     : DrawingArea(parameters.drawingAreaIdentifier, webPage)
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+     , m_remoteWCLayerTreeHostProxy(makeUniqueWithoutRefCountedCheck<RemoteWCLayerTreeHostProxy>(webPage, parameters.usesOffscreenRendering))
+ #endif
+     , m_layerFactory(*this)
+     , m_updateRenderingTimer(*this, &DrawingAreaWC::updateRendering)
+     , m_commitQueue(WorkQueue::create("DrawingAreaWC CommitQueue"_s))
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     , m_idleDisplayRefreshTimer(*this, &DrawingAreaWC::idleDisplayRefreshTimerFired)
+ #endif
+ {
+-#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+     if (WCTilePainter::isEnabled())
+         m_tilePainter = makeUnique<WCTilePainter>();
+ #endif
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     liveDrawingAreasWC().append(this);
+     // The process's monitor without a drawing area (the last one went): this
+     // one drives it.
+@@ -443,7 +443,7 @@ DrawingAreaWC::~DrawingAreaWC()
+ {
+     while (auto layer = m_liveGraphicsLayers.removeHead())
+         layer->clearObserver();
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     liveDrawingAreasWC().removeFirst(this);
+     m_idleDisplayRefreshTimer.stop();
+     // This drawing area drove the process's monitor (a closed or discarded
+@@ -523,7 +523,7 @@ void DrawingAreaWC::updatePreferences(const WebPreferencesStore& store)
+ {
+     Settings& settings = m_webPage->corePage()->settings();
+     settings.setAcceleratedCompositingForFixedPositionEnabled(settings.acceleratedCompositingEnabled());
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+     settings.setForceCompositingMode(store.getBoolValueForKey(WebPreferencesKey::siteIsolationEnabledKey()));
+ #else
+     // PS5: no non-composited path without a GPU process (sendUpdateNonAC), and
+@@ -568,7 +568,7 @@ void DrawingAreaWC::setTileCoverageReducedWC(bool reduced)
+     triggerRenderingUpdate();
+ }
+ 
+-#if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ void DrawingAreaWC::scrollUpdatesWC(Vector<ScrollUpdate>&& updates, FloatSize velocity, float lookaheadScale, std::optional<Vector<ScrollingNodeID>>&& nodesInTitleGesture, CompletionHandler<void()>&& completionHandler)
+ {
+     GraphicsLayerWC::setScrollVelocity(velocity, lookaheadScale);
+@@ -761,7 +761,7 @@ void DrawingAreaWC::updateRendering()
+ 
+ void DrawingAreaWC::sendUpdateAC()
+ {
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     Vector<PendingUpdate> updates;
+ #endif
+     bool didProcessMainFrame = false;
+@@ -811,7 +811,7 @@ void DrawingAreaWC::sendUpdateAC()
+         if (rootLayer.viewOverlayRootLayer)
+             rootLayer.viewOverlayRootLayer->flushCompositingState(visibleRect);
+ 
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+         auto fence = m_webPage->ensureRemoteRenderingBackendProxy().flushImageBuffers();
+ 
+         m_commitQueue->dispatch([this, weakThis = WeakPtr(*this), stateID = m_backingStoreStateID, updateInfo = std::exchange(m_updateInfo, { }), fence = WTF::move(fence), willCallDisplayDidRefresh]() mutable {
+@@ -836,12 +836,12 @@ void DrawingAreaWC::sendUpdateAC()
+         updates.append({ std::exchange(m_updateInfo, { }), willCallDisplayDidRefresh });
+ #endif
+     }
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     sendUpdatesWC(WTF::move(updates));
+ #endif
+ }
+ 
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+ void DrawingAreaWC::sendUpdatesWC(Vector<PendingUpdate>&& updates)
+ {
+     // WPE (PS5): the scene is hosted by the UI process (DrawingAreaProxyWCPS5,
+@@ -917,7 +917,7 @@ static bool shouldPaintBoundsRect(const IntRect& bounds, const Vector<IntRect, 1
+ 
+ void DrawingAreaWC::sendUpdateNonAC()
+ {
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     // Messages::DrawingAreaProxy::Update (UpdateInfo bitmaps) only exists for
+     // the UI-side BackingStore of Win/PlayStation. Without a GPU process
+     // compositing is forced on (updatePreferences), so this only runs before
+@@ -984,7 +984,7 @@ void DrawingAreaWC::sendUpdateNonAC()
+             send(Messages::DrawingAreaProxy::Update(stateID, WTF::move(updateInfo)));
+         });
+     });
+-#endif // !ENABLE(GPU_PROCESS)
++#endif // !ENABLE(WC_GPU_PROCESS)
+ }
+ 
+ void DrawingAreaWC::graphicsLayerAdded(GraphicsLayerWC& layer)
+@@ -1006,7 +1006,7 @@ void DrawingAreaWC::commitLayerUpdateInfo(WCLayerUpdateInfo&& info)
+ 
+ RefPtr<ImageBuffer> DrawingAreaWC::createImageBuffer(FloatSize size, float deviceScaleFactor)
+ {
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+     if (WebProcess::singleton().shouldUseRemoteRenderingFor(RenderingPurpose::DOM))
+         return Ref { m_webPage.get() }->ensureRemoteRenderingBackendProxy().createImageBuffer(size, RenderingMode::Unaccelerated, RenderingPurpose::DOM, deviceScaleFactor, ColorSpace::SRGB(), { PixelFormat::BGRA8 });
+ #endif
+@@ -1040,7 +1040,7 @@ void DrawingAreaWC::displayDidRefresh(MonotonicTime)
+         m_hasDeferredRenderingUpdate = false;
+         triggerRenderingUpdate();
+     }
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+ #if defined(PS5_PAYLOAD_SDK)
+     if (m_lastUpdateSent && !m_inSynchronousDisplayDidRefresh) {
+         auto& stats = wcRenderStats();
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index daa731eafb..86a66226e6 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -29,7 +29,7 @@
+ 
+ #include "DrawingArea.h"
+ #include "GraphicsLayerWC.h"
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+ #include "RemoteWCLayerTreeHostProxy.h"
+ #endif
+ #include "WCLayerFactory.h"
+@@ -76,7 +76,7 @@ private:
+ #endif
+     void updateGeometryWC(uint64_t, WebCore::IntSize, float deviceScaleFactor, float intrinsicDeviceScaleFactor) override;
+     void setTileCoverageReducedWC(bool) override;
+-#if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     // PS5 async scrolling (COMPOSITING-PLAN.md): offered always; WebPage only
+     // turns it on when the title enabled threaded scrolling for this page.
+     bool supportsAsyncScrolling() const override { return true; }
+@@ -88,7 +88,7 @@ private:
+     void updatePreferences(const WebPreferencesStore&) override;
+     bool shouldUseTiledBackingForFrameView(const WebCore::LocalFrameView&) const override;
+     void displayDidRefresh(MonotonicTime = MonotonicTime::now()) override;
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     // rAF follows the presents: a DisplayRefreshMonitor fired by each
+     // update's reply (sent after the swap that shows it), or at most at
+     // 60 Hz by a timer while no update is in flight.
+@@ -113,7 +113,7 @@ private:
+     void graphicsLayerRemoved(GraphicsLayerWC&) override;
+     void commitLayerUpdateInfo(WCLayerUpdateInfo&&) override;
+     RefPtr<WebCore::ImageBuffer> createImageBuffer(WebCore::FloatSize, float deviceScaleFactor) override;
+-#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+     WCTilePainter* tilePainter() override { return m_tilePainter.get(); }
+ #endif
+ 
+@@ -121,7 +121,7 @@ private:
+     void updateRendering();
+     void sendUpdateAC();
+     void sendUpdateNonAC();
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     struct PendingUpdate {
+         WCUpdateInfo info;
+         bool willCallDisplayDidRefresh;
+@@ -140,7 +140,7 @@ private:
+     RootLayerInfo* rootLayerInfoWithFrameIdentifier(WebCore::FrameIdentifier);
+ 
+     WebCore::GraphicsLayerClient m_rootLayerClient;
+-#if ENABLE(GPU_PROCESS)
++#if ENABLE(WC_GPU_PROCESS)
+     const std::unique_ptr<RemoteWCLayerTreeHostProxy> m_remoteWCLayerTreeHostProxy;
+ #endif
+     WCLayerFactory m_layerFactory;
+@@ -159,7 +159,7 @@ private:
+     WebCore::IntRect m_scrollRect;
+     WebCore::IntSize m_scrollOffset;
+     CompletionHandler<void()> m_forceRepaintCompletionHandler;
+-#if !ENABLE(GPU_PROCESS)
++#if !ENABLE(WC_GPU_PROCESS)
+     RefPtr<DisplayRefreshMonitorWC> m_displayRefreshMonitor; // the process's monitor while this drawing area drives it, else null
+     WebCore::Timer m_idleDisplayRefreshTimer;
+     MonotonicTime m_lastDisplayRefresh;
+@@ -167,7 +167,7 @@ private:
+     bool m_firingForReply { false };
+     bool m_inSynchronousDisplayDidRefresh { false };
+ #endif
+-#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+     std::unique_ptr<WCTilePainter> m_tilePainter; // null: PS5WK_WC_TILE_PAINT=0
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index c20352c02f..00592f9e95 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -88,7 +88,7 @@ static bool flushCullingEnabled()
+ static unsigned s_cullGeneration = 1;
+ #endif
+ 
+-#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+ using WCTilePart = WCTilePainter::Part;
+ #else
+ struct WCTilePart {
+@@ -163,7 +163,7 @@ public:
+                 parts.append({ entry.key, dirtyRect });
+         }
+         if (!parts.isEmpty()) {
+-#if USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+             // PS5 (WCTilePainter.h): into the shared tile arena, recorded once
+             // and replayed on the painting threads.
+             if (auto* painter = m_owner.m_observer ? m_owner.m_observer->tilePainter() : nullptr) {
+@@ -1129,7 +1129,7 @@ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+         update.backdropFiltersRect = backdropFiltersRect();
+     if (update.changes & WCLayerChange::PlatformLayer) {
+         update.platformLayer.hasLayer = m_platformLayer;
+-#if ENABLE(WEBGL)
++#if ENABLE(WC_WEBGL)
+         if (m_platformLayer)
+             update.platformLayer.identifiers = static_cast<WCPlatformLayerGCGL*>(m_platformLayer)->takeContentBufferIdentifiers();
+ #endif
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp
+index 76f95c0a0c..0b96cbbfad 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.cpp
+@@ -19,7 +19,7 @@
+ #include "config.h"
+ #include "WCScrollingCoordinator.h"
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "DrawingArea.h"
+ #include "WebPage.h"
+@@ -178,4 +178,4 @@ WheelEventHandlingResult WCScrollingCoordinator::handleWheelEventForScrolling(co
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h
+index 42062d29aa..e4fe83642d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCScrollingCoordinator.h
+@@ -18,7 +18,7 @@
+ 
+ #pragma once
+ 
+-#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "RemoteScrollingCoordinatorTransaction.h"
+ #include <WebCore/AsyncScrollingCoordinator.h>
+@@ -102,4 +102,4 @@ private:
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+index bb53aab7fe..92049bfe67 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -25,7 +25,7 @@
+ #include "config.h"
+ #include "WCTilePainter.h"
+ 
+-#if USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include "GraphicsLayerWC.h"
+ #include "WCBackingStore.h"
+@@ -615,4 +615,4 @@ void WCTilePainter::finish(SendFunction&& send)
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
+index d30430cb31..cd53d4eff8 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.h
+@@ -24,7 +24,7 @@
+ 
+ #pragma once
+ 
+-#if USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
++#if USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+ 
+ #include <WebCore/IntRect.h>
+ #include <WebCore/TextureMapperSparseBackingStore.h>
+@@ -107,4 +107,4 @@ private:
+ 
+ } // namespace WebKit
+ 
+-#endif // USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(GPU_PROCESS)
++#endif // USE(GRAPHICS_LAYER_WC) && USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+index af93eed48a..d8f36c49e0 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+@@ -28,7 +28,7 @@
+ #if USE(GRAPHICS_LAYER_WC)
+ 
+ #include "WCBackingStore.h"
+-#if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+ #include "RemoteScrollingCoordinatorTransaction.h"
+ #endif
+ #include "WCContentBufferIdentifier.h"
+@@ -180,7 +180,7 @@ struct WCUpdateInfo {
+     // PS5 async scrolling (COMPOSITING-PLAN.md): the main frame's scroll
+     // position when this update was made (main frame updates only).
+     std::optional<WebCore::FloatPoint> mainFrameScrollPosition;
+-#if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     // The scrolling tree's commit (main frame updates, async scrolling on).
+     std::optional<RemoteScrollingCoordinatorTransaction> scrollingTransaction;
+     bool hasWheelEventListeners { false };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+index 983788c8fd..8d283af352 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+@@ -153,7 +153,7 @@ struct WebKit::WCUpdateInfo {
+     Vector<WebKit::WCTileArenaChunk> tileArenaChunks;
+     Vector<uint64_t> removedTileArenaChunks;
+     std::optional<WebCore::FloatPoint> mainFrameScrollPosition;
+-#if ENABLE(ASYNC_SCROLLING) && !ENABLE(GPU_PROCESS)
++#if ENABLE(ASYNC_SCROLLING) && !ENABLE(WC_GPU_PROCESS)
+     std::optional<WebKit::RemoteScrollingCoordinatorTransaction> scrollingTransaction;
+     bool hasWheelEventListeners;
+     int paintedAbove;
+diff --git a/Source/WebKit/config.h b/Source/WebKit/config.h
+index 09e0fa7a3c..bc3753c885 100644
+--- a/Source/WebKit/config.h
++++ b/Source/WebKit/config.h
+@@ -47,3 +47,16 @@
+ #if ENABLE(WEBDRIVER_MOUSE_INTERACTIONS) || ENABLE(WEBDRIVER_KEYBOARD_INTERACTIONS) || ENABLE(WEBDRIVER_TOUCH_INTERACTIONS) || ENABLE(WEBDRIVER_WHEEL_INTERACTIONS)
+ #define ENABLE_WEBDRIVER_ACTIONS_API 1
+ #endif
++
++// Whether the WC compositor runs in the GPU process (upstream, when there is
++// one). On the PS5 it stays in the UI process (the title) and the GPU process
++// side only hosts remote WebGL (spikes/11-webgl).
++#if defined(ENABLE_GPU_PROCESS) && ENABLE_GPU_PROCESS && defined(USE_GRAPHICS_LAYER_WC) && USE_GRAPHICS_LAYER_WC && !defined(PS5_PAYLOAD_SDK)
++#define ENABLE_WC_GPU_PROCESS 1
++#endif
++
++// Upstream's WC WebGL layer (RemoteGraphicsContextGLWC and its proxy). The
++// PS5 takes the generic remote WebGL path, with its own proxy.
++#if defined(USE_GRAPHICS_LAYER_WC) && USE_GRAPHICS_LAYER_WC && !defined(PS5_PAYLOAD_SDK)
++#define ENABLE_WC_WEBGL 1
++#endif

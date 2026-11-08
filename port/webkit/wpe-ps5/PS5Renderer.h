@@ -275,6 +275,9 @@ private:
     // GPU compositing: the stream keys the scene drew as video layers this
     // frame (PS5CompositorContext::videoTexture); not drawn under the page.
     static unsigned compositorVideoTexture(uint64_t key, int* width, int* height, uint32_t* frames);
+    // Any thread (WebGL's video copies, PS5CompositorContext::copyVideoFrame).
+    static void* copyVideoFrame(uint64_t key, unsigned texture, bool flipY);
+    static bool videoFrameSize(uint64_t key, int* width, int* height);
     uint64_t m_layerVideoKeys[kMaxVideoStreams] { };
     unsigned m_layerVideoKeyCount { 0 };
 

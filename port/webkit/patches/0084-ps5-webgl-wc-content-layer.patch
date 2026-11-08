@@ -1,0 +1,866 @@
+diff --git a/Source/WebCore/platform/graphics/GraphicsLayerContentsDisplayDelegate.h b/Source/WebCore/platform/graphics/GraphicsLayerContentsDisplayDelegate.h
+index 8af9ea34fb..b25f6de30f 100644
+--- a/Source/WebCore/platform/graphics/GraphicsLayerContentsDisplayDelegate.h
++++ b/Source/WebCore/platform/graphics/GraphicsLayerContentsDisplayDelegate.h
+@@ -71,6 +71,11 @@ public:
+ #elif USE(COORDINATED_GRAPHICS)
+     virtual void setDisplayBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&&) = 0;
+     virtual void display(CoordinatedPlatformLayer&, std::optional<Damage>&&) = 0;
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 remote WebGL: the context's key, by which the title's WC scene finds
++    // its drawing buffer (WebKit's PS5WebGLLayers.h); 0 for other contents.
++    virtual uint64_t ps5WebGLLayerKey() const { return 0; }
++#endif
+ #if USE(SKIA)
+     void setThreadSafeGrContext(const sk_sp<GrContextThreadSafeProxy>&);
+     const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext() const;
+diff --git a/Source/WebCore/platform/graphics/PlatformDisplay.cpp b/Source/WebCore/platform/graphics/PlatformDisplay.cpp
+index 9b62362463..9d5b5f0a13 100644
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.cpp
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.cpp
+@@ -114,6 +114,14 @@ GLContext* PlatformDisplay::sharingGLContext()
+     return m_sharingGLContext.get();
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++void PlatformDisplay::setSharingGLContext(std::unique_ptr<GLContext>&& context)
++{
++    RELEASE_ASSERT(!m_sharingGLContext);
++    m_sharingGLContext = WTF::move(context);
++}
++#endif
++
+ void PlatformDisplay::clearGLContexts()
+ {
+ #if USE(SKIA)
+diff --git a/Source/WebCore/platform/graphics/PlatformDisplay.h b/Source/WebCore/platform/graphics/PlatformDisplay.h
+index 044e2af82c..2d3d65197d 100644
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.h
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.h
+@@ -90,6 +90,12 @@ public:
+     virtual Type type() const = 0;
+ 
+     WEBCORE_EXPORT GLContext* sharingGLContext();
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: the title makes the sharing context itself, in the compositor's
++    // share group, so WebGL's textures are the compositor's (WebKit's
++    // PS5GPUProcessInTitle.cpp). Before anything asks for one.
++    WEBCORE_EXPORT void setSharingGLContext(std::unique_ptr<GLContext>&&);
++#endif
+     void clearGLContexts();
+     EGLDisplay eglDisplay() const;
+     GLDisplay& glDisplay() const { return m_eglDisplay.get(); }
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+new file mode 100644
+index 0000000000..e37b40bd7e
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+@@ -0,0 +1,126 @@
++/*
++ * PS5: remote WebGL contexts as WC contents layers (PS5WebGLLayers.h).
++ */
++
++#include "config.h"
++#include "PS5WebGLLayers.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
++
++#include <WebCore/CoordinatedPlatformLayerBuffer.h>
++#include <WebCore/TextureMapper.h>
++#include <wtf/HashMap.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/Vector.h>
++
++namespace WebKit {
++using namespace WebCore;
++
++namespace {
++
++using Key = std::pair<uint64_t, uint64_t>; // WebProcess, context
++
++Lock s_lock;
++HashMap<Key, RefPtr<PS5WebGLLayer>>& layers() WTF_REQUIRES_LOCK(s_lock)
++{
++    static NeverDestroyed<HashMap<Key, RefPtr<PS5WebGLLayer>>> map;
++    return map;
++}
++
++Lock s_garbageLock;
++Vector<std::unique_ptr<CoordinatedPlatformLayerBuffer>>& garbage() WTF_REQUIRES_LOCK(s_garbageLock)
++{
++    static NeverDestroyed<Vector<std::unique_ptr<CoordinatedPlatformLayerBuffer>>> buffers;
++    return buffers;
++}
++
++void retire(std::unique_ptr<CoordinatedPlatformLayerBuffer>&& buffer)
++{
++    if (!buffer)
++        return;
++    Locker locker { s_garbageLock };
++    garbage().append(WTF::move(buffer));
++}
++
++} // namespace
++
++PS5WebGLLayer::~PS5WebGLLayer()
++{
++    Locker locker { m_lock };
++    retire(WTF::move(m_pending));
++    retire(WTF::move(m_shown));
++}
++
++void PS5WebGLLayer::setBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&& buffer)
++{
++    std::unique_ptr<CoordinatedPlatformLayerBuffer> unshown;
++    {
++        Locker locker { m_lock };
++        if (m_detached) {
++            unshown = WTF::move(buffer);
++        } else
++            unshown = std::exchange(m_pending, WTF::move(buffer));
++    }
++    // A frame the compositor never drew (the page drew faster than it shows).
++    retire(WTF::move(unshown));
++}
++
++void PS5WebGLLayer::detach()
++{
++    Locker locker { m_lock };
++    m_detached = true;
++    retire(WTF::move(m_pending));
++    retire(WTF::move(m_shown));
++}
++
++void PS5WebGLLayer::paintToTextureMapper(TextureMapper& textureMapper, const FloatRect& target, const TransformationMatrix& modelViewMatrix, float opacity)
++{
++    // Held while the draw is issued: the context can't delete the texture
++    // between this check and the draw (detach() takes the lock first).
++    Locker locker { m_lock };
++    if (m_detached)
++        return;
++    if (m_pending)
++        retire(std::exchange(m_shown, WTF::move(m_pending)));
++    if (m_shown)
++        m_shown->paintToTextureMapper(textureMapper, target, modelViewMatrix, opacity); // waits on the frame's fence (GPU side)
++}
++
++namespace PS5WebGLLayers {
++
++void add(ProcessIdentifier process, uint64_t key, PS5WebGLLayer& layer)
++{
++    Locker locker { s_lock };
++    layers().set({ process.toUInt64(), key }, &layer);
++}
++
++void remove(ProcessIdentifier process, uint64_t key)
++{
++    RefPtr<PS5WebGLLayer> layer;
++    {
++        Locker locker { s_lock };
++        layer = layers().take({ process.toUInt64(), key });
++    }
++}
++
++RefPtr<PS5WebGLLayer> find(ProcessIdentifier process, uint64_t key)
++{
++    Locker locker { s_lock };
++    return layers().get({ process.toUInt64(), key });
++}
++
++void collectGarbage()
++{
++    Vector<std::unique_ptr<CoordinatedPlatformLayerBuffer>> buffers;
++    {
++        Locker locker { s_garbageLock };
++        buffers = std::exchange(garbage(), { });
++    }
++    // Destroyed here, with the compositor's context current (their GL syncs).
++}
++
++} // namespace PS5WebGLLayers
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+new file mode 100644
+index 0000000000..799656e24e
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -0,0 +1,66 @@
++/*
++ * PS5: remote WebGL contexts as WC contents layers (spikes/11-webgl, M2).
++ *
++ * Each context in the title (RemoteGraphicsContextGLPS5.cpp) draws with
++ * ANGLE into drawing buffers that share GL names with the compositor's
++ * context (PS5GPUProcessInTitle.cpp sets the share group up). After each
++ * prepareForDisplay() the context hands its newest buffer (texture, size,
++ * fence) to its PS5WebGLLayer. The canvas's GraphicsLayerWC names the
++ * context by its RemoteGraphicsContextGLIdentifier (WCUpdateInfo's
++ * webGLLayerKey); WCScene finds the layer here by that key and the scene's
++ * WebProcess, and draws it on the render thread like a video layer.
++ *
++ * Threads: the context's work queue adds, sets buffers and detaches; the
++ * render thread finds and paints. Buffers (their GL fences) are only ever
++ * destroyed on the render thread, with the compositor's context current:
++ * collectGarbage() at each frame.
++ */
++
++#pragma once
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
++
++#include <WebCore/CoordinatedPlatformLayerBuffer.h>
++#include <WebCore/ProcessIdentifier.h>
++#include <WebCore/TextureMapperPlatformLayer.h>
++#include <memory>
++#include <wtf/Lock.h>
++#include <wtf/ThreadSafeRefCounted.h>
++
++namespace WebKit {
++
++class PS5WebGLLayer final : public ThreadSafeRefCounted<PS5WebGLLayer>, public WebCore::TextureMapperPlatformLayer {
++public:
++    static Ref<PS5WebGLLayer> create() { return adoptRef(*new PS5WebGLLayer); }
++    ~PS5WebGLLayer();
++
++    // Work queue: the frame just finished (prepareForDisplay).
++    void setBuffer(std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer>&&);
++    // Work queue: the context is going (its textures next): draw nothing more.
++    void detach();
++
++    // Render thread (TextureMapperPlatformLayer): the newest buffer.
++    void paintToTextureMapper(WebCore::TextureMapper&, const WebCore::FloatRect&, const WebCore::TransformationMatrix& modelViewMatrix, float opacity) final;
++
++private:
++    PS5WebGLLayer() = default;
++
++    Lock m_lock;
++    std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_pending WTF_GUARDED_BY_LOCK(m_lock);
++    std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_shown WTF_GUARDED_BY_LOCK(m_lock);
++    bool m_detached WTF_GUARDED_BY_LOCK(m_lock) { false };
++};
++
++namespace PS5WebGLLayers {
++
++void add(WebCore::ProcessIdentifier, uint64_t key, PS5WebGLLayer&);
++void remove(WebCore::ProcessIdentifier, uint64_t key);
++RefPtr<PS5WebGLLayer> find(WebCore::ProcessIdentifier, uint64_t key);
++// Render thread, compositor context current: destroys retired buffers.
++void collectGarbage();
++
++} // namespace PS5WebGLLayers
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+index a414986690..60caac78bd 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -2,8 +2,9 @@
+  * PS5: the title's side of remote WebGL (spikes/11-webgl). The title stands
+  * in for the GPU process (UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp). Each
+  * context is ANGLE over ps5-opengl, made on the RemoteGraphicsContextGL work
+- * queue's thread. Its drawing buffers aren't shown yet: putting them in a WC
+- * content layer is milestone M2.
++ * queue's thread, in the compositor's share group. Each finished frame's
++ * drawing buffer goes to the context's PS5WebGLLayer, which the page's WC
++ * scene draws (PS5WebGLLayers.h).
+  */
+ 
+ #include "config.h"
+@@ -11,23 +12,88 @@
+ 
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
+ 
++#include "GPUConnectionToWebProcess.h"
++#include "PS5WebGLLayers.h"
++#include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/GraphicsContextGLCoordinated.h>
++#include <WebCore/GraphicsLayerContentsDisplayDelegate.h>
++#include <epoxy/egl.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ namespace WebKit {
+ 
++namespace {
++
++// Hands each frame's buffer (GraphicsContextGLCoordinated::prepareForDisplay)
++// to the layer instead of a coordinated-graphics layer.
++class LayerDelegate final : public WebCore::GraphicsLayerContentsDisplayDelegate {
++public:
++    static Ref<LayerDelegate> create(Ref<PS5WebGLLayer>&& layer) { return adoptRef(*new LayerDelegate(WTF::move(layer))); }
++
++    void setDisplayBuffer(std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer>&& buffer) final { m_layer->setBuffer(WTF::move(buffer)); }
++    void display(WebCore::CoordinatedPlatformLayer&, std::optional<WebCore::Damage>&&) final { }
++
++private:
++    explicit LayerDelegate(Ref<PS5WebGLLayer>&& layer)
++        : m_layer(WTF::move(layer))
++    {
++    }
++
++    const Ref<PS5WebGLLayer> m_layer;
++};
++
++class GraphicsContextGLPS5 final : public WebCore::GraphicsContextGLCoordinated {
++public:
++    static RefPtr<GraphicsContextGLPS5> create(WebCore::GraphicsContextGLAttributes&& attributes, WebCore::ProcessIdentifier webProcess, uint64_t key)
++    {
++        Ref context = adoptRef(*new GraphicsContextGLPS5(WTF::move(attributes), webProcess, key));
++        if (!context->initialize())
++            return nullptr;
++        PS5WebGLLayers::add(webProcess, key, context->m_layer);
++        return context;
++    }
++
++    ~GraphicsContextGLPS5()
++    {
++        // Before GraphicsContextGLCoordinated deletes the drawing buffers.
++        m_layer->detach();
++        PS5WebGLLayers::remove(m_webProcess, m_key);
++    }
++
++private:
++    GraphicsContextGLPS5(WebCore::GraphicsContextGLAttributes&& attributes, WebCore::ProcessIdentifier webProcess, uint64_t key)
++        : GraphicsContextGLCoordinated(WTF::move(attributes))
++        , m_layer(PS5WebGLLayer::create())
++        , m_webProcess(webProcess)
++        , m_key(key)
++    {
++        m_layerContentsDisplayDelegate = LayerDelegate::create(m_layer.copyRef());
++    }
++
++    const Ref<PS5WebGLLayer> m_layer;
++    const WebCore::ProcessIdentifier m_webProcess;
++    const uint64_t m_key;
++};
++
++} // namespace
++
+ class RemoteGraphicsContextGLPS5 final : public RemoteGraphicsContextGL {
+     WTF_MAKE_TZONE_ALLOCATED(RemoteGraphicsContextGLPS5);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(RemoteGraphicsContextGLPS5);
+ public:
+     RemoteGraphicsContextGLPS5(GPUConnectionToWebProcess& connection, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+         : RemoteGraphicsContextGL(connection, identifier, renderingBackend, WTF::move(streamConnection))
++        , m_webProcess(connection.webProcessIdentifier())
++        , m_key(identifier.toUInt64())
+     {
+     }
+ 
+ private:
+     void platformWorkQueueInitialize(WebCore::GraphicsContextGLAttributes&&) final;
+     void didRunOutOfMessages() final;
++
++    const WebCore::ProcessIdentifier m_webProcess;
++    const uint64_t m_key;
+ };
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RemoteGraphicsContextGLPS5);
+@@ -36,12 +102,15 @@ void RemoteGraphicsContextGLPS5::platformWorkQueueInitialize(WebCore::GraphicsCo
+ {
+     assertIsCurrent(workQueue());
+     const bool webGL2 = attributes.isWebGL2;
+-    m_context = WebCore::GraphicsContextGLCoordinated::create(WTF::move(attributes));
++    // ANGLE makes each native context with this thread's bound API: it must
++    // be ES (spikes/11-webgl, share-group rule 2).
++    eglBindAPI(EGL_OPENGL_ES_API);
++    m_context = GraphicsContextGLPS5::create(WTF::move(attributes), m_webProcess, m_key);
+     if (!m_context) {
+         WTFLogAlways("[webgl] title: no ANGLE context for a WebGL %d page (it gets a lost context)", webGL2 ? 2 : 1);
+         return;
+     }
+-    WTFLogAlways("[webgl] title: ANGLE context for WebGL %d, max texture %d", webGL2 ? 2 : 1, m_context->maxTextureSize());
++    WTFLogAlways("[webgl] title: ANGLE context %llu for WebGL %d, max texture %d", static_cast<unsigned long long>(m_key), webGL2 ? 2 : 1, m_context->maxTextureSize());
+ }
+ 
+ void RemoteGraphicsContextGLPS5::didRunOutOfMessages()
+@@ -52,13 +121,16 @@ void RemoteGraphicsContextGLPS5::didRunOutOfMessages()
+ }
+ 
+ // The display round trip (RemoteGraphicsContextGLProxyPS5): the frame is
+-// finished in the drawing buffer, which nothing shows yet.
++// finished and its buffer handed to the context's PS5WebGLLayer.
+ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& completionHandler)
+ {
+     assertIsCurrent(workQueue());
+     static unsigned frames;
+     if (RefPtr context = m_context) {
+         context->prepareForDisplay();
++        // Submitted before the WebProcess's layer update reaches the
++        // compositor (WebGL 1 contexts get no fence: ES 2 has no GL syncs).
++        context->flush();
+         if (!frames++)
+             WTFLogAlways("[webgl] title: first frame finished");
+     }
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 2e5380fd65..7eb7cc23f2 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -31,6 +31,12 @@
+ #include "RemoteGraphicsContextGL.h"
+ #include "WCContentBuffer.h"
+ #include "WCContentBufferManager.h"
++#if defined(PS5_PAYLOAD_SDK) && ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(COORDINATED_GRAPHICS)
++#define HAVE_PS5_WEBGL_LAYERS 1
++#include "PS5WebGLLayers.h"
++#else
++#define HAVE_PS5_WEBGL_LAYERS 0
++#endif
+ #include "WCRemoteFrameHostLayerManager.h"
+ #include "WCSceneContext.h"
+ #include "WCUpdateInfo.h"
+@@ -122,6 +128,10 @@ public:
+ 
+ #if defined(PS5_PAYLOAD_SDK)
+     std::unique_ptr<VideoLayer> videoLayer; // texmapLayer's contents layer; destroyed after it
++#if HAVE_PS5_WEBGL_LAYERS
++    RefPtr<PS5WebGLLayer> webGLLayer; // the same, for a WebGL canvas
++    uint64_t webGLLayerKey { 0 };
++#endif
+     // Async scrolling: the scrolling tree's last values for this layer (an
+     // update from the WebProcess that sets them clears these).
+     std::optional<WebCore::FloatPoint> scrollingPosition;
+@@ -332,23 +342,41 @@ bool WCScene::apply(WCUpdateInfo& update)
+             layer->texmapLayer.setBackdropFiltersRect(layerUpdate.backdropFiltersRect);
+         }
+ #if defined(PS5_PAYLOAD_SDK)
++        const bool ps5Contents = layerUpdate.platformLayer.videoStreamKey || layerUpdate.platformLayer.webGLLayerKey;
+         if (layerUpdate.changes & WCLayerChange::PlatformLayer) {
+-            if (uint64_t key = layerUpdate.platformLayer.videoStreamKey) {
+-                if (layer->contentBuffer) {
+-                    layer->contentBuffer->setClient(nullptr);
+-                    layer->contentBuffer = nullptr;
++            if (ps5Contents && layer->contentBuffer) {
++                layer->contentBuffer->setClient(nullptr);
++                layer->contentBuffer = nullptr;
++            }
++#if HAVE_PS5_WEBGL_LAYERS
++            if (uint64_t key = layerUpdate.platformLayer.webGLLayerKey; key && !layerUpdate.platformLayer.videoStreamKey) {
++                // Looked up again on each update until found (the context is
++                // made before its first frame, so normally at once).
++                if (!layer->webGLLayer || layer->webGLLayerKey != key) {
++                    layer->texmapLayer.setContentsLayer(nullptr);
++                    layer->webGLLayer = PS5WebGLLayers::find(m_webProcessIdentifier, key);
++                    layer->webGLLayerKey = layer->webGLLayer ? key : 0;
+                 }
++                layer->texmapLayer.setContentsLayer(layer->webGLLayer.get());
++            } else if (layer->webGLLayer) {
++                layer->texmapLayer.setContentsLayer(nullptr);
++                layer->webGLLayer = nullptr;
++                layer->webGLLayerKey = 0;
++            }
++#endif
++            if (uint64_t key = layerUpdate.platformLayer.videoStreamKey) {
+                 if (!layer->videoLayer || layer->videoLayer->key != key) {
+                     layer->texmapLayer.setContentsLayer(nullptr);
+                     layer->videoLayer = makeUnique<VideoLayer>(key, m_videoLayerCount);
+                 }
+                 layer->texmapLayer.setContentsLayer(layer->videoLayer.get());
+             } else if (layer->videoLayer) {
+-                layer->texmapLayer.setContentsLayer(nullptr);
++                if (!layerUpdate.platformLayer.webGLLayerKey)
++                    layer->texmapLayer.setContentsLayer(nullptr);
+                 layer->videoLayer = nullptr;
+             }
+         }
+-        if (layerUpdate.changes & WCLayerChange::PlatformLayer && !layerUpdate.platformLayer.videoStreamKey) {
++        if (layerUpdate.changes & WCLayerChange::PlatformLayer && !ps5Contents) {
+ #else
+         if (layerUpdate.changes & WCLayerChange::PlatformLayer) {
+ #endif
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index 710926ff86..e982b08fe0 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -80,6 +80,8 @@ public:
+     // (video plays at its own rate, without updates from the WebProcess).
+     bool videoLayersNeedPaint() const;
+     unsigned videoLayerCount() const { return m_videoLayerCount; }
++    // The WebProcess whose page this is (WebGL layers are found by it).
++    void setWebProcessIdentifier(WebCore::ProcessIdentifier identifier) { m_webProcessIdentifier = identifier; }
+     // Async scrolling (COMPOSITING-PLAN.md): where the title's scrolling tree
+     // puts a layer (after apply(), before paint(); apply() may reset it).
+     // False if the scene has no such layer or nothing changed.
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index f5a9361acc..2f50261cc9 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -54,8 +54,10 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+     # Remote WebGL (spikes/11-webgl): the WebProcess's side, and the GPU
+     # process's, which runs in the title.
+     if (ENABLE_GPU_PROCESS AND ENABLE_WEBGL)
++        list(APPEND WebKit_PRIVATE_INCLUDE_DIRECTORIES "${WEBKIT_DIR}/GPUProcess/graphics/ps5")
+         list(APPEND WebKit_SOURCES
+             GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++            GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+ 
+             UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 39abccd8c7..33831b6f89 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -728,7 +728,7 @@ void DrawingAreaProxyWCPS5::updateWC(WCUpdateInfo&& info, CompletionHandler<void
+     }
+     host.update(sceneID, WTF::move(info), [reply = PresentReply(WTF::move(completionHandler))]() mutable {
+         reply();
+-    });
++    }, webProcessProxy().coreProcessIdentifier());
+ }
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+index b85ca03d88..02be04c036 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+@@ -9,7 +9,9 @@
+ 
+ #include "GPUProcess.h"
+ #include "GPUProcessConnectionParameters.h"
++#include "PS5WCHost.h"
+ #include "WebProcessProxy.h"
++#include <WebCore/GLContext.h>
+ #include <WebCore/PlatformDisplaySurfaceless.h>
+ 
+ namespace WebKit {
+@@ -18,6 +20,12 @@ namespace PS5GPUProcessInTitle {
+ // The GL display WebGL's contexts use (PlatformDisplay::sharedDisplay()):
+ // the title's UI process has none of its own; the compositor uses
+ // ps5-opengl's EGL directly (PS5Renderer).
++//
++// Its sharing context, which ANGLE wraps (EGL_EXTERNAL_CONTEXT_ANGLE) and
++// every WebGL context shares with, is an ES context in the compositor's
++// share group, so WebGL's drawing buffers are textures the compositor can
++// draw (PS5WebGLLayers.h). ANGLE must wrap an ES context, not the
++// compositor's GL 4.6 core one (spikes/11-webgl, share-group rule 1).
+ static bool ensureDisplay()
+ {
+     if (WebCore::PlatformDisplay::sharedDisplayIfExists())
+@@ -25,6 +33,14 @@ static bool ensureDisplay()
+     auto display = WebCore::PlatformDisplaySurfaceless::create();
+     if (!display)
+         return false;
++    if (auto* compositor = PS5WCHost::compositorContext()) {
++        if (auto sharing = WebCore::GLContext::create(display->glDisplay(), WebCore::GLContext::Target::Surfaceless, compositor)) {
++            display->setSharingGLContext(WTF::move(sharing));
++            WTFLogAlways("[webgl] title: WebGL shares GL names with the compositor");
++        } else
++            WTFLogAlways("[webgl] title: no ES context in the compositor's share group: WebGL canvases stay blank");
++    } else
++        WTFLogAlways("[webgl] title: no GPU compositor: WebGL canvases stay blank");
+     WebCore::PlatformDisplay::setSharedDisplay(WTF::move(display));
+     return true;
+ }
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 496252497b..0307d34498 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -30,6 +30,9 @@
+ #endif
+ #include "WCScene.h"
+ #include "WCSceneContext.h"
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL)
++#include "PS5WebGLLayers.h"
++#endif
+ #include "WCUpdateInfo.h"
+ #include <WebCore/BitmapTexture.h>
+ #include <WebCore/BitmapTexturePool.h>
+@@ -318,8 +321,11 @@ public:
+         if (auto requestFrame = m_requestFrame.load())
+             requestFrame();
+     }
+-    void enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&&, CompletionHandler<void()>&&, int8_t visibility = -1);
++    void enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&&, CompletionHandler<void()>&&, int8_t visibility = -1, std::optional<ProcessIdentifier> webProcess = std::nullopt);
+     void startTestDriver();
++    // Any thread: PS5Renderer's context (adopted), once set up; WebGL's
++    // contexts share GL names with it (PS5GPUProcessInTitle.cpp).
++    GLContext* compositorContext() { return m_state.load() == State::Ready ? m_glContext : nullptr; }
+ 
+     // PS5CompositorClient.
+     void attach(void (*requestFrame)()) final { m_requestFrame = requestFrame; } // main thread, early
+@@ -339,6 +345,7 @@ private:
+         CompletionHandler<void()> didPresent;
+         MonotonicTime queuedAt;
+         int8_t visibility { -1 }; // 0 hidden, 1 shown: the page's view changed (no update)
++        std::optional<ProcessIdentifier> webProcess; // the page's WebProcess (updates)
+     };
+     // The newest scene with a root layer whose page is not hidden.
+     std::optional<uint64_t> newestShowableScene();
+@@ -535,14 +542,14 @@ std::optional<uint64_t> SceneHost::newestShowableScene()
+     return shown;
+ }
+ 
+-void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, CompletionHandler<void()>&& didPresent, int8_t visibility)
++void SceneHost::enqueue(uint64_t pageID, std::unique_ptr<WCUpdateInfo>&& info, CompletionHandler<void()>&& didPresent, int8_t visibility, std::optional<ProcessIdentifier> webProcess)
+ {
+     ensureSetUp();
+     bool queued = false;
+     {
+         Locker locker { m_lock };
+         if (m_state.load() != State::Failed) {
+-            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent), MonotonicTime::now(), visibility });
++            m_queue.append({ pageID, WTF::move(info), WTF::move(didPresent), MonotonicTime::now(), visibility, webProcess });
+             queued = true;
+             m_stateChanged.notifyAll(); // a frame waiting for this update (paint)
+         }
+@@ -691,6 +698,10 @@ WCScene& SceneHost::ensureScene(uint64_t pageID)
+ 
+ void SceneHost::applyPending()
+ {
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL)
++    // WebGL frames replaced or contexts gone since the last frame.
++    PS5WebGLLayers::collectGarbage();
++#endif
+     Deque<Job> jobs;
+     {
+         Locker locker { m_lock };
+@@ -747,6 +758,8 @@ void SceneHost::applyPending()
+         } else {
+             auto start = MonotonicTime::now();
+             auto& scene = ensureScene(job.pageID);
++            if (job.webProcess)
++                scene.setWebProcessIdentifier(*job.webProcess);
+             auto shownBefore = m_shownPage;
+             // An update without layer changes (a rendering update that
+             // changed nothing composited) needs no scene paint: the frame
+@@ -1682,9 +1695,14 @@ bool PS5WCHost::available() const
+     return SceneHost::singleton().available();
+ }
+ 
+-void PS5WCHost::update(uint64_t pageID, WCUpdateInfo&& info, CompletionHandler<void()>&& didPresent)
++void PS5WCHost::update(uint64_t pageID, WCUpdateInfo&& info, CompletionHandler<void()>&& didPresent, std::optional<ProcessIdentifier> webProcess)
++{
++    SceneHost::singleton().enqueue(pageID, std::make_unique<WCUpdateInfo>(WTF::move(info)), WTF::move(didPresent), -1, webProcess);
++}
++
++GLContext* PS5WCHost::compositorContext()
+ {
+-    SceneHost::singleton().enqueue(pageID, std::make_unique<WCUpdateInfo>(WTF::move(info)), WTF::move(didPresent));
++    return SceneHost::singleton().compositorContext();
+ }
+ 
+ void PS5WCHost::removePage(uint64_t pageID)
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+index adea7bd148..54178b1966 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.h
+@@ -17,10 +17,16 @@
+ 
+ #if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+ 
++#include <WebCore/ProcessIdentifier.h>
++#include <optional>
+ #include <wtf/CompletionHandler.h>
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/Noncopyable.h>
+ 
++namespace WebCore {
++class GLContext;
++}
++
+ namespace WebKit {
+ 
+ struct WCUpdateInfo;
+@@ -34,7 +40,11 @@ public:
+     // good if that failed (the caller then falls back to the CPU path).
+     bool available() const;
+ 
+-    void update(uint64_t pageID, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent);
++    // webProcess: the page's (its WebGL layers are found by it).
++    void update(uint64_t pageID, WCUpdateInfo&&, CompletionHandler<void()>&& didPresent, std::optional<WebCore::ProcessIdentifier> webProcess = std::nullopt);
++    // Any thread: PS5Renderer's GL context once the scene context is set up
++    // (null before, or on the CPU path). WebGL shares GL names with it.
++    static WebCore::GLContext* compositorContext();
+     void removePage(uint64_t pageID);
+     // The page's view was hidden or shown (the browser's tabs): a hidden
+     // page's scene keeps applying its updates but is never the one shown;
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+index 31bc6eb1fc..5c7cdb6b3d 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+@@ -1,8 +1,9 @@
+ /*
+  * PS5: the WebProcess side of remote WebGL (spikes/11-webgl). The context
+- * itself lives in the title, which draws with ANGLE over ps5-opengl; this
+- * proxy only completes the display round trip so far. Showing the drawing
+- * buffer as a WC content layer is milestone M2.
++ * itself lives in the title, which draws with ANGLE over ps5-opengl. The
++ * canvas's layer names the context by its identifier (the delegate's
++ * ps5WebGLLayerKey); the title's WC scene finds the context's newest drawing
++ * buffer by that key and this WebProcess's identifier (PS5WebGLLayers.h).
+  */
+ 
+ #include "config.h"
+@@ -11,11 +12,34 @@
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
+ 
+ #include "RemoteGraphicsContextGLMessages.h"
++#include <WebCore/GraphicsLayerContentsDisplayDelegate.h>
+ #include <wtf/text/WTFString.h>
+ 
+ namespace WebKit {
+ using namespace WebCore;
+ 
++namespace {
++
++// Only names the context: the frames never pass through the WebProcess.
++class WebGLLayerDelegatePS5 final : public GraphicsLayerContentsDisplayDelegate {
++public:
++    static Ref<WebGLLayerDelegatePS5> create(uint64_t key) { return adoptRef(*new WebGLLayerDelegatePS5(key)); }
++
++    void setDisplayBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&&) final { }
++    void display(CoordinatedPlatformLayer&, std::optional<Damage>&&) final { }
++    uint64_t ps5WebGLLayerKey() const final { return m_key; }
++
++private:
++    explicit WebGLLayerDelegatePS5(uint64_t key)
++        : m_key(key)
++    {
++    }
++
++    const uint64_t m_key;
++};
++
++} // namespace
++
+ class RemoteGraphicsContextGLProxyPS5 final : public RemoteGraphicsContextGLProxy {
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(RemoteGraphicsContextGLProxyPS5);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(RemoteGraphicsContextGLProxyPS5);
+@@ -26,14 +50,16 @@ private:
+     friend class RemoteGraphicsContextGLProxy;
+     RemoteGraphicsContextGLProxyPS5(const GraphicsContextGLAttributes& attributes, RemoteRenderingBackendProxy& renderingBackend)
+         : RemoteGraphicsContextGLProxy(attributes, renderingBackend)
++        , m_layerDelegate(WebGLLayerDelegatePS5::create(m_identifier.toUInt64()))
+     {
+         WTFLogAlways("[webgl] remote context: WebGL %d, alpha %d", attributes.isWebGL2 ? 2 : 1, attributes.alpha);
+     }
+ 
+     // WebCore::GraphicsContextGL
+-    RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() final { return nullptr; }
++    RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() final { return m_layerDelegate.ptr(); }
+     void prepareForDisplay() final;
+ 
++    const Ref<WebGLLayerDelegatePS5> m_layerDelegate;
+     unsigned m_frames { 0 };
+ };
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 00592f9e95..0dcf399a1d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -621,13 +621,14 @@ void GraphicsLayerWC::setContentsToPlatformLayer(PlatformLayer* platformLayer, C
+ #if USE(COORDINATED_GRAPHICS)
+     // WPE (PS5): PlatformLayer is a CoordinatedPlatformLayer here, which the WC
+     // scene can't show. Video goes through setContentsToMediaPlayer (a stream
+-    // key); WebGL layers for WC are for later.
++    // key), WebGL through setContentsDisplayDelegate (a context key).
+     platformLayer = nullptr;
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+-    if (m_videoStreamKey) {
+-        // Other contents replace the video.
++    if (m_videoStreamKey || m_webGLLayerKey) {
++        // Other contents replace the video or the WebGL canvas.
+         m_videoStreamKey = 0;
++        m_webGLLayerKey = 0;
+         noteLayerPropertyChanged(WCLayerChange::PlatformLayer);
+     }
+ #endif
+@@ -650,6 +651,11 @@ void GraphicsLayerWC::setContentsDisplayDelegate(RefPtr<WebCore::GraphicsLayerCo
+ {
+ #if USE(COORDINATED_GRAPHICS)
+     // Coordinated-graphics delegates have no platformLayer(); see setContentsToPlatformLayer.
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: a remote WebGL context's delegate names the context; the title's
++    // scene draws its drawing buffer (GPUProcess/graphics/ps5/PS5WebGLLayers.h).
++    uint64_t webGLLayerKey = displayDelegate ? displayDelegate->ps5WebGLLayerKey() : 0;
++#endif
+     UNUSED_PARAM(displayDelegate);
+     PlatformLayer* platformLayer = nullptr;
+ #else
+@@ -657,6 +663,14 @@ void GraphicsLayerWC::setContentsDisplayDelegate(RefPtr<WebCore::GraphicsLayerCo
+ #endif
+     setContentsToPlatformLayer(platformLayer, purpose);
+     m_hasContentsDisplayDelegate = !!platformLayer;
++#if defined(PS5_PAYLOAD_SDK) && USE(COORDINATED_GRAPHICS)
++    if (webGLLayerKey) {
++        m_webGLLayerKey = webGLLayerKey;
++        m_hasContentsDisplayDelegate = true;
++        noteLayerPropertyChanged(WCLayerChange::PlatformLayer);
++        updateDebugIndicators();
++    }
++#endif
+ }
+ 
+ #if ENABLE(VIDEO) && defined(PS5_PAYLOAD_SDK)
+@@ -668,9 +682,10 @@ void GraphicsLayerWC::setContentsToMediaPlayer(WebCore::MediaPlayer* player, Con
+     // player asks for this again (renderingModeChanged) when it has one.
+     auto* playerPrivate = player ? player->playerPrivate() : nullptr;
+     uint64_t key = playerPrivate ? playerPrivate->ps5VideoStreamKey() : 0;
+-    if (key == m_videoStreamKey)
++    if (key == m_videoStreamKey && !m_webGLLayerKey)
+         return;
+     m_videoStreamKey = key;
++    m_webGLLayerKey = 0;
+     noteLayerPropertyChanged(WCLayerChange::PlatformLayer);
+ }
+ #endif
+@@ -678,7 +693,7 @@ void GraphicsLayerWC::setContentsToMediaPlayer(WebCore::MediaPlayer* player, Con
+ bool GraphicsLayerWC::usesContentsLayer() const
+ {
+ #if defined(PS5_PAYLOAD_SDK)
+-    if (m_videoStreamKey)
++    if (m_videoStreamKey || m_webGLLayerKey)
+         return true;
+ #endif
+     return m_platformLayer;
+@@ -1135,6 +1150,7 @@ void GraphicsLayerWC::flushCompositingStateForThisLayerOnly()
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+         update.platformLayer.videoStreamKey = m_videoStreamKey;
++        update.platformLayer.webGLLayerKey = m_webGLLayerKey;
+ #endif
+     }
+     if (update.changes & WCLayerChange::RemoteFrame)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 680ebf8c1c..c34594bd43 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -207,6 +207,8 @@ private:
+     PlatformLayer* m_platformLayer { nullptr };
+ #if defined(PS5_PAYLOAD_SDK)
+     uint64_t m_videoStreamKey { 0 }; // setContentsToMediaPlayer
++    // A WebGL canvas: its context's key in the title (setContentsDisplayDelegate).
++    uint64_t m_webGLLayerKey { 0 };
+ #endif
+     bool m_hasContentsDisplayDelegate { false };
+     Markable<WebCore::LayerHostingContextIdentifier> m_hostIdentifier;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+index d8f36c49e0..91ed552211 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.h
+@@ -160,6 +160,9 @@ struct WCLayerUpdateInfo {
+         // PS5: the contents are this ps5videosink stream's frames (0: none),
+         // drawn by the title (GraphicsLayerWC::setContentsToMediaPlayer).
+         uint64_t videoStreamKey { 0 };
++        // PS5: the contents are this remote WebGL context's drawing buffer
++        // (0: none), drawn by the title (PS5WebGLLayers.h).
++        uint64_t webGLLayerKey { 0 };
+     } platformLayer { };
+ 
+     Markable<WebCore::LayerHostingContextIdentifier> hostIdentifier { };
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+index 8d283af352..cd5e524528 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCUpdateInfo.serialization.in
+@@ -106,6 +106,7 @@ header: "WCUpdateInfo.h"
+     bool hasLayer;
+     Vector<WebKit::WCContentBufferIdentifier> identifiers;
+     uint64_t videoStreamKey;
++    uint64_t webGLLayerKey;
+ }
+ 
+ [CustomHeader] struct WebKit::WCLayerUpdateInfo {

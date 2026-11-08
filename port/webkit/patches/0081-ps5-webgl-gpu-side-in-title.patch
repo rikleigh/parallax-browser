@@ -1,0 +1,483 @@
+diff --git a/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp b/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp
+index 100e61c99f..9678a2a85c 100644
+--- a/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp
++++ b/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp
+@@ -44,7 +44,12 @@ EGLDisplay PlatformDisplay::angleEGLDisplay() const
+ 
+     Vector<EGLint> displayAttributes {
+         EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_OPENGLES_ANGLE,
+-#if !OS(ANDROID)
++#if defined(PS5_PAYLOAD_SDK)
++        // No native platform type: ANGLE then opens ps5-opengl's default
++        // display with eglGetDisplay (spikes/11-webgl), which has no
++        // eglGetPlatformDisplay.
++        EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_EGL_ANGLE,
++#elif !OS(ANDROID)
+         EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_EGL_ANGLE,
+         EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE, m_anglePlatform.value(),
+ #endif
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+index e988ddd7a1..0fae3f40c0 100644
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+@@ -33,6 +33,14 @@ namespace WebCore {
+ 
+ std::unique_ptr<PlatformDisplaySurfaceless> PlatformDisplaySurfaceless::create()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 (the title, for WebGL): ps5-opengl's EGL 1.4 has no platform
++    // displays, and its default display is surfaceless.
++    if (auto glDisplay = GLDisplay::create(eglGetDisplay(EGL_DEFAULT_DISPLAY)))
++        return std::unique_ptr<PlatformDisplaySurfaceless>(new PlatformDisplaySurfaceless(glDisplay.releaseNonNull()));
++    WTFLogAlways("Could not open the default EGL display: %s", GLContext::lastErrorString());
++    return nullptr;
++#endif
+     const char* extensions = eglQueryString(nullptr, EGL_EXTENSIONS);
+     if (!GLContext::isExtensionSupported(extensions, "EGL_MESA_platform_surfaceless"))
+         return nullptr;
+diff --git a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp
+index 98f7faaa6f..bb37e8c476 100644
+--- a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp
++++ b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp
+@@ -164,7 +164,7 @@
+ #include <WebCore/SecurityOrigin.h>
+ #endif
+ 
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+ #include "RemoteWCLayerTreeHost.h"
+ #include "WCContentBufferManager.h"
+ #include "WCRemoteFrameHostLayerManager.h"
+@@ -450,7 +450,7 @@ void GPUConnectionToWebProcess::didClose(IPC::Connection& connection)
+     // RemoteGraphicsContextsGL objects are unneeded after connection closes.
+     m_remoteGraphicsContextGLMap.clear();
+ #endif
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+     remoteGraphicsStreamWorkQueue().dispatch([webProcessIdentifier = m_webProcessIdentifier] {
+ #if ENABLE(WEBGL)
+         WCContentBufferManager::singleton().removeAllContentBuffersForProcess(webProcessIdentifier);
+@@ -519,7 +519,7 @@ void GPUConnectionToWebProcess::configureLoggingChannel(const String& channelNam
+ #endif
+ }
+ 
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+ void GPUConnectionToWebProcess::createWCLayerTreeHost(WebKit::WCLayerTreeHostIdentifier identifier, uint64_t nativeWindow, bool usesOffscreenRendering)
+ {
+     auto addResult = m_remoteWCLayerTreeHostMap.add(identifier, RemoteWCLayerTreeHost::create(*this, WTF::move(identifier), nativeWindow, usesOffscreenRendering));
+diff --git a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.h b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.h
+index 927a847ef3..c349e2ad0b 100644
+--- a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.h
++++ b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.h
+@@ -71,7 +71,7 @@
+ #include <pal/spi/cocoa/TCCSPI.h>
+ #endif
+ 
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+ #include "WCLayerTreeHostIdentifier.h"
+ #endif
+ 
+@@ -119,7 +119,7 @@ struct GPUProcessConnectionParameters;
+ struct MediaOverridesForTesting;
+ struct RemoteAudioSessionConfiguration;
+ 
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+ class RemoteWCLayerTreeHost;
+ #endif
+ 
+@@ -360,7 +360,7 @@ private:
+     void setMediaOverridesForTesting(MediaOverridesForTesting);
+     void configureLoggingChannel(const String&, WTFLogChannelState, WTFLogLevel);
+ 
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+     void createWCLayerTreeHost(WebKit::WCLayerTreeHostIdentifier, uint64_t nativeWindow, bool usesOffscreenRendering);
+     void releaseWCLayerTreeHost(WebKit::WCLayerTreeHostIdentifier);
+ #endif
+@@ -462,7 +462,7 @@ private:
+     using RemoteAudioHardwareListenerMap = HashMap<RemoteAudioHardwareListenerIdentifier, Ref<RemoteAudioHardwareListenerProxy>>;
+     RemoteAudioHardwareListenerMap m_remoteAudioHardwareListenerMap;
+ 
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+     using RemoteWCLayerTreeHostMap = HashMap<WCLayerTreeHostIdentifier, Ref<RemoteWCLayerTreeHost>>;
+     RemoteWCLayerTreeHostMap m_remoteWCLayerTreeHostMap;
+ #endif
+diff --git a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in
+index 85cb49f291..1a14384d07 100644
+--- a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in
++++ b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in
+@@ -61,7 +61,7 @@ messages -> GPUConnectionToWebProcess WantsDispatchMessage {
+     ReleaseRemoteCommandListener(WebKit::RemoteRemoteCommandListenerIdentifier identifier)
+     ReleaseTransferredImageBuffer(WebCore::ImageBufferTransferIdentifier identifier)
+     ConfigureLoggingChannel(String channelName, enum:uint8_t WTFLogChannelState state, enum:uint8_t WTFLogLevel level)
+-#if USE(GRAPHICS_LAYER_WC)
++#if ENABLE(WC_GPU_PROCESS)
+     CreateWCLayerTreeHost(WebKit::WCLayerTreeHostIdentifier identifier, uint64_t nativeWindow, bool usesOffscreenRendering) AllowedWhenWaitingForSyncReply
+     ReleaseWCLayerTreeHost(WebKit::WCLayerTreeHostIdentifier identifier) AllowedWhenWaitingForSyncReply
+ #endif
+diff --git a/Source/WebKit/GPUProcess/GPUProcess.h b/Source/WebKit/GPUProcess/GPUProcess.h
+index 3d8295ce78..7a1fc16ee5 100644
+--- a/Source/WebKit/GPUProcess/GPUProcess.h
++++ b/Source/WebKit/GPUProcess/GPUProcess.h
+@@ -108,6 +108,15 @@ public:
+     static GPUProcess& singleton();
+     static constexpr WTF::AuxiliaryProcessType processType = WTF::AuxiliaryProcessType::GPU;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: no GPUProcessProxy; the title calls the message handler itself
++    // (UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp).
++    void ps5CreateGPUConnectionToWebProcess(WebCore::ProcessIdentifier identifier, PAL::SessionID sessionID, IPC::Connection::Handle&& connectionHandle, GPUProcessConnectionParameters&& parameters)
++    {
++        createGPUConnectionToWebProcess(identifier, sessionID, WTF::move(connectionHandle), WTF::move(parameters), [] { });
++    }
++#endif
++
+     void ref() const final { ThreadSafeRefCounted::ref(); }
+     void deref() const final { ThreadSafeRefCounted::deref(); }
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp
+index 64290cae20..44bf203533 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.cpp
+@@ -75,7 +75,7 @@ IPC::StreamConnectionWorkQueue& remoteGraphicsContextGLStreamWorkQueueSingleton(
+     return instance.get();
+ }
+ 
+-#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM)
++#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM) && !defined(PS5_PAYLOAD_SDK) // PS5: ps5/RemoteGraphicsContextGLPS5.cpp
+ Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& gpuConnectionToWebProcess, GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier graphicsContextGLIdentifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+ {
+     ASSERT_NOT_REACHED();
+@@ -243,7 +243,7 @@ void RemoteGraphicsContextGL::reshape(int32_t width, int32_t height)
+         forceContextLost();
+ }
+ 
+-#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM)
++#if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM) && !defined(PS5_PAYLOAD_SDK) // PS5: ps5/RemoteGraphicsContextGLPS5.cpp
+ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& completionHandler)
+ {
+     assertIsCurrent(workQueue());
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+new file mode 100644
+index 0000000000..a414986690
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -0,0 +1,77 @@
++/*
++ * PS5: the title's side of remote WebGL (spikes/11-webgl). The title stands
++ * in for the GPU process (UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp). Each
++ * context is ANGLE over ps5-opengl, made on the RemoteGraphicsContextGL work
++ * queue's thread. Its drawing buffers aren't shown yet: putting them in a WC
++ * content layer is milestone M2.
++ */
++
++#include "config.h"
++#include "RemoteGraphicsContextGL.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++
++#include <WebCore/GraphicsContextGLCoordinated.h>
++#include <wtf/TZoneMallocInlines.h>
++
++namespace WebKit {
++
++class RemoteGraphicsContextGLPS5 final : public RemoteGraphicsContextGL {
++    WTF_MAKE_TZONE_ALLOCATED(RemoteGraphicsContextGLPS5);
++    WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(RemoteGraphicsContextGLPS5);
++public:
++    RemoteGraphicsContextGLPS5(GPUConnectionToWebProcess& connection, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
++        : RemoteGraphicsContextGL(connection, identifier, renderingBackend, WTF::move(streamConnection))
++    {
++    }
++
++private:
++    void platformWorkQueueInitialize(WebCore::GraphicsContextGLAttributes&&) final;
++    void didRunOutOfMessages() final;
++};
++
++WTF_MAKE_TZONE_ALLOCATED_IMPL(RemoteGraphicsContextGLPS5);
++
++void RemoteGraphicsContextGLPS5::platformWorkQueueInitialize(WebCore::GraphicsContextGLAttributes&& attributes)
++{
++    assertIsCurrent(workQueue());
++    const bool webGL2 = attributes.isWebGL2;
++    m_context = WebCore::GraphicsContextGLCoordinated::create(WTF::move(attributes));
++    if (!m_context) {
++        WTFLogAlways("[webgl] title: no ANGLE context for a WebGL %d page (it gets a lost context)", webGL2 ? 2 : 1);
++        return;
++    }
++    WTFLogAlways("[webgl] title: ANGLE context for WebGL %d, max texture %d", webGL2 ? 2 : 1, m_context->maxTextureSize());
++}
++
++void RemoteGraphicsContextGLPS5::didRunOutOfMessages()
++{
++    assertIsCurrent(workQueue());
++    if (RefPtr context = m_context)
++        context->flush();
++}
++
++// The display round trip (RemoteGraphicsContextGLProxyPS5): the frame is
++// finished in the drawing buffer, which nothing shows yet.
++void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& completionHandler)
++{
++    assertIsCurrent(workQueue());
++    static unsigned frames;
++    if (RefPtr context = m_context) {
++        context->prepareForDisplay();
++        if (!frames++)
++            WTFLogAlways("[webgl] title: first frame finished");
++    }
++    completionHandler();
++}
++
++Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& connection, WebCore::GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
++{
++    auto instance = adoptRef(*new RemoteGraphicsContextGLPS5(connection, identifier, renderingBackend, WTF::move(streamConnection)));
++    instance->initialize(WTF::move(attributes));
++    return instance;
++}
++
++} // namespace WebKit
++
++#endif // ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index e72e43c3e3..f5a9361acc 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -51,9 +51,14 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+         UIProcess/wpe/ps5/PS5WCNullHost.cpp
+     )
+ 
+-    # Remote WebGL (spikes/11-webgl): the WebProcess's side.
++    # Remote WebGL (spikes/11-webgl): the WebProcess's side, and the GPU
++    # process's, which runs in the title.
+     if (ENABLE_GPU_PROCESS AND ENABLE_WEBGL)
+         list(APPEND WebKit_SOURCES
++            GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++
++            UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
++
+             WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+         )
+     endif ()
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.cpp b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+index 02741be39c..fc03294dd7 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.cpp
++++ b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+@@ -40,6 +40,13 @@
+ #include <wtf/SetForScope.h>
+ #include <wtf/WTFProcess.h>
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include "Decoder.h"
++#include "MessageNames.h"
++#include <wtf/NeverDestroyed.h>
++#include <wtf/RunLoop.h>
++#endif
++
+ #if !OS(WINDOWS)
+ #include <unistd.h>
+ #endif
+@@ -123,6 +130,49 @@ void AuxiliaryProcess::initialize(AuxiliaryProcessInitializationParameters&& par
+     connection->open(*this);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++namespace {
++// The far end of an in-title process's parent connection: messages meant
++// for its UI process proxy (GPUProcessProxy) end here, logged and dropped.
++class PS5InTitleParentSink final : public IPC::Connection::Client {
++    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(PS5InTitleParentSink);
++    WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(PS5InTitleParentSink);
++public:
++    // Never destroyed (NeverDestroyed in ps5InitializeInTitle).
++    void ref() const final { }
++    void deref() const final { }
++
++    void didReceiveMessage(IPC::Connection&, IPC::Decoder& decoder) final { dropped(decoder); }
++    void didReceiveSyncMessage(IPC::Connection&, IPC::Decoder& decoder, UniqueRef<IPC::Encoder>&) final { dropped(decoder); }
++    void didClose(IPC::Connection&) final { }
++    void didReceiveInvalidMessage(IPC::Connection&, IPC::MessageName, const Vector<uint32_t>&) final { }
++
++private:
++    static void dropped(IPC::Decoder& decoder)
++    {
++        WTFLogAlways("[ps5-gpu] in-title GPU process: dropped %s (no GPUProcessProxy)", IPC::description(decoder.messageName()).characters());
++    }
++};
++}
++
++void AuxiliaryProcess::ps5InitializeInTitle()
++{
++    RELEASE_ASSERT(RunLoop::isMain());
++    if (m_connection)
++        return;
++    auto pair = IPC::Connection::createConnectionIdentifierPair();
++    RELEASE_ASSERT(pair);
++    // Both ends live as long as the title: didClose() on this side would end it.
++    static NeverDestroyed<PS5InTitleParentSink> sinkClient;
++    static NeverDestroyed<Ref<IPC::Connection>> sink = IPC::Connection::createClientConnection(IPC::Connection::Identifier { WTF::move(pair->client) });
++    sink.get()->open(sinkClient.get());
++
++    Ref connection = IPC::Connection::createServerConnection(WTF::move(pair->server));
++    lazyInitialize(m_connection, connection.copyRef());
++    connection->open(*this);
++}
++#endif
++
+ void AuxiliaryProcess::setProcessSuppressionEnabled(bool enabled)
+ {
+     if (enabled)
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.h b/Source/WebKit/Shared/AuxiliaryProcess.h
+index b6f20a406b..843a58bd40 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.h
++++ b/Source/WebKit/Shared/AuxiliaryProcess.h
+@@ -108,6 +108,15 @@ public:
+ 
+     IPC::Connection* parentProcessConnection() const { return m_connection.get(); }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: this process object runs in the title, beside the UI process (the
++    // GPU process's WebGL side, PS5GPUProcessInTitle.cpp). It gets a parent
++    // connection whose other end drops what it is sent, and none of
++    // initialize()'s process-wide set-up, which belongs to the UI process.
++    // Main run loop.
++    void ps5InitializeInTitle();
++#endif
++
+     IPC::MessageReceiverMap& messageReceiverMap() LIFETIME_BOUND { return m_messageReceiverMap; }
+ 
+ #if PLATFORM(COCOA)
+diff --git a/Source/WebKit/UIProcess/WebProcessPool.cpp b/Source/WebKit/UIProcess/WebProcessPool.cpp
+index d0d7fe9676..adad9563c2 100644
+--- a/Source/WebKit/UIProcess/WebProcessPool.cpp
++++ b/Source/WebKit/UIProcess/WebProcessPool.cpp
+@@ -136,6 +136,9 @@
+ #include "GPUProcessCreationParameters.h"
+ #include "GPUProcessMessages.h"
+ #include "GPUProcessProxy.h"
++#if ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++#include "PS5GPUProcessInTitle.h"
++#endif
+ #endif
+ 
+ #if ENABLE(REMOTE_INSPECTOR)
+@@ -593,6 +596,11 @@ void WebProcessPool::createGPUProcessConnection(WebProcessProxy& webProcessProxy
+ {
+ #if PLATFORM(COCOA)
+     parameters.applicationBundleIdentifier = applicationBundleIdentifier();
++#endif
++#if ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++    // No GPU process to launch: its WebGL side runs in the title.
++    PS5GPUProcessInTitle::createGPUProcessConnection(webProcessProxy, WTF::move(connectionIdentifier), WTF::move(parameters));
++    return;
+ #endif
+     protect(ensureGPUProcess())->createGPUProcessConnection(webProcessProxy, WTF::move(connectionIdentifier), WTF::move(parameters));
+ }
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+new file mode 100644
+index 0000000000..b85ca03d88
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+@@ -0,0 +1,59 @@
++/*
++ * PS5: the GPU process's WebGL side, in the title (PS5GPUProcessInTitle.h).
++ */
++
++#include "config.h"
++#include "PS5GPUProcessInTitle.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++
++#include "GPUProcess.h"
++#include "GPUProcessConnectionParameters.h"
++#include "WebProcessProxy.h"
++#include <WebCore/PlatformDisplaySurfaceless.h>
++
++namespace WebKit {
++namespace PS5GPUProcessInTitle {
++
++// The GL display WebGL's contexts use (PlatformDisplay::sharedDisplay()):
++// the title's UI process has none of its own; the compositor uses
++// ps5-opengl's EGL directly (PS5Renderer).
++static bool ensureDisplay()
++{
++    if (WebCore::PlatformDisplay::sharedDisplayIfExists())
++        return true;
++    auto display = WebCore::PlatformDisplaySurfaceless::create();
++    if (!display)
++        return false;
++    WebCore::PlatformDisplay::setSharedDisplay(WTF::move(display));
++    return true;
++}
++
++void createGPUProcessConnection(WebProcessProxy& webProcess, IPC::Connection::Handle&& connectionHandle, GPUProcessConnectionParameters&& parameters)
++{
++    RELEASE_ASSERT(RunLoop::isMain());
++    static bool started;
++    static bool failed;
++    if (!started) {
++        started = true;
++        if (!ensureDisplay()) {
++            failed = true;
++            WTFLogAlways("[webgl] title: no EGL display, so no WebGL");
++        } else {
++            GPUProcess::singleton().ps5InitializeInTitle();
++            WTFLogAlways("[webgl] title: GPU process side started (WebGL only)");
++        }
++    }
++    // Dropping the handle closes the connection: the WebProcess takes the
++    // GPU process as gone and its WebGL contexts as lost.
++    if (failed)
++        return;
++
++    WTFLogAlways("[webgl] title: GPU connection for WebProcess %" PRIu64, webProcess.coreProcessIdentifier().toUInt64());
++    GPUProcess::singleton().ps5CreateGPUConnectionToWebProcess(webProcess.coreProcessIdentifier(), webProcess.sessionID(), WTF::move(connectionHandle), WTF::move(parameters));
++}
++
++} // namespace PS5GPUProcessInTitle
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h
+new file mode 100644
+index 0000000000..38dfb4b5d9
+--- /dev/null
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h
+@@ -0,0 +1,32 @@
++/*
++ * PS5: the GPU process's WebGL side, in the title (spikes/11-webgl).
++ *
++ * GL works only in the title (a registered app), not in elfldr payloads, so
++ * there is no GPU process to launch. A WebProcess's request for a GPU process
++ * connection is answered here instead: WebKit's GPUProcess object, made in
++ * the title without its process start-up, takes the connection, and its
++ * WebGL contexts are ANGLE over ps5-opengl (RemoteGraphicsContextGLPS5.cpp).
++ * Canvas, page painting and media stay in the WebProcess
++ * (WebPreferencesWPE.cpp), so only remote WebGL comes here.
++ */
++
++#pragma once
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++
++#include "Connection.h"
++
++namespace WebKit {
++
++class WebProcessProxy;
++struct GPUProcessConnectionParameters;
++
++namespace PS5GPUProcessInTitle {
++
++// WebProcessPool::createGPUProcessConnection. Main run loop.
++void createGPUProcessConnection(WebProcessProxy&, IPC::Connection::Handle&&, GPUProcessConnectionParameters&&);
++
++} // namespace PS5GPUProcessInTitle
++} // namespace WebKit
++
++#endif

@@ -400,3 +400,249 @@ public sources.
 - `examples/gles3_probe.c`: minimal ES 3 plus export consumer, used for the
   link and package probes.
 - `build/` (gitignored): variant trees, logs, venv, title output.
+
+## Patch 0004: GPU blits into sRGB textures (2026-11-07, WebGL M4)
+
+`patches/0004-srgb-gpu-blit-through-linear-view.patch`: `ps5_blit_gpu_color`
+also takes an RGBA8 source into an `R8G8B8A8_SRGB` texture when the blit asks
+for the destination's linear format (GL_FRAMEBUFFER_SRGB off), drawing
+through an `R8G8B8A8_UNORM` surface of it. Before, that blit took the CPU
+fallback: the title's copy of a 1080p video frame into an SRGB8_ALPHA8 WebGL
+texture cost tens of ms (spikes/11-webgl, *M3 formats*). Built for trial with
+`PS5_OPENGL_PREFIX=$PS5WK_ROOT/toolchain/ps5-opengl-gles-noprof-m4 build.sh
+gles-noprof` (the new `PS5_OPENGL_PREFIX` installs a variant elsewhere, so
+the browser's own `toolchain/ps5-opengl-gles-noprof` stays as it was). Not
+run on the console yet. The `build/gles` tree has it applied (by hand, `git
+apply`); a `--clean` build applies it with the others.
+
+
+## Patch 0005: AGC register defaults fetched once (2026-11-07)
+
+`append_target_state` takes `sceAgcGetRegisterDefaults()`'s table, and every
+native draw (`ps5_agc_gate2_run`) called it again. Under the title profiler
+(`busy.html?n=1000`, WebGL 2) that call was 28% of the title's CPU, all at
+one address in the system library. `runtime_register_defaults` keeps the
+pointer after the first call, calls the function again every 4096th use and,
+if the pointer ever changes, logs `[ps5-agc] register defaults moved` and
+stops caching. 1000 draws per frame went from 32.7 to 47.0 fps (30 -> 21 µs
+per draw on the WebGL thread). The rest of the measured split is in
+`spikes/11-webgl/README.md` (M4).
+
+## Patch 0006: no restart conversion when no index is the restart index (2026-11-07)
+
+WebGL 2 has primitive restart on for every indexed draw, and `ps5_draw_vbo`
+sent every such draw through a `util_primconvert` context made and freed per
+draw, its indices rewritten and uploaded, and it never reached the deferred
+batch. `ps5_draws_contain_restart_index` scans the draw's indices in the
+buffer's CPU copy (`resource->data`); when none equals `restart_index` the
+draw goes on with `primitive_restart` off (user indices, out-of-range draws
+and indirect draws convert as before). `busy.html` (WebGL 2): 1000 cubes
+47.0 -> 54.7 fps, 2000 cubes 24.5 -> 29.9 (16 µs per draw on the WebGL
+thread); textured 52.7 and 28.6; GL error 0.
+
+## Patch 0007: a four-entry MRT register cache for every large table (2026-11-07)
+
+`ps5_agc_set_cx_mrt` cached its rewritten register table in one entry, and
+only for tables holding both 0x318 and 0x2d5 (the initial graphics table).
+After 0006 the prepared draws' per-draw table lacks them, so it was rewritten
+on every draw (8% of the title's CPU at 1000 draws per frame), and the WebGL
+thread alternates two large tables (101 and 85 records), which evicted each
+other. The rewrite depends only on the input records and the backend draw
+state, so the cache now holds four entries for any table of 16 or more
+records (keyed on all input bytes and on the draw state after the call:
+with `PS5_DYNAMIC_SCANOUT` the call fills in an unset depth size).
+`busy.html`: 1000 cubes 54.7 -> 59.8 fps (the 60 Hz cap), 2000 cubes 29.9
+-> 32.9 (~15 µs per draw); GL error 0.
+
+Note: `PS5_RUNTIME_QUIET` makes `printf` a no-op in `ps5_screen.c` and
+`ps5_agc_runtime_backend.c`, and the title logs stderr, not stdout:
+diagnostics go to `fprintf(stderr, ...)` (0005's warning does).
+
+## Patch 0008: GPU depth/stencil clears for 4x MSAA (2026-11-07)
+
+`ps5_clear_gpu_depth_stencil` (the blitter's depth quad) refused
+multisampled targets, so every clear of a 4x depth/stencil buffer (the
+default framebuffer of an antialiased WebGL canvas, as three.js makes it)
+drained the GPU queue and filled and flushed the tiled depth and stencil
+planes on the CPU: three.js's `webgl_geometry_cube` spent ~2.2 ms per frame
+in `glClear`. The GPU path now admits 4x targets with 4x storage, sizing the
+depth and stencil planes for 4 samples. The blitter draws with multisample
+rasterization off, which on this hardware (as on radeonsi) gives each covered
+pixel all its samples; the 4x colour clears already relied on it.
+`tests/ps5/test_gpu_clear_state.py` covers the new bounds (on macOS run it
+with `-no-pie` removed). On the console:
+`port/webkit/test/webgl/msaa-clear.html` (every sample primed, cleared,
+probed, resolved; also passes in desktop Chrome).
+Result: all 43 cases PASS on the console; three.js `webgl_geometry_cube`
+2.2 -> 0.24 ms per frame on the WebGL thread at 60 fps; `busy.html`
+unchanged (1000 cubes 59.8, 2000 32.9 fps).
+
+## Patch 0009: prepared draws clear and flush only what the GPU reads (2026-11-07)
+
+Every prepared draw zeroed its 16 KiB state pages (`memory + 0x4000`) and
+clflushed all of them (8% and 8% of the title's CPU at 1000 draws per frame
+after 0006). The GPU reads those pages only through the indirect register
+loads in the draw's stream (`0x63`/`0x64`/`0x9f`, each reading exactly its
+count of records; the packets `validate_indirect_register_tables` checks)
+and writes only the completion marker at 0x6ff0, and every table is built
+from scratch per draw. So the clear now zeroes the marker only, and the
+publish walks the finished stream and flushes each loaded table and the
+marker line; a stream it cannot read, or a table outside the 64 KiB work
+block, flushes the 16 KiB whole as before. The ranges are flushed with
+`clflushopt` unfenced and fenced once per draw: a first version flushing each
+range with `util_flush_inval_range` (two `mfence`s per call, and the fence
+waits for every flush in flight) gained nothing, the publish going from 8% to
+14% of the WebGL thread with a sixth of the lines. Host test:
+`tests/ps5/test_prepared_shader_pairs.py`. `busy.html`: 2000 cubes 32.9 ->
+37.7 fps (~12.6 µs per draw), 1000 cubes 15.8 -> 13.8 ms per frame on the
+WebGL thread; `msaa-clear.html`, `webgl.html` and three.js's cube unchanged.
+
+## Patch 0010: one fence per CPU flush (2026-11-07)
+
+`ps5_flush_gpu_data` (Gallium) and the runtime's `flush_gpu_data` used
+`util_flush_inval_range`: `clflushopt` over the range, `mfence`, the last line
+flushed again, `mfence` (the repeat is a workaround for Atom's clflush
+ordering). On this AMD CPU `clflushopt` is ordered after older stores to its
+line, so the range and one `mfence` publish it; each draw makes several of
+these flushes (descriptor and constant tables, backing stores).
+
+## Patch 0011: clear only the descriptor slots a shader lists (2026-11-07)
+
+`ps5_prepare_constant` zeroed the whole 4 KiB descriptor prefix of each
+stage's (recycled) descriptor storage on every draw, before the UBO, texture,
+storage and image writers filled their slots; the batch snapshot skips that
+prefix because of this clear. A shader reads only the slots in its metadata's
+descriptor bindings, and each writer clears and rewrites its own slot, so
+`ps5_clear_descriptor_prefix` now zeroes just each listed binding
+(`offset .. offset + array_size * stride`): ~16 bytes for a one-UBO shader
+instead of 4 KiB, which also stops the clear re-reading lines the previous
+draw had flushed out of cache. The whole prefix is still cleared with a
+geometry or tessellation stage (merged layouts), a binding in a non-zero set,
+or a binding reaching past the prefix. Host test:
+`tests/ps5/test_descriptor_prefix_clear.py`.
+
+`busy.html`: 2000 cubes 38.8 -> 41.1 fps (textured 39.0), 1000 cubes 13.35 ->
+12.75 ms per frame on the WebGL thread. `msaa-clear.html` 0 failures,
+`webgl.html` PASS, video formats 23 PASS / 0 FAIL, three.js's cube right on
+the TV. Profile at 2000 cubes: `ps5_prepare_constant` 6% -> under 1% of the
+WebGL thread; the libc/AGC time left is led by `ps5_agc_set_cx_mrt` (5%),
+`ps5_render_arena_allocate` (3.4%), `ps5_agc_gate2_run` (3.3%) and
+`runtime_shader_pair_get` (2.3%).
+
+## Patch 0012: descriptor snapshots skip the arena clear (2026-11-07)
+
+Each deferred draw takes three 16 KiB descriptor snapshots. Up to 8 batches of
+256 draws are in flight but the retired-snapshot cache keeps 256 per stage,
+so at 2000 draws per frame most snapshots are new `resource_create`s from the
+render arena, and the arena zeroed each one (the 3.4% of the WebGL thread in
+libc under `ps5_render_arena_allocate`). A snapshot's readable bytes are all
+rewritten before use, exactly as for a recycled snapshot (which already holds
+the previous draw's bytes), so `ps5_batch_copy_descriptors` creates them with
+the driver-private `PS5_RESOURCE_FLAG_UNCLEARED` and the arena skips the
+memset for them. Every other arena allocation is still cleared; the direct
+memory fallback still clears.
+
+`busy.html`: 2000 cubes 41.1 -> 42.9 fps (textured 39.0 -> 40.5), 22.4 ms per
+frame on the WebGL thread. `msaa-clear.html` 0 failures, `webgl.html` PASS,
+video formats 23 PASS / 0 FAIL. Not done: a larger snapshot cache (it would
+pin up to ~108 MiB of arena per context at this depth).
+
+## Patch 0013: inline equality for per-draw cache checks (2026-11-07)
+
+The per-draw cache hits compare bytes with the system libc `memcmp`, an
+out-of-module call through the GOT: the `set_cx_mrt` table cache (input
+records and draw state), the prepared shader-pair lookup (both shader
+packages, every draw) and the shader-variant layout match. Together ~7% of the
+WebGL thread at 2000 draws per frame, nearly all on compares that match.
+`src/platform/ps5_memeq.h` adds `ps5_memeq`, an inline equality check (SSE2,
+64 bytes per step; 8-byte words without SSE2 for host tests), used at those
+sites. Host test `tests/ps5/test_memeq.py` checks it against `memcmp` for
+lengths 0-300, offsets and every byte position, natively and as x86_64 (the
+SSE2 path) where the host runs it. Three host tests that compile the backend
+from stdin gained `-I src/platform`.
+
+`busy.html`: 2000 cubes 42.9 -> 46.4 fps (textured 40.5 -> 43.6), 20.6 ms
+per frame on the WebGL thread. `msaa-clear.html` 0 failures, `webgl.html`
+PASS, video formats 23 PASS / 0 FAIL, three.js's cube right on the TV.
+
+## Patch 0014: repeated draws skip unchanged state (2026-11-07)
+
+A batched draw carried its whole state every time: render target, shader,
+depth, blend, viewport and rasterizer register tables, rebuilt on the CPU and
+loaded indirectly (~10% of the WebGL thread at 2000 draws per frame, in
+`ps5_agc_gate2_run`, `set_cx_mrt`, `append_target_state` and the table
+publication). Within a command group the draws run as one stream and the
+context/SH/UC registers keep their last values, so `runtime_repeat_draw` emits
+only a draw's own commands (upload acquire, user data, the draw, its releases
+and completion) when everything the full path builds the tables from equals
+the previous queued draw's: all of `runtime_draw_inputs` except the per-draw
+fields (user data, index buffer/count/size, draw count), the backend draw
+state, the NGG control and the shader package bytes (an address can be reused
+for new bytecode). Anything else (first draw of a batch, tessellation, an
+unprepared pair, a dispatch or other entry in between, a changed scanout
+registration) takes the full path.
+
+A repeat must directly follow its predecessor in one submitted stream, so
+grouping is now decided as entries are appended (`joins` on the entry) and
+`runtime_batch_combine` follows the recorded decisions (a mismatch aborts). A
+repeat joins only with room left for a presentation tail
+(`RUNTIME_PRESENT_TAIL_WORDS`); `ps5_agc_gate2_batch_present` extends the last
+entry through `runtime_batch_extend_last`, which keeps the decision valid (a
+full draw that no longer fits starts its own group, as the submit-time
+grouping did). Disabled for async preparation and the diagnostic builds.
+Host tests: `test_repeat_draws.py` (every byte of the inputs and backend state,
+shader bytes, batch position; the per-draw commands match the full path's),
+`test_command_groups.py` (append-time decisions, presentation extension,
+headroom, fail-stop), `test_gpu_present.py` (a refused extension fails the
+present untouched).
+
+`busy.html`: 2000 cubes 46.4 -> 56.3 fps (textured 43.6 -> 53.2); 1000 and
+below 59.9. `msaa-clear.html` 0 failures, `webgl.html` PASS, video formats all
+20 page checks PASS, three.js's cube right on the TV.
+
+## Patch 0015: batched draws fence their descriptor tables once (2026-11-07)
+
+A draw flushed its three descriptor tables (vertex buffers, vertex stage,
+fragment stage) with a fence each. A fence waits for every older flush on its
+thread, so after 0014 the three were most of what remained of the draw's own
+time (~13% of the WebGL thread at 2000 draws per frame). A batched draw
+(`flush_cache` set: the deferred queue and multi-draw chunks) now flushes the
+first two unfenced (`ps5_flush_draw_table`), and the fragment table's flush,
+where the draw has always fenced last, fences for all three; with no fragment
+table, a lone fence there. Nothing between them submits work, and every exit
+between them drops the draw. Unbatched draws are unchanged.
+
+A first version left all three unfenced and relied on the runtime draw's fence
+before queueing. It reached 59.9 fps but the video formats page stalled once in
+its second round (the title kept presenting; the page's WebGL went idle) and
+the console needed a power-off. Why is not known: the runtime does fence on
+the same thread before queueing. This version keeps a Gallium fence before the
+runtime draw, as before.
+
+Host test: `test_batched_draw_fences.py` (the helper; the two deferred sites,
+the fragment fence and its lone-fence fallback, nothing submitted or kept
+between them; only batched callers pass a flush cache).
+
+`busy.html`: 2000 cubes 56.3 -> 59.8 fps (textured 53.2 -> 56.3); 1000 and
+below 59.9. Video formats page 3 of 3 runs, all 20 page checks PASS and the
+second round finished each time.
+
+## Patch 0016: Mesa's VAO fast path (2026-11-08)
+
+The screen fills its caps without `u_init_pipe_screen_caps`, so
+`allow_dynamic_vao_fastpath` stayed false and the state tracker took the slow
+array path: on every draw after a VAO change it ran
+`_mesa_update_vao_derived_arrays`, rescanning the VAO to merge attributes that
+share a buffer (3.3% of the WebGL thread at 2000 draws per frame, each with its
+own VAO). With the fast path (the default for Gallium drivers) each enabled
+attribute is its own vertex buffer at binding offset + relative offset, source
+offset 0: the same fetched addresses; an interleaved array takes a descriptor
+and a flush range per attribute. `max_vertex_buffers` (16) covers the 16
+vertex inputs. Host test: `test_vao_fast_path.py`.
+
+With WebKit patch 0087 (ANGLE binds a VAO without a map search for its state):
+`busy.html` 3000 cubes 39.5 -> 40.9 fps (textured 36.6 -> 37.8); 2000 and below
+59.9 (vsync). Profile at 2000: the rescan gone, the array update 2.2% (was
+3.7% with the rescan); ANGLE's bind 2.8% -> 1.7% (one read of the VAO state
+left). `msaa-clear.html` 0 failures, `webgl.html` PASS, video formats page 3 of
+3 runs (20 PASS, second round finished), three.js's cube right on the TV.

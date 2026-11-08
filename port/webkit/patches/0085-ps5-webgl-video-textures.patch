@@ -1,0 +1,482 @@
+diff --git a/Source/ThirdParty/ANGLE/PlatformWPE.cmake b/Source/ThirdParty/ANGLE/PlatformWPE.cmake
+index f194a4a6cc..0b3bae2463 100644
+--- a/Source/ThirdParty/ANGLE/PlatformWPE.cmake
++++ b/Source/ThirdParty/ANGLE/PlatformWPE.cmake
+@@ -7,6 +7,8 @@ if (ENABLE_WPE_PLATFORM_PS5)
+     # The PS5 (spikes/11-webgl): the egl* entry points come from the host
+     # (no libEGL to dlopen), no futex, FreeBSD clock and thread-name calls.
+     list(APPEND ANGLE_DEFINITIONS ANGLE_PLATFORM_PS5)
++    # Video frames copied into WebGL textures by the title (M3).
++    list(APPEND ANGLE_SOURCES src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp)
+ endif ()
+ include(linux.cmake)
+ 
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp
+new file mode 100644
+index 0000000000..5ab107397d
+--- /dev/null
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp
+@@ -0,0 +1,40 @@
++//
++// PS5 (Parallax Browser, spikes/11-webgl M3): a 2D texture whose contents
++// are written outside ANGLE. The title copies hardware-decoded video frames
++// into WebGL textures with ps5-opengl directly (WebKit's
++// RemoteGraphicsContextGLPS5.cpp), into the texture's native object, which
++// this returns. Without the initialized mark, robust resource init would
++// clear the copied frame at the texture's first use.
++//
++
++#include "libANGLE/Context.h"
++#include "libANGLE/Texture.h"
++#include "libANGLE/renderer/gl/TextureGL.h"
++#include "libGLESv2/entry_points_gles_2_0_autogen.h"
++#include "libGLESv2/global_state.h"
++
++// The texture must be bound to GL_TEXTURE_2D on the active unit, and no
++// pixel unpack buffer bound. Level 0 is (re)defined as width x height RGBA8
++// unless it already is; returns the native texture name, 0 if `name` is not
++// a mutable 2D texture of the current context.
++extern "C" ANGLE_EXPORT GLuint GL_APIENTRY ANGLE_PS5PrepareExternalTexture2D(GLuint name, GLsizei width, GLsizei height)
++{
++    gl::Context *context = gl::GetValidGlobalContext();
++    if (!context || !name || width <= 0 || height <= 0)
++        return 0;
++    gl::Texture *texture = context->getTexture(gl::TextureID{name});
++    if (!texture || texture->getType() != gl::TextureType::_2D || texture->getImmutableFormat())
++        return 0;
++
++    const gl::ImageDesc &desc = texture->getState().getImageDesc(gl::TextureTarget::_2D, 0);
++    if (desc.size.width != width || desc.size.height != height || !desc.format.valid() ||
++        desc.format.info->sizedInternalFormat != GL_RGBA8)
++    {
++        GL_TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++        const gl::ImageDesc &defined = texture->getState().getImageDesc(gl::TextureTarget::_2D, 0);
++        if (defined.size.width != width || defined.size.height != height)
++            return 0;
++    }
++    texture->setInitState(GL_NONE, gl::ImageIndex::Make2D(0), gl::InitState::Initialized);
++    return rx::GetImplAs<rx::TextureGL>(texture)->getTextureID();
++}
+diff --git a/Source/WebCore/html/HTMLMediaElement.cpp b/Source/WebCore/html/HTMLMediaElement.cpp
+index 1678c1efa6..fa83ef49ae 100644
+--- a/Source/WebCore/html/HTMLMediaElement.cpp
++++ b/Source/WebCore/html/HTMLMediaElement.cpp
+@@ -8711,7 +8711,7 @@ void HTMLMediaElement::createMediaPlayer() WTF_IGNORES_THREAD_SAFETY_ANALYSIS
+     player->setMuted(effectiveMuted());
+     RefPtr page = document().page();
+     player->setPageIsVisible(!m_elementIsHidden);
+-    player->setViewportVisibility(viewportVisibility());
++    player->setViewportVisibility(playerViewportVisibility());
+     player->setInFullscreenOrPictureInPicture(isInFullscreenOrPictureInPicture());
+ 
+ #if PLATFORM(MAC)
+@@ -10230,7 +10230,7 @@ bool HTMLMediaElement::isVideoTooSmallForInlinePlayback()
+ void HTMLMediaElement::isVisibleInViewportChanged()
+ {
+     if (RefPtr player = m_player)
+-        player->setViewportVisibility(viewportVisibility());
++        player->setViewportVisibility(playerViewportVisibility());
+ 
+     queueTaskKeepingObjectAlive(*this, TaskSource::MediaElement, [](auto& element) {
+         if (element.isContextStopped())
+@@ -10316,6 +10316,20 @@ bool HTMLMediaElement::isVisibleInViewport() const
+     return renderer && renderer->visibleInViewportState() == VisibleInViewportState::Yes;
+ }
+ 
++// What the player is told (GStreamer suspends muted video that isn't visible).
++auto HTMLMediaElement::playerViewportVisibility() const -> ViewportVisibility
++{
++#if defined(PS5_PAYLOAD_SDK)
++    // A video never put in a document is a texture source (three.js and
++    // other WebGL players play it detached and draw its frames): suspended
++    // as invisible, it would stop at its first frame. Muted videos in the
++    // page that are scrolled away are still suspended (decoder budget).
++    if (!isConnected())
++        return ViewportVisibility::VisibleInViewport;
++#endif
++    return viewportVisibility();
++}
++
+ WEBCORE_EXPORT auto HTMLMediaElement::viewportVisibility() const -> ViewportVisibility
+ {
+     if (fullscreenMode() & VideoFullscreenModePictureInPicture)
+@@ -10383,7 +10397,7 @@ void HTMLMediaElement::setFullscreenMode(VideoFullscreenMode mode)
+     scheduleUpdateAcceleratedRenderingState();
+ 
+     if (RefPtr player = this->player())
+-        player->setViewportVisibility(viewportVisibility());
++        player->setViewportVisibility(playerViewportVisibility());
+ 
+     updatePlayerDynamicRangeLimit();
+ }
+@@ -10579,7 +10593,7 @@ void HTMLMediaElement::updateMediaPlayer(IntSize presentationSize, bool shouldMa
+     RefPtr player = m_player;
+     player->setPresentationSize(presentationSize);
+     visibilityStateChanged();
+-    player->setViewportVisibility(viewportVisibility());
++    player->setViewportVisibility(playerViewportVisibility());
+ 
+     if (protect(document())->quirks().needsVideoShouldMaintainAspectRatioQuirk())
+         shouldMaintainAspectRatio = true;
+diff --git a/Source/WebCore/html/HTMLMediaElement.h b/Source/WebCore/html/HTMLMediaElement.h
+index c0a6909811..929ec66225 100644
+--- a/Source/WebCore/html/HTMLMediaElement.h
++++ b/Source/WebCore/html/HTMLMediaElement.h
+@@ -636,6 +636,7 @@ public:
+     WEBCORE_EXPORT bool LEGACY_NODELETE isVisibleInViewport() const;
+     virtual bool isIntersectingViewport() const { return false; }
+     WEBCORE_EXPORT ViewportVisibility viewportVisibility() const;
++    ViewportVisibility playerViewportVisibility() const;
+     bool LEGACY_NODELETE hasEverNotifiedAboutPlaying() const;
+     void setShouldDelayLoadEvent(bool);
+ 
+diff --git a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+index c2cf1b858d..04284ddfa3 100644
+--- a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
++++ b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+@@ -67,6 +67,9 @@
+ #include "HTMLCanvasElement.h"
+ #include "HTMLImageElement.h"
+ #include "HTMLVideoElement.h"
++#if defined(PS5_PAYLOAD_SDK) && ENABLE(VIDEO)
++#include "MediaPlayerPrivate.h"
++#endif
+ #include "HostWindow.h"
+ #include "ImageBitmap.h"
+ #include "ImageBuffer.h"
+@@ -3587,6 +3590,21 @@ ExceptionOr<void> WebGLRenderingContextBase::texImageSource(TexImageFunctionID f
+     // elements' size for WebGL 1.0 as late as possible.
+     bool sourceImageRectIsDefault = inputSourceImageRect == sentinelEmptyRect() || inputSourceImageRect == IntRect(0, 0, source.videoWidth(), source.videoHeight());
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: hardware-decoded frames never reach this process; the title copies
++    // them into the texture (GraphicsContextGL::ps5CopyTextureFromVideoStream).
++    if (functionID == TexImageFunctionID::TexImage2D && sourceImageRectIsDefault && texture && target == GraphicsContextGL::TEXTURE_2D && !level
++        && format == GraphicsContextGL::RGBA && (internalformat == GraphicsContextGL::RGBA || internalformat == GraphicsContextGL::RGBA8)
++        && type == GraphicsContextGL::UNSIGNED_BYTE) {
++        if (RefPtr player = source.player()) {
++            if (uint64_t key = player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0) {
++                if (protect(graphicsContextGL())->ps5CopyTextureFromVideoStream(key, texture->object(), m_unpackFlipY))
++                    return { };
++            }
++        }
++    }
++#endif
++
+     // Go through the fast path doing a GPU-GPU textures copy without a readback to system memory if possible.
+     // Otherwise, it will fall back to the normal SW path.
+     // FIXME: The current restrictions require that format shoud be RGB or RGBA,
+diff --git a/Source/WebCore/platform/graphics/GraphicsContextGL.h b/Source/WebCore/platform/graphics/GraphicsContextGL.h
+index b53075d86c..d48477b677 100644
+--- a/Source/WebCore/platform/graphics/GraphicsContextGL.h
++++ b/Source/WebCore/platform/graphics/GraphicsContextGL.h
+@@ -1683,6 +1683,13 @@ public:
+ 
+ #if ENABLE(VIDEO)
+     virtual bool copyTextureFromVideoFrame(VideoFrame&, PlatformGLObject texture, GCGLenum target, GCGLint level, GCGLenum internalFormat, GCGLenum  format, GCGLenum type, bool premultiplyAlpha, bool flipY) = 0;
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5 remote WebGL: texImage2D(TEXTURE_2D, 0, RGBA, RGBA, UNSIGNED_BYTE,
++    // video) for a video the title decodes in hardware (its ps5videosink
++    // stream key): the title copies the newest frame into the texture on the
++    // GPU. False: not handled here.
++    virtual bool ps5CopyTextureFromVideoStream(uint64_t, PlatformGLObject, bool) { return false; }
++#endif
+     WEBCORE_EXPORT virtual RefPtr<NativeImage> videoFrameToNativeImage(VideoFrame&);
+ #endif
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+index 2361622dc7..7158d1e785 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+@@ -128,6 +128,10 @@ protected:
+     virtual void prepareForDisplay(Vector<uint64_t>&&, CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, UnixFileDescriptor&&, Vector<uint64_t>&&)>&&) = 0;
+ #else
+     void prepareForDisplay(CompletionHandler<void()>&&);
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: RemoteGraphicsContextGLPS5.cpp.
++    void copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, bool flipY);
+ #endif
+     void getErrors(CompletionHandler<void(GCGLErrorCodeSet)>&&);
+     void copyNativeImage(WebCore::GraphicsContextGL::SurfaceBuffer, RemoteNativeImageReference);
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+index b777b0ed4b..cf21851e7e 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+@@ -42,6 +42,9 @@ messages -> RemoteGraphicsContextGL Stream {
+ #endif
+ #if !PLATFORM(COCOA) && !ENABLE(WC_WEBGL) && !USE(GBM)
+     void PrepareForDisplay() -> () Synchronous
++#endif
++#if defined(PS5_PAYLOAD_SDK)
++    void CopyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, bool flipY)
+ #endif
+     void EnsureExtensionEnabled(WebCore::GCGLExtension extension) StreamBatched
+     void GetErrors() -> (GCGLErrorCodeSet returnValue) Synchronous
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+index e37b40bd7e..81f29dac8f 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/TextureMapper.h>
++#include <atomic>
+ #include <wtf/HashMap.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/Vector.h>
+@@ -119,6 +120,25 @@ void collectGarbage()
+     // Destroyed here, with the compositor's context current (their GL syncs).
+ }
+ 
++static std::atomic<CopyVideoFrameFunction> s_copyVideoFrame;
++static std::atomic<VideoFrameSizeFunction> s_videoFrameSize;
++
++void setVideoFrameFunctions(CopyVideoFrameFunction copy, VideoFrameSizeFunction size)
++{
++    s_videoFrameSize = size;
++    s_copyVideoFrame = copy;
++}
++
++CopyVideoFrameFunction copyVideoFrameFunction()
++{
++    return s_copyVideoFrame.load();
++}
++
++VideoFrameSizeFunction videoFrameSizeFunction()
++{
++    return s_videoFrameSize.load();
++}
++
+ } // namespace PS5WebGLLayers
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index 799656e24e..ae317d98da 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -59,6 +59,21 @@ RefPtr<PS5WebGLLayer> find(WebCore::ProcessIdentifier, uint64_t key);
+ // Render thread, compositor context current: destroys retired buffers.
+ void collectGarbage();
+ 
++// Video frames for texImage2D(video) (M3): PS5Renderer's functions
++// (PS5CompositorContext::copyVideoFrame, videoFrameSize), set by the
++// compositor's set-up; null before.
++using CopyVideoFrameFunction = void* (*)(uint64_t key, unsigned texture, bool flipY);
++using VideoFrameSizeFunction = bool (*)(uint64_t key, int* width, int* height);
++void setVideoFrameFunctions(CopyVideoFrameFunction, VideoFrameSizeFunction);
++CopyVideoFrameFunction copyVideoFrameFunction();
++VideoFrameSizeFunction videoFrameSizeFunction();
++// WebGL's work queue, a WebGL context current (PS5WebGLVideoCopy.cpp): the
++// newest frame of the stream into the texture's native object, the
++// context's next commands after it on the GPU. False: no frame, no copy.
++bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY);
++// eglBindAPI(EGL_OPENGL_ES_API) on this thread (ps5-opengl's EGL).
++void bindESAPI();
++
+ } // namespace PS5WebGLLayers
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+new file mode 100644
+index 0000000000..5dd8911739
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+@@ -0,0 +1,71 @@
++/*
++ * PS5: the native half of WebGL's video textures (M3, PS5WebGLLayers.h).
++ * ps5-opengl's EGL and GL through epoxy; ANGLE's headers can't be in the
++ * same file (RemoteGraphicsContextGLPS5.cpp has the ANGLE half).
++ */
++
++#include "config.h"
++#include "PS5WebGLLayers.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
++
++#include <WebCore/GLContext.h>
++#include <WebCore/PlatformDisplay.h>
++#include <epoxy/egl.h>
++#include <epoxy/gl.h>
++#include <wtf/NeverDestroyed.h>
++
++namespace WebKit {
++namespace PS5WebGLLayers {
++
++void bindESAPI()
++{
++    eglBindAPI(EGL_OPENGL_ES_API);
++}
++
++// A native ES context of the compositor's share group, current only for a
++// copy (PS5Renderer::copyVideoFrame binds its own framebuffers), so ANGLE's
++// native context keeps the state ANGLE thinks it has. WebGL's work queue only.
++static EGLContext copyContext()
++{
++    static NeverDestroyed<std::unique_ptr<WebCore::GLContext>> context;
++    static bool failed;
++    if (!context.get() && !failed) {
++        auto& display = WebCore::PlatformDisplay::sharedDisplay();
++        context.get() = WebCore::GLContext::create(display.glDisplay(), WebCore::GLContext::Target::Surfaceless, display.sharingGLContext());
++        failed = !context.get();
++        WTFLogAlways("[webgl] title: video copy context %s", failed ? "could not be made: video textures stay empty" : "ready");
++    }
++    return context.get() ? static_cast<EGLContext>(context.get()->platformContext()) : EGL_NO_CONTEXT;
++}
++
++bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY)
++{
++    auto copy = copyVideoFrameFunction();
++    EGLContext helper = copy ? copyContext() : EGL_NO_CONTEXT;
++    if (helper == EGL_NO_CONTEXT)
++        return false;
++    EGLDisplay display = eglGetCurrentDisplay();
++    EGLContext previous = eglGetCurrentContext();
++    EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
++    EGLSurface read = eglGetCurrentSurface(EGL_READ);
++    if (display == EGL_NO_DISPLAY || previous == EGL_NO_CONTEXT)
++        return false;
++    // ANGLE's (re)definition of the texture reaches the other context.
++    glFlush();
++    if (!eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, helper))
++        return false;
++    void* done = copy(key, nativeTexture, flipY);
++    eglMakeCurrent(display, draw, read, previous);
++    if (!done)
++        return false;
++    // ANGLE's next use of the texture comes after the copy (GPU side).
++    glWaitSync(static_cast<GLsync>(done), 0, GL_TIMEOUT_IGNORED);
++    glDeleteSync(static_cast<GLsync>(done));
++    return true;
++}
++
++} // namespace PS5WebGLLayers
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+index 60caac78bd..3bee437ab4 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -17,9 +17,11 @@
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/GraphicsContextGLCoordinated.h>
+ #include <WebCore/GraphicsLayerContentsDisplayDelegate.h>
+-#include <epoxy/egl.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
++// PS5 ANGLE (Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp).
++extern "C" unsigned ANGLE_PS5PrepareExternalTexture2D(unsigned name, int width, int height);
++
+ namespace WebKit {
+ 
+ namespace {
+@@ -104,7 +106,7 @@ void RemoteGraphicsContextGLPS5::platformWorkQueueInitialize(WebCore::GraphicsCo
+     const bool webGL2 = attributes.isWebGL2;
+     // ANGLE makes each native context with this thread's bound API: it must
+     // be ES (spikes/11-webgl, share-group rule 2).
+-    eglBindAPI(EGL_OPENGL_ES_API);
++    PS5WebGLLayers::bindESAPI();
+     m_context = GraphicsContextGLPS5::create(WTF::move(attributes), m_webProcess, m_key);
+     if (!m_context) {
+         WTFLogAlways("[webgl] title: no ANGLE context for a WebGL %d page (it gets a lost context)", webGL2 ? 2 : 1);
+@@ -137,6 +139,43 @@ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& comp
+     completionHandler();
+ }
+ 
++// texImage2D(video) for a hardware-decoded video (M3): the title's newest
++// converted frame of the stream, copied into the texture on the GPU.
++void RemoteGraphicsContextGL::copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, bool flipY)
++{
++    assertIsCurrent(workQueue());
++    // The page's name for the texture (the WebProcess makes its own names).
++    if (!texture || !m_objectNames.isValidKey(texture) || !m_objectNames.contains(texture))
++        return;
++    texture = m_objectNames.get(texture);
++    RefPtr context = m_context;
++    auto frameSize = PS5WebGLLayers::videoFrameSizeFunction();
++    int width = 0, height = 0;
++    if (!context || !frameSize || !frameSize(streamKey, &width, &height))
++        return; // no frame yet: the texture keeps what it had
++    // Each GraphicsContextGL call below makes the context current (the ANGLE
++    // call and the native copy need it).
++    using GL = WebCore::GraphicsContextGL;
++    const bool webGL2 = context->contextAttributes().isWebGL2;
++    PlatformGLObject boundTexture = context->getInteger(GL::TEXTURE_BINDING_2D);
++    PlatformGLObject unpackBuffer = webGL2 ? context->getInteger(GL::PIXEL_UNPACK_BUFFER_BINDING) : 0;
++    if (unpackBuffer)
++        context->bindBuffer(GL::PIXEL_UNPACK_BUFFER, 0);
++    context->bindTexture(GL::TEXTURE_2D, texture);
++    unsigned nativeTexture = ANGLE_PS5PrepareExternalTexture2D(texture, width, height);
++    context->bindTexture(GL::TEXTURE_2D, boundTexture);
++    if (unpackBuffer)
++        context->bindBuffer(GL::PIXEL_UNPACK_BUFFER, unpackBuffer);
++    static unsigned copies, failures;
++    if (!nativeTexture || !PS5WebGLLayers::copyVideoFrameNative(streamKey, nativeTexture, flipY)) {
++        if (!failures++)
++            WTFLogAlways("[webgl] title: video frame copy failed (texture %u, %dx%d, native %u)", texture, width, height, nativeTexture);
++        return;
++    }
++    if (!copies++)
++        WTFLogAlways("[webgl] title: first video frame copied into a WebGL texture, %dx%d%s", width, height, flipY ? ", flipped" : "");
++}
++
+ Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& connection, WebCore::GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+ {
+     auto instance = adoptRef(*new RemoteGraphicsContextGLPS5(connection, identifier, renderingBackend, WTF::move(streamConnection)));
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index 2f50261cc9..f1427d92b6 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -58,6 +58,7 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+         list(APPEND WebKit_SOURCES
+             GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+             GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++            GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+ 
+             UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 0307d34498..3f1d2cd6ca 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -640,6 +640,10 @@ bool SceneHost::setUp(const PS5CompositorContext& context)
+     BitmapTextureUploaderPS5::singleton().initialize();
+     // Video layers draw the renderer's converted frames (M4).
+     WCScene::setVideoTextureFunction(context.videoTexture);
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL)
++    // WebGL's video textures (texImage2D(video), M3).
++    PS5WebGLLayers::setVideoFrameFunctions(context.copyVideoFrame, context.videoFrameSize);
++#endif
+ 
+     // S1b: always a small check (a page that can't composite must stay on
+     // the CPU path); the full measurement in test mode.
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+index 5c7cdb6b3d..1a4ed7c4a0 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+@@ -58,9 +58,24 @@ private:
+     // WebCore::GraphicsContextGL
+     RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() final { return m_layerDelegate.ptr(); }
+     void prepareForDisplay() final;
++    bool ps5CopyTextureFromVideoStream(uint64_t streamKey, PlatformGLObject texture, bool flipY) final
++    {
++        if (isContextLost())
++            return false;
++        // In order with the page's other calls; the title waits for the copy
++        // on the GPU before the texture's next use.
++        if (send(Messages::RemoteGraphicsContextGL::CopyTextureFromVideoStreamPS5(streamKey, texture, flipY)) != IPC::Error::NoError) {
++            markContextLost();
++            return false;
++        }
++        if (!m_videoCopies++)
++            WTFLogAlways("[webgl] first video frame copy requested");
++        return true;
++    }
+ 
+     const Ref<WebGLLayerDelegatePS5> m_layerDelegate;
+     unsigned m_frames { 0 };
++    unsigned m_videoCopies { 0 };
+ };
+ 
+ void RemoteGraphicsContextGLProxyPS5::prepareForDisplay()

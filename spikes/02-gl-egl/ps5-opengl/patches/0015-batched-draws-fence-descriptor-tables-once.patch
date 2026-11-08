@@ -1,0 +1,144 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index ad83d82..5629eb2 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -2585,6 +2585,25 @@ ps5_flush_gpu_data(const void *address, size_t bytes)
+ #define ps5_flush_gpu_data(address, bytes) PS5_CACHE_MEASURE(ps5_flush_gpu_data, address, bytes)
+ #endif
+ 
++/* A batched draw (flush_cache set) flushes its vertex-buffer and vertex
++ * descriptor tables without a fence each and marks *pending; the fragment
++ * table's flush, where the draw has always fenced last, then fences once for
++ * all three (a fence waits for every older flush on this thread), or fences
++ * alone if that table is empty. Each fence waits for the flushes before it:
++ * three per draw were ~10% of the WebGL thread at 2000 draws per frame. */
++static void
++ps5_flush_draw_table(const void *address, size_t bytes, bool *pending)
++{
++   if (!pending) {
++      ps5_flush_gpu_data(address, bytes);
++      return;
++   }
++   if (!bytes)
++      return;
++   util_flush_range_no_fence((void *)address, bytes);
++   *pending = true;
++}
++
+ /* A draw may publish the completed private table after its last writer.
+  * Resource-data publication is separate and must never be deferred here. */
+ static void
+@@ -9978,6 +9997,8 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+    uint32_t *input_user_data;
+    uint32_t pixel_user_data[32] = {0};
+    size_t descriptor_bytes[2] = {0};
++   bool table_fence_pending = false;
++   bool *defer_table_fence = flush_cache ? &table_fence_pending : NULL;
+    unsigned point_coord_input = 0;
+    struct ps5_vertex_layout vertex_layout;
+    struct ps5_vertex_layout fragment_layout = {0};
+@@ -10577,8 +10598,8 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+       }
+       input_user_data[input_metadata->vertex_buffer_table_user_data_dword] =
+          (uint32_t)descriptor_address;
+-      ps5_flush_gpu_data(descriptor_resource->data,
+-                         descriptor_index * 16);
++      ps5_flush_draw_table(descriptor_resource->data,
++                           descriptor_index * 16, defer_table_fence);
+    }
+    if (tessellation_active &&
+        (!ps5_prepare_tessellation_buffers(context, input_metadata,
+@@ -10604,8 +10625,8 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+       return;
+    }
+    if (descriptor_bytes[0])
+-      ps5_flush_gpu_data(((struct ps5_resource *)context->descriptor_storage[0])->data,
+-                         descriptor_bytes[0]);
++      ps5_flush_draw_table(((struct ps5_resource *)context->descriptor_storage[0])->data,
++                           descriptor_bytes[0], defer_table_fence);
+    if (!tessellation_active &&
+        !ps5_prepare_vertex_storage(context, input_metadata, input_user_data,
+                                    input_user_data_count)) {
+@@ -10668,6 +10689,8 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+    if (descriptor_bytes[1])
+       ps5_flush_gpu_data(((struct ps5_resource *)context->descriptor_storage[1])->data,
+                          descriptor_bytes[1]);
++   else if (table_fence_pending)
++      __builtin_ia32_mfence(); /* Publishes the tables flushed unfenced above. */
+    if (streamout_active &&
+        !ps5_prepare_streamout(
+           context, vertex_metadata, descriptor_resource, user_data,
+diff --git a/tests/ps5/test_batched_draw_fences.py b/tests/ps5/test_batched_draw_fences.py
+new file mode 100644
+index 0000000..ace3bda
+--- /dev/null
++++ b/tests/ps5/test_batched_draw_fences.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""A batched draw flushes its first two descriptor tables without a fence
++each; the fragment table's flush, where the draw always fenced last, fences
++once for all three, and fences alone when that table is empty."""
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++screen = (root / "src/gallium/ps5/ps5_screen.c").read_text()
++
++a = screen.index("static void\nps5_flush_draw_table(")
++helper = screen[a:screen.index("\n}\n", a) + 3]
++code = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stddef.h>
++static unsigned unfenced, fenced;
++static void util_flush_range_no_fence(void *p, size_t n) { assert(p && n); ++unfenced; }
++static void ps5_flush_gpu_data(const void *p, size_t n) { assert(p); (void)n; ++fenced; }
++''' + helper + r'''
++int main(void) {
++    char table[64];
++    bool pending = false;
++    ps5_flush_draw_table(table, 0, &pending); /* Nothing to flush. */
++    assert(!unfenced && !fenced && !pending);
++    ps5_flush_draw_table(table, 64, &pending);
++    assert(unfenced == 1 && !fenced && pending);
++    ps5_flush_draw_table(table, 64, NULL); /* Unbatched: fenced as before. */
++    assert(unfenced == 1 && fenced == 1);
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory() as tmp:
++    exe = Path(tmp) / "draw-fences"
++    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-x", "c",
++                    "-o", str(exe), "-"], input=code, text=True, check=True)
++    subprocess.run([str(exe)], check=True)
++
++draw = screen[screen.index("\nps5_draw_vbo_locked(struct pipe_context *base,"):]
++draw = draw[:draw.index("\n}\n")]
++flat = re.sub(r"\s+", " ", draw)
++# Deferred only for batched draws (the deferred queue and multi-draw chunks).
++assert "bool table_fence_pending = false;" in flat
++assert "bool *defer_table_fence = flush_cache ? &table_fence_pending : NULL;" in flat
++sites = re.findall(r"ps5_flush_draw_table\((.*?)\);", flat)
++assert len(sites) == 2, sites
++assert sites[0].startswith("descriptor_resource->data, descriptor_index * 16,"), sites
++assert "descriptor_storage[0])->data" in sites[1], sites
++assert all(s.endswith(", defer_table_fence") for s in sites), sites
++# The fragment table keeps its fenced flush; without one, a lone fence.
++last = ("if (descriptor_bytes[1]) ps5_flush_gpu_data(((struct ps5_resource *)"
++        "context->descriptor_storage[1])->data, descriptor_bytes[1]); "
++        "else if (table_fence_pending) __builtin_ia32_mfence();")
++assert flat.count(last) == 1, "fragment-table fence"
++# Nothing between the first unfenced flush and that fence submits work or
++# leaves the draw except by dropping it.
++first = flat.index("ps5_flush_draw_table(")
++span = flat[first:flat.index(last)]
++assert "ps5_agc_gate2_run" not in span and "submit" not in span.lower(), "submission"
++for ret in re.finditer(r"return\b[^;]*;", span):
++    before = span[max(0, ret.start() - 60):ret.start()]
++    assert "last_draw_status = -" in before, before
++callers = [re.sub(r"\s+", " ", c) for c in re.findall(r"ps5_draw_vbo_locked\(base,[^;]*;", screen)]
++flush_args = sorted({re.search(r", ([^,]+), [^,]+\);$", c).group(1) for c in callers})
++assert flush_args == ["&flush_cache", "&ps5_deferred.flush_cache", "NULL"], flush_args
++print("PASS: batched draws fence their descriptor tables once, at the fragment table")

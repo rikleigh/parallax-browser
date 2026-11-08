@@ -1,0 +1,137 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 11caade..8af4a14 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -3419,6 +3419,31 @@ ps5_metadata_has_indirect_ubo(const PsbcShaderMetadata *metadata,
+    return false;
+ }
+ 
++/* Recycled descriptor storage holds the previous draw's descriptors. Constant
++ * preparation runs first on this prefix, so clear every slot the shader can
++ * address before the per-type writers fill theirs; bytes outside the shader's
++ * bindings are never read. Merged stages, or a binding outside the prefix,
++ * keep the whole clear. */
++static void
++ps5_clear_descriptor_prefix(uint8_t *data, const PsbcShaderMetadata *metadata,
++                            bool whole)
++{
++   for (unsigned i = 0; !whole && i < metadata->descriptor_binding_count; ++i) {
++      const PsbcDescriptorBinding *binding = &metadata->descriptor_bindings[i];
++      whole = binding->set ||
++         (uint64_t)binding->offset + (uint64_t)binding->array_size * binding->stride >
++            PS5_CONSTANT_DATA_OFFSET;
++   }
++   if (whole) {
++      memset(data, 0, PS5_CONSTANT_DATA_OFFSET);
++      return;
++   }
++   for (unsigned i = 0; i < metadata->descriptor_binding_count; ++i) {
++      const PsbcDescriptorBinding *binding = &metadata->descriptor_bindings[i];
++      memset(data + binding->offset, 0, (size_t)binding->array_size * binding->stride);
++   }
++}
++
+ static bool
+ ps5_prepare_constant(struct ps5_context *context,
+                      const struct ps5_shader *shader, unsigned slot,
+@@ -3490,7 +3515,8 @@ ps5_prepare_constant(struct ps5_context *context,
+       return false;
+ 
+    if (!storage_fs)
+-      memset(storage->data, 0, PS5_CONSTANT_DATA_OFFSET);
++      ps5_clear_descriptor_prefix(storage->data, metadata,
++         merged_geometry || context->gs || context->tcs || context->tes);
+    for (index = 0; index < metadata->descriptor_binding_count; ++index) {
+       const PsbcDescriptorBinding *binding =
+          &metadata->descriptor_bindings[index];
+diff --git a/tests/ps5/test_descriptor_prefix_clear.py b/tests/ps5/test_descriptor_prefix_clear.py
+new file mode 100644
+index 0000000..2a9f564
+--- /dev/null
++++ b/tests/ps5/test_descriptor_prefix_clear.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""Exercise ps5_clear_descriptor_prefix: listed slots only, whole-prefix fallbacks.
++
++Host check only; native pixels with recycled descriptor storage remain required.
++"""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'src/gallium/ps5/ps5_screen.c').read_text()
++start = source.index('static void\nps5_clear_descriptor_prefix(')
++helper = source[start:source.index('\n}', start) + 2]
++code = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#define PS5_CONSTANT_DATA_OFFSET 4096u
++#define PSBC_MAX_DESCRIPTOR_BINDINGS 128
++typedef struct { uint8_t set, binding; int type; uint32_t array_size, offset, stride; } PsbcDescriptorBinding;
++typedef struct { uint32_t descriptor_binding_count;
++                 PsbcDescriptorBinding descriptor_bindings[PSBC_MAX_DESCRIPTOR_BINDINGS]; } PsbcShaderMetadata;
++''' + helper + r'''
++static uint8_t data[PS5_CONSTANT_DATA_OFFSET + 64];
++static void poison(void) { memset(data, 0xa5, sizeof(data)); }
++static void expect(uint32_t begin, uint32_t end, bool zero) {
++ for (uint32_t i = begin; i < end; ++i) assert(data[i] == (zero ? 0 : 0xa5));
++}
++int main(void) {
++ PsbcShaderMetadata m = {0};
++ // A UBO, a texture array and a storage buffer, out of order.
++ m.descriptor_bindings[m.descriptor_binding_count++] = (PsbcDescriptorBinding){0, 40, 1, 1, 0x300, 16};
++ m.descriptor_bindings[m.descriptor_binding_count++] = (PsbcDescriptorBinding){0, 0, 2, 3, 0x30, 48};
++ m.descriptor_bindings[m.descriptor_binding_count++] = (PsbcDescriptorBinding){0, 60, 3, 1, 0x800, 16};
++ poison(); ps5_clear_descriptor_prefix(data, &m, false);
++ expect(0, 0x30, false); expect(0x30, 0xc0, true); expect(0xc0, 0x300, false);
++ expect(0x300, 0x310, true); expect(0x310, 0x800, false); expect(0x800, 0x810, true);
++ expect(0x810, sizeof(data), false);
++ // Merged stages keep the whole clear.
++ poison(); ps5_clear_descriptor_prefix(data, &m, true);
++ expect(0, PS5_CONSTANT_DATA_OFFSET, true); expect(PS5_CONSTANT_DATA_OFFSET, sizeof(data), false);
++ // A binding ending exactly at the prefix is fine; one byte past falls back.
++ m.descriptor_bindings[2] = (PsbcDescriptorBinding){0, 60, 3, 2, PS5_CONSTANT_DATA_OFFSET - 32, 16};
++ poison(); ps5_clear_descriptor_prefix(data, &m, false);
++ expect(0x310, PS5_CONSTANT_DATA_OFFSET - 32, false); expect(PS5_CONSTANT_DATA_OFFSET - 32, PS5_CONSTANT_DATA_OFFSET, true);
++ expect(PS5_CONSTANT_DATA_OFFSET, sizeof(data), false);
++ m.descriptor_bindings[2].offset += 1;
++ poison(); ps5_clear_descriptor_prefix(data, &m, false);
++ expect(0, PS5_CONSTANT_DATA_OFFSET, true); expect(PS5_CONSTANT_DATA_OFFSET, sizeof(data), false);
++ // A count that would overflow 32 bits falls back rather than wrapping.
++ m.descriptor_bindings[2] = (PsbcDescriptorBinding){0, 60, 3, 0x10000001u, 0x800, 0x10};
++ poison(); ps5_clear_descriptor_prefix(data, &m, false);
++ expect(0, PS5_CONSTANT_DATA_OFFSET, true); expect(PS5_CONSTANT_DATA_OFFSET, sizeof(data), false);
++ // A non-zero set is not this table's layout.
++ m.descriptor_bindings[2] = (PsbcDescriptorBinding){1, 60, 3, 1, 0x800, 16};
++ poison(); ps5_clear_descriptor_prefix(data, &m, false);
++ expect(0, PS5_CONSTANT_DATA_OFFSET, true);
++ // No bindings clears nothing.
++ m.descriptor_binding_count = 0;
++ poison(); ps5_clear_descriptor_prefix(data, &m, false);
++ expect(0, sizeof(data), false);
++ puts("PASS descriptor prefix clear: listed slots only, merged/outside/overflow/set fallbacks");
++}
++'''
++with tempfile.TemporaryDirectory() as directory:
++    exe = str(Path(directory) / 'check')
++    subprocess.run(['clang-18', '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
++                    '-x', 'c', '-', '-o', exe], input=code, text=True, check=True)
++    subprocess.run([exe], check=True, timeout=30)
+diff --git a/tests/ps5/test_vertex_snapshot.py b/tests/ps5/test_vertex_snapshot.py
+index a25cfe0..d9735f3 100644
+--- a/tests/ps5/test_vertex_snapshot.py
++++ b/tests/ps5/test_vertex_snapshot.py
+@@ -14,7 +14,7 @@ helper = source[start:source.index('\n}', start) + 2]
+ # The skipped prefix must still be cleared before texture preparation/enqueue.
+ constant = source[source.index('ps5_prepare_constant(struct'):source.index('ps5_tessellation_buffer_layout(')]
+ assert 'if (!expected_ubo_count)\n      return true;' in constant
+-assert 'if (!storage_fs)\n      memset(storage->data, 0, PS5_CONSTANT_DATA_OFFSET);' in constant
++assert 'if (!storage_fs)\n      ps5_clear_descriptor_prefix(storage->data, metadata,\n         merged_geometry || context->gs || context->tcs || context->tes);' in constant
+ draw = source[source.index('ps5_draw_vbo_locked(struct'):source.index('ps5_multidraw_eligible(struct')]
+ for shader in ('vs', 'fs'):
+     assert draw.index(f'ps5_prepare_constant(context, context->{shader},') < draw.index(f'ps5_prepare_texture(context, context->{shader},')

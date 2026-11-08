@@ -1,0 +1,313 @@
+<!doctype html>
+<!-- WebGL M4 check (spikes/11-webgl): depth/stencil clears of 4x MSAA
+     targets reach every sample. For each target a draw first sets every
+     sample (depth 0 with depthFunc ALWAYS, or stencil 0x55 with REPLACE),
+     then the clear under test runs, then a quad is drawn that passes only
+     where the clear value is (depth 0.5 with LESS, stencil EQUAL 0). The
+     target is resolved and read: a sample the clear missed keeps the old
+     value, fails the test and leaves the resolved pixel at about 1/4 or
+     3/4 of the colour. Targets: 4x renderbuffers of each depth format, the
+     same at 1x (the control) and the default framebuffer of an antialiased
+     canvas (what three.js uses). Cases: depth, stencil, depth+stencil,
+     colour+depth+stencil in one call, and a scissored depth clear (left half
+     cleared, right half not). Log lines: RESULT webgl-msaa-clear
+     <target> <case> PASS|FAIL. ?bench=1 afterwards: a 1920x1080 antialiased
+     canvas cleared (colour, depth, stencil) and 200 small quads drawn per
+     frame for 10 s; the title's [webgl] lines give the WebGL thread's time per
+     frame. Upload to /data/ps5webkit/webgl-msaa-clear.html and open
+     file:///data/ps5webkit/webgl-msaa-clear.html[?bench=1]. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL MSAA clears</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 256px; height: 256px; border: 2px solid #555; margin-right: 12px; }
+  #bench { display: none; position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; border: 0; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>WebGL MSAA clears</h1>
+<canvas id="c" width="512" height="512"></canvas><canvas id="aa" width="512" height="512"></canvas>
+<div id="out">starting</div>
+<canvas id="bench" width="1920" height="1080"></canvas>
+<script>
+const params = new URLSearchParams(location.search);
+const out = document.getElementById('out');
+const lines = [];
+let failures = 0;
+function log(text) { console.log('[webgl-msaa-clear] ' + text); }
+function result(name, pass, detail) {
+  if (!pass) ++failures;
+  const line = 'RESULT webgl-msaa-clear ' + name + ' ' + (pass ? 'PASS' : 'FAIL') + (detail ? ' ' + detail : '');
+  lines.push(line);
+  out.textContent = lines.join('\n');
+  log(line);
+}
+
+const SIZE = 512;
+
+function setup(gl) {
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, `#version 300 es
+    uniform float z;
+    void main() {
+      vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+      gl_Position = vec4(p, z, 1.0);
+    }`);
+  gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, `#version 300 es
+    precision mediump float;
+    uniform vec4 color;
+    out vec4 fragColor;
+    void main() { fragColor = color; }`);
+  gl.compileShader(fs);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+    log('link failed: ' + gl.getProgramInfoLog(program) + gl.getShaderInfoLog(vs) + gl.getShaderInfoLog(fs));
+  gl.useProgram(program);
+  gl.bindVertexArray(gl.createVertexArray());
+  return { z: gl.getUniformLocation(program, 'z'), color: gl.getUniformLocation(program, 'color') };
+}
+
+/* A full-screen triangle at NDC depth z (window depth (z + 1) / 2). */
+function quad(gl, u, z, color) {
+  gl.uniform1f(u.z, z);
+  gl.uniform4fv(u.color, color || [1, 1, 1, 1]);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function resetState(gl) {
+  gl.disable(gl.SCISSOR_TEST);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.STENCIL_TEST);
+  gl.colorMask(true, true, true, true);
+  gl.depthMask(true);
+  gl.stencilMask(0xff);
+  gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+  gl.viewport(0, 0, SIZE, SIZE);
+}
+
+/* Every sample's depth to 0 and/or stencil to 0x55, colour black. */
+function prime(gl, u, depth, stencil) {
+  resetState(gl);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.colorMask(false, false, false, false);
+  if (depth) {
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.ALWAYS);
+  }
+  if (stencil) {
+    gl.enable(gl.STENCIL_TEST);
+    gl.stencilFunc(gl.ALWAYS, 0x55, 0xff);
+    gl.stencilOp(gl.REPLACE, gl.REPLACE, gl.REPLACE);
+  }
+  quad(gl, u, -1.0);
+  resetState(gl);
+}
+
+/* The quad that passes only where depth is 1 and/or stencil is 0. */
+function probe(gl, u, depth, stencil, color) {
+  resetState(gl);
+  if (depth) {
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.depthMask(false);
+  }
+  if (stencil) {
+    gl.enable(gl.STENCIL_TEST);
+    gl.stencilFunc(gl.EQUAL, 0, 0xff);
+  }
+  quad(gl, u, 0.0, color);
+  resetState(gl);
+}
+
+const POINTS = [[8, 8], [SIZE - 9, 8], [SIZE / 2, SIZE / 2], [8, SIZE - 9], [SIZE - 9, SIZE - 9],
+                [SIZE / 4, SIZE / 2], [3 * SIZE / 4, SIZE / 2]];
+
+/* read(x, y) returns [r, g, b, a] of the resolved target. */
+function check(name, read, expect) {
+  const bad = [];
+  for (const [x, y] of POINTS) {
+    const want = expect(x, y);
+    const got = read(x, y);
+    if (want.some((v, i) => Math.abs(v - got[i]) > 2))
+      bad.push(`(${x},${y}) ${got.slice(0, 3).join(',')} want ${want.slice(0, 3).join(',')}`);
+  }
+  result(name, bad.length === 0, bad.slice(0, 3).join('; '));
+}
+
+const RED = [1, 0, 0, 1], GREEN = [0, 1, 0, 1], BLUE = [0, 0, 1, 1], WHITE = [1, 1, 1, 1];
+const px = c => c.map(v => v * 255);
+
+function runCases(target, gl, u, bindDraw, read, hasStencil) {
+  const all = () => true;
+  const err0 = gl.getError();
+  if (err0) log(target + ' GL error before: ' + err0);
+
+  bindDraw();
+  prime(gl, u, true, false);
+  gl.clearDepth(1.0);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+  probe(gl, u, true, false, RED);
+  check(target + ' depth', read, () => px(RED));
+
+  if (hasStencil) {
+    bindDraw();
+    prime(gl, u, false, true);
+    gl.clearStencil(0);
+    gl.clear(gl.STENCIL_BUFFER_BIT);
+    probe(gl, u, false, true, GREEN);
+    check(target + ' stencil', read, () => px(GREEN));
+
+    bindDraw();
+    prime(gl, u, true, true);
+    gl.clear(gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+    probe(gl, u, true, true, BLUE);
+    check(target + ' depth+stencil', read, () => px(BLUE));
+  }
+
+  bindDraw();
+  prime(gl, u, true, hasStencil);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | (hasStencil ? gl.STENCIL_BUFFER_BIT : 0));
+  probe(gl, u, true, hasStencil, WHITE);
+  check(target + ' color+depth' + (hasStencil ? '+stencil' : ''), read, () => px(WHITE));
+
+  bindDraw();
+  prime(gl, u, true, false);
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(0, 0, SIZE / 2, SIZE);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.SCISSOR_TEST);
+  probe(gl, u, true, false, RED);
+  check(target + ' scissored-depth', read, x => x < SIZE / 2 ? px(RED) : [0, 0, 0, 255]);
+
+  const err = gl.getError();
+  if (err) result(target + ' gl-error', false, String(err));
+}
+
+function renderbufferCases() {
+  const gl = document.getElementById('c').getContext('webgl2', { antialias: false, depth: false, stencil: false });
+  if (!gl) { result('context', false, 'no WebGL 2'); return; }
+  const u = setup(gl);
+  const maxSamples = gl.getParameter(gl.MAX_SAMPLES);
+  log('MAX_SAMPLES ' + maxSamples);
+
+  const resolveFb = gl.createFramebuffer();
+  const resolveRb = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, resolveRb);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, SIZE, SIZE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, resolveFb);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, resolveRb);
+  const pixel = new Uint8Array(4);
+
+  const formats = [
+    ['DEPTH24_STENCIL8', gl.DEPTH24_STENCIL8, gl.DEPTH_STENCIL_ATTACHMENT, true],
+    ['DEPTH32F_STENCIL8', gl.DEPTH32F_STENCIL8, gl.DEPTH_STENCIL_ATTACHMENT, true],
+    ['DEPTH_COMPONENT24', gl.DEPTH_COMPONENT24, gl.DEPTH_ATTACHMENT, false],
+    ['DEPTH_COMPONENT32F', gl.DEPTH_COMPONENT32F, gl.DEPTH_ATTACHMENT, false],
+    ['DEPTH_COMPONENT16', gl.DEPTH_COMPONENT16, gl.DEPTH_ATTACHMENT, false],
+  ];
+  for (const samples of [4, 0]) {
+    for (const [formatName, format, attachment, hasStencil] of formats) {
+      const target = (samples ? 'msaa4' : 'msaa0') + '-' + formatName;
+      const fb = gl.createFramebuffer();
+      const color = gl.createRenderbuffer();
+      const depth = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, color);
+      gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, SIZE, SIZE);
+      gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+      gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, format, SIZE, SIZE);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, color);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, attachment, gl.RENDERBUFFER, depth);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        result(target + ' framebuffer', false, 'status ' + status);
+        continue;
+      }
+      let resolved = false;
+      const bindDraw = () => { gl.bindFramebuffer(gl.FRAMEBUFFER, fb); resolved = false; };
+      const read = (x, y) => {
+        if (!resolved) {
+          gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fb);
+          gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, resolveFb);
+          gl.blitFramebuffer(0, 0, SIZE, SIZE, 0, 0, SIZE, SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, resolveFb);
+          resolved = true;
+        }
+        gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+        return Array.from(pixel);
+      };
+      runCases(target, gl, u, bindDraw, read, hasStencil);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(fb);
+      gl.deleteRenderbuffer(color);
+      gl.deleteRenderbuffer(depth);
+    }
+  }
+  /* What the page showed last: the 1x DEPTH_COMPONENT16 scissored case. */
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, resolveFb);
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+  gl.blitFramebuffer(0, 0, SIZE, SIZE, 0, 0, SIZE, SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+}
+
+function defaultFramebufferCases() {
+  const gl = document.getElementById('aa').getContext('webgl2', { antialias: true, depth: true, stencil: true });
+  if (!gl) { result('aa-context', false, 'no WebGL 2'); return; }
+  const u = setup(gl);
+  log('default framebuffer SAMPLES ' + gl.getParameter(gl.SAMPLES) +
+      ' STENCIL_BITS ' + gl.getParameter(gl.STENCIL_BITS));
+  const pixel = new Uint8Array(4);
+  runCases('canvas-aa', gl, u, () => gl.bindFramebuffer(gl.FRAMEBUFFER, null), (x, y) => {
+    gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return Array.from(pixel);
+  }, gl.getParameter(gl.STENCIL_BITS) > 0);
+}
+
+function bench() {
+  const canvas = document.getElementById('bench');
+  canvas.style.display = 'block';
+  const gl = canvas.getContext('webgl2', { antialias: true, depth: true, stencil: true });
+  const u = setup(gl);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  const start = performance.now();
+  let frames = 0;
+  function frame(now) {
+    const t = (now - start) / 1000;
+    gl.clearColor(0.1, 0.1, 0.15 + 0.1 * Math.sin(t), 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+    for (let i = 0; i < 200; ++i) {
+      gl.viewport((i % 20) * 96, Math.floor(i / 20) * 108, 64, 64);
+      quad(gl, u, 0.99 - i * 0.004, [i / 200, 0.5, 1 - i / 200, 1]);
+    }
+    ++frames;
+    if (now - start < 10000) {
+      requestAnimationFrame(frame);
+    } else {
+      const line = `RESULT webgl-msaa-clear bench ${(frames * 1000 / (now - start)).toFixed(1)} fps (1920x1080 4x, clear + 200 draws)`;
+      lines.push(line);
+      out.textContent = lines.join('\n');
+      log(line);
+      canvas.style.display = 'none';
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+renderbufferCases();
+defaultFramebufferCases();
+log('done: ' + failures + ' failures');
+if (params.get('bench') === '1')
+  setTimeout(bench, 500);
+</script>
+</body>
+</html>

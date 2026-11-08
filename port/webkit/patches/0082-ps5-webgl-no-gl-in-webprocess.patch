@@ -1,0 +1,48 @@
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+index 865a6dc538..039f911382 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+@@ -151,7 +151,7 @@ uint64_t BitmapTexturePool::sizeInBytes()
+ void BitmapTexturePool::scheduleReleaseUnusedTextures()
+ {
+     assertIsHeld(m_lock);
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS) && defined(PS5_PAYLOAD_SDK)
++#if USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) // the compositor is in the title, GPU process or not
+     // The PS5 compositor runs TextureMapper on the title's render thread, in
+     // a context no other thread may use; WCScene releases unused textures
+     // there on every update (TextureMapper::releaseUnusedTexturesNow). The
+@@ -237,7 +237,7 @@ void BitmapTexturePool::enterLimitExceededModeIfNeeded()
+         m_onLimitExceededMode = true;
+         m_releaseUnusedSecondsTolerance = s_releaseUnusedSecondsToleranceOnLimitExceeded;
+         m_releaseUnusedTexturesTimerInterval = s_releaseUnusedTexturesTimerIntervalOnLimitExceeded;
+-#if USE(GRAPHICS_LAYER_WC) && !ENABLE(GPU_PROCESS) && defined(PS5_PAYLOAD_SDK)
++#if USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) // the compositor is in the title, GPU process or not
+         // No main-thread timer on PS5 (see scheduleReleaseUnusedTextures): the
+         // next WCScene update releases with the shorter tolerance. The timer
+         // ran on the title's main thread without a GL context and aborted in
+diff --git a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+index f789c48aaf..8148adb000 100644
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+@@ -1314,6 +1314,21 @@ std::unique_ptr<WebCore::WorkerClient> WebChromeClient::createWorkerClient(Seria
+ #if ENABLE(WEBGL)
+ RefPtr<GraphicsContextGL> WebChromeClient::createGraphicsContextGL(const GraphicsContextGLAttributes& attributes) const
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: no GL in the WebProcess (an elfldr payload, no libEGL: libepoxy
++    // aborts on the first EGL call). WebGL is remote only, drawn in the title
++    // (UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp).
++#if ENABLE(GPU_PROCESS)
++    if (WebProcess::singleton().shouldUseRemoteRenderingForWebGL()) {
++        RefPtr page = m_page.get();
++        if (!page)
++            return nullptr;
++        return RemoteGraphicsContextGLProxy::create(attributes, page.releaseNonNull());
++    }
++#endif
++    UNUSED_PARAM(attributes);
++    return nullptr;
++#endif
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+     WebProcess::singleton().initializePlatformDisplayIfNeeded();
+     WebProcess::singleton().initializeVulkanIfNeeded();

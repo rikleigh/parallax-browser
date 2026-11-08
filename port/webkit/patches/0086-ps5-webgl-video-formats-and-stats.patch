@@ -1,0 +1,582 @@
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp
+index 5ab107397d..2fbee472f4 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp
+@@ -9,32 +9,91 @@
+ 
+ #include "libANGLE/Context.h"
+ #include "libANGLE/Texture.h"
++#include "libANGLE/formatutils.h"
+ #include "libANGLE/renderer/gl/TextureGL.h"
+ #include "libGLESv2/entry_points_gles_2_0_autogen.h"
+ #include "libGLESv2/global_state.h"
+ 
++namespace
++{
++// The 8-bit colour formats a blit from an RGBA8 frame can write as they are.
++bool IsVideoCopyFormat(GLenum sizedInternalFormat)
++{
++    switch (sizedInternalFormat)
++    {
++        case GL_RGBA8:
++        case GL_RGB8:
++        case GL_SRGB8_ALPHA8:
++        case GL_SRGB8:
++            return true;
++        default:
++            return false;
++    }
++}
++}  // namespace
++
+ // The texture must be bound to GL_TEXTURE_2D on the active unit, and no
+-// pixel unpack buffer bound. Level 0 is (re)defined as width x height RGBA8
+-// unless it already is; returns the native texture name, 0 if `name` is not
+-// a mutable 2D texture of the current context.
+-extern "C" ANGLE_EXPORT GLuint GL_APIENTRY ANGLE_PS5PrepareExternalTexture2D(GLuint name, GLsizei width, GLsizei height)
++// pixel unpack buffer bound.
++//
++// internalFormat != 0 (texImage2D): level 0 is (re)defined as width x height
++// with the page's internalFormat/format/type (through the entry point, with
++// its validation) unless it already is; the texture must be mutable.
++// internalFormat == 0 (texSubImage2D at 0,0): level 0 stays as it is and must
++// be at least width x height in one of the formats above.
++//
++// Returns the native texture name, 0 if the texture isn't fit (nothing is
++// copied then).
++extern "C" ANGLE_EXPORT GLuint GL_APIENTRY ANGLE_PS5PrepareExternalTexture2D(GLuint name,
++                                                                            GLsizei width,
++                                                                            GLsizei height,
++                                                                            GLenum internalFormat,
++                                                                            GLenum format,
++                                                                            GLenum type)
+ {
+     gl::Context *context = gl::GetValidGlobalContext();
+     if (!context || !name || width <= 0 || height <= 0)
+         return 0;
+     gl::Texture *texture = context->getTexture(gl::TextureID{name});
+-    if (!texture || texture->getType() != gl::TextureType::_2D || texture->getImmutableFormat())
++    if (!texture || texture->getType() != gl::TextureType::_2D)
+         return 0;
+ 
+     const gl::ImageDesc &desc = texture->getState().getImageDesc(gl::TextureTarget::_2D, 0);
+-    if (desc.size.width != width || desc.size.height != height || !desc.format.valid() ||
+-        desc.format.info->sizedInternalFormat != GL_RGBA8)
++    if (internalFormat)
++    {
++        if (texture->getImmutableFormat())
++            return 0;
++        const GLenum wanted = gl::GetInternalFormatInfo(internalFormat, type).sizedInternalFormat;
++        if (!IsVideoCopyFormat(wanted))
++            return 0;
++        if (desc.size.width != width || desc.size.height != height || !desc.format.valid() ||
++            desc.format.info->sizedInternalFormat != wanted)
++        {
++            GL_TexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internalFormat), width, height, 0,
++                          format, type, nullptr);
++            const gl::ImageDesc &defined =
++                texture->getState().getImageDesc(gl::TextureTarget::_2D, 0);
++            if (defined.size.width != width || defined.size.height != height ||
++                !defined.format.valid() || defined.format.info->sizedInternalFormat != wanted)
++                return 0;
++        }
++    }
++    else if (desc.size.width < width || desc.size.height < height || !desc.format.valid() ||
++             !IsVideoCopyFormat(desc.format.info->sizedInternalFormat))
++    {
++        return 0;
++    }
++
++    if (internalFormat || (desc.size.width == width && desc.size.height == height))
++    {
++        texture->setInitState(GL_NONE, gl::ImageIndex::Make2D(0), gl::InitState::Initialized);
++    }
++    else if (texture->initState(GL_NONE, gl::ImageIndex::Make2D(0)) != gl::InitState::Initialized)
+     {
+-        GL_TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+-        const gl::ImageDesc &defined = texture->getState().getImageDesc(gl::TextureTarget::_2D, 0);
+-        if (defined.size.width != width || defined.size.height != height)
++        // A copy into part of level 0: clear it now, as a texSubImage2D
++        // would, not at first use (after the copy).
++        if (texture->ensureInitialized(context, gl::EnsureInitializedLevels::BaseOnly) !=
++            angle::Result::Continue)
+             return 0;
+     }
+-    texture->setInitState(GL_NONE, gl::ImageIndex::Make2D(0), gl::InitState::Initialized);
+     return rx::GetImplAs<rx::TextureGL>(texture)->getTextureID();
+ }
+diff --git a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+index 04284ddfa3..d5dff1c013 100644
+--- a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
++++ b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+@@ -3592,14 +3592,48 @@ ExceptionOr<void> WebGLRenderingContextBase::texImageSource(TexImageFunctionID f
+ 
+ #if defined(PS5_PAYLOAD_SDK)
+     // PS5: hardware-decoded frames never reach this process; the title copies
+-    // them into the texture (GraphicsContextGL::ps5CopyTextureFromVideoStream).
+-    if (functionID == TexImageFunctionID::TexImage2D && sourceImageRectIsDefault && texture && target == GraphicsContextGL::TEXTURE_2D && !level
+-        && format == GraphicsContextGL::RGBA && (internalformat == GraphicsContextGL::RGBA || internalformat == GraphicsContextGL::RGBA8)
+-        && type == GraphicsContextGL::UNSIGNED_BYTE) {
+-        if (RefPtr player = source.player()) {
+-            if (uint64_t key = player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0) {
+-                if (protect(graphicsContextGL())->ps5CopyTextureFromVideoStream(key, texture->object(), m_unpackFlipY))
+-                    return { };
++    // them into the texture (GraphicsContextGL::ps5CopyTextureFromVideoStream):
++    // texImage2D into level 0 of a 2D texture as 8-bit RGBA, RGB or sRGB, or
++    // texSubImage2D of the whole frame at 0,0 into one (internalformat 0).
++    if (sourceImageRectIsDefault && texture && target == GraphicsContextGL::TEXTURE_2D && !level && type == GraphicsContextGL::UNSIGNED_BYTE) {
++        auto copyFormat = [&]() -> std::optional<GCGLenum> {
++            if (functionID == TexImageFunctionID::TexSubImage2D) {
++                if (xoffset || yoffset)
++                    return std::nullopt;
++                switch (format) {
++                case GraphicsContextGL::RGBA:
++                case GraphicsContextGL::RGB:
++                case GraphicsContextGL::SRGB_ALPHA_EXT:
++                case GraphicsContextGL::SRGB_EXT:
++                    return 0;
++                default:
++                    return std::nullopt;
++                }
++            }
++            if (functionID != TexImageFunctionID::TexImage2D)
++                return std::nullopt;
++            switch (internalformat) {
++            case GraphicsContextGL::RGBA:
++            case GraphicsContextGL::RGBA8:
++            case GraphicsContextGL::SRGB8_ALPHA8:
++                return format == GraphicsContextGL::RGBA ? std::optional<GCGLenum>(internalformat) : std::nullopt;
++            case GraphicsContextGL::RGB:
++            case GraphicsContextGL::RGB8:
++            case GraphicsContextGL::SRGB8:
++                return format == GraphicsContextGL::RGB ? std::optional<GCGLenum>(internalformat) : std::nullopt;
++            case GraphicsContextGL::SRGB_ALPHA_EXT:
++            case GraphicsContextGL::SRGB_EXT:
++                return format == static_cast<GCGLenum>(internalformat) ? std::optional<GCGLenum>(internalformat) : std::nullopt;
++            default:
++                return std::nullopt;
++            }
++        }();
++        if (copyFormat) {
++            if (RefPtr player = source.player()) {
++                if (uint64_t key = player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0) {
++                    if (protect(graphicsContextGL())->ps5CopyTextureFromVideoStream(key, texture->object(), *copyFormat, format, type, m_unpackFlipY))
++                        return { };
++                }
+             }
+         }
+     }
+diff --git a/Source/WebCore/platform/graphics/GraphicsContextGL.h b/Source/WebCore/platform/graphics/GraphicsContextGL.h
+index d48477b677..a90304d6a0 100644
+--- a/Source/WebCore/platform/graphics/GraphicsContextGL.h
++++ b/Source/WebCore/platform/graphics/GraphicsContextGL.h
+@@ -1684,11 +1684,12 @@ public:
+ #if ENABLE(VIDEO)
+     virtual bool copyTextureFromVideoFrame(VideoFrame&, PlatformGLObject texture, GCGLenum target, GCGLint level, GCGLenum internalFormat, GCGLenum  format, GCGLenum type, bool premultiplyAlpha, bool flipY) = 0;
+ #if defined(PS5_PAYLOAD_SDK)
+-    // PS5 remote WebGL: texImage2D(TEXTURE_2D, 0, RGBA, RGBA, UNSIGNED_BYTE,
+-    // video) for a video the title decodes in hardware (its ps5videosink
+-    // stream key): the title copies the newest frame into the texture on the
+-    // GPU. False: not handled here.
+-    virtual bool ps5CopyTextureFromVideoStream(uint64_t, PlatformGLObject, bool) { return false; }
++    // PS5 remote WebGL: texImage2D(TEXTURE_2D, 0, internalFormat, format,
++    // type, video) or, with internalFormat 0, texSubImage2D at 0,0 for a video
++    // the title decodes in hardware (its ps5videosink stream key): the title
++    // copies the newest frame into the texture on the GPU. False: not handled
++    // here.
++    virtual bool ps5CopyTextureFromVideoStream(uint64_t /* streamKey */, PlatformGLObject /* texture */, GCGLenum /* internalFormat */, GCGLenum /* format */, GCGLenum /* type */, bool /* flipY */) { return false; }
+ #endif
+     WEBCORE_EXPORT virtual RefPtr<NativeImage> videoFrameToNativeImage(VideoFrame&);
+ #endif
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+index 7158d1e785..a13de77212 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+@@ -131,7 +131,7 @@ protected:
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+     // PS5: RemoteGraphicsContextGLPS5.cpp.
+-    void copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, bool flipY);
++    void copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, uint32_t internalFormat, uint32_t format, uint32_t type, bool flipY);
+ #endif
+     void getErrors(CompletionHandler<void(GCGLErrorCodeSet)>&&);
+     void copyNativeImage(WebCore::GraphicsContextGL::SurfaceBuffer, RemoteNativeImageReference);
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+index cf21851e7e..af26925769 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+@@ -44,7 +44,7 @@ messages -> RemoteGraphicsContextGL Stream {
+     void PrepareForDisplay() -> () Synchronous
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+-    void CopyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, bool flipY)
++    void CopyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, uint32_t internalFormat, uint32_t format, uint32_t type, bool flipY)
+ #endif
+     void EnsureExtensionEnabled(WebCore::GCGLExtension extension) StreamBatched
+     void GetErrors() -> (GCGLErrorCodeSet returnValue) Synchronous
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+index 81f29dac8f..99aa4209fe 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+@@ -22,6 +22,7 @@ namespace {
+ using Key = std::pair<uint64_t, uint64_t>; // WebProcess, context
+ 
+ Lock s_lock;
++unsigned s_made WTF_GUARDED_BY_LOCK(s_lock) { 0 };
+ HashMap<Key, RefPtr<PS5WebGLLayer>>& layers() WTF_REQUIRES_LOCK(s_lock)
+ {
+     static NeverDestroyed<HashMap<Key, RefPtr<PS5WebGLLayer>>> map;
+@@ -93,6 +94,19 @@ void add(ProcessIdentifier process, uint64_t key, PS5WebGLLayer& layer)
+ {
+     Locker locker { s_lock };
+     layers().set({ process.toUInt64(), key }, &layer);
++    s_made++;
++}
++
++Stats stats()
++{
++    Stats result;
++    Locker locker { s_lock };
++    result.made = s_made;
++    for (auto& layer : layers().values()) {
++        result.contexts++;
++        result.drawingBufferBytes += layer->drawingBufferBytes();
++    }
++    return result;
+ }
+ 
+ void remove(ProcessIdentifier process, uint64_t key)
+@@ -143,4 +157,15 @@ VideoFrameSizeFunction videoFrameSizeFunction()
+ 
+ } // namespace WebKit
+ 
++// The title's [mem] line (port/webkit/apps/title/titlemem.c, weak there).
++extern "C" void ps5wk_webgl_mem_stats(unsigned* contexts, unsigned* made, double* drawingBufferMB);
++extern "C" void ps5wk_webgl_mem_stats(unsigned* contexts, unsigned* made, double* drawingBufferMB)
++{
++    auto stats = WebKit::PS5WebGLLayers::stats();
++    *contexts = stats.contexts;
++    *made = stats.made;
++    *drawingBufferMB = stats.drawingBufferBytes / 1048576.0;
++}
++
++
+ #endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index ae317d98da..7a3419fc80 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -23,6 +23,7 @@
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/ProcessIdentifier.h>
+ #include <WebCore/TextureMapperPlatformLayer.h>
++#include <atomic>
+ #include <memory>
+ #include <wtf/Lock.h>
+ #include <wtf/ThreadSafeRefCounted.h>
+@@ -38,6 +39,10 @@ public:
+     void setBuffer(std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer>&&);
+     // Work queue: the context is going (its textures next): draw nothing more.
+     void detach();
++    // Work queue: about how much GL memory the context's drawing buffers
++    // take (for the compositor's GL memory lines and its texture cap).
++    void setDrawingBufferBytes(uint64_t bytes) { m_drawingBufferBytes = bytes; }
++    uint64_t drawingBufferBytes() const { return m_drawingBufferBytes; }
+ 
+     // Render thread (TextureMapperPlatformLayer): the newest buffer.
+     void paintToTextureMapper(WebCore::TextureMapper&, const WebCore::FloatRect&, const WebCore::TransformationMatrix& modelViewMatrix, float opacity) final;
+@@ -49,6 +54,7 @@ private:
+     std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_pending WTF_GUARDED_BY_LOCK(m_lock);
+     std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_shown WTF_GUARDED_BY_LOCK(m_lock);
+     bool m_detached WTF_GUARDED_BY_LOCK(m_lock) { false };
++    std::atomic<uint64_t> m_drawingBufferBytes { 0 };
+ };
+ 
+ namespace PS5WebGLLayers {
+@@ -59,6 +65,15 @@ RefPtr<PS5WebGLLayer> find(WebCore::ProcessIdentifier, uint64_t key);
+ // Render thread, compositor context current: destroys retired buffers.
+ void collectGarbage();
+ 
++// Every live context: their count, the contexts made so far, and the sum of
++// their drawing buffers (estimated, PS5WebGLLayer::setDrawingBufferBytes).
++struct Stats {
++    unsigned contexts { 0 };
++    unsigned made { 0 };
++    uint64_t drawingBufferBytes { 0 };
++};
++Stats stats();
++
+ // Video frames for texImage2D(video) (M3): PS5Renderer's functions
+ // (PS5CompositorContext::copyVideoFrame, videoFrameSize), set by the
+ // compositor's set-up; null before.
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+index 3bee437ab4..04060e064a 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -17,10 +17,14 @@
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/GraphicsContextGLCoordinated.h>
+ #include <WebCore/GraphicsLayerContentsDisplayDelegate.h>
++#include <time.h>
++#include <wtf/HashSet.h>
++#include <wtf/Lock.h>
++#include <wtf/NeverDestroyed.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ // PS5 ANGLE (Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp).
+-extern "C" unsigned ANGLE_PS5PrepareExternalTexture2D(unsigned name, int width, int height);
++extern "C" unsigned ANGLE_PS5PrepareExternalTexture2D(unsigned name, int width, int height, unsigned internalFormat, unsigned format, unsigned type);
+ 
+ namespace WebKit {
+ 
+@@ -55,6 +59,21 @@ public:
+         return context;
+     }
+ 
++    // About the GL memory of the drawing buffers: 3 RGBA8 textures (the
++    // display buffer, the one drawn, one the compositor may still show).
++    // The default framebuffer's depth, stencil and multisample buffers are
++    // GL objects WebCore makes through the stream like the page's own, not
++    // counted here.
++    void updateDrawingBufferBytes()
++    {
++        auto size = getInternalFramebufferSize();
++        if (size == m_estimatedSize)
++            return;
++        m_estimatedSize = size;
++        const uint64_t pixels = static_cast<uint64_t>(std::max(size.width(), 0)) * std::max(size.height(), 0);
++        m_layer->setDrawingBufferBytes(pixels * 4 * 3);
++    }
++
+     ~GraphicsContextGLPS5()
+     {
+         // Before GraphicsContextGLCoordinated deletes the drawing buffers.
+@@ -75,8 +94,57 @@ private:
+     const Ref<PS5WebGLLayer> m_layer;
+     const WebCore::ProcessIdentifier m_webProcess;
+     const uint64_t m_key;
++    WebCore::IntSize m_estimatedSize;
++};
++
++// The WebGL thread's CPU time per frame (all its contexts' GL work: stream
++// decoding, ANGLE, the driver), logged every 5 s while frames come.
++struct ThreadFrameStats {
++    double lastCPU { -1 };
++    double windowCPU { 0 };
++    double maxCPU { 0 };
++    unsigned frames { 0 };
++    MonotonicTime windowStart;
+ };
+ 
++double threadCPUMilliseconds()
++{
++    struct timespec ts;
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts))
++        return 0;
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
++void noteFrame()
++{
++    static thread_local ThreadFrameStats stats;
++    const double cpu = threadCPUMilliseconds();
++    const auto now = MonotonicTime::now();
++    if (stats.lastCPU < 0) {
++        stats.lastCPU = cpu;
++        stats.windowStart = now;
++        return;
++    }
++    const double frameCPU = cpu - stats.lastCPU;
++    stats.lastCPU = cpu;
++    stats.windowCPU += frameCPU;
++    stats.maxCPU = std::max(stats.maxCPU, frameCPU);
++    stats.frames++;
++    const double seconds = (now - stats.windowStart).seconds();
++    if (seconds < 5)
++        return;
++    if (seconds < 7) {
++        auto layers = PS5WebGLLayers::stats();
++        WTFLogAlways("[webgl] title: %.1f frames/s; the WebGL thread %.2f ms CPU per frame (max %.1f), %.0f%% of a core; %u contexts, drawing buffers ~%.1f MB",
++            stats.frames / seconds, stats.windowCPU / stats.frames, stats.maxCPU, stats.windowCPU / (seconds * 10), layers.contexts, layers.drawingBufferBytes / 1048576.0);
++    }
++    // A longer gap (no frames for a while): a new window without a line.
++    stats.windowCPU = 0;
++    stats.maxCPU = 0;
++    stats.frames = 0;
++    stats.windowStart = now;
++}
++
+ } // namespace
+ 
+ class RemoteGraphicsContextGLPS5 final : public RemoteGraphicsContextGL {
+@@ -133,6 +201,8 @@ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& comp
+         // Submitted before the WebProcess's layer update reaches the
+         // compositor (WebGL 1 contexts get no fence: ES 2 has no GL syncs).
+         context->flush();
++        static_cast<GraphicsContextGLPS5&>(*context).updateDrawingBufferBytes();
++        noteFrame();
+         if (!frames++)
+             WTFLogAlways("[webgl] title: first frame finished");
+     }
+@@ -141,7 +211,7 @@ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& comp
+ 
+ // texImage2D(video) for a hardware-decoded video (M3): the title's newest
+ // converted frame of the stream, copied into the texture on the GPU.
+-void RemoteGraphicsContextGL::copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, bool flipY)
++void RemoteGraphicsContextGL::copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, uint32_t internalFormat, uint32_t format, uint32_t type, bool flipY)
+ {
+     assertIsCurrent(workQueue());
+     // The page's name for the texture (the WebProcess makes its own names).
+@@ -162,18 +232,26 @@ void RemoteGraphicsContextGL::copyTextureFromVideoStreamPS5(uint64_t streamKey,
+     if (unpackBuffer)
+         context->bindBuffer(GL::PIXEL_UNPACK_BUFFER, 0);
+     context->bindTexture(GL::TEXTURE_2D, texture);
+-    unsigned nativeTexture = ANGLE_PS5PrepareExternalTexture2D(texture, width, height);
++    unsigned nativeTexture = ANGLE_PS5PrepareExternalTexture2D(texture, width, height, internalFormat, format, type);
+     context->bindTexture(GL::TEXTURE_2D, boundTexture);
+     if (unpackBuffer)
+         context->bindBuffer(GL::PIXEL_UNPACK_BUFFER, unpackBuffer);
+-    static unsigned copies, failures;
+-    if (!nativeTexture || !PS5WebGLLayers::copyVideoFrameNative(streamKey, nativeTexture, flipY)) {
+-        if (!failures++)
+-            WTFLogAlways("[webgl] title: video frame copy failed (texture %u, %dx%d, native %u)", texture, width, height, nativeTexture);
+-        return;
++    // The first copy and the first failure of each kind (call and format) are logged.
++    static Lock logLock;
++    static NeverDestroyed<HashSet<uint64_t>> logged;
++    const bool ok = nativeTexture && PS5WebGLLayers::copyVideoFrameNative(streamKey, nativeTexture, flipY);
++    const uint64_t kind = (static_cast<uint64_t>(internalFormat ? internalFormat : format) << 2) | (internalFormat ? 2 : 0) | (ok ? 1 : 0);
++    {
++        Locker locker { logLock };
++        if (!logged->add(kind + 1).isNewEntry)
++            return;
+     }
+-    if (!copies++)
+-        WTFLogAlways("[webgl] title: first video frame copied into a WebGL texture, %dx%d%s", width, height, flipY ? ", flipped" : "");
++    const char* call = internalFormat ? "texImage2D" : "texSubImage2D";
++    const unsigned formatShown = internalFormat ? internalFormat : format;
++    if (!ok)
++        WTFLogAlways("[webgl] title: video frame copy failed: %s 0x%x, texture %u, frame %dx%d, native %u", call, formatShown, texture, width, height, nativeTexture);
++    else
++        WTFLogAlways("[webgl] title: first video frame copied into a WebGL texture: %s 0x%x, %dx%d%s", call, formatShown, width, height, flipY ? ", flipped" : "");
+ }
+ 
+ Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& connection, WebCore::GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 7eb7cc23f2..710259f3b6 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -502,6 +502,20 @@ std::optional<WebCore::FloatRect> WCScene::layerRectOnSurface(WebCore::PlatformL
+     return layer->texmapLayer.toSurfaceTransform().mapRect(WebCore::FloatRect(boundsOrigin, layer->texmapLayer.size()));
+ }
+ 
++unsigned WCScene::webGLLayerCount() const
++{
++#if HAVE_PS5_WEBGL_LAYERS
++    unsigned count = 0;
++    for (auto& entry : m_layers) {
++        if (entry.value->webGLLayer)
++            count++;
++    }
++    return count;
++#else
++    return 0;
++#endif
++}
++
+ bool WCScene::videoLayersNeedPaint() const
+ {
+     if (!m_videoLayerCount)
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index e982b08fe0..7ac603a685 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -80,6 +80,8 @@ public:
+     // (video plays at its own rate, without updates from the WebProcess).
+     bool videoLayersNeedPaint() const;
+     unsigned videoLayerCount() const { return m_videoLayerCount; }
++    // Layers showing a WebGL canvas (counted when asked).
++    unsigned webGLLayerCount() const;
+     // The WebProcess whose page this is (WebGL layers are found by it).
+     void setWebProcessIdentifier(WebCore::ProcessIdentifier identifier) { m_webProcessIdentifier = identifier; }
+     // Async scrolling (COMPOSITING-PLAN.md): where the title's scrolling tree
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 3f1d2cd6ca..034b7808b8 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -966,7 +966,11 @@ void SceneHost::checkGLMemory()
+     if (capMB <= 0)
+         return;
+     const double logMB = capMB * 0.8, restoreMB = capMB * 0.6, emergencyMB = capMB * 1.5;
+-    double frameMB = BitmapTextureUploaderPS5::textureBytes() / 1048576.0;
++    // WebGL drawing buffers are GL memory too (spikes/11-webgl M4): counted
++    // with the tiles. Fewer tiles is all the cap can do about them; a page
++    // showing WebGL never goes to the CPU path (its canvases would go blank).
++    const double webGLMB = PS5WebGLLayers::stats().drawingBufferBytes / 1048576.0;
++    double frameMB = BitmapTextureUploaderPS5::textureBytes() / 1048576.0 + webGLMB;
+     auto now = MonotonicTime::now();
+     if (m_glPage != m_shownPage) {
+         // Another page shown (or a new drawing area after a restart): its own state.
+@@ -990,8 +994,8 @@ void SceneHost::checkGLMemory()
+         unsigned layers = 0;
+         for (auto& entry : m_scenes)
+             layers += entry.second->layerCount();
+-        WTFLogAlways("[wc] GL textures %.1f MB (%.1f this frame; texture pool %.1f MB), over %.0f MB (cap %.0f MB, %s; %u layers in %zu scenes; peak %.1f MB)", mb, frameMB, // NOLINT
+-            BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, logMB, capMB,
++        WTFLogAlways("[wc] GL textures %.1f MB (%.1f this frame; texture pool %.1f MB, WebGL ~%.1f MB), over %.0f MB (cap %.0f MB, %s; %u layers in %zu scenes; peak %.1f MB)", mb, frameMB, // NOLINT
++            BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, webGLMB, logMB, capMB,
+             m_glState == GLMemoryState::Normal ? "normal coverage" : m_glState == GLMemoryState::Reduced ? "coverage reduced" : "CPU fallback asked",
+             layers, m_scenes.size(), m_glPeakMB);
+         m_glLoggedAt = now;
+@@ -1041,7 +1045,11 @@ void SceneHost::checkGLMemory()
+         post(DrawingAreaProxyWCPS5::GLMemoryAction::ReduceCoverage);
+     }
+     if (m_glState == GLMemoryState::Reduced) {
+-        if ((mb > capMB && now - m_glReducedAt >= 5_s) || mb > emergencyMB) {
++        auto shown = m_scenes.find(page);
++        const bool showsWebGL = shown != m_scenes.end() && shown->second->webGLLayerCount();
++        if (showsWebGL && ((mb > capMB && now - m_glReducedAt >= 5_s) || mb > emergencyMB)) {
++            // Stays at reduced coverage (logged at most every 30 s, above).
++        } else if ((mb > capMB && now - m_glReducedAt >= 5_s) || mb > emergencyMB) {
+             WTFLogAlways("[wc] GL textures %.1f MB still over the %.0f MB cap %.1f s after reducing coverage (texture pool %.1f MB): this page goes to the CPU path", mb, capMB, // NOLINT
+                 (now - m_glReducedAt).seconds(), BitmapTexturePool::singleton().sizeInBytes() / 1048576.0);
+             m_glState = GLMemoryState::Fallback;
+@@ -1188,6 +1196,12 @@ void SceneHost::maybeLog()
+             WTFLogAlways("[wc] %.1f s: %u updates answered when applied (async scrolling)", seconds, m_stats.earlyReplies); // NOLINT
+         if (videoLayers || m_stats.videoPaints)
+             WTFLogAlways("[wc] %.1f s: %u video layers, %u paints for video frames only", seconds, videoLayers, m_stats.videoPaints); // NOLINT
++        if (auto webGL = PS5WebGLLayers::stats(); webGL.contexts) {
++            unsigned webGLLayers = 0;
++            for (auto& entry : m_scenes)
++                webGLLayers += entry.second->webGLLayerCount();
++            WTFLogAlways("[wc] %.1f s: WebGL %u contexts (%u made), %u layers shown, drawing buffers ~%.1f MB (in the GL texture cap)", seconds, webGL.contexts, webGL.made, webGLLayers, webGL.drawingBufferBytes / 1048576.0); // NOLINT
++        }
+     }
+     auto start = now;
+     m_stats = { };
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+index 1a4ed7c4a0..5db83c0697 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+@@ -58,18 +58,18 @@ private:
+     // WebCore::GraphicsContextGL
+     RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() final { return m_layerDelegate.ptr(); }
+     void prepareForDisplay() final;
+-    bool ps5CopyTextureFromVideoStream(uint64_t streamKey, PlatformGLObject texture, bool flipY) final
++    bool ps5CopyTextureFromVideoStream(uint64_t streamKey, PlatformGLObject texture, GCGLenum internalFormat, GCGLenum format, GCGLenum type, bool flipY) final
+     {
+         if (isContextLost())
+             return false;
+         // In order with the page's other calls; the title waits for the copy
+         // on the GPU before the texture's next use.
+-        if (send(Messages::RemoteGraphicsContextGL::CopyTextureFromVideoStreamPS5(streamKey, texture, flipY)) != IPC::Error::NoError) {
++        if (send(Messages::RemoteGraphicsContextGL::CopyTextureFromVideoStreamPS5(streamKey, texture, internalFormat, format, type, flipY)) != IPC::Error::NoError) {
+             markContextLost();
+             return false;
+         }
+         if (!m_videoCopies++)
+-            WTFLogAlways("[webgl] first video frame copy requested");
++            WTFLogAlways("[webgl] first video frame copy requested (%s, format 0x%x)", internalFormat ? "texImage2D" : "texSubImage2D", internalFormat ? internalFormat : format);
+         return true;
+     }
+ 

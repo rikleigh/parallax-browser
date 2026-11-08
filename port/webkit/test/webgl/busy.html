@@ -1,0 +1,198 @@
+<!doctype html>
+<!-- WebGL M4 check (spikes/11-webgl): the cost of busy scenes. A grid of
+     lit cubes drawn the way three.js draws meshes: per object a
+     bindVertexArray, two uniformMatrix4fv (model-view, normal), a
+     uniform3f (colour), a bindTexture when ?tex=1, and a drawElements of 36
+     indices. Steps through 100, 250, 500, 1000 and 2000 objects (?n=500
+     runs one count), 5 s each, and logs one line per step:
+     RESULT webgl-busy n=<count> <fps> fps, JS <ms> per frame ...
+     plus a GL error check. The title's `[webgl] title: ... per frame`
+     lines give the cost on its side (the WebGL thread). WebGL 2 unless
+     ?gl=1. Upload to /data/ps5webkit/webgl-busy.html and open
+     file:///data/ps5webkit/webgl-busy.html[?n=500][&tex=1][&gl=1]. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL busy</title>
+<style>
+  body { background: #111; color: #eee; font: 24px/1.4 sans-serif; margin: 40px; }
+  canvas { width: 1280px; height: 720px; border: 2px solid #555; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>WebGL busy</h1>
+<canvas id="c" width="1280" height="720"></canvas>
+<div id="out">starting</div>
+<script>
+const params = new URLSearchParams(location.search);
+const out = document.getElementById('out');
+const lines = [];
+function log(text) { console.log('[webgl-busy] ' + text); }
+function result(text) {
+  lines.push(text);
+  out.textContent = lines.join('\n');
+  log('RESULT webgl-busy ' + text);
+}
+
+const webGL1 = params.get('gl') === '1';
+const useTextures = params.get('tex') === '1';
+const counts = params.get('n') ? [parseInt(params.get('n'), 10)] : [100, 250, 500, 1000, 2000];
+const gl = document.getElementById('c').getContext(webGL1 ? 'webgl' : 'webgl2', { antialias: true });
+const vao = webGL1 ? gl.getExtension('OES_vertex_array_object') : null;
+const createVertexArray = () => webGL1 ? vao.createVertexArrayOES() : gl.createVertexArray();
+const bindVertexArray = v => webGL1 ? vao.bindVertexArrayOES(v) : gl.bindVertexArray(v);
+
+const vs = gl.createShader(gl.VERTEX_SHADER);
+gl.shaderSource(vs, `attribute vec3 position; attribute vec3 normal; attribute vec2 uv;
+uniform mat4 modelView; uniform mat4 projection; uniform mat3 normalMatrix;
+varying vec3 vNormal; varying vec2 vUv;
+void main() { vNormal = normalize(normalMatrix * normal); vUv = uv; gl_Position = projection * modelView * vec4(position, 1.0); }`);
+gl.compileShader(vs);
+const fs = gl.createShader(gl.FRAGMENT_SHADER);
+gl.shaderSource(fs, `precision mediump float; varying vec3 vNormal; varying vec2 vUv; uniform vec3 color; uniform sampler2D map; uniform float textured;
+void main() { float light = 0.3 + 0.7 * max(dot(vNormal, normalize(vec3(0.5, 0.8, 0.6))), 0.0);
+  vec3 base = textured > 0.5 ? texture2D(map, vUv).rgb * color : color; gl_FragColor = vec4(base * light, 1.0); }`);
+gl.compileShader(fs);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+gl.bindAttribLocation(prog, 0, 'position');
+gl.bindAttribLocation(prog, 1, 'normal');
+gl.bindAttribLocation(prog, 2, 'uv');
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  log('link failed: ' + gl.getProgramInfoLog(prog) + gl.getShaderInfoLog(vs) + gl.getShaderInfoLog(fs));
+const loc = name => gl.getUniformLocation(prog, name);
+const uModelView = loc('modelView'), uProjection = loc('projection'), uNormal = loc('normalMatrix'), uColor = loc('color'), uMap = loc('map'), uTextured = loc('textured');
+
+// A unit cube: 24 vertices, 36 indices. Per face: normal N and axes U, V
+// with U x V = N, so the corners go counter-clockwise seen from outside.
+const faces = [
+  [[0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
+  [[1, 0, 0], [0, 0, -1], [0, 1, 0]], [[-1, 0, 0], [0, 0, 1], [0, 1, 0]],
+  [[0, 1, 0], [1, 0, 0], [0, 0, -1]], [[0, -1, 0], [1, 0, 0], [0, 0, 1]]];
+const verts = [], indices = [];
+faces.forEach(([N, U, V], f) => {
+  [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([s, r]) => verts.push(
+    (N[0] + s * U[0] + r * V[0]) / 2, (N[1] + s * U[1] + r * V[1]) / 2, (N[2] + s * U[2] + r * V[2]) / 2, N[0], N[1], N[2], (s + 1) / 2, (r + 1) / 2));
+  indices.push(f * 4, f * 4 + 1, f * 4 + 2, f * 4, f * 4 + 2, f * 4 + 3);
+});
+// Each object its own vertex array (as three.js: one per geometry and program), sharing the buffers.
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+const ibo = gl.createBuffer();
+function makeVertexArray() {
+  const v = createVertexArray();
+  bindVertexArray(v);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 32, 24);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  bindVertexArray(null);
+  return v;
+}
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+
+// Four small checker textures.
+const textures = [0, 1, 2, 3].map(i => {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  const px = new Uint8Array(64 * 64 * 4);
+  for (let y = 0; y < 64; y++)
+    for (let x = 0; x < 64; x++) {
+      const on = ((x >> (3 + i % 2)) + (y >> 3)) & 1;
+      px.set(on ? [255, 255, 255, 255] : [60 + 40 * i, 60, 120, 255], (y * 64 + x) * 4);
+    }
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  return t;
+});
+
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+// Model-view of a cube at (x, y, z) turned by a about Y and b about X; its normal matrix.
+function modelView(m, n, x, y, z, a, b) {
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b);
+  m[0] = ca; m[1] = sa * sb; m[2] = -sa * cb; m[3] = 0;
+  m[4] = 0; m[5] = cb; m[6] = sb; m[7] = 0;
+  m[8] = sa; m[9] = -ca * sb; m[10] = ca * cb; m[11] = 0;
+  m[12] = x; m[13] = y; m[14] = z; m[15] = 1;
+  n[0] = m[0]; n[1] = m[1]; n[2] = m[2]; n[3] = m[4]; n[4] = m[5]; n[5] = m[6]; n[6] = m[8]; n[7] = m[9]; n[8] = m[10];
+}
+
+let objects = [];
+function setCount(count) {
+  objects.forEach(o => webGL1 ? vao.deleteVertexArrayOES(o.vao) : gl.deleteVertexArray(o.vao));
+  objects = [];
+  const side = Math.ceil(Math.sqrt(count));
+  for (let i = 0; i < count; i++) {
+    const gx = i % side, gy = Math.floor(i / side);
+    objects.push({ vao: makeVertexArray(), x: (gx - (side - 1) / 2) * 1.6, y: (gy - (side - 1) / 2) * 1.6, z: -side * 1.4 - 4,
+      color: [0.4 + 0.6 * (i % 7) / 6, 0.4 + 0.6 * (i % 5) / 4, 0.4 + 0.6 * (i % 3) / 2], texture: textures[i % 4], phase: i * 0.37 });
+  }
+}
+
+const m = new Float32Array(16), n = new Float32Array(9);
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+let step = 0, stepStart = 0, frames = 0, jsMS = 0, jsMax = 0, last = 0, gaps = 0, gapMax = 0;
+setCount(counts[0]);
+function frame(now) {
+  if (!stepStart)
+    stepStart = last = now;
+  const t0 = performance.now();
+  gl.viewport(0, 0, 1280, 720);
+  gl.clearColor(0.08, 0.08, 0.12, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uProjection, false, perspective(0.9, 1280 / 720, 0.5, 500));
+  gl.uniform1i(uMap, 0);
+  gl.uniform1f(uTextured, useTextures ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE0);
+  const time = now / 1000;
+  for (const o of objects) {
+    bindVertexArray(o.vao);
+    modelView(m, n, o.x, o.y, o.z, time + o.phase, time * 0.7 + o.phase);
+    gl.uniformMatrix4fv(uModelView, false, m);
+    gl.uniformMatrix3fv(uNormal, false, n);
+    gl.uniform3f(uColor, o.color[0], o.color[1], o.color[2]);
+    if (useTextures)
+      gl.bindTexture(gl.TEXTURE_2D, o.texture);
+    gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+  }
+  bindVertexArray(null);
+  const js = performance.now() - t0;
+  jsMS += js; jsMax = Math.max(jsMax, js);
+  if (frames) {
+    const gap = now - last;
+    gapMax = Math.max(gapMax, gap);
+    if (gap > 1000 / 30)
+      gaps++;
+  }
+  last = now;
+  frames++;
+  if (now - stepStart >= 5000) {
+    const seconds = (now - stepStart) / 1000;
+    const error = gl.getError();
+    result('n=' + objects.length + ' ' + (frames / seconds).toFixed(1) + ' fps, JS ' + (jsMS / frames).toFixed(2) + ' ms per frame (max ' + jsMax.toFixed(1) +
+      '), ' + gaps + ' frames over 33 ms (longest ' + gapMax.toFixed(0) + ' ms), WebGL ' + (webGL1 ? 1 : 2) + (useTextures ? ', textured' : '') + ', GL error 0x' + error.toString(16));
+    step++;
+    if (step >= counts.length) {
+      log('done');
+      step = 0;
+    }
+    setCount(counts[step]);
+    stepStart = now; frames = 0; jsMS = 0; jsMax = 0; gaps = 0; gapMax = 0;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

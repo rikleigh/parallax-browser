@@ -32,6 +32,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -312,11 +313,19 @@ static void stack_finished(void)
         atomic_store(&r->finishedMs, spike_now_ms());
 }
 
+/* The sampling profiler's thread table (apps/common/profiler.c, in the
+ * title for /data/ps5webkit/title-profile; weak: absent in payload builds). */
+void ps5wk_profiler_thread(int starting) __attribute__((weak));
+
 static void* stack_trampoline(void* p)
 {
     stack_rec* r = p;
     pthread_setspecific(stack_key, r);
+    if (ps5wk_profiler_thread)
+        ps5wk_profiler_thread(1);
     void* result = r->fn(r->arg);
+    if (ps5wk_profiler_thread)
+        ps5wk_profiler_thread(0);
     stack_finished();
     return result;
 }
@@ -455,6 +464,10 @@ double ps5wk_title_direct_mb(void)
     return total / 1048576.0;
 }
 
+/* WebKit's WebGL contexts in the title (PS5WebGLLayers.cpp; weak: absent
+ * in builds without WebGL). */
+void ps5wk_webgl_mem_stats(unsigned* contexts, unsigned* made, double* drawingBufferMB) __attribute__((weak));
+
 void ps5wk_title_mem_log(const char* milestone)
 {
     dheap_stats_t h;
@@ -467,10 +480,18 @@ void ps5wk_title_mem_log(const char* milestone)
     unsigned live = stacks_live, created = threads_created;
     size_t sb = stack_bytes;
     pthread_mutex_unlock(&stack_lock);
+    char webgl[96] = "";
+    if (ps5wk_webgl_mem_stats) {
+        unsigned contexts = 0, made = 0;
+        double mb = 0;
+        ps5wk_webgl_mem_stats(&contexts, &made, &mb);
+        if (made)
+            snprintf(webgl, sizeof webgl, "; WebGL %u contexts (%u made), drawing buffers ~%.1f MB", contexts, made, mb);
+    }
     spike_log("[mem] %s: flexible %.1f MB free; direct memory %.1f MB in use; direct heap %.1f MB mapped (peak %.1f, %llu libc fallbacks, init %s); "
               "anon mmaps %.1f MB in %u (peak %.1f MB, %llu made, %llu failed, %llu zero fills, %llu passed through); "
-              "thread stacks %u live, %.1f MB (%u created, %u libc)",
+              "thread stacks %u live, %.1f MB (%u created, %u libc)%s",
         milestone, dmem_flexible_free() / 1048576.0, ps5wk_title_direct_mb(), h.mapped / 1048576.0, h.peak / 1048576.0, h.libc_fallbacks,
         h.init_step, (mapped - sb) / 1048576.0, n, peak / 1048576.0, dmap_count, dmap_failures, dmap_zero_fills,
-        dmap_passthrough, live, sb / 1048576.0, created, threads_libc);
+        dmap_passthrough, live, sb / 1048576.0, created, threads_libc, webgl);
 }

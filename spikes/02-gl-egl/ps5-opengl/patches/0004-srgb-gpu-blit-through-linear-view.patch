@@ -1,0 +1,40 @@
+ps5 driver: GPU blits into sRGB textures through their linear view (WebGL M4)
+
+A blit from an RGBA8 texture into an SRGB8_ALPHA8 one with
+GL_FRAMEBUFFER_SRGB off (Mesa then asks for the destination's linear
+format) took the CPU fallback: ps5_blit_gpu_color wanted the resource's
+own format on both sides. RGBA8 linear and sRGB views share the native
+tiled layout (as the clear path already notes), so the blitter draws into
+the sRGB texture through an R8G8B8A8_UNORM surface. The title copies
+hardware-decoded video frames into WebGL textures this way; three.js uploads
+video as SRGB8_ALPHA8 (spikes/11-webgl). Seen before: two 1080p copies per
+frame (RGBA8 + sRGB) held a page at ~13 fps, the WebGL thread at 76 ms of
+CPU per frame.
+
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -7933,7 +7933,13 @@
+           r->base.last_level >= 16 ||
+           ((!resolve || i) &&
+            (r->base.nr_samples > 1 || r->base.nr_storage_samples > 1)) ||
+-          r->base.format != info->src.format ||
++          (r->base.format != info->src.format &&
++           /* ps5webkit: an RGBA8 copy into an sRGB texture through its
++            * linear view (GL_FRAMEBUFFER_SRGB off): the same native tiled
++            * bytes, written as they are. Before: the CPU fallback, tens of ms
++            * for a 1080p video frame into a WebGL texture. */
++           !(i == 1 && !resolve && r->base.format == PIPE_FORMAT_R8G8B8A8_SRGB &&
++             info->dst.format == PIPE_FORMAT_R8G8B8A8_UNORM)) ||
+           !(r->base.bind & PIPE_BIND_RENDER_TARGET) ||
+           (r->base.bind & PIPE_BIND_DISPLAY_TARGET) ||
+           r->depth_staging_size ||
+@@ -7999,6 +8005,9 @@
+    struct pipe_surface surface;
+    struct pipe_sampler_view templ;
+    util_blitter_default_dst_texture(&surface, info->dst.resource, info->dst.level, info->dst.box.z);
++   /* ps5webkit: the view the blit asked for (linear for an sRGB texture
++    * written without encoding, see above). */
++   surface.format = info->dst.format;
+    util_blitter_default_src_texture(blitter, &templ, info->src.resource, info->src.level);
+    struct pipe_sampler_view *view = context->base.create_sampler_view(
+       &context->base, info->src.resource, &templ);

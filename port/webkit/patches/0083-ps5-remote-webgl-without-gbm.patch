@@ -1,0 +1,17 @@
+diff --git a/Source/WebKit/WebProcess/WebProcess.cpp b/Source/WebKit/WebProcess/WebProcess.cpp
+index 40987671f9..e5c075670d 100644
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -2745,7 +2745,11 @@ void WebProcess::setUseGPUProcessForWebGL(bool useGPUProcessForWebGL)
+ 
+ bool WebProcess::shouldUseRemoteRenderingForWebGL() const
+ {
+-#if USE(COORDINATED_GRAPHICS)
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: WebGL is drawn in the title (PS5GPUProcessInTitle.cpp), not with
++    // GBM buffers.
++    return m_useGPUProcessForWebGL;
++#elif USE(COORDINATED_GRAPHICS)
+ #if USE(GBM)
+     return m_useGPUProcessForWebGL && WebCore::GraphicsContextGLGBM::checkRequirements();
+ #else

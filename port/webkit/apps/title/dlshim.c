@@ -64,6 +64,13 @@ void* __wrap_dlsym(void* handle, const char* symbol)
     return (void*)lookupProc(symbol);
 }
 
+/* ANGLE's EGL backend (WebGL builds; spikes/11-webgl/patches/0001) asks for
+ * the native egl* and GL entry points here instead of dlsym()ing libEGL. */
+void* angle_ps5_egl_get_proc_address(const char* name)
+{
+    return __wrap_dlsym(&eglHandle, name);
+}
+
 /* Strong references to the SCE functions the PS5 platform declares weak
  * (PS5Sce.h, weak so the payload links without these stubs). With only weak
  * references the title's imports came out NULL at run time ("pad:

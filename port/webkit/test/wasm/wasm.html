@@ -1,0 +1,86 @@
+<!doctype html>
+<!-- WebAssembly check: a hand-assembled module (add, a summing loop, one page
+     of memory) compiled with WebAssembly.compile and run until JSC tiers it
+     up (IPInt, then BBQ/OMG), the memory grown to 64 MB, and the time per
+     call against the same loop in JavaScript. Results as text and as
+     console lines "[wasm-check] ...". Upload to /data/ps5webkit/wasm.html
+     and open file:///data/ps5webkit/wasm.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebAssembly check</title>
+<style>
+  body { background: #111; color: #eee; font: 28px/1.4 sans-serif; margin: 40px; }
+  .ok { color: #6d6; } .fail { color: #f66; }
+  pre { font-size: 24px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>WebAssembly check</h1>
+<pre id="out"></pre>
+<script>
+const out = document.getElementById('out');
+function line(text, cls) {
+  const span = document.createElement('span');
+  span.textContent = text + '\n';
+  if (cls) span.className = cls;
+  out.appendChild(span);
+  console.log('[wasm-check] ' + text);
+}
+
+// (func add (i32 i32) -> i32), (func sum (n i32) -> i32: n + (n-1) + ... + 1,
+// wrapping), (memory 1), exported as add, sum, mem.
+const bytes = new Uint8Array([
+  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  0x01,0x0c,0x02,0x60,0x02,0x7f,0x7f,0x01,0x7f,0x60,0x01,0x7f,0x01,0x7f,
+  0x03,0x03,0x02,0x00,0x01,
+  0x05,0x03,0x01,0x00,0x01,
+  0x07,0x13,0x03,0x03,0x61,0x64,0x64,0x00,0x00,0x03,0x73,0x75,0x6d,0x00,0x01,0x03,0x6d,0x65,0x6d,0x02,0x00,
+  0x0a,0x2b,0x02,0x07,0x00,0x20,0x00,0x20,0x01,0x6a,0x0b,
+  0x21,0x01,0x01,0x7f,0x02,0x40,0x03,0x40,0x20,0x00,0x45,0x0d,0x01,0x20,0x01,0x20,0x00,0x6a,0x21,0x01,0x20,0x00,0x41,0x01,0x6b,0x21,0x00,0x0c,0x00,0x0b,0x0b,0x20,0x01,0x0b,
+]);
+
+function jsSum(n) { let s = 0; for (; n; n--) s = (s + n) | 0; return s; }
+
+async function run() {
+  line(navigator.userAgent);
+  if (typeof WebAssembly !== 'object') { line('WebAssembly: not available', 'fail'); return; }
+  let t = performance.now();
+  const module = await WebAssembly.compile(bytes);
+  const instance = await WebAssembly.instantiate(module);
+  const e = instance.exports;
+  line('compile + instantiate: ' + (performance.now() - t).toFixed(1) + ' ms');
+
+  const add = e.add(2, 40);
+  const sum = e.sum(100000);
+  const want = jsSum(100000);
+  line('add(2, 40) = ' + add + ', sum(100000) = ' + sum + (add === 42 && sum === want ? ': PASS' : ': FAIL, want ' + want),
+       add === 42 && sum === want ? 'ok' : 'fail');
+
+  // Warm up (tier-up), then time 200 calls of a 1,000,000-step loop.
+  for (let i = 0; i < 50; i++) e.sum(1000000);
+  t = performance.now();
+  let check = 0;
+  for (let i = 0; i < 200; i++) check ^= e.sum(1000000);
+  const wasmMS = (performance.now() - t) / 200;
+  for (let i = 0; i < 50; i++) jsSum(1000000);
+  t = performance.now();
+  for (let i = 0; i < 200; i++) check ^= jsSum(1000000);
+  const jsMS = (performance.now() - t) / 200;
+  line('1M-step loop: wasm ' + wasmMS.toFixed(3) + ' ms, JS ' + jsMS.toFixed(3) + ' ms per call (check ' + check + ')');
+
+  try {
+    t = performance.now();
+    e.mem.grow(1023); // 1 + 1023 pages of 64 KB = 64 MB
+    const view = new Uint8Array(e.mem.buffer);
+    view[view.length - 1] = 7;
+    line('memory grown to ' + (e.mem.buffer.byteLength / 1048576) + ' MB in ' + (performance.now() - t).toFixed(1) + ' ms, last byte ' + view[view.length - 1] + ': PASS', 'ok');
+  } catch (err) {
+    line('memory grow: ' + err, 'fail');
+  }
+  line('done');
+}
+run().catch(err => line('exception: ' + err, 'fail'));
+</script>
+</body>
+</html>

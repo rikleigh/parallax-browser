@@ -1,0 +1,100 @@
+diff --git a/Source/ThirdParty/ANGLE/PlatformWPE.cmake b/Source/ThirdParty/ANGLE/PlatformWPE.cmake
+index d5792550be..f194a4a6cc 100644
+--- a/Source/ThirdParty/ANGLE/PlatformWPE.cmake
++++ b/Source/ThirdParty/ANGLE/PlatformWPE.cmake
+@@ -3,6 +3,11 @@ if (is_android)
+ else ()
+     list(APPEND ANGLE_DEFINITIONS ANGLE_PLATFORM_LINUX EGL_NO_PLATFORM_SPECIFIC_TYPES)
+ endif ()
++if (ENABLE_WPE_PLATFORM_PS5)
++    # The PS5 (spikes/11-webgl): the egl* entry points come from the host
++    # (no libEGL to dlopen), no futex, FreeBSD clock and thread-name calls.
++    list(APPEND ANGLE_DEFINITIONS ANGLE_PLATFORM_PS5)
++endif ()
+ include(linux.cmake)
+ 
+ if (USE_OPENGL)
+diff --git a/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h b/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h
+index 0d5bac3787..c738dda729 100644
+--- a/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h
++++ b/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h
+@@ -32,7 +32,8 @@
+ // - Windows 8+
+ //
+ // There is no TSAN support for futex currently, so it is disabled in that case
+-#if !defined(ANGLE_WITH_TSAN)
++// PS5 (ps5webkit spike 11): no futex syscall; the std::mutex fallback.
++#if !defined(ANGLE_WITH_TSAN) && !defined(ANGLE_PLATFORM_PS5)
+ #    if defined(ANGLE_PLATFORM_LINUX) || defined(ANGLE_PLATFORM_ANDROID)
+ // Linux has had futexes for a very long time.  Assume support.
+ #        define ANGLE_USE_FUTEX 1
+diff --git a/Source/ThirdParty/ANGLE/src/common/system_utils_linux.cpp b/Source/ThirdParty/ANGLE/src/common/system_utils_linux.cpp
+index 8ff5755710..a82baec674 100644
+--- a/Source/ThirdParty/ANGLE/src/common/system_utils_linux.cpp
++++ b/Source/ThirdParty/ANGLE/src/common/system_utils_linux.cpp
+@@ -18,6 +18,13 @@
+ 
+ #include <array>
+ 
++// PS5 (ps5webkit spike 11): FreeBSD libc: no CLOCK_MONOTONIC_RAW, no pthread_setname_np.
++#if defined(ANGLE_PLATFORM_PS5)
++#    include <pthread_np.h>
++#    define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
++#    define pthread_setname_np pthread_set_name_np
++#endif
++
+ namespace angle
+ {
+ std::string GetExecutablePath()
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+index ddf845523a..b6c86a49b0 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+@@ -10,6 +10,14 @@
+ 
+ #include <dlfcn.h>
+ 
++#if defined(ANGLE_PLATFORM_PS5)
++// PS5 (ps5webkit spike 11): the native EGL (ps5-opengl) is a static archive in
++// the same executable; there is no libEGL.so to dlopen. The host program
++// supplies a lookup over the egl* symbols it linked, which falls back to
++// ps5-opengl's eglGetProcAddress for the GL entry points.
++extern "C" void *angle_ps5_egl_get_proc_address(const char *name);
++#endif
++
+ namespace rx
+ {
+ namespace
+@@ -33,7 +41,11 @@ egl::Error FunctionsEGLDL::initialize(EGLAttrib platformType,
+                                       const char *libName,
+                                       void *eglHandle)
+ {
+-
++#if defined(ANGLE_PLATFORM_PS5)
++    mGetProcAddressPtr =
++        reinterpret_cast<PFNEGLGETPROCADDRESSPROC>(angle_ps5_egl_get_proc_address);
++    return FunctionsEGL::initialize(platformType, nativeDisplay);
++#else
+     if (eglHandle)
+     {
+         // If the handle is provided, use it.
+@@ -60,6 +72,7 @@ egl::Error FunctionsEGLDL::initialize(EGLAttrib platformType,
+     }
+ 
+     return FunctionsEGL::initialize(platformType, nativeDisplay);
++#endif
+ }
+ 
+ void *FunctionsEGLDL::getProcAddress(const char *name) const
+@@ -69,7 +82,11 @@ void *FunctionsEGLDL::getProcAddress(const char *name) const
+     {
+         return f;
+     }
++#if defined(ANGLE_PLATFORM_PS5)
++    return nullptr;
++#else
+     return dlsym(nativeEGLHandle, name);
++#endif
+ }
+ 
+ }  // namespace rx

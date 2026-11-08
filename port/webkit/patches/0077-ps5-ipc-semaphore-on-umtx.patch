@@ -1,0 +1,196 @@
+diff --git a/Source/WebKit/Platform/IPC/IPCSemaphore.h b/Source/WebKit/Platform/IPC/IPCSemaphore.h
+index ef0dd2de9f..ec9072d4c2 100644
+--- a/Source/WebKit/Platform/IPC/IPCSemaphore.h
++++ b/Source/WebKit/Platform/IPC/IPCSemaphore.h
+@@ -80,7 +80,7 @@ public:
+ #elif USE(UNIX_DOMAIN_SOCKETS)
+     explicit Semaphore(UnixFileDescriptor&&);
+     UnixFileDescriptor duplicateDescriptor() const;
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     explicit operator bool() const { return !!m_fd && m_state; }
+ #else
+     explicit operator bool() const { return !!m_fd; }
+@@ -99,7 +99,7 @@ private:
+     Win32Handle m_semaphoreHandle;
+ #elif USE(UNIX_DOMAIN_SOCKETS)
+     UnixFileDescriptor m_fd;
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     bool waitImpl(Timeout);
+ 
+     void* m_state { nullptr };
+diff --git a/Source/WebKit/Platform/IPC/unix/IPCSemaphoreUnix.cpp b/Source/WebKit/Platform/IPC/unix/IPCSemaphoreUnix.cpp
+index 16ebf8f28d..9d2d2c1835 100644
+--- a/Source/WebKit/Platform/IPC/unix/IPCSemaphoreUnix.cpp
++++ b/Source/WebKit/Platform/IPC/unix/IPCSemaphoreUnix.cpp
+@@ -65,9 +65,24 @@
+ #endif
+ #endif
+ 
++#if OS(FREEBSD)
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/umtx.h>
++#include <time.h>
++#include <unistd.h>
++#include <wtf/Atomics.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/SafeStrerror.h>
++#include <wtf/simde/simde.h>
++#endif
++
+ namespace IPC {
+ 
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+ 
+ // The semaphore is a counter in a page shared with the peer. A waiter polls the
+ // counter for a short while before parking on it with futex(2), and only a
+@@ -82,6 +97,7 @@ static constexpr size_t semaphoreStateSize = 4096;
+ static constexpr Seconds semaphorePollDuration = 50_us;
+ static constexpr unsigned semaphorePollRetryInterval = 64;
+ 
++#if OS(LINUX)
+ struct FutexTimespec {
+     long seconds;
+     long nanoseconds;
+@@ -117,6 +133,40 @@ static SemaphoreState* mapSemaphoreState(int fd)
+     return static_cast<SemaphoreState*>(mapping);
+ }
+ 
++#else
++// FreeBSD (the PS5): no memfd or seals; the state page is anonymous POSIX
++// shared memory, as SharedMemoryUnix.cpp makes it, and futex(2) becomes
++// _umtx_op(2)'s shared (not _PRIVATE) wait and wake, which key on the page
++// rather than the address, so they work across processes.
++using FutexTimespec = struct timespec;
++
++static void futexWakeOne(Atomic<uint32_t>& word)
++{
++    _umtx_op(&word, UMTX_OP_WAKE, 1, nullptr, nullptr);
++}
++
++static bool futexWaitWhileZero(Atomic<uint32_t>& word, const FutexTimespec* relativeTimeout)
++{
++    void* size = relativeTimeout ? reinterpret_cast<void*>(sizeof(*relativeTimeout)) : nullptr;
++    if (!_umtx_op(&word, UMTX_OP_WAIT_UINT, 0, size, const_cast<FutexTimespec*>(relativeTimeout)))
++        return true;
++    return errno == EINTR || errno == ETIMEDOUT;
++}
++
++static SemaphoreState* mapSemaphoreState(int fd)
++{
++    if (fd < 0)
++        return nullptr;
++    struct stat status;
++    if (fstat(fd, &status) == -1 || static_cast<size_t>(status.st_size) < semaphoreStateSize)
++        return nullptr;
++    void* mapping = mmap(nullptr, semaphoreStateSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (mapping == MAP_FAILED)
++        return nullptr;
++    return static_cast<SemaphoreState*>(mapping);
++}
++#endif
++
+ static bool tryDecrement(SemaphoreState& state)
+ {
+     for (;;) {
+@@ -184,7 +234,31 @@ bool Semaphore::waitImpl(Timeout timeout)
+ 
+ Semaphore::Semaphore()
+ {
+-#if OS(LINUX)
++#if OS(FREEBSD)
++    int fd = -1;
++    do {
++        fd = shm_open(SHM_ANON, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
++    } while (fd == -1 && errno == EINTR);
++    if (fd == -1) {
++        RELEASE_LOG_ERROR(IPC, "Failed to create IPC semaphore: %" PUBLIC_LOG_STRING, safeStrerror(errno));
++        return;
++    }
++    int result = -1;
++    do {
++        result = ftruncate(fd, semaphoreStateSize);
++    } while (result == -1 && errno == EINTR);
++    if (result == -1) {
++        RELEASE_LOG_ERROR(IPC, "Failed to prepare IPC semaphore: %" PUBLIC_LOG_STRING, safeStrerror(errno));
++        closeWithRetry(fd);
++        return;
++    }
++    m_fd = { fd, UnixFileDescriptor::Adopt };
++    m_state = mapSemaphoreState(m_fd.value());
++    if (!m_state) {
++        RELEASE_LOG_ERROR(IPC, "Failed to map IPC semaphore: %" PUBLIC_LOG_STRING, safeStrerror(errno));
++        m_fd = { };
++    }
++#elif OS(LINUX)
+     int fd = -1;
+     do {
+         fd = static_cast<int>(syscall(__NR_memfd_create, "IPCSemaphore", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+@@ -214,14 +288,14 @@ Semaphore::Semaphore()
+ Semaphore::Semaphore(UnixFileDescriptor&& fd)
+     : m_fd(WTF::move(fd))
+ {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     m_state = mapSemaphoreState(m_fd.value());
+ #endif
+ }
+ 
+ Semaphore::Semaphore(Semaphore&& other)
+     : m_fd(WTF::move(other.m_fd))
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     , m_state(std::exchange(other.m_state, nullptr))
+ #endif
+ {
+@@ -232,7 +306,7 @@ Semaphore& Semaphore::operator=(Semaphore&& other)
+     if (this != &other) {
+         destroy();
+         m_fd = WTF::move(other.m_fd);
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+         m_state = std::exchange(other.m_state, nullptr);
+ #endif
+     }
+@@ -246,7 +320,7 @@ Semaphore::~Semaphore()
+ 
+ void Semaphore::signal()
+ {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     if (!m_state) [[unlikely]]
+         return;
+     auto& state = *static_cast<SemaphoreState*>(m_state);
+@@ -258,7 +332,7 @@ void Semaphore::signal()
+ 
+ bool Semaphore::wait()
+ {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     if (!m_state) [[unlikely]]
+         return false;
+     return waitImpl(Timeout::infinity());
+@@ -269,7 +343,7 @@ bool Semaphore::wait()
+ 
+ bool Semaphore::waitFor(Timeout timeout)
+ {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     if (!m_state) [[unlikely]]
+         return false;
+     return waitImpl(timeout);
+@@ -285,7 +359,7 @@ UnixFileDescriptor Semaphore::duplicateDescriptor() const
+ 
+ void Semaphore::destroy()
+ {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(FREEBSD)
+     if (m_state) {
+         munmap(m_state, semaphoreStateSize);
+         m_state = nullptr;

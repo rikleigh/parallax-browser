@@ -1,0 +1,73 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index fa06195..285ade5 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -13444,9 +13444,14 @@ ps5_clear_gpu_depth_stencil(struct ps5_context *context, unsigned buffers,
+       return false;
+    struct pipe_surface surface = context->framebuffer.zsbuf;
+    const struct ps5_resource *target = (const struct ps5_resource *)surface.texture;
++   /* 4x depth/stencil as the draws render it: the blitter's single-sample
++    * rasterization covers every sample of each pixel it touches. */
++   const bool msaa4 = target && PS5_ENABLE_MSAA4_CANDIDATE &&
++      target->base.nr_samples == 4 && target->base.nr_storage_samples == 4;
++   const unsigned samples = msaa4 ? 4u : 1u;
+    if (!target || (target->base.target != PIPE_TEXTURE_2D &&
+                    target->base.target != PIPE_TEXTURE_2D_ARRAY) ||
+-       target->base.nr_samples > 1 || target->base.nr_storage_samples > 1 ||
++       ((target->base.nr_samples > 1 || target->base.nr_storage_samples > 1) && !msaa4) ||
+        target->base.last_level || !target->base.array_size ||
+        target->base.depth0 != 1 || !context->framebuffer.width || !context->framebuffer.height ||
+        target->base.width0 > PS5_MAX_DEPTH_WIDTH || target->base.height0 > PS5_MAX_DEPTH_HEIGHT ||
+@@ -13457,11 +13462,12 @@ ps5_clear_gpu_depth_stencil(struct ps5_context *context, unsigned buffers,
+        (surface.format != PIPE_FORMAT_Z32_FLOAT &&
+         surface.format != PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) ||
+        target->base.format != surface.format || !target->data ||
+-       ps5_tiled_depth_surface_size(target->base.width0, target->base.height0, 1) >
++       ps5_tiled_depth_surface_size(target->base.width0, target->base.height0, samples) >
+           target->allocation_size / (surface.last_layer + 1u) ||
+        ((buffers & PIPE_CLEAR_STENCIL) &&
+         (surface.format != PIPE_FORMAT_Z32_FLOAT_S8X24_UINT || !target->stencil_data ||
+-         ps5_tiled_stencil_surface_size(target->base.width0, target->base.height0) >
++         ps5_tiled_stencil_surface_size_samples(target->base.width0, target->base.height0,
++                                                samples) >
+             target->stencil_allocation_size / (surface.last_layer + 1u))))
+       return false;
+    unsigned left, bottom, right, top;
+diff --git a/tests/ps5/test_gpu_clear_state.py b/tests/ps5/test_gpu_clear_state.py
+index 730ed1d..cbf462f 100644
+--- a/tests/ps5/test_gpu_clear_state.py
++++ b/tests/ps5/test_gpu_clear_state.py
+@@ -424,8 +424,9 @@ static __attribute__((unused)) bool ps5_any_primitive_query(const struct ps5_con
+     return c->active_primitives_generated_query || c->active_primitives_emitted_query;
+ }
+ static size_t ps5_tiled_depth_surface_size(unsigned w,unsigned h,unsigned samples)
+-{ assert(samples==1); return (size_t)w*h*4; }
+-static size_t ps5_tiled_stencil_surface_size(unsigned w,unsigned h) { return (size_t)w*h; }
++{ assert(samples==1||samples==4); return (size_t)w*h*4*samples; }
++static size_t ps5_tiled_stencil_surface_size_samples(unsigned w,unsigned h,unsigned samples)
++{ assert(samples==1||samples==4); return (size_t)w*h*samples; }
+ static void ps5_clear_bounds(const struct pipe_scissor_state *s,unsigned w,unsigned h,
+     unsigned *x0,unsigned *y0,unsigned *x1,unsigned *y1) {
+     *x0=s && s->minx<w ? s->minx : s ? w : 0;
+@@ -477,6 +478,21 @@ int main(void) {
+     assert(!CHECK(&c,3,255,&scissor,.375)); } while (0)
+     REJECT_TARGET(base.target,3); REJECT_TARGET(base.last_level,1);
+     REJECT_TARGET(base.nr_samples,4); REJECT_TARGET(base.nr_storage_samples,4);
++    REJECT_TARGET(base.nr_samples,2);
++    { /* 4x depth/stencil: admitted only with 4x storage and 4x allocations. */
++        struct ps5_resource t=target; struct ps5_context c=good;
++        c.framebuffer.zsbuf.texture=&t;
++        t.base.nr_samples=t.base.nr_storage_samples=4;
++        assert(!CHECK(&c,3,255,NULL,.375));
++        t.allocation_size*=4; assert(!CHECK(&c,3,255,NULL,.375));
++        assert(CHECK(&c,1,255,NULL,.375));
++        t.stencil_allocation_size*=4; assert(CHECK(&c,3,255,NULL,.375));
++        assert(CHECK(&c,2,255,&scissor,NAN));
++        assert(!CHECK(&c,3,15,NULL,.375));
++        t.base.nr_storage_samples=1; assert(!CHECK(&c,3,255,NULL,.375));
++        t.base.nr_storage_samples=4; t.base.nr_samples=2;
++        assert(!CHECK(&c,3,255,NULL,.375));
++    }
+     REJECT_TARGET(base.array_size,0); REJECT_TARGET(base.depth0,2);
+     REJECT_TARGET(base.width0,8193); REJECT_TARGET(base.height0,8193);
+     REJECT_TARGET(data,NULL); REJECT_TARGET(stencil_data,NULL);

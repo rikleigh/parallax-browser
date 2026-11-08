@@ -1,0 +1,162 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 8af4a14..0f215ed 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -113,6 +113,10 @@ _Static_assert(PIPE_LOGICOP_CLEAR == 0 && PIPE_LOGICOP_COPY == 12 &&
+     PS5_RENDER_ARENA_SLOT_BYTES)
+ #define PS5_RENDER_ARENA_BITMAP_WORDS \
+    ((PS5_RENDER_ARENA_SLOT_COUNT + 63u) / 64u)
++/* Driver-private: the caller rewrites every byte the GPU reads before first
++ * use (descriptor snapshots, exactly as for recycled ones), so an arena
++ * allocation skips its clear. */
++#define PS5_RESOURCE_FLAG_UNCLEARED PIPE_RESOURCE_FLAG_DRV_PRIV
+ 
+ struct ps5_screen {
+    struct pipe_screen base;
+@@ -4812,7 +4816,7 @@ ps5_render_arena_mark(struct ps5_screen *screen, unsigned first,
+ static bool
+ ps5_render_arena_allocate(struct ps5_screen *screen,
+                           struct ps5_resource *resource, size_t size,
+-                          size_t alignment)
++                          size_t alignment, bool clear)
+ {
+    struct ps5_resource *pool =
+       (struct ps5_resource *)screen->render_pool;
+@@ -4844,7 +4848,8 @@ ps5_render_arena_allocate(struct ps5_screen *screen,
+       resource->allocation_size = size;
+       pipe_resource_reference(&resource->render_pool_owner,
+                               screen->render_pool);
+-      memset(resource->data, 0, size);
++      if (clear)
++         memset(resource->data, 0, size);
+ #ifdef AGC_RUNTIME_DIAGNOSTICS
+       printf("[ps5-gallium] shared-resource offset=%zu bytes=%zu first=%u count=%u alignment=%zu\n",
+              PS5_RENDER_ARENA_OFFSET +
+@@ -5095,7 +5100,8 @@ ps5_resource_create_unlocked(struct pipe_screen *screen,
+        !(templ->bind & PIPE_BIND_DISPLAY_TARGET) &&
+        templ->format != PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
+       if (!ps5_render_arena_allocate(ps5, resource, allocation_size,
+-                                     allocation_alignment)) {
++                                     allocation_alignment,
++                                     !(templ->flags & PS5_RESOURCE_FLAG_UNCLEARED))) {
+          printf("[ps5-gallium] shared-resource exhausted bytes=%zu alignment=%zu\n",
+                 allocation_size, allocation_alignment);
+          /* The arena is an allocation fast path, not a resource-size limit.
+@@ -11678,6 +11684,8 @@ ps5_batch_copy_descriptors(struct pipe_context *base,
+       if (templ.width0 > source->size)
+          return false;
+ #if defined(PS5_NATIVE_TITLE_RUNTIME) && defined(PS5_DEFERRED_DRAW_BATCH)
++      /* A snapshot is filled below and by preparation like a recycled one. */
++      templ.flags |= PS5_RESOURCE_FLAG_UNCLEARED;
+       storage[stage] = ps5_descriptor_take(base, stage, &templ);
+ #else
+       storage[stage] = base->screen->resource_create(base->screen, &templ);
+diff --git a/tests/ps5/test_buffer_arena.py b/tests/ps5/test_buffer_arena.py
+index 68529a6..1c948b7 100644
+--- a/tests/ps5/test_buffer_arena.py
++++ b/tests/ps5/test_buffer_arena.py
+@@ -25,10 +25,11 @@ code = r'''
+ #define PS5_RENDER_ARENA_SLOT_COUNT 16u
+ #define PS5_RENDER_ARENA_OFFSET 256u
+ #define PS5_RENDER_POOL_BYTES (PS5_RENDER_ARENA_OFFSET + 1024u)
++#define PS5_RESOURCE_FLAG_UNCLEARED 4096u
+ enum { PIPE_BUFFER, PIPE_TEXTURE_1D, PIPE_TEXTURE_2D, PIPE_TEXTURE_3D,
+        PIPE_TEXTURE_CUBE, PIPE_TEXTURE_2D_ARRAY };
+ enum { PIPE_BIND_DISPLAY_TARGET=1, PIPE_FORMAT_Z32_FLOAT_S8X24_UINT=10 };
+-struct pipe_resource { unsigned target, bind, format; };
++struct pipe_resource { unsigned target, bind, format, flags; };
+ struct ps5_resource {
+     struct pipe_resource base;
+     unsigned char *data;
+@@ -91,15 +92,22 @@ int main(void) {
+     assert(extra.render_arena_first_slot==4 && extra.render_arena_slot_count==2);
+     for (unsigned i=0; i<128; ++i) assert(!extra.data[i]);
+     assert(bytes[PS5_RENDER_ARENA_OFFSET+3*64]==0xcc);
++    /* Snapshots rewritten before use take the slot without the clear. */
++    struct ps5_resource uncleared={0};
++    templ.flags=PS5_RESOURCE_FLAG_UNCLEARED;
++    assert(try_arena(&screen,&uncleared,&templ,64,64));
++    assert(uncleared.render_arena_first_slot==3);
++    for (unsigned i=0; i<64; ++i) assert(uncleared.data[i]==0xcc);
++    templ.flags=0;
+     struct ps5_resource bad={0};
+-    assert(!ps5_render_arena_allocate(&screen,&bad,0,64));
+-    assert(!ps5_render_arena_allocate(&screen,&bad,65,64));
+-    assert(!ps5_render_arena_allocate(&screen,&bad,1088,64));
+-    assert(!ps5_render_arena_allocate(&screen,&bad,64,0));
+-    assert(!ps5_render_arena_allocate(&screen,&bad,64,65));
++    assert(!ps5_render_arena_allocate(&screen,&bad,0,64,true));
++    assert(!ps5_render_arena_allocate(&screen,&bad,65,64,true));
++    assert(!ps5_render_arena_allocate(&screen,&bad,1088,64,true));
++    assert(!ps5_render_arena_allocate(&screen,&bad,64,0,true));
++    assert(!ps5_render_arena_allocate(&screen,&bad,64,65,true));
+     screen.render_pool=NULL;
+     assert(!try_arena(&screen,&bad,&templ,64,64));
+-    assert(!ps5_render_arena_allocate(&screen,&bad,64,64));
++    assert(!ps5_render_arena_allocate(&screen,&bad,64,64,true));
+     screen.render_pool=&pool.base; pool.data=NULL;
+     assert(!try_arena(&screen,&bad,&templ,64,64));
+     assert(!bad.data && !bad.render_pool_owner);
+@@ -133,7 +141,7 @@ int main(void) {
+   for(unsigned first=0;first+slots<=130;++first)
+    if(!(first%align) && ps5_render_arena_range_is_free(&screen,first,slots)) {expected=first;break;}
+   struct ps5_resource out={0};
+-  bool ok=ps5_render_arena_allocate(&screen,&out,slots*64,align*64);
++  bool ok=ps5_render_arena_allocate(&screen,&out,slots*64,align*64,true);
+   assert(ok==(expected<130));
+   if(ok) assert(out.render_arena_first_slot==expected && out.render_arena_slot_count==slots);
+  }
+diff --git a/tests/ps5/test_render_target_extents.py b/tests/ps5/test_render_target_extents.py
+index ac510f2..f4070a9 100644
+--- a/tests/ps5/test_render_target_extents.py
++++ b/tests/ps5/test_render_target_extents.py
+@@ -108,12 +108,13 @@ static void check_target_extents(unsigned width, unsigned height, bool attached)
+         }
+     }
+ }
+-struct pipe_resource { unsigned bind, format, nr_samples, target; };
++#define PS5_RESOURCE_FLAG_UNCLEARED 4096u
++struct pipe_resource { unsigned bind, format, nr_samples, target, flags; };
+ static bool arena_available;
+ static unsigned direct_allocations;
+ static bool ps5_render_arena_allocate(struct ps5_screen *screen,
+-    struct ps5_resource *resource, size_t size, size_t alignment) {
+-    (void)screen; (void)resource; (void)size; (void)alignment;
++    struct ps5_resource *resource, size_t size, size_t alignment, bool clear) {
++    (void)screen; (void)resource; (void)size; (void)alignment; (void)clear;
+     return arena_available;
+ }
+ static struct ps5_resource *allocate(size_t allocation_size) {
+diff --git a/tests/ps5/test_vertex_snapshot.py b/tests/ps5/test_vertex_snapshot.py
+index d9735f3..85eb010 100644
+--- a/tests/ps5/test_vertex_snapshot.py
++++ b/tests/ps5/test_vertex_snapshot.py
+@@ -29,8 +29,9 @@ code = r'''
+ #define PS5_DIRECT_ALIGNMENT 16384
+ #define PS5_CONSTANT_DATA_OFFSET 4096
+ #define PIPE_BUFFER 1
++#define PS5_RESOURCE_FLAG_UNCLEARED 4096u
+ #define MAX2(a,b) ((a)>(b)?(a):(b))
+-struct pipe_resource { unsigned target; size_t width0; };
++struct pipe_resource { unsigned target; size_t width0; unsigned flags; };
+ struct pipe_context { int unused; };
+ struct nir { struct { unsigned num_ubos, num_ssbos, num_images; } info; };
+ struct ps5_shader { struct nir *nir; };
+@@ -54,6 +55,8 @@ static size_t ps5_descriptor_snapshot_size(const struct ps5_context *c, unsigned
+ static struct pipe_resource *ps5_descriptor_take(struct pipe_context *c, unsigned s,
+                                                 const struct pipe_resource *t) {
+  (void)c;
++ // Snapshots are rewritten before use, so they are created without a clear.
++ assert(t->flags & PS5_RESOURCE_FLAG_UNCLEARED);
+  if ((int)s == fail_stage) return NULL;
+  resources[s+3].base = *t; resources[s+3].size = t->width0;
+  return &resources[s+3].base;
+@@ -70,7 +73,7 @@ int main(void) {
+  struct ps5_shader shaders[2] = {{&nir[0]}, {&nir[1]}};
+  struct pipe_resource *saved[3], *storage[3];
+  for (unsigned i=0;i<6;++i) {
+-  resources[i]=(struct ps5_resource){{PIPE_BUFFER,32768}, data[i],32768};
++  resources[i]=(struct ps5_resource){{PIPE_BUFFER,32768,0}, data[i],32768};
+   if(i<3) saved[i]=&resources[i].base;
+  }
+  resources[0].base.width0=resources[0].size=16384;

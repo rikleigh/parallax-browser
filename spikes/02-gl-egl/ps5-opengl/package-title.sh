@@ -31,6 +31,9 @@ shift $((OPTIND - 1))
 NATIVE="$ROOT/ref/PS5VR/app/tools/native-app"     # vendored boilerplate tooling
 PSGL="$ROOT/ref/ps5-opengl/native-app"            # ps5-opengl's title runtime pieces
 SDK="$PS5_PAYLOAD_SDK"; SYS="$SDK/target"
+# C++ runtime archives: the SDK's (LLVM 18) unless PS5_CXXLIB names another
+# (Spike 11 links ANGLE, built against toolchain/libcxx19 like WebKit).
+CXXLIB="${PS5_CXXLIB:-$SYS/lib}"
 W="$HERE/build/title-$TITLE"; mkdir -p "$W/tool" "$W/obj"
 LLD="$SDK/bin/prospero-lld"
 
@@ -79,7 +82,7 @@ done
     --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" \
     "$W"/obj/*.o "$@" -u ps5_agc_gate2_run \
     --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
-    "$SYS/lib/libc++.a" "$SYS/lib/libc++abi.a" "$SYS/lib/libunwind.a" \
+    "$CXXLIB/libc++.a" "$CXXLIB/libc++abi.a" "$CXXLIB/libunwind.a" \
     "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
     --as-needed "${sdk_stubs[@]}" --start-group "$SYS/lib/libc.a" --end-group \
     2> "$W/link.log" || {

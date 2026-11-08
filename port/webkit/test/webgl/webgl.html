@@ -1,0 +1,78 @@
+<!doctype html>
+<!-- WebGL M1 check (spikes/11-webgl): creates a WebGL 1 and a WebGL 2 context,
+     draws a triangle in each and reads a pixel back. The contexts live in the
+     title (remote WebGL); the results are written as text (spin.html is the
+     on-screen check). Upload to /data/ps5webkit/webgl.html and open
+     file:///data/ps5webkit/webgl.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL check</title>
+<style>
+  body { background: #111; color: #eee; font: 28px/1.4 sans-serif; margin: 40px; }
+  canvas { width: 128px; height: 128px; border: 2px solid #555; margin-right: 16px; }
+  .ok { color: #6d6; } .fail { color: #f66; }
+  pre { font-size: 22px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>WebGL check</h1>
+<canvas id="c1" width="64" height="64"></canvas><canvas id="c2" width="64" height="64"></canvas>
+<pre id="out"></pre>
+<script>
+const out = document.getElementById('out');
+function line(text, cls) {
+  const span = document.createElement('span');
+  span.textContent = text + '\n';
+  if (cls) span.className = cls;
+  out.appendChild(span);
+  console.log('[webgl-check] ' + text);
+}
+
+function check(id, kind) {
+  const t0 = performance.now();
+  const gl = document.getElementById(id).getContext(kind, { antialias: false, preserveDrawingBuffer: true });
+  if (!gl) { line(kind + ': no context', 'fail'); return; }
+  if (gl.isContextLost()) { line(kind + ': context lost at creation', 'fail'); return; }
+  line(kind + ': ' + gl.getParameter(gl.VERSION) + ' / ' + gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+  line('  renderer: ' + gl.getParameter(gl.RENDERER) + ', max texture ' + gl.getParameter(gl.MAX_TEXTURE_SIZE));
+
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, 'attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }');
+  gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, 'precision mediump float; void main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }');
+  gl.compileShader(fs);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+  gl.bindAttribLocation(prog, 0, 'p');
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    line('  link failed: ' + gl.getProgramInfoLog(prog) + ' ' + gl.getShaderInfoLog(vs) + ' ' + gl.getShaderInfoLog(fs), 'fail');
+    return;
+  }
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.clearColor(1, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  const px = new Uint8Array(4);
+  gl.readPixels(32, 32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const err = gl.getError();
+  const good = px[0] < 8 && px[1] > 247 && px[2] < 8 && err === gl.NO_ERROR;
+  line('  triangle pixel ' + Array.from(px).join(',') + ', error 0x' + err.toString(16) + ', ' +
+       (performance.now() - t0).toFixed(0) + ' ms: ' + (good ? 'PASS' : 'FAIL'), good ? 'ok' : 'fail');
+}
+
+line(navigator.userAgent);
+for (const [id, kind] of [['c1', 'webgl'], ['c2', 'webgl2']]) {
+  try { check(id, kind); } catch (e) { line(kind + ': exception ' + e, 'fail'); }
+}
+line('done');
+</script>
+</body>
+</html>

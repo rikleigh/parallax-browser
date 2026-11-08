@@ -10,7 +10,7 @@
 #           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles
 #   gles-noprof : the gles tree reinstalled with the driver's per-draw
 #           profiling compiled out (PS5_DRAW_PROFILE=0 PS5_RUNTIME_QUIET=1)
-#           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles-noprof
+#           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles-noprof (PS5_OPENGL_PREFIX: elsewhere)
 #   gles-async : gles-noprof + PS5_ASYNC_NATIVE_PREP=1 (two pinned worker
 #           threads build the native command streams of batched draws)
 #           -> $PS5WK_ROOT/toolchain/ps5-opengl-gles-async
@@ -178,6 +178,8 @@ case "$variant" in
         for p in "$HERE"/patches/*.patch; do patches+=("$p"); done
         (export PS5_DRAW_PROFILE=0 PS5_RUNTIME_QUIET=1
          [[ $variant == gles-async ]] && export PS5_ASYNC_NATIVE_PREP=1
-         build_variant gles "$ROOT/toolchain/ps5-opengl-$variant" "${patches[@]}") ;;
+         # PS5_OPENGL_PREFIX: install elsewhere (a driver change on trial
+         # leaves the browser's own build alone).
+         build_variant gles "${PS5_OPENGL_PREFIX:-$ROOT/toolchain/ps5-opengl-$variant}" "${patches[@]}") ;;
 esac
 log "done"
