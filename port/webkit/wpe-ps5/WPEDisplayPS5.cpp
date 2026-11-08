@@ -106,6 +106,10 @@ struct _WPEDisplayPS5Private {
     // not.
     enum class PressKind : uint8_t { Other, PointerClick, FocusMove };
     PressKind lastPressKind { PressKind::Other };
+    // When an editable field last got focus: a click on a field that does
+    // not move the focus (the field already has it, say after a form's
+    // validation focused it) opens the keyboard itself.
+    double focusedAt { -1000 };
     GRefPtr<GSource> padSource;
 
     double pointerX { 0 };
@@ -230,6 +234,35 @@ WPEView* wpeDisplayPS5GetActiveView(WPEDisplayPS5* display)
 void wpeDisplayPS5SetFocusedInputContext(WPEDisplayPS5* display, WPEInputMethodContext* context)
 {
     display->priv->focusedInputContext = context;
+    display->priv->focusedAt = nowSeconds();
+}
+
+// A click on an editable node opens the keyboard through the focus change it
+// causes (wpeDisplayPS5FocusFollowsPressOnField). A click on the field that
+// already has focus causes none, so after the click, once any focus change
+// would have arrived, the keyboard opens for that field if focus stayed put.
+// Should a focus change arrive later still, the dialog's text is dropped
+// rather than typed elsewhere (the context checks it is still focused).
+static void openKeyboardIfFocusStayed(WPEDisplayPS5* display, double clickAt)
+{
+    struct Click {
+        GRefPtr<WPEDisplayPS5> display;
+        GRefPtr<WPEInputMethodContext> context;
+        double at;
+    };
+    auto* priv = display->priv;
+    if (!priv->focusedInputContext || !priv->pointerOverEditable || !priv->pointerTargetReported || priv->pendingText)
+        return;
+    auto* click = new Click { display, priv->focusedInputContext, clickAt };
+    g_timeout_add_full(G_PRIORITY_DEFAULT, 400, [](gpointer data) -> gboolean {
+        auto* click = static_cast<Click*>(data);
+        auto* priv = click->display->priv;
+        if (priv->focusedInputContext == click->context.get() && priv->focusedAt < click->at && !priv->pendingText) {
+            PS5_LOG("IME: click on the focused field: keyboard opens");
+            wpeInputMethodContextPS5OpenKeyboard(click->context.get());
+        }
+        return G_SOURCE_REMOVE;
+    }, click, [](gpointer data) { delete static_cast<Click*>(data); });
 }
 
 void wpeDisplayPS5InputContextDestroyed(WPEDisplayPS5* display, WPEInputMethodContext* context)
@@ -309,10 +342,10 @@ static void pollTextDialog(WPEDisplayPS5* display)
 gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title, const char* initialText, gboolean url, WPEDisplayPS5TextCallback callback, gpointer userData)
 {
     g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
-    return wpeDisplayPS5RequestText(display, title, initialText, url, url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT, callback, userData);
+    return wpeDisplayPS5RequestText(display, title, initialText, url, url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT, !url, callback, userData);
 }
 
-bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const char* initialText, bool url, int32_t enterLabel, WPEDisplayPS5TextCallback callback, gpointer userData)
+bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const char* initialText, bool url, int32_t enterLabel, bool autoCapitalize, WPEDisplayPS5TextCallback callback, gpointer userData)
 {
     auto* priv = display->priv;
     if (priv->pendingText || !priv->ime.init) {
@@ -330,7 +363,7 @@ bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const c
     param.userID = priv->userID;
     param.type = url ? PS5_IME_TYPE_URL : PS5_IME_TYPE_DEFAULT;
     param.enterLabel = enterLabel;
-    param.option = url ? PS5_IME_OPTION_NO_AUTO_CAPITALIZATION : 0;
+    param.option = autoCapitalize ? 0 : PS5_IME_OPTION_NO_AUTO_CAPITALIZATION;
     param.maxTextLength = G_N_ELEMENTS(pending->buffer) - 1;
     param.inputTextBuffer = pending->buffer;
     param.posX = PS5Renderer::singleton().width() / 2.0f;
@@ -354,8 +387,9 @@ bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const c
         PS5_LOG("sceImeDialogInit failed: 0x%08x", rc);
         return FALSE;
     }
-    PS5_LOG("IME dialog open (%s, %zu chars, enter label %s)", url ? "URL" : "text", strlen(initialText ? initialText : ""),
-        enterLabel == PS5_IME_ENTER_LABEL_SEARCH ? "Search" : enterLabel == PS5_IME_ENTER_LABEL_GO ? "Go" : enterLabel == PS5_IME_ENTER_LABEL_SEND ? "Send" : "default");
+    PS5_LOG("IME dialog open (%s, %zu chars, enter label %s, %s)", url ? "URL" : "text", strlen(initialText ? initialText : ""),
+        enterLabel == PS5_IME_ENTER_LABEL_SEARCH ? "Search" : enterLabel == PS5_IME_ENTER_LABEL_GO ? "Go" : enterLabel == PS5_IME_ENTER_LABEL_SEND ? "Send" : "default",
+        autoCapitalize ? "capitals on" : "no capitals");
     priv->pendingText = WTF::move(pending);
     return TRUE;
 }
@@ -797,6 +831,7 @@ static void padTick(WPEDisplayPS5* display)
             GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
                 eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
             wpe_view_event(view, event.get());
+            openKeyboardIfFocusStayed(display, priv->lastPress);
         } else
             sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
     }

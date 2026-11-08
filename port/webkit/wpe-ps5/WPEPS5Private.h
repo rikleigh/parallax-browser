@@ -51,9 +51,10 @@ void wpeDisplayPS5InputContextDestroyed(WPEDisplayPS5*, WPEInputMethodContext*);
 // gets a short reason for the log (NULL when no press was recent).
 bool wpeDisplayPS5FocusFollowsPressOnField(WPEDisplayPS5*, const char** why);
 
-// The system keyboard with the given enter label (PS5_IME_ENTER_LABEL_*);
-// wpe_display_ps5_request_text without the check.
-bool wpeDisplayPS5RequestText(WPEDisplayPS5*, const char* title, const char* initialText, bool url, int32_t enterLabel, WPEDisplayPS5TextCallback, gpointer userData);
+// The system keyboard with the given enter label (PS5_IME_ENTER_LABEL_*),
+// capitalizing automatically or not; wpe_display_ps5_request_text without
+// the check.
+bool wpeDisplayPS5RequestText(WPEDisplayPS5*, const char* title, const char* initialText, bool url, int32_t enterLabel, bool autoCapitalize, WPEDisplayPS5TextCallback, gpointer userData);
 
 // Return pressed and released on the active view (real key events: keydown,
 // keypress, keyup), as the pad's X does when the pointer is hidden.
