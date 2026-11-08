@@ -30,7 +30,11 @@
 //    editable node (X on a field) or a D-pad / L1 / R1 press that moved the
 //    focus; not when a page focuses a field by itself, on load or in a
 //    button's click handler (a search button that refocuses its field);
-//  - on Triangle while a field is focused.
+//  - on Triangle while a field is focused;
+//  - on X over the field that already has focus (no focus change follows;
+//    say a form's validation focused it after Go).
+// It capitalizes automatically only where the page asks (autocapitalize) or
+// in a multi-line field.
 // The dialog starts with the field's text around the cursor; on "OK" that
 // text is replaced (delete-surrounding + committed), and in a single-line
 // field Return follows, as a phone keyboard's Go key submits the form (the
@@ -82,9 +86,17 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
         || priv->surrounding.find('\n') != std::string::npos;
     priv->enterSubmits = !multiline;
     int32_t enterLabel = multiline ? PS5_IME_ENTER_LABEL_DEFAULT : purpose == WPE_INPUT_PURPOSE_SEARCH ? PS5_IME_ENTER_LABEL_SEARCH : PS5_IME_ENTER_LABEL_GO;
+    // No automatic capitals in form fields (user names, passwords, e-mail
+    // addresses, searches): only where the page asks for them (an
+    // autocapitalize attribute: WebKit's uppercase hints), or in a textarea
+    // or contenteditable element that does not ask for lowercase.
+    auto hints = wpe_input_method_context_get_input_hints(context);
+    constexpr auto uppercase = static_cast<WPEInputHints>(WPE_INPUT_HINT_UPPERCASE_CHARS | WPE_INPUT_HINT_UPPERCASE_WORDS | WPE_INPUT_HINT_UPPERCASE_SENTENCES);
+    bool autoCapitalize = !url && purpose != WPE_INPUT_PURPOSE_PASSWORD
+        && ((hints & uppercase) || (multiline && !(hints & WPE_INPUT_HINT_LOWERCASE)));
 
     g_object_ref(context);
-    priv->waiting = wpeDisplayPS5RequestText(display, title, initial, url, enterLabel, [](const char* text, gpointer userData) {
+    priv->waiting = wpeDisplayPS5RequestText(display, title, initial, url, enterLabel, autoCapitalize, [](const char* text, gpointer userData) {
         auto* context = WPE_INPUT_METHOD_CONTEXT(userData);
         auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
         priv->waiting = false;
