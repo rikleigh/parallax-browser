@@ -561,6 +561,12 @@ bool PS5Renderer::perfOverlay()
     return on;
 }
 
+void PS5Renderer::setKeyboardLift(int pixels)
+{
+    if (m_keyboardLift.exchange(std::max(pixels, 0)) != std::max(pixels, 0))
+        requestCompositorFrame();
+}
+
 void PS5Renderer::requestCompositorFrame()
 {
     g_mutex_lock(&m_lock);
@@ -1259,6 +1265,8 @@ void PS5Renderer::drawScene()
         pageH = contentHeight * scale;
         pageX = (m_width - pageW) / 2;
         pageY = (m_height - pageH) / 2;
+        // Lifted above the on-screen keyboard (videos and the page together).
+        pageY -= m_keyboardLift.load(std::memory_order_relaxed);
     }
 
     // Videos under the page, clipped to it.

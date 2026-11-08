@@ -29,6 +29,7 @@
 #include "PS5Sce.h"
 #include "WPEExtensions.h"
 #include "WPEPS5Private.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <gio/gio.h>
@@ -110,6 +111,14 @@ struct _WPEDisplayPS5Private {
     // not move the focus (the field already has it, say after a form's
     // validation focused it) opens the keyboard itself.
     double focusedAt { -1000 };
+    // When the keyboard's Go sent Return: Return in a form field moves the
+    // focus to the next field (WebKit patch 0091), and the keyboard opens
+    // there, as on a phone.
+    double goSentAt { -1000 };
+    // The open keyboard's top edge on screen, for the page lift (see
+    // keyboardLiftFor); the lift now applied.
+    float keyboardTop { 0 };
+    int keyboardLift { 0 };
     GRefPtr<GSource> padSource;
 
     double pointerX { 0 };
@@ -254,7 +263,7 @@ static void openKeyboardIfFocusStayed(WPEDisplayPS5* display, double clickAt)
     if (!priv->focusedInputContext || !priv->pointerOverEditable || !priv->pointerTargetReported || priv->pendingText)
         return;
     auto* click = new Click { display, priv->focusedInputContext, clickAt };
-    g_timeout_add_full(G_PRIORITY_DEFAULT, 400, [](gpointer data) -> gboolean {
+    g_timeout_add_full(G_PRIORITY_DEFAULT, 200, [](gpointer data) -> gboolean {
         auto* click = static_cast<Click*>(data);
         auto* priv = click->display->priv;
         if (priv->focusedInputContext == click->context.get() && priv->focusedAt < click->at && !priv->pendingText) {
@@ -277,7 +286,10 @@ bool wpeDisplayPS5FocusFollowsPressOnField(WPEDisplayPS5* display, const char** 
     using PressKind = _WPEDisplayPS5Private::PressKind;
     const char* reason = nullptr; // no recent press: the page focused the field by itself
     bool open = false;
-    if (nowSeconds() - priv->lastPress >= 1.0)
+    if (nowSeconds() - priv->goSentAt < 1.0) {
+        open = true;
+        reason = "Go on the keyboard (the next field, or one the page chose)";
+    } else if (nowSeconds() - priv->lastPress >= 1.0)
         ;
     else if (priv->lastPressKind == PressKind::FocusMove) {
         open = true;
@@ -327,6 +339,8 @@ static void pollTextDialog(WPEDisplayPS5* display)
     PS5ImeDialogResult result { };
     int rc = status == PS5_IME_DIALOG_STATUS_FINISHED ? priv->ime.getResult(&result) : -1;
     priv->ime.term();
+    priv->keyboardLift = 0;
+    PS5Renderer::singleton().setKeyboardLift(0); // the page back where it was
     if (rc || result.endStatus) {
         PS5_LOG("IME dialog closed: status %d rc 0x%x end %d", status, rc, result.endStatus);
         finishText(display, nullptr);
@@ -342,10 +356,57 @@ static void pollTextDialog(WPEDisplayPS5* display)
 gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title, const char* initialText, gboolean url, WPEDisplayPS5TextCallback callback, gpointer userData)
 {
     g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
-    return wpeDisplayPS5RequestText(display, title, initialText, url, url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT, !url, callback, userData);
+    return wpeDisplayPS5RequestText(display, title, initialText, url, url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT, !url, false, false, 0, 0, callback, userData);
 }
 
-bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const char* initialText, bool url, int32_t enterLabel, bool autoCapitalize, WPEDisplayPS5TextCallback callback, gpointer userData)
+// How far to draw the page higher so the field being typed into (its
+// caret line, in view coordinates) sits above the open keyboard. The view
+// fills the screen at scale 1. Only a field wholly on screen lifts the page
+// (the page image holds what is on screen and nothing below it), never by
+// more than the keyboard's height and the field's, and never so far that the field's top
+// leaves the screen; anything else (a caret position before a scroll that
+// reveals the field: patch 0095 sends it again after) leaves the page put.
+static int keyboardLiftFor(WPEDisplayPS5* display, int fieldY, int fieldHeight, const char** why)
+{
+    auto* priv = display->priv;
+    const float screenHeight = PS5Renderer::singleton().height();
+    const float margin = 32 * screenHeight / 1080.0f; // the gap above the keyboard
+    int viewHeight = priv->activeView ? wpe_view_get_height(priv->activeView) : 0;
+    if (fieldHeight <= 0 || viewHeight <= 0 || priv->keyboardTop <= 0)
+        return 0;
+    float viewToScreen = screenHeight / viewHeight;
+    // The caret's line, with room for the field's border and padding.
+    float fieldTop = (fieldY - fieldHeight * 0.5f) * viewToScreen;
+    float fieldBottom = (fieldY + fieldHeight * 1.5f) * viewToScreen;
+    if (fieldY < 0 || (fieldY + fieldHeight) * viewToScreen > screenHeight) {
+        if (why)
+            *why = " (caret off screen: no lift)";
+        return 0;
+    }
+    if (fieldBottom <= priv->keyboardTop - margin)
+        return 0;
+    float wanted = fieldBottom - (priv->keyboardTop - margin);
+    float keepTopVisible = std::max(fieldTop - margin, 0.0f);
+    // At most the keyboard's height and room for the field: enough for a
+    // field at the very bottom of the screen to clear it.
+    float most = screenHeight - priv->keyboardTop + margin + (fieldBottom - fieldTop);
+    return static_cast<int>(std::min({ wanted, keepTopVisible, most }));
+}
+
+void wpeDisplayPS5KeyboardFieldMoved(WPEDisplayPS5* display, int fieldY, int fieldHeight)
+{
+    auto* priv = display->priv;
+    if (!priv->pendingText)
+        return;
+    int lift = keyboardLiftFor(display, fieldY, fieldHeight, nullptr);
+    if (lift == priv->keyboardLift)
+        return;
+    PS5_LOG("IME: the field moved (caret y %d h %d): page lifted %d px (was %d)", fieldY, fieldHeight, lift, priv->keyboardLift);
+    priv->keyboardLift = lift;
+    PS5Renderer::singleton().setKeyboardLift(lift);
+}
+
+bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const char* initialText, bool url, int32_t enterLabel, bool autoCapitalize, bool password, bool noLearning, int fieldY, int fieldHeight, WPEDisplayPS5TextCallback callback, gpointer userData)
 {
     auto* priv = display->priv;
     if (priv->pendingText || !priv->ime.init) {
@@ -361,17 +422,41 @@ bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const c
 
     PS5ImeDialogParam param { };
     param.userID = priv->userID;
-    param.type = url ? PS5_IME_TYPE_URL : PS5_IME_TYPE_DEFAULT;
+    param.type = password ? PS5_IME_TYPE_BASIC_LATIN : url ? PS5_IME_TYPE_URL : PS5_IME_TYPE_DEFAULT;
     param.enterLabel = enterLabel;
-    param.option = autoCapitalize ? 0 : PS5_IME_OPTION_NO_AUTO_CAPITALIZATION;
+    param.option = (autoCapitalize ? 0 : PS5_IME_OPTION_NO_AUTO_CAPITALIZATION) | (password ? PS5_IME_OPTION_PASSWORD : 0)
+        | (password || noLearning ? PS5_IME_OPTION_NO_LEARNING : 0);
     param.maxTextLength = G_N_ELEMENTS(pending->buffer) - 1;
     param.inputTextBuffer = pending->buffer;
-    param.posX = PS5Renderer::singleton().width() / 2.0f;
-    param.posY = PS5Renderer::singleton().height() / 2.0f;
-    param.horizontalAlignment = 1; // centre
-    param.verticalAlignment = 1;
     param.placeholder = pending->placeholder;
     param.title = pending->title;
+    // The keyboard opens at the bottom of the screen, as on a phone, and when
+    // it would cover the field being typed into, the page is drawn higher
+    // (PS5Renderer::setKeyboardLift) until it closes: no scrolling, so a
+    // field at the end of a page or in a fixed box rises too, and the page
+    // never sees it. The view fills the screen at scale 1; its coordinates
+    // scale to the screen's. The keyboard's size comes from the system
+    // (1920x1080 coordinates), else a guess of 45% of the screen.
+    const float screenHeight = PS5Renderer::singleton().height();
+    const float toScreen = screenHeight / 1080.0f;
+    param.posX = 960;
+    param.posY = 1080 - 16;
+    param.horizontalAlignment = 1; // centre
+    param.verticalAlignment = 2; // 0 top, 1 centre, 2 bottom
+    uint32_t panelWidth = 0, panelHeight = 0;
+    int sizeRC = priv->ime.getPanelSize ? priv->ime.getPanelSize(&param, &panelWidth, &panelHeight) : -1;
+    bool sizeKnown = !sizeRC && panelHeight > 100 && panelHeight < 1080;
+    float keyboardTop = sizeKnown ? (1080 - 16 - static_cast<float>(panelHeight)) * toScreen : screenHeight * 0.55f;
+    priv->keyboardTop = keyboardTop;
+    int viewHeight = priv->activeView ? wpe_view_get_height(priv->activeView) : 0;
+    const char* why = nullptr;
+    int lift = keyboardLiftFor(display, fieldY, fieldHeight, &why);
+    char placement[200];
+    snprintf(placement, sizeof placement, "bottom, %s %ux%u%s, caret y %d h %d in a view %d high, page lifted %d px",
+        sizeKnown ? "panel" : "panel guessed; system said", panelWidth, panelHeight, sizeRC ? " (no size call)" : "",
+        fieldY, fieldHeight, viewHeight, lift);
+    if (why)
+        strncat(placement, why, sizeof placement - strlen(placement) - 1);
 
     // The keyboard's own pointer follows the touchpad, and a touchpad that
     // reports a touch (a resting finger, or none at all) pins the selection
@@ -383,11 +468,23 @@ bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const c
         PS5_LOG("sceImeDialogInit with the pointer disabled failed (0x%08x); trying without", rc);
         rc = priv->ime.init(&param, nullptr);
     }
+    if (rc && (param.option & PS5_IME_OPTION_NO_LEARNING)) {
+        // Should the system refuse the no-learning option: without it.
+        PS5_LOG("sceImeDialogInit with no learning failed (0x%08x); trying without", rc);
+        param.option &= ~PS5_IME_OPTION_NO_LEARNING;
+        rc = priv->ime.init(&param, &extended);
+        if (rc)
+            rc = priv->ime.init(&param, nullptr);
+    }
     if (rc) {
         PS5_LOG("sceImeDialogInit failed: 0x%08x", rc);
         return FALSE;
     }
-    PS5_LOG("IME dialog open (%s, %zu chars, enter label %s, %s)", url ? "URL" : "text", strlen(initialText ? initialText : ""),
+    priv->keyboardLift = lift;
+    PS5Renderer::singleton().setKeyboardLift(lift);
+    // Never the text itself (a password, or what a page holds): its length.
+    PS5_LOG("IME dialog open (%s%s, %zu chars, keyboard at the %s, enter label %s, %s)", password ? "password" : url ? "URL" : "text",
+        param.option & PS5_IME_OPTION_NO_LEARNING ? ", no learning" : "", strlen(initialText ? initialText : ""), placement,
         enterLabel == PS5_IME_ENTER_LABEL_SEARCH ? "Search" : enterLabel == PS5_IME_ENTER_LABEL_GO ? "Go" : enterLabel == PS5_IME_ENTER_LABEL_SEND ? "Send" : "default",
         autoCapitalize ? "capitals on" : "no capitals");
     priv->pendingText = WTF::move(pending);
@@ -411,8 +508,10 @@ static void tapKey(WPEView* view, guint keyval, guint keycode, WPEModifiers modi
 
 void wpeDisplayPS5SendReturn(WPEDisplayPS5* display)
 {
-    if (auto* view = display->priv->activeView)
+    if (auto* view = display->priv->activeView) {
+        display->priv->goSentAt = nowSeconds();
         tapKey(view, WPE_KEY_Return, 36);
+    }
 }
 
 struct KeyMapping {

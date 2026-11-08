@@ -1,0 +1,21 @@
+diff --git a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+index 385ca595fb..1a8a29db84 100644
+--- a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+@@ -135,7 +135,16 @@ void WebPage::getPlatformEditorState(LocalFrame& frame, EditorState& result) con
+ 
+     auto& postLayoutData = *result.postLayoutData;
+     auto& visualData = *result.visualData;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the on-screen keyboard keeps clear of the caret, so it needs the
++    // caret where it is on screen: absoluteCaretBounds() is in the frame's
++    // document coordinates (off by the scroll position, and by the frame's
++    // place in the page for an iframe), and WPE passes it on unchanged
++    // (InputMethodFilter::platformTransformCursorRectToViewCoordinates).
++    visualData.caretRectAtStart = protect(frame.view())->contentsToRootView(frame.selection().absoluteCaretBounds());
++#else
+     visualData.caretRectAtStart = frame.selection().absoluteCaretBounds();
++#endif
+ 
+     const VisibleSelection& selection = frame.selection().selection();
+     if (selection.isNone())

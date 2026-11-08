@@ -1,0 +1,107 @@
+diff --git a/Source/WebKit/Shared/glib/InputMethodState.h b/Source/WebKit/Shared/glib/InputMethodState.h
+index 6882878960..b33abe7bb8 100644
+--- a/Source/WebKit/Shared/glib/InputMethodState.h
++++ b/Source/WebKit/Shared/glib/InputMethodState.h
+@@ -28,6 +28,7 @@
+ #include <WebCore/AutocapitalizeTypes.h>
+ #include <WebCore/InputMode.h>
+ #include <wtf/OptionSet.h>
++#include <wtf/text/WTFString.h>
+ 
+ namespace IPC {
+ class Decoder;
+@@ -72,6 +73,9 @@ struct InputMethodState {
+ 
+     Purpose purpose { Purpose::FreeForm };
+     OptionSet<Hint> hints;
++    // What the page calls the field (its label, aria-label or placeholder),
++    // for an on-screen keyboard's title (PS5); empty elsewhere.
++    String label;
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/Shared/glib/InputMethodState.serialization.in b/Source/WebKit/Shared/glib/InputMethodState.serialization.in
+index 5918b2490d..dfad7a9d38 100644
+--- a/Source/WebKit/Shared/glib/InputMethodState.serialization.in
++++ b/Source/WebKit/Shared/glib/InputMethodState.serialization.in
+@@ -49,4 +49,5 @@ header: "InputMethodState.h"
+ struct WebKit::InputMethodState {
+     WebKit::InputMethodState::Purpose purpose;
+     OptionSet<WebKit::InputMethodState::Hint> hints;
++    String label;
+ };
+diff --git a/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp b/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp
+index 213dea8b44..a6a57e9033 100644
+--- a/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp
++++ b/Source/WebKit/UIProcess/API/glib/InputMethodFilter.cpp
+@@ -202,6 +202,14 @@ void InputMethodFilter::notifyContentType()
+     g_object_freeze_notify(G_OBJECT(m_context.get()));
+     webkit_input_method_context_set_input_purpose(m_context.get(), toWebKitPurpose(m_state->purpose));
+     webkit_input_method_context_set_input_hints(m_context.get(), toWebKitHints(m_state->hints));
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the field's label for the on-screen keyboard's title, passed on to
++    // the platform context with the hints (WebKitInputMethodContextImplWPE).
++    auto labelUTF8 = m_state->label.utf8();
++    auto labelBytes = byteCast<char>(labelUTF8.span());
++    g_object_set_data_full(G_OBJECT(m_context.get()), "ps5-field-label", g_strndup(labelBytes.data(), labelBytes.size()), g_free);
++    g_object_notify(G_OBJECT(m_context.get()), "input-hints");
++#endif
+     g_object_thaw_notify(G_OBJECT(m_context.get()));
+ }
+ 
+diff --git a/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp b/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp
+index 7a8c54f3b9..af5e1499af 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WebKitInputMethodContextImplWPE.cpp
+@@ -86,6 +86,11 @@ static void inputPurposeChangedCallback(WebKitInputMethodContextImplWPE* context
+ 
+ static void inputHintsChangedCallback(WebKitInputMethodContextImplWPE* context)
+ {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the field's label (InputMethodFilter::notifyContentType).
++    auto* label = static_cast<const char*>(g_object_get_data(G_OBJECT(context), "ps5-field-label"));
++    g_object_set_data_full(G_OBJECT(context->priv->context.get()), "ps5-field-label", g_strdup(label ? label : ""), g_free);
++#endif
+     wpe_input_method_context_set_input_hints(context->priv->context.get(), toWPEInputHints(webkit_input_method_context_get_input_hints(WEBKIT_INPUT_METHOD_CONTEXT(context))));
+ }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+index 2f4c07878d..385ca595fb 100644
+--- a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+@@ -39,7 +39,10 @@
+ #include "WebProcessExtensionManager.h"
+ #include <WebCore/DocumentView.h>
+ #include <WebCore/Editor.h>
++#include <WebCore/ElementInlines.h>
+ #include <WebCore/HTMLInputElement.h>
++#include <WebCore/HTMLNames.h>
++#include <WebCore/NodeList.h>
+ #include <WebCore/HTMLTextAreaElement.h>
+ #include <WebCore/LocalFrameInlines.h>
+ #include <WebCore/LocalFrameView.h>
+@@ -231,6 +234,24 @@ static std::optional<InputMethodState> inputMethodStateForElement(Element* eleme
+     if (element->isSpellCheckingEnabled())
+         state.hints.add(InputMethodState::Hint::Spellcheck);
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the system keyboard covers much of the screen, so its title says
++    // which field it types into: the field's <label>, else its aria-label,
++    // else its placeholder (no value, so nothing typed).
++    if (RefPtr htmlElement = dynamicDowncast<HTMLElement>(*element)) {
++        auto clean = [](const String& text) {
++            auto simplified = text.trim(isASCIIWhitespace).simplifyWhiteSpace(isASCIIWhitespace);
++            return simplified.length() > 60 ? makeString(StringView(simplified).left(59), u'\u2026') : simplified;
++        };
++        if (RefPtr labels = htmlElement->labels(); labels && labels->length())
++            state.label = clean(protect(labels->item(0))->textContent());
++        if (state.label.isEmpty())
++            state.label = clean(htmlElement->attributeWithoutSynchronization(HTMLNames::aria_labelAttr));
++        if (state.label.isEmpty())
++            state.label = clean(htmlElement->attributeWithoutSynchronization(HTMLNames::placeholderAttr));
++    }
++#endif
++
+     return state;
+ }
+ 

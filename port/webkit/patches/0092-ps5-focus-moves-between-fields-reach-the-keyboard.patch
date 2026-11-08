@@ -1,0 +1,38 @@
+diff --git a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+index 22996faa12..2f4c07878d 100644
+--- a/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/glib/WebPageGLib.cpp
+@@ -52,6 +52,9 @@
+ #include <WebCore/UserAgent.h>
+ #include <WebCore/VisiblePosition.h>
+ #include <WebCore/VisibleUnits.h>
++#include <wtf/HashMap.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/WeakPtr.h>
+ #include <wtf/text/MakeString.h>
+ 
+ #if ENABLE(2022_GLIB_API)
+@@ -247,6 +250,23 @@ void WebPage::setInputMethodState(Element* element)
+     if (state && !m_userIsInteracting)
+         state->hints.add(InputMethodState::Hint::InhibitOnScreenKeyboard);
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: focus moving straight from one field to another is a new field to
++    // the on-screen keyboard: it opens there after Go moved the focus
++    // (WebCore patch 0091) and must start from that field's text. The UI
++    // process reports a focus in only after a state of none (InputMethodFilter::
++    // setState), and with two fields of the same state (two plain text
++    // fields) it saw no change at all. Tell it the old field lost the focus
++    // first, then the new field's state.
++    static NeverDestroyed<HashMap<WebCore::PageIdentifier, WeakPtr<Element, WeakPtrImplWithEventTargetData>>> stateElements;
++    auto& stateElement = stateElements->add(identifier(), nullptr).iterator->value;
++    bool otherElement = state && m_inputMethodState && stateElement.get() != element;
++    stateElement = state ? element : nullptr;
++    if (otherElement) {
++        m_inputMethodState = std::nullopt;
++        send(Messages::WebPageProxy::SetInputMethodState(std::nullopt));
++    }
++#endif
+     if (m_inputMethodState == state)
+         return;
+ 

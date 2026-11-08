@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <glib.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -101,6 +102,9 @@ public:
     void setCompositor(PS5CompositorClient*);
     // Any thread: the compositor has work (applyPending/paint/didPresent).
     void requestCompositorFrame();
+    // Draw the page this many pixels higher (the on-screen keyboard is up
+    // and would cover the field being typed into); 0 puts it back. Any thread.
+    void setKeyboardLift(int pixels);
 
     // Hardware decoding (PS5VideoDecoder's output buffers): a persistent,
     // coherent GL buffer made on the render thread (blocks until it is);
@@ -197,6 +201,7 @@ private:
     void* m_eglConfig { nullptr };
     int m_width { 0 };
     int m_height { 0 };
+    std::atomic<int> m_keyboardLift { 0 }; // see setKeyboardLift
 
     pthread_t m_thread { };
     GMutex m_lock;

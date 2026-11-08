@@ -22,7 +22,9 @@
 #include "WPEPS5Private.h"
 #include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/WTFGType.h>
+#include <algorithm>
 #include <string>
+#include <utility>
 
 // Text input through the system keyboard (libSceImeDialog). WebKit focuses
 // this context when an editable element gets focus. The keyboard opens:
@@ -34,10 +36,14 @@
 //  - on X over the field that already has focus (no focus change follows;
 //    say a form's validation focused it after Go).
 // It capitalizes automatically only where the page asks (autocapitalize) or
-// in a multi-line field.
+// in a multi-line field. In a password field it is in password mode (dots)
+// and starts with the password typed so far, which OK replaces like any
+// other field's text.
 // The dialog starts with the field's text around the cursor; on "OK" that
 // text is replaced (delete-surrounding + committed), and in a single-line
-// field Return follows, as a phone keyboard's Go key submits the form (the
+// field Return follows, as a phone keyboard's Go key: in a form with a
+// later text field it moves there (WebKit patch 0091) and the keyboard
+// opens on it, in the last field it submits the form (the
 // key events reach the WebProcess after the committed text, on the same
 // connection, so the page sees the new value first). The dialog's OK button
 // then says Search in a search field and Go in other single-line fields; a
@@ -53,6 +59,11 @@ struct _WPEInputMethodContextPS5Private {
     guint cursorIndex { 0 };
     bool waiting { false };
     bool enterSubmits { false }; // the open dialog's OK sends Return after the text
+    guint openSource { 0 }; // a keyboard to open once the field's text arrives
+    // The caret's rectangle in view coordinates (WebKit's cursor area), so
+    // the keyboard opens where it doesn't cover the field; height 0: unknown.
+    int caretY { 0 };
+    int caretHeight { 0 };
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEInputMethodContextPS5, wpe_input_method_context_ps5, WPE_TYPE_INPUT_METHOD_CONTEXT, WPEInputMethodContext)
 
@@ -78,8 +89,14 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
 
     auto purpose = wpe_input_method_context_get_input_purpose(context);
     bool url = purpose == WPE_INPUT_PURPOSE_URL;
-    const char* title = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "Password" : url ? "Address" : purpose == WPE_INPUT_PURPOSE_SEARCH ? "Search" : "Text";
-    const char* initial = purpose == WPE_INPUT_PURPOSE_PASSWORD ? "" : priv->surrounding.c_str();
+    // The title names the field as the page does (WebKit patch 0093: its
+    // label, aria-label or placeholder), else says what kind of field it is.
+    auto* label = static_cast<const char*>(g_object_get_data(G_OBJECT(context), "ps5-field-label"));
+    const char* title = label && *label ? label : purpose == WPE_INPUT_PURPOSE_PASSWORD ? "Password" : url ? "Address" : purpose == WPE_INPUT_PURPOSE_SEARCH ? "Search" : "Text";
+    bool password = purpose == WPE_INPUT_PURPOSE_PASSWORD;
+    // A password field's own value (WebKit patch 0090; its rendered text
+    // would be dots), shown as dots by the password-mode keyboard.
+    const char* initial = priv->surrounding.c_str();
     // Single line: no multiline hint (patch 0071 sets it for textarea and
     // contenteditable) and no new line in the text around the cursor.
     bool multiline = (wpe_input_method_context_get_input_hints(context) & WPE_INPUT_HINT_MULTILINE)
@@ -96,13 +113,15 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
         && ((hints & uppercase) || (multiline && !(hints & WPE_INPUT_HINT_LOWERCASE)));
 
     g_object_ref(context);
-    priv->waiting = wpeDisplayPS5RequestText(display, title, initial, url, enterLabel, autoCapitalize, [](const char* text, gpointer userData) {
+    // Predictions don't learn a password, or what a field marks private
+    // (WebKit: a field that has ever been a password field).
+    bool noLearning = password || (hints & WPE_INPUT_HINT_PRIVATE);
+    priv->waiting = wpeDisplayPS5RequestText(display, title, initial, url, enterLabel, autoCapitalize, password, noLearning, priv->caretY, priv->caretHeight, [](const char* text, gpointer userData) {
         auto* context = WPE_INPUT_METHOD_CONTEXT(userData);
         auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
         priv->waiting = false;
         if (text && priv->focused) {
-            bool replace = wpe_input_method_context_get_input_purpose(context) != WPE_INPUT_PURPOSE_PASSWORD;
-            if (replace && priv->surrounding.length()) {
+            if (priv->surrounding.length()) {
                 // Replace the whole surrounding text with the dialog's result.
                 glong before = utf16Length(priv->surrounding.c_str(), priv->cursorIndex);
                 glong total = utf16Length(priv->surrounding.c_str(), priv->surrounding.length());
@@ -124,6 +143,9 @@ void wpeInputMethodContextPS5OpenKeyboard(WPEInputMethodContext* context)
 static void wpeInputMethodContextPS5Dispose(GObject* object)
 {
     auto* context = WPE_INPUT_METHOD_CONTEXT(object);
+    auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
+    if (priv->openSource)
+        g_source_remove(std::exchange(priv->openSource, 0));
     if (auto* display = displayFor(context))
         wpeDisplayPS5InputContextDestroyed(display, context);
     G_OBJECT_CLASS(wpe_input_method_context_ps5_parent_class)->dispose(object);
@@ -156,14 +178,20 @@ static void wpeInputMethodContextPS5FocusIn(WPEInputMethodContext* context)
     bool open = wpeDisplayPS5FocusFollowsPressOnField(display, &why);
     if (why)
         PS5_LOG("IME: field focused after a %s: keyboard %s", why, open ? "opens" : "stays closed (Triangle opens it)");
-    // Defer: WebKit sends the surrounding text right after focus.
+    // Wait for the field's text: WebKit sends it with the next editor state,
+    // after the focus, and the keyboard starts from it. An empty field sends
+    // none (see focus out), so open after 100 ms without it.
     if (open) {
-        g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, [](gpointer userData) -> gboolean {
+        if (priv->openSource)
+            g_source_remove(priv->openSource);
+        priv->openSource = g_timeout_add(100, [](gpointer userData) -> gboolean {
             auto* context = WPE_INPUT_METHOD_CONTEXT(userData);
-            if (WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv->focused)
+            auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
+            priv->openSource = 0;
+            if (priv->focused)
                 wpeInputMethodContextPS5OpenKeyboard(context);
             return G_SOURCE_REMOVE;
-        }, g_object_ref(context), g_object_unref);
+        }, context);
     }
 }
 
@@ -171,6 +199,16 @@ static void wpeInputMethodContextPS5FocusOut(WPEInputMethodContext* context)
 {
     auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
     priv->focused = false;
+    if (priv->openSource)
+        g_source_remove(std::exchange(priv->openSource, 0));
+    // WebKit forgets the text it last sent here on a focus out and sends a
+    // field's text only when it differs from that (InputMethodFilter), so
+    // an empty field sends nothing: keep no text past this point either, or
+    // the next field's keyboard starts with the last one's (a password from
+    // another site, shown in the open).
+    priv->surrounding.clear();
+    priv->cursorIndex = 0;
+    priv->caretY = priv->caretHeight = 0;
     if (auto* display = displayFor(context))
         wpeDisplayPS5InputContextDestroyed(display, context);
 }
@@ -180,6 +218,25 @@ static void wpeInputMethodContextPS5SetSurrounding(WPEInputMethodContext* contex
     auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
     priv->surrounding.assign(text ? text : "", text ? length : 0);
     priv->cursorIndex = std::min<guint>(cursorIndex, length);
+    // The text a newly focused field's keyboard waited for.
+    if (priv->openSource) {
+        g_source_remove(std::exchange(priv->openSource, 0));
+        if (priv->focused)
+            wpeInputMethodContextPS5OpenKeyboard(context);
+    }
+}
+
+static void wpeInputMethodContextPS5SetCursorArea(WPEInputMethodContext* context, int, int y, int, int height)
+{
+    auto* priv = WPE_INPUT_METHOD_CONTEXT_PS5(context)->priv;
+    priv->caretY = y;
+    priv->caretHeight = std::max(height, 1);
+    // The page scrolled under an open keyboard (say revealing the field
+    // after focus): the lift follows.
+    if (priv->waiting) {
+        if (auto* display = displayFor(context))
+            wpeDisplayPS5KeyboardFieldMoved(display, priv->caretY, priv->caretHeight);
+    }
 }
 
 static void wpeInputMethodContextPS5Reset(WPEInputMethodContext*)
@@ -197,6 +254,7 @@ static void wpe_input_method_context_ps5_class_init(WPEInputMethodContextPS5Clas
     imClass->focus_in = wpeInputMethodContextPS5FocusIn;
     imClass->focus_out = wpeInputMethodContextPS5FocusOut;
     imClass->set_surrounding = wpeInputMethodContextPS5SetSurrounding;
+    imClass->set_cursor_area = wpeInputMethodContextPS5SetCursorArea;
     imClass->reset = wpeInputMethodContextPS5Reset;
 }
 

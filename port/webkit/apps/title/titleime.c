@@ -65,6 +65,7 @@ struct ps5wk_ime_functions {
     int (*term)(void);
     int (*abort)(void);
     int (*common_dialog_initialize)(void);
+    int (*get_panel_size)(const void* param, uint32_t* width, uint32_t* height);
 };
 
 #define SYSMODULE_IME_DIALOG 0x96
@@ -151,7 +152,7 @@ int ps5wk_title_load_ime(struct ps5wk_ime_functions* out)
     int h = load_module(SYSMODULE_IME_DIALOG, "libSceImeDialog");
     if (h >= 0) {
         static const char* const names[] = { "sceImeDialogInit", "sceImeDialogGetStatus", "sceImeDialogGetResult",
-            "sceImeDialogTerm", "sceImeDialogAbort" };
+            "sceImeDialogTerm", "sceImeDialogAbort", "sceImeDialogGetPanelSize" };
         void* slots[COUNT(names)];
         bind_exports(h, "libSceImeDialog.sprx", names, slots, COUNT(names), klibSceImeDialogExports,
             COUNT(klibSceImeDialogExports), &klibSceImeDialogAnchor);
@@ -160,6 +161,7 @@ int ps5wk_title_load_ime(struct ps5wk_ime_functions* out)
         out->get_result = (int (*)(void*))slots[2];
         out->term = (int (*)(void))slots[3];
         out->abort = (int (*)(void))slots[4];
+        out->get_panel_size = (int (*)(const void*, uint32_t*, uint32_t*))slots[5]; /* optional */
     }
     int c = load_module(0, "libSceCommonDialog");
     if (c >= 0) {
