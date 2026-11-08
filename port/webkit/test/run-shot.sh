@@ -20,7 +20,7 @@ ROOT="$(cd "$HERE/../../.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
 . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
 WK="$ROOT/toolchain/wpe-webkit"
-BLD="${BLD:-$WK/build}"
+BLD="${BLD:-$WK/build-webgl}"
 URL="${1:-https://example.com/}"
 TIMEOUT="${2:-150}"
 FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
