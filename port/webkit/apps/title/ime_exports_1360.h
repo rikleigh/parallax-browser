@@ -8,6 +8,9 @@ static const export_sig_t klibSceImeDialogExports[] = {
   {"sceImeDialogGetResult", 0x19d0},
   {"sceImeDialogTerm", 0x1a50},
   {"sceImeDialogAbort", 0x19b0},
+  /* Added by hand: the generator's name table lacks it; its NID
+   * (wqsJvRXwl58) found in the same library with ps5_dynlib. */
+  {"sceImeDialogGetPanelSize", 0x110},
 };
 static const export_anchor_t klibSceImeDialogAnchor = {0x8d90, "checkImeDialogInitParam"};
 static const export_sig_t klibSceCommonDialogExports[] = {

@@ -54,7 +54,10 @@ bool wpeDisplayPS5FocusFollowsPressOnField(WPEDisplayPS5*, const char** why);
 // The system keyboard with the given enter label (PS5_IME_ENTER_LABEL_*),
 // capitalizing automatically or not; wpe_display_ps5_request_text without
 // the check.
-bool wpeDisplayPS5RequestText(WPEDisplayPS5*, const char* title, const char* initialText, bool url, int32_t enterLabel, bool autoCapitalize, WPEDisplayPS5TextCallback, gpointer userData);
+// The focused field's caret moved (a scroll) while the keyboard is open:
+// the page lift follows it.
+void wpeDisplayPS5KeyboardFieldMoved(WPEDisplayPS5*, int fieldY, int fieldHeight);
+bool wpeDisplayPS5RequestText(WPEDisplayPS5*, const char* title, const char* initialText, bool url, int32_t enterLabel, bool autoCapitalize, bool password, bool noLearning, int fieldY, int fieldHeight, WPEDisplayPS5TextCallback, gpointer userData);
 
 // Return pressed and released on the active view (real key events: keydown,
 // keypress, keyup), as the pad's X does when the pointer is hidden.

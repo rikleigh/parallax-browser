@@ -1,0 +1,36 @@
+diff --git a/Source/WebCore/html/HTMLInputElement.cpp b/Source/WebCore/html/HTMLInputElement.cpp
+index 21cef3085f..5db53a073f 100644
+--- a/Source/WebCore/html/HTMLInputElement.cpp
++++ b/Source/WebCore/html/HTMLInputElement.cpp
+@@ -1437,6 +1437,12 @@ void HTMLInputElement::defaultEventHandler(Event& event)
+         if (RefPtr next = nextTextFieldInFormForPS5(*this)) {
+             if (wasChangedSinceLastFormControlChangeEvent())
+                 dispatchFormControlChangeEvent();
++            // Into view first: focus() reveals the field after the editor
++            // state with its caret went to the UI process, which places the
++            // keyboard (and lifts the page) by that caret, so a field below
++            // the fold got a caret position off the screen. Centred, so the
++            // field isn't left at the screen's edge, under the keyboard.
++            next->scrollIntoViewIfNeeded(true);
+             next->focus();
+             event.setDefaultHandled();
+             return;
+diff --git a/Source/WebKit/WebProcess/WebPage/WebPage.cpp b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+index 42ba919ee7..b9828b817e 100644
+--- a/Source/WebKit/WebProcess/WebPage/WebPage.cpp
++++ b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+@@ -4030,6 +4030,14 @@ void WebPage::pageDidScroll()
+ 
+     if (RefPtr view = protect(protect(corePage())->mainFrame())->virtualView())
+         send(Messages::WebPageProxy::PageDidScroll(view->scrollOffset()));
++
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the on-screen keyboard keeps clear of the focused field's caret,
++    // which moves on screen when the page scrolls (revealing the field after
++    // focus() lands here later, with async scrolling): send it again.
++    if (m_inputMethodState)
++        scheduleFullEditorStateUpdate();
++#endif
+ }
+ 
+ void WebPage::pageStoppedScrolling()

@@ -85,6 +85,9 @@ struct PS5ImeFunctions {
     int (*term)(void);
     int (*abort)(void);
     int (*commonDialogInitialize)(void);
+    // sceImeDialogGetPanelSize(param, &width, &height): the keyboard's size
+    // for these parameters (1920x1080 coordinates, as posX/posY); optional.
+    int (*getPanelSize)(const void* param, uint32_t* width, uint32_t* height);
 };
 int ps5wk_title_load_ime(PS5ImeFunctions*) __attribute__((weak));
 
@@ -106,7 +109,8 @@ enum PS5ImeEnterLabel : int32_t {
 enum : uint32_t {
     PS5_IME_OPTION_MULTILINE = 0x01,
     PS5_IME_OPTION_NO_AUTO_CAPITALIZATION = 0x02,
-    PS5_IME_OPTION_PASSWORD = 0x04,
+    PS5_IME_OPTION_PASSWORD = 0x04, // with PS5_IME_TYPE_BASIC_LATIN (0x80bc0030 with the default type)
+    PS5_IME_OPTION_NO_LEARNING = 0x20, // predictions don't learn what is typed (shadPS4's OrbisImeOption)
 };
 
 struct PS5ImeDialogParam {

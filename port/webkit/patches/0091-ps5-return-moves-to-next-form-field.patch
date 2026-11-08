@@ -1,0 +1,83 @@
+diff --git a/Source/WebCore/html/HTMLInputElement.cpp b/Source/WebCore/html/HTMLInputElement.cpp
+index c0c22a86d5..21cef3085f 100644
+--- a/Source/WebCore/html/HTMLInputElement.cpp
++++ b/Source/WebCore/html/HTMLInputElement.cpp
+@@ -53,6 +53,7 @@
+ #include "FormController.h"
+ #include "FrameSelection.h"
+ #include "HTMLDataListElement.h"
++#include "CheckVisibilityOptions.h"
+ #include "HTMLFormElement.h"
+ #include "HTMLImageLoader.h"
+ #include "HTMLInputElementInlines.h"
+@@ -1318,6 +1319,52 @@ void HTMLInputElement::didBlur()
+     protect(m_inputType)->elementDidBlur();
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: the next field Return moves to (see defaultEventHandler): a later
++// text field of the same form that a person can see and reach. Fields a
++// page hides from people (bot traps: display none, invisible, transparent,
++// no size, out of the tab order) are skipped, so they stay empty.
++static RefPtr<HTMLElement> nextTextFieldInFormForPS5(HTMLInputElement& input)
++{
++    RefPtr form = input.form();
++    if (!form)
++        return nullptr;
++    protect(input.document())->updateLayoutIgnorePendingStylesheets();
++    bool afterInput = false;
++    for (auto& listed : form->copyListedElementsVector()) {
++        Ref element = listed->asHTMLElement();
++        if (element.ptr() == &input) {
++            afterInput = true;
++            continue;
++        }
++        if (!afterInput)
++            continue;
++        RefPtr control = dynamicDowncast<HTMLTextFormControlElement>(element);
++        if (!control)
++            continue;
++        if (RefPtr field = dynamicDowncast<HTMLInputElement>(*control); field && !field->isTextField())
++            continue;
++        if (control->isDisabledFormControl() || control->isReadOnly() || !control->isFocusable())
++            continue;
++        if (auto tabIndex = control->tabIndexSetExplicitly(); tabIndex && *tabIndex < 0)
++            continue;
++        CheckVisibilityOptions visibility;
++        visibility.opacityProperty = true;
++        visibility.visibilityProperty = true;
++        if (!control->checkVisibility(visibility))
++            continue;
++        auto* renderer = control->renderer();
++        if (!renderer)
++            continue;
++        auto box = renderer->absoluteBoundingBoxRect();
++        if (box.width() < 2 || box.height() < 2 || box.maxX() <= 0 || box.maxY() <= 0)
++            continue;
++        return control;
++    }
++    return nullptr;
++}
++#endif
++
+ void HTMLInputElement::defaultEventHandler(Event& event)
+ {
+     if (auto* mouseEvent = dynamicDowncast<MouseEvent>(event); mouseEvent && mouseEvent->button() == MouseButton::Left) {
+@@ -1384,6 +1431,17 @@ void HTMLInputElement::defaultEventHandler(Event& event)
+     }
+ 
+     if (protect(m_inputType)->shouldSubmitImplicitly(event)) {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: Return (the keyboard's Go key) moves to the form's next text
++        // field, as a phone keyboard does, and only the last field submits.
++        if (RefPtr next = nextTextFieldInFormForPS5(*this)) {
++            if (wasChangedSinceLastFormControlChangeEvent())
++                dispatchFormControlChangeEvent();
++            next->focus();
++            event.setDefaultHandled();
++            return;
++        }
++#endif
+         if (isSearchField())
+             addSearchResult();
+         // Form submission finishes editing, just as loss of focus does.
