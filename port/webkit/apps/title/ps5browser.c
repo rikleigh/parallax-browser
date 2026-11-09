@@ -63,7 +63,7 @@
 #endif
 
 #ifndef PS5WK_HOME_URL
-#define PS5WK_HOME_URL "file:///data/ps5webkit/start.html"
+#define PS5WK_HOME_URL PS5WK_START_URL
 #endif
 
 void g_io_openssl_load(void*);
@@ -743,7 +743,8 @@ static char* homeURL(void)
     g_free(path);
     if (found) {
         g_strstrip(contents);
-        if (*contents)
+        /* The start page was a file: page before parallax://start. */
+        if (*contents && strcmp(contents, PS5WK_LEGACY_START_URL))
             return contents;
         g_free(contents);
     }
@@ -760,14 +761,16 @@ static int fileExists(const char* path);
  *       a "Sent" page for browsers, which closes itself in a pop-up)
  *   GET /?url=<encoded>  the same, for the bookmarklet's pop-up
  *   GET /                a page to type a link into, and the bookmarklet
- *   GET /status          {"ok":true,"uri":"<the page shown>"}
+ *   GET /status          {"ok":true,"uri":"<the page shown>"}, the PIN as for
+ *       /open; "uri" empty and "private":true while private browsing
  *   POST /cookies        Netscape cookies.txt lines (tools/ps5open --cookies,
- *       from Chrome) added to the cookie store. Knob:
- *       /data/ps5webkit/push-cookie-key.txt: a key the X-PS5-Key header must match
+ *       from Chrome) added to the cookie store; the PIN as for /open. Knob:
+ *       /data/ps5webkit/push-cookie-key.txt: a key the X-PS5-Key header must
+ *       match too (an empty or unreadable key file refuses every import)
  *   GET /settings, GET /settings.json, POST /settings, POST /restart,
  *       POST /clear  the settings page and its API (settingsServe below)
- *   GET /link.json  (the PS5 itself only) this server's address on the LAN
- *       now, for the start page's and Settings' QR code: {"localOnly",
+ *   GET /link.json  (parallax:// pages only) this server's address on the
+ *       LAN now, for the start page's and Settings' QR code: {"localOnly",
  *       "pin", "url", "qr": rows of "0"/"1"}; no url without an address or
  *       with push-off
  *   GET /logo.png   Parallax's logo (/app0/ui), for these pages
@@ -778,12 +781,17 @@ static int fileExists(const char* path);
  * The control socket takes "open <url>" too. Bare hosts get https://, other
  * words a search; only http, https and file:///data/ps5webkit/ URLs load.
  * Loading a page also leaves View in VR (onLoadChanged).
- * Knobs: /data/ps5webkit/push-off (a file): the server listens on
- * 127.0.0.1 only (the in-app Settings page still opens; the LAN can't).
+ * Who may ask: every request's Host must be this PS5's address or a local
+ * name, and one with an Origin must come from a page served here (pushRoute).
+ * 127.0.0.1 is trusted for nothing: web pages in this browser reach it too.
+ * No CORS headers. The browser's own pages are parallax:// (below), which
+ * calls the same routes without the PIN.
+ * Knobs: /data/ps5webkit/push-off (a file): no server (Settings still
+ * opens on the PS5, as parallax://settings; the LAN can't reach it).
  * /data/ps5webkit/push-pin.txt: a PIN that requests must carry (pin=...).
  * A request is read within 3 s and 64 KB, one at a time: a slow or
- * oversized client gets an error, never a stuck title. Nothing here waits
- * for the main loop (the browser itself loads /settings from this thread). */
+ * oversized client gets an error, never a stuck title. Only /browser waits
+ * for the main loop (up to 3 s). */
 #define PS5WK_PUSH_PORT 9040
 #define PS5WK_PUSH_MAX 65536 /* a site's cookies fit */
 #define PS5WK_COOKIE_KEY "/data/ps5webkit/push-cookie-key.txt"
@@ -1048,36 +1056,58 @@ static char* jsonString(const char* s)
     return g_string_free(out, FALSE);
 }
 
-/* cors: let pages of any origin call it (not the settings: see settingsServe). */
-static void pushReplyCORS(int client, int status, const char* type, const char* body, gboolean cors)
+/* Where a reply goes: an HTTP client of the link server (fd), or one of the
+ * browser's own parallax:// pages (fd -1: the reply is kept for the URI
+ * scheme request, see "parallax://" below). */
+typedef struct {
+    int fd;
+    int status;
+    char* type;
+    GBytes* body;
+} PushOut;
+
+static void pushKeep(PushOut* client, int status, const char* type, const char* data, size_t length)
 {
+    client->status = status;
+    g_free(client->type);
+    client->type = g_strdup(type);
+    if (client->body)
+        g_bytes_unref(client->body);
+    client->body = g_bytes_new(data ? data : "", data ? length : 0);
+}
+
+/* No CORS headers on anything: no other site's page may read a reply (the
+ * PS5's own pages are parallax://, phones use pages served from here). */
+static void pushReply(PushOut* client, int status, const char* type, const char* body)
+{
+    size_t length = body ? strlen(body) : 0;
+    if (client->fd < 0) {
+        pushKeep(client, status, type, body, length);
+        return;
+    }
     const char* reason = status == 200 ? "OK" : status == 204 ? "No Content" : status == 400 ? "Bad Request"
         : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed"
-        : status == 408 ? "Request Timeout" : status == 413 ? "Payload Too Large" : "Service Unavailable";
-    size_t length = body ? strlen(body) : 0;
-    char* head = g_strdup_printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n%s"
-        "Cache-Control: no-store\r\nConnection: close\r\n\r\n", status, reason, type, length,
-        cors ? "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, X-PS5-PIN, X-PS5-Key\r\nAccess-Control-Allow-Private-Network: true\r\n" : "");
-    send(client, head, strlen(head), 0);
+        : status == 408 ? "Request Timeout" : status == 409 ? "Conflict" : status == 413 ? "Payload Too Large" : "Service Unavailable";
+    char* head = g_strdup_printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Cache-Control: no-store\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n", status, reason, type, length);
+    send(client->fd, head, strlen(head), 0);
     if (length)
-        send(client, body, length, 0);
+        send(client->fd, body, length, 0);
     g_free(head);
 }
 
-static void pushReply(int client, int status, const char* type, const char* body)
-{
-    pushReplyCORS(client, status, type, body, TRUE);
-}
-
 /* Sends a file's bytes (the logo). */
-static void pushReplyBytes(int client, const char* type, const char* data, size_t length)
+static void pushReplyBytes(PushOut* client, const char* type, const char* data, size_t length)
 {
+    if (client->fd < 0) {
+        pushKeep(client, 200, type, data, length);
+        return;
+    }
     char* head = g_strdup_printf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
         "Cache-Control: max-age=3600\r\nConnection: close\r\n\r\n", type, length);
-    send(client, head, strlen(head), 0);
+    send(client->fd, head, strlen(head), 0);
     for (size_t sent = 0; sent < length;) {
-        ssize_t n = send(client, data + sent, length - sent, 0);
+        ssize_t n = send(client->fd, data + sent, length - sent, 0);
         if (n <= 0)
             break;
         sent += (size_t)n;
@@ -1201,12 +1231,14 @@ static char* pushDownloadsSection(const char* pin, gboolean pinOK)
     return section;
 }
 
-/* The page with the text box; host: what the bookmarklet calls. */
-static char* pushIndexPage(const char* host, const char* pin, gboolean pinOK)
+/* The page with the text box; host: what the bookmarklet calls. showShown:
+ * the page the PS5 shows (with the PIN, and not while private). */
+static char* pushIndexPage(const char* host, const char* pin, gboolean pinOK, gboolean showShown)
 {
     char* downloads = pushDownloadsSection(pin, pinOK);
-    char* shown = copyShownURI();
-    char* shownHTML = g_markup_escape_text(shown, -1);
+    char* shown = showShown ? copyShownURI() : NULL;
+    char* shownHTML = shown && *shown ? g_markup_escape_text(shown, -1) : NULL;
+    char* showing = shownHTML ? g_strdup_printf("<p>Showing now: <code>%s</code></p>", shownHTML) : g_strdup("");
     char* pinPart = pin ? g_strdup_printf("+'&pin=%s'", pin) : g_strdup("");
     char* bookmarklet = g_strdup_printf("javascript:(function(){var u='http://%s/open?url='+encodeURIComponent(location.href)%s;"
         "var w=window.open(u,'ps5open','width=420,height=260');if(!w)location.href=u;})()", host, pinPart);
@@ -1216,7 +1248,7 @@ static char* pushIndexPage(const char* host, const char* pin, gboolean pinOK)
         "<form id=\"f\" method=\"post\" action=\"/open\">"
         "<input name=\"url\" id=\"url\" placeholder=\"Address or search\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" inputmode=\"url\" autofocus required>"
         "%s<button>Open on PS5</button></form><p id=\"status\"></p></div>"
-        "<p>Showing now: <code>%s</code></p>"
+        "%s"
         "<h2>Bookmarklet</h2><p>Drag this to the bookmarks bar, then click it on any page to open that page on the PS5:</p>"
         "<p><a class=\"bm\" href=\"%s\">Send to PS5</a></p>"
         "<p>From a terminal: <code>curl 'http://%s/open?url=example.com'</code></p>%s"
@@ -1225,10 +1257,11 @@ static char* pushIndexPage(const char* host, const char* pin, gboolean pinOK)
         ".then(function(r){return r.json()}).then(function(j){s.textContent=j.ok?'Opening '+j.url:'Not sent: '+j.error})"
         ".catch(function(){s.textContent='The PS5 did not answer'})}</script></main></body></html>",
         pushPageStyle, pushBrand, pushPIN ? "<input name=\"pin\" placeholder=\"PIN\" inputmode=\"numeric\" autocomplete=\"off\">" : "",
-        shownHTML, bookmarkletHTML, host, downloads);
+        showing, bookmarkletHTML, host, downloads);
     g_free(downloads);
     g_free(shown);
     g_free(shownHTML);
+    g_free(showing);
     g_free(pinPart);
     g_free(bookmarklet);
     g_free(bookmarkletHTML);
@@ -1285,8 +1318,8 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  *   POST /adblock?do=allow|block&site=<host>   ads allowed on a site (and
  *       its subdomains) or blocked there again; the page reloads if it is
  *       on that site
- * The PIN applies as for /open, except to the PS5 itself (127.0.0.1). No
- * CORS headers, and requests with an Origin header must come from the
+ * The PIN applies as for /open, except to the PS5's own parallax://settings.
+ * No CORS headers, and requests with an Origin header must come from the
  * address they were sent to, by IP or a local name: other web pages
  * (a form posted from a site, DNS rebinding) can't change settings. */
 #define PS5WK_TITLE_ID "PPSA99020"
@@ -1501,20 +1534,28 @@ static const char* restartBrowser(const char* from)
     return NULL;
 }
 
-static void settingsReplyJSON(int client, int status, gboolean ok, const char* message)
+static void settingsReplyJSON(PushOut* client, int status, gboolean ok, const char* message)
 {
     char* quoted = jsonString(message);
     char* reply = g_strdup_printf("{\"ok\":%s,\"%s\":%s}\n", ok ? "true" : "false", ok ? "message" : "error", quoted);
-    pushReplyCORS(client, status, "application/json", reply, FALSE);
+    pushReply(client, status, "application/json", reply);
     g_free(reply);
     g_free(quoted);
 }
 
-static char* settingsState(const char* message)
+/* Another device asking while private browsing is shown: not which page
+ * (the PS5's own pages are trusted: Settings goes back to it). */
+static gboolean hideShownFrom(gboolean trusted)
 {
-    char* shown = copyShownURI();
+    return !trusted && ps5wk_browser_private();
+}
+
+static char* settingsState(const char* message, gboolean trusted)
+{
+    gboolean hide = hideShownFrom(trusted);
+    char* shown = hide ? g_strdup("") : copyShownURI();
     g_mutex_lock(&shownLock);
-    char* back = g_strdup(settingsReturnURI ? settingsReturnURI : "");
+    char* back = g_strdup(settingsReturnURI && !hide ? settingsReturnURI : "");
     g_mutex_unlock(&shownLock);
     char* shownJSON = jsonString(shown);
     char* backJSON = jsonString(back);
@@ -1544,17 +1585,19 @@ static char* settingsState(const char* message)
     return state;
 }
 
-/* Push thread: the routes above. Replies at once: what needs the main loop
- * is queued there, and its result shows in /settings.json ("status"). */
-static void settingsServe(int client, const char* from, gboolean loopback, gboolean get, gboolean post, const char* path,
-    const char* query, const char* body, const char* type, const char* host, const char* origin, gboolean pinOK)
+/* A route thread (the link server's, or a parallax:// request's): the routes
+ * above. Replies at once: what needs the main loop is queued there, and its
+ * result shows in /settings.json ("status"). trusted: the PS5's own page
+ * (parallax://settings), which needs no PIN. */
+static void settingsServe(PushOut* client, const char* from, gboolean trusted, gboolean get, gboolean post, const char* path,
+    const char* query, const char* body, const char* type, gboolean pinOK)
 {
     if (!strcmp(path, "/settings") && get) {
-        pushReplyCORS(client, 200, "text/html; charset=utf-8", ps5wk_settings_page, FALSE);
+        pushReply(client, 200, "text/html; charset=utf-8", ps5wk_settings_page);
         return;
     }
     if (!strcmp(path, "/gamepad") && get) { /* its script uses /browser/gamepad */
-        pushReplyCORS(client, 200, "text/html; charset=utf-8", ps5wk_gamepad_page_html, FALSE);
+        pushReply(client, 200, "text/html; charset=utf-8", ps5wk_gamepad_page_html);
         return;
     }
     gboolean known = (!strcmp(path, "/settings.json") && get)
@@ -1564,13 +1607,8 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
             || !strcmp(path, "/settings") || !strcmp(path, "/adblock") ? 405 : 404, FALSE, "method not allowed or no such page");
         return;
     }
-    if (!pinOK && !loopback) {
+    if (!pinOK && !trusted) {
         settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
-        return;
-    }
-    if (!settingsRequestAllowed(host, origin)) {
-        spike_log("settings: refused a request from %s (Host \"%s\", Origin \"%s\")", from, host, origin);
-        settingsReplyJSON(client, 403, FALSE, "refused: open the settings at the PS5's IP address (http://<ip>:9040/settings)");
         return;
     }
     if (windDownStart && post) {
@@ -1578,8 +1616,8 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         return;
     }
     if (!strcmp(path, "/settings.json")) {
-        char* state = settingsState(NULL);
-        pushReplyCORS(client, 200, "application/json", state, FALSE);
+        char* state = settingsState(NULL, trusted);
+        pushReply(client, 200, "application/json", state);
         g_free(state);
     } else if (!strcmp(path, "/settings")) {
         gboolean json = strstr(type, "json") || *body == '{';
@@ -1590,8 +1628,8 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         ps5wk_adblock_setting_changed(); /* applies at once (no restart) */
         applyPerfOverlaySetting();
         if (ok || changed) {
-            char* state = settingsState(message);
-            pushReplyCORS(client, ok ? 200 : 503, "application/json", state, FALSE);
+            char* state = settingsState(message, trusted);
+            pushReply(client, ok ? 200 : 503, "application/json", state);
             g_free(state);
         } else
             settingsReplyJSON(client, 400, FALSE, message);
@@ -1618,8 +1656,8 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
         if (error)
             settingsReplyJSON(client, 400, FALSE, error);
         else {
-            char* state = settingsState(done);
-            pushReplyCORS(client, 200, "application/json", state, FALSE);
+            char* state = settingsState(done, trusted);
+            pushReply(client, 200, "application/json", state);
             g_free(state);
         }
         g_free(done);
@@ -1759,7 +1797,7 @@ static gboolean parseByteRange(const char* value, gint64 size, gint64* start, gi
 }
 
 /* TRUE: the client socket was handed to a sending thread. */
-static gboolean serveDownloadFile(int client, const char* from, const char* encodedName, const char* rangeHeader, gboolean head)
+static gboolean serveDownloadFile(PushOut* client, const char* from, const char* encodedName, const char* rangeHeader, gboolean head)
 {
     char* name = g_uri_unescape_string(encodedName, NULL);
     char* path = name ? ps5wk_downloads_finished_path(name) : NULL;
@@ -1775,7 +1813,7 @@ static gboolean serveDownloadFile(int client, const char* from, const char* enco
         return FALSE;
     }
     FileSend* job = g_new0(FileSend, 1);
-    job->client = client;
+    job->client = client->fd;
     job->fd = fd;
     job->size = st.st_size;
     job->start = 0;
@@ -1788,7 +1826,7 @@ static gboolean serveDownloadFile(int client, const char* from, const char* enco
         if (!parseByteRange(rangeHeader, job->size, &job->start, &job->length)) {
             char* reply = g_strdup_printf("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */%" G_GINT64_FORMAT "\r\n"
                 "Content-Length: 0\r\nConnection: close\r\n\r\n", job->size);
-            send(client, reply, strlen(reply), 0);
+            send(client->fd, reply, strlen(reply), 0);
             g_free(reply);
             close(fd);
             g_free(job->name);
@@ -1822,8 +1860,19 @@ static gboolean serveDownloadFile(int client, const char* from, const char* enco
 }
 
 /* TRUE: the client socket is someone else's now (a file transfer). */
-static gboolean pushServe(int client, const char* from, gboolean loopback)
+static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, const char* method, char* target, const char* headers,
+    const char* body);
+
+/* One route at a time (the link server's thread and parallax:// requests'):
+ * the routes were written for a single thread. */
+static GMutex routeLock;
+
+/* Push thread: one HTTP request on client. TRUE: the socket is someone
+ * else's now (a file transfer). */
+static gboolean pushServe(int fd, const char* from)
 {
+    PushOut out = { .fd = fd };
+    PushOut* client = &out;
     char* request = g_malloc(PS5WK_PUSH_MAX + 1);
     size_t used = 0, headerEnd = 0, contentLength = 0;
     gint64 deadline = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
@@ -1836,12 +1885,12 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
             break;
         }
         int wait = (int)((deadline - g_get_monotonic_time()) / 1000);
-        struct pollfd p = { .fd = client, .events = POLLIN };
+        struct pollfd p = { .fd = fd, .events = POLLIN };
         if (wait <= 0 || poll(&p, 1, wait) <= 0) {
             status = 408;
             break;
         }
-        ssize_t n = recv(client, request + used, PS5WK_PUSH_MAX - used, 0);
+        ssize_t n = recv(fd, request + used, PS5WK_PUSH_MAX - used, 0);
         if (n <= 0) {
             status = 400;
             break;
@@ -1879,6 +1928,20 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
         return FALSE;
     }
     const char* headers = strchr(request, '\n') ? strchr(request, '\n') + 1 : "";
+    g_mutex_lock(&routeLock);
+    gboolean handed = pushRoute(client, from, FALSE, method, target, headers, body);
+    g_mutex_unlock(&routeLock);
+    g_free(request);
+    return handed;
+}
+
+/* A request to the routes above, from the link server (trusted FALSE: the
+ * PIN, and the Host and Origin rules below) or from one of the browser's own
+ * parallax:// pages (trusted). Not on the main loop: /browser waits for it.
+ * TRUE: client's socket is someone else's now (a file transfer). */
+static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, const char* method, char* target, const char* headers,
+    const char* body)
+{
     char accept[256] = "", type[128] = "", host[128] = "", pinHeader[64] = "", keyHeader[128] = "", origin[160] = "";
     headerValue(headers, "Accept", accept, sizeof accept);
     headerValue(headers, "Origin", origin, sizeof origin);
@@ -1896,10 +1959,21 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
         || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad");
     gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
 
+    /* Every request from the network: the Host must be this PS5 by address
+     * or a local name (not a site's name that DNS rebinding points here), and
+     * a request with an Origin must come from a page served here. Web pages
+     * in this browser reach 127.0.0.1 too: that counts for nothing. No CORS
+     * anywhere, so a CORS preflight (OPTIONS) gets this refusal as well. */
+    if (!trusted && !settingsRequestAllowed(host, origin)) {
+        spike_log("push: refused %s %s from %s (Host \"%s\", Origin \"%s\")", method, path, from, host, origin);
+        if (settingsPath || browserPath)
+            settingsReplyJSON(client, 403, FALSE, "refused: open this page at the PS5's IP address (http://<ip>:9040/)");
+        else
+            pushReply(client, 403, "text/plain", "ERR refused: send requests to the PS5's IP address, not from another site\n");
+        return FALSE;
+    }
     if (!strcmp(method, "OPTIONS")) {
-        /* No CORS for the settings: a page elsewhere can't send them JSON. */
-        pushReplyCORS(client, 204, "text/plain", NULL, !settingsPath && !browserPath);
-        g_free(request);
+        pushReply(client, 204, "text/plain", NULL);
         return FALSE;
     }
     gboolean get = !strcmp(method, "GET") || !strcmp(method, "HEAD");
@@ -1920,37 +1994,35 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
     gboolean json = strstr(accept, "application/json") || (query && strstr(query, "format=json"));
 
     if (settingsPath) {
-        settingsServe(client, from, loopback, get, post, path, query, body, type, host, origin, pinOK);
+        settingsServe(client, from, trusted, get, post, path, query, body, type, pinOK);
     } else if (browserPath) {
         /* Tabs, bookmarks, history and simulated menu keys (browserui.c):
-         * the settings' rules (no CORS, same Host and Origin, the PIN). */
-        if (!pinOK && !loopback)
+         * the settings' rules (the PIN, except for the PS5's own pages). */
+        if (!pinOK && !trusted)
             settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
-        else if (!settingsRequestAllowed(host, origin)) {
-            spike_log("browser: refused a request from %s (Host \"%s\", Origin \"%s\")", from, host, origin);
-            settingsReplyJSON(client, 403, FALSE, "refused");
-        } else if (windDownStart)
+        else if (windDownStart)
             settingsReplyJSON(client, 503, FALSE, "the browser is closing");
         else {
             int code = 200;
             char* reply = ps5wk_browser_api(method, path, query, body, &code);
             if (post)
                 spike_log("browser API from %s: %s %s%s%s", from, method, path, query ? "?" : "", query ? query : "");
-            pushReplyCORS(client, code, "application/json", reply, FALSE);
+            pushReply(client, code, "application/json", reply);
             g_free(reply);
         }
     } else if (g_str_has_prefix(path, "/downloads/") && get) {
-        /* A finished download: the PIN as for /open (not for the PS5 itself). */
-        if (!pinOK && !loopback)
+        /* A finished download, to another device: the PIN as for /open. */
+        if (client->fd < 0)
+            pushReply(client, 404, "text/plain", "ERR not here\n");
+        else if (!pinOK)
             pushReply(client, 403, "text/plain", "ERR wrong or missing PIN\n");
         else if (serveDownloadFile(client, from, path + strlen("/downloads/"), rangeHeader, !strcmp(method, "HEAD"))) {
             g_free(url);
             g_free(pin);
-            g_free(request);
             return TRUE;
         }
     } else if (!strcmp(path, "/downloads.json") && get) {
-        if (!pinOK && !loopback)
+        if (!pinOK && !trusted)
             pushReply(client, 403, "application/json", "{\"ok\":false,\"error\":\"wrong or missing PIN\"}\n");
         else {
             char* list = ps5wk_downloads_finished_json();
@@ -1960,21 +2032,31 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
             g_free(list);
         }
     } else if (!strcmp(path, "/status") && get) {
-        char* shown = copyShownURI();
-        char* quoted = jsonString(shown);
-        char* reply = g_strdup_printf("{\"ok\":true,\"uri\":%s}\n", quoted);
-        pushReply(client, 200, "application/json", reply);
-        g_free(reply);
-        g_free(quoted);
-        g_free(shown);
+        /* The page shown: the PIN as for /open, and not while private. */
+        if (!pinOK && !trusted)
+            pushReply(client, 403, "application/json", "{\"ok\":false,\"error\":\"wrong or missing PIN\"}\n");
+        else {
+            gboolean hide = hideShownFrom(trusted);
+            char* shown = hide ? g_strdup("") : copyShownURI();
+            char* quoted = jsonString(shown);
+            char* reply = g_strdup_printf("{\"ok\":true,\"uri\":%s%s}\n", quoted, hide ? ",\"private\":true" : "");
+            pushReply(client, 200, "application/json", reply);
+            g_free(reply);
+            g_free(quoted);
+            g_free(shown);
+        }
     } else if (!strcmp(path, "/cookies") && post) {
-        /* Open by default (home network); with a key file, requests must
-         * carry it in X-PS5-Key (not the PIN: cookies log into accounts). */
+        /* The PIN as for /open; with a key file, requests must carry it in
+         * X-PS5-Key too (cookies log into accounts). A key file that can't
+         * be read, or is empty, refuses every import. */
         gchar* key = NULL;
-        if (g_file_get_contents(PS5WK_COOKIE_KEY, &key, NULL, NULL))
+        gboolean keyFile = g_file_test(PS5WK_COOKIE_KEY, G_FILE_TEST_EXISTS);
+        if (keyFile && g_file_get_contents(PS5WK_COOKIE_KEY, &key, NULL, NULL))
             g_strstrip(key);
-        if (key && *key && strcmp(key, keyHeader)) {
-            spike_log("push from %s: cookies refused (wrong key)", from);
+        if (!pinOK) {
+            pushReply(client, 403, "text/plain", "ERR wrong or missing PIN\n");
+        } else if (keyFile && (!key || !*key || strcmp(key, keyHeader))) {
+            spike_log("push from %s: cookies refused (%s)", from, !key || !*key ? "unreadable or empty key file" : "wrong key");
             pushReply(client, 403, "text/plain", "ERR wrong or missing cookie key (X-PS5-Key)\n");
         } else if (windDownStart || !cookieManager) {
             pushReply(client, 503, "text/plain", "ERR the browser is closing\n");
@@ -2007,8 +2089,8 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
         pushReply(client, code, json && !html ? "application/json" : html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", reply);
         g_free(reply);
         g_free(uri);
-    } else if (!strcmp(path, "/link.json") && get && loopback) {
-        /* The start page (a file: page: CORS) and Settings on the PS5. */
+    } else if (!strcmp(path, "/link.json") && get && trusted) {
+        /* The start page and Settings on the PS5 (parallax://). */
         char* reply = linkJSON();
         pushReply(client, 200, "application/json", reply);
         g_free(reply);
@@ -2032,11 +2114,11 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
             struct sockaddr_in local;
             socklen_t length = sizeof local;
             char ip[INET_ADDRSTRLEN] = "0.0.0.0";
-            if (!getsockname(client, (struct sockaddr*)&local, &length))
+            if (client->fd >= 0 && !getsockname(client->fd, (struct sockaddr*)&local, &length))
                 inet_ntop(AF_INET, &local.sin_addr, ip, sizeof ip);
             snprintf(host, sizeof host, "%s:%d", ip, PS5WK_PUSH_PORT);
         }
-        char* page = pushIndexPage(host, pushPIN && pinOK ? pushPIN : NULL, pinOK);
+        char* page = pushIndexPage(host, pushPIN && pinOK ? pushPIN : NULL, pinOK, pinOK && !hideShownFrom(trusted));
         pushReply(client, 200, "text/html; charset=utf-8", page);
         g_free(page);
     } else if (!strcmp(path, "/") || !strcmp(path, "/open") || !strcmp(path, "/status") || !strcmp(path, "/cookies")) {
@@ -2046,7 +2128,6 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
     }
     g_free(url);
     g_free(pin);
-    g_free(request);
     return FALSE;
 }
 
@@ -2099,7 +2180,7 @@ static void* pushThread(void* unused)
             if (!getsockname(client, (struct sockaddr*)&local, &localLength))
                 inet_ntop(AF_INET, &local.sin_addr, pushLastLocal, sizeof pushLastLocal);
         }
-        if (!pushServe(client, from, peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)))
+        if (!pushServe(client, from))
             close(client);
     }
     return NULL;
@@ -2108,8 +2189,10 @@ static void* pushThread(void* unused)
 static void pushStart(void)
 {
     if (fileExists("/data/ps5webkit/push-off")) {
-        spike_log("push: /data/ps5webkit/push-off: 127.0.0.1 only");
+        /* The PS5's own pages don't need it (parallax://, below). */
+        spike_log("push: /data/ps5webkit/push-off: no link server");
         pushLocalOnly = TRUE;
+        return;
     }
     gchar* pin = NULL;
     if (g_file_get_contents("/data/ps5webkit/push-pin.txt", &pin, NULL, NULL)) {
@@ -2124,6 +2207,196 @@ static void pushStart(void)
         pthread_detach(thread);
     else
         spike_log("push: no thread");
+}
+
+/* ---- parallax:// (README: "The browser's own pages") ----
+ * The browser's own pages, served by the title itself rather than by the
+ * link server:
+ *   parallax://settings           Settings (the link server's /settings page)
+ *   parallax://gamepad?site=<host> the button mapping (/gamepad)
+ *   parallax://start              the start page: /data/ps5webkit/start.html,
+ *       with the start-data.js and parallax-logo.png next to it
+ * Their scripts call the link server's routes on their own origin
+ * (/settings.json, /browser/..., /link.json), answered here without the
+ * PIN: only these pages can send such requests. The scheme is display
+ * isolated: only parallax: pages may link to, frame or load parallax: URLs,
+ * so a web page can't reach them (the link server, which web pages in this
+ * browser reach at 127.0.0.1 too, trusts no one for that). */
+#define PS5WK_START_DIR "/data/ps5webkit"
+
+typedef struct {
+    char* host;
+    char* method;
+    char* target;
+    char* headers;
+    char* body;
+    PushOut out;
+} SchemeCall;
+
+static void schemeCallFree(gpointer data)
+{
+    SchemeCall* call = data;
+    g_free(call->host);
+    g_free(call->method);
+    g_free(call->target);
+    g_free(call->headers);
+    g_free(call->body);
+    g_free(call->out.type);
+    if (call->out.body)
+        g_bytes_unref(call->out.body);
+    g_free(call);
+}
+
+static void schemeFinish(WebKitURISchemeRequest* request, int status, const char* type, GBytes* body)
+{
+    GInputStream* stream = g_memory_input_stream_new_from_bytes(body);
+    WebKitURISchemeResponse* response = webkit_uri_scheme_response_new(stream, (gint64)g_bytes_get_size(body));
+    webkit_uri_scheme_response_set_status(response, (guint)status, NULL);
+    webkit_uri_scheme_response_set_content_type(response, type);
+    SoupMessageHeaders* headers = soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
+    soup_message_headers_append(headers, "Cache-Control", "no-store");
+    soup_message_headers_append(headers, "X-Frame-Options", "DENY");
+    soup_message_headers_append(headers, "Content-Security-Policy", "frame-ancestors 'none'");
+    webkit_uri_scheme_response_set_http_headers(response, headers); /* takes them */
+    webkit_uri_scheme_request_finish_with_response(request, response);
+    g_object_unref(response);
+    g_object_unref(stream);
+}
+
+static void schemeFinishText(WebKitURISchemeRequest* request, int status, const char* text)
+{
+    GBytes* body = g_bytes_new(text, strlen(text));
+    schemeFinish(request, status, "text/plain; charset=utf-8", body);
+    g_bytes_unref(body);
+}
+
+/* A GLib worker thread: the route, as for the link server (/browser waits
+ * for the main loop, so never there). */
+static void schemeRouteThread(GTask* task, gpointer source, gpointer data, GCancellable* cancellable)
+{
+    (void)source;
+    (void)cancellable;
+    SchemeCall* call = data;
+    char* from = g_strdup_printf("parallax://%s", call->host);
+    g_mutex_lock(&routeLock);
+    pushRoute(&call->out, from, TRUE, call->method, call->target, call->headers, call->body);
+    g_mutex_unlock(&routeLock);
+    g_free(from);
+    g_task_return_boolean(task, TRUE);
+}
+
+/* Main loop: the route's reply to the page. */
+static void schemeRouteDone(GObject* source, GAsyncResult* result, gpointer data)
+{
+    (void)data;
+    SchemeCall* call = g_task_get_task_data(G_TASK(result));
+    if (call->out.body)
+        schemeFinish(WEBKIT_URI_SCHEME_REQUEST(source), call->out.status, call->out.type ? call->out.type : "text/plain", call->out.body);
+    else
+        schemeFinishText(WEBKIT_URI_SCHEME_REQUEST(source), 500, "no reply\n");
+}
+
+/* A file of the start page's, next to start.html: TRUE if it was sent. */
+static gboolean schemeStartFile(WebKitURISchemeRequest* request, const char* path)
+{
+    static const struct { const char* path; const char* file; const char* type; } files[] = {
+        { "", "start.html", "text/html; charset=utf-8" },
+        { "/", "start.html", "text/html; charset=utf-8" },
+        { "/start-data.js", "start-data.js", "text/javascript; charset=utf-8" },
+    };
+    for (unsigned i = 0; i < G_N_ELEMENTS(files); i++) {
+        if (strcmp(path, files[i].path))
+            continue;
+        char* name = g_build_filename(PS5WK_START_DIR, files[i].file, NULL);
+        gchar* data = NULL;
+        gsize length = 0;
+        if (g_file_get_contents(name, &data, &length, NULL)) {
+            GBytes* body = g_bytes_new_take(data, length);
+            schemeFinish(request, 200, files[i].type, body);
+            g_bytes_unref(body);
+        } else
+            schemeFinishText(request, 404, "not found\n");
+        g_free(name);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Main loop (WebKit's URI scheme callback). */
+static void onParallaxRequest(WebKitURISchemeRequest* request, gpointer data)
+{
+    (void)data;
+    GUri* uri = g_uri_parse(webkit_uri_scheme_request_get_uri(request), G_URI_FLAGS_ENCODED, NULL);
+    const char* host = uri ? g_uri_get_host(uri) : NULL;
+    const char* path = uri ? g_uri_get_path(uri) : "";
+    const char* query = uri ? g_uri_get_query(uri) : NULL;
+    gboolean root = !*path || !strcmp(path, "/");
+    if (!host || (strcmp(host, "settings") && strcmp(host, "gamepad") && strcmp(host, "start"))) {
+        schemeFinishText(request, 404, "no such page\n");
+        if (uri)
+            g_uri_unref(uri);
+        return;
+    }
+    if (!strcmp(host, "start") && schemeStartFile(request, path)) {
+        g_uri_unref(uri);
+        return;
+    }
+    /* Each page at its root is the link server's page of that name. */
+    const char* route = !root ? path : !strcmp(host, "settings") ? "/settings" : !strcmp(host, "gamepad") ? "/gamepad" : NULL;
+    if (route && !strcmp(route, "/parallax-logo.png"))
+        route = "/logo.png";
+    if (!route || strlen(route) + (query ? strlen(query) : 0) > 2000) {
+        schemeFinishText(request, 404, "no such page\n");
+        g_uri_unref(uri);
+        return;
+    }
+    SchemeCall* call = g_new0(SchemeCall, 1);
+    call->out.fd = -1;
+    call->host = g_strdup(host);
+    const char* method = webkit_uri_scheme_request_get_http_method(request);
+    call->method = g_strdup(method && *method ? method : "GET");
+    call->target = query ? g_strdup_printf("%s?%s", route, query) : g_strdup(route);
+    GString* headers = g_string_new(NULL);
+    SoupMessageHeaders* requestHeaders = webkit_uri_scheme_request_get_http_headers(request);
+    static const char* const names[] = { "Accept", "Content-Type" };
+    for (unsigned i = 0; requestHeaders && i < G_N_ELEMENTS(names); i++) {
+        const char* value = soup_message_headers_get_one(requestHeaders, names[i]);
+        if (value && !strpbrk(value, "\r\n"))
+            g_string_append_printf(headers, "%s: %s\r\n", names[i], value);
+    }
+    call->headers = g_string_free(headers, FALSE);
+    /* The body (POST): small, from the page's own script. */
+    GString* body = g_string_new(NULL);
+    GInputStream* stream = webkit_uri_scheme_request_get_http_body(request);
+    if (stream) {
+        char buffer[4096];
+        gssize n;
+        while (body->len < PS5WK_PUSH_MAX && (n = g_input_stream_read(stream, buffer, sizeof buffer, NULL, NULL)) > 0)
+            g_string_append_len(body, buffer, n);
+        g_object_unref(stream);
+    }
+    if (body->len >= PS5WK_PUSH_MAX) {
+        g_string_free(body, TRUE);
+        schemeCallFree(call);
+        schemeFinishText(request, 413, "too large\n");
+        g_uri_unref(uri);
+        return;
+    }
+    call->body = g_string_free(body, FALSE);
+    g_uri_unref(uri);
+    GTask* task = g_task_new(request, NULL, schemeRouteDone, NULL);
+    g_task_set_task_data(task, call, schemeCallFree);
+    g_task_run_in_thread(task, schemeRouteThread);
+    g_object_unref(task);
+}
+
+static void parallaxSchemeInit(void)
+{
+    WebKitWebContext* context = webkit_web_context_get_default();
+    webkit_web_context_register_uri_scheme(context, "parallax", onParallaxRequest, NULL, NULL);
+    WebKitSecurityManager* security = webkit_web_context_get_security_manager(context);
+    webkit_security_manager_register_uri_scheme_as_display_isolated(security, "parallax");
+    webkit_security_manager_register_uri_scheme_as_secure(security, "parallax");
 }
 
 /* Titles differ from payloads in which socket calls work (Spike 8): log
@@ -2358,6 +2631,7 @@ int main(int argc, char** argv)
      * (back/forward cache, process cache): 6 payloads after 3 sites. Without
      * them only the current page's process and one prewarmed one live. */
     webkit_web_context_set_cache_model(webkit_web_context_get_default(), WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
+    parallaxSchemeInit(); /* before the first page: Settings and the start page */
     WebKitSettings* settings = webkit_settings_new_with_settings(
         "enable-page-cache", FALSE,
         "enable-spatial-navigation", TRUE,

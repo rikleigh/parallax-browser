@@ -79,9 +79,12 @@ default it asks for no password.
   (a plain body `curl -d https://example.com …/open` works too). The reply is
   `OK loading <url>` (HTTP 200), or `ERR <why>` (400, 403 for a wrong PIN, or
   503 while the browser is closing). Send `Accept: application/json` for
-  `{"ok":true,"url":…}`. `GET /status` gives `{"ok":true,"uri":…}`. CORS is
-  open (`Access-Control-Allow-Origin: *`, plus the Private Network Access
-  header), so http pages and local tools can call it with `fetch`.
+  `{"ok":true,"url":…}`. `GET /status` gives `{"ok":true,"uri":…}` (the PIN
+  as for `/open`; while private browsing is shown, an empty `uri` and
+  `"private":true`). No CORS headers are sent, and every request must be
+  sent to the PS5's address or a local name, with no `Origin` header or the
+  server's own (see *The browser's own pages*): other sites' pages, including
+  the ones open in the PS5 browser, can't call it.
 - **On the console** the title's control socket takes `open <url>` too
   (`/system_tmp/ps5wk/ps5browser-control.sock`, the socket that the launcher's
   `stop` uses).
@@ -123,11 +126,13 @@ default it asks for no password.
   request carry `pin=4821` (a query or form field, or an `X-PS5-PIN` header).
   The page then shows a PIN box, and `http://<ps5>:9040/?pin=4821` gives a
   bookmarklet with the PIN built in. `/data/ps5webkit/push-off` (a file):
-  the server listens on 127.0.0.1 only, so nothing on the LAN reaches it but
-  the in-app Settings still work (see *Settings*). Both files are read at
-  startup.
-- **The QR code:** `GET /link.json` (from the PS5 itself only; CORS, for
-  the start page, a `file:` page) answers `{"localOnly", "pin", "url",
+  no server, so nothing reaches it, but Settings still opens on the PS5
+  (`parallax://settings`, see *The browser's own pages*). Both files are
+  read at startup. `/data/ps5webkit/push-cookie-key.txt`: `POST /cookies`
+  must carry that key in `X-PS5-Key` as well as the PIN; an empty or
+  unreadable key file refuses every import.
+- **The QR code:** `GET /link.json` (for `parallax://` pages only: the
+  start page and Settings) answers `{"localOnly", "pin", "url",
   "qr"}`: `url` is `http://<address>:9040/`, the address the PS5 has now
   (the source address of a route out, from a UDP socket connected to a
   public address, which sends nothing; else the address the last LAN
@@ -139,6 +144,36 @@ default it asks for no password.
   logo (`/app0/ui/parallax-logo.png`, from the title package).
 - The port is fixed at 9040. The other ports in use are elfldr 9021, the
   launcher 9031, ftpsrv 2121 and the Mac's log server 9999.
+
+### The browser's own pages (parallax://)
+
+Settings, the button mapping and the start page are served by the title
+itself, not by the link server: `parallax://settings`,
+`parallax://gamepad?site=<host>` and `parallax://start`
+(`/data/ps5webkit/start.html`, with `start-data.js` and `parallax-logo.png`
+next to it). `apps/title/ps5browser.c` registers the scheme on WebKit's web
+context (`webkit_web_context_register_uri_scheme`). Their scripts call the
+link server's routes on their own origin (`/settings.json`, `/browser/...`,
+`/link.json`); the handler runs those routes on a GLib worker thread (one
+route at a time, with the link server's) without the PIN, and answers with
+`X-Frame-Options: DENY`. The pages are the same ones a phone gets from the
+link server, so the scripts use paths, not addresses.
+
+Only these pages are trusted. The scheme is registered as *display
+isolated* (and secure): only `parallax:` pages may link to, frame or load
+`parallax:` URLs, so a web page can't open or call them. (Registered as
+*local* instead, WebKit would keep each `parallax:` page from reading its
+own origin, as it does for `file:`.) The link server trusts nobody for
+coming from 127.0.0.1, since web pages in the browser reach it there too.
+Before, the in-app pages were `http://127.0.0.1:9040/...` and loopback
+skipped the PIN, so any page open in the browser could read the downloads
+list, the page shown and import cookies.
+
+The old `file:///data/ps5webkit/start.html` (saved tabs, history, a
+`home-url.txt` with it) opens `parallax://start` instead (browserui.c's
+decide-policy). A `parallax:` page can't link to `file:` pages, so the start
+page's test pills (development only, not in a release) ask the browser to
+open them with `POST /open`.
 - **Checked on the console** (2026-10-29, log only, no TV): with the browser
   stopped, ps5open started it with the link as the launch argument (the
   title gets it as argv[1], with an empty argv[0]), and with a 514-character
@@ -197,7 +232,7 @@ served by the link server in `ps5browser.c`).
   *Back to the page*: the tab closes and the page you were on is
   shown again.
   The start page also has a *Settings* tile. The page is
-  `http://127.0.0.1:9040/settings` and is made for the D-pad: big buttons,
+  `parallax://settings` and is made for the D-pad: big buttons,
   a pink focus ring and the browser's dark palette. X picks an option. For the home page
   field, X or Triangle brings up the keyboard.
 - **On a Mac or phone:** open `http://192.168.1.50:9040/settings`. It
@@ -285,9 +320,9 @@ second press.
   deletes the finished files and their entries; `POST /clear?what=downloads`).
   *Restart browser* with downloads running asks for the second press with
   "1 download in progress; it will pause".
-- **Link server off** (`push-off`): the server now listens on 127.0.0.1 only,
-  instead of not running at all. The menu still opens Settings, but phones,
-  `ps5open` and the bookmarklet can't reach the PS5. Turn it back on from the
+- **Link server off** (`push-off`): no server. The menu still opens Settings
+  (`parallax://settings`), but phones, `ps5open` and the bookmarklet can't
+  reach the PS5. Turn it back on from the
   PS5's Settings, or delete the file over FTP.
 
 API (the page uses it too). No CORS headers are sent. A request with an
@@ -295,8 +330,8 @@ API (the page uses it too). No CORS headers are sent. A request with an
 address must be an IP, `localhost`, a name without dots or a `.local`/`.lan`/`.home`
 name. So no other web page can change settings, whether by posting a form
 or through DNS rebinding. A PIN set in `push-pin.txt` applies as it does for
-`/open`, except to the PS5 itself (127.0.0.1). The page then shows a PIN
-box.
+`/open`, except to the PS5's own `parallax://settings`. The page then shows
+a PIN box.
 
 ```sh
 curl http://192.168.1.50:9040/settings.json        # every setting: value, default, inUse, restart, pending; uri, started, status
@@ -539,10 +574,10 @@ the old one; no sync, no telemetry):
 | `bookmarks.json` | `{"version":1,"bookmarks":[{"url","title","added"}]}`, newest first, at most 500 |
 | `history.json` | `{"version":1,"history":[{"url","title","last","visits"}]}`, newest first, at most 1000 pages; http/https only (not the start page, Settings or files); written 10 s after a change |
 | `downloads.json` | the Downloads list (see *Downloads*); the files are in `downloads/` |
-| `start-data.js` | in `/data/ps5webkit`, not the user's folder: `window.ps5wkData = {bookmarks, top}`, the start page's *Bookmarks* and *Most visited* (pages visited at least twice), written at every start for the user who started the browser. A script file next to `start.html`, so only `file:` pages there can read it, not web pages |
+| `start-data.js` | in `/data/ps5webkit`, not the user's folder: `window.ps5wkData = {bookmarks, top}`, the start page's *Bookmarks* and *Most visited* (pages visited at least twice), written at every start for the user who started the browser. A script file next to `start.html`, served as `parallax://start/start-data.js`, so only `parallax:` pages can read it, not web pages |
 
-The start page (`runtime/start.html`, still the home page and what a new
-tab opens) has the Parallax logo and wordmark, the *Send from your phone*
+The start page (`runtime/start.html`, `parallax://start`, still the home
+page and what a new tab opens) has the Parallax logo and wordmark, the *Send from your phone*
 card and a Settings tile at the top right, a field for an address or
 words to search for (as the bar's: an address with a dot and no spaces,
 else DuckDuckGo Lite), then tiles for the bookmarks, the most visited pages
@@ -729,7 +764,7 @@ controller in two ways:
 | | |
 | --- | --- |
 | switching it on | the menu's gamepad button (✕: on or off for the site); or the offer *"Gamepad mode available △ Turn on □ Set up buttons ○ Not now"*: on a page that reads the controller, on a site with no answer yet, the first press brings it up, and it stays until answered (remembered for the site) or the page changes; an unanswered offer comes back on the site's next page. Checked on the TV 2026-11-09 |
-| the mapping | □ on the menu's gamepad button (*Set up buttons*), or □ on the offer, opens `http://127.0.0.1:9040/gamepad?site=<host>` in a browser page tab (see *Tabs, bookmarks, history*: the game keeps its tab, and it opens with 12 tabs open); *Back to the page* or O closes it and shows the game again. Also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
+| the mapping | □ on the menu's gamepad button (*Set up buttons*), or □ on the offer, opens `parallax://gamepad?site=<host>` in a browser page tab (see *Tabs, bookmarks, history*: the game keeps its tab, and it opens with 12 tabs open); *Back to the page* or O closes it and shows the game again. Also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
 | presets | *Controller only* (no keys: games that read the controller); *Arrows + Space* (D-pad and left stick arrows, ✕ Space, ○ Esc, □ Z, △ X, L1 Shift, R1 Ctrl, Options Enter); *WASD + mouse* (left stick WASD, right stick pointer, R2 click, ✕ Space, ○ C, □ R, △ E, L1 Q, R1 F, L2 Shift, Options Esc, touchpad Tab); *Point and click* (left stick pointer, ✕ and R2 click, right stick scrolls, ○ and Options Esc) |
 | a key per button | any of A-Z, 0-9, Space, Enter, Esc, Tab, Backspace, Shift, Ctrl, Alt, the arrows, or a mouse click at the pointer; sent as real key events with `KeyboardEvent.code` (hardware key codes) |
 | where it is kept | `users/<id>/sites.json` (browserdata.c), per host; local files (`file:`) count as one site |

@@ -358,7 +358,7 @@ static gboolean writePartsAtomically(const char* path, const char* const* parts,
 }
 
 /* The browser's own pages: no generic cosmetic filters there. */
-#define AB_EXEMPT_TOP_URLS "{\"exemptTopURLs\":[\"^file:\",\"^http://127\\\\.0\\\\.0\\\\.1:9040/\"]}"
+#define AB_EXEMPT_TOP_URLS "{\"exemptTopURLs\":[\"^file:\",\"^parallax:\",\"^http://127\\\\.0\\\\.0\\\\.1:9040/\"]}"
 
 /* Phase 2: uBO Lite's rulesets/scripting/ files at version for ids,
  * converted by ubol-scripting.js (already evaluated in js). Returns the

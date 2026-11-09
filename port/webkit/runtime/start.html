@@ -74,7 +74,7 @@ footer span{display:inline-flex;align-items:center;gap:10px}
   <div><h1>Parallax</h1><p>Browser for PS5 and PS VR2</p></div>
   <div class="end">
     <div id="phone" hidden></div>
-    <a class="settings" href="http://127.0.0.1:9040/settings"><i>⚙</i>Settings</a>
+    <a class="settings" href="parallax://settings"><i>⚙</i>Settings</a>
   </div>
 </header>
 
@@ -122,6 +122,16 @@ footer span{display:inline-flex;align-items:center;gap:10px}
 <a href="video.html?src=media/vrtest_MKX200_LR.mp4">Fisheye 200 (MKX200) 3D</a>
 <a href="video.html?src=media/sync-1080p30-h264.mp4">Flat video (big screen)</a>
 </div>
+<script>
+/* The test pages are file: pages next to this one, which a parallax: page
+ * can't link to: the browser opens them (POST /open, as from a phone). */
+document.querySelectorAll(".pills a[href^='video.html']").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+        e.preventDefault();
+        fetch("/open?url=" + encodeURIComponent("file:///data/ps5webkit/" + a.getAttribute("href")), { method: "POST" });
+    });
+});
+</script>
 <!-- /tests -->
 
 <footer>
@@ -230,7 +240,7 @@ footer span{display:inline-flex;align-items:center;gap:10px}
         svg.append(bg, p);
         return svg;
     }
-    fetch("http://127.0.0.1:9040/link.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (link) {
+    fetch("/link.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (link) {
         var box = document.getElementById("phone"), text = document.createElement("div"), b = document.createElement("b"), span = document.createElement("span");
         b.textContent = "Send from your phone";
         text.append(b);

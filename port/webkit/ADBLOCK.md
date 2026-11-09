@@ -387,8 +387,9 @@ only bigger).
    `unless-top-url` (the excepted sites and entities as top-URL regexes) and
    `resource-type: document` (checked once per document, not per
    subresource). Then one `ignore-previous-rules` rule with `if-top-url`
-   for the 1274 generichide sites and the browser's own pages (`file:` =
-   the start page, `http://127.0.0.1:9040/` = Settings): it only stops the
+   for the 1274 generichide sites and the browser's own pages (`parallax:` =
+   the start page and Settings; `file:` and `http://127.0.0.1:9040/`, what
+   they were before): it only stops the
    cosmetic rules before it; the network rules come after it.
 2. **Per-site cosmetic filters and scriptlets: WebKit user content,
    registered per host.** The converter merges all rulesets into one host

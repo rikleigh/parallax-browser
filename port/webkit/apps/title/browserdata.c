@@ -690,7 +690,7 @@ gboolean ps5wk_history_wanted(const char* url)
         return FALSE;
     if (!g_str_has_prefix(url, "http://") && !g_str_has_prefix(url, "https://"))
         return FALSE;
-    /* The title's own pages (Settings) */
+    /* The link server's pages, as the PS5 itself opened them before parallax:// */
     return !g_str_has_prefix(url, "http://127.0.0.1:9040/") && !g_str_has_prefix(url, "http://localhost:9040/");
 }
 

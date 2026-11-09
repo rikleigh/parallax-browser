@@ -358,7 +358,7 @@ static char* lastURI; /* main loop: the page the filter was last set for */
 
 static gboolean isSettingsPage(const char* uri)
 {
-    return uri && g_str_has_prefix(uri, "http://127.0.0.1:9040/");
+    return uri && g_str_has_prefix(uri, "parallax:");
 }
 
 /* Main loop. The filter on or off for the page at uri (NULL: the last one). */

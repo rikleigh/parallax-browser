@@ -190,8 +190,12 @@ char* ps5wk_gamepad_api(gboolean post, const char* site, const char* gamepad, co
     const char* left, const char* right, gboolean remove, int* status);
 /* The mapping page (GET /gamepad on the link server). */
 extern const char ps5wk_gamepad_page_html[];
-#define PS5WK_GAMEPAD_URL "http://127.0.0.1:9040/gamepad"
-#define PS5WK_SETTINGS_URL_PREFIX "http://127.0.0.1:9040/settings"
+#define PS5WK_GAMEPAD_URL "parallax://gamepad"
+#define PS5WK_SETTINGS_URL_PREFIX "parallax://settings"
+#define PS5WK_START_URL "parallax://start"
+/* The start page before parallax://start (ps5browser.c): saved tabs, history
+ * and home-url.txt may still have it; it opens parallax://start instead. */
+#define PS5WK_LEGACY_START_URL "file:///data/ps5webkit/start.html"
 
 /* Private browsing (browserui.c): TRUE while the private session is shown. */
 gboolean ps5wk_browser_private(void);

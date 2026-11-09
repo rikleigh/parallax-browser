@@ -41,4 +41,4 @@ void ps5wk_settings_set_status(const char* format, ...) G_GNUC_PRINTF(1, 2);
 extern const char ps5wk_settings_page[];
 
 /* The page the browser menu's Settings button (⚙) opens. */
-#define PS5WK_SETTINGS_URL "http://127.0.0.1:9040/settings"
+#define PS5WK_SETTINGS_URL "parallax://settings"

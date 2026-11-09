@@ -197,7 +197,8 @@ static int hintWidth(WPEDisplayPS5Canvas* c, const char* key, const char* label)
 
 static gboolean isStartPage(const char* uri)
 {
-    return !strncmp(uri, "file:///data/ps5webkit/start.html", 33);
+    /* parallax://start, or the file: page it was before */
+    return !strncmp(uri, "parallax://start", 16) || !strncmp(uri, "file:///data/ps5webkit/start.html", 33);
 }
 
 /* Where an address starts showing: https:// and www. are left out. */

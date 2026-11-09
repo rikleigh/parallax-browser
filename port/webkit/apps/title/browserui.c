@@ -1446,7 +1446,7 @@ static void onAddressEntered(const char* text, gpointer data)
 static void editAddress(void)
 {
     const char* current = shownURI();
-    if (!strncmp(current, "file:", 5) || !strncmp(current, "about:", 6) || !strncmp(current, "data:", 5))
+    if (!strncmp(current, "file:", 5) || !strncmp(current, "about:", 6) || !strncmp(current, "data:", 5) || !strncmp(current, "parallax:", 9))
         current = "";
     if (!wpe_display_ps5_request_text(display, "Address or search", current, TRUE, onAddressEntered, NULL))
         spike_log("browser: address: no system keyboard");
@@ -2096,9 +2096,29 @@ void ps5wk_browser_download_started(WebKitWebView* view)
 
 /* Notes which pages are form (POST) results, and a tab coming back never
  * sends a form again. */
+static gboolean loadStartPage(gpointer data)
+{
+    WebKitWebView* view = data;
+    webkit_web_view_load_uri(view, PS5WK_START_URL);
+    g_object_unref(view);
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean onDecidePolicy(WebKitWebView* view, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data)
 {
     (void)data;
+    if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
+        /* The old file: start page (a saved tab, history, Back): the start
+         * page is parallax://start now, which its QR code needs. */
+        WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+        WebKitURIRequest* request = webkit_navigation_action_get_request(action);
+        const char* uri = request ? webkit_uri_request_get_uri(request) : NULL;
+        if (uri && g_str_has_prefix(uri, PS5WK_LEGACY_START_URL)) {
+            webkit_policy_decision_ignore(decision);
+            g_idle_add(loadStartPage, g_object_ref(view));
+            return TRUE;
+        }
+    }
     if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
         if (!ps5wk_downloads_response_policy(view, WEBKIT_RESPONSE_POLICY_DECISION(decision)))
             return FALSE;
