@@ -10,6 +10,7 @@
  *     browser/data browser/cache      WebKit's website data (cookies.sqlite,
  *                                     local storage, IndexedDB...) and HTTP cache
  *     home-url.txt                    the Home page setting (settings.c)
+ *     search.txt                      the Search engine setting (settings.c)
  *     adblock-allow.txt               sites where ads are allowed (adblock.c)
  *
  * Before users, all of that was in /data/ps5webkit itself. The first start
@@ -225,7 +226,7 @@ static char* storageState(gboolean* counting)
     requestCount();
     *counting = answerGen <= changedGen;
     Usage lists = { 0, 0 };
-    static const char* const listFiles[] = { "bookmarks.json", "history.json", "session.json", "downloads.json", "home-url.txt", "adblock-allow.txt" };
+    static const char* const listFiles[] = { "bookmarks.json", "history.json", "session.json", "downloads.json", "home-url.txt", "search.txt", "adblock-allow.txt" };
     for (unsigned i = 0; i < G_N_ELEMENTS(listFiles); i++) {
         char* path = g_build_filename(profileDir, listFiles[i], NULL);
         struct stat st;

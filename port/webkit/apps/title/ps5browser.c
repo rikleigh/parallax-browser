@@ -226,7 +226,7 @@ static char* uriFromInput(const char* text)
     if (!strchr(text, ' ') && strchr(text, '.'))
         return g_strdup_printf("https://%s", text);
     char* query = g_uri_escape_string(text, NULL, FALSE);
-    char* uri = g_strdup_printf("https://lite.duckduckgo.com/lite/?q=%s", query);
+    char* uri = g_strdup_printf("%s%s", ps5wk_settings_search_url(), query); /* Settings: Search engine */
     g_free(query);
     return uri;
 }
@@ -822,6 +822,8 @@ static int fileExists(const char* path);
  *       match too (an empty or unreadable key file refuses every import)
  *   GET /settings, GET /settings.json, POST /settings, POST /restart,
  *       POST /clear  the settings page and its API (settingsServe below)
+ *   GET /search.json  (parallax:// pages only) {"url": the search engine's
+ *       URL from Settings, the words go after it}
  *   GET /link.json  (parallax:// pages only) this server's address on the
  *       LAN now, for the start page's and Settings' QR code: {"localOnly",
  *       "pin", "url", "qr": rows of "0"/"1"}; no url without an address or
@@ -2162,6 +2164,12 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
         pushReply(client, code, json && !html ? "application/json" : html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", reply);
         g_free(reply);
         g_free(uri);
+    } else if (!strcmp(path, "/search.json") && get && trusted) {
+        /* The start page's field (parallax://start): Settings' search
+         * engine, the words go after "url". */
+        char* reply = g_strdup_printf("{\"url\":\"%s\"}\n", ps5wk_settings_search_url());
+        pushReply(client, 200, "application/json", reply);
+        g_free(reply);
     } else if (!strcmp(path, "/link.json") && get && trusted) {
         /* The start page and Settings on the PS5 (parallax://). */
         char* reply = linkJSON();

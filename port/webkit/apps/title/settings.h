@@ -34,6 +34,9 @@ char* ps5wk_settings_json(const char* extra);
  * then) or when something could not be written. */
 gboolean ps5wk_settings_update(const char* body, gboolean json, char** message, int* changed);
 
+/* The search engine setting's URL, the words (escaped) go after it:
+ * "https://www.google.com/search?q=" by default. Any thread. */
+const char* ps5wk_settings_search_url(void);
 /* The result of the last action (clearing data, restarting), for the page. */
 void ps5wk_settings_set_status(const char* format, ...) G_GNUC_PRINTF(1, 2);
 

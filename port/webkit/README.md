@@ -63,7 +63,7 @@ default it asks for no password.
   opens the same address in the current tab instead.
 - Links load in the tab shown (see *Tabs, bookmarks, history*).
 - **Terminal:** `tools/ps5open <url>` (bare hosts get `https://`, other words
-  a DuckDuckGo search). With no argument it sends the front Safari tab, or
+  a search with Settings' search engine). With no argument it sends the front Safari tab, or
   Chrome's if Safari has none: if Safari or Chrome is the frontmost app, that
   one is used; `-s` or `-c` picks one. `ps5open --status` prints the page
   the PS5 is showing. For `ps5open` anywhere, link it onto your PATH:
@@ -261,6 +261,7 @@ are saved as soon as you press a button.
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
 | Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |
+| Search engine for words typed in the address bar or the start page's field: Google (default), Bing, DuckDuckGo, DuckDuckGo Lite, Brave Search, Ecosia, Startpage | `search.txt` in the PS5 user's folder (no file: Google) | none |
 
 The page also has these actions: *Clear cache*, *Clear cookies* and *Clear
 all website data* in the Storage card (`webkit_website_data_manager_clear`
@@ -408,7 +409,7 @@ runtime files, the ad-block lists, `child.env` and the other switches in
 | `…/name.txt` | the user's name, for someone looking over FTP |
 | `…/bookmarks.json`, `history.json`, `session.json`, `downloads.json`, `downloads/` | see *Tabs, bookmarks, history* and *Downloads* |
 | `…/browser/data/`, `…/browser/cache/` | WebKit's website data (`cookies.sqlite`, local storage, IndexedDB, HSTS) and its HTTP cache |
-| `…/home-url.txt`, `…/adblock-allow.txt` | the Home page setting; the sites where ads are allowed |
+| `…/home-url.txt`, `…/search.txt`, `…/adblock-allow.txt` | the Home page and Search engine settings; the sites where ads are allowed |
 | `/data/ps5webkit/start-data.js` | the start page's bookmarks and most visited, rewritten at every start for the user who started the browser (next to `start.html`, which loads it) |
 
 **Moving to users.** Before this, all of it was in `/data/ps5webkit` itself,
@@ -449,7 +450,7 @@ files).
 **Options**, which now opens the **browser menu** instead of the URL prompt.
 The D-pad's focus starts on the address field, so **Options, then X** (or
 Triangle) brings up the system keyboard (URL layout, *Go*): an address, or
-words to search for (DuckDuckGo Lite, as before).
+words to search for (with Settings' *Search engine*: Google unless changed).
 
 | In the menu | |
 | --- | --- |
@@ -587,7 +588,8 @@ The start page (`runtime/start.html`, `parallax://start`, still the home
 page and what a new tab opens) has the Parallax logo and wordmark, the *Send from your phone*
 card and a Settings tile at the top right, a field for an address or
 words to search for (as the bar's: an address with a dot and no spaces,
-else DuckDuckGo Lite), then tiles for the bookmarks, the most visited pages
+else a search with Settings' *Search engine*, which the page reads from
+`/search.json`), then tiles for the bookmarks, the most visited pages
 and the links, and the test pages as smaller pills. The D-pad moves between
 tiles (up from the first row: the field, which brings up the keyboard); L1/R1
 and X work as on any page. It needs `parallax-logo.png` next to it

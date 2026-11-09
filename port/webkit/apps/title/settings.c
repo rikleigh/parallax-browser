@@ -93,6 +93,9 @@ static const Setting settings[] = {
     { "home_url", KIND_FILE, TYPE_TEXT, "home-url.txt", "", 0, "Home page",
         "Opens when the browser starts, in new tabs and with Home. Empty: the built-in start page. On the PS5: □ on the Home button in the browser menu makes the page shown the home page, or goes back to the start page.",
         NULL, 0, 0 },
+    { "search", KIND_FILE, TYPE_CHOICE, "search.txt", "google", 0, "Search engine",
+        "Searches for words typed in the address bar or on the start page, when they aren't an address.",
+        "google=Google|bing=Bing|duckduckgo=DuckDuckGo|ddglite=DuckDuckGo Lite|brave=Brave Search|ecosia=Ecosia|startpage=Startpage", 0, 0 },
 };
 #define SETTING_COUNT (sizeof settings / sizeof settings[0])
 
@@ -634,7 +637,7 @@ gboolean ps5wk_settings_update(const char* body, gboolean json, char** message, 
                 }
             } else
                 ok = !unlink(path) || !fileExists(path);
-        } else if (!*values[i]) {
+        } else if (!*values[i] || !strcmp(values[i], s->fallback)) { /* the default: no file */
             ok = !unlink(path) || !fileExists(path);
         } else {
             char* line = g_strdup_printf("%s\n", values[i]);
@@ -677,6 +680,40 @@ gboolean ps5wk_settings_update(const char* body, gboolean json, char** message, 
     g_string_free(done, TRUE);
     g_string_free(failed, TRUE);
     return ok;
+}
+
+/* The search engines of the "search" setting: what goes before the words
+ * (escaped). Every choice in the table has one; an unknown value (a file
+ * edited by hand) searches with the first. */
+static const struct {
+    const char* id;
+    const char* url;
+} searchEngines[] = {
+    { "google", "https://www.google.com/search?q=" },
+    { "bing", "https://www.bing.com/search?q=" },
+    { "duckduckgo", "https://duckduckgo.com/?q=" },
+    { "ddglite", "https://lite.duckduckgo.com/lite/?q=" },
+    { "brave", "https://search.brave.com/search?q=" },
+    { "ecosia", "https://www.ecosia.org/search?q=" },
+    { "startpage", "https://www.startpage.com/do/search?q=" },
+};
+
+const char* ps5wk_settings_search_url(void)
+{
+    const char* url = searchEngines[0].url;
+    g_mutex_lock(&lock);
+    for (size_t i = 0; i < SETTING_COUNT; i++) {
+        if (strcmp(settings[i].id, "search"))
+            continue;
+        char* value = currentValue(&settings[i], "");
+        for (size_t e = 0; e < G_N_ELEMENTS(searchEngines); e++) {
+            if (!strcmp(value, searchEngines[e].id))
+                url = searchEngines[e].url;
+        }
+        g_free(value);
+    }
+    g_mutex_unlock(&lock);
+    return url;
 }
 
 /* The settings page: built from /settings.json by its script (no innerHTML:

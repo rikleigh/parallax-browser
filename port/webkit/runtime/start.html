@@ -255,7 +255,13 @@ document.querySelectorAll(".pills a[href^='video.html']").forEach(function (a) {
     }, function () { /* no link server: no card */ });
 
     /* The field: an address, or words to search for (as the browser's
-     * address bar does, ps5browser.c's uriFromInput). */
+     * address bar does, ps5browser.c's uriFromInput) with the search engine
+     * in Settings (Google until /search.json answers). */
+    var searchURL = "https://www.google.com/search?q=";
+    fetch("/search.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (search) {
+        if (search && /^https:\/\//.test(search.url))
+            searchURL = search.url;
+    }, function () { /* not from the browser: Google */ });
     document.getElementById("go").addEventListener("submit", function (event) {
         event.preventDefault();
         var text = document.getElementById("q").value.trim();
@@ -266,7 +272,7 @@ document.querySelectorAll(".pills a[href^='video.html']").forEach(function (a) {
         else if (!/ /.test(text) && /\./.test(text))
             location.href = "https://" + text;
         else
-            location.href = "https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(text);
+            location.href = searchURL + encodeURIComponent(text);
     });
 
     /* D-pad: from tile to tile (the nearest in that direction); up from the
