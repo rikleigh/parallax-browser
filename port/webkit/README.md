@@ -190,8 +190,11 @@ The browser's main knobs are on one settings page. It works from the PS5 and
 from any other device, and both use the same code (`apps/title/settings.c`,
 served by the link server in `ps5browser.c`).
 
-- **On the PS5:** press **R3** (click the right stick) to open Settings. Press
-  R3 again, or O, or *Back to the page*, to go back to the page you were on.
+- **On the PS5:** press **R3** (click the right stick) to open Settings. It
+  opens in a *browser page tab* over the page, which stays as it was (a
+  game keeps running), and it opens even with 12 tabs open. Press R3 again,
+  or O, or *Back to the page*: the tab closes and the page you were on is
+  shown again.
   The start page also has a *Settings* tile. The page is
   `http://127.0.0.1:9040/settings` and is made for the D-pad: big buttons,
   a pink focus ring and the browser's dark palette. X picks an option. For the home page
@@ -506,7 +509,13 @@ restore: the tab shows *This page came from a form* with a link that loads
 the address without the form. A new tab starts with a fresh back/forward
 list (an empty `about:blank` first entry, built in WebKit's session state
 format, which Back skips). At most **12 tabs** (a 13th is refused with a
-message). Links with `target=_blank` and `window.open()` after a click open
+message). The browser's own pages, Settings and the button mapping, don't
+count: they open in a **browser page tab** next to the tab shown, one at a
+time (Settings from the mapping page loads in the same tab), never kept in
+the session file. O with nothing to go back to, R3 on Settings, or *Back
+to the page* (`POST /browser/page action=close`) closes it and shows the
+tab it was opened over. A browser page tab that goes on to a web page
+becomes an ordinary tab. Links with `target=_blank` and `window.open()` after a click open
 in a new tab; pop-ups without a click are dropped (`browser: pop-up without
 a click blocked`). Links sent from another device (`/open`, ps5open) load in
 the tab shown.
@@ -637,6 +646,7 @@ remotely; indexes are 1-based as in the menu):
 ```sh
 curl http://192.168.1.50:9040/browser/state       # tabs, menu focus, back/forward, bookmarks, the last 50 history entries
 curl -X POST 'http://192.168.1.50:9040/browser/tab?action=new&url=example.com'   # or action=switch&index=2, action=close&index=2
+curl -X POST 'http://192.168.1.50:9040/browser/page?action=close'  # close the browser page tab shown (Settings, the mapping), back to its tab
 curl -X POST 'http://192.168.1.50:9040/browser/key?name=options'  # a menu press: options up down left right x o square triangle l1 r1 r2 l3 r3
 curl -X POST 'http://192.168.1.50:9040/browser/address?text=ps5+vr2'  # as typed on the keyboard
 curl -X POST 'http://192.168.1.50:9040/browser/bookmark'          # toggle the page shown (or url=...)
@@ -712,14 +722,15 @@ controller in two ways:
   navigation off), so the whole controller is the game's. Each button can
   also press a key, and each stick can be the arrow keys, W A S D, the
   pointer or scrolling, for games that only read the keyboard or mouse.
-  **Hold Options for a second** to open the browser menu (a short press
-  still goes to the game, which often uses it for pause); the menu opens
-  with the focus on the gamepad button.
+  **Hold Options for a second** to leave gamepad mode: it goes off for the
+  site (*"Gamepad mode off · turn it back on from the menu's controller
+  button"*) and the pad is the browser's again. A short press still goes to
+  the game, which often uses it for pause.
 
 | | |
 | --- | --- |
-| switching it on | the menu's gamepad button (✕: on or off for the site); or the offer *"Gamepad mode available △ Turn on ○ Not now"*: on a page that reads the controller, on a site with no answer yet, the first press brings it up, and it stays until answered (remembered for the site) or the page changes; an unanswered offer comes back on the site's next page. Checked on the TV 2026-11-09 |
-| the mapping | □ on the menu's gamepad button opens `http://127.0.0.1:9040/gamepad?site=<host>` in a new tab (the game keeps its tab); also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
+| switching it on | the menu's gamepad button (✕: on or off for the site); or the offer *"Gamepad mode available △ Turn on □ Set up buttons ○ Not now"*: on a page that reads the controller, on a site with no answer yet, the first press brings it up, and it stays until answered (remembered for the site) or the page changes; an unanswered offer comes back on the site's next page. Checked on the TV 2026-11-09 |
+| the mapping | □ on the menu's gamepad button (*Set up buttons*), or □ on the offer, opens `http://127.0.0.1:9040/gamepad?site=<host>` in a browser page tab (see *Tabs, bookmarks, history*: the game keeps its tab, and it opens with 12 tabs open); *Back to the page* or O closes it and shows the game again. Also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
 | presets | *Controller only* (no keys: games that read the controller); *Arrows + Space* (D-pad and left stick arrows, ✕ Space, ○ Esc, □ Z, △ X, L1 Shift, R1 Ctrl, Options Enter); *WASD + mouse* (left stick WASD, right stick pointer, R2 click, ✕ Space, ○ C, □ R, △ E, L1 Q, R1 F, L2 Shift, Options Esc, touchpad Tab); *Point and click* (left stick pointer, ✕ and R2 click, right stick scrolls, ○ and Options Esc) |
 | a key per button | any of A-Z, 0-9, Space, Enter, Esc, Tab, Backspace, Shift, Ctrl, Alt, the arrows, or a mouse click at the pointer; sent as real key events with `KeyboardEvent.code` (hardware key codes) |
 | where it is kept | `users/<id>/sites.json` (browserdata.c), per host; local files (`file:`) count as one site |
@@ -734,10 +745,11 @@ Code: `wpe-ps5/WPEDisplayPS5.cpp` (`wpe_display_ps5_set_gamepad_mode`, the
 keys and sticks in the pad loop, Options held as
 `WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD`), `apps/title/gamepad.c` (the site's
 mode, the offer, the presets, `/browser/gamepad` and the mapping page),
-`apps/title/browserui.c` (the menu button). Log lines: `[wpe-ps5] gamepad
+`apps/title/browserui.c` (the menu button, Options held, the browser page tab). Log lines: `[wpe-ps5] gamepad
 mode on: 12 key(s), left stick arrows, right stick gamepad`, `[wpe-ps5]
 gamepad: the page reads the gamepad`, `gamepad: offered gamepad mode on
-<host>`, `[wpe-ps5] pad: Options held in gamepad mode`. Test page:
+<host>`, `[wpe-ps5] pad: Options held in gamepad mode`, `gamepad: left with
+Options held on <host>`. Test page:
 `test/input/gamepad.html` (what the page gets, rumble on □ held 2 s).
 
 ## Private browsing
@@ -3143,7 +3155,7 @@ focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
 R3 = Settings (XF86Tools; see *Settings*); L3 = home page; L3 + R3 =
 performance overlay; touchpad = View in VR. In gamepad mode none of these:
 the page gets the pad (and the keys set for the site), and Options held 1 s
-opens the menu (see *Gamepad mode*).
+leaves gamepad mode (see *Gamepad mode*).
 
 GL goes through libepoxy; in the title, `--wrap=dlopen/dlsym` and
 `apps/title/dlshim.c` resolve epoxy's lookups to the statically linked

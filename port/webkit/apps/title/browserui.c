@@ -12,7 +12,9 @@
  * then scrolls back to where it was. A page that came from a form (POST) is
  * not sent again: a short page offers to load the address instead. A new
  * tab gets a fresh back/forward list (an empty about:blank first entry that
- * Back skips). At most MAX_TABS tabs; memory stays that of one page.
+ * Back skips). At most MAX_TABS tabs, plus one browser page tab (Settings,
+ * the button mapping) over the tab it was opened from; memory stays that of
+ * one page.
  *
  * The UI is drawn by the title (browserdraw.c, wpe_display_ps5_set_ui_layer, a CPU canvas
  * shown over the page by PS5Renderer, the same with GPU compositing on or
@@ -64,7 +66,7 @@ char* ps5wk_home_url(void);
 void ps5wk_open_settings(void);
 gboolean ps5wk_vr_buttons(guint32 pressed);
 
-typedef struct {
+typedef struct Tab {
     char* url;
     char* title;
     GBytes* state; /* the saved back/forward list (a discarded tab's way back; refreshed when a live tab is hidden) */
@@ -72,6 +74,11 @@ typedef struct {
     gboolean fromForm; /* the page shown is a form's (POST) result */
     WebKitWebView* view; /* live: its own web view (the active tab always has one), else NULL */
     gint64 lastUsed;     /* monotonic us: last shown (LRU of live tabs) */
+    /* A browser page tab (Settings, button mapping): opened over another
+     * tab, not one of the MAX_TABS, never in the session file; closing it
+     * goes back to opener (NULL once that tab is closed). */
+    gboolean browserPage;
+    struct Tab* opener;
 } Tab;
 
 static WPEDisplayPS5* display;
@@ -122,6 +129,30 @@ static void tabFree(gpointer data)
 static Tab* activeTab(void)
 {
     return tabs && active >= 0 && active < (int)tabs->len ? g_ptr_array_index(tabs, active) : NULL;
+}
+
+/* The browser's own pages, which open in a browser page tab. */
+static gboolean isBrowserPageURI(const char* uri)
+{
+    return uri && (g_str_has_prefix(uri, PS5WK_SETTINGS_URL_PREFIX) || g_str_has_prefix(uri, PS5WK_GAMEPAD_URL));
+}
+
+/* The tabs MAX_TABS counts: all but a browser page tab. */
+static unsigned userTabCount(void)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; tabs && i < tabs->len; i++)
+        n += !((Tab*)g_ptr_array_index(tabs, i))->browserPage;
+    return n;
+}
+
+static int tabIndex(const Tab* tab)
+{
+    for (unsigned i = 0; tab && tabs && i < tabs->len; i++) {
+        if (g_ptr_array_index(tabs, i) == tab)
+            return (int)i;
+    }
+    return -1;
 }
 
 static void setString(char** field, const char* value)
@@ -649,6 +680,7 @@ static void switchTo(int index)
 
 typedef struct {
     char* url;
+    gboolean browserPage;
 } NewTabJob;
 
 static void newTabNow(gpointer data)
@@ -665,9 +697,11 @@ static void newTabNow(gpointer data)
     Tab* tab = tabNew(job->url, "");
     tab->view = view;
     tab->lastUsed = g_get_monotonic_time();
+    tab->browserPage = job->browserPage;
+    tab->opener = job->browserPage ? old : NULL;
     g_ptr_array_insert(tabs, at, tab);
     active = at;
-    spike_log("browser: new tab %d of %u: %s (%u live)", active + 1, tabs->len, job->url, liveCount());
+    spike_log("browser: new %stab %d of %u: %s (%u live)", job->browserPage ? "browser page " : "", active + 1, tabs->len, job->url, liveCount());
     showView(view);
     loadFresh(view, job->url);
     logLiveTabs("a new tab");
@@ -677,10 +711,11 @@ static void newTabNow(gpointer data)
     g_free(job);
 }
 
-/* Opens url (NULL: the home page) in a new tab after the active one. */
-static gboolean openInNewTab(const char* url)
+/* Opens url (NULL: the home page) in a new tab after the active one; a
+ * browser page tab is not one of the MAX_TABS. */
+static gboolean openTab(const char* url, gboolean browserPage)
 {
-    if (tabs->len >= MAX_TABS) {
+    if (!browserPage && userTabCount() >= MAX_TABS) {
         char text[96];
         snprintf(text, sizeof text, "%d tabs is the most: close one first (Options, then Square)", MAX_TABS);
         wpe_display_ps5_show_message(display, text, 3);
@@ -691,6 +726,7 @@ static gboolean openInNewTab(const char* url)
         return FALSE;
     NewTabJob* job = g_new0(NewTabJob, 1);
     job->url = url ? g_strdup(url) : ps5wk_home_url();
+    job->browserPage = browserPage;
     if (shownTabStaysLive()) {
         captureScroll(NULL, NULL);
         newTabNow(job);
@@ -701,12 +737,23 @@ static gboolean openInNewTab(const char* url)
     return TRUE;
 }
 
+static gboolean openInNewTab(const char* url)
+{
+    return openTab(url, FALSE);
+}
+
 static void closeTab(int index)
 {
     if (!tabs || index < 0 || index >= (int)tabs->len || switching)
         return;
     Tab* closing = g_ptr_array_index(tabs, index);
-    spike_log("browser: closing tab %d of %u (%s%s)", index + 1, tabs->len, closing->url, closing->view ? ", live" : "");
+    spike_log("browser: closing %stab %d of %u (%s%s)", closing->browserPage ? "browser page " : "", index + 1, tabs->len, closing->url,
+        closing->view ? ", live" : "");
+    for (unsigned i = 0; i < tabs->len; i++) {
+        Tab* other = g_ptr_array_index(tabs, i);
+        if (other->opener == closing)
+            other->opener = NULL;
+    }
     if (tabs->len == 1) {
         /* The last tab: it becomes a new tab on the home page. */
         char* home = ps5wk_home_url();
@@ -714,6 +761,8 @@ static void closeTab(int index)
         setString(&closing->title, "");
         closing->scrollX = closing->scrollY = 0;
         closing->fromForm = FALSE;
+        closing->browserPage = FALSE;
+        closing->opener = NULL;
         g_clear_pointer(&closing->state, g_bytes_unref);
         loadFresh(closing->view, home);
         g_free(home);
@@ -721,8 +770,12 @@ static void closeTab(int index)
         ps5wk_vr_stop(FALSE, "tab closed");
         WebKitWebView* freed = closing->view;
         closing->view = NULL;
+        /* A browser page tab goes back to the tab it was opened over. */
+        int back = tabIndex(closing->opener);
         g_ptr_array_remove_index(tabs, (unsigned)index);
-        active = index < (int)tabs->len ? index : (int)tabs->len - 1;
+        if (back > index)
+            back--;
+        active = back >= 0 ? back : index < (int)tabs->len ? index : (int)tabs->len - 1;
         Tab* tab = activeTab();
         tab->lastUsed = g_get_monotonic_time();
         if (tab->view) {
@@ -909,9 +962,19 @@ static void sessionWrite(gpointer data)
     /* While private, the file keeps the normal tabs (as they were set
      * aside), never a private one. */
     GPtrArray* saving = privateMode ? normalTabs : tabs;
+    int savingActive = privateMode ? normalActive : active;
+    /* Not a browser page tab: the tab it was opened over is the one shown. */
+    Tab* shown = savingActive >= 0 && savingActive < (int)saving->len ? g_ptr_array_index(saving, savingActive) : NULL;
+    while (shown && shown->browserPage)
+        shown = shown->opener;
+    int savedActive = 0;
     GPtrArray* list = g_ptr_array_new_with_free_func(ps5wk_session_tab_free);
     for (unsigned i = 0; i < saving->len; i++) {
         Tab* tab = g_ptr_array_index(saving, i);
+        if (tab->browserPage)
+            continue;
+        if (tab == shown || (!shown && (int)i < savingActive))
+            savedActive = (int)list->len;
         PS5WKSessionTab* saved = g_new0(PS5WKSessionTab, 1);
         saved->url = g_strdup(tab->url);
         saved->title = g_strdup(tab->title);
@@ -929,7 +992,14 @@ static void sessionWrite(gpointer data)
             saved->state = g_bytes_ref(tab->state);
         g_ptr_array_add(list, saved);
     }
-    ps5wk_session_save(list, privateMode ? normalActive : active);
+    if (!list->len) {
+        char* home = ps5wk_home_url();
+        PS5WKSessionTab* saved = g_new0(PS5WKSessionTab, 1);
+        saved->url = home;
+        saved->title = g_strdup("");
+        g_ptr_array_add(list, saved);
+    }
+    ps5wk_session_save(list, savedActive);
     g_ptr_array_unref(list);
 }
 
@@ -1006,7 +1076,7 @@ static int rowCount(int sec)
 {
     switch (sec) {
     case SEC_TABS:
-        return (int)tabs->len + (tabs->len < MAX_TABS ? 1 : 0);
+        return (int)tabs->len + (userTabCount() < MAX_TABS ? 1 : 0);
     case SEC_BOOKMARKS:
         return (int)ps5wk_bookmarks()->len;
     case SEC_HISTORY:
@@ -1105,13 +1175,13 @@ static void fillState(BUIState* s)
     s->progress = webkit_web_view_get_estimated_load_progress(webView);
     s->canBack = canGoBack();
     s->canForward = webkit_web_view_can_go_forward(webView);
-    s->canNewTab = tabs->len < MAX_TABS;
+    s->canNewTab = userTabCount() < MAX_TABS;
     s->starred = ps5wk_bookmark_find(shownURI()) >= 0;
     s->gamepadOn = ps5wk_gamepad_active();
     s->privateMode = privateMode;
     s->title = shownTitle();
     s->uri = shownURI();
-    s->tabCount = tabs->len;
+    s->tabCount = userTabCount();
     s->maxTabs = MAX_TABS;
     s->userName = ps5wk_profile_name();
     s->zone = zone;
@@ -1444,17 +1514,22 @@ static void toolbarActivate(int index)
     }
 }
 
-/* The gamepad button's □: the mapping page for the site shown, in a new tab
- * (the game keeps its tab). */
+/* The gamepad button's □ (and the offer's): the mapping page for the site
+ * shown, in a browser page tab (the game keeps its tab). */
 static void openGamepadPage(void)
+{
+    if (menuOpen)
+        setMenu(FALSE);
+    ps5wk_browser_open_gamepad_page();
+}
+
+void ps5wk_browser_open_gamepad_page(void)
 {
     const char* site = ps5wk_gamepad_site();
     char* escaped = site ? g_uri_escape_string(site, NULL, TRUE) : NULL;
     char* url = escaped ? g_strdup_printf("%s?site=%s", PS5WK_GAMEPAD_URL, escaped) : g_strdup(PS5WK_GAMEPAD_URL);
-    if (openInNewTab(url))
-        setMenu(FALSE);
-    else
-        wpe_display_ps5_show_message(display, "No room for another tab: close one first", 2);
+    if (!ps5wk_browser_open_page(url))
+        wpe_display_ps5_show_message(display, "One moment: try again", 2);
     g_free(url);
     g_free(escaped);
 }
@@ -1732,10 +1807,12 @@ static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
 {
     (void)d;
     (void)data;
-    /* Options held in gamepad mode: the menu (its focus on the gamepad
-     * button, to switch the mode off). */
+    /* Options held in gamepad mode: out of it (off for the site); the menu
+     * if it was already off. */
     if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD) {
-        if (!menuOpen) {
+        if (ps5wk_gamepad_active())
+            ps5wk_gamepad_leave();
+        else if (!menuOpen) {
             ps5wk_browser_toggle_menu();
             zone = ZONE_TOOLBAR;
             toolbarFocus = TB_GAMEPAD;
@@ -1764,6 +1841,36 @@ void ps5wk_browser_go_back(void)
 {
     if (canGoBack())
         webkit_web_view_go_back(webView);
+    else
+        ps5wk_browser_close_page(); /* a browser page tab: back to its tab */
+}
+
+gboolean ps5wk_browser_open_page(const char* url)
+{
+    Tab* tab = activeTab();
+    if (tab && tab->browserPage) {
+        webkit_web_view_load_uri(webView, url);
+        return TRUE;
+    }
+    if (switching)
+        return FALSE;
+    /* One browser page tab at a time. */
+    for (unsigned i = 0; i < tabs->len; i++) {
+        if (((Tab*)g_ptr_array_index(tabs, i))->browserPage) {
+            closeTab((int)i);
+            break;
+        }
+    }
+    return openTab(url, TRUE);
+}
+
+gboolean ps5wk_browser_close_page(void)
+{
+    Tab* tab = activeTab();
+    if (!tab || !tab->browserPage || switching || tabs->len < 2)
+        return FALSE;
+    closeTab(active);
+    return TRUE;
 }
 
 static void applyPendingScroll(void)
@@ -1811,6 +1918,11 @@ void ps5wk_browser_load_changed(WebKitWebView* view, WebKitLoadEvent event)
         Tab* tab = activeTab();
         if (tab && uri && *uri && strcmp(uri, "about:blank"))
             setString(&tab->url, uri);
+        /* A browser page tab that goes to a web page is an ordinary tab now. */
+        if (tab && tab->browserPage && uri && *uri && strcmp(uri, "about:blank") && !isBrowserPageURI(uri)) {
+            tab->browserPage = FALSE;
+            tab->opener = NULL;
+        }
         /* A form's result (not a redirect after it): a tab switch must not
          * load it again. */
         if (tab)
@@ -2304,6 +2416,11 @@ static char* apiRun(ApiCall* call, int* status)
             n >= 0 && n < (int)tabs->len ? closeTab(n) : (void)(error = g_strdup("index: 1..tabs"));
         else
             error = g_strdup("action=new|switch|close");
+    } else if (!strcmp(path, "/browser/page")) {
+        if (!action || strcmp(action, "close"))
+            error = g_strdup("action=close");
+        else if (!ps5wk_browser_close_page())
+            error = g_strdup("the tab shown is not a browser page tab");
     } else if (!strcmp(path, "/browser/bookmark")) {
         const char* uri = url ? url : shownURI();
         ps5wk_bookmark_toggle(uri, url ? url : shownTitle());
