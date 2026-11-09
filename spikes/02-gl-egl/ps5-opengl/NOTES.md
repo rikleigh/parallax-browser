@@ -701,3 +701,23 @@ At m=60 both hold 60 fps. Built into `toolchain/ps5-opengl-gles-noprof-m6`.
 A WebGL racing game (Unity) on the same build: 13.4 ms of the WebGL thread per
 frame with the caches off, 7.9 ms with them on, both ~58-59 fps, and the
 same picture on the TV either way.
+
+## Patch 0019: GPU resolves for half-float 4x MSAA (2026-11-09)
+
+`ps5_blit_gpu_color` took a 4x MSAA resolve only for R8G8B8A8_UNORM; an
+RGBA16F one went to the CPU resolve, which reads each tiled sample, unpacks
+the half floats and packs the average. An HDR WebGL 2 game (Unity: RGBA16F
+with 4x MSAA, resolved by `blitFramebuffer` every frame) spent ~330 ms of the
+WebGL thread per 1396x734 frame there: 3 fps, 99% of the thread under
+`ps5_blit`. 4x RGBA16F targets are already sampled like RGBA8 ones (the
+MSAA tile follows the texel size), and u_blitter's resolve shader averages
+in float, so RGBA16F resolves now take the GPU path too. Host test:
+`test_gpu_blit.py` (RGBA16F resolve accepted, one byte short refused, R8
+still refused).
+
+`port/webkit/test/webgl/msaa-hdr-resolve.html` (1396x734: clear to
+(2, 0.5, 0.25), a triangle of (0, 4, 0), resolved and read back as floats;
+edge pixels must be 0/1/2/3/4-sample mixes): PASS before and after, the same
+384510/637954/2200 inside/outside/edge pixels as desktop Chrome; 250 ms ->
+0.23 ms per draw + resolve. The game: 3 fps / 330 ms -> 59.5-59.9 fps /
+3.5-4 ms per frame. Built into `toolchain/ps5-opengl-gles-noprof-m7`.

@@ -1,0 +1,43 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 89594a7..a2e0e5e 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -8146,7 +8146,13 @@ ps5_blit_gpu_color(struct ps5_context *context, const struct pipe_blit_info *inf
+         info->src.format != PIPE_FORMAT_R8_UNORM &&
+         info->src.format != PIPE_FORMAT_R8G8_UNORM &&
+         info->src.format != PIPE_FORMAT_R16G16B16A16_FLOAT) ||
+-       (resolve && info->src.format != PIPE_FORMAT_R8G8B8A8_UNORM))
++       /* ps5webkit: half-float resolves too. An HDR WebGL 2 game (Unity:
++        * RGBA16F with 4x MSAA, resolved by blitFramebuffer every frame) took
++        * the CPU resolve, ~330 ms per 1396x734 frame on the WebGL thread.
++        * 4x RGBA16F targets are sampled like RGBA8 ones (the tile follows the
++        * texel size), and the blitter's resolve shader averages in float. */
++       (resolve && info->src.format != PIPE_FORMAT_R8G8B8A8_UNORM &&
++        info->src.format != PIPE_FORMAT_R16G16B16A16_FLOAT))
+       return false;
+    for (unsigned i = 0; i < 2; ++i) {
+       const struct ps5_resource *r = resources[i];
+diff --git a/tests/ps5/test_gpu_blit.py b/tests/ps5/test_gpu_blit.py
+index 834ebb8..186c253 100644
+--- a/tests/ps5/test_gpu_blit.py
++++ b/tests/ps5/test_gpu_blit.py
+@@ -300,6 +300,19 @@ int main(void) {
+     resolved.filter=PIPE_TEX_FILTER_LINEAR;
+     assert(!cpu_resolve_accepts(&resolved));
+     assert(!ps5_blit_gpu_color(&c,&resolved));
++    /* ps5webkit: 4x RGBA16F resolves (HDR WebGL 2) take the GPU path too;
++     * other formats still don't. */
++    { struct ps5_resource hdr=msaa, hdr_dst=d;
++      hdr.base.format=hdr_dst.base.format=PIPE_FORMAT_R16G16B16A16_FLOAT;
++      hdr.allocation_size*=2; hdr_dst.allocation_size*=2;
++      hdr_dst.data=(uint8_t *)(uintptr_t)0x10000000;
++      struct pipe_blit_info half={.src={&hdr.base,PIPE_FORMAT_R16G16B16A16_FLOAT,0,{0,0,0,512,512,1}},
++          .dst={&hdr_dst.base,PIPE_FORMAT_R16G16B16A16_FLOAT,0,{0,0,0,512,512,1}},.mask=15};
++      assert(ps5_blit_gpu_color(&c,&half));
++      hdr.allocation_size--; assert(!ps5_blit_gpu_color(&c,&half)); hdr.allocation_size++;
++      hdr.base.format=hdr_dst.base.format=PIPE_FORMAT_R8_UNORM;
++      half.src.format=half.dst.format=PIPE_FORMAT_R8_UNORM;
++      assert(!ps5_blit_gpu_color(&c,&half)); }
+     resolved=b; resolved.dst.resource=&msaa.base; assert(!ps5_blit_gpu_color(&c,&resolved));
+     linear=true; assert(!ps5_blit_gpu_color(&c,&b)); linear=false;
+ #define BAD_CONTEXT(field) do { c.field=1; assert(!ps5_blit_gpu_color(&c,&b)); c.field=0; } while (0)
