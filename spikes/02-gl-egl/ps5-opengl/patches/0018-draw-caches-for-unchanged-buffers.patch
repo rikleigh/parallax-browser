@@ -1,0 +1,593 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index 70651d4..89594a7 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -14,6 +14,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #if defined(PS5_NATIVE_TITLE_RUNTIME) && defined(__SSE2__)
+ #include <emmintrin.h>
+ #endif
+@@ -581,6 +583,15 @@ struct ps5_resource {
+    size_t texture_published_bytes, stencil_published_bytes;
+    bool external_cpu_access;
+    bool gpu_written; /* CPU-cached lines may predate a compute write */
++   /* Draw caches (ps5_draw_cache_*): CPU writes seen through the access hooks,
++    * and whether the GPU may write this buffer (then it is never cached). */
++   uint64_t draw_cache_writes;
++   bool draw_cache_off;
++   struct ps5_flushed_range {
++      uint64_t writes, generation; /* writes + 1 when valid */
++      size_t begin, end;
++   } vertex_flushed, index_flushed;
++   struct ps5_index_range_entry *index_ranges;
+    struct pipe_resource *render_pool_owner;
+    struct pipe_resource *stencil_sample;
+    uint8_t *data;
+@@ -602,6 +613,144 @@ struct ps5_resource {
+    unsigned render_arena_slot_count;
+ };
+ 
++/* Patch 0018: draw caches for unchanged vertex and index buffers.
++ *
++ * Engines upload their meshes once and draw them every frame, but each indexed
++ * draw used to scan its indices on the CPU (the vertex range it reads, and
++ * whether it holds the restart index) and flush the CPU cache lines of its
++ * vertex and index data. CPU writes to a buffer are published where they are
++ * made (buffer_subdata, transfer flush/unmap), so data no CPU write has touched
++ * since the last flush needs no new one, and a scan of unchanged indices gives
++ * the same answer. Every CPU access hook bumps the buffer's write count
++ * (ps5_draw_cache_note_write); a buffer the GPU may write (stream output,
++ * shader storage, images, compute) or the CPU writes without a callback
++ * (persistent mappings, exports) is never cached. /data/ps5webkit/no-gl-draw-cache
++ * turns the caches off. */
++#define PS5_INDEX_RANGE_ENTRIES 32u
++struct ps5_index_range_entry {
++   uint64_t writes, generation; /* writes + 1 when valid */
++   uint32_t start, count;
++   uint8_t size;
++   bool bounds_valid, bounds_ok;
++   bool restart_valid, restart_contains;
++   int32_t bias;
++   uint32_t restart_index;
++   unsigned minimum, maximum, effective_minimum, effective_maximum;
++};
++
++static uint64_t ps5_draw_cache_generation = 1;
++static simple_mtx_t ps5_draw_cache_mutex = SIMPLE_MTX_INITIALIZER;
++
++static bool
++ps5_draw_cache_on(void)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      /* open(), not access(): in a title, access() reports existing files
++       * as missing. */
++      int fd = open("/data/ps5webkit/no-gl-draw-cache", O_RDONLY);
++      if (fd >= 0)
++         close(fd);
++      enabled = fd < 0;
++   }
++   return enabled;
++}
++
++/* A CPU access to the buffer (NULL: to an unknown one). */
++static inline void
++ps5_draw_cache_note_write(struct ps5_resource *resource)
++{
++   if (resource)
++      __atomic_fetch_add(&resource->draw_cache_writes, 1, __ATOMIC_RELAXED);
++   else
++      __atomic_fetch_add(&ps5_draw_cache_generation, 1, __ATOMIC_RELAXED);
++}
++
++static inline void
++ps5_draw_cache_mark_gpu_writable(struct pipe_resource *base)
++{
++   if (base && base->target == PIPE_BUFFER)
++      ((struct ps5_resource *)base)->draw_cache_off = true;
++}
++
++static inline bool
++ps5_draw_cache_usable(const struct ps5_resource *resource)
++{
++   return resource && resource->base.target == PIPE_BUFFER &&
++          !resource->external_cpu_access && !resource->draw_cache_off &&
++          !resource->gpu_written && ps5_draw_cache_on();
++}
++
++/* The buffer's write count + 1 and the generation, read before the data is used. */
++static inline void
++ps5_draw_cache_stamp(const struct ps5_resource *resource, uint64_t *writes, uint64_t *generation)
++{
++   *writes = __atomic_load_n(&resource->draw_cache_writes, __ATOMIC_RELAXED) + 1;
++   *generation = __atomic_load_n(&ps5_draw_cache_generation, __ATOMIC_RELAXED);
++}
++
++/* Flushes [begin, end) of the buffer's data unless it was flushed since its last write. */
++static bool
++ps5_draw_cache_flushed(struct ps5_resource *resource, struct ps5_flushed_range *range,
++                       size_t begin, size_t end, uint64_t *writes, uint64_t *generation)
++{
++   if (!ps5_draw_cache_usable(resource) || end <= begin)
++      return false;
++   ps5_draw_cache_stamp(resource, writes, generation);
++   simple_mtx_lock(&ps5_draw_cache_mutex);
++   const bool flushed = range->writes == *writes && range->generation == *generation &&
++                        begin >= range->begin && end <= range->end;
++   simple_mtx_unlock(&ps5_draw_cache_mutex);
++   return flushed;
++}
++
++static void
++ps5_draw_cache_note_flush(struct ps5_resource *resource, struct ps5_flushed_range *range,
++                          size_t begin, size_t end, uint64_t writes, uint64_t generation)
++{
++   if (!writes || !ps5_draw_cache_usable(resource) || end <= begin)
++      return;
++   simple_mtx_lock(&ps5_draw_cache_mutex);
++   if (range->writes == writes && range->generation == generation &&
++       begin <= range->end && end >= range->begin) {
++      range->begin = MIN2(range->begin, begin);
++      range->end = MAX2(range->end, end);
++   } else {
++      range->writes = writes;
++      range->generation = generation;
++      range->begin = begin;
++      range->end = end;
++   }
++   simple_mtx_unlock(&ps5_draw_cache_mutex);
++}
++
++/* The cache entry for indices [start, start + count) of size `size`, already
++ * matching the buffer's current contents or reset for them; NULL when the
++ * buffer is not cached. Call with ps5_draw_cache_mutex held. */
++static struct ps5_index_range_entry *
++ps5_draw_cache_index_entry(struct ps5_resource *resource, uint32_t start, uint32_t count,
++                           uint8_t size, uint64_t writes, uint64_t generation)
++{
++   if (!resource->index_ranges) {
++      resource->index_ranges = calloc(PS5_INDEX_RANGE_ENTRIES, sizeof(*resource->index_ranges));
++      if (!resource->index_ranges)
++         return NULL;
++   }
++   uint32_t hash = start * 2654435761u ^ count * 40503u ^ size;
++   struct ps5_index_range_entry *entry =
++      &resource->index_ranges[(hash >> 7) % PS5_INDEX_RANGE_ENTRIES];
++   if (entry->writes != writes || entry->generation != generation ||
++       entry->start != start || entry->count != count || entry->size != size) {
++      memset(entry, 0, sizeof(*entry));
++      entry->writes = writes;
++      entry->generation = generation;
++      entry->start = start;
++      entry->count = count;
++      entry->size = size;
++   }
++   return entry;
++}
++
+ struct ps5_transfer {
+    struct pipe_transfer base;
+    void *staging;
+@@ -5390,6 +5539,7 @@ ps5_resource_create(struct pipe_screen *screen,
+ static void
+ ps5_invalidate_gpu_writes(struct ps5_resource *resource)
+ {
++   ps5_draw_cache_note_write(resource);
+    if (!resource || !resource->gpu_written)
+       return;
+    resource->gpu_written = false;
+@@ -5972,6 +6122,8 @@ ps5_resource_destroy(struct pipe_screen *screen, struct pipe_resource *base)
+       resource->base.format == PIPE_FORMAT_Z32_FLOAT;
+ #endif
+ 
++   free(resource->index_ranges);
++   resource->index_ranges = NULL;
+    simple_mtx_lock(&ps5->resource_mutex);
+    if (render_pool_owner) {
+       ps5_render_arena_mark(ps5, resource->render_arena_first_slot,
+@@ -7057,6 +7209,8 @@ ps5_transfer_map(struct pipe_context *context, struct pipe_resource *base,
+ 
+    if (usage & PIPE_MAP_PERSISTENT)
+       resource->external_cpu_access = true;
++   if (usage & PIPE_MAP_WRITE)
++      ps5_draw_cache_note_write(resource);
+ 
+    transfer = calloc(1, sizeof(*transfer));
+    if (!transfer)
+@@ -7261,7 +7415,8 @@ ps5_transfer_flush_region(struct pipe_context *context,
+        !(transfer->usage & PIPE_MAP_UNSYNCHRONIZED))
+       ps5_draw_batch_drain_buffer(transfer ? transfer->resource : NULL);
+    (void)context;
+-   (void)transfer;
++   if (transfer && (transfer->usage & PIPE_MAP_WRITE))
++      ps5_draw_cache_note_write((struct ps5_resource *)transfer->resource);
+    ps5_publish_transfer_write(transfer, box);
+ }
+ 
+@@ -7282,6 +7437,8 @@ ps5_transfer_unmap(struct pipe_context *context,
+    if (resource->base.target != PIPE_BUFFER || (transfer->usage & PIPE_MAP_READ) ||
+        !(transfer->usage & PIPE_MAP_UNSYNCHRONIZED))
+       ps5_draw_batch_drain_buffer(transfer->resource);
++   if (transfer->usage & PIPE_MAP_WRITE)
++      ps5_draw_cache_note_write(resource);
+    if (ps5->staging && (transfer->usage & PIPE_MAP_WRITE) &&
+        (transfer->resource->bind & PIPE_BIND_DEPTH_STENCIL) &&
+        !resource->depth_staging_size &&
+@@ -9395,6 +9552,10 @@ ps5_index_value(const void *indices, unsigned index_size, unsigned index)
+  * as before) when the indices are not in a CPU-visible buffer or a range is
+  * out of bounds. */
+ static bool
++ps5_scan_for_restart_index(const struct ps5_resource *resource, unsigned size, uint32_t restart,
++                           const struct pipe_draw_start_count_bias *draws, unsigned num_draws);
++
++static bool
+ ps5_draws_contain_restart_index(const struct pipe_draw_info *info,
+                                 const struct pipe_draw_start_count_bias *draws,
+                                 unsigned num_draws)
+@@ -9410,6 +9571,41 @@ ps5_draws_contain_restart_index(const struct pipe_draw_info *info,
+       return true;
+    if ((size == 1 && restart > UINT8_MAX) || (size == 2 && restart > UINT16_MAX))
+       return false; /* no index of this size can equal it */
++   /* One draw of an unchanged buffer: the answer of the last scan (patch 0018). */
++   struct ps5_resource *cache_resource = (struct ps5_resource *)info->index.resource;
++   uint64_t writes = 0, generation = 0;
++   const bool cached = num_draws == 1 && ps5_draw_cache_usable(cache_resource);
++   if (cached) {
++      ps5_draw_cache_stamp(cache_resource, &writes, &generation);
++      simple_mtx_lock(&ps5_draw_cache_mutex);
++      struct ps5_index_range_entry *entry = ps5_draw_cache_index_entry(
++         cache_resource, draws[0].start, draws[0].count, (uint8_t)size, writes, generation);
++      if (entry && entry->restart_valid && entry->restart_index == restart) {
++         const bool contains = entry->restart_contains;
++         simple_mtx_unlock(&ps5_draw_cache_mutex);
++         return contains;
++      }
++      simple_mtx_unlock(&ps5_draw_cache_mutex);
++   }
++   const bool contains = ps5_scan_for_restart_index(resource, size, restart, draws, num_draws);
++   if (cached) {
++      simple_mtx_lock(&ps5_draw_cache_mutex);
++      struct ps5_index_range_entry *entry = ps5_draw_cache_index_entry(
++         cache_resource, draws[0].start, draws[0].count, (uint8_t)size, writes, generation);
++      if (entry) {
++         entry->restart_valid = true;
++         entry->restart_index = restart;
++         entry->restart_contains = contains;
++      }
++      simple_mtx_unlock(&ps5_draw_cache_mutex);
++   }
++   return contains;
++}
++
++static bool
++ps5_scan_for_restart_index(const struct ps5_resource *resource, unsigned size, uint32_t restart,
++                           const struct pipe_draw_start_count_bias *draws, unsigned num_draws)
++{
+    for (unsigned d = 0; d < num_draws; ++d) {
+       const uint64_t offset = (uint64_t)draws[d].start * size;
+       const uint64_t bytes = (uint64_t)draws[d].count * size;
+@@ -9470,6 +9666,51 @@ ps5_index_bounds(const void *indices, unsigned index_size, unsigned count, int b
+    return *effective_maximum != UINT32_MAX;
+ }
+ 
++/* ps5_index_bounds, remembered per index buffer range until a write (patch 0018). */
++static bool
++ps5_index_bounds_cached(struct ps5_resource *resource, uint32_t start, const void *indices,
++                        unsigned index_size, unsigned count, int bias,
++                        unsigned *minimum, unsigned *maximum,
++                        unsigned *effective_minimum, unsigned *effective_maximum)
++{
++   uint64_t writes, generation;
++   const bool cached = ps5_draw_cache_usable(resource);
++   if (cached) {
++      ps5_draw_cache_stamp(resource, &writes, &generation);
++      simple_mtx_lock(&ps5_draw_cache_mutex);
++      struct ps5_index_range_entry *entry = ps5_draw_cache_index_entry(
++         resource, start, count, (uint8_t)index_size, writes, generation);
++      if (entry && entry->bounds_valid && entry->bias == bias) {
++         *minimum = entry->minimum;
++         *maximum = entry->maximum;
++         *effective_minimum = entry->effective_minimum;
++         *effective_maximum = entry->effective_maximum;
++         const bool ok = entry->bounds_ok;
++         simple_mtx_unlock(&ps5_draw_cache_mutex);
++         return ok;
++      }
++      simple_mtx_unlock(&ps5_draw_cache_mutex);
++   }
++   const bool ok = ps5_index_bounds(indices, index_size, count, bias, minimum, maximum,
++                                    effective_minimum, effective_maximum);
++   if (cached) {
++      simple_mtx_lock(&ps5_draw_cache_mutex);
++      struct ps5_index_range_entry *entry = ps5_draw_cache_index_entry(
++         resource, start, count, (uint8_t)index_size, writes, generation);
++      if (entry) {
++         entry->bounds_valid = true;
++         entry->bounds_ok = ok;
++         entry->bias = bias;
++         entry->minimum = *minimum;
++         entry->maximum = *maximum;
++         entry->effective_minimum = *effective_minimum;
++         entry->effective_maximum = *effective_maximum;
++      }
++      simple_mtx_unlock(&ps5_draw_cache_mutex);
++   }
++   return ok;
++}
++
+ static void
+ ps5_log_indices(const void *indices, unsigned index_size, unsigned count,
+                 unsigned limit)
+@@ -10195,9 +10436,10 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+          ps5_log_indices(indices, info->index_size, draws[0].count, 16);
+       }
+ #endif
+-      if (!ps5_index_bounds(indices, info->index_size, draws[0].count,
+-                            draws[0].index_bias, &min_index, &max_index,
+-                            &min_effective, &max_effective)) {
++      if (!ps5_index_bounds_cached(index_resource, draws[0].start, indices,
++                                   info->index_size, draws[0].count,
++                                   draws[0].index_bias, &min_index, &max_index,
++                                   &min_effective, &max_effective)) {
+          context->last_draw_status = -12;
+          return;
+       }
+@@ -10606,11 +10848,21 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+             context->last_draw_status = -9;
+             return;
+          }
+-         ps5_flush_batch_backing(
+-            vertex_resource->external_cpu_access ? NULL : flush_cache,
+-            2 + PS5_MAX_TEXTURE_UNITS + binding,
+-            (const void *)(vertex_address + binding_begin[binding]),
+-            binding_bytes[binding] - binding_begin[binding]);
++         {
++            const size_t begin = vertex_buffer->buffer_offset + binding_begin[binding];
++            const size_t end = vertex_buffer->buffer_offset + binding_bytes[binding];
++            uint64_t writes = 0, generation = 0;
++            if (!ps5_draw_cache_flushed(vertex_resource, &vertex_resource->vertex_flushed,
++                                        begin, end, &writes, &generation)) {
++               ps5_flush_batch_backing(
++                  vertex_resource->external_cpu_access ? NULL : flush_cache,
++                  2 + PS5_MAX_TEXTURE_UNITS + binding,
++                  (const void *)(vertex_address + binding_begin[binding]),
++                  binding_bytes[binding] - binding_begin[binding]);
++               ps5_draw_cache_note_flush(vertex_resource, &vertex_resource->vertex_flushed,
++                                         begin, end, writes, generation);
++            }
++         }
+          descriptor_index++;
+       }
+       input_user_data[input_metadata->vertex_buffer_table_user_data_dword] =
+@@ -11172,11 +11424,21 @@ ps5_draw_vbo_locked(struct pipe_context *base,
+    if (info->index_size) {
+       int rc;
+ 
+-      ps5_flush_batch_backing(
+-         index_resource->external_cpu_access ? NULL : flush_cache,
+-         2 + PS5_MAX_TEXTURE_UNITS + PIPE_MAX_ATTRIBS,
+-         index_resource->data + index_offset,
+-         (size_t)draws[0].count * info->index_size);
++      {
++         const size_t begin = index_offset;
++         const size_t end = index_offset + (size_t)draws[0].count * info->index_size;
++         uint64_t writes = 0, generation = 0;
++         if (!ps5_draw_cache_flushed(index_resource, &index_resource->index_flushed,
++                                     begin, end, &writes, &generation)) {
++            ps5_flush_batch_backing(
++               index_resource->external_cpu_access ? NULL : flush_cache,
++               2 + PS5_MAX_TEXTURE_UNITS + PIPE_MAX_ATTRIBS,
++               index_resource->data + index_offset,
++               (size_t)draws[0].count * info->index_size);
++            ps5_draw_cache_note_flush(index_resource, &index_resource->index_flushed,
++                                      begin, end, writes, generation);
++         }
++      }
+       if (ps5_agc_gate2_set_index_buffer_typed)
+          rc = ps5_agc_gate2_set_index_buffer_typed(
+             (uint8_t *)index_resource->data + index_offset,
+@@ -12208,6 +12470,7 @@ ps5_draw_batch_drain_buffer(struct pipe_resource *base)
+ #endif
+ 
+    struct ps5_resource *buffer = (struct ps5_resource *)base;
++   ps5_draw_cache_note_write(buffer);
+    simple_mtx_lock(&ps5_deferred_mutex);
+    if (buffer) {
+       buffer->texture_publication_epoch = 0;
+@@ -16122,6 +16385,8 @@ ps5_set_shader_buffers(struct pipe_context *base, mesa_shader_stage stage,
+    for (unsigned i = 0; i < count; ++i) {
+       struct pipe_shader_buffer *bound = &bound_buffers[start + i];
+       const struct pipe_shader_buffer *b = buffers ? &buffers[i] : NULL;
++      if (b)
++         ps5_draw_cache_mark_gpu_writable(b->buffer);
+       pipe_resource_reference(&bound->buffer, b ? b->buffer : NULL);
+       bound->buffer_offset = b && b->buffer ? b->buffer_offset : 0;
+       bound->buffer_size = b && b->buffer ? b->buffer_size : 0;
+@@ -16206,6 +16471,7 @@ ps5_set_shader_images(struct pipe_context *base, mesa_shader_stage stage,
+          return;
+       if (ps5_image_view_incomplete(v))
+          continue;
++      ps5_draw_cache_mark_gpu_writable(v->resource);
+       if (v->resource->target == PIPE_BUFFER) {
+          if (!ps5_image_buffer_descriptor(v,
+                (uintptr_t)((struct ps5_resource *)v->resource)->data >> 32,
+@@ -16394,8 +16660,10 @@ ps5_queue_compute(struct ps5_context *context, struct pipe_resource *const *buff
+    table = NULL;
+    for (unsigned i = 0; i < buffer_count; ++i)
+       pipe_resource_reference(&pinned->retained[pinned->retained_count++], buffers[i]);
+-   for (unsigned i = 0; i < written_count; ++i)
++   for (unsigned i = 0; i < written_count; ++i) {
+       ((struct ps5_resource *)written[i])->gpu_written = true;
++      ps5_draw_cache_mark_gpu_writable(written[i]);
++   }
+    queued = true;
+    if (ps5_deferred.count == PS5_MULTIDRAW_BATCH_CAPACITY)
+       ps5_draw_batch_flush_locked();
+@@ -16650,6 +16918,7 @@ ps5_launch_grid(struct pipe_context *base, const struct pipe_grid_info *grid)
+ #endif
+    for (unsigned i = 0; i < written_count; ++i) {
+       struct ps5_resource *resource = (struct ps5_resource *)written[i];
++      ps5_draw_cache_mark_gpu_writable(written[i]);
+       if (resource->external_cpu_access)
+          ps5_flush_gpu_data(resource->data, resource->allocation_size);
+       else
+@@ -17633,6 +17902,8 @@ ps5_set_stream_output_targets(struct pipe_context *base,
+    }
+ 
+    for (index = 0; index < count; ++index) {
++      if (targets[index])
++         ps5_draw_cache_mark_gpu_writable(targets[index]->buffer);
+       pipe_so_target_reference(&context->stream_output_targets[index],
+                                targets[index]);
+       if (targets[index] && !(append_mask & BITFIELD_BIT(index))) {
+@@ -17670,6 +17941,7 @@ ps5_buffer_subdata(struct pipe_context *base, struct pipe_resource *resource,
+    else
+       ps5_invalidate_gpu_writes(buffer);
+    memcpy(buffer->data + offset, data, size);
++   ps5_draw_cache_note_write(buffer);
+    /* UNSYNCHRONIZED writes may fill previously unused holes inside an already
+     * published bounding range. Publish at the write, even without a drain. */
+    ps5_flush_gpu_data(buffer->data + offset, size);
+diff --git a/tests/ps5/test_draw_cache.py b/tests/ps5/test_draw_cache.py
+new file mode 100644
+index 0000000..98dc198
+--- /dev/null
++++ b/tests/ps5/test_draw_cache.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""Patch 0018's draw caches: the helpers from ps5_screen.c, compiled on the host.
++
++A buffer's cached flush range and index-range entries hold only until its next
++CPU write (or any access to an unknown buffer); buffers the GPU may write or
++the CPU writes without a callback are never cached.
++"""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++s = (root / 'src/gallium/ps5/ps5_screen.c').read_text()
++a = s.index('#define PS5_INDEX_RANGE_ENTRIES')
++b = s.index('\n}\n', s.index('ps5_draw_cache_index_entry(struct ps5_resource *resource')) + 3
++helpers = s[a:b]
++# Every write path bumps the count; the GPU-write bindings mark the buffer.
++for needle in ('ps5_draw_cache_note_write(resource);\n   if (!resource || !resource->gpu_written)',
++               'ps5_draw_cache_note_write(buffer);\n   simple_mtx_lock(&ps5_deferred_mutex);',
++               'memcpy(buffer->data + offset, data, size);\n   ps5_draw_cache_note_write(buffer);',
++               'ps5_draw_cache_mark_gpu_writable(targets[index]->buffer);',
++               'ps5_draw_cache_mark_gpu_writable(b->buffer);',
++               'ps5_draw_cache_mark_gpu_writable(v->resource);',
++               'free(resource->index_ranges);'):
++    assert needle in s, needle
++assert s.count('ps5_draw_cache_mark_gpu_writable(written[i]);') == 2
++assert s.count('if (transfer->usage & PIPE_MAP_WRITE)\n      ps5_draw_cache_note_write(resource);') == 1
++assert s.count('ps5_draw_cache_note_write((struct ps5_resource *)transfer->resource);') == 1
++
++code = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#define MAX2(a,b) ((a) > (b) ? (a) : (b))
++#define MIN2(a,b) ((a) < (b) ? (a) : (b))
++enum { PIPE_BUFFER = 1, PIPE_TEXTURE_2D = 2 };
++typedef int simple_mtx_t;
++#define SIMPLE_MTX_INITIALIZER 0
++static int locked;
++static void simple_mtx_lock(simple_mtx_t *m) { (void)m; assert(!locked); locked = 1; }
++static void simple_mtx_unlock(simple_mtx_t *m) { (void)m; assert(locked); locked = 0; }
++struct pipe_resource { unsigned target; };
++struct ps5_index_range_entry;
++struct ps5_resource {
++   struct pipe_resource base;
++   bool external_cpu_access, gpu_written;
++   uint64_t draw_cache_writes;
++   bool draw_cache_off;
++   struct ps5_flushed_range { uint64_t writes, generation; size_t begin, end; } vertex_flushed, index_flushed;
++   struct ps5_index_range_entry *index_ranges;
++};
++''' + helpers + r'''
++static bool flushed(struct ps5_resource *r, size_t begin, size_t end) {
++   uint64_t w = 0, g = 0;
++   if (ps5_draw_cache_flushed(r, &r->vertex_flushed, begin, end, &w, &g))
++      return true;
++   ps5_draw_cache_note_flush(r, &r->vertex_flushed, begin, end, w, g);
++   return false;
++}
++int main(void) {
++   struct ps5_resource r = {{PIPE_BUFFER}};
++   assert(!flushed(&r, 0, 64));            /* first draw flushes */
++   assert(flushed(&r, 0, 64));             /* unchanged: skipped */
++   assert(flushed(&r, 16, 32));            /* inside the flushed range */
++   assert(!flushed(&r, 32, 128));          /* extends it */
++   assert(flushed(&r, 0, 128));            /* merged */
++   assert(!flushed(&r, 512, 600));         /* disjoint: replaced */
++   assert(flushed(&r, 512, 600) && !flushed(&r, 0, 64));
++   ps5_draw_cache_note_write(&r);          /* a CPU write */
++   assert(!flushed(&r, 0, 64));
++   assert(flushed(&r, 0, 64));
++   ps5_draw_cache_note_write(NULL);        /* an access to an unknown buffer */
++   assert(!flushed(&r, 0, 64));
++   assert(!flushed(&r, 8, 8));             /* empty ranges are never cached */
++   assert(!flushed(&r, 8, 8));
++
++   struct ps5_resource persistent = {{PIPE_BUFFER}, true};
++   assert(!flushed(&persistent, 0, 64) && !flushed(&persistent, 0, 64));
++   struct ps5_resource written = {{PIPE_BUFFER}};
++   ps5_draw_cache_mark_gpu_writable(&written.base);
++   assert(!flushed(&written, 0, 64) && !flushed(&written, 0, 64));
++   struct ps5_resource texture = {{PIPE_TEXTURE_2D}};
++   ps5_draw_cache_mark_gpu_writable(&texture.base);
++   assert(!texture.draw_cache_off);
++   assert(!ps5_draw_cache_usable(&texture));
++
++   /* Index-range entries: kept for the same range and contents, reset otherwise. */
++   uint64_t w, g;
++   ps5_draw_cache_stamp(&r, &w, &g);
++   simple_mtx_lock(&ps5_draw_cache_mutex);
++   struct ps5_index_range_entry *e = ps5_draw_cache_index_entry(&r, 10, 300, 2, w, g);
++   assert(e && !e->bounds_valid && !e->restart_valid);
++   e->bounds_valid = true; e->minimum = 3; e->maximum = 99;
++   e = ps5_draw_cache_index_entry(&r, 10, 300, 2, w, g);
++   assert(e->bounds_valid && e->minimum == 3 && e->maximum == 99);
++   assert(!ps5_draw_cache_index_entry(&r, 10, 300, 4, w, g)->bounds_valid); /* other size */
++   simple_mtx_unlock(&ps5_draw_cache_mutex);
++   ps5_draw_cache_note_write(&r);
++   ps5_draw_cache_stamp(&r, &w, &g);
++   simple_mtx_lock(&ps5_draw_cache_mutex);
++   assert(!ps5_draw_cache_index_entry(&r, 10, 300, 2, w, g)->bounds_valid);
++   simple_mtx_unlock(&ps5_draw_cache_mutex);
++   free(r.index_ranges);
++   return 0;
++}
++'''
++with tempfile.TemporaryDirectory() as d:
++    p = Path(d)
++    (p / 'test.c').write_text(code)
++    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-missing-field-initializers',
++                    '-fsanitize=address,undefined', str(p / 'test.c'), '-o', str(p / 'test')], check=True)
++    subprocess.run([str(p / 'test')], check=True)
++print('draw caches: PASS')
+diff --git a/tests/ps5/test_draw_flush_ranges.py b/tests/ps5/test_draw_flush_ranges.py
+index e376c3f..8f7ce8d 100644
+--- a/tests/ps5/test_draw_flush_ranges.py
++++ b/tests/ps5/test_draw_flush_ranges.py
+@@ -18,8 +18,8 @@ calc=s[a:b]
+ runtime=(Path(__file__).resolve().parents[2]/'src/platform/ps5_agc_native_runtime.c').read_text()
+ a=runtime.index('static void (flush_gpu_data)(const void *address, size_t bytes)\n{')
+ native=runtime[a:runtime.index('\n}',a)+2]
+-assert '(const void *)(vertex_address + binding_begin[binding]),\n            binding_bytes[binding] - binding_begin[binding]);' in s
+-assert 'index_resource->data + index_offset,\n         (size_t)draws[0].count * info->index_size);' in s
++assert '(const void *)(vertex_address + binding_begin[binding]),\n                  binding_bytes[binding] - binding_begin[binding]);' in s
++assert 'index_resource->data + index_offset,\n               (size_t)draws[0].count * info->index_size);' in s
+ code=r'''
+ #include <assert.h>
+ #include <stdint.h>

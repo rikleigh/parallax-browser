@@ -663,3 +663,41 @@ Host test: `test_gpu_blit.py` (swizzled blit accepted with the view swizzle
 set, NONE selectors and resolves refused). Built into
 `toolchain/ps5-opengl-gles-noprof-m4`; not yet timed on the console with the
 player that showed it.
+
+## Patch 0018: draws skip the flush and index scan of unchanged buffers (2026-11-09)
+
+Every indexed draw scanned its indices for the min/max (`ps5_index_bounds`)
+and, when restart was on, for the restart index; and flushed the CPU cache
+lines of its vertex range and index range (`ps5_flush_batch_backing`), even
+when the buffers had not changed since the last draw. A game that draws the
+same static level geometry each frame paid that again on every draw: in a
+profile of one, 26% of the WebGL thread was `util_clflushopt_range` (97% of it
+the per-draw vertex/index flush) and 12% `ps5_index_bounds`.
+
+Each buffer now counts its CPU writes (`buffer_subdata`, write maps, flushes
+of mapped ranges, unmaps, the deferred drain and the GPU-write invalidation;
+an access to an unknown buffer bumps a global generation). A draw skips the
+vertex or index flush when the same range (merged with earlier ones) was
+flushed at the same count, and takes the index bounds and the restart result
+from a 32-entry per-buffer cache keyed by start, count and index size.
+Buffers the GPU may write (stream output, shader buffers and images, compute
+outputs) and persistently mapped ones (no callback on CPU writes) are never
+cached. `/data/ps5webkit/no-gl-draw-cache` turns the caches off. The file is
+checked with open(), since in a title access() reports existing files as missing.
+Before that fix the switch never took effect, so the first A/B runs (busy.html,
+the first bigmesh runs) compared on with on.
+Host test: `test_draw_cache.py` (with ASan/UBSan).
+
+`port/webkit/test/webgl/bigmesh.html?m=240`: 240 static meshes of 32,768
+triangles, each drawn once per frame with one `drawElements`:
+
+| | page fps | WebGL thread per frame |
+| --- | --- | --- |
+| caches off | 25.4 | 39.4 ms (index scan 54%, flushes 13%) |
+| caches on | 59.9 (vsync) | 2.55 ms |
+
+At m=60 both hold 60 fps. Built into `toolchain/ps5-opengl-gles-noprof-m6`.
+
+A WebGL racing game (Unity) on the same build: 13.4 ms of the WebGL thread per
+frame with the caches off, 7.9 ms with them on, both ~58-59 fps, and the
+same picture on the TV either way.
