@@ -2140,7 +2140,16 @@ the headset to be released.
   names an angle but no stereo layout), the video's own pictures decide (see
   *Projection guess* below); a Triangle choice is remembered per site. With
   no `<video>` reachable (a cross-origin player frame) it still enters VR on
-  the title's newest video stream, without player controls.
+  the title's newest video stream, without player controls. A video the
+  page plays without putting it in the document counts too: WebGL players
+  (360 and VR video drawn into a canvas) do that, so with WebGL on such
+  sites lost their controls (2026-11-09; they had fallen back to a plain
+  `<video>` without WebGL). A user script in the page's world at document
+  start (`kTrackerScript`, every frame) remembers each video `play()` is
+  called on (weakly, the last 16); the probe logs `detached=<n>` and
+  `inpage=0|1`. Test: `test/media/detached-video.html` (our clip through
+  WebGL from a detached `<video>`): checked in the headset 2026-11-09,
+  controls and seeking work.
 - The display (`wpe_display_ps5_vr_*`, `wpe_display_ps5_set_button_handler`)
   hands the request to the render thread and captures the pad.
 - The render thread (`PS5RendererVR.cpp`): `psvr2_open` (Hmd2, VrTracker2,

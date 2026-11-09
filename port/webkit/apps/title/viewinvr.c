@@ -117,8 +117,33 @@ static char vrDrawn[512];    /* what the panel and card show: redrawn when it ch
 
 /* ---------------------------------------------------------------- the page's video */
 
+/* The videos the page played, attached to the document or not: a WebGL
+ * player (360 and VR video, drawn into a canvas) often plays a <video> it
+ * never puts in the page, which querySelectorAll can't see; it was found
+ * only while WebGL was off and such players fell back to a plain <video>.
+ * A user script in the page's world, at document start in every frame,
+ * remembers each video play() is called on (weakly, the last 16) in
+ * window.__ps5wkMedia (not enumerable). */
+static const char kTrackerScript[] =
+    "(function () {\n"
+    "  if (window.__ps5wkMedia || typeof HTMLMediaElement === 'undefined' || typeof WeakRef === 'undefined') return;\n"
+    "  const seen = [];\n"
+    "  Object.defineProperty(window, '__ps5wkMedia', { value: seen });\n"
+    "  const proto = HTMLMediaElement.prototype, play = proto.play;\n"
+    "  proto.play = function () {\n"
+    "    try {\n"
+    "      if (this instanceof HTMLVideoElement && !seen.some(r => r.deref() === this)) {\n"
+    "        seen.push(new WeakRef(this));\n"
+    "        if (seen.length > 16) seen.shift();\n"
+    "      }\n"
+    "    } catch (e) {}\n"
+    "    return play.apply(this, arguments);\n"
+    "  };\n"
+    "})();";
+
 /* Finds the playing video (or the largest one) in the page and same-origin
- * frames, remembers it for the commands below and describes it, one
+ * frames, also the ones played outside the document (kTrackerScript),
+ * remembers it for the commands below and describes it, one
  * key=value per line. Runs in the page's world: YouTube's player object
  * (#movie_player) is a page script's. */
 static const char kProbeScript[] =
@@ -126,13 +151,16 @@ static const char kProbeScript[] =
     "  function collect(doc, out, depth) {\n"
     "    try {\n"
     "      for (const v of doc.querySelectorAll('video')) out.push(v);\n"
+    "      const w = doc.defaultView, seen = w && w.__ps5wkMedia;\n"
+    "      if (seen) for (const r of seen) { const v = r.deref(); if (v && !v.isConnected && !out.includes(v)) { out.push(v); out.detached++; } }\n"
     "      if (depth < 3) for (const f of doc.querySelectorAll('iframe')) {\n"
     "        try { if (f.contentDocument) collect(f.contentDocument, out, depth + 1); } catch (e) {}\n"
     "      }\n"
     "    } catch (e) {}\n"
     "    return out;\n"
     "  }\n"
-    "  const all = collect(document, [], 0);\n"
+    "  const found = []; found.detached = 0;\n"
+    "  const all = collect(document, found, 0);\n"
     "  let best = null, bestScore = -1;\n"
     "  for (const v of all) {\n"
     "    const r = v.getBoundingClientRect();\n"
@@ -141,9 +169,9 @@ static const char kProbeScript[] =
     "  }\n"
     "  window.__ps5wkVRVideo = best;\n"
     "  const clean = s => String(s == null ? '' : s).replace(/[\\r\\n]+/g, ' ').slice(0, 600);\n"
-    "  const out = ['videos=' + all.length, 'title=' + clean(document.title), 'url=' + clean(location.href)];\n"
+    "  const out = ['videos=' + all.length, 'detached=' + all.detached, 'title=' + clean(document.title), 'url=' + clean(location.href)];\n"
     "  if (best) {\n"
-    "    out.push('found=1', 'paused=' + (best.paused ? 1 : 0), 'size=' + best.videoWidth + 'x' + best.videoHeight,\n"
+    "    out.push('found=1', 'inpage=' + (best.isConnected ? 1 : 0), 'paused=' + (best.paused ? 1 : 0), 'size=' + best.videoWidth + 'x' + best.videoHeight,\n"
     "      'time=' + best.currentTime, 'duration=' + best.duration);\n"
     "    const srcs = [best.currentSrc, best.getAttribute('src'), best.getAttribute('data-src'), best.title];\n"
     "    for (const s of best.querySelectorAll('source')) srcs.push(s.src);\n"
@@ -177,10 +205,11 @@ static const char kProbeScript[] =
  * when there is one, so its UI follows. %s = command, %.3f = seconds. */
 static const char kCommandScript[] =
     "(function (cmd, arg) {\n"
+    "  const played = (window.__ps5wkMedia || []).map(r => r.deref()).filter(Boolean);\n"
     "  let v = window.__ps5wkVRVideo;\n"
-    "  if (!v || !v.isConnected) {\n"
+    "  if (!v || (!v.isConnected && !played.includes(v))) {\n"
     "    v = null;\n"
-    "    for (const c of document.querySelectorAll('video')) if (!v || (v.paused && !c.paused)) v = c;\n"
+    "    for (const c of [...document.querySelectorAll('video'), ...played]) if (!v || (v.paused && !c.paused)) v = c;\n"
     "    window.__ps5wkVRVideo = v;\n"
     "  }\n"
     "  if (!v) return 'found=0';\n"
@@ -1154,6 +1183,11 @@ void ps5wk_vr_init(WPEDisplay* display, WebKitWebView* webView)
 {
     vrDisplay = WPE_DISPLAY_PS5(display);
     vrWebView = webView;
+    /* Every tab's view shares this content manager. */
+    WebKitUserScript* tracker = webkit_user_script_new(kTrackerScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(webView), tracker);
+    webkit_user_script_unref(tracker);
     wpe_display_ps5_set_button_handler(vrDisplay, onButtons, NULL);
     wpe_display_ps5_set_captured_pad_callback(vrDisplay, onCapturedPad, NULL);
 }
