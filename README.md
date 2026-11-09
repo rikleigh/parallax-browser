@@ -6,20 +6,27 @@ play the video on a page in the **PS VR2** headset.
 <p align="center"><img src="port/webkit/runtime/parallax-logo.png" width="160" alt="Parallax Browser logo"></p>
 
 > **Status: experimental.** Tested on one console, firmware 13.60, with a
-> DualSense and a PS VR2. Expect rough edges. WebGL and WebXR aren't
-> supported yet.
+> DualSense and a PS VR2. Expect rough edges. WebXR isn't supported yet.
 
 ## Features
 
 - **WPE WebKit** with GPU compositing, async scrolling, and JavaScriptCore
-  with the JIT.
+  with the JIT. WebAssembly runs with the JIT too.
+- **WebGL** (1 and 2) on the PS5's GPU, including video drawn into WebGL.
 - **Hardware video decoding** through the console's decoder: H.264, HEVC
   and VP9, up to 8K, including HLS streams.
+- **Audio:** AAC, MP3, Opus, Vorbis (Ogg and WebM) and FLAC, and the Web
+  Audio API.
 - **View in VR:** press R3 (the right stick) on a page that's playing a video to watch
   it in the PS VR2: 180° or 360°, side-by-side or top/bottom 3D, or fisheye.
   The layout is detected from the page and the picture, and the video is
   centred where you look.
+- **Gamepad mode** for browser games: the page gets the controller through
+  the Gamepad API (with rumble), or keys and a mouse you map to the buttons
+  for each site. Hold Options to leave it.
 - **Tabs** (recent tabs stay loaded), **bookmarks**, **history** and a start page.
+- **Private browsing:** no history, and cookies and site data are dropped
+  when you leave it.
 - **A profile for each PS5 user:** cookies, history, bookmarks, tabs and
   downloads are kept apart, and Settings shows how much storage each uses.
 - **Downloads** with pause and resume, which survive a browser restart, and
@@ -31,6 +38,7 @@ play the video on a page in the **PS VR2** headset.
   scan the QR code in the menu, to send links to the PS5, change settings
   and fetch downloads.
 - The system on-screen keyboard for text fields.
+- The touchpad works as a mouse.
 
 ## Controls (DualSense)
 
@@ -122,8 +130,10 @@ the PS5 on macOS (Apple silicon). The steps, roughly:
    [Setup](#setup-for-the-spikes)).
 3. `spikes/04-jsc/build.sh` builds libc++ 19 and ICU, and
    `spikes/02-gl-egl/ps5-opengl/build.sh gles` builds ps5-opengl with
-   OpenGL ES, and `build.sh gles-noprof` then installs the build the browser
-   links (the same with its per-draw profiling compiled out). Then
+   OpenGL ES and the browser's patches. Then
+   `PS5_OPENGL_PREFIX=$PWD/toolchain/ps5-opengl-gles-noprof-m8 spikes/02-gl-egl/ps5-opengl/build.sh gles-noprof`
+   installs the build the browser links (the same with its per-draw
+   profiling compiled out; `package.sh` looks for it there). Then
    `port/deps/build.sh all` builds the libraries into
    `toolchain/wpe-sysroot` ([port/deps/README.md](port/deps/README.md)).
 4. `port/webkit/build.sh` applies the patches in `port/webkit/patches/` to

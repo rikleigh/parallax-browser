@@ -54,6 +54,7 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 | **Milestone 2** | | | `build.sh m2` (2m34s clean); gst smoke 10/10 PASS incl. the audio sink (`smoke/results/20261028-095119.log`) |
 | dav1d | 1.5.1 | smoke-tested | AV1 via avdec_libdav1d |
 | FFmpeg | 7.1.1 | smoke-tested | decoders only: aac, mp3, opus, vorbis, flac, h264, hevc, vp8, vp9, libdav1d; avfilter, swresample; LGPL |
+| libogg, libvorbis, libopus | 1.3.6, 1.3.7, 1.5.2 | built | for gst-plugins-base's ogg, vorbis and opus plugins and -bad's opusparse (Opus in WebM for MSE); merged into gstreamer-full; BSD-3-Clause |
 | GStreamer core | 1.28.8 | smoke-tested | static, `gstreamer-static-full` (gst_init registers static plugins), registry off |
 | gst-plugins-base | 1.28.8 | smoke-tested | app, playback (decodebin3/parsebin/playbin3), typefind, converters; **no GL** |
 | gst-plugins-good | 1.28.8 | smoke-tested | isomp4, matroska, audioparsers, adaptivedemux2 (hlsdemux2/dashdemux2), id3demux, autodetect (autoaudiosink), deinterlace + videofilter (WebKit's software video path plugs them; missing = MEDIA_ERR_SRC_NOT_SUPPORTED), audiofx (scaletempo) |
