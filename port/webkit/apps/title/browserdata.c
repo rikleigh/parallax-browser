@@ -15,6 +15,11 @@
  *                   "size","received","state","etag","lastModified","started",
  *                   "finished","error","sha256","restarted"}]}, newest first
  *                   (downloads.c keeps the list and decides when to write it)
+ *   sites.json      {"version":1,"sites":[{"host","gamepad","keys","left","right",
+ *                   "changed"}]}, most recently changed first: per-site
+ *                   settings (gamepad mode and its button mapping; README:
+ *                   "Gamepad mode"). In private mode changes go to a list in
+ *                   memory that goes with the private session.
  *   start-data.js   window.ps5wkData = {bookmarks:[...], top:[...]}: what the
  *                   start page (a file: page, the only kind that can load it)
  *                   shows; web pages can't read file: URLs
@@ -48,7 +53,9 @@
 static char* dataDir;
 static GPtrArray* bookmarks; /* PS5WKEntry*, newest first */
 static GPtrArray* history;   /* PS5WKEntry*, newest first */
-static gboolean bookmarksDirty, historyDirty;
+static GPtrArray* sites;        /* PS5WKSite*, most recently changed first */
+static GPtrArray* privateSites; /* the same while private, or NULL */
+static gboolean bookmarksDirty, historyDirty, sitesDirty;
 static guint saveTimer;
 
 /* ---------------------------------------------------------------- JSON */
@@ -401,6 +408,27 @@ static void saveNow(void)
         g_source_remove(saveTimer);
         saveTimer = 0;
     }
+    if (sitesDirty) {
+        GString* out = g_string_new("{\"version\":1,\"sites\":[");
+        for (unsigned i = 0; i < sites->len; i++) {
+            PS5WKSite* site = g_ptr_array_index(sites, i);
+            g_string_append(out, i ? ",\n{\"host\":" : "\n{\"host\":");
+            ps5wk_json_string(out, site->host);
+            g_string_append(out, ",\"gamepad\":");
+            ps5wk_json_string(out, ps5wk_site_gamepad_name(site->gamepad));
+            g_string_append(out, ",\"keys\":");
+            ps5wk_json_string(out, site->keys ? site->keys : "");
+            g_string_append(out, ",\"left\":");
+            ps5wk_json_string(out, site->left ? site->left : "");
+            g_string_append(out, ",\"right\":");
+            ps5wk_json_string(out, site->right ? site->right : "");
+            g_string_append_printf(out, ",\"changed\":%" G_GINT64_FORMAT "}", site->changed);
+        }
+        g_string_append(out, "]}\n");
+        if (writeFileAtomically("sites.json", out->str, out->len))
+            sitesDirty = FALSE;
+        g_string_free(out, TRUE);
+    }
     gboolean any = bookmarksDirty || historyDirty;
     if (bookmarksDirty) {
         GString* out = g_string_new("{\"version\":1,\"bookmarks\":[");
@@ -456,6 +484,9 @@ void ps5wk_bdata_flush(void)
     saveNow();
 }
 
+static void siteFree(gpointer data);
+static void loadSites(void);
+
 void ps5wk_bdata_init(const char* dir)
 {
     dataDir = g_strdup(dir);
@@ -463,8 +494,145 @@ void ps5wk_bdata_init(const char* dir)
     history = g_ptr_array_new_with_free_func(entryFree);
     loadEntries(bookmarks, "bookmarks.json", "bookmarks", "added", BOOKMARKS_MAX);
     loadEntries(history, "history.json", "history", "last", HISTORY_MAX);
-    spike_log("browser: %u bookmarks, %u history entries", bookmarks->len, history->len);
+    sites = g_ptr_array_new_with_free_func(siteFree);
+    loadSites();
+    spike_log("browser: %u bookmarks, %u history entries, %u sites with settings", bookmarks->len, history->len, sites->len);
     writeStartData(); /* the last user's until now */
+}
+
+/* ---------------------------------------------------------------- sites */
+
+#define SITES_MAX 300
+
+static void siteFree(gpointer data)
+{
+    PS5WKSite* site = data;
+    g_free(site->host);
+    g_free(site->keys);
+    g_free(site->left);
+    g_free(site->right);
+    g_free(site);
+}
+
+static PS5WKSite* siteCopy(const PS5WKSite* from, const char* host)
+{
+    PS5WKSite* site = g_new0(PS5WKSite, 1);
+    site->host = g_strdup(host);
+    if (from) {
+        site->gamepad = from->gamepad;
+        site->keys = g_strdup(from->keys);
+        site->left = g_strdup(from->left);
+        site->right = g_strdup(from->right);
+        site->changed = from->changed;
+    }
+    return site;
+}
+
+const char* ps5wk_site_gamepad_name(int gamepad)
+{
+    return gamepad == PS5WK_GAMEPAD_ON ? "on" : gamepad == PS5WK_GAMEPAD_OFF ? "off" : "ask";
+}
+
+static int gamepadFromName(const char* name)
+{
+    return !g_strcmp0(name, "on") ? PS5WK_GAMEPAD_ON : !g_strcmp0(name, "off") ? PS5WK_GAMEPAD_OFF : PS5WK_GAMEPAD_ASK;
+}
+
+static void loadSites(void)
+{
+    JNode* root = readJSONFile("sites.json");
+    JNode* list = jget(root, "sites");
+    for (unsigned i = 0; list && list->type == J_ARRAY && i < list->items->len && sites->len < SITES_MAX; i++) {
+        JNode* item = g_ptr_array_index(list->items, i);
+        const char* host = jstr(item, "host");
+        if (!host || !*host || ps5wk_site_find(host))
+            continue;
+        PS5WKSite* site = siteCopy(NULL, host);
+        site->gamepad = gamepadFromName(jstr(item, "gamepad"));
+        site->keys = g_strdup(jstr(item, "keys"));
+        site->left = g_strdup(jstr(item, "left"));
+        site->right = g_strdup(jstr(item, "right"));
+        site->changed = (gint64)jnum(item, "changed", 0);
+        g_ptr_array_add(sites, site);
+    }
+    jfree(root);
+}
+
+GPtrArray* ps5wk_sites(void)
+{
+    return privateSites ? privateSites : sites;
+}
+
+PS5WKSite* ps5wk_site_find(const char* host)
+{
+    GPtrArray* list = ps5wk_sites();
+    for (unsigned i = 0; host && i < list->len; i++) {
+        PS5WKSite* site = g_ptr_array_index(list, i);
+        if (!g_ascii_strcasecmp(site->host, host))
+            return site;
+    }
+    return NULL;
+}
+
+PS5WKSite* ps5wk_site_get(const char* host)
+{
+    g_return_val_if_fail(host && *host, NULL);
+    PS5WKSite* site = ps5wk_site_find(host);
+    if (!site) {
+        site = siteCopy(NULL, host);
+        g_ptr_array_insert(ps5wk_sites(), 0, site);
+    }
+    return site;
+}
+
+void ps5wk_site_changed(PS5WKSite* site)
+{
+    GPtrArray* list = ps5wk_sites();
+    site->changed = nowSeconds();
+    unsigned index;
+    if (g_ptr_array_find(list, site, &index) && index) {
+        g_ptr_array_steal_index(list, index);
+        g_ptr_array_insert(list, 0, site);
+    }
+    while (list->len > SITES_MAX)
+        g_ptr_array_remove_index(list, list->len - 1);
+    if (list == sites) {
+        sitesDirty = TRUE;
+        scheduleSave(BOOKMARKS_DELAY_S);
+    }
+}
+
+gboolean ps5wk_site_remove(const char* host)
+{
+    PS5WKSite* site = ps5wk_site_find(host);
+    if (!site)
+        return FALSE;
+    GPtrArray* list = ps5wk_sites();
+    g_ptr_array_remove(list, site);
+    if (list == sites) {
+        sitesDirty = TRUE;
+        scheduleSave(BOOKMARKS_DELAY_S);
+    }
+    return TRUE;
+}
+
+void ps5wk_sites_set_private(gboolean enabled)
+{
+    if (!enabled) {
+        if (privateSites)
+            g_ptr_array_unref(privateSites);
+        privateSites = NULL;
+        return;
+    }
+    if (privateSites)
+        return;
+    /* A copy of the saved settings: what the private session changes goes
+     * with it. */
+    privateSites = g_ptr_array_new_with_free_func(siteFree);
+    for (unsigned i = 0; i < sites->len; i++) {
+        PS5WKSite* site = g_ptr_array_index(sites, i);
+        g_ptr_array_add(privateSites, siteCopy(site, site->host));
+    }
 }
 
 /* ---------------------------------------------------------------- bookmarks */

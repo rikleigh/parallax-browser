@@ -425,7 +425,9 @@ words to search for (DuckDuckGo Lite, as before).
 
 The bar: Back, Forward, Reload (Stop while loading), Home, the address
 field (the page's title and address), the tab count, Bookmark (☆ adds the
-page shown, ★ removes it), New tab (the home page) and Settings (⚙, as
+page shown, ★ removes it), Gamepad mode (the controller; □ on it opens the
+button mapping, see *Gamepad mode*), Private browsing (the hat and glasses,
+see *Private browsing*), New tab (the home page) and Settings (⚙, as
 R3). History has *Clear
 all history* at the top (X twice). While a page loads (menu closed), the bar
 shows at the top with the page's title, address and a progress line, and
@@ -683,6 +685,88 @@ title's extra direct memory (699-714 vs 658 MB). A third tab discarded the
 least recently used one and reused its view. GPU compositing off: the
 first switch back to a live tab showed the old page until the repaint fix
 above; with it, each switch showed the right page.
+
+## Gamepad mode
+
+Built and checked on the TV 2026-11-09 (the Gamepad API, all buttons and
+axes, analog triggers, rumble, the keys, Options held, the offer). Browser games get the
+controller in two ways:
+
+- **The Gamepad API**, always (WebKit is now built with `ENABLE_GAMEPAD`).
+  A page that asks (`navigator.getGamepads()`, `gamepadconnected`) sees the
+  DualSense as gamepad 0 with the standard mapping and Chrome's id for it
+  (`DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product:
+  0ce6)`): 17 buttons, with L2/R2 as analog values (a small WebKit addition,
+  patch 0103: `wpe_gamepad_button_value_event`), and 4 axes. The touchpad
+  button is button 8 (Select/Create: the system keeps the real Create button)
+  and the PS button (16) never reaches a title. `vibrationActuator`
+  (`dual-rumble`) drives the motors through `scePadSetVibration`, after
+  `scePadSetVibrationMode(2)` (a DualSense opens in haptics mode, where motor
+  levels move nothing). The page sees the controller only while it has the
+  pad: everything reads as released while the menu, the keyboard or View in
+  VR has it. `wpe-ps5/WPEGamepadPS5.cpp` is the device; WebKit's
+  `GamepadProviderWPE` makes it (`wpe_display_create_gamepad_manager`) when a
+  page first asks for gamepads.
+- **Gamepad mode**, per site: the pad stops meaning anything to the
+  browser (no pointer, scrolling, Back, zoom, reload or focus moves; spatial
+  navigation off), so the whole controller is the game's. Each button can
+  also press a key, and each stick can be the arrow keys, W A S D, the
+  pointer or scrolling, for games that only read the keyboard or mouse.
+  **Hold Options for a second** to open the browser menu (a short press
+  still goes to the game, which often uses it for pause); the menu opens
+  with the focus on the gamepad button.
+
+| | |
+| --- | --- |
+| switching it on | the menu's gamepad button (✕: on or off for the site); or the offer *"Gamepad mode available △ Turn on ○ Not now"*: on a page that reads the controller, on a site with no answer yet, the first press brings it up, and it stays until answered (remembered for the site) or the page changes; an unanswered offer comes back on the site's next page. Checked on the TV 2026-11-09 |
+| the mapping | □ on the menu's gamepad button opens `http://127.0.0.1:9040/gamepad?site=<host>` in a new tab (the game keeps its tab); also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
+| presets | *Controller only* (no keys: games that read the controller); *Arrows + Space* (D-pad and left stick arrows, ✕ Space, ○ Esc, □ Z, △ X, L1 Shift, R1 Ctrl, Options Enter); *WASD + mouse* (left stick WASD, right stick pointer, R2 click, ✕ Space, ○ C, □ R, △ E, L1 Q, R1 F, L2 Shift, Options Esc, touchpad Tab); *Point and click* (left stick pointer, ✕ and R2 click, right stick scrolls, ○ and Options Esc) |
+| a key per button | any of A-Z, 0-9, Space, Enter, Esc, Tab, Backspace, Shift, Ctrl, Alt, the arrows, or a mouse click at the pointer; sent as real key events with `KeyboardEvent.code` (hardware key codes) |
+| where it is kept | `users/<id>/sites.json` (browserdata.c), per host; local files (`file:`) count as one site |
+
+The offer's default is *Controller only* (the page reads the controller);
+switching gamepad mode on from the menu on a page that does not read it
+starts with *Arrows + Space*. A page gets both the Gamepad API and the
+keys, so a game that reads both may see a press twice: *Controller only*
+avoids that.
+
+Code: `wpe-ps5/WPEDisplayPS5.cpp` (`wpe_display_ps5_set_gamepad_mode`, the
+keys and sticks in the pad loop, Options held as
+`WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD`), `apps/title/gamepad.c` (the site's
+mode, the offer, the presets, `/browser/gamepad` and the mapping page),
+`apps/title/browserui.c` (the menu button). Log lines: `[wpe-ps5] gamepad
+mode on: 12 key(s), left stick arrows, right stick gamepad`, `[wpe-ps5]
+gamepad: the page reads the gamepad`, `gamepad: offered gamepad mode on
+<host>`, `[wpe-ps5] pad: Options held in gamepad mode`. Test page:
+`test/input/gamepad.html` (what the page gets, rumble on □ held 2 s).
+
+## Private browsing
+
+Built and checked on the TV 2026-11-09 (on with 12 normal tabs set aside,
+off with them back). The menu's hat-and-glasses
+button switches the whole browser to private browsing, like a private
+window: the normal tabs are written to the session file and set aside (their
+pages close), and a private tab opens on the home page. Private pages:
+
+- use an **ephemeral network session**
+  (`webkit_network_session_new_ephemeral`): cookies, local storage,
+  IndexedDB and the cache live in memory only;
+- run in **their own WebProcess** (WebKit patch 0104: with one WebProcess
+  for everything, patch 0018, a page of another session would otherwise
+  have shared the normal one's; on PS5 a process now serves one data store).
+  The normal one ends when its pages close, so there is still one at a
+  time;
+- leave **no history** and are never written to `session.json` (a restart
+  or a crash comes back to the normal tabs);
+- show a **plum bar** with a *Private* chip, also while loading.
+
+Leaving (the same button) closes the private tabs, their WebProcess and the
+session with its data, and brings the normal tabs back where they were.
+Bookmarks work as usual (a bookmark added in private browsing is kept).
+Downloads are kept, as in Safari: the file and its line in the Downloads
+list stay. Gamepad-mode settings changed while private last only until it
+ends. `POST /browser/private on=1|0` (link server, PIN) does the same as
+the button; `GET` says whether it is on.
 
 ## Downloads
 
@@ -3048,7 +3132,9 @@ bar, tabs, bookmarks, history; see *Tabs, bookmarks, history*);
 Triangle = keyboard for the focused field (it also opens by itself when X
 focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
 R3 = Settings (XF86Tools; see *Settings*); L3 = home page; L3 + R3 =
-performance overlay; touchpad = View in VR.
+performance overlay; touchpad = View in VR. In gamepad mode none of these:
+the page gets the pad (and the keys set for the site), and Options held 1 s
+opens the menu (see *Gamepad mode*).
 
 GL goes through libepoxy; in the title, `--wrap=dlopen/dlsym` and
 `apps/title/dlshim.c` resolve epoxy's lookups to the statically linked

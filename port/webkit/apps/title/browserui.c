@@ -91,6 +91,13 @@ static unsigned liveLimit = 2;   /* live tabs (views), /data/ps5webkit/live-tabs
 static gboolean memoryTight;     /* over the pressure line: one live tab until well under it */
 static guint memoryTimer;
 static gboolean showFormPage(gpointer data);
+/* Private browsing (README: "Private browsing"): the tabs shown are the
+ * private session's; the normal ones wait in normalTabs (records only, no
+ * views) and are what the session file keeps. */
+static gboolean privateMode;
+static WebKitNetworkSession* privateSession;
+static GPtrArray* normalTabs;
+static int normalActive;
 
 /* ---------------------------------------------------------------- tabs */
 
@@ -192,6 +199,7 @@ static GBytes* captureState(WebKitWebView* view)
 
 static void scheduleSessionSave(void);
 static void redraw(void);
+static void sessionWrite(gpointer data);
 static void showBar(void);
 static void connectView(WebKitWebView* view);
 
@@ -739,6 +747,109 @@ static void closeTab(int index)
     redraw();
 }
 
+/* ---- private browsing ---- */
+
+static WebKitNetworkSession* normalSession; /* the first view's (the user's data) */
+
+/* A web view of @session, as a tab's (not related to the view shown: a
+ * session change means another WebProcess, WebKit patch 0104). */
+static WebKitWebView* sessionView(WebKitNetworkSession* session)
+{
+    wpe_display_ps5_set_active_view(display, webkit_web_view_get_wpe_view(webView));
+    WebKitWebView* view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+        "display", WPE_DISPLAY(display),
+        "network-session", session,
+        "settings", webkit_web_view_get_settings(webView),
+        "user-content-manager", webkit_web_view_get_user_content_manager(webView),
+        "website-policies", webkit_web_view_get_website_policies(webView),
+        NULL));
+    connectView(view);
+    spike_log("[tabs] new web view %p in the %s session", view, session == normalSession ? "normal" : "private");
+    return view;
+}
+
+static void destroyTabViews(GPtrArray* list)
+{
+    for (unsigned i = 0; list && i < list->len; i++) {
+        Tab* tab = g_ptr_array_index(list, i);
+        WebKitWebView* view = tab->view;
+        tab->view = NULL;
+        destroyView(view);
+    }
+}
+
+/* Private browsing on: the normal tabs are written to the session file and
+ * set aside (their pages close: one WebProcess at a time), and a private
+ * tab opens on the home page in a new ephemeral network session (cookies,
+ * storage and cache in memory only), in its own WebProcess. Nothing of it
+ * reaches the history or the session file; site settings changed meanwhile
+ * go with it. Off: the private tabs, their WebProcess and the session go,
+ * and the normal tabs come back. FALSE: not now (a tab switch running, the
+ * browser closing). */
+static gboolean setPrivate(gboolean on)
+{
+    if (on == privateMode)
+        return TRUE;
+    if (switching || sessionFrozen || !normalSession) {
+        spike_log("browser: private browsing %s refused (%s)", on ? "on" : "off", switching ? "a tab switch is running" : "closing or a test run");
+        return FALSE;
+    }
+    ps5wk_vr_stop(FALSE, on ? "private browsing" : "private browsing ended");
+    char* home = ps5wk_home_url();
+    if (on) {
+        for (unsigned i = 0; i < tabs->len; i++)
+            saveTab(g_ptr_array_index(tabs, i));
+        sessionWrite(GINT_TO_POINTER(1));
+        privateSession = webkit_network_session_new_ephemeral();
+        ps5wk_downloads_watch_session(privateSession);
+        ps5wk_sites_set_private(TRUE);
+        WebKitWebView* view = sessionView(privateSession);
+        normalTabs = tabs;
+        normalActive = active;
+        tabs = g_ptr_array_new_with_free_func(tabFree);
+        Tab* tab = tabNew(home, "");
+        tab->view = view;
+        tab->lastUsed = g_get_monotonic_time();
+        g_ptr_array_add(tabs, tab);
+        active = 0;
+        privateMode = TRUE;
+        showView(view);
+        loadFresh(view, home);
+        destroyTabViews(normalTabs);
+        spike_log("browser: private browsing on (%u normal tabs set aside)", normalTabs->len);
+        wpe_display_ps5_show_message(display, "Private browsing: no history, and cookies and site data go when you leave", 4);
+    } else {
+        GPtrArray* privateTabs = tabs;
+        tabs = normalTabs;
+        normalTabs = NULL;
+        privateMode = FALSE;
+        ps5wk_sites_set_private(FALSE);
+        if (!tabs->len)
+            g_ptr_array_add(tabs, tabNew(home, ""));
+        active = normalActive >= 0 && normalActive < (int)tabs->len ? normalActive : 0;
+        Tab* tab = activeTab();
+        tab->view = sessionView(normalSession);
+        tab->lastUsed = g_get_monotonic_time();
+        showView(tab->view);
+        activate();
+        destroyTabViews(privateTabs);
+        g_ptr_array_unref(privateTabs);
+        g_clear_object(&privateSession);
+        spike_log("browser: private browsing off (its tabs, WebProcess and data gone)");
+        wpe_display_ps5_show_message(display, "Private browsing ended: its pages, cookies and data are gone", 3);
+        scheduleSessionSave();
+    }
+    g_free(home);
+    logLiveTabs(on ? "private browsing" : "private browsing ended");
+    redraw();
+    return TRUE;
+}
+
+gboolean ps5wk_browser_private(void)
+{
+    return privateMode;
+}
+
 /* Memory: hidden live tabs go when the WebProcess's libpas memory nears its
  * limit (60% of PS5WK_MEM_RESTART_MB, default 3 GB: the limit itself restarts
  * the WebProcess, every page in it) or the title's free flexible memory runs
@@ -795,9 +906,12 @@ static void sessionWrite(gpointer data)
     (void)data;
     if (sessionFrozen && !GPOINTER_TO_INT(data))
         return;
+    /* While private, the file keeps the normal tabs (as they were set
+     * aside), never a private one. */
+    GPtrArray* saving = privateMode ? normalTabs : tabs;
     GPtrArray* list = g_ptr_array_new_with_free_func(ps5wk_session_tab_free);
-    for (unsigned i = 0; i < tabs->len; i++) {
-        Tab* tab = g_ptr_array_index(tabs, i);
+    for (unsigned i = 0; i < saving->len; i++) {
+        Tab* tab = g_ptr_array_index(saving, i);
         PS5WKSessionTab* saved = g_new0(PS5WKSessionTab, 1);
         saved->url = g_strdup(tab->url);
         saved->title = g_strdup(tab->title);
@@ -815,7 +929,7 @@ static void sessionWrite(gpointer data)
             saved->state = g_bytes_ref(tab->state);
         g_ptr_array_add(list, saved);
     }
-    ps5wk_session_save(list, active);
+    ps5wk_session_save(list, privateMode ? normalActive : active);
     g_ptr_array_unref(list);
 }
 
@@ -837,7 +951,7 @@ static gboolean sessionTimerFired(gpointer data)
 
 static void scheduleSessionSave(void)
 {
-    if (sessionFrozen || sessionTimer)
+    if (sessionFrozen || sessionTimer || privateMode)
         return;
     sessionTimer = g_timeout_add(SESSION_DELAY_MS, sessionTimerFired, NULL);
 }
@@ -993,6 +1107,8 @@ static void fillState(BUIState* s)
     s->canForward = webkit_web_view_can_go_forward(webView);
     s->canNewTab = tabs->len < MAX_TABS;
     s->starred = ps5wk_bookmark_find(shownURI()) >= 0;
+    s->gamepadOn = ps5wk_gamepad_active();
+    s->privateMode = privateMode;
     s->title = shownTitle();
     s->uri = shownURI();
     s->tabCount = tabs->len;
@@ -1313,11 +1429,34 @@ static void toolbarActivate(int index)
         if (openInNewTab(NULL))
             setMenu(FALSE);
         break;
+    case TB_GAMEPAD:
+        setMenu(FALSE);
+        ps5wk_gamepad_toggle();
+        break;
+    case TB_PRIVATE:
+        setMenu(FALSE);
+        setPrivate(!privateMode);
+        break;
     case TB_SETTINGS: /* as R3 */
         setMenu(FALSE);
         ps5wk_open_settings();
         break;
     }
+}
+
+/* The gamepad button's □: the mapping page for the site shown, in a new tab
+ * (the game keeps its tab). */
+static void openGamepadPage(void)
+{
+    const char* site = ps5wk_gamepad_site();
+    char* escaped = site ? g_uri_escape_string(site, NULL, TRUE) : NULL;
+    char* url = escaped ? g_strdup_printf("%s?site=%s", PS5WK_GAMEPAD_URL, escaped) : g_strdup(PS5WK_GAMEPAD_URL);
+    if (openInNewTab(url))
+        setMenu(FALSE);
+    else
+        wpe_display_ps5_show_message(display, "No room for another tab: close one first", 2);
+    g_free(url);
+    g_free(escaped);
 }
 
 static const char* rowURL(int row)
@@ -1542,6 +1681,8 @@ static void menuButtons(guint32 pressed)
     if (pressed & WPE_DISPLAY_PS5_BUTTON_SQUARE) {
         if (zone == ZONE_LIST)
             rowRemove(listFocus);
+        else if (toolbarFocus == TB_GAMEPAD)
+            openGamepadPage();
         return;
     }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_R2) {
@@ -1591,10 +1732,23 @@ static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
 {
     (void)d;
     (void)data;
+    /* Options held in gamepad mode: the menu (its focus on the gamepad
+     * button, to switch the mode off). */
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD) {
+        if (!menuOpen) {
+            ps5wk_browser_toggle_menu();
+            zone = ZONE_TOOLBAR;
+            toolbarFocus = TB_GAMEPAD;
+            redraw();
+        }
+        return TRUE;
+    }
     if (menuOpen) {
         menuButtons(pressed);
         return TRUE;
     }
+    if (ps5wk_gamepad_buttons(pressed))
+        return TRUE;
     if (ps5wk_vr_buttons(pressed))
         return TRUE;
     if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS) {
@@ -1663,7 +1817,8 @@ void ps5wk_browser_load_changed(WebKitWebView* view, WebKitLoadEvent event)
             tab->fromForm = uri && ((postURI && !strcmp(postURI, uri)) || (formPlaceholderURI && !strcmp(formPlaceholderURI, uri)));
         g_clear_pointer(&postURI, g_free);
         g_clear_pointer(&formPlaceholderURI, g_free);
-        ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
+        if (!privateMode)
+            ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
         scheduleSessionSave();
         break;
     }
@@ -1714,7 +1869,8 @@ static void onTitleChanged(GObject* object, GParamSpec* pspec, gpointer data)
         setString(&tab->title, title);
     if (view != webView)
         return;
-    ps5wk_history_set_title(webkit_web_view_get_uri(view), title);
+    if (!privateMode)
+        ps5wk_history_set_title(webkit_web_view_get_uri(view), title);
     if (menuOpen || barShown)
         redraw();
 }
@@ -1733,7 +1889,8 @@ static void onURIChanged(GObject* object, GParamSpec* pspec, gpointer data)
         setString(&tab->url, uri);
     if (view != webView)
         return;
-    ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
+    if (!privateMode)
+        ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
     scheduleSessionSave();
     if (menuOpen || barShown)
         redraw();
@@ -1923,6 +2080,7 @@ void ps5wk_browser_init(WPEDisplay* d, WebKitWebView* view)
     wpe_display_ps5_set_button_handler(display, onButtons, NULL);
     wpe_display_ps5_set_ui_pointer_callback(display, onUIPointer, NULL);
     connectView(view);
+    normalSession = webkit_web_view_get_network_session(view);
 }
 
 static gboolean fileExists(const char* path)
@@ -2087,6 +2245,41 @@ static char* apiRun(ApiCall* call, int* status)
     gboolean post = !strcmp(call->method, "POST");
     if (!strcmp(path, "/browser") || !strcmp(path, "/browser/state")) {
         return stateJSON();
+    }
+    if (!strcmp(path, "/browser/gamepad")) {
+        char* site = param(call->query, call->body, "site");
+        char* gamepad = param(call->query, call->body, "gamepad");
+        char* preset = param(call->query, call->body, "preset");
+        char* keys = param(call->query, call->body, "keys");
+        char* left = param(call->query, call->body, "left");
+        char* right = param(call->query, call->body, "right");
+        char* remove = param(call->query, call->body, "remove");
+        char* reply = ps5wk_gamepad_api(post, site, gamepad, preset, keys, left, right, remove && !strcmp(remove, "1"), status);
+        g_free(site);
+        g_free(gamepad);
+        g_free(preset);
+        g_free(keys);
+        g_free(left);
+        g_free(right);
+        g_free(remove);
+        if (menuOpen || barShown)
+            redraw();
+        return reply;
+    }
+    if (!strcmp(path, "/browser/private")) {
+        if (!post)
+            return g_strdup_printf("{\"ok\":true,\"private\":%s}\n", privateMode ? "true" : "false");
+        char* on = param(call->query, call->body, "on");
+        if (!on || (strcmp(on, "1") && strcmp(on, "0"))) {
+            g_free(on);
+            *status = 400;
+            return g_strdup("{\"ok\":false,\"error\":\"on=1 or on=0\"}\n");
+        }
+        gboolean ok = setPrivate(!strcmp(on, "1"));
+        g_free(on);
+        if (!ok)
+            *status = 409;
+        return g_strdup_printf("{\"ok\":%s,\"private\":%s}\n", ok ? "true" : "false", privateMode ? "true" : "false");
     }
     if (!post) {
         *status = 405;

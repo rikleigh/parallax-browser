@@ -10,6 +10,7 @@ set(WPEPlatformPS5_SOURCES
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5VideoDecoder.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/PS5VideoServer.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEDisplayPS5.cpp
+    ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEGamepadPS5.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEInputMethodContextPS5.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEProcessManagerPS5.cpp
     ${WEBKIT_DIR}/WPEPlatform/wpe/ps5/WPEToplevelPS5.cpp

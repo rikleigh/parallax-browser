@@ -316,6 +316,29 @@ static void drawButton(WPEDisplayPS5Canvas* c, int x, int y, int w, int h, const
         addHot(x, y, w, h, HOT_TOOLBAR, index);
 }
 
+/* The gamepad button's icon: a controller, its D-pad and buttons cut out. */
+static void gamepadIcon(WPEDisplayPS5Canvas* c, int cx, int cy, guint32 color)
+{
+    const guint32 hole = PX_A(PX_BASE, 0xff);
+    wpe_display_ps5_canvas_fill(c, cx - 22, cy - 12, 44, 20, 10, color);
+    wpe_display_ps5_canvas_fill(c, cx - 22, cy - 6, 15, 19, 7, color);
+    wpe_display_ps5_canvas_fill(c, cx + 7, cy - 6, 15, 19, 7, color);
+    wpe_display_ps5_canvas_fill(c, cx - 17, cy - 4, 11, 3, 1, hole);
+    wpe_display_ps5_canvas_fill(c, cx - 13, cy - 8, 3, 11, 1, hole);
+    wpe_display_ps5_canvas_fill(c, cx + 8, cy - 8, 5, 5, 2, hole);
+    wpe_display_ps5_canvas_fill(c, cx + 13, cy - 3, 5, 5, 2, hole);
+}
+
+/* The private browsing button's icon: a hat and dark glasses. */
+static void privateIcon(WPEDisplayPS5Canvas* c, int cx, int cy, guint32 color)
+{
+    wpe_display_ps5_canvas_fill(c, cx - 12, cy - 18, 24, 11, 4, color);
+    wpe_display_ps5_canvas_fill(c, cx - 21, cy - 9, 42, 4, 2, color);
+    wpe_display_ps5_canvas_fill(c, cx - 19, cy + 1, 16, 12, 6, color);
+    wpe_display_ps5_canvas_fill(c, cx + 3, cy + 1, 16, 12, 6, color);
+    wpe_display_ps5_canvas_fill(c, cx - 4, cy + 4, 8, 3, 1, color);
+}
+
 static void drawProgress(WPEDisplayPS5Canvas* c, int screenW, double progress)
 {
     if (progress < 0.05)
@@ -395,18 +418,27 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
 {
     const int screenW = s->screenW;
     const gboolean toolbar = interactive && s->zone == ZONE_TOOLBAR;
-    wpe_display_ps5_canvas_fill_gradient(c, 0, 0, screenW, BAR_H, 0, PX_A(PX_BASE, 0xf6), PX_A(PX_SURFACE, 0xee), TRUE);
-    wpe_display_ps5_canvas_fill(c, 0, BAR_H - 1, screenW, 1, 0, PX_A(PX_LINE, 0xff));
+    /* Private browsing: a plum bar, so a private page never looks like the others. */
+    wpe_display_ps5_canvas_fill_gradient(c, 0, 0, screenW, BAR_H, 0, PX_A(s->privateMode ? PX_PRIVATE_BAR : PX_BASE, 0xf6),
+        PX_A(s->privateMode ? PX_PRIVATE_BAR_2 : PX_SURFACE, 0xee), TRUE);
+    wpe_display_ps5_canvas_fill(c, 0, BAR_H - 1, screenW, 1, 0, PX_A(s->privateMode ? PX_MAGENTA : PX_LINE, 0xff));
 
-    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "+", "⚙" };
-    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
+    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "", "", "+", "⚙" };
+    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
     int x = EDGE;
     for (int i = TB_BACK; i <= TB_HOME; i++) {
         drawButton(c, x, BTN_Y, BTN_W, BTN_H, labels[i], enabled[i] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == i, interactive ? i : -1);
         x += BTN_W + GAP;
     }
-    /* the right: settings, new tab, bookmark, the tab count */
-    const int settingsX = screenW - EDGE - BTN_W, newTabX = settingsX - GAP - BTN_W, starX = newTabX - GAP - BTN_W, countX = starX - GAP - 64;
+    /* the right: settings, new tab, private, gamepad, bookmark, the tab count */
+    const int settingsX = screenW - EDGE - BTN_W, newTabX = settingsX - GAP - BTN_W, privateX = newTabX - GAP - BTN_W;
+    const int gamepadX = privateX - GAP - BTN_W, starX = gamepadX - GAP - BTN_W, countX = starX - GAP - 64;
+    drawButton(c, privateX, BTN_Y, BTN_W, BTN_H, labels[TB_PRIVATE], PX_TEXT, toolbar && s->toolbarFocus == TB_PRIVATE, interactive ? TB_PRIVATE : -1);
+    privateIcon(c, privateX + BTN_W / 2, BTN_Y + BTN_H / 2, s->privateMode ? PX_PINK : PX_TEXT);
+    drawButton(c, gamepadX, BTN_Y, BTN_W, BTN_H, labels[TB_GAMEPAD], PX_TEXT, toolbar && s->toolbarFocus == TB_GAMEPAD, interactive ? TB_GAMEPAD : -1);
+    gamepadIcon(c, gamepadX + BTN_W / 2, BTN_Y + BTN_H / 2, s->gamepadOn ? PX_CYAN_TEXT : PX_TEXT);
+    if (s->gamepadOn)
+        wpe_display_ps5_canvas_fill_gradient(c, gamepadX + 18, BTN_Y + BTN_H - 8, BTN_W - 36, 4, 2, PX_CYAN, PX_BLUE, FALSE);
     drawButton(c, settingsX, BTN_Y, BTN_W, BTN_H, labels[TB_SETTINGS], PX_TEXT, toolbar && s->toolbarFocus == TB_SETTINGS, interactive ? TB_SETTINGS : -1);
     drawButton(c, newTabX, BTN_Y, BTN_W, BTN_H, labels[TB_NEWTAB], enabled[TB_NEWTAB] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == TB_NEWTAB,
         interactive ? TB_NEWTAB : -1);
@@ -447,6 +479,16 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
         wpe_display_ps5_canvas_fill(c, ax + aw - hw - 12, ay + 12, hw, ah - 24, PX_RADIUS_CHIP, PX_A(PX_INK, 0xb0));
         hint(c, ax + aw - hw + 2, ay + ah / 2, "✕", what);
         textW -= hw + 16;
+    }
+    if (s->privateMode && !addressFocused) {
+        /* "Private" in a chip at the field's right end */
+        const char* label = "Private";
+        const int cw = wpe_display_ps5_canvas_text_width(c, 19, TRUE, label) + 28;
+        const int cx = ax + aw - cw - 12;
+        wpe_display_ps5_canvas_fill(c, cx, ay + 16, cw, ah - 32, PX_RADIUS_CHIP, PX_A(PX_MAGENTA, 0x55));
+        wpe_display_ps5_canvas_stroke(c, cx, ay + 16, cw, ah - 32, PX_RADIUS_CHIP, 1, PX_A(PX_PINK, 0xc0), PX_A(PX_PINK, 0xc0), FALSE);
+        textCentred(c, cx + cw / 2, ay + ah / 2, cw, 19, TRUE, PX_TEXT, label);
+        textW -= cw + 16;
     }
     const char* title = s->title ? s->title : "";
     const char* uri = s->uri ? s->uri : "";
@@ -526,7 +568,12 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         hint(c, x, cy, "Options", "Close the menu");
         return;
     }
-    if (s->section == SEC_TABS) {
+    if (!list && s->toolbarFocus == TB_GAMEPAD) {
+        x += hint(c, x, cy, "✕", s->gamepadOn ? "Gamepad mode off" : "Gamepad mode on") + 32;
+        x += hint(c, x, cy, "□", "Buttons") + 32;
+    } else if (!list && s->toolbarFocus == TB_PRIVATE)
+        x += hint(c, x, cy, "✕", s->privateMode ? "Leave private browsing" : "Private browsing") + 32;
+    else if (s->section == SEC_TABS) {
         x += hint(c, x, cy, "✕", list ? "Switch" : "Select") + 32;
         x += hint(c, x, cy, "□", "Close tab") + 32;
     } else if (s->section == SEC_DOWNLOADS) {

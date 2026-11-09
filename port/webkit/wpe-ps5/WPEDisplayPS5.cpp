@@ -27,6 +27,7 @@
 #include <sys/resource.h>
 #include <time.h>
 #include "PS5Sce.h"
+#include "WPEGamepadPS5.h"
 #include "WPEExtensions.h"
 #include "WPEPS5Private.h"
 #include <algorithm>
@@ -38,6 +39,7 @@
 #include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/WTFGType.h>
 #include <string>
+#include <vector>
 
 /**
  * WPEDisplayPS5:
@@ -73,6 +75,7 @@ static constexpr double repeatDelay = 0.40;
 static constexpr double repeatInterval = 0.06;
 static constexpr double pointerShownFor = 8.0; // seconds after the last stick move
 static constexpr int stickDeadZone = 14; // of 127
+static constexpr double optionsHoldFor = 1.0; // gamepad mode: Options held this long is the browser's
 
 // WPEScreen is abstract; the TV is one fixed screen.
 G_DECLARE_FINAL_TYPE(WPEScreenPS5, wpe_screen_ps5, WPE, SCREEN_PS5, WPEScreen)
@@ -171,6 +174,25 @@ struct _WPEDisplayPS5Private {
     WPEDisplayPS5VRCallback vrCallback { nullptr };
     gpointer vrCallbackData { nullptr };
     bool vrStarting { false };
+
+    // The Gamepad API's device (WPEGamepadPS5.cpp; owned by WebKit's
+    // manager, which exists while a page uses gamepads) and whether WebKit
+    // reads it now.
+    WPEGamepad* gamepad { nullptr };
+    bool gamepadMonitoring { false };
+    WPEDisplayPS5GamepadCallback gamepadCallback { nullptr };
+    gpointer gamepadCallbackData { nullptr };
+    bool vibrationModeSet { false };
+    unsigned rumbleLogs { 0 };
+    // Gamepad mode (wpe_display_ps5_set_gamepad_mode): the keys the buttons
+    // send, the sticks, and what is down now.
+    bool gamepadMode { false };
+    std::vector<WPEDisplayPS5ButtonKey> gamepadKeys;
+    WPEDisplayPS5StickAction stickActions[2] { WPE_DISPLAY_PS5_STICK_GAMEPAD, WPE_DISPLAY_PS5_STICK_GAMEPAD };
+    uint32_t gamepadKeysDown { 0 }; // buttons whose keys went down
+    uint8_t stickKeysDown[2] { 0, 0 }; // per stick: up, down, left, right
+    double optionsDownAt { -1 };
+    bool optionsHoldSent { false };
 
     GRefPtr<WPEProcessManager> processManager;
     std::string childELF;
@@ -548,6 +570,178 @@ static double stickValue(uint8_t raw)
     return (v < 0 ? -1 : 1) * x * x; // quadratic: fine control near the centre
 }
 
+// The left stick's pointer (page pointer events): moves it by the stick's
+// deflection; returns whether the pointer is shown now (and hides it when
+// its time is up).
+static bool stickPointer(WPEDisplayPS5* display, WPEView* view, double sx, double sy, double t)
+{
+    auto* priv = display->priv;
+    int width = wpe_view_get_width(view), height = wpe_view_get_height(view);
+    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
+    if (sx || sy) {
+        if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
+            priv->pointerX = width / 2.0;
+            priv->pointerY = height / 2.0;
+        }
+        const double speed = 22.0; // px per tick at full deflection
+        double dx = sx * speed, dy = sy * speed;
+        priv->pointerX = std::fmin(std::fmax(priv->pointerX + dx, 0), width - 1);
+        priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, 0), height - 1);
+        priv->pointerMovedAt = t;
+        auto modifiers = priv->pointerDown ? WPE_MODIFIER_POINTER_BUTTON1 : static_cast<WPEModifiers>(0);
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), modifiers, priv->pointerX, priv->pointerY, dx, dy));
+        wpe_view_event(view, event.get());
+        wpeDisplayPS5ScheduleRedraw(display);
+        return true;
+    }
+    if (priv->pointerWasVisible && !pointerVisible)
+        wpeDisplayPS5ScheduleRedraw(display); // hide it
+    return pointerVisible;
+}
+
+// The right stick's scrolling, under the pointer (or the centre).
+static void stickScroll(WPEDisplayPS5* display, WPEView* view, double rx, double ry, bool pointerVisible)
+{
+    if (!rx && !ry)
+        return;
+    auto* priv = display->priv;
+    const double speed = 14.0; // WebKit multiplies precise deltas by 2.5
+    double px = pointerVisible ? priv->pointerX : wpe_view_get_width(view) / 2.0;
+    double py = pointerVisible ? priv->pointerY : wpe_view_get_height(view) / 2.0;
+    GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
+        static_cast<WPEModifiers>(0), -rx * speed, -ry * speed, TRUE, FALSE, px, py));
+    wpe_view_event(view, event.get());
+}
+
+// ---------------------------------------------------------------- gamepad mode
+
+struct DirectionKey {
+    guint keyval;
+    guint keycode;
+};
+// up, down, left, right
+static const DirectionKey kArrowKeys[4] = { { WPE_KEY_Up, 111 }, { WPE_KEY_Down, 116 }, { WPE_KEY_Left, 113 }, { WPE_KEY_Right, 114 } };
+static const DirectionKey kWASDKeys[4] = { { WPE_KEY_w, 25 }, { WPE_KEY_s, 39 }, { WPE_KEY_a, 38 }, { WPE_KEY_d, 40 } };
+
+static const DirectionKey* directionKeys(WPEDisplayPS5StickAction action)
+{
+    return action == WPE_DISPLAY_PS5_STICK_ARROWS ? kArrowKeys : action == WPE_DISPLAY_PS5_STICK_WASD ? kWASDKeys : nullptr;
+}
+
+// A mouse click at the pointer (a button mapped to WPE_KEY_Pointer_Button1).
+static void pointerButton(WPEDisplayPS5* display, WPEView* view, bool down)
+{
+    auto* priv = display->priv;
+    if (down == priv->pointerDown)
+        return;
+    priv->pointerDown = down;
+    if (down) {
+        if (priv->pointerX == 0 && priv->pointerY == 0) {
+            priv->pointerX = wpe_view_get_width(view) / 2.0;
+            priv->pointerY = wpe_view_get_height(view) / 2.0;
+        }
+        guint count = wpe_view_compute_press_count(view, priv->pointerX, priv->pointerY, WPE_BUTTON_PRIMARY, eventTime());
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, view, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), WPE_MODIFIER_POINTER_BUTTON1, WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, count));
+        wpe_view_event(view, event.get());
+    } else {
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
+        wpe_view_event(view, event.get());
+    }
+}
+
+static void gamepadKey(WPEDisplayPS5* display, WPEView* view, const WPEDisplayPS5ButtonKey& key, bool down)
+{
+    if (key.keyval == WPE_KEY_Pointer_Button1)
+        pointerButton(display, view, down);
+    else
+        sendKey(view, key.keyval, key.keycode, static_cast<WPEModifiers>(0), down);
+}
+
+// What gamepad mode holds down goes up: the page loses the pad, the view or
+// the mapping changes.
+static void releaseGamepadInput(WPEDisplayPS5* display, WPEView* view)
+{
+    auto* priv = display->priv;
+    if (view) {
+        for (const auto& key : priv->gamepadKeys) {
+            if (priv->gamepadKeysDown & key.button)
+                gamepadKey(display, view, key, false);
+        }
+        for (int stick = 0; stick < 2; stick++) {
+            const auto* keys = directionKeys(priv->stickActions[stick]);
+            for (int d = 0; keys && d < 4; d++) {
+                if (priv->stickKeysDown[stick] & (1 << d))
+                    sendKey(view, keys[d].keyval, keys[d].keycode, static_cast<WPEModifiers>(0), false);
+            }
+        }
+    }
+    priv->gamepadKeysDown = 0;
+    priv->stickKeysDown[0] = priv->stickKeysDown[1] = 0;
+    priv->optionsDownAt = -1;
+}
+
+// Gamepad mode with the page holding the pad: the mapped keys, the sticks,
+// and Options held for the application.
+static void gamepadModeTick(WPEDisplayPS5* display, WPEView* view, const PS5PadData& data, uint32_t now, uint32_t pressed, uint32_t released, double t)
+{
+    auto* priv = display->priv;
+    if (pressed & PS5_PAD_OPTIONS) {
+        priv->optionsDownAt = t;
+        priv->optionsHoldSent = false;
+    }
+    if (!(now & PS5_PAD_OPTIONS))
+        priv->optionsDownAt = -1;
+    else if (priv->optionsDownAt >= 0 && !priv->optionsHoldSent && t - priv->optionsDownAt >= optionsHoldFor && priv->buttonHandler) {
+        priv->optionsHoldSent = true;
+        PS5_LOG("pad: Options held in gamepad mode");
+        bool wasUI = priv->uiMode, wasCaptured = priv->padCaptured, wasGamepadMode = priv->gamepadMode;
+        priv->buttonHandler(display, WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD, priv->buttonHandlerData);
+        if (priv->uiMode != wasUI || priv->padCaptured != wasCaptured || priv->activeView != view || priv->gamepadMode != wasGamepadMode)
+            return;
+    }
+
+    uint32_t down = pressed & ~priv->gamepadKeysDown;
+    uint32_t up = released & priv->gamepadKeysDown;
+    for (const auto& key : priv->gamepadKeys) {
+        if (down & key.button) {
+            gamepadKey(display, view, key, true);
+            priv->gamepadKeysDown |= key.button;
+        }
+        if (up & key.button)
+            gamepadKey(display, view, key, false);
+    }
+    priv->gamepadKeysDown &= ~up;
+
+    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
+    bool pointerStick = false;
+    for (int stick = 0; stick < 2; stick++) {
+        uint8_t rawX = data.sticks[stick * 2], rawY = data.sticks[stick * 2 + 1];
+        auto action = priv->stickActions[stick];
+        if (const auto* keys = directionKeys(action)) {
+            // Past half way: the key goes down; back under 0.3: up.
+            double x = (static_cast<int>(rawX) - 128) / 127.0, y = (static_cast<int>(rawY) - 128) / 127.0;
+            const double amount[4] = { -y, y, -x, x };
+            for (int d = 0; d < 4; d++) {
+                bool isDown = priv->stickKeysDown[stick] & (1 << d);
+                bool wanted = amount[d] > (isDown ? 0.3 : 0.5);
+                if (wanted != isDown) {
+                    sendKey(view, keys[d].keyval, keys[d].keycode, static_cast<WPEModifiers>(0), wanted);
+                    priv->stickKeysDown[stick] ^= 1 << d;
+                }
+            }
+        } else if (action == WPE_DISPLAY_PS5_STICK_POINTER) {
+            pointerStick = true;
+            pointerVisible = stickPointer(display, view, stickValue(rawX), stickValue(rawY), t);
+        } else if (action == WPE_DISPLAY_PS5_STICK_SCROLL)
+            stickScroll(display, view, stickValue(rawX), stickValue(rawY), pointerVisible);
+    }
+    if (!pointerStick)
+        stickPointer(display, view, 0, 0, t); // only hides it when its time is up
+}
+
 static void openPad(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
@@ -797,6 +991,12 @@ static void padTick(WPEDisplayPS5* display)
 
     // While the on-screen keyboard is up, the pad belongs to it.
     if (priv->pendingText) {
+        if (priv->gamepad)
+            wpeGamepadPS5SetState(priv->gamepad, 0, nullptr);
+        if (priv->gamepadMode) {
+            releaseGamepadInput(display, view);
+            priv->buttons = 0; // nothing below was sent in gamepad mode
+        }
         // End what the page saw go down: X on a field opens the keyboard
         // while X is still held (the field takes focus on the press), so
         // its release never reached the page, which then kept the button
@@ -844,7 +1044,9 @@ static void padTick(WPEDisplayPS5* display)
         released &= ~swallowedReleases;
         priv->swallowedButtons &= ~swallowedReleases;
     }
-    if (pressed && priv->buttonHandler) {
+    // In gamepad mode the page gets every press (Options held is checked in
+    // gamepadModeTick); the application's UI and View in VR still get them.
+    if (pressed && priv->buttonHandler && (!priv->gamepadMode || priv->uiMode || priv->padCaptured)) {
         bool wasCaptured = priv->padCaptured;
         if (wasCaptured)
             priv->capturedPressAt = t;
@@ -857,6 +1059,14 @@ static void padTick(WPEDisplayPS5* display)
             pressed = 0;
         }
     }
+    // The Gamepad API sees the pad while the page has it (not what the
+    // application took), and everything released while it does not.
+    const bool pageHasPad = !priv->padCaptured && !priv->uiMode;
+    if (priv->gamepad)
+        wpeGamepadPS5SetState(priv->gamepad, pageHasPad ? now & ~priv->swallowedButtons : 0, pageHasPad ? &data : nullptr);
+    if (!pageHasPad && (priv->gamepadKeysDown || priv->stickKeysDown[0] || priv->stickKeysDown[1]))
+        releaseGamepadInput(display, view);
+
     if (priv->padCaptured) {
         priv->repeatingKey = 0;
         if (priv->capturedPadCallback)
@@ -867,40 +1077,14 @@ static void padTick(WPEDisplayPS5* display)
         uiTick(display, data, now, pressed, t);
         return;
     }
-
-    // Left stick: pointer.
-    double sx = stickValue(data.sticks[0]), sy = stickValue(data.sticks[1]);
-    int width = wpe_view_get_width(view), height = wpe_view_get_height(view);
-    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
-    if (sx || sy) {
-        if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
-            priv->pointerX = width / 2.0;
-            priv->pointerY = height / 2.0;
-        }
-        const double speed = 22.0; // px per tick at full deflection
-        double dx = sx * speed, dy = sy * speed;
-        priv->pointerX = std::fmin(std::fmax(priv->pointerX + dx, 0), width - 1);
-        priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, 0), height - 1);
-        priv->pointerMovedAt = t;
-        auto modifiers = priv->pointerDown ? WPE_MODIFIER_POINTER_BUTTON1 : static_cast<WPEModifiers>(0);
-        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
-            eventTime(), modifiers, priv->pointerX, priv->pointerY, dx, dy));
-        wpe_view_event(view, event.get());
-        wpeDisplayPS5ScheduleRedraw(display);
-        pointerVisible = true;
-    } else if (priv->pointerWasVisible && !pointerVisible)
-        wpeDisplayPS5ScheduleRedraw(display); // hide it
-
-    // Right stick: scroll under the pointer (or the centre).
-    double rx = stickValue(data.sticks[2]), ry = stickValue(data.sticks[3]);
-    if (rx || ry) {
-        const double speed = 14.0; // WebKit multiplies precise deltas by 2.5
-        double px = pointerVisible ? priv->pointerX : width / 2.0;
-        double py = pointerVisible ? priv->pointerY : height / 2.0;
-        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
-            static_cast<WPEModifiers>(0), -rx * speed, -ry * speed, TRUE, FALSE, px, py));
-        wpe_view_event(view, event.get());
+    if (priv->gamepadMode) {
+        gamepadModeTick(display, view, data, now, pressed, released, t);
+        return;
     }
+
+    // Left stick: pointer. Right stick: scroll under the pointer (or the centre).
+    bool pointerVisible = stickPointer(display, view, stickValue(data.sticks[0]), stickValue(data.sticks[1]), t);
+    stickScroll(display, view, stickValue(data.sticks[2]), stickValue(data.sticks[3]), pointerVisible);
 
     // Cross: click when the pointer is shown, otherwise Return.
     if (pressed & PS5_PAD_CROSS) {
@@ -1134,6 +1318,11 @@ static WPEInputMethodContext* wpeDisplayPS5CreateInputMethodContext(WPEDisplay*,
     return wpeInputMethodContextPS5New(view);
 }
 
+static WPEGamepadManager* wpeDisplayPS5CreateGamepadManager(WPEDisplay* display)
+{
+    return wpeGamepadManagerPS5New(WPE_DISPLAY_PS5(display));
+}
+
 static void wpe_display_ps5_class_init(WPEDisplayPS5Class* displayPS5Class)
 {
     GObjectClass* objectClass = G_OBJECT_CLASS(displayPS5Class);
@@ -1147,6 +1336,7 @@ static void wpe_display_ps5_class_init(WPEDisplayPS5Class* displayPS5Class)
     displayClass->get_n_screens = wpeDisplayPS5GetNScreens;
     displayClass->get_screen = wpeDisplayPS5GetScreen;
     displayClass->create_input_method_context = wpeDisplayPS5CreateInputMethodContext;
+    displayClass->create_gamepad_manager = wpeDisplayPS5CreateGamepadManager;
 }
 
 /**
@@ -1258,6 +1448,7 @@ void wpe_display_ps5_set_active_view(WPEDisplayPS5* display, WPEView* view)
         return;
     // The old page sees the end of what it was pressed with; held buttons
     // are ignored until released.
+    releaseGamepadInput(display, old);
     if (priv->pointerDown && old) {
         priv->pointerDown = false;
         GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, old, WPE_INPUT_SOURCE_MOUSE,
@@ -1274,6 +1465,113 @@ void wpe_display_ps5_set_active_view(WPEDisplayPS5* display, WPEView* view)
     wpeViewPS5SetActive(view, true);
     wpeDisplayPS5ScheduleRedraw(display);
     PS5_LOG("active view %p (was %p)", view, old);
+}
+
+// ---------------------------------------------------------------- gamepad mode, the Gamepad API
+
+static const char* stickActionName(WPEDisplayPS5StickAction action)
+{
+    switch (action) {
+    case WPE_DISPLAY_PS5_STICK_GAMEPAD: return "gamepad";
+    case WPE_DISPLAY_PS5_STICK_ARROWS: return "arrows";
+    case WPE_DISPLAY_PS5_STICK_WASD: return "wasd";
+    case WPE_DISPLAY_PS5_STICK_POINTER: return "pointer";
+    case WPE_DISPLAY_PS5_STICK_SCROLL: return "scroll";
+    }
+    return "?";
+}
+
+void wpe_display_ps5_set_gamepad_mode(WPEDisplayPS5* display, gboolean enabled, const WPEDisplayPS5ButtonKey* keys, guint keyCount,
+    WPEDisplayPS5StickAction leftStick, WPEDisplayPS5StickAction rightStick)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    g_return_if_fail(keys || !keyCount);
+    auto* priv = display->priv;
+    releaseGamepadInput(display, priv->activeView);
+    if (priv->pointerDown && priv->activeView)
+        pointerButton(display, priv->activeView, false);
+    bool changed = priv->gamepadMode != !!enabled;
+    priv->gamepadMode = enabled;
+    priv->gamepadKeys.assign(keys, keys + keyCount);
+    priv->stickActions[0] = leftStick;
+    priv->stickActions[1] = rightStick;
+    if (changed) {
+        // Neither side sees half a press.
+        priv->ignoredButtons |= priv->buttons;
+        priv->buttons = 0;
+        priv->swallowedButtons = 0;
+        priv->repeatingKey = 0;
+        priv->stickChord = false;
+    }
+    PS5_LOG("gamepad mode %s: %u key(s), left stick %s, right stick %s", enabled ? "on" : "off", keyCount,
+        stickActionName(leftStick), stickActionName(rightStick));
+}
+
+gboolean wpe_display_ps5_get_gamepad_mode(WPEDisplayPS5* display)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return display->priv->gamepadMode;
+}
+
+void wpe_display_ps5_set_gamepad_callback(WPEDisplayPS5* display, WPEDisplayPS5GamepadCallback callback, gpointer userData)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->gamepadCallback = callback;
+    display->priv->gamepadCallbackData = userData;
+}
+
+gboolean wpe_display_ps5_gamepad_in_use(WPEDisplayPS5* display)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return display->priv->gamepad && display->priv->gamepadMonitoring;
+}
+
+void wpeDisplayPS5GamepadCreated(WPEDisplayPS5* display, WPEGamepad* gamepad)
+{
+    display->priv->gamepad = gamepad;
+}
+
+void wpeDisplayPS5GamepadMonitoring(WPEDisplayPS5* display, bool monitoring)
+{
+    auto* priv = display->priv;
+    if (priv->gamepadMonitoring == monitoring)
+        return;
+    priv->gamepadMonitoring = monitoring;
+    PS5_LOG("gamepad: %s", monitoring ? "the page reads the gamepad" : "no page reads the gamepad");
+    if (priv->gamepadCallback)
+        priv->gamepadCallback(display, monitoring, priv->gamepadCallbackData);
+}
+
+void wpeDisplayPS5GamepadGone(WPEDisplayPS5* display, WPEGamepad* gamepad)
+{
+    auto* priv = display->priv;
+    if (priv->gamepad != gamepad)
+        return;
+    wpeDisplayPS5GamepadMonitoring(display, false);
+    priv->gamepad = nullptr;
+    PS5_LOG("gamepad: no page uses gamepads now");
+}
+
+bool wpeDisplayPS5Rumble(WPEDisplayPS5* display, double strong, double weak)
+{
+    auto* priv = display->priv;
+    if (priv->pad < 0 || !scePadSetVibration)
+        return false;
+    if (!priv->vibrationModeSet && scePadSetVibrationMode) {
+        priv->vibrationModeSet = true;
+        int rc = scePadSetVibrationMode(priv->pad, 2);
+        PS5_LOG("gamepad: vibration mode compatible -> 0x%x", static_cast<unsigned>(rc));
+    }
+    const uint8_t motors[2] = {
+        static_cast<uint8_t>(std::lround(std::fmin(1.0, std::fmax(0.0, strong)) * 255)),
+        static_cast<uint8_t>(std::lround(std::fmin(1.0, std::fmax(0.0, weak)) * 255)),
+    };
+    int rc = scePadSetVibration(priv->pad, motors);
+    if (rc || priv->rumbleLogs < 10) {
+        priv->rumbleLogs++;
+        PS5_LOG("gamepad: rumble %u/%u -> 0x%x", motors[0], motors[1], static_cast<unsigned>(rc));
+    }
+    return !rc;
 }
 
 gboolean wpe_display_ps5_get_ui_mode(WPEDisplayPS5* display)

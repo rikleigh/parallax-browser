@@ -22,6 +22,9 @@
 
 /* At start, after browserui.c's init (it gives the active view). */
 void ps5wk_downloads_init(WPEDisplayPS5* display, WebKitNetworkSession* session);
+/* Another session's downloads come here too (private browsing's; the files
+ * and the list are kept as for any download). */
+void ps5wk_downloads_watch_session(WebKitNetworkSession* session);
 
 /* browserui.c's decide-policy for responses: TRUE when the response was
  * made a download (attachment, a type the browser can't show in the main

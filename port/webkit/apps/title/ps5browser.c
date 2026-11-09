@@ -603,6 +603,7 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     if (event == WEBKIT_LOAD_COMMITTED) {
         ps5wk_vr_stop(FALSE, "another page");
         setShownURI(webkit_web_view_get_uri(view));
+        ps5wk_gamepad_page(view, webkit_web_view_get_uri(view)); /* the site's gamepad mode */
     }
     if (event == WEBKIT_LOAD_FINISHED) {
         const char* title = webkit_web_view_get_title(view) ? webkit_web_view_get_title(view) : "";
@@ -1343,6 +1344,7 @@ void ps5wk_set_active_web_view(WebKitWebView* view)
     ps5wk_adblock_set_web_view(view);
     ps5wk_vr_set_web_view(view);
     setShownURI(webkit_web_view_get_uri(view));
+    ps5wk_gamepad_page(view, webkit_web_view_get_uri(view));
 }
 
 /* The browser menu's L3/R3 and Settings links: Settings, unless shown. */
@@ -1539,6 +1541,10 @@ static void settingsServe(int client, const char* from, gboolean loopback, gbool
 {
     if (!strcmp(path, "/settings") && get) {
         pushReplyCORS(client, 200, "text/html; charset=utf-8", ps5wk_settings_page, FALSE);
+        return;
+    }
+    if (!strcmp(path, "/gamepad") && get) { /* its script uses /browser/gamepad */
+        pushReplyCORS(client, 200, "text/html; charset=utf-8", ps5wk_gamepad_page_html, FALSE);
         return;
     }
     gboolean known = (!strcmp(path, "/settings.json") && get)
@@ -1877,7 +1883,7 @@ static gboolean pushServe(int client, const char* from, gboolean loopback)
         *query++ = 0;
     const char* path = target;
     gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
-        || !strcmp(path, "/adblock");
+        || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad");
     gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
 
     if (!strcmp(method, "OPTIONS")) {
@@ -2392,6 +2398,7 @@ int main(int argc, char** argv)
         "website-policies", policies,
         NULL));
     ps5wk_connect_web_view(webView);
+    ps5wk_gamepad_init(WPE_DISPLAY_PS5(display));
     ps5wk_vr_init(display, webView);
     /* After View in VR: the browser's button handler chains it. */
     ps5wk_browser_init(display, webView);

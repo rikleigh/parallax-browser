@@ -1,0 +1,118 @@
+<!doctype html>
+<!-- Gamepad API and gamepad mode check (README: "Gamepad mode"). Shows what
+     the page gets from the DualSense: navigator.getGamepads() (id, mapping,
+     buttons with their values, axes) and the keys and clicks gamepad mode
+     sends, and logs every change as
+       [gamepad] connected <id> mapping <m> buttons <n> axes <n>
+       [gamepad] button <i> <value>   /   [gamepad] axis <i> <value>
+       [gamepad] key down|up <key> <code>   /   [gamepad] click <x>,<y>
+       RESULT gamepad seen <id>; <buttons pressed so far> buttons, axes moved: <list>
+     (the RESULT line after each new button or axis). □ held for 2 s rumbles
+     the controller (vibrationActuator.playEffect "dual-rumble", 600 ms).
+     Upload to /data/ps5webkit/gamepad.html and open
+     file:///data/ps5webkit/gamepad.html (gamepad mode for "Local files"). -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gamepad check</title>
+<style>
+  body { background: #0b0a24; color: #eee; font: 24px/1.4 sans-serif; margin: 40px; }
+  h1 { margin: 0 0 16px; font-size: 34px; }
+  #pad { display: grid; grid-template-columns: repeat(9, 1fr); gap: 8px; max-width: 1400px; }
+  .b { border: 2px solid #3a3680; border-radius: 10px; padding: 8px; text-align: center; min-height: 72px; }
+  .b.on { background: #6d0efd; border-color: #a77bff; }
+  .b small { display: block; color: #b9b5e0; font-size: 18px; }
+  #axes { display: flex; gap: 40px; margin: 24px 0; }
+  .stick { width: 160px; height: 160px; border: 2px solid #3a3680; border-radius: 50%; position: relative; }
+  .dot { width: 24px; height: 24px; border-radius: 50%; background: #0ee3fe; position: absolute; left: 68px; top: 68px; }
+  #keys, #status { white-space: pre; color: #b9b5e0; }
+  #status { color: #fff; font-weight: 600; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<h1>Gamepad check</h1>
+<div id="status">Press a button on the controller.</div>
+<div id="pad"></div>
+<div id="axes"><div class="stick"><div class="dot" id="s0"></div></div><div class="stick"><div class="dot" id="s1"></div></div><div id="trig"></div></div>
+<div id="keys"></div>
+<script>
+const NAMES = ['✕', '○', '□', '△', 'L1', 'R1', 'L2', 'R2', 'Select (touchpad)', 'Options', 'L3', 'R3', '↑', '↓', '←', '→', 'PS'];
+const pad = document.getElementById('pad');
+const cells = NAMES.map((name, i) => {
+  const b = document.createElement('div');
+  b.className = 'b';
+  b.innerHTML = name + '<small>' + i + '</small>';
+  pad.appendChild(b);
+  return b;
+});
+function log(text) { console.log('[gamepad] ' + text); }
+const keyLines = [];
+function keyLine(text) {
+  log(text);
+  keyLines.unshift(text);
+  keyLines.length = Math.min(keyLines.length, 8);
+  document.getElementById('keys').textContent = 'Keys and clicks from gamepad mode:\n' + keyLines.join('\n');
+}
+addEventListener('keydown', e => { if (!e.repeat) keyLine('key down ' + e.key + ' ' + e.code); e.preventDefault(); });
+addEventListener('keyup', e => { keyLine('key up ' + e.key + ' ' + e.code); e.preventDefault(); });
+addEventListener('mousedown', e => keyLine('click ' + e.clientX + ',' + e.clientY));
+addEventListener('gamepadconnected', e => log('gamepadconnected ' + e.gamepad.index + ' ' + e.gamepad.id));
+addEventListener('gamepaddisconnected', e => log('gamepaddisconnected ' + e.gamepad.index));
+
+let id = null, seenButtons = new Set(), movedAxes = new Set(), last = { buttons: [], axes: [] }, squareSince = 0, rumbled = false;
+function result() {
+  log('RESULT gamepad seen ' + id + '; ' + seenButtons.size + ' buttons, axes moved: ' + ([...movedAxes].sort().join(',') || 'none'));
+}
+function frame() {
+  const gp = [...navigator.getGamepads()].find(g => g);
+  if (gp) {
+    if (gp.id !== id) {
+      id = gp.id;
+      log('connected ' + gp.id + ' mapping ' + gp.mapping + ' buttons ' + gp.buttons.length + ' axes ' + gp.axes.length
+        + ' rumble ' + !!(gp.vibrationActuator));
+      document.getElementById('status').textContent = gp.id + ' · mapping ' + (gp.mapping || '(none)');
+    }
+    let changed = false;
+    gp.buttons.forEach((b, i) => {
+      const v = Math.round(b.value * 100) / 100;
+      if (cells[i]) cells[i].classList.toggle('on', b.pressed);
+      if (v !== last.buttons[i]) {
+        last.buttons[i] = v;
+        log('button ' + i + ' ' + v);
+        if (b.pressed && !seenButtons.has(i)) { seenButtons.add(i); changed = true; }
+      }
+    });
+    gp.axes.forEach((a, i) => {
+      const v = Math.round(a * 10) / 10;
+      if (v !== last.axes[i]) {
+        last.axes[i] = v;
+        if (Math.abs(v) >= 0.5 && !movedAxes.has(i)) { movedAxes.add(i); changed = true; log('axis ' + i + ' ' + v); }
+      }
+    });
+    for (let s = 0; s < 2; s++) {
+      const dot = document.getElementById('s' + s);
+      dot.style.left = (68 + gp.axes[s * 2] * 68) + 'px';
+      dot.style.top = (68 + gp.axes[s * 2 + 1] * 68) + 'px';
+    }
+    document.getElementById('trig').textContent = 'L2 ' + gp.buttons[6].value.toFixed(2) + '   R2 ' + gp.buttons[7].value.toFixed(2);
+    if (gp.buttons[2].pressed) {
+      squareSince = squareSince || performance.now();
+      if (!rumbled && performance.now() - squareSince > 2000 && gp.vibrationActuator) {
+        rumbled = true;
+        gp.vibrationActuator.playEffect('dual-rumble', { duration: 600, strongMagnitude: 1, weakMagnitude: 0.6 })
+          .then(r => log('rumble ' + r), e => log('rumble failed ' + e));
+      }
+    } else {
+      squareSince = 0;
+      rumbled = false;
+    }
+    if (changed)
+      result();
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+log('page ready; navigator.getGamepads ' + (navigator.getGamepads ? 'present' : 'missing'));
+</script>
+</body>
+</html>

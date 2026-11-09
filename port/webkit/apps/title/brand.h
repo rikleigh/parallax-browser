@@ -32,6 +32,8 @@
 #define PX_TEXT_OFF 0xff545080u /* disabled */
 #define PX_PINK 0xffff5cd6u     /* magenta lightened for text (7:1): a starred page, a warning */
 #define PX_CYAN_TEXT 0xff7fefffu /* cyan for text: the tab shown */
+#define PX_PRIVATE_BAR 0xff1d0626u   /* the bar in private browsing (plum) */
+#define PX_PRIVATE_BAR_2 0xff2a0a3au
 
 /* ---- focus and selection: the back pane to the front one */
 #define PX_FOCUS_FROM PX_VIOLET
