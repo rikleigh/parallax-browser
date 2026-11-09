@@ -1,0 +1,692 @@
+diff --git a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+index d5dff1c013..54456e194f 100644
+--- a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
++++ b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+@@ -434,6 +434,23 @@ static GraphicsContextGLAttributes resolveGraphicsContextGLAttributes(const WebG
+     return glAttributes;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: which page, frame and canvas each WebGL context belongs to and how long it lives, to tell
++// a page's contexts apart in the title's per-context lines ("[webgl] title:   context ...").
++namespace {
++struct PS5ContextOrigin {
++    MonotonicTime created;
++    String where;
++};
++Lock ps5ContextOriginsLock;
++HashMap<const void*, PS5ContextOrigin>& ps5ContextOrigins() WTF_REQUIRES_LOCK(ps5ContextOriginsLock)
++{
++    static NeverDestroyed<HashMap<const void*, PS5ContextOrigin>> origins;
++    return origins.get();
++}
++}
++#endif
++
+ std::unique_ptr<WebGLRenderingContextBase> WebGLRenderingContextBase::create(CanvasBase& canvas, WebGLContextAttributes attributes, WebGLVersion type)
+ {
+     RefPtr scriptExecutionContext = canvas.scriptExecutionContext();
+@@ -472,6 +489,19 @@ std::unique_ptr<WebGLRenderingContextBase> WebGLRenderingContextBase::create(Can
+     renderingContext->updateMemoryCost();
+     if (!initialized)
+         renderingContext->forceContextLost();
++#if defined(PS5_PAYLOAD_SDK)
++    {
++        const char* frame = "a worker";
++        if (RefPtr document = dynamicDowncast<Document>(*scriptExecutionContext))
++            frame = document->frame() && document->frame()->isMainFrame() ? "the main frame" : "a subframe";
++        auto size = canvas.size();
++        String where = makeString("WebGL "_s, isWebGL2 ? 2 : 1, " context for "_s, scriptExecutionContext->url().host(), " ("_s, String::fromLatin1(frame), ", "_s,
++            canvasElement ? (canvasElement->isConnected() ? "canvas in the document"_s : "canvas not in the document"_s) : "OffscreenCanvas"_s, ' ', size.width(), 'x', size.height(), ')');
++        WTFLogAlways("[webgl] page: %s", where.utf8().data());
++        Locker locker { ps5ContextOriginsLock };
++        ps5ContextOrigins().set(renderingContext.get(), PS5ContextOrigin { MonotonicTime::now(), WTF::move(where) });
++    }
++#endif
+     return renderingContext;
+ }
+ 
+@@ -672,6 +702,13 @@ WebGLRenderingContextBase::~WebGLRenderingContextBase()
+     // Currently the extensions are not part of the weak ptr object graph. Lose them explicitly.
+     loseExtensions(LostContextMode::RealLostContext);
+     destroyGraphicsContextGL();
++#if defined(PS5_PAYLOAD_SDK)
++    {
++        Locker locker { ps5ContextOriginsLock };
++        if (auto origin = ps5ContextOrigins().take(this); !origin.where.isNull())
++            WTFLogAlways("[webgl] page: %s gone after %.1f s", origin.where.utf8().data(), (MonotonicTime::now() - origin.created).seconds());
++    }
++#endif
+ 
+     {
+         Locker locker { WebGLProgram::instancesLock() };
+diff --git a/Source/WebCore/html/canvas/WebGLSync.cpp b/Source/WebCore/html/canvas/WebGLSync.cpp
+index b3beb2b1ae..e12e30c0b8 100644
+--- a/Source/WebCore/html/canvas/WebGLSync.cpp
++++ b/Source/WebCore/html/canvas/WebGLSync.cpp
+@@ -32,6 +32,9 @@
+ #include "WebGLRenderingContextBase.h"
+ #include <wtf/Lock.h>
+ #include <wtf/Locker.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include <unistd.h>
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -79,6 +82,24 @@ void WebGLSync::updateCache(WebGLRenderingContextBase& context)
+         return;
+ 
+     m_allowCacheUpdate = false;
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: the context is remote (in the title) and its commands run in
++    // order, so asking for the status means waiting behind every command
++    // sent so far: ~10-15 ms per query, and engines (Unity) query a fence
++    // every frame (half the main thread's time at 60 fps). The page cannot
++    // see GPU results except through commands queued after the fence
++    // (readPixels, getBufferSubData, ...), which the driver orders after the
++    // fence's work itself, so a fence one task old reads as signaled here
++    // without the round trip; within its own task it stays unsignaled, as
++    // WebGL requires. /data/ps5webkit/webgl-sync-query asks the title again.
++    static int askTitle = -1;
++    if (askTitle < 0)
++        askTitle = !access("/data/ps5webkit/webgl-sync-query", F_OK);
++    if (!askTitle) {
++        m_syncStatus = GraphicsContextGL::SIGNALED;
++        return;
++    }
++#endif
+     m_syncStatus = protect(context.graphicsContextGL())->getSynci(m_sync, GraphicsContextGL::SYNC_STATUS);
+     if (m_syncStatus == GraphicsContextGL::UNSIGNALED)
+         scheduleAllowCacheUpdate(context);
+diff --git a/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp b/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp
+index e8b03b554d..1b2ee24bf0 100644
+--- a/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp
++++ b/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp
+@@ -2773,11 +2773,40 @@ void GraphicsContextGLANGLE::waitSync(GCGLsync sync, GCGLbitfield flags, GCGLint
+ GCGLint GraphicsContextGLANGLE::getSynci(GCGLsync sync, GCGLenum pname)
+ {
+     GCGLint value = 0;
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: how long a sync status query takes here, in the title (the
++    // WebProcess waits for it): "[webgl] title: getSynci N in 5 s, current
++    // X ms, GetSynciv Y ms (max Z)". A slow query is the driver's lock.
++    static unsigned ps5Count;
++    static double ps5CurrentMs, ps5QueryMs, ps5MaxMs;
++    static MonotonicTime ps5Period;
++    auto ps5Start = MonotonicTime::now();
++    if (!ps5Period)
++        ps5Period = ps5Start;
++    bool current = makeContextCurrent();
++    auto ps5Current = MonotonicTime::now();
++    if (current)
++        GL_GetSynciv(static_cast<GLsync>(sync), pname, 1, nullptr, &value);
++    auto ps5End = MonotonicTime::now();
++    ps5Count++;
++    ps5CurrentMs += (ps5Current - ps5Start).milliseconds();
++    ps5QueryMs += (ps5End - ps5Current).milliseconds();
++    ps5MaxMs = std::max(ps5MaxMs, (ps5End - ps5Start).milliseconds());
++    if (ps5End - ps5Period >= 5_s) {
++        WTFLogAlways("[webgl] title: getSynci %u in %.1f s, making the context current %.1f ms, GetSynciv %.1f ms (max %.1f ms per call)",
++            ps5Count, (ps5End - ps5Period).seconds(), ps5CurrentMs, ps5QueryMs, ps5MaxMs);
++        ps5Count = 0;
++        ps5CurrentMs = ps5QueryMs = ps5MaxMs = 0;
++        ps5Period = ps5End;
++    }
++    return value;
++#else
+     if (!makeContextCurrent())
+         return value;
+ 
+     GL_GetSynciv(static_cast<GLsync>(sync), pname, 1, nullptr, &value);
+     return value;
++#endif
+ }
+ 
+ void GraphicsContextGLANGLE::pauseTransformFeedback()
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+index a13de77212..6cfae4351a 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.h
+@@ -132,6 +132,25 @@ protected:
+ #if defined(PS5_PAYLOAD_SDK)
+     // PS5: RemoteGraphicsContextGLPS5.cpp.
+     void copyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, uint32_t internalFormat, uint32_t format, uint32_t type, bool flipY);
++    // fenceSync without a round trip: the page names the sync (a handle it
++    // picks), the title keeps the handle's GL sync for the other sync calls.
++    void fenceSyncPS5(uint64_t handle, uint32_t condition, uint32_t flags);
++    GCGLsync ps5Sync(uint64_t handle);
++    // PrepareForDisplay without the answer (/data/ps5webkit/webgl-async-display).
++    void prepareForDisplayPS5();
++    // Which context the WebGL thread works for (RemoteGraphicsContextGLPS5.cpp logs it).
++    void ps5NoteBatchCPU(double ms) final { m_ps5Stats.batchCPU += ms; }
++    struct PS5ContextStats {
++        MonotonicTime created;
++        bool webGL2 { false };
++        unsigned frames { 0 };
++        double batchCPU { 0 };
++        int width { 0 };
++        int height { 0 };
++        unsigned loggedFrames { 0 };
++        double loggedCPU { 0 };
++    };
++    PS5ContextStats m_ps5Stats;
+ #endif
+     void getErrors(CompletionHandler<void(GCGLErrorCodeSet)>&&);
+     void copyNativeImage(WebCore::GraphicsContextGL::SurfaceBuffer, RemoteNativeImageReference);
+@@ -195,6 +214,9 @@ protected:
+     ScopedWebGLRenderingResourcesRequest m_renderingResourcesRequest;
+     SharedPreferencesForWebProcess m_sharedPreferencesForWebProcess;
+     HashMap<uint32_t, PlatformGLObject, IntHash<uint32_t>, WTF::UnsignedWithZeroKeyHashTraits<uint32_t>> m_objectNames;
++#if defined(PS5_PAYLOAD_SDK)
++    HashMap<uint64_t, GCGLsync> m_ps5Syncs; // the page's sync handle -> its GL sync (fenceSyncPS5)
++#endif
+     std::optional<uint64_t> m_estimatedMemoryCost WTF_GUARDED_BY_CAPABILITY(workQueue());
+     bool m_memoryCostUpdateScheduled WTF_GUARDED_BY_CAPABILITY(workQueue()) { false };
+ };
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+index af26925769..d7d9657513 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGL.messages.in
+@@ -45,6 +45,8 @@ messages -> RemoteGraphicsContextGL Stream {
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
+     void CopyTextureFromVideoStreamPS5(uint64_t streamKey, PlatformGLObject texture, uint32_t internalFormat, uint32_t format, uint32_t type, bool flipY)
++    void FenceSyncPS5(uint64_t handle, uint32_t condition, uint32_t flags)
++    void PrepareForDisplayPS5()
+ #endif
+     void EnsureExtensionEnabled(WebCore::GCGLExtension extension) StreamBatched
+     void GetErrors() -> (GCGLErrorCodeSet returnValue) Synchronous
+diff --git a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGLFunctionsGenerated.cpp b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGLFunctionsGenerated.cpp
+index 15cb1ec055..225f5f0797 100644
+--- a/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGLFunctionsGenerated.cpp
++++ b/Source/WebKit/GPUProcess/graphics/RemoteGraphicsContextGLFunctionsGenerated.cpp
+@@ -33,6 +33,12 @@
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL)
+ 
+ #define MESSAGE_CHECK(assertion) MESSAGE_CHECK_BASE(assertion, m_connection);
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: the page's sync handles (fenceSyncPS5, RemoteGraphicsContextGLPS5.cpp).
++#define PS5_SYNC(handle) ps5Sync(handle)
++#else
++#define PS5_SYNC(handle) reinterpret_cast<GCGLsync>(static_cast<intptr_t>(handle))
++#endif
+ 
+ namespace WebKit {
+ using namespace WebCore;
+@@ -1559,35 +1565,39 @@ void RemoteGraphicsContextGL::isSync(uint64_t arg0, CompletionHandler<void(bool)
+ {
+     assertIsCurrent(workQueue());
+     GCGLboolean returnValue = { };
+-    returnValue = protect(m_context)->isSync(reinterpret_cast<GCGLsync>(static_cast<intptr_t>(arg0)));
++    returnValue = protect(m_context)->isSync(PS5_SYNC(arg0));
+     completionHandler(static_cast<bool>(returnValue));
+ }
+ 
+ void RemoteGraphicsContextGL::deleteSync(uint64_t arg0)
+ {
+     assertIsCurrent(workQueue());
+-    protect(m_context)->deleteSync(reinterpret_cast<GCGLsync>(static_cast<intptr_t>(arg0)));
++#if defined(PS5_PAYLOAD_SDK)
++    protect(m_context)->deleteSync(m_ps5Syncs.isValidKey(arg0) ? m_ps5Syncs.take(arg0) : nullptr);
++#else
++    protect(m_context)->deleteSync(PS5_SYNC(arg0));
++#endif
+ }
+ 
+ void RemoteGraphicsContextGL::clientWaitSync(uint64_t arg0, uint32_t flags, uint64_t timeout, CompletionHandler<void(uint32_t)>&& completionHandler)
+ {
+     assertIsCurrent(workQueue());
+     GCGLenum returnValue = { };
+-    returnValue = protect(m_context)->clientWaitSync(reinterpret_cast<GCGLsync>(static_cast<intptr_t>(arg0)), flags, static_cast<GCGLuint64>(timeout));
++    returnValue = protect(m_context)->clientWaitSync(PS5_SYNC(arg0), flags, static_cast<GCGLuint64>(timeout));
+     completionHandler(returnValue);
+ }
+ 
+ void RemoteGraphicsContextGL::waitSync(uint64_t arg0, uint32_t flags, int64_t timeout)
+ {
+     assertIsCurrent(workQueue());
+-    protect(m_context)->waitSync(reinterpret_cast<GCGLsync>(static_cast<intptr_t>(arg0)), flags, static_cast<GCGLint64>(timeout));
++    protect(m_context)->waitSync(PS5_SYNC(arg0), flags, static_cast<GCGLint64>(timeout));
+ }
+ 
+ void RemoteGraphicsContextGL::getSynci(uint64_t arg0, uint32_t pname, CompletionHandler<void(int32_t)>&& completionHandler)
+ {
+     assertIsCurrent(workQueue());
+     GCGLint returnValue = { };
+-    returnValue = protect(m_context)->getSynci(reinterpret_cast<GCGLsync>(static_cast<intptr_t>(arg0)), pname);
++    returnValue = protect(m_context)->getSynci(PS5_SYNC(arg0), pname);
+     completionHandler(returnValue);
+ }
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+index 04060e064a..ba04ac6c3c 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -13,6 +13,7 @@
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
+ 
+ #include "GPUConnectionToWebProcess.h"
++#include "Logging.h"
+ #include "PS5WebGLLayers.h"
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/GraphicsContextGLCoordinated.h>
+@@ -23,11 +24,16 @@
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
++#define MESSAGE_CHECK(assertion) MESSAGE_CHECK_BASE(assertion, m_connection);
++
+ // PS5 ANGLE (Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp).
+ extern "C" unsigned ANGLE_PS5PrepareExternalTexture2D(unsigned name, int width, int height, unsigned internalFormat, unsigned format, unsigned type);
+ 
+ namespace WebKit {
+ 
++// Each live context's line (RemoteGraphicsContextGLPS5::logStats), after the frame line.
++void logContextStats(double seconds);
++
+ namespace {
+ 
+ // Hands each frame's buffer (GraphicsContextGLCoordinated::prepareForDisplay)
+@@ -137,6 +143,7 @@ void noteFrame()
+         auto layers = PS5WebGLLayers::stats();
+         WTFLogAlways("[webgl] title: %.1f frames/s; the WebGL thread %.2f ms CPU per frame (max %.1f), %.0f%% of a core; %u contexts, drawing buffers ~%.1f MB",
+             stats.frames / seconds, stats.windowCPU / stats.frames, stats.maxCPU, stats.windowCPU / (seconds * 10), layers.contexts, layers.drawingBufferBytes / 1048576.0);
++        logContextStats(seconds);
+     }
+     // A longer gap (no frames for a while): a new window without a line.
+     stats.windowCPU = 0;
+@@ -158,16 +165,64 @@ public:
+     {
+     }
+ 
++    ~RemoteGraphicsContextGLPS5();
++
++    // Each live context's frames and WebGL thread time since the last line, with the frame line.
++    static void logStats(double seconds);
++
+ private:
+     void platformWorkQueueInitialize(WebCore::GraphicsContextGLAttributes&&) final;
+     void didRunOutOfMessages() final;
+ 
++    static Lock s_registryLock;
++    static HashSet<RemoteGraphicsContextGLPS5*>& registry() WTF_REQUIRES_LOCK(s_registryLock);
++
+     const WebCore::ProcessIdentifier m_webProcess;
+     const uint64_t m_key;
+ };
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RemoteGraphicsContextGLPS5);
+ 
++Lock RemoteGraphicsContextGLPS5::s_registryLock;
++
++HashSet<RemoteGraphicsContextGLPS5*>& RemoteGraphicsContextGLPS5::registry()
++{
++    static NeverDestroyed<HashSet<RemoteGraphicsContextGLPS5*>> contexts;
++    return contexts.get();
++}
++
++RemoteGraphicsContextGLPS5::~RemoteGraphicsContextGLPS5()
++{
++    bool registered;
++    {
++        Locker locker { s_registryLock };
++        registered = registry().remove(this);
++    }
++    if (registered) {
++        WTFLogAlways("[webgl] title: context %llu (WebGL %d) gone after %.1f s: %u frames, %.0f ms of the WebGL thread",
++            static_cast<unsigned long long>(m_key), m_ps5Stats.webGL2 ? 2 : 1, (MonotonicTime::now() - m_ps5Stats.created).seconds(), m_ps5Stats.frames, m_ps5Stats.batchCPU);
++    }
++}
++
++void RemoteGraphicsContextGLPS5::logStats(double seconds)
++{
++    Locker locker { s_registryLock };
++    auto now = MonotonicTime::now();
++    for (auto* context : registry()) {
++        auto& stats = context->m_ps5Stats;
++        WTFLogAlways("[webgl] title:   context %llu (WebGL %d, %dx%d, %.0f s old): %u frames, %.1f ms of the WebGL thread per second",
++            static_cast<unsigned long long>(context->m_key), stats.webGL2 ? 2 : 1, stats.width, stats.height, (now - stats.created).seconds(),
++            stats.frames - stats.loggedFrames, (stats.batchCPU - stats.loggedCPU) / seconds);
++        stats.loggedFrames = stats.frames;
++        stats.loggedCPU = stats.batchCPU;
++    }
++}
++
++void logContextStats(double seconds)
++{
++    RemoteGraphicsContextGLPS5::logStats(seconds);
++}
++
+ void RemoteGraphicsContextGLPS5::platformWorkQueueInitialize(WebCore::GraphicsContextGLAttributes&& attributes)
+ {
+     assertIsCurrent(workQueue());
+@@ -181,6 +236,10 @@ void RemoteGraphicsContextGLPS5::platformWorkQueueInitialize(WebCore::GraphicsCo
+         return;
+     }
+     WTFLogAlways("[webgl] title: ANGLE context %llu for WebGL %d, max texture %d", static_cast<unsigned long long>(m_key), webGL2 ? 2 : 1, m_context->maxTextureSize());
++    m_ps5Stats.created = MonotonicTime::now();
++    m_ps5Stats.webGL2 = webGL2;
++    Locker locker { s_registryLock };
++    registry().add(this);
+ }
+ 
+ void RemoteGraphicsContextGLPS5::didRunOutOfMessages()
+@@ -193,6 +252,14 @@ void RemoteGraphicsContextGLPS5::didRunOutOfMessages()
+ // The display round trip (RemoteGraphicsContextGLProxyPS5): the frame is
+ // finished and its buffer handed to the context's PS5WebGLLayer.
+ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& completionHandler)
++{
++    prepareForDisplayPS5();
++    completionHandler();
++}
++
++// The same without the round trip: the page goes on while the title finishes
++// the frame (the stream's buffer is what keeps it from getting far ahead).
++void RemoteGraphicsContextGL::prepareForDisplayPS5()
+ {
+     assertIsCurrent(workQueue());
+     static unsigned frames;
+@@ -202,11 +269,14 @@ void RemoteGraphicsContextGL::prepareForDisplay(CompletionHandler<void()>&& comp
+         // compositor (WebGL 1 contexts get no fence: ES 2 has no GL syncs).
+         context->flush();
+         static_cast<GraphicsContextGLPS5&>(*context).updateDrawingBufferBytes();
++        auto size = context->getInternalFramebufferSize();
++        m_ps5Stats.frames++;
++        m_ps5Stats.width = size.width();
++        m_ps5Stats.height = size.height();
+         noteFrame();
+         if (!frames++)
+             WTFLogAlways("[webgl] title: first frame finished");
+     }
+-    completionHandler();
+ }
+ 
+ // texImage2D(video) for a hardware-decoded video (M3): the title's newest
+@@ -254,6 +324,31 @@ void RemoteGraphicsContextGL::copyTextureFromVideoStreamPS5(uint64_t streamKey,
+         WTFLogAlways("[webgl] title: first video frame copied into a WebGL texture: %s 0x%x, %dx%d%s", call, formatShown, width, height, flipY ? ", flipped" : "");
+ }
+ 
++// fenceSync without the round trip (RemoteGraphicsContextGLProxyPS5): the
++// page picks the sync's handle, so it needs no answer. Engines make a fence
++// every frame; answering it meant the page waiting for all the frame's work
++// to get through the stream (6-12 ms a frame).
++void RemoteGraphicsContextGL::fenceSyncPS5(uint64_t handle, uint32_t condition, uint32_t flags)
++{
++    assertIsCurrent(workQueue());
++    MESSAGE_CHECK(m_ps5Syncs.isValidKey(handle) && !m_ps5Syncs.contains(handle));
++    RefPtr context = m_context;
++    if (!context)
++        return;
++    if (GCGLsync sync = context->fenceSync(condition, flags))
++        m_ps5Syncs.add(handle, sync);
++}
++
++// The GL sync of one of the page's handles, null for one the title has not
++// got (its fenceSync failed, or it was deleted): GL then reports the error.
++GCGLsync RemoteGraphicsContextGL::ps5Sync(uint64_t handle)
++{
++    assertIsCurrent(workQueue());
++    if (!m_ps5Syncs.isValidKey(handle))
++        return nullptr;
++    return m_ps5Syncs.get(handle);
++}
++
+ Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& connection, WebCore::GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+ {
+     auto instance = adoptRef(*new RemoteGraphicsContextGLPS5(connection, identifier, renderingBackend, WTF::move(streamConnection)));
+diff --git a/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp b/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp
+index 38f3158a3b..18150723de 100644
+--- a/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp
++++ b/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp
+@@ -31,6 +31,10 @@
+ #endif
+ #include <wtf/Borrow.h>
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include <time.h>
++#endif
++
+ namespace IPC {
+ 
+ StreamConnectionWorkQueue::StreamConnectionWorkQueue(ASCIILiteral name)
+@@ -156,8 +160,21 @@ void StreamConnectionWorkQueue::processStreams()
+             WTF::move(function)();
+ 
+         hasMoreToProcess = false;
+-        for (auto& connection : borrow(connections))
++        for (auto& connection : borrow(connections)) {
++#if defined(PS5_PAYLOAD_SDK)
++            // PS5: which client (WebGL context) the thread's time goes to.
++            auto threadCPU = [] {
++                struct timespec ts;
++                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++                return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++            };
++            double start = threadCPU();
++#endif
+             hasMoreToProcess |= connection->dispatchStreamMessages(defaultMessageLimit) == StreamServerConnection::HasMoreMessages;
++#if defined(PS5_PAYLOAD_SDK)
++            connection->ps5NoteBatchCPU(threadCPU() - start);
++#endif
++        }
+     } while (hasMoreToProcess);
+ }
+ 
+diff --git a/Source/WebKit/Platform/IPC/StreamServerConnection.h b/Source/WebKit/Platform/IPC/StreamServerConnection.h
+index 63c42f50a4..962ec01aea 100644
+--- a/Source/WebKit/Platform/IPC/StreamServerConnection.h
++++ b/Source/WebKit/Platform/IPC/StreamServerConnection.h
+@@ -69,6 +69,10 @@ class StreamServerConnectionClient : public StreamMessageReceiver, public CanMak
+ public:
+     virtual void didReceiveInvalidMessage(StreamServerConnection&, MessageName, const Vector<uint32_t>& indicesOfObjectsFailingDecoding) = 0;
+     virtual void didRunOutOfMessages() { }
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: the work queue thread's CPU time for one batch of this client's messages.
++    virtual void ps5NoteBatchCPU(double /* ms */) { }
++#endif
+ 
+ protected:
+     virtual ~StreamServerConnectionClient() = default;
+@@ -109,6 +113,13 @@ public:
+         HasNoMessages,
+         HasMoreMessages
+     };
++#if defined(PS5_PAYLOAD_SDK)
++    void ps5NoteBatchCPU(double ms)
++    {
++        if (CheckedPtr client = m_client)
++            client->ps5NoteBatchCPU(ms);
++    }
++#endif
+     DispatchResult dispatchStreamMessages(size_t messageLimit);
+     void LEGACY_NODELETE markCurrentlyDispatchedMessageAsInvalid(ASCIILiteral error);
+     void LEGACY_NODELETE markCurrentlyDispatchedMessageAsInvalid(const String&);
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxy.h b/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxy.h
+index 8baf96084b..0d15cb2fb7 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxy.h
++++ b/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxy.h
+@@ -405,8 +405,19 @@ protected:
+     template<typename T>
+     [[nodiscard]] IPC::Connection::SendSyncResult<T> sendSync(T&& message)
+     {
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: each of these waits for the title's WebGL thread (ps5NoteSyncCall).
++        auto start = MonotonicTime::now();
++        auto result = protect(m_streamConnection)->sendSync(std::forward<T>(message), m_identifier);
++        ps5NoteSyncCall(static_cast<unsigned>(T::name()), MonotonicTime::now() - start);
++        return result;
++#else
+         return protect(m_streamConnection)->sendSync(std::forward<T>(message), m_identifier);
++#endif
+     }
++#if defined(PS5_PAYLOAD_SDK)
++    static void ps5NoteSyncCall(unsigned messageName, Seconds waited);
++#endif
+ 
+     RemoteGraphicsContextGLIdentifier m_identifier { RemoteGraphicsContextGLIdentifier::generate() };
+     bool m_hasPreparedForDisplay { false };
+@@ -450,6 +461,9 @@ private:
+     GCGLint m_maxArrayTextureLayers { 0 };
+     std::optional<size_t> m_estimatedMemoryCost;
+     uint32_t m_nextObjectName { 0 };
++#if defined(PS5_PAYLOAD_SDK)
++    uint64_t m_ps5NextSyncHandle { 0 }; // fenceSync's handles (the title's FenceSyncPS5)
++#endif
+     WebCore::ColorSpace m_drawingBufferColorSpace { WebCore::ColorSpace::SRGB() };
+     WeakPtr<RemoteRenderingBackendProxy> m_renderingBackend;
+     const RefPtr<RemoteSharedResourceCacheProxy> m_sharedResourceCache;
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxyFunctionsGenerated.cpp b/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxyFunctionsGenerated.cpp
+index e27006f307..807c21b676 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxyFunctionsGenerated.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/RemoteGraphicsContextGLProxyFunctionsGenerated.cpp
+@@ -2367,6 +2367,16 @@ GCGLsync RemoteGraphicsContextGLProxy::fenceSync(GCGLenum condition, GCGLbitfiel
+ {
+     if (isContextLost())
+         return { };
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: the page names the sync, so nothing waits for the title (its
++    // fenceSyncPS5 keeps the GL sync under this handle).
++    uint64_t handle = ++m_ps5NextSyncHandle;
++    if (send(Messages::RemoteGraphicsContextGL::FenceSyncPS5(handle, condition, flags)) != IPC::Error::NoError) {
++        markContextLost();
++        return { };
++    }
++    return reinterpret_cast<GCGLsync>(static_cast<intptr_t>(handle));
++#else
+     auto sendResult = sendSync(Messages::RemoteGraphicsContextGL::FenceSync(condition, flags));
+     if (!sendResult.succeeded()) {
+         markContextLost();
+@@ -2374,6 +2384,7 @@ GCGLsync RemoteGraphicsContextGLProxy::fenceSync(GCGLenum condition, GCGLbitfiel
+     }
+     auto& [returnValue] = sendResult.reply();
+     return reinterpret_cast<GCGLsync>(static_cast<intptr_t>(returnValue));
++#endif
+ }
+ 
+ GCGLboolean RemoteGraphicsContextGLProxy::isSync(GCGLsync arg0)
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+index 5db83c0697..b4a1f8545a 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+@@ -11,8 +11,15 @@
+ 
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
+ 
++#include "MessageNames.h"
+ #include "RemoteGraphicsContextGLMessages.h"
+ #include <WebCore/GraphicsLayerContentsDisplayDelegate.h>
++#include <algorithm>
++#include <unistd.h>
++#include <wtf/HashMap.h>
++#include <wtf/Lock.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/text/StringBuilder.h>
+ #include <wtf/text/WTFString.h>
+ 
+ namespace WebKit {
+@@ -40,11 +47,68 @@ private:
+ 
+ } // namespace
+ 
++// Synchronous WebGL calls (getError, getParameter, compile/link status,
++// readPixels, ...): each one waits for the title's WebGL thread to get to it
++// and answer. Every 5 s with any: "[webgl] sync calls: N in 5.0 s, X ms
++// waiting (Y% of the time); slowest kinds: Name count/ms/max ...".
++// /data/ps5webkit/no-webgl-sync-log turns the line off.
++void RemoteGraphicsContextGLProxy::ps5NoteSyncCall(unsigned messageName, Seconds waited)
++{
++    struct Kind {
++        unsigned count { 0 };
++        double ms { 0 };
++        double maxMs { 0 };
++    };
++    static Lock lock;
++    static NeverDestroyed<HashMap<unsigned, Kind, IntHash<unsigned>, WTF::UnsignedWithZeroKeyHashTraits<unsigned>>> kinds;
++    static MonotonicTime periodStart;
++    static int enabled = -1;
++    if (enabled < 0)
++        enabled = access("/data/ps5webkit/no-webgl-sync-log", F_OK) ? 1 : 0;
++    if (!enabled)
++        return;
++
++    Locker locker { lock };
++    auto now = MonotonicTime::now();
++    if (!periodStart)
++        periodStart = now;
++    double ms = waited.milliseconds();
++    auto& kind = kinds->add(messageName, Kind { }).iterator->value;
++    kind.count++;
++    kind.ms += ms;
++    kind.maxMs = std::max(kind.maxMs, ms);
++
++    Seconds period = now - periodStart;
++    if (period < 5_s)
++        return;
++    unsigned total = 0;
++    double totalMs = 0;
++    Vector<std::pair<unsigned, Kind>> sorted;
++    for (auto& entry : kinds.get()) {
++        total += entry.value.count;
++        totalMs += entry.value.ms;
++        sorted.append({ entry.key, entry.value });
++    }
++    std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });
++    StringBuilder top;
++    for (size_t i = 0; i < sorted.size() && i < 6; i++) {
++        auto& [name, k] = sorted[i];
++        top.append(' ', IPC::description(static_cast<IPC::MessageName>(name)), ' ', k.count, '/', static_cast<int>(k.ms), "ms/max "_s, static_cast<int>(k.maxMs), "ms"_s);
++    }
++    WTFLogAlways("[webgl] sync calls: %u in %.1f s, %.0f ms waiting (%.0f%% of the time); slowest kinds:%s",
++        total, period.seconds(), totalMs, 100 * totalMs / period.milliseconds(), top.toString().utf8().data());
++    kinds->clear();
++    periodStart = now;
++}
++
+ class RemoteGraphicsContextGLProxyPS5 final : public RemoteGraphicsContextGLProxy {
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(RemoteGraphicsContextGLProxyPS5);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(RemoteGraphicsContextGLProxyPS5);
+ public:
+-    virtual ~RemoteGraphicsContextGLProxyPS5() = default;
++    virtual ~RemoteGraphicsContextGLProxyPS5()
++    {
++        WTFLogAlways("[webgl] remote context %llu gone: %u frames", static_cast<unsigned long long>(m_identifier.toUInt64()), m_frames);
++    }
+ 
+ private:
+     friend class RemoteGraphicsContextGLProxy;
+@@ -52,7 +116,7 @@ private:
+         : RemoteGraphicsContextGLProxy(attributes, renderingBackend)
+         , m_layerDelegate(WebGLLayerDelegatePS5::create(m_identifier.toUInt64()))
+     {
+-        WTFLogAlways("[webgl] remote context: WebGL %d, alpha %d", attributes.isWebGL2 ? 2 : 1, attributes.alpha);
++        WTFLogAlways("[webgl] remote context %llu: WebGL %d, alpha %d", static_cast<unsigned long long>(m_identifier.toUInt64()), attributes.isWebGL2 ? 2 : 1, attributes.alpha);
+     }
+ 
+     // WebCore::GraphicsContextGL
+@@ -82,6 +146,25 @@ void RemoteGraphicsContextGLProxyPS5::prepareForDisplay()
+ {
+     if (isContextLost())
+         return;
++    // /data/ps5webkit/webgl-async-display: the page does not wait for the
++    // title to finish the frame (the compositor shows the newest finished one).
++    static int async = -1;
++    if (async < 0) {
++        async = !access("/data/ps5webkit/webgl-async-display", F_OK);
++        if (async)
++            WTFLogAlways("[webgl] frames are handed to the title without waiting (/data/ps5webkit/webgl-async-display)");
++    }
++    if (async) {
++        if (send(Messages::RemoteGraphicsContextGL::PrepareForDisplayPS5()) != IPC::Error::NoError) {
++            WTFLogAlways("[webgl] PrepareForDisplay failed: the stream to the title is gone");
++            markContextLost();
++            return;
++        }
++        if (!m_frames++)
++            WTFLogAlways("[webgl] first frame prepared for display");
++        m_hasPreparedForDisplay = true;
++        return;
++    }
+     auto sendResult = sendSync(Messages::RemoteGraphicsContextGL::PrepareForDisplay());
+     if (!sendResult.succeeded()) {
+         WTFLogAlways("[webgl] PrepareForDisplay failed: the stream to the title is gone");

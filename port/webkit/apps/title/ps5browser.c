@@ -412,6 +412,38 @@ static gboolean testOnload(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* /data/ps5webkit/debug-dialogs (a file, any contents; read at startup): log
+ * every alert()/confirm()/prompt() call in every frame, with its message and
+ * the JS stack, as a console warning "[ps5wk-dialog] ...". It catches calls
+ * to a page's own replacement too: window.alert becomes an accessor that
+ * wraps whatever function the page assigns, then calls it as before. A page
+ * that swaps alert() for its own "the game crashed" handler never reaches
+ * the browser's dialog, so only this shows what the call was. */
+static const char debugDialogsSource[] =
+    "(function(){try{['alert','confirm','prompt'].forEach(function(name){"
+    "function wrap(f){if(typeof f!=='function')return f;return function(){"
+    "try{var m=arguments.length?String(arguments[0]):'';var s=(new Error()).stack||'';"
+    "console.warn('[ps5wk-dialog] '+name+' in '+location.host+(window===top?'':' (frame)')+': '+m.slice(0,400)+'\\n'+s.split('\\n').slice(1,16).join('\\n'));}catch(e){}"
+    "return f.apply(this,arguments);};}"
+    "var current=wrap(window[name]);"
+    "Object.defineProperty(window,name,{configurable:true,enumerable:true,"
+    "get:function(){return current;},set:function(v){current=wrap(v);}});"
+    "});}catch(e){}})();";
+
+static void debugDialogsInit(WebKitWebView* view)
+{
+    int flag = open("/data/ps5webkit/debug-dialogs", O_RDONLY);
+    if (flag < 0)
+        return;
+    close(flag);
+    static const char* const allow[] = { "http://*/*", "https://*/*", "file://*/*", NULL };
+    WebKitUserScript* script = webkit_user_script_new(debugDialogsSource, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, allow, NULL);
+    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(view), script);
+    webkit_user_script_unref(script);
+    spike_log("debug dialogs: alert/confirm/prompt calls are logged with their stack (/data/ps5webkit/debug-dialogs)");
+}
+
 static void testURLFinished(gboolean ok, const char* uri, const char* detail)
 {
     if (!testWaitingForLoad)
@@ -2365,6 +2397,7 @@ int main(int argc, char** argv)
     ps5wk_browser_init(display, webView);
     ps5wk_downloads_init(WPE_DISPLAY_PS5(display), session);
     ps5wk_adblock_init(webView);
+    debugDialogsInit(webView);
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 
     memLog("web view created");

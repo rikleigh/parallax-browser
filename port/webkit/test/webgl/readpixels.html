@@ -1,0 +1,344 @@
+<!doctype html>
+<!-- WebGL readPixels and fence syncs, the ways game engines use them (a
+     Unity WebGL game's driver error in readPixels lost its context: ANGLE
+     loses a WebGL context on any driver error, and every later call failed).
+     Each case reads a 7x5 area (odd sizes, as a game's might be) from one kind
+     of target and checks the GL error, the pixel read back and that the
+     context is still there. Cases: the default framebuffer of an antialiased
+     and a plain canvas; RGBA8, RGBA8 with the implementation's read
+     format/type, R8 and RG8, SRGB8_ALPHA8, RGB565/RGBA4/RGB5_A1 renderbuffers,
+     RGB10_A2, RGBA16F/RGBA32F/R11F_G11F_B10F (EXT_color_buffer_float),
+     RGBA8UI and RGBA32I (integer reads); RGB565/RGBA4/RGB5_A1 read with the
+     implementation's read format/type, and WebGL 1 RGB 565, RGBA 4444, RGBA
+     5551 and RGB 888 textures read that way too (Unity); a 4x MSAA renderbuffer resolved
+     with blitFramebuffer; and a read into a PIXEL_PACK_BUFFER followed by
+     fenceSync, clientWaitSync and getBufferSubData (an asynchronous GPU
+     readback), also with pack alignment 1 and a row length. Log lines:
+     RESULT webgl-readpixels <case> PASS|FAIL <why>, then RESULT
+     webgl-readpixels summary. A failing case's driver reason is in the
+     title's "[webgl] title: driver error" lines. Upload to
+     /data/ps5webkit/webgl-readpixels.html and open
+     file:///data/ps5webkit/webgl-readpixels.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL readPixels</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 128px; height: 128px; border: 2px solid #555; margin-right: 12px; }
+  #out { white-space: pre; }
+  .fail { color: #f66; }
+</style>
+</head>
+<body>
+<h1>WebGL readPixels</h1>
+<canvas id="aa"></canvas><canvas id="plain"></canvas><canvas id="webgl1"></canvas>
+<div id="out"></div>
+<script>
+const out = document.getElementById('out');
+const results = [];
+function report(name, ok, why) {
+  results.push(ok);
+  const line = 'RESULT webgl-readpixels ' + name + ' ' + (ok ? 'PASS' : 'FAIL') + (why ? ' ' + why : '');
+  console.log(line);
+  const div = document.createElement('div');
+  div.textContent = line;
+  if (!ok) div.className = 'fail';
+  out.appendChild(div);
+}
+
+const W = 7, H = 5, SIZE = 16;
+const COLOR = [0.25, 0.5, 0.75, 1.0];
+
+function makeContext(id, antialias) {
+  const canvas = document.getElementById(id);
+  canvas.width = canvas.height = SIZE;
+  return canvas.getContext('webgl2', { antialias, preserveDrawingBuffer: true });
+}
+
+function clearTo(gl, integer) {
+  if (integer === 'uint')
+    gl.clearBufferuiv(gl.COLOR, 0, new Uint32Array([64, 128, 192, 255]));
+  else if (integer === 'int')
+    gl.clearBufferiv(gl.COLOR, 0, new Int32Array([-64, 128, -192, 255]));
+  else {
+    gl.clearColor(...COLOR);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+}
+
+function errors(gl) {
+  const list = [];
+  for (let e = gl.getError(), n = 0; e !== gl.NO_ERROR && n < 8; e = gl.getError(), n++)
+    list.push('0x' + e.toString(16));
+  return list;
+}
+
+// Reads W x H at (3, 2) and checks the first pixel against `expect` (a function of the array).
+function check(gl, name, format, type, array, expect) {
+  errors(gl);
+  gl.readPixels(3, 2, W, H, format, type, array);
+  const errs = errors(gl);
+  if (gl.isContextLost())
+    return report(name, false, 'context lost');
+  if (errs.length)
+    return report(name, false, 'GL error ' + errs.join(','));
+  const why = expect(array);
+  report(name, !why, why || '');
+}
+
+const near = (a, b, tolerance) => Math.abs(a - b) <= tolerance;
+function expectBytes(channels, tolerance = 2) {
+  const want = COLOR.map(c => Math.round(c * 255));
+  return a => {
+    for (let i = 0; i < channels; i++)
+      if (!near(a[i], want[i], tolerance)) return 'pixel ' + Array.from(a.slice(0, 4)).join(',') + ' expected ' + want.slice(0, channels).join(',');
+    return '';
+  };
+}
+function expectFloats(channels, tolerance = 0.01) {
+  return a => {
+    for (let i = 0; i < channels; i++)
+      if (!near(a[i], COLOR[i], tolerance)) return 'pixel ' + Array.from(a.slice(0, 4)).map(v => v.toFixed(3)).join(',');
+    return '';
+  };
+}
+
+function withTarget(gl, name, setup, read) {
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  let made;
+  try {
+    made = setup();
+  } catch (e) {
+    report(name, false, 'setup threw ' + e);
+    return;
+  }
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    report(name, false, 'framebuffer incomplete 0x' + status.toString(16) + ' (skipped)');
+  } else {
+    gl.viewport(0, 0, SIZE, SIZE);
+    read();
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fb);
+  if (made && made.texture) gl.deleteTexture(made.texture);
+  if (made && made.renderbuffer) gl.deleteRenderbuffer(made.renderbuffer);
+}
+
+function texture(gl, internalFormat, format, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, internalFormat, SIZE, SIZE);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { texture: t };
+}
+function renderbuffer(gl, internalFormat, samples = 0) {
+  const r = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, r);
+  if (samples) gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, internalFormat, SIZE, SIZE);
+  else gl.renderbufferStorage(gl.RENDERBUFFER, internalFormat, SIZE, SIZE);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, r);
+  return { renderbuffer: r };
+}
+
+// Reads with the implementation's read format/type (what Unity does) and
+// checks the first pixel, unpacking 565/4444/5551 shorts.
+function checkReadFormat(gl, name, channels, tolerance) {
+  const format = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT), type = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE);
+  const label = name + ' 0x' + format.toString(16) + '/0x' + type.toString(16);
+  const packed = { [gl.UNSIGNED_SHORT_5_6_5]: [[11, 5], [5, 6], [0, 5]], [gl.UNSIGNED_SHORT_4_4_4_4]: [[12, 4], [8, 4], [4, 4], [0, 4]],
+                   [gl.UNSIGNED_SHORT_5_5_5_1]: [[11, 5], [6, 5], [1, 5], [0, 1]] }[type];
+  if (packed) {
+    check(gl, label, format, type, new Uint16Array(W * H * 2), a => {
+      const want = COLOR.map(c => Math.round(c * 255));
+      const got = packed.map(([shift, bits]) => Math.round(((a[0] >> shift) & ((1 << bits) - 1)) * 255 / ((1 << bits) - 1)));
+      for (let i = 0; i < Math.min(channels, got.length); i++)
+        if (!near(got[i], want[i], tolerance)) return 'pixel ' + got.join(',') + ' expected ' + want.slice(0, channels).join(',');
+      return '';
+    });
+  } else if (type === gl.UNSIGNED_BYTE) {
+    check(gl, label, format, type, new Uint8Array(W * H * 4), expectBytes(Math.min(channels, format === gl.RGB ? 3 : 4), tolerance));
+  } else {
+    report(label, false, 'unexpected read type');
+  }
+}
+
+// WebGL 1 (Unity's WebGL 1 builds): unsized textures of packed types, read
+// with the implementation's read format/type.
+function runWebGL1() {
+  const canvas = document.getElementById('webgl1');
+  canvas.width = canvas.height = SIZE;
+  const gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: true });
+  if (!gl) return report('webgl1', false, 'no WebGL 1 context');
+  const cases = [
+    ['webgl1-rgb-565', gl.RGB, gl.UNSIGNED_SHORT_5_6_5, 3, 10],
+    ['webgl1-rgba-4444', gl.RGBA, gl.UNSIGNED_SHORT_4_4_4_4, 4, 20],
+    ['webgl1-rgba-5551', gl.RGBA, gl.UNSIGNED_SHORT_5_5_5_1, 3, 10],
+    ['webgl1-rgb-8', gl.RGB, gl.UNSIGNED_BYTE, 3, 2],
+  ];
+  for (const [name, format, type, channels, tolerance] of cases) {
+    withTarget(gl, name, () => {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, format, SIZE, SIZE, 0, format, type, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      return { texture: t };
+    }, () => { clearTo(gl); checkReadFormat(gl, name, channels, tolerance); });
+  }
+}
+
+function run() {
+  // The default framebuffers.
+  for (const [id, aa] of [['aa', true], ['plain', false]]) {
+    const gl = makeContext(id, aa);
+    if (!gl) { report('default-' + id, false, 'no WebGL 2 context'); continue; }
+    clearTo(gl);
+    check(gl, 'default-' + (aa ? 'antialiased' : 'plain') + '-rgba8', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(4));
+  }
+
+  const gl = makeContext('plain', false);
+  const floatRT = !!gl.getExtension('EXT_color_buffer_float');
+
+  const cases = [
+    ['rgba8', () => texture(gl, gl.RGBA8), () => { clearTo(gl); check(gl, 'rgba8', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(4)); }],
+    ['rgba8-read-format', () => texture(gl, gl.RGBA8), () => {
+      clearTo(gl);
+      const format = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT), type = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE);
+      if (format === gl.RGBA && type === gl.UNSIGNED_BYTE) return report('rgba8-read-format', true, '(it is RGBA/UNSIGNED_BYTE)');
+      const channels = format === gl.RGB ? 3 : format === gl.RG ? 2 : format === gl.RED ? 1 : 4;
+      check(gl, 'rgba8-read-format 0x' + format.toString(16) + '/0x' + type.toString(16), format, type, new Uint8Array(W * H * 4), expectBytes(Math.min(channels, 4)));
+    }],
+    ['r8', () => texture(gl, gl.R8), () => { clearTo(gl); check(gl, 'r8', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(1)); }],
+    ['rg8', () => texture(gl, gl.RG8), () => { clearTo(gl); check(gl, 'rg8', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(2)); }],
+    ['srgb8-alpha8', () => texture(gl, gl.SRGB8_ALPHA8), () => { clearTo(gl); check(gl, 'srgb8-alpha8', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), a => a[3] > 250 ? '' : 'alpha ' + a[3]); }],
+    ['rgb565', () => renderbuffer(gl, gl.RGB565), () => { clearTo(gl); check(gl, 'rgb565', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(3, 10)); }],
+    ['rgba4', () => renderbuffer(gl, gl.RGBA4), () => { clearTo(gl); check(gl, 'rgba4', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(4, 20)); }],
+    ['rgb5-a1', () => renderbuffer(gl, gl.RGB5_A1), () => { clearTo(gl); check(gl, 'rgb5-a1', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(3, 10)); }],
+    ['rgb565-read-format', () => renderbuffer(gl, gl.RGB565), () => { clearTo(gl); checkReadFormat(gl, 'rgb565-read-format', 3, 10); }],
+    ['rgba4-read-format', () => renderbuffer(gl, gl.RGBA4), () => { clearTo(gl); checkReadFormat(gl, 'rgba4-read-format', 4, 20); }],
+    ['rgb5-a1-read-format', () => renderbuffer(gl, gl.RGB5_A1), () => { clearTo(gl); checkReadFormat(gl, 'rgb5-a1-read-format', 3, 10); }],
+    ['rgb10-a2', () => texture(gl, gl.RGB10_A2), () => { clearTo(gl); check(gl, 'rgb10-a2', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(3, 3)); }],
+    ['rgba8ui', () => texture(gl, gl.RGBA8UI), () => { clearTo(gl, 'uint'); check(gl, 'rgba8ui', gl.RGBA_INTEGER, gl.UNSIGNED_INT, new Uint32Array(W * H * 4), a => a[0] === 64 && a[3] === 255 ? '' : 'pixel ' + Array.from(a.slice(0, 4))); }],
+    ['rgba32i', () => texture(gl, gl.RGBA32I), () => { clearTo(gl, 'int'); check(gl, 'rgba32i', gl.RGBA_INTEGER, gl.INT, new Int32Array(W * H * 4), a => a[0] === -64 && a[2] === -192 ? '' : 'pixel ' + Array.from(a.slice(0, 4))); }],
+  ];
+  if (floatRT) {
+    cases.push(
+      ['rgba16f-float', () => texture(gl, gl.RGBA16F), () => { clearTo(gl); check(gl, 'rgba16f-float', gl.RGBA, gl.FLOAT, new Float32Array(W * H * 4), expectFloats(4)); }],
+      ['rgba16f-half-float', () => texture(gl, gl.RGBA16F), () => { clearTo(gl); check(gl, 'rgba16f-half-float', gl.RGBA, gl.HALF_FLOAT, new Uint16Array(W * H * 4), a => a[0] ? '' : 'pixel 0'); }],
+      ['rgba32f', () => texture(gl, gl.RGBA32F), () => { clearTo(gl); check(gl, 'rgba32f', gl.RGBA, gl.FLOAT, new Float32Array(W * H * 4), expectFloats(4)); }],
+      ['r11f-g11f-b10f', () => texture(gl, gl.R11F_G11F_B10F), () => { clearTo(gl); check(gl, 'r11f-g11f-b10f', gl.RGBA, gl.FLOAT, new Float32Array(W * H * 4), expectFloats(3, 0.02)); }],
+      ['r32f', () => texture(gl, gl.R32F), () => { clearTo(gl); check(gl, 'r32f', gl.RGBA, gl.FLOAT, new Float32Array(W * H * 4), expectFloats(1)); }],
+    );
+  } else {
+    report('float-render-targets', false, 'no EXT_color_buffer_float');
+  }
+  for (const [name, setup, read] of cases)
+    withTarget(gl, name, setup, read);
+  runWebGL1();
+
+  // A 4x MSAA renderbuffer, resolved into an RGBA8 texture and read there.
+  {
+    const msaa = gl.createFramebuffer(), resolve = gl.createFramebuffer();
+    const rb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, 4, gl.RGBA8, SIZE, SIZE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaa);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rb);
+    clearTo(gl);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, resolve);
+    const t = texture(gl, gl.RGBA8).texture;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaa);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, resolve);
+    gl.blitFramebuffer(0, 0, SIZE, SIZE, 0, 0, SIZE, SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, resolve);
+    check(gl, 'msaa-resolved', gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(W * H * 4), expectBytes(4));
+    // Reading the MSAA framebuffer itself is an INVALID_OPERATION in WebGL: the check is that
+    // it stays a WebGL error and the context survives it.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaa);
+    errors(gl);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    const errs = errors(gl);
+    report('msaa-direct-read-rejected', errs.length === 1 && errs[0] === '0x502' && !gl.isContextLost(), 'errors ' + (errs.join(',') || 'none'));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(msaa); gl.deleteFramebuffer(resolve); gl.deleteRenderbuffer(rb); gl.deleteTexture(t);
+  }
+
+  // Asynchronous readback into a pixel pack buffer, with a fence.
+  for (const [name, alignment, rowLength] of [['pbo-fence', 4, 0], ['pbo-fence-align1-rowlength', 1, 9]]) {
+    withTarget(gl, name, () => texture(gl, gl.RGBA8), () => {
+      clearTo(gl);
+      const rowPixels = rowLength || W;
+      const bytes = rowPixels * 4 * (H - 1) + W * 4;
+      const pbo = gl.createBuffer();
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_READ);
+      gl.pixelStorei(gl.PACK_ALIGNMENT, alignment);
+      gl.pixelStorei(gl.PACK_ROW_LENGTH, rowLength);
+      errors(gl);
+      gl.readPixels(3, 2, W, H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      let errs = errors(gl);
+      gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+      gl.pixelStorei(gl.PACK_ROW_LENGTH, 0);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      if (!sync || errs.length || gl.isContextLost()) {
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        gl.deleteBuffer(pbo);
+        asyncDone();
+        return report(name, false, (sync ? '' : 'fenceSync gave null; ') + (errs.length ? 'GL error ' + errs.join(',') : '') + (gl.isContextLost() ? ' context lost' : ''));
+      }
+      gl.flush();
+      let waits = 0, status;
+      const poll = () => {
+        status = gl.clientWaitSync(sync, 0, 0);
+        if ((status === gl.TIMEOUT_EXPIRED) && ++waits < 120)
+          return requestAnimationFrame(poll);
+        gl.deleteSync(sync);
+        errs = errors(gl);
+        const data = new Uint8Array(bytes);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, data);
+        errs = errs.concat(errors(gl));
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        gl.deleteBuffer(pbo);
+        let why;
+        if (status !== gl.ALREADY_SIGNALED && status !== gl.CONDITION_SATISFIED)
+          why = 'clientWaitSync 0x' + status.toString(16) + ' after ' + waits + ' frames';
+        else if (errs.length)
+          why = 'GL error ' + errs.join(',');
+        else
+          why = expectBytes(4)(data);
+        report(name, !why, (why || '') + ' (signalled after ' + waits + ' frames)');
+        asyncDone();
+      };
+      // The framebuffer is deleted when withTarget returns; the PBO keeps the result.
+      requestAnimationFrame(poll);
+    });
+  }
+}
+
+// The fence cases end in later frames: the summary waits for both (or 5 s).
+let pendingAsync = 2, finished = false;
+function asyncDone() {
+  if (--pendingAsync === 0) setTimeout(finish, 0);
+}
+setTimeout(finish, 5000);
+
+function finish() {
+  if (finished) return;
+  finished = true;
+  const passed = results.filter(Boolean).length;
+  const line = 'RESULT webgl-readpixels summary ' + passed + '/' + results.length + ' passed';
+  console.log(line);
+  const div = document.createElement('div');
+  div.textContent = line;
+  out.appendChild(div);
+}
+
+run();
+</script>
+</body>
+</html>

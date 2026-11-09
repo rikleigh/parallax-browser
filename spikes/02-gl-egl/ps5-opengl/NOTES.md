@@ -663,3 +663,89 @@ Host test: `test_gpu_blit.py` (swizzled blit accepted with the view swizzle
 set, NONE selectors and resolves refused). Built into
 `toolchain/ps5-opengl-gles-noprof-m4`; not yet timed on the console with the
 player that showed it.
+
+## Patch 0018: draws skip the flush and index scan of unchanged buffers (2026-11-09)
+
+Every indexed draw scanned its indices for the min/max (`ps5_index_bounds`)
+and, when restart was on, for the restart index; and flushed the CPU cache
+lines of its vertex range and index range (`ps5_flush_batch_backing`), even
+when the buffers had not changed since the last draw. A game that draws the
+same static level geometry each frame paid that again on every draw: in a
+profile of one, 26% of the WebGL thread was `util_clflushopt_range` (97% of it
+the per-draw vertex/index flush) and 12% `ps5_index_bounds`.
+
+Each buffer now counts its CPU writes (`buffer_subdata`, write maps, flushes
+of mapped ranges, unmaps, the deferred drain and the GPU-write invalidation;
+an access to an unknown buffer bumps a global generation). A draw skips the
+vertex or index flush when the same range (merged with earlier ones) was
+flushed at the same count, and takes the index bounds and the restart result
+from a 32-entry per-buffer cache keyed by start, count and index size.
+Buffers the GPU may write (stream output, shader buffers and images, compute
+outputs) and persistently mapped ones (no callback on CPU writes) are never
+cached. `/data/ps5webkit/no-gl-draw-cache` turns the caches off. The file is
+checked with open(), since in a title access() reports existing files as missing.
+Before that fix the switch never took effect, so the first A/B runs (busy.html,
+the first bigmesh runs) compared on with on.
+Host test: `test_draw_cache.py` (with ASan/UBSan).
+
+`port/webkit/test/webgl/bigmesh.html?m=240`: 240 static meshes of 32,768
+triangles, each drawn once per frame with one `drawElements`:
+
+| | page fps | WebGL thread per frame |
+| --- | --- | --- |
+| caches off | 25.4 | 39.4 ms (index scan 54%, flushes 13%) |
+| caches on | 59.9 (vsync) | 2.55 ms |
+
+At m=60 both hold 60 fps. Built into `toolchain/ps5-opengl-gles-noprof-m6`.
+
+A WebGL racing game (Unity) on the same build: 13.4 ms of the WebGL thread per
+frame with the caches off, 7.9 ms with them on, both ~58-59 fps, and the
+same picture on the TV either way.
+
+## Patch 0019: GPU resolves for half-float 4x MSAA (2026-11-09)
+
+`ps5_blit_gpu_color` took a 4x MSAA resolve only for R8G8B8A8_UNORM; an
+RGBA16F one went to the CPU resolve, which reads each tiled sample, unpacks
+the half floats and packs the average. An HDR WebGL 2 game (Unity: RGBA16F
+with 4x MSAA, resolved by `blitFramebuffer` every frame) spent ~330 ms of the
+WebGL thread per 1396x734 frame there: 3 fps, 99% of the thread under
+`ps5_blit`. 4x RGBA16F targets are already sampled like RGBA8 ones (the
+MSAA tile follows the texel size), and u_blitter's resolve shader averages
+in float, so RGBA16F resolves now take the GPU path too. Host test:
+`test_gpu_blit.py` (RGBA16F resolve accepted, one byte short refused, R8
+still refused).
+
+`port/webkit/test/webgl/msaa-hdr-resolve.html` (1396x734: clear to
+(2, 0.5, 0.25), a triangle of (0, 4, 0), resolved and read back as floats;
+edge pixels must be 0/1/2/3/4-sample mixes): PASS before and after, the same
+384510/637954/2200 inside/outside/edge pixels as desktop Chrome; 250 ms ->
+0.23 ms per draw + resolve. The game: 3 fps / 330 ms -> 59.5-59.9 fps /
+3.5-4 ms per frame. Built into `toolchain/ps5-opengl-gles-noprof-m7`.
+
+## Patch 0020: cube map faces render in place (2026-11-09)
+
+A cube map is sampled from linear storage, so as a render target it had a
+tiled staging surface, and `ps5_linear_color_pitch` (which lets a draw render
+straight into one linear mip/layer) took only 2D and 2D array targets: every
+draw into a cube face copied the whole face to the staging surface and back,
+with cache flushes. A three.js CubeCamera (a reflective sphere, its scene
+drawn into six faces each frame) spent ~610 ms of the WebGL thread per frame
+there: 1.6 fps, 95% under `ps5_stage_color_surface`. A face is one layer of
+that storage, so cube and cube array faces now render linearly like array
+layers, and the GPU colour clear takes them too. Host tests:
+`test_gpu_blit.py` (every face and a mip of a staged cube render linearly; a
+face past the last, two faces, a 3D target don't), `test_gpu_clear_state.py`
+(a staged cube face clears on the GPU only when it renders linearly).
+
+`test_color_staging.py` failed to compile since patch 0018: it copies the
+source between `struct ps5_resource` and `struct ps5_transfer`, where the
+draw-cache helpers now are; it leaves them out. (`test_multidraw_lifetime.py`
+fails to compile from before 0018, on MESA_PRIM names its stubs lack; not
+fixed here.)
+
+`port/webkit/test/webgl/cube-render.html` (each face of an RGBA8 cube, level
+0 and level 1 of a mipmapped one, cleared and half drawn over; read back
+through the framebuffer and sampled at both halves; also passes in desktop
+Chrome): PASS before and after; 6 x 40 draws into 512x512 faces 303 ->
+2.0 ms. `webgl_animation_skinning_ik`: 1.6 fps / 610 ms -> 60 fps /
+3.5 ms per frame. Built into `toolchain/ps5-opengl-gles-noprof-m8`.

@@ -1,0 +1,183 @@
+<!doctype html>
+<!-- WebGL 2 check (ps5-opengl: cube map faces rendered in place): every face
+     of an RGBA8 cube map is cleared to its own colour and its left half drawn
+     over in another (a quad), at level 0 and at level 1 of a mipmapped cube.
+     Checked twice: each face read back through its framebuffer, and the cube
+     sampled (NEAREST) at a point inside each half of each face. Then 40 draws
+     into each face are timed, as a CubeCamera's scene would be.
+       RESULT cube-render PASS|FAIL <size>: readback <bad> wrong, sampled <bad>
+       wrong; <ms> ms per 6 x 40 draws
+     ?s=<size> (default 512). Upload to /data/ps5webkit/webgl-cube-render.html
+     and open file:///data/ps5webkit/webgl-cube-render.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL cube render</title>
+<style>
+  body { background: #111; color: #eee; font: 24px/1.4 sans-serif; margin: 40px; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>WebGL cube render</h1>
+<div id="out">starting</div>
+<script>
+const params = new URLSearchParams(location.search);
+const SIZE = parseInt(params.get('s') || '512', 10);
+const out = document.getElementById('out');
+function log(text) { console.log('[cube-render] ' + text); out.textContent = text; }
+
+function run() {
+  const gl = document.createElement('canvas').getContext('webgl2', { antialias: false });
+  if (!gl)
+    return 'RESULT cube-render FAIL no WebGL 2';
+
+  function program(vs, fs) {
+    const p = gl.createProgram();
+    for (const [type, source] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, source);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+        throw new Error('shader: ' + gl.getShaderInfoLog(s));
+      gl.attachShader(p, s);
+    }
+    gl.bindAttribLocation(p, 0, 'p');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+      throw new Error('link: ' + gl.getProgramInfoLog(p));
+    return p;
+  }
+  const flat = program(`#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`, `#version 300 es
+precision highp float; uniform vec4 colour; out vec4 o; void main() { o = colour; }`);
+  const sample = program(`#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`, `#version 300 es
+precision highp float; uniform samplerCube cube; uniform float lod; out vec4 o;
+vec3 dir(int face, float sc) {
+  // OpenGL's cube face table at t = 0.5 (tc = 0): s = (sc + 1) / 2.
+  if (face == 0) return vec3(1.0, 0.0, -sc);
+  if (face == 1) return vec3(-1.0, 0.0, sc);
+  if (face == 2) return vec3(sc, 1.0, 0.0);
+  if (face == 3) return vec3(sc, -1.0, 0.0);
+  if (face == 4) return vec3(sc, 0.0, 1.0);
+  return vec3(-sc, 0.0, -1.0);
+}
+void main() {
+  int i = int(gl_FragCoord.x);
+  o = textureLod(cube, dir(i / 2, (i % 2) == 0 ? -0.5 : 0.5), lod);
+}`);
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  // Two triangles: the whole target, then its left half.
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1,
+                                                   -1, -1, 0, -1, -1, 1, -1, 1, 0, -1, 0, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  const clearColours = [], drawColours = [];
+  for (let f = 0; f < 6; f++) {
+    clearColours.push([(f * 40 + 20) / 255, (200 - f * 30) / 255, (f * 17 + 5) / 255, 1]);
+    drawColours.push([(250 - f * 35) / 255, (f * 23 + 40) / 255, (f * 31 + 60) / 255, 1]);
+  }
+  const fb = gl.createFramebuffer();
+  const colourLocation = gl.getUniformLocation(flat, 'colour');
+
+  function renderFaces(texture, level, size, draws) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.useProgram(flat);
+    for (let f = 0; f < 6; f++) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X + f, texture, level);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE)
+        throw new Error('face ' + f + ' level ' + level + ' incomplete');
+      gl.viewport(0, 0, size, size);
+      gl.clearColor(...clearColours[f]);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      for (let k = 0; k < draws; k++) {
+        gl.uniform4fv(colourLocation, drawColours[f]);
+        gl.drawArrays(gl.TRIANGLES, 6, 6);
+      }
+    }
+  }
+
+  function check(texture, level, size) {
+    renderFaces(texture, level, size, 1);
+    let readBad = 0, first = '';
+    const pixels = new Uint8Array(size * size * 4);
+    for (let f = 0; f < 6; f++) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X + f, texture, level);
+      gl.readPixels(0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const want = x < size / 2 ? drawColours[f] : clearColours[f];
+          const i = (y * size + x) * 4;
+          for (let c = 0; c < 4; c++) {
+            if (Math.abs(pixels[i + c] - Math.round(want[c] * 255)) > 1) {
+              if (!readBad)
+                first = ' first: level ' + level + ' face ' + f + ' (' + x + ',' + y + ') ' + Array.from(pixels.subarray(i, i + 4)).join(',');
+              readBad++;
+              break;
+            }
+          }
+        }
+      }
+    }
+    // Sampled: 12 pixels, two per face (left half, right half).
+    const target = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 12, 1);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+    gl.viewport(0, 0, 12, 1);
+    gl.useProgram(sample);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
+    gl.uniform1i(gl.getUniformLocation(sample, 'cube'), 0);
+    gl.uniform1f(gl.getUniformLocation(sample, 'lod'), level);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    const sampled = new Uint8Array(12 * 4);
+    gl.readPixels(0, 0, 12, 1, gl.RGBA, gl.UNSIGNED_BYTE, sampled);
+    let sampleBad = 0;
+    for (let i = 0; i < 12; i++) {
+      const f = i >> 1, want = i % 2 ? clearColours[f] : drawColours[f];
+      for (let c = 0; c < 4; c++) {
+        if (Math.abs(sampled[i * 4 + c] - Math.round(want[c] * 255)) > 1) {
+          if (!sampleBad && !first)
+            first = ' first sampled: level ' + level + ' face ' + f + (i % 2 ? ' right ' : ' left ') + Array.from(sampled.subarray(i * 4, i * 4 + 4)).join(',');
+          sampleBad++;
+          break;
+        }
+      }
+    }
+    gl.deleteTexture(target);
+    return { readBad, sampleBad, first };
+  }
+
+  function cube(levels) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, t);
+    gl.texStorage2D(gl.TEXTURE_CUBE_MAP, levels, gl.RGBA8, SIZE, SIZE);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, levels > 1 ? gl.NEAREST_MIPMAP_NEAREST : gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  }
+
+  const single = cube(1), mipmapped = cube(2);
+  const a = check(single, 0, SIZE), b = check(mipmapped, 1, SIZE >> 1);
+
+  const t0 = performance.now();
+  renderFaces(single, 0, SIZE, 40);
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+  const ms = performance.now() - t0;
+
+  const error = gl.getError();
+  const readBad = a.readBad + b.readBad, sampleBad = a.sampleBad + b.sampleBad;
+  const pass = !readBad && !sampleBad && !error;
+  return 'RESULT cube-render ' + (pass ? 'PASS' : 'FAIL') + ' ' + SIZE + ': readback ' + readBad + ' wrong, sampled ' + sampleBad +
+      ' wrong' + (error ? ', GL error 0x' + error.toString(16) : '') + (a.first || b.first) + '; ' + ms.toFixed(1) + ' ms per 6 x 40 draws';
+}
+setTimeout(() => {
+  try { log(run()); } catch (e) { log('RESULT cube-render FAIL exception ' + e.message); }
+}, 500);
+</script>
+</body>
+</html>

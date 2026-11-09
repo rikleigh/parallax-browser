@@ -1,0 +1,113 @@
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/Display.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/Display.cpp
+index 1585c40011..75d3f83942 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/Display.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/Display.cpp
+@@ -2690,7 +2690,14 @@ void Display::initializeFrontendFeatures()
+ {
+     // Enable on all Impls
+     ANGLE_FEATURE_CONDITION(&mFrontendFeatures, loseContextOnOutOfMemory, true);
++#if defined(ANGLE_PLATFORM_PS5)
++    // PS5 (ps5webkit): an error from the driver fails that call only, it doesn't lose the WebGL
++    // context. A WebGL game can't come back from a lost context; the console's driver still has
++    // gaps, and RendererGL logs each driver error's reason so they can be found and fixed.
++    ANGLE_FEATURE_CONDITION(&mFrontendFeatures, loseHardenedContextOnBackendError, false);
++#else
+     ANGLE_FEATURE_CONDITION(&mFrontendFeatures, loseHardenedContextOnBackendError, true);
++#endif
+     ANGLE_FEATURE_CONDITION(&mFrontendFeatures, allowCompressedFormats, true);
+ 
+     // If this feature is enabled, the context can be created with a certain requested version
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/RendererGL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/RendererGL.cpp
+index e509bdbb6e..1636be854d 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/RendererGL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/RendererGL.cpp
+@@ -11,6 +11,10 @@
+ 
+ #include <EGL/eglext.h>
+ #include <thread>
++#if defined(ANGLE_PLATFORM_PS5)
++#include <atomic>
++#include <cstdio>
++#endif
+ 
+ #include "common/debug.h"
+ #include "common/system_utils.h"
+@@ -141,6 +145,26 @@ static void INTERNAL_GL_APIENTRY LogGLDebugMessage(GLenum source,
+     }
+ }
+ 
++#if defined(ANGLE_PLATFORM_PS5)
++// PS5 (ps5webkit): the reason the driver gives for each GL error (as "GL_INVALID_OPERATION in
++// glReadPixels(multisample FBO)"); ANGLE itself only says which call failed. The first 20, then
++// every 500th.
++static void INTERNAL_GL_APIENTRY LogPS5DriverError(GLenum source,
++                                                    GLenum type,
++                                                    GLuint id,
++                                                    GLenum severity,
++                                                    GLsizei length,
++                                                    const GLchar *message,
++                                                    const void *userParam)
++{
++    static std::atomic<unsigned> count;
++    unsigned n = count.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (n > 20 && n % 500)
++        return;
++    fprintf(stderr, "[webgl] title: driver error %u: %.*s\n", n, static_cast<int>(length), message);
++}
++#endif
++
+ namespace rx
+ {
+ 
+@@ -189,6 +213,18 @@ RendererGL::RendererGL(std::unique_ptr<FunctionsGL> functions,
+                                         0, nullptr, GL_FALSE);
+         mFunctions->debugMessageCallback(&LogGLDebugMessage, nullptr);
+     }
++#if defined(ANGLE_PLATFORM_PS5)
++    else if (hasDebugOutput)
++    {
++        // Errors only, asynchronous (no GL_DEBUG_OUTPUT_SYNCHRONOUS): nothing else is generated.
++        mFunctions->enable(GL_DEBUG_OUTPUT);
++        mFunctions->debugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr,
++                                        GL_FALSE);
++        mFunctions->debugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_ERROR, GL_DONT_CARE, 0,
++                                        nullptr, GL_TRUE);
++        mFunctions->debugMessageCallback(&LogPS5DriverError, nullptr);
++    }
++#endif
+ 
+     if (mFeatures.initializeCurrentVertexAttributes.enabled)
+     {
+diff --git a/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp b/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp
+index 24ac596ad8..a7996ba6e2 100644
+--- a/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp
++++ b/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp
+@@ -35,6 +35,7 @@
+ #include "Logging.h"
+ #include "PixelBuffer.h"
+ #include "PlatformDisplay.h"
++#include <atomic>
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+@@ -126,6 +127,20 @@ void GraphicsContextGLANGLE::checkGPUStatus()
+         m_failNextStatusCheck = false;
+         forceContextLost();
+     }
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: ANGLE can lose a WebGL context by itself (out of memory, a driver reset). Unless it's
++    // reported here, the page never gets webglcontextlost: it only sees every later call fail
++    // quietly (null fence syncs, shaders that fail to compile with no log, limits of 0), as the
++    // Cocoa port's version of this function prevents. Asked at every 32nd draw: it reaches the driver.
++    static std::atomic<unsigned> checks;
++    if (isContextLost() || checks.fetch_add(1, std::memory_order_relaxed) % 32)
++        return;
++    GCGLenum status = GL_GetGraphicsResetStatusEXT();
++    if (status == GL_NO_ERROR)
++        return;
++    WTFLogAlways("[webgl] title: ANGLE lost a context (reset status 0x%x); the page gets webglcontextlost", status);
++    forceContextLost();
++#endif
+ }
+ 
+ void GraphicsContextGLANGLE::platformReleaseThreadResources()

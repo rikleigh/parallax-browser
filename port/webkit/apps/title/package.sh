@@ -24,13 +24,15 @@ WK="$ROOT/toolchain/wpe-webkit"
 BLD="${BLD:-$WK/build-webgl}"
 OUT="${OUT:-$WK/titles}"
 # ps5-opengl built with the browser's patches (spikes/02-gl-egl/ps5-opengl/
-# patches, through 0017: WebGL draw batching, the VAO fast path, video copies
-# on the GPU) and its per-draw profiling compiled out: build it with
-#   PS5_OPENGL_PREFIX=$ROOT/toolchain/ps5-opengl-gles-noprof-m4 \
+# patches, through 0020: WebGL draw batching, the VAO fast path, video copies
+# on the GPU, no flush or index scan of unchanged buffers, HDR MSAA resolves
+# on the GPU, cube faces rendered in place) and its per-draw profiling
+# compiled out: build it with
+#   PS5_OPENGL_PREFIX=$ROOT/toolchain/ps5-opengl-gles-noprof-m8 \
 #     spikes/02-gl-egl/ps5-opengl/build.sh gles-noprof
 # The older gles-noprof (27 Oct) lacks them; gles-async is faster still but
 # keeps two cores spinning and takes draws from one thread only.
-PREFIX="${PS5_OPENGL:-$ROOT/toolchain/ps5-opengl-gles-noprof-m4}"
+PREFIX="${PS5_OPENGL:-$ROOT/toolchain/ps5-opengl-gles-noprof-m8}"
 LIBCXX="$ROOT/toolchain/libcxx19/install"
 NATIVE="$ROOT/ref/PS5VR/app/tools/native-app"
 PSGL="$ROOT/ref/ps5-opengl/native-app"

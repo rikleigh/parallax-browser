@@ -539,13 +539,20 @@ static std::atomic<uint64_t> mmapPeakBytes, mmapLargest;
 static std::atomic<uintptr_t> bigStart[BIG_MAPPINGS];
 static size_t bigLength[BIG_MAPPINGS];
 
+// A slot is claimed with 1 (never an address) before its length is set, so
+// a slot's length is only written by the thread that owns it. Setting it
+// before the claim overwrote the length of every taken slot on the way: the
+// resident count then measured old mappings at the newest one's length, and
+// munmap no longer found them.
 static void rememberBig(void* address, size_t length)
 {
     for (int i = 0; i < BIG_MAPPINGS; i++) {
         uintptr_t expected = 0;
-        bigLength[i] = length;
-        if (bigStart[i].compare_exchange_strong(expected, (uintptr_t)address))
+        if (bigStart[i].compare_exchange_strong(expected, 1)) {
+            bigLength[i] = length;
+            bigStart[i].store((uintptr_t)address, std::memory_order_release);
             return;
+        }
     }
 }
 
@@ -566,8 +573,8 @@ static double residentBigMB()
     static unsigned char vector[(1 << 20) / 4096];
     size_t page = getpagesize(), resident = 0;
     for (int i = 0; i < BIG_MAPPINGS; i++) {
-        uintptr_t start = bigStart[i].load(std::memory_order_relaxed);
-        if (!start)
+        uintptr_t start = bigStart[i].load(std::memory_order_acquire);
+        if (start <= 1)
             continue;
         size_t length = bigLength[i];
         for (size_t offset = 0; offset < length; offset += 1 << 20) {
@@ -633,16 +640,31 @@ extern "C" int __wrap_munmap(void* address, size_t length)
     return result;
 }
 
-// Resident set size of this process (kern.proc.pid), or -1 (payloads get
-// EPERM/ENOENT for it on 13.60; then only getrusage's peak is printed).
-static long residentKB()
+// Resident set size (KB) and thread count of this process, from
+// kern.proc.pid, or -1. The console's kinfo_proc may be larger than the
+// SDK's (ki_structsize), so the size is asked first: with a buffer of
+// sizeof(struct kinfo_proc) this always failed.
+static long residentKB(int* threads = nullptr)
 {
-    struct kinfo_proc info;
-    size_t size = sizeof(info);
+    if (threads)
+        *threads = -1;
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid() };
-    if (sysctl(mib, 4, &info, &size, nullptr, 0) || size < sizeof(info))
+    size_t size = 0;
+    if (sysctl(mib, 4, nullptr, &size, nullptr, 0) || size < sizeof(struct kinfo_proc))
         return -1;
-    return info.ki_rssize * (long)(getpagesize() / 1024);
+    size += 4096;
+    char* buffer = (char*)malloc(size);
+    if (!buffer)
+        return -1;
+    long kb = -1;
+    if (!sysctl(mib, 4, buffer, &size, nullptr, 0) && size >= sizeof(struct kinfo_proc)) {
+        auto* info = (struct kinfo_proc*)buffer;
+        kb = info->ki_rssize * (long)(getpagesize() / 1024);
+        if (threads)
+            *threads = info->ki_numthreads;
+    }
+    free(buffer);
+    return kb;
 }
 
 // Settings' Storage card (NetworkProcess): a title can't list folders
@@ -786,7 +808,8 @@ static void* memLogger(void* data)
             sceKernelAvailableFlexibleMemorySize(&flexible);
         struct rusage usage;
         getrusage(RUSAGE_SELF, &usage);
-        long rss = residentKB();
+        int threads = -1;
+        long rss = residentKB(&threads);
         double pas = &pas_page_malloc_num_allocated_bytes ? pas_page_malloc_num_allocated_bytes / 1048576.0 : -1;
         double resident = residentBigMB();
         double compact = &pas_compact_heap_reservation_bump ? pas_compact_heap_reservation_bump / 1048576.0 : -1;
@@ -815,9 +838,9 @@ static void* memLogger(void* data)
             locks.fast ? "futex" : "libc", (unsigned long long)locks.mutex_parks, (unsigned long long)locks.cond_waits,
             (unsigned long long)locks.rwlock_parks, heap.pas ? "libpas" : "libc", (unsigned long long)heap.foreign_frees,
             (unsigned long long)heap.foreign_reallocs, (unsigned long long)heap.fallbacks, heap.bitmap_failures ? ", BITMAP FAILURES" : "");
-        char rssText[48];
+        char rssText[64];
         if (rss >= 0)
-            snprintf(rssText, sizeof rssText, "rss %.1f MB, peak", rss / 1024.0);
+            snprintf(rssText, sizeof rssText, "%d threads, rss %.1f MB, peak", threads, rss / 1024.0);
         else
             snprintf(rssText, sizeof rssText, "peak rss");
         LOG("[mem] %s at %.0f s: %s %.1f MB; flexible free %.1f MB (%+.1f since start); libpas pages %.1f MB (%.1f given back, %.1f committed), resident in big mappings %.1f MB, compact %.1f of %.0f MB; mmaps %lld live, %.1f MB (peak %.1f, largest %.1f), %llu calls, %llu munmaps, %llu failed%s%s",
@@ -918,6 +941,64 @@ static void* runWebKit(void* data)
     return nullptr;
 }
 
+// What a clock read costs here (performance.now() and WebKit's own timing
+// read CLOCK_MONOTONIC), logged once per WebProcess. With
+// /data/ps5webkit/probe-mmap also what mapping anonymous memory costs (a
+// WebAssembly heap's growth blocked the page ~1 s per mmap), on a thread of
+// its own so that the page doesn't wait for it.
+static void probePlatformCosts()
+{
+    auto nowNs = [](clockid_t clock) {
+        struct timespec ts;
+        clock_gettime(clock, &ts);
+        return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    };
+    constexpr int calls = 20000;
+    long long start = nowNs(CLOCK_MONOTONIC);
+    long long sink = 0;
+    for (int i = 0; i < calls; i++)
+        sink += nowNs(CLOCK_MONOTONIC);
+    long long monotonic = nowNs(CLOCK_MONOTONIC) - start;
+    start = nowNs(CLOCK_MONOTONIC);
+    for (int i = 0; i < calls; i++)
+        sink += nowNs(CLOCK_REALTIME);
+    long long realtime = nowNs(CLOCK_MONOTONIC) - start;
+    LOG("[probe] clock_gettime: CLOCK_MONOTONIC %.0f ns, CLOCK_REALTIME %.0f ns per call (%d calls, %lld)",
+        double(monotonic) / calls, double(realtime) / calls, calls, sink & 1);
+    if (access("/data/ps5webkit/probe-mmap", F_OK))
+        return;
+    pthread_t thread;
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_create(&thread, &attributes, [](void*) -> void* {
+        auto ms = [] {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+        };
+        for (size_t mb : { 4, 16, 64, 16, 4 }) {
+            size_t bytes = mb << 20;
+            double t0 = ms();
+            void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            double t1 = ms();
+            if (p == MAP_FAILED) {
+                LOG("[probe] mmap %zu MB failed (errno %d)", mb, errno);
+                continue;
+            }
+            double t2 = ms();
+            for (size_t i = 0; i < bytes; i += 4096)
+                static_cast<volatile char*>(p)[i] = 1;
+            double t3 = ms();
+            munmap(p, bytes);
+            double t4 = ms();
+            LOG("[probe] mmap %zu MB: %.1f ms; touching its pages %.1f ms; munmap %.1f ms", mb, t1 - t0, t3 - t2, t4 - t3);
+        }
+        return nullptr;
+    }, nullptr);
+    pthread_attr_destroy(&attributes);
+}
+
 int main(int, char**)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -987,8 +1068,10 @@ int main(int, char**)
         return 1;
 
     setupEnvironment(path, network);
-    if (!network)
+    if (!network) {
         configureJIT();
+        probePlatformCosts();
+    }
     // Audio goes to the UIProcess's audio server (apps/common/ps5audioserver.c):
     // <dir>/ui-<pid>.sock -> <dir>/audio-<pid>.sock; hole-punch video frames
     // to its video server (wpe-ps5/PS5VideoServer.cpp): <dir>/video-<pid>.sock.

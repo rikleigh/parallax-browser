@@ -1,0 +1,157 @@
+<!doctype html>
+<!-- WebGL check (ps5-opengl patch 0018): large static meshes, drawn the way
+     engines draw level geometry. ?m=<meshes> (default 60) grids of
+     ?g=<cells> x <cells> quads (default 128: 32768 triangles, 98304 16-bit
+     indices, 16641 vertices of position + normal), each in its own static
+     vertex and index buffer, each drawn once per frame with one
+     drawElements. Cheap shaders, so the per-draw CPU work in the title (the
+     driver's index scans and cache flushes of the draw's data) is what the
+     frame rate shows. After 2 s of warm-up, 5 s are measured and logged:
+     RESULT webgl-bigmesh m=<meshes> g=<cells> <fps> fps, JS <ms> per frame
+     The title's `[webgl] title: ... per frame` lines give the WebGL thread's
+     cost. Upload to /data/ps5webkit/webgl-bigmesh.html and open
+     file:///data/ps5webkit/webgl-bigmesh.html[?m=60][&g=128]. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL big meshes</title>
+<style>
+  body { background: #111; color: #eee; font: 24px/1.4 sans-serif; margin: 40px; }
+  canvas { width: 1280px; height: 720px; border: 2px solid #555; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>WebGL big meshes</h1>
+<canvas id="c" width="1280" height="720"></canvas>
+<div id="out">starting</div>
+<script>
+const params = new URLSearchParams(location.search);
+const meshes = parseInt(params.get('m') || '60', 10);
+const cells = parseInt(params.get('g') || '128', 10);
+const out = document.getElementById('out');
+function log(text) { console.log('[webgl-bigmesh] ' + text); out.textContent = text; }
+
+const gl = document.getElementById('c').getContext('webgl2', { antialias: false });
+if (!gl)
+  log('RESULT webgl-bigmesh FAIL no WebGL 2');
+
+const vs = `#version 300 es
+in vec3 position; in vec3 normal;
+uniform mat4 mvp; uniform vec3 colour;
+out vec3 shade;
+void main() {
+  gl_Position = mvp * vec4(position, 1.0);
+  shade = colour * (0.4 + 0.6 * max(dot(normal, normalize(vec3(0.3, 0.8, 0.5))), 0.0));
+}`;
+const fs = `#version 300 es
+precision mediump float;
+in vec3 shade; out vec4 colourOut;
+void main() { colourOut = vec4(shade, 1.0); }`;
+function shader(type, source) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    log('RESULT webgl-bigmesh FAIL shader: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+const program = gl.createProgram();
+gl.attachShader(program, shader(gl.VERTEX_SHADER, vs));
+gl.attachShader(program, shader(gl.FRAGMENT_SHADER, fs));
+gl.bindAttribLocation(program, 0, 'position');
+gl.bindAttribLocation(program, 1, 'normal');
+gl.linkProgram(program);
+gl.useProgram(program);
+const mvpLocation = gl.getUniformLocation(program, 'mvp');
+const colourLocation = gl.getUniformLocation(program, 'colour');
+
+// One grid: a wavy surface in [-1, 1]^2, different per mesh.
+function makeMesh(seed) {
+  const n = cells + 1;
+  const verts = new Float32Array(n * n * 6);
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const u = x / cells * 2 - 1, v = y / cells * 2 - 1;
+      const h = 0.15 * Math.sin(u * 6 + seed) * Math.cos(v * 5 + seed * 0.7);
+      const dx = 0.15 * 6 * Math.cos(u * 6 + seed) * Math.cos(v * 5 + seed * 0.7);
+      const dy = -0.15 * 5 * Math.sin(u * 6 + seed) * Math.sin(v * 5 + seed * 0.7);
+      const len = Math.hypot(dx, dy, 1);
+      verts.set([u, v, h, -dx / len, -dy / len, 1 / len], (y * n + x) * 6);
+    }
+  }
+  const indices = new Uint16Array(cells * cells * 6);
+  let i = 0;
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < cells; x++) {
+      const a = y * n + x, b = a + 1, c = a + n, d = c + 1;
+      indices.set([a, b, c, b, d, c], i);
+      i += 6;
+    }
+  }
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: indices.length };
+}
+const list = [];
+for (let k = 0; k < meshes; k++)
+  list.push(makeMesh(k * 1.7));
+
+const columns = Math.ceil(Math.sqrt(meshes * 16 / 9));
+const rows = Math.ceil(meshes / columns);
+gl.enable(gl.DEPTH_TEST);
+gl.clearColor(0.05, 0.05, 0.08, 1);
+
+let frames = 0, jsTotal = 0, jsMax = 0, start = 0, phase = 'warm-up';
+const t0 = performance.now();
+function frame(now) {
+  const js0 = performance.now();
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const sx = 2 / columns, sy = 2 / rows, spin = now / 1000;
+  for (let k = 0; k < list.length; k++) {
+    const cx = -1 + sx * (k % columns + 0.5), cy = 1 - sy * (Math.floor(k / columns) + 0.5);
+    const c = Math.cos(spin + k), s = Math.sin(spin + k), z = 0.45;
+    // scale, a tilt, a spin about z, then the cell's place (column-major)
+    gl.uniformMatrix4fv(mvpLocation, false, new Float32Array([
+      sx * z * c, sy * z * s * 0.6, s * 0.1, 0,
+      -sx * z * s, sy * z * c * 0.6, c * 0.1, 0,
+      0, sy * z * 0.8, 0.2, 0,
+      cx, cy, 0.5, 1]));
+    gl.uniform3f(colourLocation, 0.4 + 0.6 * ((k * 37) % 10) / 10, 0.5, 0.9 - 0.5 * ((k * 53) % 10) / 10);
+    gl.bindVertexArray(list[k].vao);
+    gl.drawElements(gl.TRIANGLES, list[k].count, gl.UNSIGNED_SHORT, 0);
+  }
+  gl.bindVertexArray(null);
+  const js = performance.now() - js0;
+  if (phase === 'warm-up' && now - t0 > 2000) {
+    phase = 'measure';
+    start = now;
+  } else if (phase === 'measure') {
+    frames++;
+    jsTotal += js;
+    jsMax = Math.max(jsMax, js);
+    if (now - start >= 5000) {
+      const error = gl.getError();
+      log('RESULT webgl-bigmesh m=' + meshes + ' g=' + cells + ' ' + (frames * 1000 / (now - start)).toFixed(1) +
+          ' fps, JS ' + (jsTotal / frames).toFixed(2) + ' ms per frame (max ' + jsMax.toFixed(1) + '), ' +
+          (meshes * cells * cells * 2) + ' triangles per frame, GL error ' + (error ? '0x' + error.toString(16) : 'none'));
+      phase = 'done';
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

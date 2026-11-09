@@ -1,0 +1,68 @@
+diff -ru a/gst/gsttask.c b/gst/gsttask.c
+--- a/gst/gsttask.c	2026-11-08 13:25:07
++++ b/gst/gsttask.c	2026-11-08 13:25:07
+@@ -740,6 +740,17 @@
+     g_warning ("failed to create thread: %s", error->message);
+     g_error_free (error);
+     res = FALSE;
++    /* PS5: the default pool queues nothing when it can't start a thread (see
++     * gsttaskpool.c), so gst_task_func will never run: undo the start, or a
++     * join waits for it forever. Stopped, the task can be started again. */
++    if (G_OBJECT_TYPE (priv->pool_id) == GST_TYPE_TASK_POOL) {
++      task->running = FALSE;
++      SET_TASK_STATE (task, GST_TASK_STOPPED);
++      gst_object_unref (priv->pool_id);
++      priv->pool_id = NULL;
++      priv->id = NULL;
++      gst_object_unref (task);
++    }
+   }
+   return res;
+ }
+diff -ru a/gst/gsttaskpool.c b/gst/gsttaskpool.c
+--- a/gst/gsttaskpool.c	2026-11-08 13:25:07
++++ b/gst/gsttaskpool.c	2026-11-08 13:25:07
+@@ -70,6 +70,25 @@
+   func (user_data);
+ }
+ 
++/* PS5: each task gets a thread of its own instead of one from the GThreadPool.
++ * When the pool can't start a thread (the console's per-process thread limit:
++ * a page full of videos), g_thread_pool_push() still queues the task, which
++ * then only runs once another task's thread is free, and GstTask can't take
++ * it back: gst_task_join() (a pipeline going to NULL, a source that failed to
++ * start) waited for it forever, on the WebProcess's main thread. A thread of
++ * its own fails cleanly instead and start_task() undoes the start. */
++static gpointer
++default_thread_func (gpointer data)
++{
++  TaskData *tdata = data;
++  GstTaskPoolFunction func = tdata->func;
++  gpointer user_data = tdata->user_data;
++
++  g_free (tdata);
++  func (user_data);
++  return NULL;
++}
++
+ static void
+ default_prepare (GstTaskPool * pool, GError ** error)
+ {
+@@ -107,9 +126,14 @@
+   tdata->user_data = user_data;
+ 
+   GST_OBJECT_LOCK (pool);
+-  if (pool->pool)
+-    g_thread_pool_push (pool->pool, tdata, error);
+-  else {
++  if (pool->pool) {
++    GThread *thread =
++        g_thread_try_new ("gsttask", default_thread_func, tdata, error);
++    if (thread)
++      g_thread_unref (thread);
++    else
++      g_free (tdata);
++  } else {
+     g_free (tdata);
+     g_set_error_literal (error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
+         "No thread pool");

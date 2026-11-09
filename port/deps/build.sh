@@ -652,14 +652,14 @@ step_gst_plugins_base() {
 }
 
 step_gst_plugins_good() {
-    log "gst-plugins-good $GST_VER (isomp4, matroska, audioparsers, id3demux, autodetect, deinterlace, videofilter, audiofx, adaptivedemux2 HLS/DASH)"
+    log "gst-plugins-good $GST_VER (isomp4, matroska, audioparsers, id3demux, autodetect, deinterlace, videofilter, audiofx, interleave, adaptivedemux2 HLS/DASH)"
     fetch https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-$GST_VER.tar.xz \
         a7670ed900d3d03be744d25c1873b239896e9a82ce6d17f8febc6fffbaee9521
     unpack gst-plugins-good "$FETCHED"
     meson_pkg gst-plugins-good "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dorc=disabled -Dasm=disabled \
         -Disomp4=enabled -Dmatroska=enabled -Daudioparsers=enabled -Did3demux=enabled \
         -Dapetag=enabled -Dicydemux=enabled -Dwavparse=enabled -Dautodetect=enabled \
-        -Ddeinterlace=enabled -Dvideofilter=enabled -Daudiofx=enabled \
+        -Ddeinterlace=enabled -Dvideofilter=enabled -Daudiofx=enabled -Dinterleave=enabled \
         -Dadaptivedemux2=enabled -Dsoup=enabled -Dsoup-version=3 -Dhls-crypto=openssl
     fix_sysroot; cleanup gst-plugins-good
 }
@@ -688,7 +688,8 @@ GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions 
                   videoconvertscale volume pbtypes rawparse subparse gio isomp4 matroska
                   audioparsers id3demux apetag icydemux wavparse adaptivedemux2
                   videoparsersbad mpegtsdemux mpegpsdemux id3tag libav autodetect
-                  deinterlace videofilter audiofx)
+                  deinterlace videofilter audiofx interleave)
+# (interleave: deinterleave, which Web Audio's decodeAudioData and output use)
 # (WebKit's software video path sets playbin's deinterlace and soft-colorbalance
 # flags; a missing deinterlace/videobalance is a missing-plugin message, which
 # WebKit turns into MEDIA_ERR_SRC_NOT_SUPPORTED. audiofx = scaletempo for

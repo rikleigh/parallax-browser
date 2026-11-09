@@ -1,0 +1,149 @@
+diff --git a/src/gallium/ps5/ps5_screen.c b/src/gallium/ps5/ps5_screen.c
+index a2e0e5e..0b06538 100644
+--- a/src/gallium/ps5/ps5_screen.c
++++ b/src/gallium/ps5/ps5_screen.c
+@@ -6794,7 +6794,12 @@ ps5_linear_color_pitch(const struct pipe_surface *surface)
+        !ps5_agc_gate2_set_color_target_layouts || !surface || !surface->texture)
+       return 0;
+    const struct ps5_resource *r = (const struct ps5_resource *)surface->texture;
+-   if ((r->base.target != PIPE_TEXTURE_2D && r->base.target != PIPE_TEXTURE_2D_ARRAY) ||
++   /* ps5webkit: a cube (array) face is one layer of the same linear storage,
++    * rendered like an array layer. Before: every draw into a face copied the
++    * whole face to the tiled staging surface and back (a three.js CubeCamera
++    * reflection: ~600 ms of the WebGL thread per frame). */
++   if ((r->base.target != PIPE_TEXTURE_2D && r->base.target != PIPE_TEXTURE_2D_ARRAY &&
++        r->base.target != PIPE_TEXTURE_CUBE && r->base.target != PIPE_TEXTURE_CUBE_ARRAY) ||
+        !r->base.width0 || !r->base.height0 || r->base.depth0 != 1 ||
+        r->base.last_level >= ARRAY_SIZE(r->level_stride) || r->base.last_level >= 16 ||
+        r->base.width0 > PS5_MAX_COLOR_WIDTH || r->base.height0 > PS5_MAX_COLOR_HEIGHT ||
+@@ -13655,8 +13660,12 @@ ps5_clear_gpu_color(struct ps5_context *context, unsigned buffers,
+        surface->format == PIPE_FORMAT_R8G8B8A8_SRGB) &&
+       (target->base.format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+        target->base.format == PIPE_FORMAT_R8G8B8A8_SRGB);
++   /* ps5webkit: cube faces too; one with staging must render linearly
++    * (checked per layer below), as an array layer does. */
+    if (!target || (target->base.target != PIPE_TEXTURE_2D &&
+-                   target->base.target != PIPE_TEXTURE_2D_ARRAY) ||
++                   target->base.target != PIPE_TEXTURE_2D_ARRAY &&
++                   target->base.target != PIPE_TEXTURE_CUBE &&
++                   target->base.target != PIPE_TEXTURE_CUBE_ARRAY) ||
+        ((target->base.nr_samples > 1 || target->base.nr_storage_samples > 1) &&
+         !(PS5_ENABLE_MSAA4_CANDIDATE && target->base.nr_samples == 4 &&
+           target->base.nr_storage_samples == 4 && !target->render_staging_size &&
+diff --git a/tests/ps5/test_color_staging.py b/tests/ps5/test_color_staging.py
+index ac759e7..90e39c9 100644
+--- a/tests/ps5/test_color_staging.py
++++ b/tests/ps5/test_color_staging.py
+@@ -16,6 +16,16 @@ def section(start, end):
+     return source[source.index(start):source.index(end)]
+ 
+ 
++def without_draw_caches(text):
++    """struct ps5_resource is followed by patch 0018's draw-cache helpers
++    (tested in test_draw_cache.py); they need state this test doesn't have."""
++    if "#define PS5_INDEX_RANGE_ENTRIES" not in text:
++        return text
++    a = text.index("#define PS5_INDEX_RANGE_ENTRIES")
++    b = text.index("\n}\n", text.index("ps5_draw_cache_index_entry(struct ps5_resource *resource")) + 3
++    return text[:a] + text[b:]
++
++
+ def function(name):
+     start = source.index("static unsigned\n" + name + "(")
+     return source[start:source.index("\n}", start) + 2]
+@@ -44,7 +54,7 @@ static unsigned ps5_texture_level_layers(const struct pipe_resource *r, unsigned
+ }
+ static unsigned flushes;
+ static void ps5_flush_gpu_data(void *p, size_t n) { assert(p && n); ++flushes; }
+-''' + section("struct ps5_resource {", "struct ps5_transfer {") + section(
++''' + without_draw_caches(section("struct ps5_resource {", "struct ps5_transfer {")) + section(
+     "static size_t\nps5_tiled_color_surface_size(", "static uint32_t\nps5_color_target_info(") + section(
+     "static size_t\nps5_tiled_affine_offset(", "static size_t\nps5_tiled_depth_offset(") + section(
+     "static size_t\nps5_tiled_color_offset(", "static size_t\nps5_tiled_color_msaa4_offset(") +
+diff --git a/tests/ps5/test_gpu_blit.py b/tests/ps5/test_gpu_blit.py
+index 186c253..b1eff2e 100644
+--- a/tests/ps5/test_gpu_blit.py
++++ b/tests/ps5/test_gpu_blit.py
+@@ -51,6 +51,7 @@ code = r'''
+ #define MAX2(a,b) ((a) > (b) ? (a) : (b))
+ #define MIN2(a,b) ((a) < (b) ? (a) : (b))
+ enum { PIPE_TEXTURE_2D=2, PIPE_TEXTURE_3D=3, PIPE_TEXTURE_2D_ARRAY=4,
++       PIPE_TEXTURE_CUBE=8, PIPE_TEXTURE_CUBE_ARRAY=9,
+        PIPE_FORMAT_R8G8B8A8_UNORM=1, PIPE_FORMAT_R8_UNORM=2,
+        PIPE_FORMAT_R8G8_UNORM=3, PIPE_FORMAT_R16G16B16A16_FLOAT=4,
+        PIPE_FORMAT_R11G11B10_FLOAT=5, PIPE_FORMAT_R8G8B8A8_SRGB=6,
+@@ -336,6 +337,24 @@ int main(void) {
+         t.base.nr_samples=0;
+         t.data++; assert(!ps5_linear_color_pitch(&s));
+     }
++    /* ps5webkit: every face of a staged cube renders linearly, like an array
++     * layer; a face past the last, two faces, or a 3D target do not. */
++    { struct ps5_resource cube=linear_resource(1);
++      cube.base.target=PIPE_TEXTURE_CUBE; cube.base.array_size=6;
++      cube.size=6*cube.layer_stride; cube.allocation_size=cube.size+cube.render_staging_size;
++      for (unsigned face=0;face<6;++face) {
++          struct pipe_surface s={.texture=&cube.base,.format=1,.level=0,.first_layer=face,.last_layer=face};
++          assert(ps5_linear_color_pitch(&s)==1024*4);
++          s.level=2; assert(ps5_linear_color_pitch(&s)==256*4);
++      }
++      struct pipe_surface past={.texture=&cube.base,.format=1,.first_layer=6,.last_layer=6};
++      assert(!ps5_linear_color_pitch(&past));
++      struct pipe_surface two={.texture=&cube.base,.format=1,.first_layer=0,.last_layer=1};
++      assert(!ps5_linear_color_pitch(&two));
++      cube.base.target=PIPE_TEXTURE_CUBE_ARRAY;
++      struct pipe_surface face={.texture=&cube.base,.format=1,.first_layer=5,.last_layer=5};
++      assert(ps5_linear_color_pitch(&face)==1024*4);
++      cube.base.target=PIPE_TEXTURE_3D; assert(!ps5_linear_color_pitch(&face)); }
+     for (unsigned format=1;format<=4;++format) {
+         struct ps5_resource t=linear_resource(format);
+         struct pipe_blit_info mip={.src={&t.base,format,0,{0,0,0,1024,1024,1}},
+diff --git a/tests/ps5/test_gpu_clear_state.py b/tests/ps5/test_gpu_clear_state.py
+index cbf462f..8859362 100644
+--- a/tests/ps5/test_gpu_clear_state.py
++++ b/tests/ps5/test_gpu_clear_state.py
+@@ -66,6 +66,8 @@ code = r'''
+ #define PIPE_MASK_RGBA 15
+ #define PIPE_TEXTURE_2D 2
+ #define PIPE_TEXTURE_2D_ARRAY 7
++#define PIPE_TEXTURE_CUBE 4
++#define PIPE_TEXTURE_CUBE_ARRAY 8
+ #define PIPE_FORMAT_R8G8B8A8_UNORM 1
+ #define PIPE_FORMAT_R8_UNORM 2
+ #define PIPE_FORMAT_R8G8_UNORM 3
+@@ -216,6 +218,14 @@ int main(void) {
+     good.framebuffer.cbufs[0].last_layer=0;
+     assert(!ps5_clear_gpu_color(&good,4,15,NULL,&color));
+     good.framebuffer.cbufs[0].first_layer=0;
++    /* ps5webkit: a staged cube face clears on the GPU when it renders linearly. */
++    target.base.target=PIPE_TEXTURE_CUBE; target.base.array_size=6;
++    good.framebuffer.cbufs[0].first_layer=good.framebuffer.cbufs[0].last_layer=5;
++    assert(ps5_clear_gpu_color(&good,4,15,NULL,&color));
++    linear_pitch=0; assert(!ps5_clear_gpu_color(&good,4,15,NULL,&color)); linear_pitch=512;
++    target.base.target=PIPE_TEXTURE_CUBE_ARRAY; target.base.array_size=12;
++    assert(ps5_clear_gpu_color(&good,4,15,NULL,&color));
++    good.framebuffer.cbufs[0].first_layer=good.framebuffer.cbufs[0].last_layer=0;
+     target.base.array_size=1;
+     target.base.target=3;
+     good.framebuffer.cbufs[0].format=target.base.format;
+@@ -408,6 +418,8 @@ code = r'''
+ #define PIPE_CLEAR_STENCIL 2u
+ #define PIPE_TEXTURE_2D 2
+ #define PIPE_TEXTURE_2D_ARRAY 7
++#define PIPE_TEXTURE_CUBE 4
++#define PIPE_TEXTURE_CUBE_ARRAY 8
+ #define PIPE_FORMAT_Z32_FLOAT 1
+ #define PIPE_FORMAT_Z32_FLOAT_S8X24_UINT 2
+ struct resource { unsigned target,format,nr_samples,nr_storage_samples,last_level,
+diff --git a/tests/ps5/test_multidraw_lifetime.py b/tests/ps5/test_multidraw_lifetime.py
+index 2fa12a3..5581364 100644
+--- a/tests/ps5/test_multidraw_lifetime.py
++++ b/tests/ps5/test_multidraw_lifetime.py
+@@ -440,7 +440,7 @@ code = r'''
+ #define PS5_RENDER_ARENA_OFFSET (2u * 0xa00000u)
+ #define PS5_CONSTANT_DATA_OFFSET 16u /* Scaled prefix for the 64-byte ownership fixture. */
+ enum { PIPE_MAX_ATTRIBS=16, PS5_MAX_CONSTANT_BUFFERS=13, PS5_MAX_TEXTURE_UNITS=16, PS5_MAX_RENDER_TARGETS=8, PIPE_BUFFER=1,
+-       PIPE_TEXTURE_2D=2, PIPE_TEXTURE_2D_ARRAY=3, PIPE_FORMAT_R8G8B8A8_UNORM=1, MESA_PRIM_TRIANGLES=4, MESA_PRIM_TRIANGLE_FAN=5, PIPE_BIND_DISPLAY_TARGET=1,
++       PIPE_TEXTURE_2D=2, PIPE_TEXTURE_2D_ARRAY=3, PIPE_TEXTURE_CUBE=8, PIPE_TEXTURE_CUBE_ARRAY=9, PIPE_FORMAT_R8G8B8A8_UNORM=1, MESA_PRIM_TRIANGLES=4, MESA_PRIM_TRIANGLE_FAN=5, PIPE_BIND_DISPLAY_TARGET=1,
+        PIPE_FORMAT_Z32_FLOAT=77, PIPE_FORMAT_Z32_FLOAT_S8X24_UINT=78, PIPE_MAX_VERTEX_STREAMS=4,
+        PIPE_FORMAT_X32_S8X24_UINT=79, PIPE_BIND_RENDER_TARGET=2, PIPE_BIND_DEPTH_STENCIL=4 };
+ struct pipe_resource { unsigned target, format, nr_samples, nr_storage_samples, refs, last_level, bind, array_size, width0; };

@@ -26,6 +26,7 @@
     /* -good */          X(isomp4) X(matroska) X(audioparsers) X(id3demux)   \
                          X(apetag) X(icydemux) X(wavparse) X(adaptivedemux2) \
                          X(autodetect) X(deinterlace) X(videofilter) X(audiofx) \
+                         X(interleave)                                       \
     /* -bad */           X(videoparsersbad) X(mpegtsdemux) X(mpegpsdemux)    \
                          X(id3tag)                                           \
     /* gst-libav */      X(libav)                                            \

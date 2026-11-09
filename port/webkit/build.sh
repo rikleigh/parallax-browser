@@ -188,6 +188,14 @@ WEBKIT_OPTIONS=(
 )
 if [ "$WEBGL" = 1 ]; then
     WEBKIT_OPTIONS+=(-DENABLE_WEBGL=ON -DENABLE_GPU_PROCESS=ON)
+    # Web Audio (AudioContext): in the WebProcess (UseGPUProcessForMedia is off
+    # with GStreamer), out through autoaudiosink = ps5audiosink like <video>'s
+    # sound. Games need it: Unity's sound start-up calls alert("Web Audio API
+    # is not supported") without it, and game portals turn that alert into a
+    # "the game crashed" screen. WEB_AUDIO=0 builds without it.
+    if [ "${WEB_AUDIO:-1}" = 1 ]; then
+        WEBKIT_OPTIONS+=(-DENABLE_WEB_AUDIO=ON)
+    fi
 fi
 if [ "$WC" = 1 ]; then
     WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=ON -DUSE_GRAPHICS_LAYER_WC=ON)

@@ -1,0 +1,82 @@
+<!doctype html>
+<!-- Big ArrayBuffers made and dropped the way a game page's downloads,
+     decompression and IndexedDB copies are: each round allocates buffers of
+     4 to 200 MB of mixed sizes (each a little bigger than the last, so a heap
+     that keeps freed address space can't reuse it), writes every page, checks
+     a few bytes and drops them. On PS5, libpas used to keep every freed range
+     reserved (2 MB of address space = one of the console's shared CPU page
+     tables), until mmap failed in every process; blocks of 4 MB and more are
+     now mappings of their own, unmapped when freed. Compare the WebProcess's
+     "[mem] web4 ... mmaps N live, X MB" lines before and after: X should come
+     back down. ?rounds=<n> (default 12), ?peak=<MB> live at once (default 600).
+     Log lines: RESULT big-buffers round N ..., RESULT big-buffers summary.
+     Upload to /data/ps5webkit/big-buffers.html and open
+     file:///data/ps5webkit/big-buffers.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Big buffers</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>Big ArrayBuffers</h1>
+<div id="out"></div>
+<script>
+const params = new URLSearchParams(location.search);
+const rounds = Number(params.get('rounds') || 12);
+const peakMB = Number(params.get('peak') || 600);
+const MB = 1024 * 1024, PAGE = 16384;
+const out = document.getElementById('out');
+function say(line) {
+  console.log(line);
+  out.textContent += line + '\n';
+}
+
+let failures = 0, corrupt = 0, total = 0;
+function round(n) {
+  const start = performance.now();
+  const live = [];
+  let liveMB = 0, made = 0;
+  // Sizes grow round by round (4.5, 9, ... MB plus n MB), so freed ranges are always a bit small.
+  for (let i = 0; liveMB < peakMB; i++) {
+    const size = Math.min(200, 4.5 * (i + 1) + n) * MB | 0;
+    let buffer;
+    try {
+      buffer = new ArrayBuffer(size);
+    } catch (e) {
+      failures++;
+      say('RESULT big-buffers round ' + n + ' allocation of ' + (size / MB).toFixed(1) + ' MB failed: ' + e);
+      break;
+    }
+    const bytes = new Uint8Array(buffer);
+    for (let p = 0; p < size; p += PAGE)
+      bytes[p] = (p / PAGE + i) & 0xff;
+    live.push({ bytes, i });
+    liveMB += size / MB;
+    made++;
+  }
+  for (const { bytes, i } of live) {
+    for (let p = 0; p < bytes.length; p += PAGE * 61)
+      if (bytes[p] !== ((p / PAGE + i) & 0xff)) corrupt++;
+  }
+  total += made;
+  say('RESULT big-buffers round ' + n + ' made ' + made + ' buffers, ' + Math.round(liveMB) + ' MB live at the peak, ' + Math.round(performance.now() - start) + ' ms');
+}
+
+let n = 1;
+function next() {
+  round(n);
+  if (++n <= rounds) {
+    // Let the GC collect the dropped buffers.
+    setTimeout(next, 2500);
+    return;
+  }
+  say('RESULT big-buffers summary ' + (failures || corrupt ? 'FAIL' : 'PASS') + ' (' + total + ' buffers in ' + rounds + ' rounds, ' + failures + ' failed allocations, ' + corrupt + ' bad bytes)');
+}
+next();
+</script>
+</body>
+</html>
