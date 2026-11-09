@@ -624,6 +624,37 @@ step_ffmpeg() {
     fix_sysroot; cleanup ffmpeg
 }
 
+# Ogg, Vorbis and Opus: GStreamer's own plugins need the Xiph libraries.
+# gst-libav does not register FFmpeg's Vorbis decoder (it defers to
+# vorbisdec), and -bad's opusparse, which MSE needs for Opus in WebM, links
+# libopus.
+step_libogg() {
+    log "libogg 1.3.6 (the Ogg container, for GStreamer's oggdemux)"
+    fetch https://downloads.xiph.org/releases/ogg/libogg-1.3.6.tar.xz \
+        5c8253428e181840cd20d41f3ca16557a9cc04bad4a3d04cce84808677fa1061
+    unpack libogg "$FETCHED"
+    cmake_pkg libogg -DBUILD_TESTING=OFF -DINSTALL_DOCS=OFF
+    fix_sysroot; cleanup libogg
+}
+
+step_libvorbis() {
+    log "libvorbis 1.3.7 (vorbisdec/vorbisparse)"
+    fetch https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz \
+        b33cc4934322bcbf6efcbacf49e3ca01aadbea4114ec9589d1b1e9d20f72954b
+    unpack libvorbis "$FETCHED"
+    cmake_pkg libvorbis -DBUILD_TESTING=OFF -DINSTALL_CMAKE_PACKAGE_MODULE=OFF
+    fix_sysroot; cleanup libvorbis
+}
+
+step_opus() {
+    log "libopus 1.5.2 (opusdec, opusparse; float, x86 intrinsics with run-time detection)"
+    fetch https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz \
+        65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1
+    unpack opus "$FETCHED"
+    meson_pkg opus -Dtests=disabled -Ddocs=disabled -Dextra-programs=disabled
+    fix_sysroot; cleanup opus
+}
+
 GST_VER=1.28.8
 GST_COMMON=(-Dauto_features=disabled -Dtests=disabled -Ddoc=disabled -Dglib_debug=disabled)
 
@@ -640,14 +671,15 @@ step_gstreamer() {
 }
 
 step_gst_plugins_base() {
-    log "gst-plugins-base $GST_VER (app, audio, video, pbutils, tag, fft; playback, typefind, converters; GL off)"
+    log "gst-plugins-base $GST_VER (app, audio, video, pbutils, tag, fft; playback, typefind, converters; ogg, vorbis, opus; GL off)"
     fetch https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-$GST_VER.tar.xz \
         ade70e3381fcbb024f1f20aa9ede9b5654aeed39d5bd70b1a98f53015e501117
     unpack gst-plugins-base "$FETCHED"
     meson_pkg gst-plugins-base "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dintrospection=disabled -Dtools=disabled -Dorc=disabled -Dgl=disabled \
         -Dapp=enabled -Daudioconvert=enabled -Daudioresample=enabled -Dtypefind=enabled \
         -Dplayback=enabled -Dvideoconvertscale=enabled -Dvolume=enabled -Dpbtypes=enabled \
-        -Drawparse=enabled -Dsubparse=enabled -Dgio=enabled -Dgio-typefinder=enabled
+        -Drawparse=enabled -Dsubparse=enabled -Dgio=enabled -Dgio-typefinder=enabled \
+        -Dogg=enabled -Dvorbis=enabled -Dopus=enabled
     fix_sysroot; cleanup gst-plugins-base
 }
 
@@ -665,12 +697,12 @@ step_gst_plugins_good() {
 }
 
 step_gst_plugins_bad() {
-    log "gst-plugins-bad $GST_VER (videoparsers, mpegtsdemux + libgstmpegts, codecparsers)"
+    log "gst-plugins-bad $GST_VER (videoparsers, mpegtsdemux + libgstmpegts, codecparsers, opusparse)"
     fetch https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-$GST_VER.tar.xz \
         670d888bde8242579b0d8e91f60cf337aa7be20ca7c315ebfbdd6e5a9218d104
     unpack gst-plugins-bad "$FETCHED"
     meson_pkg gst-plugins-bad "${GST_COMMON[@]}" -Dexamples=disabled -Dnls=disabled -Dintrospection=disabled -Dtools=disabled -Dorc=disabled -Dgpl=disabled \
-        -Dvideoparsers=enabled -Dmpegtsdemux=enabled -Did3tag=enabled -Dmpegdemux=enabled
+        -Dvideoparsers=enabled -Dmpegtsdemux=enabled -Did3tag=enabled -Dmpegdemux=enabled -Dopus=enabled
     fix_sysroot; cleanup gst-plugins-bad
 }
 
@@ -688,8 +720,11 @@ GST_FULL_PLUGINS=(coreelements app audioconvert audioresample typefindfunctions 
                   videoconvertscale volume pbtypes rawparse subparse gio isomp4 matroska
                   audioparsers id3demux apetag icydemux wavparse adaptivedemux2
                   videoparsersbad mpegtsdemux mpegpsdemux id3tag libav autodetect
-                  deinterlace videofilter audiofx interleave)
-# (interleave: deinterleave, which Web Audio's decodeAudioData and output use)
+                  deinterlace videofilter audiofx interleave ogg vorbis opus opusparse)
+# (interleave: deinterleave, which Web Audio's decodeAudioData and output use;
+# ogg, vorbis, opus: Ogg files (oggdemux) with Vorbis (vorbisdec) or Opus
+# (opusdec), for <audio> and decodeAudioData; opusparse: Opus in WebM for MSE,
+# which WebKit offers only with a parser)
 # (WebKit's software video path sets playbin's deinterlace and soft-colorbalance
 # flags; a missing deinterlace/videobalance is a missing-plugin message, which
 # WebKit turns into MEDIA_ERR_SRC_NOT_SUPPORTED. audiofx = scaletempo for
@@ -733,9 +768,10 @@ step_gst_full() {
           case "$p" in */libgstreamer-full-1.0.a) continue ;; esac
           echo "ADDLIB $p"
       done
-      # gst-libav's FFmpeg and dav1d too, so WebKit's USE_GSTREAMER_FULL
-      # (which links only this archive) needs nothing media-specific.
-      for p in avfilter avformat avcodec swresample avutil dav1d; do
+      # gst-libav's FFmpeg and dav1d, and the Xiph libraries, too, so
+      # WebKit's USE_GSTREAMER_FULL (which links only this archive) needs
+      # nothing media-specific.
+      for p in avfilter avformat avcodec swresample avutil dav1d vorbisenc vorbis ogg opus; do
           echo "ADDLIB $lib/lib$p.a"
       done
       echo "SAVE"; echo "END"; } > "$mri"
@@ -751,7 +787,7 @@ step_gst_full() {
     done
     reqs=$(PKG_CONFIG_LIBDIR="$lib/pkgconfig:$lib/gstreamer-1.0/pkgconfig:$SYSROOT/share/pkgconfig" \
         pkg-config --print-requires --print-requires-private "${mods[@]}" 2>/dev/null |
-        awk '{print $1}' | grep -v -E '^(gst|libav|libswresample|dav1d)' | sort -u | tr '\n' ' ')
+        awk '{print $1}' | grep -v -E '^(gst|libav|libswresample|dav1d)|^(ogg|vorbis|vorbisenc|opus)$' | sort -u | tr '\n' ' ')
     cat > "$lib/pkgconfig/gstreamer-full-1.0.pc" <<PC
 prefix=\${pcfiledir}/../..
 libdir=\${prefix}/lib
@@ -854,7 +890,7 @@ STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv p
           libxml2 libxslt sqlite libpsl icu freetype harfbuzz fontconfig pcre2 libffi glib
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
           cacert fonts mime xkeyboard_config)
-STEPS_M2=(dav1d ffmpeg gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
+STEPS_M2=(dav1d ffmpeg libogg libvorbis opus gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
 
 if [ "${1:-}" = "--list" ]; then
     echo "# Milestone 1 (default)"; printf '%s\n' "${STEPS_M1[@]}" | tr _ -

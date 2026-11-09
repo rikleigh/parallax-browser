@@ -38,5 +38,6 @@
 50:audio/mpeg:*.mp3
 50:audio/ogg:*.ogg
 50:audio/ogg:*.opus
+50:audio/ogg:*.oga
 50:audio/flac:*.flac
 50:audio/wav:*.wav

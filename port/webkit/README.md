@@ -30,7 +30,11 @@ Settings switch (see *Settings* and COMPOSITING-PLAN.md).
 The default tree (WEBGL=1, build-webgl) has WebGL (through a GPU process
 hosted in the title) and Web Audio (AudioContext in the WebProcess, out
 through ps5audiosink to the title like `<video>`'s sound; WEB_AUDIO=0 builds
-without it; test page test/audio/webaudio.html). No WebXR, WebRTC, speech,
+without it; test page test/audio/webaudio.html: decodeAudioData, Ogg
+Vorbis/Opus and WebM Opus, MSE Opus, AudioWorklet, MediaElementAudioSourceNode).
+Ogg (oggdemux), Vorbis (vorbisdec) and Opus (opusdec, and opusparse for Opus
+in WebM through MSE) are GStreamer's own plugins on libogg, libvorbis and
+libopus (port/deps/build.sh). No WebXR, WebRTC, speech,
 geolocation, sandbox, introspection, docs, journald or libbacktrace.
 
 ## Send a link from another device
@@ -1075,7 +1079,7 @@ JavaScript completely (events and timers ran only after the video ended):
 the profile showed 81 % of the main thread in Skia's `bilerp_clamp_8888`.
 YouTube asks `isTypeSupported` and gets: avc1 yes, vp9/vp09 yes, av01 no,
 VP9 at 3840x2160 no, at 1920x1080@60 yes; mp4a yes; `audio/webm; opus` no
-(not needed so far: YouTube sent AAC).
+(not needed so far: YouTube sent AAC; yes since 2026-11-09, with opusparse).
 
 **In the title (log-only run, 2026-10-28 11:58, audio-silent):** the local
 1080p30 MP4 played with its audio going through the title's sceAudioOut
@@ -1185,7 +1189,7 @@ Still open after step 1 (the first three are addressed by step 2a, below):
 title fps, YouTube 60 fps under its overlays (every video frame repainted
 the player's gradient/blur layers on the CPU), the 24 s without video
 frames on YouTube after the consent dialog (audio and clock ran on); and
-Opus in WebM for MSE.
+Opus in WebM for MSE (since 2026-11-09: opusparse on libopus).
 
 ## Hole-punch video (Milestone 2 step 2a, 2026-10-28)
 

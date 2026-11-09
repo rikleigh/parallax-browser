@@ -27,8 +27,9 @@
                          X(apetag) X(icydemux) X(wavparse) X(adaptivedemux2) \
                          X(autodetect) X(deinterlace) X(videofilter) X(audiofx) \
                          X(interleave)                                       \
+    /* -base, Xiph */    X(ogg) X(vorbis) X(opus)                            \
     /* -bad */           X(videoparsersbad) X(mpegtsdemux) X(mpegpsdemux)    \
-                         X(id3tag)                                           \
+                         X(id3tag) X(opusparse)                              \
     /* gst-libav */      X(libav)                                            \
     /* ours: audio and hole-punch video to the title */ X(ps5audio) X(ps5video)
 

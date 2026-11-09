@@ -1,0 +1,65 @@
+diff --git a/Source/WebCore/platform/audio/gstreamer/AudioSourceProviderGStreamer.cpp b/Source/WebCore/platform/audio/gstreamer/AudioSourceProviderGStreamer.cpp
+index f2793b6433..e2a772d44b 100644
+--- a/Source/WebCore/platform/audio/gstreamer/AudioSourceProviderGStreamer.cpp
++++ b/Source/WebCore/platform/audio/gstreamer/AudioSourceProviderGStreamer.cpp
+@@ -222,21 +222,32 @@ void AudioSourceProviderGStreamer::configureAudioBin(GstElement* audioBin, GstEl
+     GstElement* audioResample = makeGStreamerElement("audioresample"_s);
+     GstElement* audioResample2 = makeGStreamerElement("audioresample"_s);
+     GstElement* volumeElement = makeGStreamerElement("volume"_s, "volume"_s);
+-
+-    gst_bin_add_many(GST_BIN_CAST(m_audioSinkBin.get()), audioTee, audioQueue, audioConvert, audioResample, volumeElement, audioConvert2, audioResample2, audioSink, nullptr);
++    // While a MediaElementAudioSourceNode is the client, the media is heard
++    // only through Web Audio: the valve turns the direct branch's buffers into
++    // gap events (silence, the sink's timing kept). The volume element can't
++    // do it: with a platform sink that has no volume property of its own,
++    // playsink adopts this element as the stream volume and sets its mute from
++    // the media element's, undoing ours (the element played twice, the
++    // direct copy at full volume).
++    GstElement* valve = gst_element_factory_make("valve", "webaudio-valve");
++    gst_util_set_object_arg(G_OBJECT(valve), "drop-mode", "transform-to-gap");
++    g_object_set(valve, "drop", !!m_client, nullptr);
++
++    gst_bin_add_many(GST_BIN_CAST(m_audioSinkBin.get()), audioTee, audioQueue, audioConvert, audioResample, volumeElement, valve, audioConvert2, audioResample2, audioSink, nullptr);
+ 
+     // Add a ghostpad to the bin so it can proxy to tee.
+     GRefPtr audioTeeSinkPad = adoptGRef(gst_element_get_static_pad(audioTee, "sink"));
+     gst_element_add_pad(m_audioSinkBin.get(), gst_ghost_pad_new("sink", audioTeeSinkPad.get()));
+ 
+-    // Link a new src pad from tee to queue ! audioconvert ! audioresample ! volume ! audioconvert !
++    // Link a new src pad from tee to queue ! audioconvert ! audioresample ! volume ! valve ! audioconvert !
+     // audioresample ! audiosink. The audioresample and audioconvert are needed to ensure the audio
+     // sink receives buffers in the correct format.
+     gst_element_link_pads_full(audioTee, "src_%u", audioQueue, "sink", GST_PAD_LINK_CHECK_NOTHING);
+     gst_element_link_pads_full(audioQueue, "src", audioConvert, "sink", GST_PAD_LINK_CHECK_NOTHING);
+     gst_element_link_pads_full(audioConvert, "src", audioResample, "sink", GST_PAD_LINK_CHECK_NOTHING);
+     gst_element_link_pads_full(audioResample, "src", volumeElement, "sink", GST_PAD_LINK_CHECK_NOTHING);
+-    gst_element_link_pads_full(volumeElement, "src", audioConvert2, "sink", GST_PAD_LINK_CHECK_NOTHING);
++    gst_element_link_pads_full(volumeElement, "src", valve, "sink", GST_PAD_LINK_CHECK_NOTHING);
++    gst_element_link_pads_full(valve, "src", audioConvert2, "sink", GST_PAD_LINK_CHECK_NOTHING);
+     gst_element_link_pads_full(audioConvert2, "src", audioResample2, "sink", GST_PAD_LINK_CHECK_NOTHING);
+     gst_element_link_pads_full(audioResample2, "src", audioSink, "sink", GST_PAD_LINK_CHECK_NOTHING);
+ }
+@@ -344,15 +355,14 @@ void AudioSourceProviderGStreamer::setClient(WeakPtr<AudioSourceProviderClient>&
+     bool previousClientWasValid = !!m_client;
+     m_client = WTF::move(newClient);
+ 
+-    // The volume element is used to mute audio playback towards the
+-    // autoaudiosink. This is needed to avoid double playback of audio
+-    // from our audio sink and from the WebAudio AudioDestination node
+-    // supposedly configured already by application side.
+-    GRefPtr volumeElement = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(m_audioSinkBin.get()), "volume"));
+-
+-    if (volumeElement) {
+-        bool shouldMute = !!m_client;
+-        g_object_set(volumeElement.get(), "mute", shouldMute, nullptr);
++    // The valve silences audio playback towards the autoaudiosink. This is
++    // needed to avoid double playback of audio from our audio sink and from
++    // the WebAudio AudioDestination node supposedly configured already by
++    // application side (see configureAudioBin(): not the volume element's
++    // mute, which playsink may own).
++    if (m_audioSinkBin) {
++        if (GRefPtr valve = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(m_audioSinkBin.get()), "webaudio-valve")))
++            g_object_set(valve.get(), "drop", !!m_client, nullptr);
+     }
+ 
+     GRefPtr audioTee = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(m_audioSinkBin.get()), "audioTee"));
