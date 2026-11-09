@@ -3119,6 +3119,81 @@ a ping every 5 s, a health check before each round):
   it to the local elfldr, as the title sends its children), so no large
   payload goes from the Mac to elfldr any more.
 
+## Speedometer (2026-11-09)
+
+Speedometer 3.1 in the title (PPSA99020), with the browser's defaults (ad
+blocking on, GPU compositing, JIT all tiers). **browserbench.org: 5.70 ±
+0.19 before, 6.04 ± 0.16 and 6.07 ± 0.23 after.** The rounds were measured on
+a copy of the benchmark (release/3.1 branch, served from the Mac, with a
+small reporter module that logs `SPEEDO iter/DONE/SUITES` lines to the page
+console; not committed), each run in a freshly started title:
+
+| round | change | local score (runs) |
+| --- | --- | --- |
+| 0 | baseline | 5.27 (5.36 with the profiler) |
+| 1 | `-O3` and no libc++ hardening checks (`USE_CXX_STDLIB_ASSERTIONS=OFF`; build.sh, full rebuild) | 5.59, 5.64 |
+| 2 | ad blocker: one generic selector dropped (`ubol-scripting.js` 2), user style rules cached (WebKit patch 0105) | 5.63, 5.66 / 5.67, 5.65 |
+| 3 | `clock_gettime` from the TSC in ps5wk-child (`apps/common/ps5clock.c`) | 5.85, 5.83 |
+| 4 | two JIT compiler threads per tier (child.env): no gain, not kept; shared rule feature vectors (WebKit patch 0106) | 5.87, 5.81 / 5.85, 5.81 |
+
+Run-to-run spread is about ±0.1. Ad blocking off scored 5.94 at round 0
+(+12%), so the blocker is still the largest single cost (about 10% now).
+
+- **Profile** (`PS5WK_PROFILE=1`, a whole run): the WebProcess main thread
+  is style 18%, JS runtime 16%, JIT code 14%, layout 12%, DOM 12%, malloc 8%.
+  Speedometer times the test's own work (sync) and the rendering after it
+  up to the next timer (async: style, layout, paint).
+- **Compiler flags**: WebKit's default for libc++ is
+  `_LIBCPP_HARDENING_MODE_EXTENSIVE` (bounds checks in every container
+  access); `-O3` instead of `-O2`. The PS5 target already compiles for
+  znver2.
+- **The ad blocker's generic cosmetic style sheet** (13,945 selectors, one
+  user style sheet in every frame, see ADBLOCK.md) cost most in two ways:
+  - `#cmdTextDisplay ~ *`, the only generic selector whose subject is `*`:
+    tested against every element, walking all earlier siblings, and it makes
+    every insertion restyle later siblings. The converter now drops such
+    selectors (ubol-scripting.js VERSION 2, lists are converter 1002; a
+    console with an older list converts again at its next daily check).
+  - WebKit rebuilt the user style RuleSet (all 13,945 rules) for every new
+    style resolver, and a page that adds or removes a `<style>` gets a new
+    resolver: Observable Plot puts one in each chart, so Charts spent 20% of
+    the main thread there, inside the measured time. **Patch 0105**
+    (`ExtensionStyleSheets::cachedUserStyle`): the RuleSet is kept while
+    the document's user style sheets are unchanged (any change through
+    `ExtensionStyleSheets` drops it), and only when no rule depends on a
+    media query that can change; keyed on print media. Charts async 134 ->
+    88 ms.
+  - Every resolver, shadow trees' included, also merged the user rules'
+    invalidation features (13,000 class and id entries) into its own set.
+    **Patch 0106**: `RuleFeatureSet` keeps its per-key feature vectors as
+    `SharedRuleFeatureVector` (ref-counted, copied before a shared one is
+    changed), so merging takes references. Charts async 86 -> 77 ms,
+    Perf-Dashboard sync 380 -> 362 ms.
+  - `test/adblock/cosmetic.html` now also checks a class added later, an
+    element added later and a `<style>` added and removed (`dynamic hidden
+    2/2, still hidden 4/4`), with both patches.
+- **`clock_gettime` is a system call on the console, ~1.1 us** (the
+  WebProcess's `[probe] clock_gettime` line), and WebKit reads the
+  monotonic clock everywhere (timers, `MonotonicTime::now`, libpas's epoch,
+  GLib, `performance.now()`): 2-3% of the main thread. `ps5clock.c`
+  (`--wrap=clock_gettime`, ps5wk-child only): the first 250 ms time the TSC
+  against the kernel; then monotonic time is an anchor plus TSC ticks, and
+  every 2 s one caller re-reads the kernel clock, refines the rate over the
+  whole run and steers the next 2 s (at most 0.2%) to stay within
+  microseconds of it, or jumps forward when it is more than 50 ms behind
+  (the process was suspended). Realtime is monotonic plus the kernel's
+  offset, re-read at each check. A seqlock with fenced `rdtsc` keeps it
+  monotonic: 0 steps back in 250 million calls from 8 threads (Mac test
+  under Rosetta), ~15 ns per call there. Off switch:
+  `/data/ps5webkit/no-tsc-clock`. The probe line still shows the kernel's
+  cost (it runs during the calibration).
+- **Not changed**: more JIT compiler threads (one per tier stays, for
+  memory); emulated TLS (`__emutls_get_address`, ~1%); the content
+  blocker's URL matching (`DFABytecodeInterpreter`, ~1%, mostly during
+  loads); rebuilding the user rules once per new document (~4% of the main
+  thread, during loads, not measured; the conditional display-none sheet
+  is per document, so a cache across documents needs splitting the sheets).
+
 ## JSC `Date` (FEASIBILITY §8 item 5)
 
 Not a clock bug. WTF's wall clock on this libc is

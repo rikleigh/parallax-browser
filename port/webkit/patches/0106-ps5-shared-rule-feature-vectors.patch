@@ -1,0 +1,187 @@
+diff --git a/Source/WebCore/style/RuleFeature.cpp b/Source/WebCore/style/RuleFeature.cpp
+index 525c12224a..1683b1fdad 100644
+--- a/Source/WebCore/style/RuleFeature.cpp
++++ b/Source/WebCore/style/RuleFeature.cpp
+@@ -462,6 +462,16 @@ static PseudoClassInvalidationKey makePseudoClassInvalidationKey(CSSSelector::Ps
+     return makePseudoClassInvalidationKey(pseudoClass, InvalidationKeyType::Universal);
+ };
+ 
++// The vector in slot, made first, or copied first when another set shares it.
++static RuleFeatureVector& mutableFeatures(RefPtr<SharedRuleFeatureVector>& slot)
++{
++    if (!slot)
++        slot = SharedRuleFeatureVector::create();
++    else if (!slot->hasOneRef())
++        slot = SharedRuleFeatureVector::create(slot->features);
++    return slot->features;
++}
++
+ void RuleFeatureSet::collectFeatures(CollectionContext& collectionContext, const RuleData& ruleData, const Vector<Ref<const StyleRuleScope>>& scopeRules)
+ {
+     RELEASE_ASSERT(isMainThread());
+@@ -509,9 +519,7 @@ void RuleFeatureSet::collectFeatures(CollectionContext& collectionContext, const
+             auto& [selector, matchElement, isNegation, scopeSources] = entry;
+             auto& name = selector->value();
+ 
+-            auto& featureVector = *map.ensure(name, [] {
+-                return makeUnique<RuleFeatureVector>();
+-            }).iterator->value;
++            auto& featureVector = mutableFeatures(map.add(name, nullptr).iterator->value);
+ 
+             addToVector(featureVector, RuleFeature {
+                 ruleData,
+@@ -535,9 +543,7 @@ void RuleFeatureSet::collectFeatures(CollectionContext& collectionContext, const
+ 
+     for (auto& entry : selectorFeatures.attributes) {
+         auto& [selector, matchElement, isNegation, scopeSources] = entry;
+-        auto& featureVector = *attributeRules.ensure(selector->attribute().localNameLowercase(), [] {
+-            return makeUnique<RuleFeatureVector>();
+-        }).iterator->value;
++        auto& featureVector = mutableFeatures(attributeRules.add(selector->attribute().localNameLowercase(), nullptr).iterator->value);
+ 
+         addToVector(featureVector, RuleFeature {
+             ruleData,
+@@ -554,9 +560,7 @@ void RuleFeatureSet::collectFeatures(CollectionContext& collectionContext, const
+ 
+     for (auto& entry : selectorFeatures.pseudoClasses) {
+         auto& [selector, matchElement, isNegation, scopeSources] = entry;
+-        auto& featureVector = *pseudoClassRules.ensure(makePseudoClassInvalidationKey(selector->pseudoClass(), *selector), [] {
+-            return makeUnique<Vector<RuleFeature>>();
+-        }).iterator->value;
++        auto& featureVector = mutableFeatures(pseudoClassRules.add(makePseudoClassInvalidationKey(selector->pseudoClass(), *selector), nullptr).iterator->value);
+ 
+         addToVector(featureVector, RuleFeature {
+             ruleData,
+@@ -576,9 +580,7 @@ void RuleFeatureSet::collectFeatures(CollectionContext& collectionContext, const
+     for (auto& entry : selectorFeatures.hasPseudoClasses) {
+         auto& [selector, matchElement, isNegation, scopeSources] = entry;
+         // The selector argument points to a selector inside :has() selector list instead of :has() itself.
+-        auto& featureVector = *hasPseudoClassRules.ensure(makePseudoClassInvalidationKey(CSSSelector::PseudoClass::Has, *selector), [] {
+-            return makeUnique<RuleFeatureVector>();
+-        }).iterator->value;
++        auto& featureVector = mutableFeatures(hasPseudoClassRules.add(makePseudoClassInvalidationKey(CSSSelector::PseudoClass::Has, *selector), nullptr).iterator->value);
+ 
+         addToVector(featureVector, RuleFeature {
+             ruleData,
+@@ -623,11 +625,12 @@ void RuleFeatureSet::add(const RuleFeatureSet& other)
+     attributeLowercaseLocalNamesInRules.addAll(other.attributeLowercaseLocalNamesInRules);
+     attributeLocalNamesInRules.addAll(other.attributeLocalNamesInRules);
+ 
++    // A vector this set doesn't have is shared, not copied (SharedRuleFeatureVector).
+     auto addMap = [&](auto& map, auto& otherMap) {
+         for (auto& keyValuePair : otherMap) {
+-            map.ensure(keyValuePair.key, [] {
+-                return makeUnique<std::decay_t<decltype(*keyValuePair.value)>>();
+-            }).iterator->value->appendVector(*keyValuePair.value);
++            auto result = map.add(keyValuePair.key, keyValuePair.value);
++            if (!result.isNewEntry)
++                mutableFeatures(result.iterator->value).appendVector(keyValuePair.value->features);
+         }
+     };
+ 
+@@ -678,16 +681,18 @@ void RuleFeatureSet::clear()
+ 
+ void RuleFeatureSet::shrinkToFit()
+ {
+-    for (auto& rules : idRules.values())
+-        rules->shrinkToFit();
+-    for (auto& rules : classRules.values())
+-        rules->shrinkToFit();
+-    for (auto& rules : attributeRules.values())
+-        rules->shrinkToFit();
+-    for (auto& rules : pseudoClassRules.values())
+-        rules->shrinkToFit();
+-    for (auto& rules : hasPseudoClassRules.values())
+-        rules->shrinkToFit();
++    // Shared vectors were shrunk by the set that made them.
++    auto shrink = [](auto& map) {
++        for (auto& rules : map.values()) {
++            if (rules->hasOneRef())
++                rules->features.shrinkToFit();
++        }
++    };
++    shrink(idRules);
++    shrink(classRules);
++    shrink(attributeRules);
++    shrink(pseudoClassRules);
++    shrink(hasPseudoClassRules);
+ }
+ 
+ } // namespace Style
+diff --git a/Source/WebCore/style/RuleFeature.h b/Source/WebCore/style/RuleFeature.h
+index 6113edba40..8523a6ee8c 100644
+--- a/Source/WebCore/style/RuleFeature.h
++++ b/Source/WebCore/style/RuleFeature.h
+@@ -28,6 +28,7 @@
+ #include <wtf/HashMap.h>
+ #include <wtf/HashSet.h>
+ #include <wtf/Markable.h>
++#include <wtf/RefCounted.h>
+ #include <wtf/text/AtomString.h>
+ #include <wtf/text/AtomStringHash.h>
+ 
+@@ -113,6 +114,26 @@ using PseudoClassInvalidationKey = std::tuple<unsigned, uint8_t, AtomString>;
+ 
+ using RuleFeatureVector = Vector<RuleFeature>;
+ 
++// A RuleFeatureVector that several RuleFeatureSets share: RuleFeatureSet::add
++// takes a reference to a vector the set doesn't have yet instead of copying
++// it (a large user style sheet, e.g. a content blocker's, otherwise copies
++// thousands of vectors for every new style resolver, shadow trees' too), and
++// a shared vector is copied before it is changed.
++struct SharedRuleFeatureVector : public RefCounted<SharedRuleFeatureVector> {
++    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(SharedRuleFeatureVector);
++public:
++    static Ref<SharedRuleFeatureVector> create() { return adoptRef(*new SharedRuleFeatureVector); }
++    static Ref<SharedRuleFeatureVector> create(const RuleFeatureVector& features) { return adoptRef(*new SharedRuleFeatureVector(features)); }
++    RuleFeatureVector features;
++
++private:
++    SharedRuleFeatureVector() = default;
++    explicit SharedRuleFeatureVector(const RuleFeatureVector& features)
++        : features(features)
++    {
++    }
++};
++
+ struct SelectorDeduplicationKey {
+     SelectorDeduplicationKey(const CSSSelector&);
+ 
+@@ -141,11 +162,11 @@ struct RuleFeatureSet {
+     HashSet<AtomString> attributeLowercaseLocalNamesInRules;
+     HashSet<AtomString> attributeLocalNamesInRules;
+ 
+-    HashMap<AtomString, std::unique_ptr<RuleFeatureVector>> idRules;
+-    HashMap<AtomString, std::unique_ptr<RuleFeatureVector>> classRules;
+-    HashMap<AtomString, std::unique_ptr<RuleFeatureVector>> attributeRules;
+-    HashMap<PseudoClassInvalidationKey, std::unique_ptr<RuleFeatureVector>> pseudoClassRules;
+-    HashMap<PseudoClassInvalidationKey, std::unique_ptr<RuleFeatureVector>> hasPseudoClassRules;
++    HashMap<AtomString, RefPtr<SharedRuleFeatureVector>> idRules;
++    HashMap<AtomString, RefPtr<SharedRuleFeatureVector>> classRules;
++    HashMap<AtomString, RefPtr<SharedRuleFeatureVector>> attributeRules;
++    HashMap<PseudoClassInvalidationKey, RefPtr<SharedRuleFeatureVector>> pseudoClassRules;
++    HashMap<PseudoClassInvalidationKey, RefPtr<SharedRuleFeatureVector>> hasPseudoClassRules;
+ 
+     HashSet<AtomString> classesAffectingHost;
+     HashSet<AtomString> attributesAffectingHost;
+diff --git a/Source/WebCore/style/StyleScopeRuleSets.cpp b/Source/WebCore/style/StyleScopeRuleSets.cpp
+index d0cf745fea..67b1e63bc5 100644
+--- a/Source/WebCore/style/StyleScopeRuleSets.cpp
++++ b/Source/WebCore/style/StyleScopeRuleSets.cpp
+@@ -415,14 +415,14 @@ static Vector<InvalidationRuleSet> buildInvalidationRuleSets(const RuleFeatureVe
+ }
+ 
+ template<typename KeyType, typename Hash, typename HashTraits>
+-static Vector<InvalidationRuleSet>* ensureInvalidationRuleSets(const KeyType& key, HashMap<KeyType, std::unique_ptr<Vector<InvalidationRuleSet>>, Hash, HashTraits>& ruleSetMap, const HashMap<KeyType, std::unique_ptr<RuleFeatureVector>, Hash, HashTraits>& ruleFeatures)
++static Vector<InvalidationRuleSet>* ensureInvalidationRuleSets(const KeyType& key, HashMap<KeyType, std::unique_ptr<Vector<InvalidationRuleSet>>, Hash, HashTraits>& ruleSetMap, const HashMap<KeyType, RefPtr<SharedRuleFeatureVector>, Hash, HashTraits>& ruleFeatures)
+ {
+     return ruleSetMap.ensure(key, [&] () -> std::unique_ptr<Vector<InvalidationRuleSet>> {
+         auto* features = ruleFeatures.get(key);
+         if (!features)
+             return nullptr;
+ 
+-        return makeUnique<Vector<InvalidationRuleSet>>(buildInvalidationRuleSets(*features));
++        return makeUnique<Vector<InvalidationRuleSet>>(buildInvalidationRuleSets(features->features));
+     }).iterator->value.get();
+ }
+ 

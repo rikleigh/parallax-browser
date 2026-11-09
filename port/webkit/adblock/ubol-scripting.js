@@ -44,7 +44,25 @@
 var UBOLScripting = (function () {
     'use strict';
 
-    var VERSION = 1; /* of this converter: part of the list's identity (with dnr-to-webkit.js's) */
+    var VERSION = 2; /* of this converter: part of the list's identity (with dnr-to-webkit.js's) */
+
+    /* A generic selector whose subject (the rightmost compound) is only `*`
+     * (pseudo-classes at most) is tested on every element of every page, and
+     * with a sibling combinator (`#x ~ *`) WebKit walks every earlier sibling
+     * for each element and restyles all later siblings on every insertion:
+     * quadratic on long lists and charts (Speedometer's Charts and NewsSite
+     * suites were 20-50% slower with one such selector in the global style
+     * sheet). Too costly for a style sheet every frame of every page gets;
+     * uBO Lite applies these after a DOM survey instead. (2: dropped.) */
+    function costlyGeneric(selector) {
+        var flat = String(selector).replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
+            .replace(/\[[^\]]*\]/g, '[a]');
+        while (/\([^()]*\)/.test(flat))
+            flat = flat.replace(/\([^()]*\)/g, '{}');
+        var parts = flat.trim().split(/\s*[\s>+~]\s*/);
+        var subject = parts[parts.length - 1];
+        return /^\*?(:{1,2}[\w-]+(\{\})?)*$/.test(subject) && subject.length > 0 && subject.charAt(0) === '*';
+    }
     var FORMAT = 1;  /* of the site data */
     var WORLDS = ['main', 'isolated'];
 
@@ -510,6 +528,10 @@ var UBOLScripting = (function () {
         var universal = [], conditional = [];
         for (var gi = 0; gi < genericOrder.length; gi++) {
             var selector = genericOrder[gi];
+            if (costlyGeneric(selector)) {
+                stats.genericCostlyDropped = (stats.genericCostlyDropped || 0) + 1;
+                continue;
+            }
             var hosts = exceptions[selector];
             if (!hosts) {
                 universal.push({ trigger: { 'url-filter': '.*' }, action: { type: 'css-display-none', selector: selector } });
