@@ -401,13 +401,82 @@ static bool sendFD(int socket, const ps5wk_welcome& welcome, int fd)
     }
 }
 
+// A child's hello, read as it arrives: the main loop never waits for a
+// peer (one that sent part of a hello and then nothing used to stop the UI
+// in a blocking recv). Whole within 2 s, or the connection is closed.
+struct PendingHello {
+    WPEProcessManagerPS5* manager; // a reference
+    int fd;
+    ps5wk_hello hello;
+    size_t received;
+    guint watch;
+    guint timeout;
+};
+
+static void handleHello(WPEProcessManagerPS5*, int client, const ps5wk_hello&);
+
+static void pendingHelloEnd(PendingHello* pending, bool closeFD)
+{
+    if (pending->watch)
+        g_source_remove(pending->watch);
+    if (pending->timeout)
+        g_source_remove(pending->timeout);
+    if (closeFD)
+        close(pending->fd);
+    g_object_unref(pending->manager);
+    delete pending;
+}
+
+static gboolean pendingHelloTimeout(gpointer data)
+{
+    auto* pending = static_cast<PendingHello*>(data);
+    pending->timeout = 0;
+    g_warning("[ps5-launch] rendezvous: no whole hello within 2 s (%zu of %zu bytes)", pending->received, sizeof(pending->hello));
+    pendingHelloEnd(pending, true);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean pendingHelloReadable(int fd, GIOCondition, gpointer data)
+{
+    auto* pending = static_cast<PendingHello*>(data);
+    ssize_t n = recv(fd, reinterpret_cast<char*>(&pending->hello) + pending->received, sizeof(pending->hello) - pending->received, 0);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return G_SOURCE_CONTINUE;
+    if (n <= 0) {
+        g_warning("[ps5-launch] rendezvous: connection closed after %zu of %zu hello bytes (errno %d)", pending->received, sizeof(pending->hello), n ? errno : 0);
+        pending->watch = 0;
+        pendingHelloEnd(pending, true);
+        return G_SOURCE_REMOVE;
+    }
+    pending->received += static_cast<size_t>(n);
+    if (pending->received < sizeof(pending->hello))
+        return G_SOURCE_CONTINUE;
+    pending->watch = 0;
+    handleHello(pending->manager, fd, pending->hello); // closes fd
+    pendingHelloEnd(pending, false);
+    return G_SOURCE_REMOVE;
+}
+
 static void handleConnection(WPEProcessManagerPS5* manager, int client)
 {
+    int flags = fcntl(client, F_GETFL, 0);
+    if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) < 0) {
+        g_warning("[ps5-launch] rendezvous: O_NONBLOCK failed (errno %d)", errno);
+        close(client);
+        return;
+    }
+    fcntl(client, F_SETFD, FD_CLOEXEC);
+    auto* pending = new PendingHello { WPE_PROCESS_MANAGER_PS5(g_object_ref(manager)), client, { }, 0, 0, 0 };
+    pending->watch = g_unix_fd_add(client, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR), pendingHelloReadable, pending);
+    pending->timeout = g_timeout_add(2000, pendingHelloTimeout, pending);
+}
+
+// Main loop: a whole hello; closes client.
+static void handleHello(WPEProcessManagerPS5* manager, int client, const ps5wk_hello& hello)
+{
     auto* priv = manager->priv;
-    ps5wk_hello hello { };
-    struct pollfd p { client, POLLIN, 0 };
-    if (poll(&p, 1, 2000) != 1 || recv(client, &hello, sizeof(hello), MSG_WAITALL) != sizeof(hello) || hello.magic != PS5WK_HELLO_MAGIC) {
-        g_warning("[ps5-launch] rendezvous: bad or missing hello (errno %d)", errno);
+    if (hello.magic != PS5WK_HELLO_MAGIC) {
+        g_warning("[ps5-launch] rendezvous: bad hello (magic 0x%llx)", static_cast<unsigned long long>(hello.magic));
         close(client);
         return;
     }
