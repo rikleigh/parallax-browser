@@ -1299,7 +1299,8 @@ static gboolean isSettingsURI(const char* uri)
     return uri && g_str_has_prefix(uri, PS5WK_SETTINGS_URL);
 }
 
-/* Main loop: R3 opens Settings, and from there goes back to the page. */
+/* Main loop: R3 opens Settings (in a browser page tab over the page, which
+ * stays as it is), and from there goes back to the page. */
 static void toggleSettings(void)
 {
     if (ps5wk_vr_active() || windDownStart)
@@ -1307,6 +1308,8 @@ static void toggleSettings(void)
     const char* current = webkit_web_view_get_uri(webView);
     if (isSettingsURI(current)) {
         spike_log("settings: R3, back to the page");
+        if (ps5wk_browser_close_page())
+            return;
         if (webkit_web_view_can_go_back(webView))
             webkit_web_view_go_back(webView);
         else {
@@ -1316,13 +1319,18 @@ static void toggleSettings(void)
         }
         return;
     }
-    g_mutex_lock(&shownLock);
-    g_free(settingsReturnURI);
-    settingsReturnURI = g_strdup(current && *current ? current : "");
-    g_mutex_unlock(&shownLock);
+    /* From the mapping page, the page it was opened for stays the one to
+     * come back to. */
+    if (!(current && g_str_has_prefix(current, PS5WK_GAMEPAD_URL))) {
+        g_mutex_lock(&shownLock);
+        g_free(settingsReturnURI);
+        settingsReturnURI = g_strdup(current && *current ? current : "");
+        g_mutex_unlock(&shownLock);
+    }
     spike_log("settings: R3, opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
     loadStart = g_get_monotonic_time();
-    webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
+    if (!ps5wk_browser_open_page(PS5WK_SETTINGS_URL))
+        webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
 }
 
 /* Every tab's view gets these (browserui.c makes the views of live tabs). */
@@ -1473,7 +1481,7 @@ static const char* restartBrowser(const char* from)
         return "the launcher doesn't see the browser running";
     }
     g_mutex_lock(&shownLock);
-    const char* back = shownURI && !isSettingsURI(shownURI) ? shownURI : settingsReturnURI;
+    const char* back = shownURI && !isSettingsURI(shownURI) && !g_str_has_prefix(shownURI, PS5WK_GAMEPAD_URL) ? shownURI : settingsReturnURI;
     const char* error = NULL;
     char* uri = back && *back ? pushNormalize(back, &error) : NULL;
     g_mutex_unlock(&shownLock);

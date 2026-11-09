@@ -9,11 +9,12 @@
  *     and spatial navigation off (the arrow keys are the game's);
  *   - on a page that reads the gamepad, on a site with no answer yet, the
  *     first press brings the offer "Gamepad mode available △ Turn on
- *     ○ Not now"; it stays
+ *     □ Set up buttons ○ Not now"; it stays
  *     until answered (remembered either way) or the page changes, and comes
  *     back on the next page of the site until it is answered;
- *   - Options held 1 s opens the browser menu (browserui.c), whose gamepad
- *     button switches the mode for the site; □ there opens the mapping page;
+ *   - Options held 1 s leaves gamepad mode (off for the site); the browser
+ *     menu's gamepad button switches it for the site, □ there opens the
+ *     mapping page (in a browser page tab, browserui.c);
  *   - /gamepad (link server) is the mapping page: presets, a key per button,
  *     what the sticks do; it talks to /browser/gamepad (browserui.c's API).
  *
@@ -253,7 +254,7 @@ static void apply(gboolean announce)
             webkit_settings_set_enable_spatial_navigation(settings, !on);
     }
     if (announce && on != modeOn)
-        wpe_display_ps5_show_message(display, on ? "Gamepad mode on · hold Options for the browser menu" : "Gamepad mode off", on ? 4 : 2);
+        wpe_display_ps5_show_message(display, on ? "Gamepad mode on · hold Options to leave it" : "Gamepad mode off", on ? 4 : 2);
     if (on)
         hidePrompt();
     if (on != modeOn)
@@ -293,7 +294,7 @@ const char* ps5wk_gamepad_site(void)
  * covered it) until it is answered or the page changes. */
 static void showPrompt(void)
 {
-    wpe_display_ps5_show_message(display, "Gamepad mode available    △ Turn on    ○ Not now", 3600);
+    wpe_display_ps5_show_message(display, "Gamepad mode available    △ Turn on    □ Set up buttons    ○ Not now", 3600);
 }
 
 static void hidePrompt(void)
@@ -359,6 +360,14 @@ gboolean ps5wk_gamepad_buttons(guint32 pressed)
         apply(TRUE);
         return TRUE;
     }
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_SQUARE) {
+        /* Not an answer: the offer comes back on the site's next page (or
+         * this one, from the mapping page) unless one is given there. */
+        hidePrompt();
+        spike_log("gamepad: mapping page from the offer on %s", host);
+        ps5wk_browser_open_gamepad_page();
+        return TRUE;
+    }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE) {
         prompting = FALSE;
         PS5WKSite* site = ps5wk_site_get(host);
@@ -381,6 +390,18 @@ void ps5wk_gamepad_toggle(void)
     hidePrompt();
     setMode(ps5wk_site_get(host), !modeOn);
     apply(TRUE);
+}
+
+void ps5wk_gamepad_leave(void)
+{
+    if (!modeOn || !host)
+        return;
+    PS5WKSite* site = ps5wk_site_get(host);
+    site->gamepad = PS5WK_GAMEPAD_OFF;
+    ps5wk_site_changed(site);
+    apply(FALSE);
+    wpe_display_ps5_show_message(display, "Gamepad mode off · turn it back on from the menu's controller button", 3);
+    spike_log("gamepad: left with Options held on %s", host);
 }
 
 void ps5wk_gamepad_init(WPEDisplayPS5* d)
@@ -544,7 +565,8 @@ const char ps5wk_gamepad_page_html[] =
     "html{font-size:clamp(16px,1.25vw,26px)}\n"
     "body{margin:0;background:var(--bg);color:var(--fg);font:1rem/1.45 -apple-system,system-ui,sans-serif}\n"
     "main{max-width:56rem;margin:0 auto;padding:1.2rem 16px 3rem}\n"
-    "h1{font-size:1.6rem;margin:0}\n"
+    "header{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}\n"
+    "h1{font-size:1.6rem;margin:0;flex:1}\n"
     "h1 span{display:block;font-size:.8rem;font-weight:600;color:var(--muted);letter-spacing:.02em}\n"
     "h2{font-size:1rem;margin:1.8rem 0 .4rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}\n"
     ".card{background:var(--card);border:1px solid var(--line);border-radius:.8rem;padding:.9rem 1rem;margin:.5rem 0}\n"
@@ -568,8 +590,8 @@ const char ps5wk_gamepad_page_html[] =
     "#status{min-height:1.5em;margin:.6rem 0;font-weight:600}\n"
     ".note{color:var(--muted)}\n"
     "</style></head><body><main>\n"
-    "<h1><span>Parallax · per-site controls</span>Gamepad mode</h1>\n"
-    "<p class=\"help\">In gamepad mode the whole controller belongs to the page: the browser stops using it (no pointer, scrolling or Back). <b>Hold Options for a second</b> to get the browser menu back. Pages that support controllers read it directly; for keyboard games, each button can press a key.</p>\n"
+    "<header><h1><span>Parallax · per-site controls</span>Gamepad mode</h1><button id=\"back\" hidden>Back to the page</button></header>\n"
+    "<p class=\"help\">In gamepad mode the whole controller belongs to the page: the browser stops using it (no pointer, scrolling or Back). <b>Hold Options for a second</b> to leave it. Pages that support controllers read it directly; for keyboard games, each button can press a key.</p>\n"
     "<div id=\"pinbox\" class=\"card\" hidden><p>This PS5 asks for the link server's PIN.</p><div class=\"row\"><input id=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" placeholder=\"PIN\"><button id=\"pinok\">OK</button></div></div>\n"
     "<div id=\"status\" role=\"status\"></div>\n"
     "<div id=\"site\"></div>\n"
@@ -605,7 +627,7 @@ const char ps5wk_gamepad_page_html[] =
     "var STICKS=[['gamepad','Controller'],['arrows','Arrow keys'],['wasd','W A S D'],['pointer','Pointer'],['scroll','Scroll']];\n"
     "function render(focus){\n"
     "  var box=$('site');box.textContent='';\n"
-    "  if(!site){box.appendChild(el('div','card note','Open a game, then hold Options and pick the gamepad button, or come here from the menu (□ on the gamepad button).'));renderOthers();return}\n"
+    "  if(!site){box.appendChild(el('div','card note','Open a game, then come here from the menu (Options, then □ on the controller button) or from the offer (□).'));renderOthers();return}\n"
     "  var e=entry(),m=keyMap(e);\n"
     "  var c=el('div','card');box.appendChild(c);\n"
     "  var head=el('div','row');head.appendChild(el('span','name',site=='file:'?'Local files':site));\n"
@@ -625,7 +647,7 @@ const char ps5wk_gamepad_page_html[] =
     "  c.appendChild(el('h2',null,'Right stick'));\n"
     "  c.appendChild(seg(STICKS,e.right,function(v){send({right:v},'r'+v)},'r'));\n"
     "  c.appendChild(el('h2',null,'Buttons'));\n"
-    "  c.appendChild(el('p','help','The page always gets the controller too; a key here is pressed as well. Options held for a second is the browser\\'s.'));\n"
+    "  c.appendChild(el('p','help','The page always gets the controller too; a key here is pressed as well. Options held for a second leaves gamepad mode.'));\n"
     "  var g=el('div','map');c.appendChild(g);\n"
     "  S.buttons.forEach(function(bt){\n"
     "    var b=el('button',m[bt.name]?'set':null);b.id='b'+bt.name;\n"
@@ -656,5 +678,9 @@ const char ps5wk_gamepad_page_html[] =
     "}\n"
     "$('pinok').onclick=function(){pin=$('pin').value.trim();try{sessionStorage.setItem('ps5pin',pin)}catch(e){}load()};\n"
     "$('pin').onkeydown=function(e){if(e.key=='Enter')$('pinok').click()};\n"
+    "/* On the PS5: closes this browser page tab, back to the page it was opened over (O does too). */\n"
+    "$('back').hidden=document.documentElement.className!='tv';\n"
+    "$('back').onclick=function(){var h={'Content-Type':'application/x-www-form-urlencoded'};if(pin)h['X-PS5-PIN']=pin;\n"
+    "  fetch('/browser/page',{method:'POST',headers:h,body:'action=close',cache:'no-store'}).then(function(r){if(!r.ok)history.back()}).catch(function(){history.back()})};\n"
     "load('gon');\n"
     "</script></body></html>\n";

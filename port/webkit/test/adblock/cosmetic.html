@@ -10,9 +10,13 @@
   lists, a tag and an attribute from the "highly generic" one) and controls
   that nothing hides. Served over http (e.g. tools/serve-media.py --port 8779
   port/webkit/test/adblock) they should be hidden; opened as a file: page they
-  should not be (the browser's own pages are exempt). Result, one console
-  line the title relays:
-    [cosmetic-test] http: hidden 4/4 (#AD_160 .ez-sidebar-wall ad-slot [data-ad-name]), controls shown 2/2
+  should not be (the browser's own pages are exempt). Then the dynamic part
+  (style invalidation and resolver rebuilds with the user style rules, WebKit
+  patch 0105): a shown element gets a hidden class, a new element with a
+  hidden id is added, and a <style> is added and removed (new style
+  resolvers reuse the cached user rules); both must end up hidden and the
+  first four stay hidden. Result, one console line the title relays:
+    [cosmetic-test] http: hidden 4/4 (#AD_160 .ez-sidebar-wall ad-slot [data-ad-name]), controls shown 2/2, dynamic hidden 2/2, still hidden 4/4
 -->
 <style>
 :root{color-scheme:dark}
@@ -29,6 +33,7 @@ body{margin:0;background:#10141c;color:#e8ecf2;font:20px/1.4 system-ui,sans-seri
 <div class="box" data-ad-name="x" data-test="ad">[data-ad-name] (highly generic attribute)</div>
 <div class="box" id="content-160" data-test="control">control: #content-160</div>
 <div class="box sidebar-wall-paper" data-test="control">control: .sidebar-wall-paper</div>
+<div class="box" id="dyn">dynamic: gets .ez-sidebar-wall</div>
 <script>
 setTimeout(function () {
     var ads = document.querySelectorAll('[data-test=ad]'), controls = document.querySelectorAll('[data-test=control]');
@@ -36,6 +41,25 @@ setTimeout(function () {
     ads.forEach(function (e) { if (getComputedStyle(e).display === 'none') hidden.push(e.id ? '#' + e.id : e.className.replace('box ', '.') || e.tagName); });
     controls.forEach(function (e) { if (getComputedStyle(e).display !== 'none') shownControls++; });
     var text = '[cosmetic-test] ' + location.protocol.replace(':', '') + ': hidden ' + hidden.length + '/' + ads.length + ' (' + hidden.join(' ') + '), controls shown ' + shownControls + '/' + controls.length;
+    var isHidden = function (e) { return getComputedStyle(e).display === 'none'; };
+    var dyn = document.getElementById('dyn');
+    dyn.classList.add('ez-sidebar-wall');
+    var added = document.createElement('div');
+    added.className = 'box';
+    added.id = 'AD_160_2';
+    added.textContent = 'dynamic: added later';
+    document.body.appendChild(added);
+    var dynHidden = (isHidden(dyn) ? 1 : 0);
+    added.id = 'AD_160';
+    dynHidden += isHidden(added) ? 1 : 0;
+    var style = document.createElement('style');
+    style.textContent = '.box{outline:1px solid #445}';
+    document.head.appendChild(style);
+    var still = 0;
+    ads.forEach(function (e) { if (isHidden(e)) still++; });
+    style.remove();
+    ads.forEach(function (e) { if (!isHidden(e)) still--; });
+    text += ', dynamic hidden ' + dynHidden + '/2, still hidden ' + still + '/' + ads.length;
     document.getElementById('summary').textContent = text;
     console.log(text);
 }, 1000);

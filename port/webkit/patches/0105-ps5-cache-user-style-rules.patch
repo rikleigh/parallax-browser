@@ -1,0 +1,180 @@
+diff --git a/Source/WebCore/dom/ExtensionStyleSheets.cpp b/Source/WebCore/dom/ExtensionStyleSheets.cpp
+index b40bc5ae09..75d9e15a3a 100644
+--- a/Source/WebCore/dom/ExtensionStyleSheets.cpp
++++ b/Source/WebCore/dom/ExtensionStyleSheets.cpp
+@@ -63,6 +63,22 @@ ExtensionStyleSheets::ExtensionStyleSheets(Document& document)
+ 
+ ExtensionStyleSheets::~ExtensionStyleSheets() = default;
+ 
++void ExtensionStyleSheets::didChangeExtensionStyleSheets()
++{
++    ++m_userStyleVersion;
++    m_hasCachedUserStyle = false;
++    m_cachedUserStyle = nullptr;
++    protect(m_document->styleScope())->didChangeExtensionStyleSheets();
++}
++
++void ExtensionStyleSheets::setCachedUserStyle(RefPtr<Style::RuleSet>&& ruleSet, bool printMedia)
++{
++    m_cachedUserStyle = WTF::move(ruleSet);
++    m_cachedUserStyleVersion = m_userStyleVersion;
++    m_cachedUserStylePrint = printMedia;
++    m_hasCachedUserStyle = true;
++}
++
+ static Ref<CSSStyleSheet> createExtensionsStyleSheet(Document& document, URL url, const String& text, UserStyleLevel level)
+ {
+     auto contents = StyleSheetContents::create(url.string(), CSSParserContext(document, url));
+@@ -96,7 +112,7 @@ void ExtensionStyleSheets::clearPageUserSheet()
+ {
+     if (m_pageUserSheet) {
+         m_pageUserSheet = nullptr;
+-        protect(m_document->styleScope())->didChangeExtensionStyleSheets();
++        didChangeExtensionStyleSheets();
+     }
+ }
+ 
+@@ -104,7 +120,7 @@ void ExtensionStyleSheets::updatePageUserSheet()
+ {
+     clearPageUserSheet();
+     if (pageUserSheet())
+-        protect(m_document->styleScope())->didChangeExtensionStyleSheets();
++        didChangeExtensionStyleSheets();
+ }
+ 
+ const Vector<Ref<CSSStyleSheet>>& ExtensionStyleSheets::injectedUserStyleSheets() const
+@@ -210,7 +226,7 @@ bool ExtensionStyleSheets::hasCachedInjectedStyleSheets() const
+ void ExtensionStyleSheets::invalidateInjectedStyleSheetCache()
+ {
+     m_injectedStyleSheetCacheValid = false;
+-    protect(m_document->styleScope())->didChangeExtensionStyleSheets();
++    didChangeExtensionStyleSheets();
+ }
+ 
+ void ExtensionStyleSheets::addUserStyleSheet(Ref<StyleSheetContents>&& userSheet)
+@@ -218,7 +234,7 @@ void ExtensionStyleSheets::addUserStyleSheet(Ref<StyleSheetContents>&& userSheet
+     ASSERT(userSheet.get().isUserStyleSheet());
+     Ref document = m_document;
+     m_userStyleSheets.append(CSSStyleSheet::create(WTF::move(userSheet), document));
+-    document->styleScope().didChangeExtensionStyleSheets();
++    didChangeExtensionStyleSheets();
+ }
+ 
+ void ExtensionStyleSheets::addAuthorStyleSheetForTesting(Ref<StyleSheetContents>&& authorSheet)
+@@ -226,7 +242,7 @@ void ExtensionStyleSheets::addAuthorStyleSheetForTesting(Ref<StyleSheetContents>
+     ASSERT(!authorSheet.get().isUserStyleSheet());
+     Ref document = m_document;
+     m_authorStyleSheetsForTesting.append(CSSStyleSheet::create(WTF::move(authorSheet), document));
+-    document->styleScope().didChangeExtensionStyleSheets();
++    didChangeExtensionStyleSheets();
+ }
+ 
+ #if ENABLE(CONTENT_EXTENSIONS)
+@@ -240,7 +256,7 @@ void ExtensionStyleSheets::addDisplayNoneSelector(const String& identifier, cons
+         m_userStyleSheets.append(protect(result.iterator->value->styleSheet()));
+ 
+     if (protect(result.iterator->value)->addDisplayNoneSelector(selector, selectorID))
+-        document->styleScope().didChangeExtensionStyleSheets();
++        didChangeExtensionStyleSheets();
+ }
+ 
+ void ExtensionStyleSheets::maybeAddContentExtensionSheet(const String& identifier, StyleSheetContents& sheet)
+@@ -254,7 +270,7 @@ void ExtensionStyleSheets::maybeAddContentExtensionSheet(const String& identifie
+     Ref cssSheet = CSSStyleSheet::create(sheet, document);
+     m_contentExtensionSheets.set(identifier, cssSheet.copyRef());
+     m_userStyleSheets.append(WTF::move(cssSheet));
+-    document->styleScope().didChangeExtensionStyleSheets();
++    didChangeExtensionStyleSheets();
+ 
+ }
+ #endif // ENABLE(CONTENT_EXTENSIONS)
+diff --git a/Source/WebCore/dom/ExtensionStyleSheets.h b/Source/WebCore/dom/ExtensionStyleSheets.h
+index 93d7a47f88..91a9f93623 100644
+--- a/Source/WebCore/dom/ExtensionStyleSheets.h
++++ b/Source/WebCore/dom/ExtensionStyleSheets.h
+@@ -51,6 +51,10 @@ class StyleSheetContents;
+ class StyleSheetList;
+ class WeakPtrImplWithEventTargetData;
+ 
++namespace Style {
++class RuleSet;
++}
++
+ class ExtensionStyleSheets final : public CanMakeCheckedPtr<ExtensionStyleSheets> {
+     WTF_MAKE_TZONE_ALLOCATED(ExtensionStyleSheets);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(ExtensionStyleSheets);
+@@ -87,7 +91,18 @@ public:
+ 
+     void detachFromDocument();
+ 
++    // The user style RuleSet ScopeRuleSets::initializeUserStyle built from
++    // these sheets, kept while they are unchanged (a large content blocker
++    // style sheet would otherwise be turned into rules again for every new
++    // style resolver, i.e. at every author style sheet change). Not kept
++    // when its rules depend on media queries that can change.
++    bool hasCachedUserStyle(bool printMedia) const { return m_hasCachedUserStyle && m_cachedUserStyleVersion == m_userStyleVersion && m_cachedUserStylePrint == printMedia; }
++    Style::RuleSet* cachedUserStyle() const { return m_cachedUserStyle.get(); }
++    void setCachedUserStyle(RefPtr<Style::RuleSet>&&, bool printMedia);
++
+ private:
++    void didChangeExtensionStyleSheets();
++
+     WeakRef<Document, WeakPtrImplWithEventTargetData> m_document;
+ 
+     RefPtr<CSSStyleSheet> m_pageUserSheet;
+@@ -101,6 +116,12 @@ private:
+     Vector<Ref<CSSStyleSheet>> m_authorStyleSheetsForTesting;
+     Vector<UserStyleSheet> m_pageSpecificStyleSheets;
+ 
++    unsigned m_userStyleVersion { 0 };
++    unsigned m_cachedUserStyleVersion { 0 };
++    bool m_hasCachedUserStyle { false };
++    bool m_cachedUserStylePrint { false };
++    RefPtr<Style::RuleSet> m_cachedUserStyle;
++
+ #if ENABLE(CONTENT_EXTENSIONS)
+     MemoryCompactRobinHoodHashMap<String, Ref<CSSStyleSheet>> m_contentExtensionSheets;
+     MemoryCompactRobinHoodHashMap<String, Ref<ContentExtensions::ContentExtensionStyleSheet>> m_contentExtensionSelectorSheets;
+diff --git a/Source/WebCore/style/RuleSet.h b/Source/WebCore/style/RuleSet.h
+index 24da00738e..72aa3ee7a5 100644
+--- a/Source/WebCore/style/RuleSet.h
++++ b/Source/WebCore/style/RuleSet.h
+@@ -98,6 +98,7 @@ public:
+     void shrinkToFit();
+ 
+     bool hasViewportDependentMediaQueries() const { return m_hasViewportDependentMediaQueries; }
++    bool hasDynamicMediaQueryRules() const { return !m_dynamicMediaQueryRules.isEmpty(); }
+ 
+     std::optional<DynamicMediaQueryEvaluationChanges> evaluateDynamicMediaQueryRules(const MQ::MediaQueryEvaluator&);
+ 
+diff --git a/Source/WebCore/style/StyleScopeRuleSets.cpp b/Source/WebCore/style/StyleScopeRuleSets.cpp
+index 7679fc3aec..d0cf745fea 100644
+--- a/Source/WebCore/style/StyleScopeRuleSets.cpp
++++ b/Source/WebCore/style/StyleScopeRuleSets.cpp
+@@ -125,6 +125,14 @@ void ScopeRuleSets::initializeUserStyle()
+     CheckedRef extensionStyleSheets = protect(m_styleResolver.document())->extensionStyleSheets();
+     auto& mediaQueryEvaluator = m_styleResolver.mediaQueryEvaluator();
+ 
++    // The rules from unchanged user style sheets, as built for the last
++    // resolver (ExtensionStyleSheets::cachedUserStyle).
++    bool printMedia = mediaQueryEvaluator.isPrintMedia();
++    if (extensionStyleSheets->hasCachedUserStyle(printMedia)) {
++        m_userStyle = extensionStyleSheets->cachedUserStyle();
++        return;
++    }
++
+     auto userStyle = RuleSet::create();
+ 
+     if (RefPtr pageUserSheet = extensionStyleSheets->pageUserSheet()) {
+@@ -147,8 +155,11 @@ void ScopeRuleSets::initializeUserStyle()
+ #endif
+     collectRulesFromUserStyleSheets(extensionStyleSheets->documentUserStyleSheets(), userStyle, mediaQueryEvaluator);
+ 
++    bool cacheable = !userStyle->hasViewportDependentMediaQueries() && !userStyle->hasDynamicMediaQueryRules();
+     if (userStyle->ruleCount() > 0 || userStyle->pageRules().size() > 0)
+         m_userStyle = WTF::move(userStyle);
++    if (cacheable)
++        extensionStyleSheets->setCachedUserStyle(RefPtr { m_userStyle }, printMedia);
+ }
+ 
+ void ScopeRuleSets::collectRulesFromUserStyleSheets(const Vector<Ref<CSSStyleSheet>>& userSheets, RuleSet& userStyle, const MQ::MediaQueryEvaluator& mediaQueryEvaluator)

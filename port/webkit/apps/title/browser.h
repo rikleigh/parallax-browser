@@ -148,8 +148,18 @@ void ps5wk_browser_load_changed(WebKitWebView* view, WebKitLoadEvent event);
 gboolean ps5wk_browser_view_terminated(WebKitWebView* view);
 /* Hidden live tabs give up their pages (before the WebProcess restarts). */
 void ps5wk_browser_discard_hidden(const char* why);
-/* Back as the pad's O does (not into the empty first entry of a new tab). */
+/* Back as the pad's O does (not into the empty first entry of a new tab;
+ * a browser page tab with nothing to go back to closes). */
 void ps5wk_browser_go_back(void);
+/* The browser's own pages (Settings, button mapping) open in a browser page
+ * tab over the tab shown: one at a time, not one of the tabs the limit
+ * counts. FALSE: not now (a tab switch in progress). */
+gboolean ps5wk_browser_open_page(const char* url);
+/* Closes the browser page tab shown, back to the tab it was opened over
+ * (also POST /browser/page action=close). FALSE: the tab shown isn't one. */
+gboolean ps5wk_browser_close_page(void);
+/* The mapping page for the site shown (the menu's gamepad button's □). */
+void ps5wk_browser_open_gamepad_page(void);
 /* Options: the menu (with the address field focused). */
 void ps5wk_browser_toggle_menu(void);
 gboolean ps5wk_browser_menu_open(void);
@@ -170,6 +180,8 @@ void ps5wk_gamepad_page(WebKitWebView* view, const char* uri);
 gboolean ps5wk_gamepad_buttons(guint32 pressed);
 /* The menu's gamepad button: on/off for the site shown. */
 void ps5wk_gamepad_toggle(void);
+/* Options held in gamepad mode: off for the site shown. */
+void ps5wk_gamepad_leave(void);
 gboolean ps5wk_gamepad_active(void);
 /* The site shown ("file:" for local files), NULL for none. */
 const char* ps5wk_gamepad_site(void);
@@ -179,6 +191,7 @@ char* ps5wk_gamepad_api(gboolean post, const char* site, const char* gamepad, co
 /* The mapping page (GET /gamepad on the link server). */
 extern const char ps5wk_gamepad_page_html[];
 #define PS5WK_GAMEPAD_URL "http://127.0.0.1:9040/gamepad"
+#define PS5WK_SETTINGS_URL_PREFIX "http://127.0.0.1:9040/settings"
 
 /* Private browsing (browserui.c): TRUE while the private session is shown. */
 gboolean ps5wk_browser_private(void);

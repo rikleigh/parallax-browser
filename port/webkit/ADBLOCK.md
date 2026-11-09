@@ -549,6 +549,20 @@ moved both ways by up to a few seconds (The Verge 12.7 / 10.6 s, CNN 12.5 /
 5.3 s, reddit 5.3 / 8.8 s, Apple 1.7 / 2.1 s, MDN 0.8 / 0.6 s), with the
 same request counts: real-site noise, nothing systematic.
 
+### Cost of the generic style sheet (2026-11-09)
+
+Speedometer 3.1 was 12% faster with blocking off (README: "Speedometer").
+Since then: generic selectors whose subject is only `*` (pseudo-classes at
+most) are dropped by the converter (`costlyGeneric` in ubol-scripting.js,
+VERSION 2: one selector, `#cmdTextDisplay ~ *`, which made every element
+walk its earlier siblings and every insertion restyle the later ones);
+WebKit keeps the user style rules while a document's user style sheets
+are unchanged (patch 0105) and shares rule feature vectors between style
+resolvers (patch 0106). Blocking still costs about 10%: matching the user
+rules (3% of the main thread), merging their features into each new
+resolver, building them once per new document (during loads), and the
+network rules' URL matching (1%).
+
 ### Limits
 
 - Not checked on the console yet: the per-site allow list with phase 2 (an
