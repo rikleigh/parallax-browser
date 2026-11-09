@@ -128,7 +128,8 @@ default it asks for no password.
   bookmarklet with the PIN built in. `/data/ps5webkit/push-off` (a file):
   no server, so nothing reaches it, but Settings still opens on the PS5
   (`parallax://settings`, see *The browser's own pages*). Both files are
-  read at startup. `/data/ps5webkit/push-cookie-key.txt`: `POST /cookies`
+  read at startup. `POST /cookies` is refused unless a PIN or
+  `/data/ps5webkit/push-cookie-key.txt` is set up. With the key file, it
   must carry that key in `X-PS5-Key` as well as the PIN; an empty or
   unreadable key file refuses every import.
 - **The QR code:** `GET /link.json` (for `parallax://` pages only: the
@@ -206,7 +207,9 @@ domain prefix). Nothing is written on the Mac.
   needed. Persistent ones go to `browser/data/cookies.sqlite`; session
   cookies (expiry 0) last until the browser closes. The log shows
   `push from http <ip>: N cookies for <domains>`.
-- Open by default, like the rest of the link server. Knob:
+- Not open by default, unlike the rest of the link server: cookies log into
+  accounts, so `/cookies` needs a PIN (`/data/ps5webkit/push-pin.txt`,
+  `PS5_PIN` for ps5open) or a key, or both. The key:
   `/data/ps5webkit/push-cookie-key.txt` makes `/cookies` require the same
   key in an `X-PS5-Key` header (`PS5_COOKIE_KEY` for ps5open).
 - If the browser isn't running, ps5open starts it on its home page and waits
@@ -809,12 +812,19 @@ pages close), and a private tab opens on the home page. Private pages:
   queue takes no line at all (`ps5wk_log_private` in `apps/title/titlelog.c`),
   so no page, site, download or page console message reaches
   `ps5browser.log`, its `.1` or the TCP log; a crash there leaves no lines
-  either. When it ends: `[log] private browsing ended: N lines were not
-  logged`. `debug-screenshot` takes no screenshots, and *Restart browser*
-  comes back to the home page, not the private page (`open-url.txt`
-  outlives the restart). Checked on the console 2026-11-09: a private page
-  with a marker in its address, then a normal one; the marker was nowhere
-  in the log;
+  either. A half-written stderr line is cut at the switch, so private text
+  can't finish one and slip through after. When it ends: `[log] private
+  browsing ended: N lines were not logged`. *Restart browser* comes back to
+  the home page, not the private page (`open-url.txt` outlives the
+  restart). Checked on the console 2026-11-09: a private page with a marker
+  in its address, then a normal one; the marker was nowhere in the log;
+- are **never captured**: from *private browsing on* until 2 s after it
+  ends, the renderer refuses every screenshot (`debug-screenshot`, its first
+  frames, `/browser/shot`) and drops one already asked for
+  (`wpe_display_ps5_set_captures_blocked`);
+- stay **off the link server**: `/status` and `/browser/state` give no tab
+  addresses or titles (empty, with `"private":true`), and Settings forgets
+  the page it was opened from when private browsing starts or ends;
 - show a **plum bar** with a *Private* chip, also while loading.
 
 Leaving (the same button) closes the private tabs, their WebProcess and the

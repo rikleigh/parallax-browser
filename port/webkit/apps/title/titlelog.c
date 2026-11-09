@@ -217,9 +217,22 @@ void ps5wk_log_private(int on)
 {
     pthread_mutex_lock(&lock);
     absorbStderrLocked(); /* what was written before the change */
-    if (on)
+    if (on && !privateOn) {
+        /* An unfinished stderr line from before: logged now, so private
+         * text written after it can't complete it later. */
+        if (partialLen) {
+            partial[partialLen++] = '\n';
+            pushLocked(partial, partialLen);
+            partialLen = 0;
+        }
         privateOn = 1;
-    else if (privateOn) {
+    } else if (!on && privateOn) {
+        /* An unfinished line now was written while private: dropped, or
+         * the newline that ends it would log it. */
+        if (partialLen) {
+            privateDropped++;
+            partialLen = 0;
+        }
         privateOn = 0;
         char note[128];
         int k = snprintf(note, sizeof note, "[log] private browsing ended: %llu lines were not logged\n", (unsigned long long)privateDropped);

@@ -9,6 +9,9 @@
 #   restart titlelog.c; the listener is killed and started again 5 s later
 #   reset   titlelog.c with stall=4: the stop outlasts it, the connection is
 #           reset and a new one made (into the stopped listener's backlog)
+#   private titlelog.c switching private browsing on and off: no PRIVMARK
+#           line in the file or at the listener, unfinished stderr lines
+#           from either side of a switch included
 # Prints each run's slowest call per second and checks the listener's copy:
 # every thread's lines in order, a gap only where a "[log] ... dropped" note
 # says so.
@@ -83,4 +86,27 @@ run_case direct direct stop
 run_case queue queue stop
 run_case restart queue restart
 run_case reset queue stop
+
+echo "== private (private browsing on and off, 3 rounds)"
+rm -f "$OUT/log-sink"
+echo "127.0.0.1:$PORT queue=16" > "$OUT/log-sink"
+perl "$HERE/listener.pl" -r 8192 $PORT > "$OUT/private.listener" & lpid=$!
+tick 0.5
+"$OUT/logsink-test" private $PORT 0 "$OUT" 3> "$OUT/private.report" || true
+tick 1
+kill $lpid 2>/dev/null || true; wait $lpid 2>/dev/null || true
+cat "$OUT/private.report"
+fail=0
+for f in "$OUT/logsink-test.log" "$OUT/private.listener"; do
+    leaks=$(grep -c PRIVMARK "$f" || true)
+    before=$(grep -c "before-private fragment" "$f" || true)
+    tails=$(grep -c "after-private tail" "$f" || true)
+    after=$(grep -c "after-private line" "$f" || true)
+    ended=$(grep -c "private browsing ended" "$f" || true)
+    echo "   $(basename "$f"): PRIVMARK $leaks (want 0), fragments from before $before (want 3), tails after $tails (want 3), lines after $after (want 3), end notes $ended (want 3)"
+    [[ $leaks == 0 && $before == 3 && $tails == 3 && $after == 3 && $ended == 3 ]] || fail=1
+done
+grep -E "private browsing ended|after-private tail" "$OUT/logsink-test.log" | sed 's/^/   /'
+echo "   private: $([[ $fail == 0 ]] && echo PASS || echo FAIL)"
 echo "(files in $OUT)"
+[[ $fail == 0 ]]

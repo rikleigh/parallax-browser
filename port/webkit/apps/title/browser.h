@@ -199,6 +199,9 @@ extern const char ps5wk_gamepad_page_html[];
 
 /* titlelog.c: while on, the log takes no lines (private browsing). */
 void ps5wk_log_private(int on);
+/* ps5browser.c: Settings forgets the page it was opened from (R3 there),
+ * when private browsing starts or ends: that page was the other session's. */
+void ps5wk_settings_forget_return(void);
 
 /* Private browsing (browserui.c): TRUE while the private session is shown. */
 gboolean ps5wk_browser_private(void);

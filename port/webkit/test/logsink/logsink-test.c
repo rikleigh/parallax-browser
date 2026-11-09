@@ -2,7 +2,7 @@
  * logsink-test.c - the title's log (apps/title/titlelog.c) on the Mac,
  * against a log server that stops reading (run.sh drives it).
  *
- *   logsink-test queue|direct <port> <seconds> <dir>
+ *   logsink-test queue|direct|private <port> <seconds> <dir>
  *
  * queue:  titlelog.c, as in the title (a log-sink file in <dir> applies).
  * direct: the old path, spike_log()'s blocking send() and stderr on the
@@ -13,6 +13,11 @@
  * relay of a child's output ("[web7] seq S"), 400 lines/s each. Every second
  * the slowest call of each kind is printed on the report stream (fd 3 if
  * open, else the original stdout).
+ *
+ * private: titlelog.c, private browsing switched on and off around stderr
+ *         fragments, whole lines and relayed lines all marked PRIVMARK
+ *         (none may reach the log), with unfinished stderr lines on both
+ *         sides of each switch.
  */
 #include "common/title.h"
 
@@ -23,6 +28,7 @@
 
 void (*ps5wk_log_line_hook)(const char* line, size_t n) = 0; /* WPEProcessManagerPS5.cpp */
 void ps5wk_titlelog_install(const char* dir);
+void ps5wk_log_private(int on);
 
 static FILE* report;
 static _Atomic long long worstUS[3]; /* spike_log, stderr, relay */
@@ -68,14 +74,42 @@ static void* logger(void* data)
     return NULL;
 }
 
+/* Unfinished stderr lines reach the pipe only when flushed (stderr is
+ * line-buffered into it), as a library's raw write(2) would. */
+static void errPart(const char* text)
+{
+    fputs(text, stderr);
+    fflush(stderr);
+}
+
+static int privateRun(void)
+{
+    for (int round = 0; round < 3; round++) {
+        errPart("[wpe-ps5] before-private fragment");
+        ps5wk_log_private(1);
+        errPart(" PRIVMARK-a ends the line from before\n");
+        errPart("[wpe-ps5] PRIVMARK-b unfinished");
+        spike_log("PRIVMARK-c a whole line");
+        if (ps5wk_log_line_hook)
+            ps5wk_log_line_hook("[web3] PRIVMARK-d relayed\n", strlen("[web3] PRIVMARK-d relayed\n"));
+        errPart(" PRIVMARK-e\n[wpe-ps5] PRIVMARK-f unfinished at the end");
+        usleep(50000); /* the stderr thread may take part of it meanwhile */
+        ps5wk_log_private(0);
+        errPart(" after-private tail\n");
+        spike_log("after-private line %d", round);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 5) {
-        fprintf(stderr, "usage: %s queue|direct <port> <seconds> <dir>\n", argv[0]);
+        fprintf(stderr, "usage: %s queue|direct|private <port> <seconds> <dir>\n", argv[0]);
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
-    int queue = !strcmp(argv[1], "queue");
+    int priv = !strcmp(argv[1], "private");
+    int queue = priv || !strcmp(argv[1], "queue");
     int port = atoi(argv[2]), seconds = atoi(argv[3]);
     const char* dir = argv[4];
     int reportFD = fcntl(3, F_GETFD) >= 0 ? 3 : dup(1);
@@ -101,6 +135,12 @@ int main(int argc, char** argv)
         FILE* log = fdopen(spike_log_fd, "w"); /* as the title did */
         setvbuf(log, NULL, _IOLBF, 0);
         stderr = log;
+    }
+    if (priv) {
+        privateRun();
+        spike_log("logsink-test done");
+        fprintf(report, "flush: %s\n", spike_log_flush(2000) ? "done" : "timed out");
+        return 0;
     }
     spike_log("logsink-test %s: 5 threads, 400 lines/s each, %d s", argv[1], seconds);
 

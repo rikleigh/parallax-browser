@@ -62,6 +62,10 @@ WPE_API void        wpe_display_ps5_set_log_sink  (WPEDisplayPS5 *display,
  * 1080p), and written to @path as a binary PPM; logs "[wpe-ps5] SHOT ...". */
 WPE_API void        wpe_display_ps5_capture_screen (WPEDisplayPS5 *display,
                                                     const char    *path);
+/* While blocked (private browsing), every capture above is refused, and one
+ * already asked for is dropped. */
+WPE_API void        wpe_display_ps5_set_captures_blocked (WPEDisplayPS5 *display,
+                                                          gboolean       blocked);
 
 /* ---- The pad, for the application ---- */
 

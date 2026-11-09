@@ -1513,6 +1513,12 @@ void wpe_display_ps5_capture_screen(WPEDisplayPS5* display, const char* path)
     wpeDisplayPS5ScheduleRedraw(display);
 }
 
+void wpe_display_ps5_set_captures_blocked(WPEDisplayPS5* display, gboolean blocked)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().setCapturesBlocked(blocked);
+}
+
 // ---------------------------------------------------------------- the pad for the application, View in VR
 
 void wpe_display_ps5_set_button_handler(WPEDisplayPS5* display, WPEDisplayPS5ButtonHandler handler, gpointer userData)

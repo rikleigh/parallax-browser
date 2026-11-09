@@ -86,6 +86,10 @@ public:
     // written to path as a binary PPM (P6, RGB).
     void requestCapture(const char* path);
 
+    // Any thread: while blocked (private browsing), captures are refused and
+    // one already asked for is dropped, so no page is read back.
+    void setCapturesBlocked(bool);
+
     // CPU time of the render thread so far (seconds), or -1.
     double renderThreadCPUSeconds() const;
 
@@ -234,6 +238,7 @@ private:
     bool m_pointerVisible { false };
     double m_pointerX { 0 }, m_pointerY { 0 };
     char* m_capturePath { nullptr };
+    std::atomic<bool> m_capturesBlocked { false };
     bool m_perfWanted { false };
     std::string m_perfOptions; // set before the render thread starts
     pthread_t m_mainThread { };

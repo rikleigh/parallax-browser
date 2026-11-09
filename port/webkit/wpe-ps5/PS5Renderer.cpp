@@ -584,11 +584,24 @@ void PS5Renderer::wake()
 
 void PS5Renderer::requestCapture(const char* path)
 {
+    if (m_capturesBlocked.load()) {
+        g_message("[wpe-ps5] capture refused (private browsing)");
+        return;
+    }
     g_mutex_lock(&m_lock);
     g_free(m_capturePath);
     m_capturePath = g_strdup(path);
     m_frameRequested = true;
     g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+void PS5Renderer::setCapturesBlocked(bool blocked)
+{
+    g_mutex_lock(&m_lock);
+    m_capturesBlocked.store(blocked);
+    if (blocked)
+        g_clear_pointer(&m_capturePath, g_free);
     g_mutex_unlock(&m_lock);
 }
 
@@ -783,6 +796,8 @@ void PS5Renderer::threadMain()
         int64_t painted = nowUS();
         drawScene();
         int64_t drawn = nowUS();
+        if (capturePath && m_capturesBlocked.load())
+            g_clear_pointer(&capturePath, g_free); // private browsing began meanwhile
         if (capturePath)
             writeCapture(capturePath);
         int64_t swapStart = nowUS();

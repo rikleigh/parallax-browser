@@ -764,7 +764,8 @@ static int fileExists(const char* path);
  *   GET /status          {"ok":true,"uri":"<the page shown>"}, the PIN as for
  *       /open; "uri" empty and "private":true while private browsing
  *   POST /cookies        Netscape cookies.txt lines (tools/ps5open --cookies,
- *       from Chrome) added to the cookie store; the PIN as for /open. Knob:
+ *       from Chrome) added to the cookie store; only with a PIN or a cookie
+ *       key set up (neither: refused). The PIN as for /open. Knob:
  *       /data/ps5webkit/push-cookie-key.txt: a key the X-PS5-Key header must
  *       match too (an empty or unreadable key file refuses every import)
  *   GET /settings, GET /settings.json, POST /settings, POST /restart,
@@ -1552,6 +1553,13 @@ static gboolean hideShownFrom(gboolean trusted)
     return !trusted && ps5wk_browser_private();
 }
 
+void ps5wk_settings_forget_return(void)
+{
+    g_mutex_lock(&shownLock);
+    g_clear_pointer(&settingsReturnURI, g_free);
+    g_mutex_unlock(&shownLock);
+}
+
 static char* settingsState(const char* message, gboolean trusted)
 {
     gboolean hide = hideShownFrom(trusted);
@@ -2048,14 +2056,25 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
             g_free(shown);
         }
     } else if (!strcmp(path, "/cookies") && post) {
-        /* The PIN as for /open; with a key file, requests must carry it in
-         * X-PS5-Key too (cookies log into accounts). A key file that can't
-         * be read, or is empty, refuses every import. */
+        /* Cookies log into accounts: refused unless a PIN or a key file is
+         * set up. The PIN as for /open; with a key file, requests must carry
+         * it in X-PS5-Key too. A key file that can't be read, or is empty,
+         * refuses every import. */
         gchar* key = NULL;
-        gboolean keyFile = g_file_test(PS5WK_COOKIE_KEY, G_FILE_TEST_EXISTS);
+        /* Not g_file_test(): its access() reports existing files as missing
+         * in a title. stat() sees an unreadable one too; open() if not. */
+        struct stat keyStat;
+        int keyFD = open(PS5WK_COOKIE_KEY, O_RDONLY);
+        gboolean keyFile = keyFD >= 0 || !stat(PS5WK_COOKIE_KEY, &keyStat);
+        if (keyFD >= 0)
+            close(keyFD);
         if (keyFile && g_file_get_contents(PS5WK_COOKIE_KEY, &key, NULL, NULL))
             g_strstrip(key);
-        if (!pinOK) {
+        if (!pushPIN && !keyFile) {
+            spike_log("push from %s: cookies refused (no PIN or cookie key set up)", from);
+            pushReply(client, 403, "text/plain",
+                "ERR cookie import needs a PIN (/data/ps5webkit/push-pin.txt) or a cookie key (/data/ps5webkit/push-cookie-key.txt)\n");
+        } else if (!pinOK) {
             pushReply(client, 403, "text/plain", "ERR wrong or missing PIN\n");
         } else if (keyFile && (!key || !*key || strcmp(key, keyHeader))) {
             spike_log("push from %s: cookies refused (%s)", from, !key || !*key ? "unreadable or empty key file" : "wrong key");

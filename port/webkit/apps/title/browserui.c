@@ -848,6 +848,7 @@ static gboolean logResume(gpointer data)
     (void)data;
     logResumeTimer = 0;
     ps5wk_log_private(FALSE);
+    wpe_display_ps5_set_captures_blocked(display, FALSE);
     spike_log("browser: private browsing off (its tabs, WebProcess and data gone)");
     return G_SOURCE_REMOVE;
 }
@@ -868,6 +869,7 @@ static gboolean setPrivate(gboolean on)
             g_source_remove(logResumeTimer);
         logResumeTimer = 0;
         ps5wk_log_private(TRUE);
+        wpe_display_ps5_set_captures_blocked(display, TRUE);
         for (unsigned i = 0; i < tabs->len; i++)
             saveTab(g_ptr_array_index(tabs, i));
         sessionWrite(GINT_TO_POINTER(1));
@@ -912,6 +914,7 @@ static gboolean setPrivate(gboolean on)
         scheduleSessionSave();
     }
     g_free(home);
+    ps5wk_settings_forget_return(); /* Settings' way back led to the other session */
     logLiveTabs(on ? "private browsing" : "private browsing ended");
     redraw();
     return TRUE;
@@ -2311,17 +2314,18 @@ static char* stateJSON(void)
         g_string_append(out, i ? ",{\"live\":" : "{\"live\":");
         g_string_append(out, tab->view ? "true" : "false");
         g_string_append(out, ",\"url\":");
-        ps5wk_json_string(out, live ? shownURI() : tab->url);
+        /* Private tabs: not their pages (as /status). */
+        ps5wk_json_string(out, privateMode ? "" : live ? shownURI() : tab->url);
         g_string_append(out, ",\"title\":");
-        ps5wk_json_string(out, live ? shownTitle() : tab->title);
+        ps5wk_json_string(out, privateMode ? "" : live ? shownTitle() : tab->title);
         g_string_append_printf(out, ",\"active\":%s,\"scrollX\":%.0f,\"scrollY\":%.0f,\"savedState\":%zu}", live ? "true" : "false",
             tab->scrollX, tab->scrollY, tab->state ? g_bytes_get_size(tab->state) : (size_t)0);
     }
     WebKitBackForwardList* list = webkit_web_view_get_back_forward_list(webView);
-    g_string_append_printf(out, "],\"active\":%d,\"maxTabs\":%d,\"menu\":%s,\"bar\":%s,\"section\":%d,\"zone\":%d,\"toolbarFocus\":%d,"
+    g_string_append_printf(out, "],\"private\":%s,\"active\":%d,\"maxTabs\":%d,\"menu\":%s,\"bar\":%s,\"section\":%d,\"zone\":%d,\"toolbarFocus\":%d,"
         "\"listFocus\":%d,\"canGoBack\":%s,\"canGoForward\":%s,\"backForwardLength\":%u,\"loading\":%s,\"progress\":%.2f,"
         "\"liveLimit\":%u,\"liveAllowed\":%u,\"liveCount\":%u,\"memoryTight\":%s,\"bookmarks\":",
-        active, MAX_TABS, menuOpen ? "true" : "false", barShown ? "true" : "false", section, zone, toolbarFocus, listFocus,
+        privateMode ? "true" : "false", active, MAX_TABS, menuOpen ? "true" : "false", barShown ? "true" : "false", section, zone, toolbarFocus, listFocus,
         canGoBack() ? "true" : "false", webkit_web_view_can_go_forward(webView) ? "true" : "false",
         webkit_back_forward_list_get_length(list), webkit_web_view_is_loading(webView) ? "true" : "false",
         webkit_web_view_get_estimated_load_progress(webView), liveLimit, liveAllowed(), liveCount(), memoryTight ? "true" : "false");
@@ -2499,6 +2503,9 @@ static char* apiRun(ApiCall* call, int* status)
         sessionWrite(GINT_TO_POINTER(1));
         ps5wk_bdata_flush();
         sessionFrozen = frozen;
+    } else if (!strcmp(path, "/browser/shot") && privateMode) {
+        *status = 409;
+        error = g_strdup("no screenshots while private browsing");
     } else if (!strcmp(path, "/browser/shot")) {
         mkdir(DATA_DIR "/shots", 0777);
         char* file = g_strdup_printf(DATA_DIR "/shots/ui-%s.ppm", name && *name ? name : "shot");
