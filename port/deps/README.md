@@ -97,7 +97,7 @@ Option-dependent, with the settings we suggest for Milestone 1:
 
 | WebKit option | default | needs | here |
 | --- | --- | --- | --- |
-| `USE_OPENSSL` (private) | OFF | OFF: libgcrypt 1.7 + libtasn1; ON: OpenSSL 3 | **use `-DUSE_OPENSSL=ON`**: OpenSSL 3.5.2 is here (glib-networking needs it anyway); libgcrypt/libtasn1 not built |
+| `USE_OPENSSL` (private) | OFF | OFF: libgcrypt 1.7 + libtasn1; ON: OpenSSL 3 | **use `-DUSE_OPENSSL=ON`**: OpenSSL 3.5.9 is here (glib-networking needs it anyway); libgcrypt/libtasn1 not built |
 | `USE_WOFF2` | ON | libwoff2dec, unless FreeType has brotli | FreeType is built with brotli, so `WOFF2Checks` turns `USE_WOFF2` off and FreeType decodes WOFF2 |
 | `ENABLE_XSLT` | ON | libxslt 1.1.13 | built |
 | `USE_LCMS` | ON | lcms2 | built |

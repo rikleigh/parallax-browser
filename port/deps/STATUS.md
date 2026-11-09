@@ -37,7 +37,7 @@ Suggested WebKit flags: `-DUSE_OPENSSL=ON -DUSE_AVIF=OFF -DUSE_JPEGXL=OFF
 | pcre2 | 10.45 | smoke-tested | 8-bit, no JIT |
 | libffi | 3.4.8 | smoke-tested | patch: no ms_abi |
 | glib | 2.88.4 | smoke-tested | gio, gio-unix, gobject, gmodule, gthread; 2 patches (ppoll off!) |
-| OpenSSL | 3.5.2 | smoke-tested | static, no-dso/no-module; OPENSSLDIR=/data/ps5webkit/etc/ssl |
+| OpenSSL | 3.5.9 | smoke-tested | static, no-dso/no-module; OPENSSLDIR=/data/ps5webkit/etc/ssl |
 | nghttp2 | 1.65.0 | smoke-tested | HTTP/2 to example.com and youtube.com |
 | libsoup | 3.8.1 | smoke-tested | HTTP/2, brotli, psl, sqlite |
 | glib-networking | 2.90.1 | smoke-tested | OpenSSL backend, static: link `gioopenssl`, call `g_io_openssl_load(NULL)` |

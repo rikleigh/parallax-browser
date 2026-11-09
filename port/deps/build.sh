@@ -471,9 +471,9 @@ step_glib() {
 }
 
 step_openssl() {
-    log "OpenSSL 3.5.2 (static libssl/libcrypto; OPENSSLDIR=$PS5_RUNTIME/etc/ssl)"
-    fetch https://github.com/openssl/openssl/releases/download/openssl-3.5.2/openssl-3.5.2.tar.gz \
-        c53a47e5e441c930c3928cf7bf6fb00e5d129b630e0aa873b08258656e7345ec
+    log "OpenSSL 3.5.9 (static libssl/libcrypto; OPENSSLDIR=$PS5_RUNTIME/etc/ssl)"
+    fetch https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz \
+        603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
     unpack openssl "$FETCHED"
     # OPENSSLDIR is a console path: the default CA file is then
     # $PS5_RUNTIME/etc/ssl/cert.pem (SSL_CERT_FILE overrides it).
