@@ -721,3 +721,31 @@ edge pixels must be 0/1/2/3/4-sample mixes): PASS before and after, the same
 384510/637954/2200 inside/outside/edge pixels as desktop Chrome; 250 ms ->
 0.23 ms per draw + resolve. The game: 3 fps / 330 ms -> 59.5-59.9 fps /
 3.5-4 ms per frame. Built into `toolchain/ps5-opengl-gles-noprof-m7`.
+
+## Patch 0020: cube map faces render in place (2026-11-09)
+
+A cube map is sampled from linear storage, so as a render target it had a
+tiled staging surface, and `ps5_linear_color_pitch` (which lets a draw render
+straight into one linear mip/layer) took only 2D and 2D array targets: every
+draw into a cube face copied the whole face to the staging surface and back,
+with cache flushes. A three.js CubeCamera (a reflective sphere, its scene
+drawn into six faces each frame) spent ~610 ms of the WebGL thread per frame
+there: 1.6 fps, 95% under `ps5_stage_color_surface`. A face is one layer of
+that storage, so cube and cube array faces now render linearly like array
+layers, and the GPU colour clear takes them too. Host tests:
+`test_gpu_blit.py` (every face and a mip of a staged cube render linearly; a
+face past the last, two faces, a 3D target don't), `test_gpu_clear_state.py`
+(a staged cube face clears on the GPU only when it renders linearly).
+
+`test_color_staging.py` failed to compile since patch 0018: it copies the
+source between `struct ps5_resource` and `struct ps5_transfer`, where the
+draw-cache helpers now are; it leaves them out. (`test_multidraw_lifetime.py`
+fails to compile from before 0018, on MESA_PRIM names its stubs lack; not
+fixed here.)
+
+`port/webkit/test/webgl/cube-render.html` (each face of an RGBA8 cube, level
+0 and level 1 of a mipmapped one, cleared and half drawn over; read back
+through the framebuffer and sampled at both halves; also passes in desktop
+Chrome): PASS before and after; 6 x 40 draws into 512x512 faces 303 ->
+2.0 ms. `webgl_animation_skinning_ik`: 1.6 fps / 610 ms -> 60 fps /
+3.5 ms per frame. Built into `toolchain/ps5-opengl-gles-noprof-m8`.
