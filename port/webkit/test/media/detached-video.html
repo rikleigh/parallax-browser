@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- View in VR with a WebGL player (README: "View in VR"): the video plays
+     from a <video> made with document.createElement and never put in the
+     page, drawn into a WebGL canvas every frame, as 360/VR players do. View
+     in VR must still find it (the probe logs "videos=1 detached=1 ...
+     found=1 inpage=0") and its controls must work (play/pause, seeking).
+       ?src=<url> (default media/sync-1080p30-h264.mp4, ours)
+     Logs "[detached] playing <w>x<h>, <n> frames drawn". Upload to
+     /data/ps5webkit/detached-video.html and open
+     file:///data/ps5webkit/detached-video.html, then the touchpad. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Detached video in WebGL</title>
+<style>
+  html, body { margin: 0; background: #000; color: #eee; font: 24px sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #out { position: fixed; left: 24px; bottom: 24px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="out">starting</div>
+<script>
+const src = new URLSearchParams(location.search).get('src') || 'media/sync-1080p30-h264.mp4';
+const out = document.getElementById('out');
+function log(t) { console.log('[detached] ' + t); out.textContent = t; }
+const video = document.createElement('video'); // never attached to the document
+video.src = src;
+video.loop = true;
+video.muted = true;
+video.playsInline = true;
+video.crossOrigin = 'anonymous';
+
+const canvas = document.getElementById('c');
+canvas.width = 1920; canvas.height = 1080;
+const gl = canvas.getContext('webgl');
+const vs = gl.createShader(gl.VERTEX_SHADER);
+gl.shaderSource(vs, 'attribute vec2 p; varying vec2 t; void main(){ t = vec2(p.x * .5 + .5, .5 - p.y * .5); gl_Position = vec4(p, 0., 1.); }');
+gl.compileShader(vs);
+const fs = gl.createShader(gl.FRAGMENT_SHADER);
+gl.shaderSource(fs, 'precision mediump float; varying vec2 t; uniform sampler2D s; void main(){ gl_FragColor = texture2D(s, t); }');
+gl.compileShader(fs);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+let frames = 0, lastLog = 0;
+function draw(now) {
+  if (video.readyState >= 2) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    frames++;
+  }
+  if (now - lastLog > 5000) {
+    lastLog = now;
+    log((video.paused ? 'paused' : 'playing') + ' ' + video.videoWidth + 'x' + video.videoHeight + ' at ' + video.currentTime.toFixed(1) + ' s, ' + frames + ' frames drawn');
+  }
+  requestAnimationFrame(draw);
+}
+video.play().then(() => log('play() resolved'), e => log('play() failed ' + e));
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
