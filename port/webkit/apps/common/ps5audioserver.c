@@ -193,15 +193,36 @@ static void* streamThread(void* data)
     double start = nowMS(), next = start;
     logPortState(handle, "opened", hello.pid);
     // What reached the port: peak and RMS of the samples, output errors, and
-    // the port state once the stream has played 2 s.
+    // the port state once the stream has played 2 s. Dropouts: a run of
+    // near-silence (|sample| <= QUIET: audioconvert's dither keeps silence
+    // at +-1) from GAP_MIN frames to GAP_MAX_MS long, with loud samples
+    // (> LOUD) before and after it. A client's starved ring buffer plays
+    // silence while its data is late, heard as clicks and crackles; longer
+    // quiet runs are pauses between sounds and are not counted.
     int peak = 0, outputErrors = 0, firstError = 0;
     double sumSquares = 0;
+    enum { QUIET = 2, LOUD = 64, GAP_MIN = 16, GAP_MAX_MS = 100 };
+    uint64_t quietRun = 0, gaps = 0, gapFrames = 0;
+    int heardSound = 0;
     while (grain && !stopping && !readFull(fd, grain, grainBytes)) {
         for (size_t i = 0; i < grainBytes / 2; i++) {
             int v = grain[i] < 0 ? -grain[i] : grain[i];
             if (v > peak)
                 peak = v;
             sumSquares += (double)grain[i] * grain[i];
+            if (v <= QUIET) {
+                quietRun++;
+                continue;
+            }
+            if (v > LOUD) {
+                uint64_t frames = quietRun / hello.channels;
+                if (heardSound && frames >= GAP_MIN && frames <= (uint64_t)RATE * GAP_MAX_MS / 1000) {
+                    gaps++;
+                    gapFrames += frames;
+                }
+                heardSound = 1;
+            }
+            quietRun = 0;
         }
         if (handle >= 0) {
             int rc = sceAudioOutOutput(handle, grain);
@@ -236,8 +257,10 @@ static void* streamThread(void* data)
     threadsRunning--;
     pthread_mutex_unlock(&lock);
     double rms = played ? sqrt(sumSquares / ((double)played * hello.channels)) : 0;
-    LOGA("stream from pid %d closed: %.1f s of audio in %.1f s (peak %d, rms %.0f of 32767; %d output errors, first 0x%08x)",
-        hello.pid, played / (double)RATE, (nowMS() - start) / 1e3, peak, rms, outputErrors, (unsigned)firstError);
+    LOGA("stream from pid %d closed: %.1f s of audio in %.1f s (peak %d, rms %.0f of 32767; %d output errors, first 0x%08x; "
+         "%llu dropouts, %.1f ms)",
+        hello.pid, played / (double)RATE, (nowMS() - start) / 1e3, peak, rms, outputErrors, (unsigned)firstError,
+        (unsigned long long)gaps, gapFrames * 1000.0 / RATE);
     return NULL;
 }
 

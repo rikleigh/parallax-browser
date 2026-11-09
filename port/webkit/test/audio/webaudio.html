@@ -6,9 +6,28 @@
      i.e. the output (ps5audiosink, to the title) is consuming samples;
      decodeAudioData of a WAV made here (GStreamer decode + deinterleave);
      an OfflineAudioContext render (sum of a known buffer); and a 1 s 440 Hz
-     tone, quiet, for the ear. Log lines: RESULT webaudio <check> PASS|FAIL
-     ..., then RESULT webaudio summary. Upload to /data/ps5webkit/webaudio.html
-     and open file:///data/ps5webkit/webaudio.html. -->
+     tone, quiet, for the ear. Then Ogg and Opus: canPlayType and
+     isTypeSupported answers; decodeAudioData of Ogg Vorbis, Ogg Opus and
+     WebM Opus clips (oggdemux + vorbisdec/opusdec, matroskademux); <audio>
+     playing each Ogg clip to its end; Opus in WebM through MSE (opusparse;
+     http pages only: MSE from a file:// page fails, so it is SKIP there).
+     Then an AudioWorklet (secure contexts only: file:// yes, plain http
+     SKIP; its module from a blob: URL, on file:// a data: URL), offline (a processor writing a constant) and live (its frame
+     count over 1 s), and a MediaElementAudioSourceNode (an <audio> playing the
+     WebM clip, its samples seen by an AnalyserNode). Log lines: RESULT
+     webaudio <check> PASS|FAIL|SKIP ..., then RESULT webaudio summary.
+     Upload to /data/ps5webkit/webaudio.html and open
+     file:///data/ps5webkit/webaudio.html; for MSE, serve it with
+     tools/serve-media.py --port 8773 --page port/webkit/test/audio/webaudio.html
+     and open http://<mac>:8773/webaudio.html. ?click waits for a click first
+     (for desktop browsers, which start audio only after one);
+     ?only=media-element|worklet|ogg runs just that part.
+     The clips (CLIPS below, base64) are 1 kHz tones at half scale (peaks
+     0.5-0.6 after encoding), made with ffmpeg:
+       T="0.5*sin(2*PI*1000*t)"
+       ffmpeg -f lavfi -i "aevalsrc=$T:s=48000:d=0.5" -c:a libvorbis -q:a 0 tone-vorbis.ogg
+       ffmpeg -f lavfi -i "aevalsrc=$T:s=48000:d=0.5" -c:a libopus -b:a 24k tone-opus.ogg
+       ffmpeg -f lavfi -i "aevalsrc=$T|$T:s=48000:d=2" -c:a libopus -b:a 32k tone-opus.webm -->
 <html>
 <head>
 <meta charset="utf-8">
@@ -22,17 +41,350 @@
 <h1>Web Audio</h1>
 <div id="out"></div>
 <script>
+// Test clips (see the header): base64, wrapped.
+const CLIPS = {
+  'tone-vorbis.ogg':
+    'T2dnUwACAAAAAAAAAAAc34vtAAAAAJK/k30BHgF2b3JiaXMAAAAAAYC7AAAAAAAAgLsAAAAAAAC4AU9nZ1MAAAAAAAAAAAAAHN+L' +
+    '7QEAAAA9QHy4Dz//////////////////MgN2b3JiaXMMAAAATGF2ZjYyLjMuMTAwAQAAAB8AAABlbmNvZGVyPUxhdmM2Mi4xMS4x' +
+    'MDAgbGlidm9yYmlzAQV2b3JiaXMfQkNWAQAAAQAYY1QpRplS0kqJGXOUMUaZYpJKiaWEFkJInXMUU6k515xrrLm1IIQQGlNQKQWZ' +
+    'Uo5SaRljkCkFmVIQS0kldBI6J51jEFtJwdaYa4tBthyEDZpSTCnElFKKQggZU4wpxZRSSkIHJXQOOuYcU45KKEG4nHOrtZaWY4up' +
+    'dJJK5yRkTEJIKYWSSgelU05CSDWW1lIpHXNSUmpB6CCEEEK2IIQNgtCQVQAAAQDAQBAasgoAUAAAEIqhGIoChIasAgAyAAAEoCiO' +
+    '4iiOIzmSY0kWEBqyCgAAAgAQAADAcBRJkRTJsSRL0ixL00RRVX3VNlVV9nVd13Vd13UgNGQVAAABAEBIp5mlGiDCDGQYCA1ZBQAg' +
+    'AAAARijCEANCQ1YBAAABAABiKDmIJrTmfHOOg2Y5aCrF5nRwItXmSW4q5uacc845J5tzxjjnnHOKcmYxaCa05pxzEoNmKWgmtOac' +
+    'c57E5kFrqrTmnHPGOaeDcUYY55xzmrTmQWo21uaccxa0pjlqLsXmnHMi5eZJbS7V5pxzzjnnnHPOOeecc6oXp3NwTjjnnHOi9uZa' +
+    'bkIX55xzPhmne3NCOOecc84555xzzjnnnHOC0JBVAAAQAABBGDaGcacgSJ+jgRhFiGnIpAfdo8MkaAxyCqlHo6ORUuoglFTGSSmd' +
+    'IDRkFQAACAAAIYQUUkghhRRSSCGFFFKIIYYYYsgpp5yCCiqppKKKMsoss8wyyyyzzDLrsLPOOuwwxBBDDK20EktNtdVYY62555xr' +
+    'DtJaaa211koppZRSSikIDVkFAIAAABAIGWSQQUYhhRRSiCGmnHLKKaigAkJDVgEAgAAAAgAAADzJc0RHdERHdERHdERHdETHczxH' +
+    'lERJlERJtEzL1ExPFVXVlV1b1mXd9m1hF3bd93Xf93Xj14VhWZZlWZZlWZZlWZZlWZZlWYLQkFUAAAgAAIAQQgghhRRSSCGlGGPM' +
+    'Meegk1BCIDRkFQAACAAgAAAAwFEcxXEkR3IkyZIsSZM0S7M8zdM8TfREURRN01RFV3RF3bRF2ZRN13RN2XRVWbVdWbZt2dZtX5Zt' +
+    '3/d93/d93/d93/d93/d1HQgNWQUASAAA6EiOpEiKpEiO4ziSJAGhIasAABkAAAEAKIqjOI7jSJIkSZakSZ7lWaJmaqZneqqoAqEh' +
+    'qwAAQAAAAQAAAAAAKJriKabiKaLiOaIjSqJlWqKmaq4om7Lruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7rui4QGrIK' +
+    'AJAAANCRHMmRHEmRFEmRHMkBQkNWAQAyAAACAHAMx5AUybEsS9M8zdM8TfRET/RMTxVd0QVCQ1YBAIAAAAIAAAAAADAkw1IsR3M0' +
+    'SZRUS7VUTbVUSxVVT1VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTVN0zRNIDRkJQAABADAYo3B5SAhJSXl3hDCEJOe' +
+    'MSYhtV4hBJGS3jEGFYOeMqIMct5C4xCDHggNWREARAEAAMYgxxBzyDlHqZMSOeeodJQa5xyljlJnKcWYYs0oldhSrI1zjlJHraOU' +
+    'YiwtdpRSjanGAgAAAhwAAAIshEJDVgQAUQAAhDFIKaQUYow5p5xDjCnnmHOGMeYcc44556B0UirnnHROSsQYc445p5xzUjonlXNO' +
+    'SiehAACAAAcAgAALodCQFQFAnACAQZI8T/I0UZQ0TxRFU3RdUTRd1/I81fRMU1U90VRVU1Vt2VRVWZY8zzQ901RVzzRV1VRVWTZV' +
+    'VZZFVdVt03V123RV3ZZt2/ddWxZ2UVVt3VRd2zdV1/Zd2fZ9WdZ1Y/I8VfVM03U903Rl1XVtW3VdXfdMU5ZN15Vl03Vt25VlXXdl' +
+    '2fc103Rd01Vl2XRd2XZlV7ddWfZ903WF35VlX1dlWRh2XfeFW9eV5XRd3VdlVzdWWfZ9W9eF4dZ1YZk8T1U903RdzzRdV3VdX1dd' +
+    '19Y105Rl03Vt2VRdWXZl2fddV9Z1zzRl2XRd2zZdV5ZdWfZ9V5Z13XRdX1dlWfhVV/Z1WdeV4dZt4Tdd1/dVWfaFV5Z14dZ1Ybl1' +
+    'XRg+VfV9U3aF4XRl39eF31luXTiW0XV9YZVt4VhlWTl+4ViW3feVZXRdX1ht2RhWWRaGX/id5fZ943h1XRlu3efMuu8Mx++k+8rT' +
+    '1W1jmX3dWWZfd47hGDq/8OOpqq+brisMpywLv+3rxrP7vrKMruv7qiwLvyrbwrHrvvP8vrAso+z6wmrLwrDatjHcvm4sv3Acy2vr' +
+    'yjHrvlG2dXxfeArD83R1XXlmXcf2dXTjRzh+ygAAgAEHAIAAE8pAoSErAoA4AQCPJImiZFmiKFmWKIqm6LqiaLqupGmmqWmeaVqa' +
+    'Z5qmaaqyKZquLGmaaVqeZpqap5mmaJqua5qmrIqmKcumasqyaZqy7LqybbuubNuiacqyaZqybJqmLLuyq9uu7Oq6pFmmqXmeaWqe' +
+    'Z5qmasqyaZquq3meanqeaKqeKKqqaqqqraqqLFueZ5qa6KmmJ4qqaqqmrZqqKsumqtqyaaq2bKqqbbuq7Pqybeu6aaqybaqmLZuq' +
+    'atuu7OqyLNu6L2maaWqeZ5qa55mmaZqybJqqK1uep5qeKKqq5ommaqqqLJumqsqW55mqJ4qq6omea5qqKsumatqqaZq2bKqqLZum' +
+    'Ksuubfu+68qybqqqbJuqauumasqybMu+78qq7oqmKcumqtqyaaqyLduy78uyrPuiacqyaaqybaqqLsuybRuzbPu6aJqybaqmLZuq' +
+    'KtuyLfu6LNu678qub6uqrOuyLfu67vqucOu6MLyybPuqrPq6K9u6b+sy2/Z9RNOUZVM1bdtUVVl2Zdn2Zdv2fdE0bVtVVVs2TdW2' +
+    'ZVn2fVm2bWE0Tdk2VVXWTdW0bVmWbWG2ZeF2Zdm3ZVv2ddeVdV/XfePXZd3murLty7Kt+6qr+rbu+8Jw667wCgAAGHAAAAgwoQwU' +
+    'GrISAIgCAACMYYwxCI1SzjkHoVHKOecgZM5BCCGVzDkIIZSSOQehlJQy5yCUklIIoZSUWgshlJRSawUAABQ4AAAE2KApsThAoSEr' +
+    'AYBUAACD41iW55miatqyY0meJ4qqqaq27UiW54miaaqqbVueJ4qmqaqu6+ua54miaaqq6+q6aJqmqaqu67q6Lpqiqaqq67qyrpum' +
+    'qqquK7uy7Oumqqqq68quLPvCqrquK8uybevCsKqu68qybNu2b9y6ruu+7/vCka3rui78wjEMRwEA4AkOAEAFNqyOcFI0FlhoyEoA' +
+    'IAMAgDAGIYMQQgYhhJBSSiGllBIAADDgAAAQYEIZKDRkRQAQJwAAGEMppJRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkgppZRS' +
+    'SimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkqppJRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRS' +
+    'SimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRS' +
+    'SimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRS' +
+    'SimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoplVJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJK' +
+    'KaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSCgCQinAAkHowoQwUGrISAEgFAACM' +
+    'UUopxpyDEDHmGGPQSSgpYsw5xhyUklLlHIQQUmktt8o5CCGk1FJtmXNSWosx5hgz56SkFFvNOYdSUoux5ppr7qS0VmuuNedaWqs1' +
+    '15xzzbm0FmuuOdecc8sx15xzzjnnGHPOOeecc84FAOA0OACAHtiwOsJJ0VhgoSErAYBUAAACGaUYc8456BBSjDnnHIQQIoUYc845' +
+    'CCFUjDnnHHQQQqgYc8w5CCGEkDnnHIQQQgghcw466CCEEEIHHYQQQgihlM5BCCGEEEooIYQQQgghhBA6CCGEEEIIIYQQQgghhFJK' +
+    'CCGEEEIJoZRQAABggQMAQIANqyOcFI0FFhqyEgAAAgCAHJagUs6EQY5Bjw1BylEzDUJMOdGZYk5qMxVTkDkQnXQSGWpB2V4yCwAA' +
+    'gCAAIMAEEBggKPhCCIgxAABBiMwQCYVVsMCgDBoc5gHAA0SERACQmKBIu7iALgNc0MVdB0IIQhCCWBxAAQk4OOGGJ97whBucoFNU' +
+    '6iAAAAAAAAoA4AEA4KAAIiKaq7C4wMjQ2ODo8AgAAAAAABUA+AAAOD6AiIjmKiwuMDI0Njg6PAIAAAAAAAAAAICAgAAAAAAAQAAA' +
+    'AICAT2dnUwAEwF0AAAAAAAAc34vtAgAAAPhfDYoZFC8hIiEhIiEhIiEhIiEhIiEhIiEhIiElQDT7bzvpGgABgH9Cgrv61iIQrxUF' +
+    'Wlsf1w/Bd1h293qY7yki1BQfwBhjjDGgZwAAAAAAAAAAAOI5JMZY3xljfGcJAAB+W5+fL8F3WLFTMN8iSk0RMvD6DQAAAAAAAAAA' +
+    'eFMEAAB+W5+fL8F3WLEzMN8ig5oiJBQAAAAAAAAAUAEAUPqYBAAAflufXm/BdzixMxrzLdKoKUIG+scAAAAAAAAAAODcFQAAfluf' +
+    'ny/Bd1ixUzDfIkpNETLw+g0AAAAAAAAAAHhTBAAAflufny/Bd1ixMzDfIoOaIiQUAAAAAAAAAFABAFD6mAQAAH5bn15vwXc4sTMa' +
+    '8y3SqClCBvrHAAAAAAAAAADg3BUAAH5bn58vwXdYsVMw3yJKTREy8PoNAAAAAAAAAAB4UwQAAH5bn58vwXdYsTMw3yKDmiIkFAAA' +
+    'AAAAAABQAQBQ+pgEAAB+W59eb8F3OLEzGvMt0qgpQgb6xwAAAAAAAAAA4NwVAAB+W5+fL8F3WLFTMN8iSk0RMvD6DQAAAAAAAAAA' +
+    'eFMEAAB+W5+fL8F3WLEzMN8ig5oiJBQAAAAAAAAAUAEAUPqYBAAAflufXm/BdzixMxrzLdKoKUIG+scAAAAAAAAAAODcFQAAfluf' +
+    'ny/Bd1ixUzDfIkpNETLw+g0AAAAAAAAAAHhTBAAAflufny/Bd1ixMzDfIoOaIiQUAAAAAAAAAFABAFD6mAQAAH5bn15vwXc4sTMa' +
+    '8y3SqClCBvrHAAAAAAAAAADg3BUAAH5bn58vwXdYsVMw3yJKTREy8PoNAAAAAAAAAAB4UwQAAH5bn58vwXdYsTMw3yKDmiIkFAAA' +
+    'AAAAAABQAQBQ+pgEAAB+W59eb8F3OLEzGvMt0qgpQgb6xwAAAAAAAAAA4NwVAAB+W5+fL8F3WLFTMN8iSk0RMvD6DQAAAAAAAAAA' +
+    'eFMEAAB+W5+fL8F3WLEzMN8ig5oiJBQAAAAAAAAAUAEAUPqYBAAAflufXm/BdzixMxrzLdKoKUIG+scAAAAAAAAAAODcFQAAfluf' +
+    'Hy/BbxixUzDfg0ijpggLXr8GAAAAAAAAAAB9IwAA4Hi4AH76LvOH4D98PSxP7ee7jYqmpvjIlafzjI2xsAcAAFWhAABAybEd6ayx' +
+    'koZ3CyoejAAAsAAdaB1ovYAGaIAGaAA=',
+  'tone-opus.ogg':
+    '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' +
+    'nFlOsoussi8fXK/CysQ/OjUon9NycQ==',
+  'tone-opus.webm':
+    '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',
+};
+</script>
+<script>
 const out = document.getElementById('out');
 function say(line) {
   console.log(line);
   out.textContent += line + '\n';
 }
-let failures = 0;
+let failures = 0, skipped = 0;
 function result(name, ok, detail) {
   if (!ok) failures++;
   say('RESULT webaudio ' + name + ' ' + (ok ? 'PASS' : 'FAIL') + (detail ? ' ' + detail : ''));
 }
+function skip(name, why) {
+  skipped++;
+  say('RESULT webaudio ' + name + ' SKIP ' + why);
+}
+function clip(name) {
+  const bin = atob(CLIPS[name]), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function peakOf(data) {
+  let peak = 0;
+  for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i]));
+  return peak;
+}
+function within(promise, ms, what) {
+  return Promise.race([promise, sleep(ms).then(() => { throw new Error('timed out after ' + ms + ' ms ' + what); })]);
+}
+function mediaError(el) {
+  return el.error ? 'MediaError ' + el.error.code + (el.error.message ? ' ' + el.error.message : '') : 'no error';
+}
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const ONLY = new URLSearchParams(location.search).get('only');
 
 // A mono 16-bit WAV: 0.5 s of a 1 kHz sine at 44.1 kHz.
 function makeWav() {
@@ -56,6 +408,13 @@ async function run() {
   const ctx = new Ctx();
   try { await ctx.resume(); } catch (e) { say('resume: ' + e); }
   await sleep(300);
+  if (ONLY) {
+    const checks = { 'media-element': mediaElementSource, 'worklet': worklet, 'ogg': oggAndOpus };
+    if (!checks[ONLY]) throw new Error('unknown ?only=' + ONLY);
+    await checks[ONLY](ctx);
+    say('RESULT webaudio summary ' + (failures ? 'FAIL' : 'PASS') + ' (' + failures + ' failed, ' + skipped + ' skipped; only ' + ONLY + ')');
+    return;
+  }
   result('running', ctx.state === 'running', 'state ' + ctx.state + ', sample rate ' + ctx.sampleRate);
 
   // The clock moves only while the output pulls samples.
@@ -105,9 +464,178 @@ async function run() {
   await new Promise(r => osc.onended = r);
   result('tone', true, '(1 s at 440 Hz played; listen)');
 
-  say('RESULT webaudio summary ' + (failures ? 'FAIL' : 'PASS') + ' (' + failures + ' failed)');
+  await oggAndOpus(ctx);
+  await worklet(ctx);
+  await mediaElementSource(ctx);
+
+  say('RESULT webaudio summary ' + (failures ? 'FAIL' : 'PASS') + ' (' + failures + ' failed, ' + skipped + ' skipped)');
 }
-run().catch(e => say('RESULT webaudio summary FAIL ' + e));
+
+const TYPES = [
+  ['audio/ogg; codecs="vorbis"', 'audio/ogg; codecs="opus"', 'audio/webm; codecs="opus"', 'audio/ogg'],
+  ['audio/webm; codecs="opus"', 'audio/webm; codecs="vorbis"'],
+];
+
+async function oggAndOpus(ctx) {
+  const probe = document.createElement('audio');
+  const answers = TYPES[0].map(t => t + ': ' + (probe.canPlayType(t) || '""'));
+  result('canplaytype', TYPES[0].slice(0, 3).every(t => probe.canPlayType(t) === 'probably') && probe.canPlayType('audio/ogg') !== '',
+         answers.join(', '));
+  if (window.MediaSource) {
+    result('mse-types', MediaSource.isTypeSupported(TYPES[1][0]),
+           TYPES[1].map(t => t + ': ' + MediaSource.isTypeSupported(t)).join(', '));
+  } else {
+    result('mse-types', false, '(no MediaSource)');
+  }
+
+  // decodeAudioData: every clip is a 1 kHz tone at half scale.
+  for (const [name, duration] of [['tone-vorbis.ogg', 0.5], ['tone-opus.ogg', 0.5], ['tone-opus.webm', 2]]) {
+    try {
+      const decoded = await within(ctx.decodeAudioData(clip(name).buffer), 5000, 'decoding');
+      const peak = peakOf(decoded.getChannelData(0));
+      result('decode ' + name, Math.abs(decoded.duration - duration) < 0.03 && peak > 0.4 && peak < 0.7,
+             decoded.duration.toFixed(3) + ' s, ' + decoded.numberOfChannels + ' ch, ' + decoded.sampleRate + ' Hz, peak ' + peak.toFixed(3));
+    } catch (e) {
+      result('decode ' + name, false, String(e));
+    }
+  }
+
+  // <audio>: each Ogg clip plays to its end, quietly.
+  for (const [name, type] of [['tone-vorbis.ogg', 'audio/ogg'], ['tone-opus.ogg', 'audio/ogg']]) {
+    const el = new Audio();
+    el.volume = 0.2;
+    el.src = URL.createObjectURL(new Blob([clip(name)], { type }));
+    try {
+      const ended = new Promise((resolve, reject) => { el.onended = resolve; el.onerror = () => reject(new Error(mediaError(el))); });
+      await el.play();
+      await within(ended, 5000, 'waiting for the end');
+      result('element ' + name, Math.abs(el.duration - 0.5) < 0.05, 'ended at ' + el.currentTime.toFixed(3) + ' s of ' + el.duration.toFixed(3) + ' s');
+    } catch (e) {
+      result('element ' + name, false, String(e) + ' (readyState ' + el.readyState + ', ' + mediaError(el) + ')');
+    }
+    URL.revokeObjectURL(el.src);
+    el.removeAttribute('src');
+    el.load();
+  }
+
+  // MSE: the WebM Opus clip appended in one go, played quietly past 1 s.
+  if (location.protocol === 'file:') {
+    skip('mse-opus', '(MSE needs an http page: see the header)');
+  } else if (!window.MediaSource) {
+    result('mse-opus', false, '(no MediaSource)');
+  } else {
+    const el = new Audio(), ms = new MediaSource();
+    el.volume = 0.2;
+    el.src = URL.createObjectURL(ms);
+    try {
+      await within(new Promise(r => ms.addEventListener('sourceopen', r, { once: true })), 5000, 'for sourceopen');
+      const sb = ms.addSourceBuffer(TYPES[1][0]);
+      sb.appendBuffer(clip('tone-opus.webm'));
+      await within(new Promise((resolve, reject) => { sb.onupdateend = resolve; sb.onerror = () => reject(new Error('append error')); }), 5000, 'appending');
+      ms.endOfStream();
+      const buffered = sb.buffered.length ? sb.buffered.end(0).toFixed(3) : 'nothing';
+      await el.play();
+      const t0 = performance.now();
+      while (el.currentTime < 1 && !el.ended && !el.error && performance.now() - t0 < 5000)
+        await sleep(100);
+      result('mse-opus', el.currentTime >= 1 || el.ended, 'buffered to ' + buffered + ' s, played to ' + el.currentTime.toFixed(3) + ' s, ' + mediaError(el));
+    } catch (e) {
+      result('mse-opus', false, String(e) + ' (' + mediaError(el) + ')');
+    }
+    el.pause();
+  }
+}
+
+// A processor that writes a constant, and counts the frames it rendered.
+const PROCESSOR = `
+class Constant extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.frames = 0;
+    this.port.onmessage = () => this.port.postMessage(this.frames);
+  }
+  process(inputs, outputs) {
+    for (const channel of outputs[0])
+      channel.fill(0.25);
+    this.frames += outputs[0][0].length;
+    return true;
+  }
+}
+registerProcessor('constant', Constant);
+`;
+
+async function worklet(ctx) {
+  if (!window.isSecureContext || !ctx.audioWorklet) {
+    skip('worklet', '(secure context ' + window.isSecureContext + ', audioWorklet ' + !!ctx.audioWorklet + ')');
+    return;
+  }
+  // A file:// page's origin is opaque: WebKit refuses its blob: module
+  // (worklets load in CORS mode), so it gets a data: URL instead.
+  const url = location.protocol === 'file:' ? 'data:application/javascript;base64,' + btoa(PROCESSOR)
+                                            : URL.createObjectURL(new Blob([PROCESSOR], { type: 'application/javascript' }));
+  try {
+    const offline = new OfflineAudioContext(1, 4800, 48000);
+    await within(offline.audioWorklet.addModule(url), 5000, 'loading the module');
+    new AudioWorkletNode(offline, 'constant').connect(offline.destination);
+    const d = (await offline.startRendering()).getChannelData(0);
+    let sum = 0;
+    for (let i = 0; i < d.length; i++) sum += d[i];
+    result('worklet offline', Math.abs(sum / d.length - 0.25) < 0.001, 'mean ' + (sum / d.length).toFixed(4));
+  } catch (e) {
+    result('worklet offline', false, String(e));
+  }
+  try {
+    await within(ctx.audioWorklet.addModule(url), 5000, 'loading the module');
+    const node = new AudioWorkletNode(ctx, 'constant'), silent = ctx.createGain();
+    silent.gain.value = 0;
+    node.connect(silent).connect(ctx.destination);
+    const frames = () => new Promise(r => { node.port.onmessage = e => r(e.data); node.port.postMessage(0); });
+    const f0 = await within(frames(), 2000, 'for the processor'), w0 = performance.now();
+    await sleep(1000);
+    const f1 = await within(frames(), 2000, 'for the processor'), wall = (performance.now() - w0) / 1000;
+    const rate = (f1 - f0) / wall;
+    node.disconnect();
+    result('worklet live', rate > ctx.sampleRate * 0.8 && rate < ctx.sampleRate * 1.2,
+           (f1 - f0) + ' frames in ' + wall.toFixed(3) + ' s (' + Math.round(rate) + ' per s at ' + ctx.sampleRate + ' Hz)');
+  } catch (e) {
+    result('worklet live', false, String(e));
+  }
+  if (url.startsWith('blob:'))
+    URL.revokeObjectURL(url);
+}
+
+// An <audio>'s samples routed into the graph: the analyser sees the tone.
+async function mediaElementSource(ctx) {
+  // The 2 s clip: long enough without looping (a looped 0.5 s clip clicks
+  // at every loop).
+  const el = new Audio();
+  el.src = URL.createObjectURL(new Blob([clip('tone-opus.webm')], { type: 'audio/webm' }));
+  try {
+    const source = ctx.createMediaElementSource(el), analyser = ctx.createAnalyser(), quiet = ctx.createGain();
+    analyser.fftSize = 2048;
+    quiet.gain.value = 0.1;
+    source.connect(analyser).connect(quiet).connect(ctx.destination);
+    await el.play();
+    const buf = new Float32Array(analyser.fftSize);
+    let peak = 0;
+    const t0 = performance.now();
+    while (performance.now() - t0 < 1500) {
+      await sleep(50);
+      analyser.getFloatTimeDomainData(buf);
+      peak = Math.max(peak, peakOf(buf));
+    }
+    result('media-element-source', peak > 0.4 && peak < 0.7,
+           'peak ' + peak.toFixed(3) + ' after ' + el.currentTime.toFixed(3) + ' s of playback, ' + mediaError(el));
+  } catch (e) {
+    result('media-element-source', false, String(e) + ' (' + mediaError(el) + ')');
+  }
+  el.pause();
+  URL.revokeObjectURL(el.src);
+}
+// ?click: wait for a click first (desktop browsers start audio only after one).
+const clicked = location.search.includes('click')
+  ? new Promise(r => { say('click to start'); addEventListener('click', r, { once: true }); }) : Promise.resolve();
+clicked.then(run).catch(e => say('RESULT webaudio summary FAIL ' + e));
 </script>
 </body>
 </html>
