@@ -804,6 +804,17 @@ pages close), and a private tab opens on the home page. Private pages:
   time;
 - leave **no history** and are never written to `session.json` (a restart
   or a crash comes back to the normal tabs);
+- leave **nothing in the log**: from *private browsing on* until 2 s after
+  it ends (the private WebProcess's last relayed lines), the title's log
+  queue takes no line at all (`ps5wk_log_private` in `apps/title/titlelog.c`),
+  so no page, site, download or page console message reaches
+  `ps5browser.log`, its `.1` or the TCP log; a crash there leaves no lines
+  either. When it ends: `[log] private browsing ended: N lines were not
+  logged`. `debug-screenshot` takes no screenshots, and *Restart browser*
+  comes back to the home page, not the private page (`open-url.txt`
+  outlives the restart). Checked on the console 2026-11-09: a private page
+  with a marker in its address, then a normal one; the marker was nowhere
+  in the log;
 - show a **plum bar** with a *Private* chip, also while loading.
 
 Leaving (the same button) closes the private tabs, their WebProcess and the

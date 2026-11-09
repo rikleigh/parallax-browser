@@ -76,6 +76,13 @@ static uint64_t processed;   /* ring position the sender has handed to the sinks
 static int wakePending;
 static int wakeR = -1, wakeW = -1;
 
+/* Private browsing (browserui.c, ps5wk_log_private): while it is shown, no
+ * line goes into the ring at all. The file outlives the private session, and
+ * a line may name a page (load events, a page's console messages relayed as
+ * "[webN] <url>:..."), a site or a download. Counted, and noted at the end. */
+static int privateOn;
+static uint64_t privateDropped;
+
 /* stderr: the pipe's read end and the line it has not finished yet. */
 static int stderrR = -1;
 static int stderrBySender;
@@ -134,6 +141,10 @@ static void ringPut(const char* p, size_t n)
 
 static void pushLocked(const char* p, size_t n)
 {
+    if (privateOn) {
+        privateDropped++;
+        return;
+    }
     if (ringDropped) {
         char note[96];
         int k = snprintf(note, sizeof note, "[log] %llu lines dropped: the log queue was full\n", (unsigned long long)ringDropped);
@@ -200,6 +211,23 @@ static void absorbStderrLocked(void)
         if ((size_t)r < sizeof chunk)
             return;
     }
+}
+
+void ps5wk_log_private(int on)
+{
+    pthread_mutex_lock(&lock);
+    absorbStderrLocked(); /* what was written before the change */
+    if (on)
+        privateOn = 1;
+    else if (privateOn) {
+        privateOn = 0;
+        char note[128];
+        int k = snprintf(note, sizeof note, "[log] private browsing ended: %llu lines were not logged\n", (unsigned long long)privateDropped);
+        pushLocked(note, (size_t)k);
+        privateDropped = 0;
+        wakeLocked();
+    }
+    pthread_mutex_unlock(&lock);
 }
 
 /* spike_log_sink and ps5wk_log_line_hook: whole lines ending in '\n'. */

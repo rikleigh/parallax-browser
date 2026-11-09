@@ -317,7 +317,7 @@ static unsigned shotCount;
 
 static void captureScreen(const char* name)
 {
-    if (!screenshots)
+    if (!screenshots || ps5wk_browser_private()) /* debug-screenshot: not of private pages */
         return;
     char path[256];
     snprintf(path, sizeof path, SHOT_DIR "/%02u-%s.ppm", ++shotCount, name);
@@ -1518,7 +1518,9 @@ static const char* restartBrowser(const char* from)
     g_mutex_lock(&shownLock);
     const char* back = shownURI && !isSettingsURI(shownURI) && !g_str_has_prefix(shownURI, PS5WK_GAMEPAD_URL) ? shownURI : settingsReturnURI;
     const char* error = NULL;
-    char* uri = back && *back ? pushNormalize(back, &error) : NULL;
+    /* Not a private page: open-url.txt outlives the restart, which comes
+     * back in normal browsing. */
+    char* uri = back && *back && !ps5wk_browser_private() ? pushNormalize(back, &error) : NULL;
     g_mutex_unlock(&shownLock);
     if (uri) {
         int fd = open(PS5WK_PENDING_URL, O_WRONLY | O_CREAT | O_TRUNC, 0666);

@@ -197,5 +197,8 @@ extern const char ps5wk_gamepad_page_html[];
  * and home-url.txt may still have it; it opens parallax://start instead. */
 #define PS5WK_LEGACY_START_URL "file:///data/ps5webkit/start.html"
 
+/* titlelog.c: while on, the log takes no lines (private browsing). */
+void ps5wk_log_private(int on);
+
 /* Private browsing (browserui.c): TRUE while the private session is shown. */
 gboolean ps5wk_browser_private(void);

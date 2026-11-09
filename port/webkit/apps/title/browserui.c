@@ -839,6 +839,19 @@ static void destroyTabViews(GPtrArray* list)
  * go with it. Off: the private tabs, their WebProcess and the session go,
  * and the normal tabs come back. FALSE: not now (a tab switch running, the
  * browser closing). */
+/* The log again, a moment after private browsing ended: the private
+ * WebProcess's last lines (relayed from its pipe) come in after the switch. */
+static guint logResumeTimer;
+
+static gboolean logResume(gpointer data)
+{
+    (void)data;
+    logResumeTimer = 0;
+    ps5wk_log_private(FALSE);
+    spike_log("browser: private browsing off (its tabs, WebProcess and data gone)");
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean setPrivate(gboolean on)
 {
     if (on == privateMode)
@@ -850,6 +863,11 @@ static gboolean setPrivate(gboolean on)
     ps5wk_vr_stop(FALSE, on ? "private browsing" : "private browsing ended");
     char* home = ps5wk_home_url();
     if (on) {
+        spike_log("browser: private browsing on (%u normal tabs set aside); nothing is logged until it ends", tabs->len);
+        if (logResumeTimer)
+            g_source_remove(logResumeTimer);
+        logResumeTimer = 0;
+        ps5wk_log_private(TRUE);
         for (unsigned i = 0; i < tabs->len; i++)
             saveTab(g_ptr_array_index(tabs, i));
         sessionWrite(GINT_TO_POINTER(1));
@@ -869,7 +887,6 @@ static gboolean setPrivate(gboolean on)
         showView(view);
         loadFresh(view, home);
         destroyTabViews(normalTabs);
-        spike_log("browser: private browsing on (%u normal tabs set aside)", normalTabs->len);
         wpe_display_ps5_show_message(display, "Private browsing: no history, and cookies and site data go when you leave", 4);
     } else {
         GPtrArray* privateTabs = tabs;
@@ -888,7 +905,9 @@ static gboolean setPrivate(gboolean on)
         destroyTabViews(privateTabs);
         g_ptr_array_unref(privateTabs);
         g_clear_object(&privateSession);
-        spike_log("browser: private browsing off (its tabs, WebProcess and data gone)");
+        if (logResumeTimer)
+            g_source_remove(logResumeTimer);
+        logResumeTimer = g_timeout_add_seconds(2, logResume, NULL);
         wpe_display_ps5_show_message(display, "Private browsing ended: its pages, cookies and data are gone", 3);
         scheduleSessionSave();
     }
