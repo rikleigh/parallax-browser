@@ -1,0 +1,41 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index 7bc2338cad..51f30c3bd6 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -3982,9 +3982,34 @@ void MediaPlayerPrivateGStreamer::configureVideoDecoder(GstElement* decoder)
+         // step 1); 4 threads keep 1080p60 H.264/VP9 ahead (Spike 9: more than 8
+         // collapse on the console). PS5WK_DECODER_THREADS overrides.
+         int threads = 4;
+-        if (const char* value = g_getenv("PS5WK_DECODER_THREADS"))
+-            threads = std::clamp(atoi(value), 1, 8);
++        const char* threadsValue = g_getenv("PS5WK_DECODER_THREADS");
++        if (threadsValue)
++            threads = std::clamp(atoi(threadsValue), 1, 8);
+         g_object_set(decoder, "max-threads", threads, nullptr);
++        // PS5: small videos get fewer threads. A page of hover previews (a
++        // games list: 364x208 H.264 on every card, more than the hardware
++        // decoders) made a software decoder each, 4 threads apiece, until
++        // the WebProcess reached the console's thread limit. avdec reads
++        // max-threads when the caps arrive, so the probe sees them first.
++        if (!threadsValue) {
++            GRefPtr sinkPad = adoptGRef(gst_element_get_static_pad(decoder, "sink"));
++            gst_pad_add_probe(sinkPad.get(), GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, [](GstPad* pad, GstPadProbeInfo* info, gpointer) -> GstPadProbeReturn {
++                GstEvent* event = gst_pad_probe_info_get_event(info);
++                if (GST_EVENT_TYPE(event) != GST_EVENT_CAPS)
++                    return GST_PAD_PROBE_OK;
++                GstCaps* caps = nullptr;
++                gst_event_parse_caps(event, &caps);
++                int width = 0, height = 0;
++                const GstStructure* structure = caps && gst_caps_get_size(caps) ? gst_caps_get_structure(caps, 0) : nullptr;
++                if (!structure || !gst_structure_get_int(structure, "width", &width) || !gst_structure_get_int(structure, "height", &height))
++                    return GST_PAD_PROBE_OK;
++                int64_t pixels = static_cast<int64_t>(width) * height;
++                int threads = pixels <= 640 * 480 ? 1 : pixels <= 1280 * 720 ? 2 : 4;
++                if (GRefPtr element = adoptGRef(gst_pad_get_parent_element(pad)))
++                    g_object_set(element.get(), "max-threads", threads, nullptr);
++                return GST_PAD_PROBE_OK;
++            }, nullptr, nullptr);
++        }
+         // PS5: no still-frame drains either. avdec drains by flushing libav
+         // (avcodec_flush_buffers), which drops the reference frames: every
+         // inter frame after a drain failed to decode (max-errors -1 hid it)

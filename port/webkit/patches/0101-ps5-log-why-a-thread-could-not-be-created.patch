@@ -1,0 +1,65 @@
+diff --git a/Source/WTF/wtf/Threading.cpp b/Source/WTF/wtf/Threading.cpp
+index fe11c92cca..76677673d8 100644
+--- a/Source/WTF/wtf/Threading.cpp
++++ b/Source/WTF/wtf/Threading.cpp
+@@ -270,6 +270,10 @@ void Thread::entryPoint(NewThreadContext* newThreadContext)
+ Ref<Thread> Thread::create(ASCIILiteral name, Function<void()>&& entryPoint, ThreadType threadType, QOS qos, SchedulingPolicy schedulingPolicy, StackAllocationSpecification stackSpec)
+ {
+     RefPtr thread = tryCreate(name, WTF::move(entryPoint), threadType, qos, schedulingPolicy, stackSpec);
++#if defined(PS5_PAYLOAD_SDK)
++    if (!thread)
++        WTFLogAlways("[wtf] could not create thread \"%s\"; crashing", name.characters());
++#endif
+     RELEASE_ASSERT(thread);
+     return thread.releaseNonNull();
+ }
+diff --git a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+index 184d73863f..b2c1de716a 100644
+--- a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
++++ b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+@@ -44,6 +44,13 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/ThreadingPrimitives.h>
+ #include <wtf/WTFConfig.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include <stdlib.h>
++#include <string.h>
++#include <sys/sysctl.h>
++#include <sys/user.h>
++#include <unistd.h>
++#endif
+ 
+ #if OS(HAIKU)
+ #include <OS.h>
+@@ -379,9 +386,31 @@ bool Thread::establishHandle(NewThreadContext& context, StackAllocationSpecifica
+     }
+ 
+     int error = pthread_create(&threadHandle, &attr, wtfThreadEntryPoint, &context);
++#if defined(PS5_PAYLOAD_SDK)
++    size_t requestedStack = 0;
++    pthread_attr_getstacksize(&attr, &requestedStack);
++#endif
+     pthread_attr_destroy(&attr);
+     if (error) {
+         LOG_ERROR("Failed to create pthread at entry point %p with context %p", wtfThreadEntryPoint, &context);
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: release builds drop LOG_ERROR, and Thread::create crashes on
++        // this; say why (the console's kinfo_proc is larger than the SDK's,
++        // so the size is asked first).
++        int threads = -1;
++        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid() };
++        size_t size = 0;
++        if (!sysctl(mib, 4, nullptr, &size, nullptr, 0) && size >= sizeof(struct kinfo_proc)) {
++            size += 4096;
++            if (void* buffer = malloc(size)) {
++                if (!sysctl(mib, 4, buffer, &size, nullptr, 0) && size >= sizeof(struct kinfo_proc))
++                    threads = static_cast<struct kinfo_proc*>(buffer)->ki_numthreads;
++                free(buffer);
++            }
++        }
++        WTFLogAlways("[wtf] pthread_create failed: error %d (%s); stack %zu KB requested; %d threads in the process",
++            error, strerror(error), requestedStack / 1024, threads);
++#endif
+         return false;
+     }
+ 
