@@ -202,10 +202,14 @@ static void* streamThread(void* data)
     int peak = 0, outputErrors = 0, firstError = 0;
     double sumSquares = 0;
     enum { QUIET = 2, LOUD = 64, GAP_MIN = 16, GAP_MAX_MS = 100 };
-    uint64_t quietRun = 0, gaps = 0, gapFrames = 0;
+    uint64_t quietRun = 0, gaps = 0, gapFrames = 0, frame = 0;
     int heardSound = 0;
+    char gapAt[96] = ""; // where the first few dropouts started
+    size_t gapAtLength = 0;
     while (grain && !stopping && !readFull(fd, grain, grainBytes)) {
         for (size_t i = 0; i < grainBytes / 2; i++) {
+            if (!(i % hello.channels))
+                frame++;
             int v = grain[i] < 0 ? -grain[i] : grain[i];
             if (v > peak)
                 peak = v;
@@ -219,6 +223,12 @@ static void* streamThread(void* data)
                 if (heardSound && frames >= GAP_MIN && frames <= (uint64_t)RATE * GAP_MAX_MS / 1000) {
                     gaps++;
                     gapFrames += frames;
+                    if (gaps <= 4 && gapAtLength < sizeof gapAt - 24) {
+                        int n = snprintf(gapAt + gapAtLength, sizeof gapAt - gapAtLength, "%s%.3f s (%llu)", gaps > 1 ? ", " : " at ",
+                            (double)(frame - frames) / RATE, (unsigned long long)frames);
+                        if (n > 0)
+                            gapAtLength += (size_t)n;
+                    }
                 }
                 heardSound = 1;
             }
@@ -258,9 +268,9 @@ static void* streamThread(void* data)
     pthread_mutex_unlock(&lock);
     double rms = played ? sqrt(sumSquares / ((double)played * hello.channels)) : 0;
     LOGA("stream from pid %d closed: %.1f s of audio in %.1f s (peak %d, rms %.0f of 32767; %d output errors, first 0x%08x; "
-         "%llu dropouts, %.1f ms)",
+         "%llu dropouts, %.1f ms%s)",
         hello.pid, played / (double)RATE, (nowMS() - start) / 1e3, peak, rms, outputErrors, (unsigned)firstError,
-        (unsigned long long)gaps, gapFrames * 1000.0 / RATE);
+        (unsigned long long)gaps, gapFrames * 1000.0 / RATE, gapAt);
     return NULL;
 }
 

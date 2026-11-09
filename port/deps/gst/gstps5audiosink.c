@@ -20,14 +20,21 @@
  *   payload this costs one of the audio daemon's slots per process (above).
  *
  * GstAudioSink runs write() on its own ring-buffer thread, so blocking there
- * (in sceAudioOutOutput, or on the socket while the title plays) is what
- * paces the pipeline clock. Caps are fixed to what the port takes; playsink's
+ * (in sceAudioOutOutput, or until the title has played what was sent) is
+ * what paces the pipeline clock. In server mode the socket alone would not:
+ * it takes up to 2048 mono frames at once, so at the start of a stream the
+ * ring-buffer thread sent everything written and then caught up with the
+ * streaming thread, played not-yet-written segments as silence and dropped
+ * their samples when they came (a 21 ms dropout 43 ms into a mono clip). A
+ * write waits until at most PS5_SERVER_AHEAD frames are unplayed, as a
+ * device would. Caps are fixed to what the port takes; playsink's
  * audioconvert/audioresample convert upstream.
  */
 #define PACKAGE "ps5webkit"
 #include <gst/gst.h>
 #include <gst/audio/gstaudiosink.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +43,10 @@
 #include <unistd.h>
 
 #define PS5_GRAIN 256 /* frames per sceAudioOutOutput */
+/* Server mode: the most frames sent but not yet played by the title (see
+ * server_wait_for_room). */
+#define PS5_SERVER_AHEAD (4 * PS5_GRAIN)
+#define PS5_SERVER_WAIT_MAX_US 250000
 #define PS5_RATE 48000
 #define PS5_USER_SYSTEM 255
 #define PS5_PORT_MAIN 0
@@ -77,6 +88,7 @@ struct _GstPs5AudioSink {
     guint64 played;     /* server mode: frames the title reported played */
     guint64 grains, late;
     gint64 started_us;
+    guint64 waits_timed_out; /* server mode: the title stopped reporting */
 };
 
 G_DEFINE_TYPE(GstPs5AudioSink, gst_ps5_audio_sink, GST_TYPE_AUDIO_SINK)
@@ -204,15 +216,44 @@ static void ps5_output_grain(GstPs5AudioSink *self)
     self->filled = 0;
 }
 
-/* Latest "frames played" count from the server (it sends one per grain). */
-static void server_read_played(GstPs5AudioSink *self)
+/* Latest "frames played" count from the server (it sends one per grain).
+ * fd: the connection the caller saw; reset() may close it from another
+ * thread, so nothing is read once it is no longer the current one. */
+static void server_read_played_on(GstPs5AudioSink *self, int fd)
 {
     guint64 counts[64];
-    for (;;) {
-        ssize_t n = recv(self->fd, counts, sizeof counts, MSG_DONTWAIT);
+    while (fd >= 0 && fd == self->fd) {
+        ssize_t n = recv(fd, counts, sizeof counts, MSG_DONTWAIT);
         if (n < (ssize_t)sizeof counts[0])
             break;
         self->played = counts[n / sizeof counts[0] - 1];
+    }
+}
+
+static void server_read_played(GstPs5AudioSink *self)
+{
+    server_read_played_on(self, self->fd);
+}
+
+/* Block, like a device, until sending `frames` more leaves at most
+ * PS5_SERVER_AHEAD frames unplayed by the title. Returns early when reset()
+ * drops the connection, or after PS5_SERVER_WAIT_MAX_US when the title stops
+ * reporting (then the socket's own blocking paces). */
+static void server_wait_for_room(GstPs5AudioSink *self, guint frames)
+{
+    int fd = self->fd;
+    gint64 deadline = g_get_monotonic_time() + PS5_SERVER_WAIT_MAX_US;
+    while (fd >= 0 && fd == self->fd) {
+        server_read_played_on(self, fd);
+        if (self->written + frames <= self->played + PS5_SERVER_AHEAD)
+            return;
+        if (g_get_monotonic_time() > deadline) {
+            if (!self->waits_timed_out++)
+                GST_WARNING_OBJECT(self, "the title reported nothing played for %d ms", PS5_SERVER_WAIT_MAX_US / 1000);
+            return;
+        }
+        struct pollfd p = { fd, POLLIN, 0 };
+        poll(&p, 1, 5);
     }
 }
 
@@ -225,6 +266,9 @@ static gint ps5_write(GstAudioSink *asink, gpointer data, guint length)
             g_usleep((gulong)(length / self->bpf) * G_USEC_PER_SEC / PS5_RATE);
             return length;
         }
+        server_wait_for_room(self, length / self->bpf);
+        if (self->fd < 0)
+            return length; /* reset() while waiting: dropped, as a flush does */
         const guint8 *p = data;
         guint left = length;
         while (left) {
