@@ -1057,7 +1057,7 @@ static void* decoderThread(void* data)
 //   stream that later grows past its decoder reopens it (the proxy drains
 //   first).
 // /data/ps5webkit/vdec-budget (read at each DOPEN) overrides, e.g.
-// "decoders=8 direct=2048 reserve=64 wait=500 vp9headroom=1".
+// "decoders=8 direct=2048 reserve=64 wait=500 vp9headroom=1 h264small=1".
 
 extern "C" double ps5wk_title_direct_mb(void) __attribute__((weak)); // titlemem.c (the title only)
 extern "C" int sceKernelAvailableFlexibleMemorySize(size_t*) __attribute__((weak));
@@ -1068,6 +1068,7 @@ struct BudgetLimits {
     double reserveMB { 64 };
     int waitMS { 500 };
     int vp9Headroom { 1 }; // 0: never 4K headroom, 1: streams above 1080p, 2: every VP9 stream
+    int h264Small { 1 }; // 1: H.264 streams up to 640x480 get a decoder of their own size; 0: 1920x1088
 };
 
 struct Cost {
@@ -1107,6 +1108,8 @@ static BudgetLimits readBudgetLimits()
             limits.waitMS = std::max(0, i);
         else if (sscanf(word, "vp9headroom=%d", &i) == 1)
             limits.vp9Headroom = i;
+        else if (sscanf(word, "h264small=%d", &i) == 1)
+            limits.h264Small = i;
     }
     fclose(f);
     return limits;
@@ -1360,7 +1363,14 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
     // 1920x1088 decoder (a later switch above it reopens the decoder; the
     // proxy drains first), and one above 1080p 3840x2160 while that fits in
     // half the budget (vp9headroom=2: 4K for every VP9 stream, the old way).
-    // H.264 up to 1080p costs 24 MB flexible; HEVC is sized as asked.
+    // H.264 up to 1080p costs 24 MB flexible and ~145 MB direct, as much for
+    // a 364x208 hover preview: a page of them filled the budget with eight
+    // previews (1.17 GB direct, the title down to 75 MB of flexible memory)
+    // and sent every later one to software decoding in the WebProcess, which
+    // then ran out of threads. H.264 up to 640x480 gets a decoder of its own
+    // size (macroblock-rounded); a stream that grows past it reopens it, as
+    // VP9 does, and if Videodec2 refuses the small size it is opened at
+    // 1920x1088 as before. HEVC is sized as asked.
     BudgetLimits limits = readBudgetLimits();
     int openWidth = width, openHeight = height;
     if (codec == PS5WK_VCODEC_VP9 && openWidth * openHeight < 3840 * 2160) {
@@ -1379,8 +1389,13 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
             openHeight = std::max(openHeight, 1088);
         }
     } else if (codec == PS5WK_VCODEC_H264 && openWidth * openHeight < 1920 * 1088) {
-        openWidth = std::max(openWidth, 1920);
-        openHeight = std::max(openHeight, 1088);
+        if (limits.h264Small && openWidth * openHeight <= 640 * 480) {
+            openWidth = (openWidth + 15) & ~15;
+            openHeight = (openHeight + 15) & ~15;
+        } else {
+            openWidth = std::max(openWidth, 1920);
+            openHeight = std::max(openHeight, 1088);
+        }
     }
 
     const char* names[] = { "?", "H.264", "HEVC", "?", "VP9" };
@@ -1402,6 +1417,12 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
     // rather than fall back to software.
     for (int attempt = 0; attempt < 30; attempt++) {
         hw = backend->open(codec, profile, depth, openWidth, openHeight, &frameBytes, &frameAlign, error, sizeof error);
+        if (!hw && codec == PS5WK_VCODEC_H264 && openWidth * openHeight < 1920 * 1088) {
+            DLOG("decoder for pid %d: H.264 at %dx%d refused (%s); opening at 1920x1088", d->pid, openWidth, openHeight, error);
+            openWidth = std::max(openWidth, 1920);
+            openHeight = std::max(openHeight, 1088);
+            hw = backend->open(codec, profile, depth, openWidth, openHeight, &frameBytes, &frameAlign, error, sizeof error);
+        }
         if (hw || !openDecoders())
             break;
         g_mutex_unlock(&openLock);
