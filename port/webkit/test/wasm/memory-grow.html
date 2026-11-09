@@ -1,0 +1,90 @@
+<!doctype html>
+<!-- WebAssembly memory growth the way an Emscripten build (Unity WebGL) grows
+     its heap: start at 32 MB, then each step asks for 20% more, and on a
+     failure tries the same smaller steps an Emscripten heap resize does
+     (20%, 10%, 6.7%, 5%) before giving up. Every step writes a byte in each
+     64 KB page of the new part, so the memory is really used. The heap stops
+     at ?max=<MB> (default 1536; Unity's usual maximum is 2048). Log lines:
+     RESULT wasm-memory-grow reached <MB> MB in <n> steps (<ms> ms) and
+     the WebProcess's "[wasm] memory grew in place/by moving" lines.
+     ?repeat=<n> runs it n times in a row (a page reloading its game): each
+     run's memory has to be given back for the next one to reach as far. Upload
+     to /data/ps5webkit/wasm-memory-grow.html and open
+     file:///data/ps5webkit/wasm-memory-grow.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wasm memory growth</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre; }
+</style>
+</head>
+<body>
+<h1>WebAssembly memory growth</h1>
+<div id="out"></div>
+<script>
+const params = new URLSearchParams(location.search);
+const maxMB = Number(params.get('max') || 1536);
+const repeat = Number(params.get('repeat') || 1);
+const PAGE = 65536, MB = 1024 * 1024;
+const out = document.getElementById('out');
+function say(line) {
+  console.log(line);
+  out.textContent += line + '\n';
+}
+
+function runOnce(run) {
+  const start = performance.now();
+  const memory = new WebAssembly.Memory({ initial: 32 * MB / PAGE, maximum: 32768 });
+  let pages = memory.buffer.byteLength / PAGE;
+  let steps = 0, failedAt = 0;
+  while (pages * PAGE < maxMB * MB) {
+    let grown = false;
+    for (const cutDown of [1, 2, 3, 4]) {
+      const want = Math.min(Math.ceil(pages * (1 + 0.2 / cutDown)), maxMB * MB / PAGE);
+      try {
+        memory.grow(want - pages);
+      } catch (e) {
+        continue;
+      }
+      const view = new Uint8Array(memory.buffer);
+      for (let p = pages; p < want; p++)
+        view[p * PAGE] = p & 0xff;
+      pages = want;
+      steps++;
+      grown = true;
+      break;
+    }
+    if (!grown) {
+      failedAt = pages;
+      break;
+    }
+  }
+  // Every page still has what was written.
+  const view = new Uint8Array(memory.buffer);
+  let bad = 0;
+  for (let p = 32 * MB / PAGE; p < pages; p += 97)
+    if (view[p * PAGE] !== (p & 0xff)) bad++;
+  const ms = Math.round(performance.now() - start);
+  say('RESULT wasm-memory-grow run ' + run + ' reached ' + Math.round(pages * PAGE / MB) + ' MB in ' + steps + ' steps (' + ms + ' ms)' +
+      (failedAt ? ', the next step failed' : '') + (bad ? ', ' + bad + ' pages lost their data' : ''));
+  return { reached: pages * PAGE / MB, bad };
+}
+
+let run = 1, worst = Infinity, anyBad = false;
+function next() {
+  const r = runOnce(run);
+  worst = Math.min(worst, r.reached);
+  anyBad = anyBad || !!r.bad;
+  if (++run <= repeat) {
+    // Let the GC see the old memory go.
+    setTimeout(next, 1500);
+    return;
+  }
+  say('RESULT wasm-memory-grow summary ' + (worst >= maxMB && !anyBad ? 'PASS' : 'FAIL') + ' (lowest ' + Math.round(worst) + ' of ' + maxMB + ' MB over ' + repeat + ' runs)');
+}
+next();
+</script>
+</body>
+</html>

@@ -1,0 +1,581 @@
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index 92bc17e3f3..b4da3e7106 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -40,6 +40,12 @@
+ #include <wtf/PrintStream.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/Vector.h>
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <wtf/Condition.h>
++#include <wtf/Deque.h>
++#include <wtf/Threading.h>
++#include <unistd.h>
++#endif
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
+@@ -275,6 +281,95 @@ void* BufferMemoryHandle::nullBasePointer()
+     return result;
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5, opt-in (/data/ps5webkit/wasm-prefault): a thread of its own touches a large memory's pages
++// ahead of it, from the bottom up as heaps grow, so that the page's main thread doesn't take the
++// first-touch faults (192 MB took it 226 ms; no shorter load measured with it yet). Each touch adds 0
++// atomically (lock xadd), so it never changes a byte the page is writing at the same moment.
++// ps5CancelPrefault, before a mapping is unmapped, waits for the chunk in flight (<= 256 KB).
++// WasmMemory.cpp calls ps5PrefaultMemory.
++namespace {
++
++class Prefaulter {
++public:
++    static Prefaulter& singleton()
++    {
++        static LazyNeverDestroyed<Prefaulter> prefaulter;
++        static std::once_flag once;
++        std::call_once(once, [] { prefaulter.construct(); });
++        return prefaulter.get();
++    }
++
++    void add(uint8_t* base, size_t from, size_t to)
++    {
++        static int enabled = -1;
++        if (enabled < 0)
++            enabled = access("/data/ps5webkit/wasm-prefault", F_OK) ? 0 : 1;
++        if (!enabled || from >= to)
++            return;
++        Locker locker { m_lock };
++        if (!m_thread)
++            m_thread = Thread::create("WasmPrefault"_s, [this] { run(); });
++        m_jobs.append({ base, from, to, from, MonotonicTime::now() });
++        m_condition.notifyOne();
++    }
++
++    void cancel(uint8_t* base)
++    {
++        // The worker holds m_lock while it touches a chunk: once we have it, no chunk of base is in flight.
++        Locker locker { m_lock };
++        m_jobs.removeAllMatching([&](auto& job) { return job.base == base; });
++    }
++
++private:
++    struct Job {
++        uint8_t* base;
++        size_t from;
++        size_t to;
++        size_t start;
++        MonotonicTime started;
++    };
++
++    void run()
++    {
++        constexpr size_t chunk = 256 * 1024;
++        Locker locker { m_lock };
++        for (;;) {
++            while (m_jobs.isEmpty())
++                m_condition.wait(m_lock);
++            auto& job = m_jobs.first();
++            size_t end = std::min(job.to, job.from + chunk);
++            for (size_t offset = job.from; offset < end; offset += 4096)
++                __atomic_fetch_add(job.base + offset, 0, __ATOMIC_RELAXED);
++            job.from = end;
++            if (job.from >= job.to) {
++                dataLogLn("[wasm] prefaulted ", (job.to - job.start) / (1024 * 1024), " MB of a memory (", job.start / (1024 * 1024), "-", job.to / (1024 * 1024), " MB) in ", (MonotonicTime::now() - job.started).milliseconds(), " ms on its own thread");
++                m_jobs.removeFirst();
++            }
++            DropLockForScope unlocker(locker);
++            Thread::yield();
++        }
++    }
++
++    Lock m_lock;
++    Condition m_condition;
++    RefPtr<Thread> m_thread;
++    Deque<Job> m_jobs;
++};
++
++} // namespace
++
++void ps5PrefaultMemory(void* base, size_t from, size_t to)
++{
++    Prefaulter::singleton().add(static_cast<uint8_t*>(base), from, to);
++}
++
++static void ps5CancelPrefault(void* base)
++{
++    Prefaulter::singleton().cancel(static_cast<uint8_t*>(base));
++}
++#endif
++
+ BufferMemoryHandle::~BufferMemoryHandle()
+ {
+     if (m_memory) {
+@@ -299,7 +394,15 @@ BufferMemoryHandle::~BufferMemoryHandle()
+             case MemorySharingMode::Default: {
+                 if (memory == nullBasePointer() && !m_size)
+                     return;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++                if (m_memoryHandedOver)
++                    break;
++                if (ps5MappingBytes() >= Gigacage::ps5OwnMappingBytes)
++                    ps5CancelPrefault(memory);
++                Gigacage::freeVirtualPages(Gigacage::Primitive, memory, ps5MappingBytes());
++#else
+                 Gigacage::freeVirtualPages(Gigacage::Primitive, memory, m_size);
++#endif
+                 break;
+             }
+             case MemorySharingMode::Shared: {
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.h b/Source/JavaScriptCore/runtime/BufferMemoryHandle.h
+index 76068d0f52..f451fe17dc 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.h
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.h
+@@ -28,6 +28,7 @@
+ #include <JavaScriptCore/MemoryMode.h>
+ #include <JavaScriptCore/PageCount.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ 
+ #include <bmalloc/Gigacage.h>
+@@ -179,6 +180,14 @@ public:
+     void registerInstance(JSWebAssemblyInstance&);
+ #endif
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // A handle that grew this memory in place owns its pages now: this one mustn't unmap them.
++    void handOverMemoryForPS5() { m_memoryHandedOver = true; }
++    // A large memory may be mapped past its size (Memory::grow's headroom): what to unmap.
++    size_t ps5MappingBytes() const { return std::max<size_t>(m_size, m_ps5MappingBytes); }
++    void setPS5MappingBytes(size_t bytes) { m_ps5MappingBytes = bytes; }
++#endif
++
+ private:
+     using CagedMemory = CagedPtr<Gigacage::Primitive, void>;
+ 
+@@ -193,6 +202,10 @@ private:
+ #if ENABLE(WEBASSEMBLY)
+     ThreadSafeWeakHashSet<Wasm::InstanceAnchor> m_anchors;
+ #endif
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    bool m_memoryHandedOver { false };
++    size_t m_ps5MappingBytes { 0 };
++#endif
+ };
+ 
+ } // namespace JSC
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index d2312fb4d9..07cfa5c8bd 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -44,11 +44,28 @@
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ #include <cstring>
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <algorithm>
++#include <unistd.h>
++#endif
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++namespace Gigacage {
++// WTF/wtf/FastMalloc.cpp (declared here, not in FastMalloc.h, which nearly every file includes):
++// tryAllocateZeroedVirtualPages in an address range of its own, so that it can grow in place.
++WTF_EXPORT_PRIVATE void* tryAllocateZeroedVirtualPagesWithRoomToGrow(Kind, size_t);
++}
++#endif
++
+ namespace JSC {
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// BufferMemoryHandle.cpp: touches [from, to) of a large memory's mapping on a thread of its own.
++void ps5PrefaultMemory(void* base, size_t from, size_t to);
++#endif
++
+ namespace Wasm {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(Memory);
+@@ -63,6 +80,25 @@ constexpr bool verbose = false;
+ 
+ NEVER_INLINE NO_RETURN_DUE_TO_CRASH void webAssemblyCouldntGetFastMemory() { CRASH(); }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: how much to map for a large memory of `bytes`: half as much again (at most 128 MB, never
++// past the maximum), so that most growth steps need no new mapping. The extra pages cost address space
++// (a CPU page table per 2 MB, FastMalloc.h); whether the kernel also commits memory for them
++// before they are touched is not measured yet. /data/ps5webkit/no-wasm-headroom: none.
++static size_t ps5WasmMappingTarget(size_t bytes, uint64_t maximumBytes)
++{
++    static int headroom = -1;
++    if (headroom < 0)
++        headroom = access("/data/ps5webkit/no-wasm-headroom", F_OK) ? 1 : 0;
++    if (!headroom || bytes < Gigacage::ps5OwnMappingBytes)
++        return bytes;
++    size_t extra = std::min<size_t>(bytes / 2, 128 * 1024 * 1024);
++    uint64_t target = std::min<uint64_t>(bytes + extra, std::max<uint64_t>(maximumBytes, bytes));
++    target -= target % PageCount::pageSize;
++    return std::max<size_t>(bytes, static_cast<size_t>(target));
++}
++#endif
++
+ // A grow's resulting page count must be one the memory's own address type can declare, which is
+ // tighter than what PageCount can represent.
+ static bool isDeclarablePageCount(PageCount pageCount, AddressType addressType)
+@@ -237,12 +273,31 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+         if (!initialBytes)
+             return adoptRef(new Memory(initial, maximum, MemorySharingMode::Default, addressType, WTF::move(growSuccessCallback)));
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: with headroom for the first growth steps (Memory::grow).
++        size_t mappingBytes = maximum ? ps5WasmMappingTarget(initialBytes, maximum.bytes()) : initialBytes;
++        auto mapStart = MonotonicTime::now();
++        void* slowMemory = Gigacage::tryAllocateZeroedVirtualPagesWithRoomToGrow(Gigacage::Primitive, mappingBytes);
++        if (!slowMemory && mappingBytes != initialBytes) {
++            mappingBytes = initialBytes;
++            slowMemory = Gigacage::tryAllocateZeroedVirtualPagesWithRoomToGrow(Gigacage::Primitive, mappingBytes);
++        }
++        if (slowMemory && initialBytes >= Gigacage::ps5OwnMappingBytes)
++            dataLogLn("[wasm] memory of ", initialBytes / (1024 * 1024), " MB at ", RawPointer(slowMemory), " (mapped ", mappingBytes / (1024 * 1024), " MB, mmap ", (MonotonicTime::now() - mapStart).milliseconds(), " ms)");
++#else
+         void* slowMemory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, initialBytes);
++#endif
+         if (!slowMemory) {
+             BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
+             return nullptr;
+         }
+-        return Memory::create(adoptRef(*new BufferMemoryHandle(slowMemory, initialBytes, initialBytes, initial, maximum, MemorySharingMode::Default, MemoryMode::BoundsChecking)), addressType, WTF::move(growSuccessCallback));
++        Ref handle = adoptRef(*new BufferMemoryHandle(slowMemory, initialBytes, initialBytes, initial, maximum, MemorySharingMode::Default, MemoryMode::BoundsChecking));
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        handle->setPS5MappingBytes(mappingBytes);
++        if (mappingBytes >= Gigacage::ps5OwnMappingBytes)
++            ps5PrefaultMemory(slowMemory, 0, mappingBytes);
++#endif
++        return Memory::create(WTF::move(handle), addressType, WTF::move(growSuccessCallback));
+     }
+     case MemorySharingMode::Shared: {
+         char* slowMemory = nullptr;
+@@ -396,6 +451,66 @@ std::expected<PageCount, GrowFailReason> Memory::grow(VM& vm, PageCount delta)
+ 
+         RELEASE_ASSERT(maximum().bytes() != 0);
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: a large memory is a mapping of its own (Gigacage::ps5OwnMappingBytes). Extending it
++        // in place saves the copy, and the moment when the old and the new memory are both mapped:
++        // with the system's page tables nearly used up, that moment was when a growing heap failed.
++        // An engine's heap grows in ~20% steps while it loads: the mapping gets headroom
++        // (ps5WasmMappingTarget) and a range of its own (tryAllocateZeroedVirtualPagesWithRoomToGrow),
++        // as a move copies the whole heap (184 MB took 1.7-3.2 s of the main thread).
++        constexpr size_t mb = 1024 * 1024;
++        size_t oldSize = size();
++        size_t mapped = m_handle->ps5MappingBytes();
++        auto growInPlace = [&](size_t mappingBytes, const char* how, Seconds took) {
++            Ref newHandle = adoptRef(*new BufferMemoryHandle(basePointer(), desiredSize, desiredSize, initial(), maximum(), sharingMode(), MemoryMode::BoundsChecking));
++            newHandle->setPS5MappingBytes(mappingBytes);
++            m_handle->handOverMemoryForPS5();
++            m_handle->transferAnchors(newHandle.get());
++            m_handle = WTF::move(newHandle);
++            dataLogLn("[wasm] memory grew ", how, " to ", desiredSize / mb, " MB (mapped ", mappingBytes / mb, " MB, mmap ", took.milliseconds(), " ms)");
++        };
++        if (oldSize >= Gigacage::ps5OwnMappingBytes && desiredSize <= mapped) {
++            growInPlace(mapped, "within its mapping", 0_s);
++            return success();
++        }
++        size_t target = ps5WasmMappingTarget(desiredSize, maximum().bytes());
++        if (oldSize >= Gigacage::ps5OwnMappingBytes) {
++            for (size_t want : { target, desiredSize }) {
++                auto start = MonotonicTime::now();
++                if (Gigacage::tryExtendVirtualPagesInPlace(Gigacage::Primitive, basePointer(), mapped, want)) {
++                    growInPlace(want, "in place", MonotonicTime::now() - start);
++                    ps5PrefaultMemory(basePointer(), mapped, want);
++                    return success();
++                }
++                if (want == desiredSize)
++                    break;
++            }
++        }
++        auto mapStart = MonotonicTime::now();
++        size_t newMapping = target;
++        void* newMemory = Gigacage::tryAllocateZeroedVirtualPagesWithRoomToGrow(Gigacage::Primitive, newMapping);
++        if (!newMemory && target != desiredSize) {
++            newMapping = desiredSize;
++            newMemory = Gigacage::tryAllocateZeroedVirtualPagesWithRoomToGrow(Gigacage::Primitive, newMapping);
++        }
++        Seconds mapTook = MonotonicTime::now() - mapStart;
++        if (!newMemory) {
++            BufferMemoryManager::singleton().freePhysicalBytes(desiredSize);
++            dataLogLn("[wasm] memory could not grow from ", oldSize / mb, " to ", desiredSize / mb, " MB: no address space");
++            return makeUnexpected(GrowFailReason::OutOfMemory);
++        }
++        auto copyStart = MonotonicTime::now();
++        memcpySpan(unsafeMakeSpan(static_cast<uint8_t*>(newMemory), desiredSize), m_handle->mutableSpan());
++        if (desiredSize >= Gigacage::ps5OwnMappingBytes)
++            dataLogLn("[wasm] memory grew to ", desiredSize / mb, " MB by moving to ", RawPointer(newMemory), " (mapped ", newMapping / mb, " MB, mmap ", mapTook.milliseconds(), " ms; ", oldSize / mb, " MB copied in ", (MonotonicTime::now() - copyStart).milliseconds(), " ms)");
++        Ref newHandle = adoptRef(*new BufferMemoryHandle(newMemory, desiredSize, desiredSize, initial(), maximum(), sharingMode(), MemoryMode::BoundsChecking));
++        newHandle->setPS5MappingBytes(newMapping);
++        m_handle->transferAnchors(newHandle.get());
++        m_handle = WTF::move(newHandle);
++        // The copy touched [0, desiredSize); the rest ahead of the heap.
++        if (newMapping >= Gigacage::ps5OwnMappingBytes)
++            ps5PrefaultMemory(newMemory, desiredSize, newMapping);
++#else
+         void* newMemory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, desiredSize);
+         if (!newMemory) {
+             BufferMemoryManager::singleton().freePhysicalBytes(desiredSize);
+@@ -406,6 +521,7 @@ std::expected<PageCount, GrowFailReason> Memory::grow(VM& vm, PageCount delta)
+         Ref newHandle = adoptRef(*new BufferMemoryHandle(newMemory, desiredSize, desiredSize, initial(), maximum(), sharingMode(), MemoryMode::BoundsChecking));
+         m_handle->transferAnchors(newHandle.get());
+         m_handle = WTF::move(newHandle);
++#endif
+ 
+         ASSERT(basePointer() == newMemory);
+         return success();
+diff --git a/Source/WTF/wtf/FastMalloc.cpp b/Source/WTF/wtf/FastMalloc.cpp
+index bb0e777124..66d078b792 100644
+--- a/Source/WTF/wtf/FastMalloc.cpp
++++ b/Source/WTF/wtf/FastMalloc.cpp
+@@ -35,6 +35,11 @@
+ #include <wtf/SequesteredImmortalHeap.h>
+ #include <wtf/SequesteredMalloc.h>
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <atomic>
++#include <sys/mman.h>
++#endif
++
+ #if OS(WINDOWS)
+ #include <windows.h>
+ #include <psapi.h>
+@@ -741,6 +746,13 @@ void free(Kind kind, void* p)
+ 
+ void* tryAllocateZeroedVirtualPages(Kind kind, size_t size)
+ {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    if (size >= ps5OwnMappingBytes) {
++        // Fresh anonymous pages are zeroed.
++        void* result = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        return result == MAP_FAILED ? nullptr : result;
++    }
++#endif
+     void* result = bmalloc::api::tryLargeZeroedMemalignVirtual(WTF::pageSize(), size, bmalloc::CompactAllocationMode::Compact, bmalloc::heapKind(kind));
+     BPROFILE_TRY_ALLOCATION(GIGACAGE, kind, result, size);
+     WTF::compilerFence();
+@@ -752,10 +764,57 @@ void freeVirtualPages(Kind kind, void* basePtr, size_t size)
+     if (!basePtr)
+         return;
+     RELEASE_ASSERT(isCaged(kind, basePtr));
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    if (size >= ps5OwnMappingBytes) {
++        RELEASE_ASSERT(!munmap(basePtr, size));
++        return;
++    }
++#endif
+     bmalloc::api::freeLargeVirtual(basePtr, size, bmalloc::heapKind(kind));
+     WTF::compilerFence();
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++void* tryAllocateZeroedVirtualPagesWithRoomToGrow(Kind kind, size_t size)
++{
++    if (size < ps5OwnMappingBytes)
++        return tryAllocateZeroedVirtualPages(kind, size);
++    // High up, 8 GB apart, where nothing else maps: the kernel's own placement put other mappings
++    // right after a WebAssembly heap, which then had to move (and copy hundreds of MB) to grow.
++    // A hint, not MAP_FIXED: anywhere else if that range isn't free.
++    constexpr uintptr_t first = 0x2000000000; // 128 GB
++    constexpr uintptr_t spacing = 8ull << 30;
++    constexpr uintptr_t last = first + 63 * spacing;
++    static std::atomic<uintptr_t> next { first };
++    uintptr_t hint = next.fetch_add(spacing, std::memory_order_relaxed);
++    if (hint <= last) {
++        void* result = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        if (result != MAP_FAILED)
++            return result;
++    }
++    return tryAllocateZeroedVirtualPages(kind, size);
++}
++
++bool tryExtendVirtualPagesInPlace(Kind, void* basePtr, size_t oldSize, size_t newSize)
++{
++    RELEASE_ASSERT(oldSize >= ps5OwnMappingBytes && newSize > oldSize);
++    size_t pageSize = WTF::pageSize();
++    if (oldSize % pageSize || newSize % pageSize)
++        return false;
++    // A hint, not MAP_FIXED: the kernel uses the address only if nothing is mapped there.
++    auto* end = static_cast<uint8_t*>(basePtr) + oldSize;
++    size_t extra = newSize - oldSize;
++    void* result = mmap(end, extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (result == MAP_FAILED)
++        return false;
++    if (result != end) {
++        munmap(result, extra);
++        return false;
++    }
++    return true;
++}
++#endif
++
+ void* tryMallocArray(Kind kind, size_t numElements, size_t elementSize)
+ {
+     WTF::CheckedSize checkedSize = elementSize;
+diff --git a/Source/WTF/wtf/FastMalloc.h b/Source/WTF/wtf/FastMalloc.h
+index f5d488e897..44e3f9b5ac 100644
+--- a/Source/WTF/wtf/FastMalloc.h
++++ b/Source/WTF/wtf/FastMalloc.h
+@@ -390,6 +390,15 @@ WTF_EXPORT_PRIVATE void free(Kind, void*);
+ 
+ WTF_EXPORT_PRIVATE void* tryAllocateZeroedVirtualPages(Kind, size_t);
+ WTF_EXPORT_PRIVATE void freeVirtualPages(Kind, void* basePtr, size_t);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: virtual pages of ps5OwnMappingBytes or more are a mapping of their own, unmapped when freed.
++// libpas keeps the address space of a freed large block for later, and on the PS5 every 2 MB of
++// address space costs one of the system's 8192 CPU page tables, used or not: a WebAssembly heap
++// growing to hundreds of MB used to leave each smaller copy behind until mmap failed.
++constexpr size_t ps5OwnMappingBytes = 4 * 1024 * 1024;
++// Extends such a mapping to newSize where the pages after it are free; false if they aren't.
++WTF_EXPORT_PRIVATE bool tryExtendVirtualPagesInPlace(Kind, void* basePtr, size_t oldSize, size_t newSize);
++#endif
+ 
+ WTF_EXPORT_PRIVATE void* tryMallocArray(Kind, size_t numElements, size_t elementSize);
+ 
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_large_heap.c b/Source/bmalloc/libpas/src/libpas/pas_large_heap.c
+index efc6af7c20..bd1dbc348c 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_large_heap.c
++++ b/Source/bmalloc/libpas/src/libpas/pas_large_heap.c
+@@ -42,6 +42,10 @@
+ #include "pas_zero_mode.h"
+ #include <stdio.h>
+ #include <stdlib.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include "pas_page_malloc.h"
++#include <sys/mman.h>
++#endif
+ 
+ #if PAS_ENABLE_TESTING
+ bool pas_large_object_delegation_is_enabled_override = false;
+@@ -204,6 +208,50 @@ static bool should_delegate_user_allocation_to_system_malloc(pas_large_heap* hea
+     return large_object_delegation_is_enabled(heap_config);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++/* PS5: user allocations of PS5_OWN_MAPPING_BYTES or more are mappings of their
++ * own, unmapped when freed. Every 2 MB of address space a process reserves
++ * costs one of the console's 8192 CPU page tables (a pool shared by every
++ * process), touched or not, and the large free heap never gives address space
++ * back: a game page's downloads, ArrayBuffers and IndexedDB copies (tens to
++ * hundreds of MB each) left the WebProcess with 2.3 GB of libpas address space
++ * for 1.35 GB in use, until mmap failed in every process (the NetworkProcess
++ * crashed growing a 32 MB IPC buffer). Such entries are marked
++ * delegated_to_system_malloc, which the PS5 build otherwise never uses (no MTE),
++ * so the large map needs no new field. */
++#define PS5_OWN_MAPPING_BYTES ((size_t)4 * 1024 * 1024)
++
++static bool ps5_should_own_mapping(pas_large_heap* heap, size_t size, size_t alignment,
++                                   const pas_heap_config* heap_config)
++{
++    if (size < PS5_OWN_MAPPING_BYTES || alignment > pas_page_malloc_alignment())
++        return false;
++    if (heap_config->kind != pas_heap_config_kind_bmalloc)
++        return false;
++    return !pas_heap_for_large_heap(heap)->segregated_heap.runtime_config->is_in_reserved_memory;
++}
++
++static size_t ps5_mapping_size(uintptr_t begin, uintptr_t end)
++{
++    return pas_round_up_to_power_of_2(end - begin, pas_page_malloc_alignment());
++}
++
++static pas_allocation_result ps5_own_mapping_allocate(size_t* size, size_t* alignment,
++                                                      const pas_heap_config* heap_config)
++{
++    void* memory;
++
++    *alignment = PAS_MAX(*alignment, heap_config->large_alignment);
++    *size = pas_round_up_to_power_of_2(*size, *alignment);
++    memory = mmap(NULL, pas_round_up_to_power_of_2(*size, pas_page_malloc_alignment()),
++                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (memory == MAP_FAILED)
++        return pas_allocation_result_create_failure();
++    return pas_allocation_result_create_success_with_zero_mode((uintptr_t)memory,
++                                                               pas_zero_mode_is_all_zero);
++}
++#endif
++
+ pas_allocation_result
+ pas_large_heap_try_allocate_and_forget(pas_large_heap* heap,
+                                        size_t size,
+@@ -224,6 +272,18 @@ pas_large_heap_try_allocate_user_allocation(pas_large_heap* heap,
+     pas_allocation_result result;
+     pas_large_map_entry entry;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    entry.delegated_to_system_malloc = ps5_should_own_mapping(heap, size, alignment, heap_config);
++    if (entry.delegated_to_system_malloc) {
++        result = ps5_own_mapping_allocate(&size, &alignment, heap_config);
++        /* No address space left for a mapping of its own: the free heap may still have room. */
++        if (!result.did_succeed) {
++            entry.delegated_to_system_malloc = false;
++            result = allocate_impl(heap, &size, &alignment, heap_config, transaction);
++        }
++    } else
++        result = allocate_impl(heap, &size, &alignment, heap_config, transaction);
++#else
+     entry.delegated_to_system_malloc =
+         should_delegate_user_allocation_to_system_malloc(heap, size, heap_config);
+     if (entry.delegated_to_system_malloc)
+@@ -231,6 +291,7 @@ pas_large_heap_try_allocate_user_allocation(pas_large_heap* heap,
+     else
+         result = allocate_impl(
+             heap, &size, &alignment, heap_config, transaction);
++#endif
+     if (!result.did_succeed)
+         return result;
+ 
+@@ -274,6 +335,13 @@ bool pas_large_heap_try_deallocate(uintptr_t begin,
+             pas_heap_for_large_heap(map_entry.heap)->config_kind) != heap_config)
+         return false;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (map_entry.delegated_to_system_malloc) {
++        pas_large_map_take(begin);
++        PAS_ASSERT(!munmap((void*)map_entry.begin, ps5_mapping_size(map_entry.begin, map_entry.end)));
++        return true;
++    }
++#endif
+     PAS_IGNORE_WARNINGS_BEGIN("unreachable-code");
+     if (large_object_delegation_is_enabled(heap_config)) {
+         if (map_entry.delegated_to_system_malloc) {
+@@ -334,9 +402,11 @@ bool pas_large_heap_try_shrink(uintptr_t begin,
+     heap = map_entry.heap;
+     type = pas_heap_for_large_heap(heap)->type;
+ 
++#if !defined(PS5_PAYLOAD_SDK)
+     // FIXME: if we ever want to support pas_shrink for delegating heaps,
+     // we need to add a new pathway for doing so here.
+     PAS_ASSERT(!map_entry.delegated_to_system_malloc);
++#endif
+ 
+     if (!new_size)
+         new_size = heap_config->get_type_size(type);
+@@ -346,6 +416,19 @@ bool pas_large_heap_try_shrink(uintptr_t begin,
+ 
+     new_size = pas_round_up_to_power_of_2(new_size, alignment);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    /* A mapping of its own: unmap the whole pages past the new end. */
++    if (map_entry.delegated_to_system_malloc) {
++        uintptr_t old_mapping_end = map_entry.begin + ps5_mapping_size(map_entry.begin, map_entry.end);
++        uintptr_t new_mapping_end = map_entry.begin + ps5_mapping_size(map_entry.begin, map_entry.begin + new_size);
++        if (new_mapping_end < old_mapping_end)
++            PAS_ASSERT(!munmap((void*)new_mapping_end, old_mapping_end - new_mapping_end));
++        map_entry.end = map_entry.begin + new_size;
++        pas_large_map_add(&pas_large_maps[map_entry.heap->variant], map_entry);
++        return true;
++    }
++#endif
++
+     PAS_ASSERT(pas_heap_config_kind_get_config(
+                    pas_heap_for_large_heap(heap)->config_kind)
+                == heap_config);
