@@ -27,8 +27,11 @@ composited on the GPU by WebKit's WC compositor in the title, with
 title-side (async) scrolling; the CPU path stays as the fallback and the
 Settings switch (see *Settings* and COMPOSITING-PLAN.md).
 
-No WebGL, WebXR, GPU process, Web Audio, WebRTC, speech, geolocation,
-sandbox, introspection, docs, journald or libbacktrace.
+The default tree (WEBGL=1, build-webgl) has WebGL (through a GPU process
+hosted in the title) and Web Audio (AudioContext in the WebProcess, out
+through ps5audiosink to the title like `<video>`'s sound; WEB_AUDIO=0 builds
+without it; test page test/audio/webaudio.html). No WebXR, WebRTC, speech,
+geolocation, sandbox, introspection, docs, journald or libbacktrace.
 
 ## Send a link from another device
 
