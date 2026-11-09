@@ -1,0 +1,16 @@
+diff --git a/Source/WebKit/UIProcess/WebProcessPool.cpp b/Source/WebKit/UIProcess/WebProcessPool.cpp
+index adad9563c2..329f24c136 100644
+--- a/Source/WebKit/UIProcess/WebProcessPool.cpp
++++ b/Source/WebKit/UIProcess/WebProcessPool.cpp
+@@ -1425,6 +1425,11 @@ Ref<WebProcessProxy> WebProcessPool::processForSite(WebsiteDataStore& websiteDat
+     if (canReuseAnExistingProcess && usesSingleWebProcess()) {
+ #if PLATFORM(COCOA)
+         bool mustMatchDataStore = WebKit::WebsiteDataStore::defaultDataStoreExists() && &websiteDataStore != &WebKit::WebsiteDataStore::defaultDataStore();
++#elif defined(PS5_PAYLOAD_SDK)
++        // PS5: private browsing (an ephemeral network session) gets its own
++        // WebProcess. A WebProcessProxy has one data store; pages of another
++        // session in it would use its storage and connections.
++        bool mustMatchDataStore = true;
+ #else
+         bool mustMatchDataStore = false;
+ #endif

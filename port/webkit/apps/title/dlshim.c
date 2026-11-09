@@ -82,6 +82,8 @@ extern int scePadInit(void);
 extern int scePadOpen(int, int, int, const void*);
 extern int scePadClose(int);
 extern int scePadReadState(int, void*);
+extern int scePadSetVibration(int, const unsigned char*);
+extern int scePadSetVibrationMode(int, int);
 extern int sceImeDialogInit(const void*, const void*);
 extern int sceImeDialogGetStatus(void);
 extern int sceImeDialogGetResult(void*);
@@ -90,6 +92,7 @@ extern int sceImeDialogAbort(void);
 __attribute__((used)) void* const ps5wk_title_sce_imports[] = {
     (void*)sceUserServiceInitialize, (void*)sceUserServiceGetInitialUser, (void*)sceUserServiceGetUserName,
     (void*)scePadInit, (void*)scePadOpen, (void*)scePadClose, (void*)scePadReadState,
+    (void*)scePadSetVibration, (void*)scePadSetVibrationMode,
     (void*)sceImeDialogInit, (void*)sceImeDialogGetStatus, (void*)sceImeDialogGetResult,
     (void*)sceImeDialogTerm, (void*)sceImeDialogAbort,
 };

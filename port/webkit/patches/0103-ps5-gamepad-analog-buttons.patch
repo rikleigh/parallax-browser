@@ -1,0 +1,119 @@
+diff --git a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp
+index 726b4a1926..29b84b77f3 100644
+--- a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp
++++ b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp
+@@ -63,6 +63,9 @@ PlatformGamepadWPE::PlatformGamepadWPE(WPEGamepad* gamepad, unsigned index)
+     g_signal_connect_swapped(m_gamepad.get(), "button-event", G_CALLBACK(+[](PlatformGamepadWPE* gamepad, WPEGamepadButton button, gboolean isPressed) {
+         gamepad->buttonEvent(static_cast<size_t>(button), isPressed);
+     }), this);
++    g_signal_connect_swapped(m_gamepad.get(), "button-value-event", G_CALLBACK(+[](PlatformGamepadWPE* gamepad, WPEGamepadButton button, gdouble value) {
++        gamepad->buttonValueEvent(static_cast<size_t>(button), value);
++    }), this);
+     g_signal_connect_swapped(m_gamepad.get(), "axis-event", G_CALLBACK(+[](PlatformGamepadWPE* gamepad, WPEGamepadAxis axis, gdouble value) {
+         gamepad->axisEvent(static_cast<size_t>(axis), value);
+     }), this);
+@@ -80,6 +83,17 @@ void PlatformGamepadWPE::buttonEvent(size_t button, bool isPressed)
+     GamepadProviderWPE::singleton().notifyInput(*this, isPressed ? GamepadProviderWPE::ShouldMakeGamepadsVisible::Yes : GamepadProviderWPE::ShouldMakeGamepadsVisible::No);
+ }
+ 
++void PlatformGamepadWPE::buttonValueEvent(size_t button, double value)
++{
++    m_lastUpdateTime = MonotonicTime::now();
++    bool wasPressed = m_buttonValues[button].value() > 0.1;
++    m_buttonValues[button].setValue(value);
++    // A press (crossing GamepadButton's "pressed" threshold) makes the
++    // gamepads visible to pages, as a digital button's does.
++    bool pressed = value > 0.1;
++    GamepadProviderWPE::singleton().notifyInput(*this, pressed && !wasPressed ? GamepadProviderWPE::ShouldMakeGamepadsVisible::Yes : GamepadProviderWPE::ShouldMakeGamepadsVisible::No);
++}
++
+ void PlatformGamepadWPE::axisEvent(size_t axis, double value)
+ {
+     m_lastUpdateTime = MonotonicTime::now();
+diff --git a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h
+index a261148618..db8916319f 100644
+--- a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h
++++ b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h
+@@ -50,6 +50,7 @@ private:
+     void stopEffects(CompletionHandler<void()>&&) final;
+ 
+     void buttonEvent(size_t button, bool isPressed);
++    void buttonValueEvent(size_t button, double value);
+     void axisEvent(size_t axis, double value);
+ 
+     void effectDelayTimerFired();
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp
+index 6bf4dbcae1..97cf8e6edc 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp
+@@ -62,6 +62,7 @@ static std::array<GParamSpec*, N_PROPERTIES> sObjProperties;
+ enum {
+     BUTTON_EVENT,
+     AXIS_EVENT,
++    BUTTON_VALUE_EVENT,
+ 
+     LAST_SIGNAL
+ };
+@@ -149,6 +150,25 @@ static void wpe_gamepad_class_init(WPEGamepadClass* gamepadClass)
+         G_TYPE_NONE, 2,
+         WPE_TYPE_GAMEPAD_AXIS,
+         G_TYPE_DOUBLE);
++
++    /**
++     * WPEGamepad::button-value-event:
++     * @gamepad: a #WPEGamepad
++     * @button: a #WPEGamepadButton
++     * @value: how far @button is pressed, 0 to 1
++     *
++     * Emitted when an analog button (a trigger) moves. PS5 addition: the
++     * DualSense's L2 and R2 report how far they are pressed.
++     */
++    signals[BUTTON_VALUE_EVENT] = g_signal_new(
++        "button-value-event",
++        G_TYPE_FROM_CLASS(gamepadClass),
++        G_SIGNAL_RUN_LAST,
++        0, nullptr, nullptr,
++        g_cclosure_marshal_generic,
++        G_TYPE_NONE, 2,
++        WPE_TYPE_GAMEPAD_BUTTON,
++        G_TYPE_DOUBLE);
+ }
+ 
+ /**
+@@ -223,6 +243,22 @@ void wpe_gamepad_button_event(WPEGamepad* gamepad, WPEGamepadButton button, gboo
+     g_signal_emit(gamepad, signals[BUTTON_EVENT], 0, button, isPressed);
+ }
+ 
++/**
++ * wpe_gamepad_button_value_event:
++ * @gamepad: a #WPEGamepad
++ * @button: a #WPEGamepadButton
++ * @value: how far @button is pressed, 0 to 1
++ *
++ * Emit the signal #WPEGamepad::button-value-event (an analog button).
++ */
++void wpe_gamepad_button_value_event(WPEGamepad* gamepad, WPEGamepadButton button, gdouble value)
++{
++    g_return_if_fail(WPE_IS_GAMEPAD(gamepad));
++    g_return_if_fail(value >= 0. && value <= 1.);
++
++    g_signal_emit(gamepad, signals[BUTTON_VALUE_EVENT], 0, button, value);
++}
++
+ /**
+  * wpe_gamepad_axis_event:
+  * @gamepad: a #WPEGamepad
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h
+index 7478433456..deb7a5ae21 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h
++++ b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h
+@@ -119,6 +119,9 @@ WPE_API void        wpe_gamepad_stop_input_monitor  (WPEGamepad      *gamepad);
+ WPE_API void        wpe_gamepad_button_event        (WPEGamepad      *gamepad,
+                                                      WPEGamepadButton button,
+                                                      gboolean         is_pressed);
++WPE_API void        wpe_gamepad_button_value_event  (WPEGamepad      *gamepad,
++                                                     WPEGamepadButton button,
++                                                     gdouble          value);
+ WPE_API void        wpe_gamepad_axis_event          (WPEGamepad      *gamepad,
+                                                      WPEGamepadAxis   axis,
+                                                      gdouble          value);

@@ -83,6 +83,9 @@ typedef enum {
     WPE_DISPLAY_PS5_BUTTON_CROSS = 0x00004000,
     WPE_DISPLAY_PS5_BUTTON_SQUARE = 0x00008000,
     WPE_DISPLAY_PS5_BUTTON_TOUCHPAD = 0x00100000,
+    /* Not a button: Options held for 1 s in gamepad mode (the press itself
+     * went to the page). Only the button handler sees it. */
+    WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD = 0x01000000,
 } WPEDisplayPS5Button;
 
 /* Called on the main thread with the buttons that went down, before the
@@ -120,6 +123,51 @@ WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
  * reopen it. Until this is called, any click counts. */
 WPE_API void        wpe_display_ps5_set_pointer_over_editable (WPEDisplayPS5 *display,
                                                                gboolean       editable);
+
+/* ---- Gamepad mode and the Gamepad API (README: "Gamepad mode") ---- */
+
+/* The Gamepad API is always there: pages that ask see the DualSense as a
+ * standard gamepad while the page has the pad (not while the application's
+ * UI, the keyboard or View in VR has it). Gamepad mode also stops the pad
+ * meaning anything to the browser: no pointer, scrolling, Back, zoom or
+ * focus moves; each button sends only its key below (if any) and the
+ * sticks do what they are set to. The button handler sees nothing but
+ * WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD. */
+typedef enum {
+    WPE_DISPLAY_PS5_STICK_GAMEPAD = 0, /* the Gamepad API only */
+    WPE_DISPLAY_PS5_STICK_ARROWS,      /* the arrow keys (pushed past half way) */
+    WPE_DISPLAY_PS5_STICK_WASD,        /* W A S D */
+    WPE_DISPLAY_PS5_STICK_POINTER,     /* the pointer, as outside gamepad mode */
+    WPE_DISPLAY_PS5_STICK_SCROLL,      /* scrolls, as the right stick outside gamepad mode */
+} WPEDisplayPS5StickAction;
+
+typedef struct {
+    guint32 button;  /* one WPEDisplayPS5Button bit */
+    guint   keyval;  /* WPE_KEY_*; WPE_KEY_Pointer_Button1: a click at the pointer */
+    guint   keycode; /* the hardware key code (evdev + 8), for KeyboardEvent.code */
+} WPEDisplayPS5ButtonKey;
+
+/* @keys (copied; several may name one button) and the sticks apply until
+ * the next call. Keys held when it changes (or when the pad goes to the
+ * application's UI, the keyboard or View in VR) are released first. */
+WPE_API void        wpe_display_ps5_set_gamepad_mode (WPEDisplayPS5                *display,
+                                                      gboolean                      enabled,
+                                                      const WPEDisplayPS5ButtonKey *keys,
+                                                      guint                         n_keys,
+                                                      WPEDisplayPS5StickAction      left_stick,
+                                                      WPEDisplayPS5StickAction      right_stick);
+WPE_API gboolean    wpe_display_ps5_get_gamepad_mode (WPEDisplayPS5 *display);
+
+/* WebKit started (@in_use TRUE) or stopped reading the gamepad for the page
+ * shown: a page asked for gamepads (navigator.getGamepads(), a
+ * gamepadconnected listener). Main thread. */
+typedef void (* WPEDisplayPS5GamepadCallback) (WPEDisplayPS5 *display,
+                                               gboolean       in_use,
+                                               gpointer       user_data);
+WPE_API void        wpe_display_ps5_set_gamepad_callback (WPEDisplayPS5               *display,
+                                                          WPEDisplayPS5GamepadCallback callback,
+                                                          gpointer                     user_data);
+WPE_API gboolean    wpe_display_ps5_gamepad_in_use (WPEDisplayPS5 *display);
 
 /* ---- The application's own UI (the browser's address bar and menu) ---- */
 

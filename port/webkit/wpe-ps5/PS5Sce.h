@@ -40,6 +40,11 @@ int scePadInit(void) __attribute__((weak));
 int scePadOpen(int32_t userID, int32_t type, int32_t index, const void* param) __attribute__((weak));
 int scePadClose(int32_t handle) __attribute__((weak));
 int scePadReadState(int32_t handle, void* data) __attribute__((weak));
+// Rumble (the Gamepad API's vibrationActuator): motors[0] the large (strong)
+// motor, motors[1] the small one, 0-255. A DualSense opens in advanced
+// haptics mode, where these levels move nothing: mode 2 (compatible) first.
+int scePadSetVibration(int32_t handle, const uint8_t* motors) __attribute__((weak));
+int scePadSetVibrationMode(int32_t handle, int32_t mode) __attribute__((weak));
 
 struct PS5PadData {
     uint32_t buttons;

@@ -311,6 +311,16 @@ int main(int argc, char** argv)
     menuShot("menu-toolbar-settings", &s);
 
     s = baseState();
+    s.toolbarFocus = TB_GAMEPAD;
+    s.gamepadOn = TRUE;
+    menuShot("menu-toolbar-gamepad-on", &s);
+
+    s = baseState();
+    s.toolbarFocus = TB_PRIVATE;
+    s.privateMode = TRUE;
+    menuShot("menu-toolbar-private", &s);
+
+    s = baseState();
     s.section = SEC_BOOKMARKS;
     s.rowCount = bookmarkCount;
     s.zone = ZONE_LIST;

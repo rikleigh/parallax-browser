@@ -1393,6 +1393,11 @@ void ps5wk_downloads_wind_down(void)
 
 /* ---------------------------------------------------------------- start */
 
+void ps5wk_downloads_watch_session(WebKitNetworkSession* session)
+{
+    g_signal_connect(session, "download-started", G_CALLBACK(onDownloadStarted), NULL);
+}
+
 void ps5wk_downloads_init(WPEDisplayPS5* d, WebKitNetworkSession* session)
 {
     display = d;
