@@ -14,12 +14,13 @@
  *   history: browserui.c), Square: reload,
  *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard
  *   (also opens by itself when X on a field, the D-pad or L1/R1 focus one),
- *   R3 (press the right stick): Settings, and back to the page from there,
+ *   R3 (press the right stick): View in VR (the playing video in the PS VR2
+ *   headset; its own controls while there, see viewinvr.c),
  *   L3 (press the left stick): home page,
- *   touchpad: View in VR (the playing video in the PS VR2 headset; its own
- *   controls while there, see viewinvr.c).
- * (every button is taken: the ad blocker's per-site switch is on the
- * Settings page, R3, adblock.c)
+ *   touchpad: a laptop's touchpad (one finger: the pointer, two: scroll,
+ *   press: click).
+ * (every button is taken: Settings, and the ad blocker's per-site switch on
+ * it, are in the browser menu, Options, adblock.c)
  *
  * Logs go to the Mac's tools/logserver.sh (LOG_HOST:LOG_PORT) and to
  * /data/ps5webkit/ps5browser.log.
@@ -243,8 +244,9 @@ static gboolean onViewEvent(WPEView* view, WPEEvent* event, gpointer data)
     case WPE_KEY_Reload:
         webkit_web_view_reload(webView);
         return TRUE;
-    case WPE_KEY_Tools: /* R3 */
-        toggleSettings();
+    case WPE_KEY_Tools: /* R3, at its release (not after L3 + R3) */
+        spike_log("vr: R3: View in VR");
+        ps5wk_vr_toggle();
         return TRUE;
     case WPE_KEY_HomePage: { /* L3 */
         char* home = homeURL();
@@ -1299,7 +1301,7 @@ static gboolean isSettingsURI(const char* uri)
     return uri && g_str_has_prefix(uri, PS5WK_SETTINGS_URL);
 }
 
-/* Main loop: R3 opens Settings (in a browser page tab over the page, which
+/* Main loop: opens Settings (in a browser page tab over the page, which
  * stays as it is), and from there goes back to the page. */
 static void toggleSettings(void)
 {
@@ -1307,7 +1309,7 @@ static void toggleSettings(void)
         return;
     const char* current = webkit_web_view_get_uri(webView);
     if (isSettingsURI(current)) {
-        spike_log("settings: R3, back to the page");
+        spike_log("settings: back to the page");
         if (ps5wk_browser_close_page())
             return;
         if (webkit_web_view_can_go_back(webView))
@@ -1327,7 +1329,7 @@ static void toggleSettings(void)
         settingsReturnURI = g_strdup(current && *current ? current : "");
         g_mutex_unlock(&shownLock);
     }
-    spike_log("settings: R3, opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
+    spike_log("settings: opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
     loadStart = g_get_monotonic_time();
     if (!ps5wk_browser_open_page(PS5WK_SETTINGS_URL))
         webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
@@ -1355,7 +1357,7 @@ void ps5wk_set_active_web_view(WebKitWebView* view)
     ps5wk_gamepad_page(view, webkit_web_view_get_uri(view));
 }
 
-/* The browser menu's L3/R3 and Settings links: Settings, unless shown. */
+/* The browser menu's Settings button and links: Settings, unless shown. */
 void ps5wk_open_settings(void)
 {
     if (!isSettingsURI(webkit_web_view_get_uri(webView)))

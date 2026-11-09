@@ -435,11 +435,11 @@ int main(int argc, char** argv)
     noticeShot("notice-download-started", "Download started: ftpsrv-ps5.elf\n(Options, then R1: Downloads)", 40, 0);
     noticeShot("notice-downloaded", "Downloaded ftpsrv-ps5.elf", 40, 0);
     noticeShot("notice-download-failed", "Download failed: firmware-notes.txt\nNot enough space: needs 2.00 GB, 1.10 GB free", 40, 0);
-    noticeShot("notice-vr", "PS VR2 not connected\nConnect the headset and press the touchpad again", 40, 0);
+    noticeShot("notice-vr", "PS VR2 not connected\nConnect the headset and press R3 again", 40, 0);
     noticeShot("notice-tv-vr",
         "Playing in the PS VR2 headset\nBig Buck Bunny 60fps 4K\n180\xC2\xB0 3D side by side  \xC2\xB7  The guess\n"
         "\xE2\x9C\x95 play/pause   \xE2\x97\x80 \xE2\x96\xB6 seek 10 s   \xE2\x96\xB3 projection   \xE2\x96\xA1 recentre\n"
-        "Back to the TV: \xE2\x97\x8B, Options or the touchpad",
+        "Back to the TV: \xE2\x97\x8B, Options or R3",
         52, 1);
 
     /* View in VR: the headset's panel (over the page picture, as a stand-in

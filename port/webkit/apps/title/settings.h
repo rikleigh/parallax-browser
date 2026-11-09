@@ -40,5 +40,5 @@ void ps5wk_settings_set_status(const char* format, ...) G_GNUC_PRINTF(1, 2);
 /* The settings page (static: its script reads /settings.json). */
 extern const char ps5wk_settings_page[];
 
-/* The page the in-app button (R3) opens. */
+/* The page the browser menu's Settings button (⚙) opens. */
 #define PS5WK_SETTINGS_URL "http://127.0.0.1:9040/settings"

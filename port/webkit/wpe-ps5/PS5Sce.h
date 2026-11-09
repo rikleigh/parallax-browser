@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 extern "C" {
@@ -53,10 +54,21 @@ struct PS5PadData {
     float orientation[4];
     float acceleration[3];
     float angularVelocity[3];
-    uint8_t touch[24];
+    // ScePadTouchData: how many fingers (0-2), then each finger's position
+    // (x 0-1919, y 0-1079 on a DualSense) and an id that changes with every
+    // new touch.
+    uint8_t touchCount;
+    uint8_t touchReserved[7];
+    struct {
+        uint16_t x;
+        uint16_t y;
+        uint8_t id;
+        uint8_t reserved[3];
+    } touch[2];
     uint8_t connected;
     uint8_t rest[191];
 };
+static_assert(offsetof(PS5PadData, touchCount) == 52 && offsetof(PS5PadData, connected) == 76, "ScePadData's touch data and connected");
 
 enum : uint32_t {
     PS5_PAD_L3 = 0x00000002,

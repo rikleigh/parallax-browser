@@ -594,8 +594,8 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
     hint(c, x, cy, "○", "Close");
 
     /* on the right: what the other buttons do from here */
-    static const char* const keys[] = { "L3", "R3", "touchpad" };
-    static const char* const labels[] = { "Home", "Settings", "View in VR" };
+    static const char* const keys[] = { "L3", "R3" };
+    static const char* const labels[] = { "Home", "View in VR" };
     int right = px + pw - 32, w = 0;
     for (unsigned i = 0; i < G_N_ELEMENTS(keys); i++)
         w += hintWidth(c, keys[i], labels[i]) + (i ? 28 : 0);
@@ -1086,7 +1086,7 @@ void bui_draw_vr_tv(WPEDisplayPS5Canvas* c, const BUIVRState* s)
     x = px + pad;
     x += keyCap(c, x, cy, "○") + 8;
     x += keyCap(c, x, cy, "Options") + 8;
-    x += keyCap(c, x, cy, "touchpad") + 14;
+    x += keyCap(c, x, cy, "R3") + 14;
     wpe_display_ps5_canvas_text(c, x, cy + T_HINT * 36 / 100, 0, T_HINT, FALSE, PX_TEXT_2, "Back to the TV (the video keeps playing)");
     if (s->controls) {
         static const char* const keys[] = { "✕", "◀ ▶", "△" };

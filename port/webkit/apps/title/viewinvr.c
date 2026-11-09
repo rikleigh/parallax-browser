@@ -2,7 +2,7 @@
  * View in VR (ps5browser): the <video> playing in the page, in the PS VR2
  * headset.
  *
- * The touchpad button asks the page which video plays (a script in the
+ * R3 (press the right stick; ps5browser.c) asks the page which video plays (a script in the
  * page: the playing <video>, largest first, in the page and same-origin
  * frames) and the title for small thumbnails of the playing video. The
  * projection: YouTube's own data when it has some, else keywords in the page
@@ -24,8 +24,7 @@
  *   Triangle         next projection
  *   Square           recentre (the video's front where you look)
  *   O                cancels a seek being chosen, else as below
- *   O, Options or    back to the TV (playback continues)
- *   touchpad
+ *   O, Options or R3 back to the TV (playback continues)
  *
  * Skips and scrubbing choose a target first, shown on the seek bar with its
  * time; it is sent to the page 0.6 s after the last skip, or 0.5 s after the
@@ -1116,22 +1115,18 @@ gboolean ps5wk_vr_active(void)
     return vrOn;
 }
 
-/* O, Options or the touchpad: back to the TV, at any time in VR (also while
- * the headset comes up). */
-#define LEAVE_BUTTONS (WPE_DISPLAY_PS5_BUTTON_CIRCLE | WPE_DISPLAY_PS5_BUTTON_OPTIONS | WPE_DISPLAY_PS5_BUTTON_TOUCHPAD)
+/* O, Options or R3: back to the TV, at any time in VR (also while the
+ * headset comes up). */
+#define LEAVE_BUTTONS (WPE_DISPLAY_PS5_BUTTON_CIRCLE | WPE_DISPLAY_PS5_BUTTON_OPTIONS | WPE_DISPLAY_PS5_BUTTON_R3)
 
 static gboolean onButtons(WPEDisplayPS5* display, guint32 pressed, gpointer data)
 {
     (void)display;
     (void)data;
-    if (!vrOn && !vrStarting) {
-        if (pressed & WPE_DISPLAY_PS5_BUTTON_TOUCHPAD) {
-            spike_log("vr: touchpad pressed: View in VR");
-            ps5wk_vr_toggle();
-            return TRUE;
-        }
+    /* Outside VR the page has the pad: R3 enters through the display's
+     * key at its release (ps5browser.c), so L3 + R3 stays the overlay. */
+    if (!vrOn && !vrStarting)
         return FALSE;
-    }
     /* Every press in VR is logged: whether presses reach the title at all
      * (2026-11-02: none was seen in 466 s of VR mode without a headset). */
     spike_log("vr: pad 0x%x in VR%s", (unsigned)pressed, vrStarting ? " (headset coming up)" : "");
@@ -1324,13 +1319,13 @@ static gboolean selftestTick(gpointer data)
     default: break;
     }
     step -= 9;
-    /* then enter (touchpad) and leave again, three times: with the touchpad,
+    /* then enter (as R3 does) and leave again, three times: with R3,
      * Options and O */
-    static const guint32 leave[] = { WPE_DISPLAY_PS5_BUTTON_TOUCHPAD, WPE_DISPLAY_PS5_BUTTON_OPTIONS, WPE_DISPLAY_PS5_BUTTON_CIRCLE };
-    static const char* const leaveName[] = { "touchpad", "Options", "O" };
+    static const guint32 leave[] = { WPE_DISPLAY_PS5_BUTTON_R3, WPE_DISPLAY_PS5_BUTTON_OPTIONS, WPE_DISPLAY_PS5_BUTTON_CIRCLE };
+    static const char* const leaveName[] = { "R3", "Options", "O" };
     if (selftestCycles < 3) {
         if (step % 3 == 0)
-            onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_TOUCHPAD, NULL);
+            ps5wk_vr_toggle();
         else if (step % 3 == 1) {
             if (!vrOn) {
                 SPIKE_FAIL("vr-selftest", "re-entry %u did not reach VR", selftestCycles + 1);
@@ -1384,7 +1379,7 @@ static gboolean selftestStart(gpointer data)
     struct stat st;
     if (stat("/data/ps5webkit/vr-sim-untracked", &st) == 0) {
         selftestEnterStart = g_get_monotonic_time();
-        onButtons(vrDisplay, WPE_DISPLAY_PS5_BUTTON_TOUCHPAD, NULL);
+        ps5wk_vr_toggle();
         g_timeout_add(1000, untrackedTick, NULL);
         return G_SOURCE_REMOVE;
     }

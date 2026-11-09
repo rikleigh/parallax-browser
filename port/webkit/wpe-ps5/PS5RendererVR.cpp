@@ -663,7 +663,7 @@ bool PS5Renderer::vrStart(int projection, float fisheyeDegrees, char* message, s
                 if (psvr2_device_status)
                     psvr2_device_status(&status, &worn, &lens);
                 VRLOG("PS VR2 not connected (device status %u, worn %d, lens %d mm): staying on the TV", status, worn, lens);
-                snprintf(message, messageSize, "PS VR2 not connected. Connect the headset, turn it on and press the touchpad again.");
+                snprintf(message, messageSize, "PS VR2 not connected. Connect the headset, turn it on and press R3 again.");
             } else
                 snprintf(message, messageSize, "The PS VR2 headset could not be opened. Connect it, turn it on and try again.");
             delete vr;
@@ -1143,7 +1143,7 @@ void PS5Renderer::vrFrame()
     }
     if ((!vr->sim || vr->simUntracked) && !vr->tracked && now - vr->startUS > kNoTrackingUS) {
         char why[192];
-        snprintf(why, sizeof(why), "No head tracking from the PS VR2 in %.0f s. Back on the TV: put the headset on, then press the touchpad.",
+        snprintf(why, sizeof(why), "No head tracking from the PS VR2 in %.0f s. Back on the TV: put the headset on, then press R3.",
             kNoTrackingUS / 1e6);
         vrStop(why);
         return;

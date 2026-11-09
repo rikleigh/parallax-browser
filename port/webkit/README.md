@@ -190,16 +190,16 @@ The browser's main knobs are on one settings page. It works from the PS5 and
 from any other device, and both use the same code (`apps/title/settings.c`,
 served by the link server in `ps5browser.c`).
 
-- **On the PS5:** press **R3** (click the right stick) to open Settings. It
+- **On the PS5:** Options, then **Settings** (⚙) in the menu's bar. (R3
+  opened it until 2026-11-09; R3 is View in VR now.) It
   opens in a *browser page tab* over the page, which stays as it was (a
-  game keeps running), and it opens even with 12 tabs open. Press R3 again,
-  or O, or *Back to the page*: the tab closes and the page you were on is
+  game keeps running), and it opens even with 12 tabs open. Press O, or
+  *Back to the page*: the tab closes and the page you were on is
   shown again.
   The start page also has a *Settings* tile. The page is
   `http://127.0.0.1:9040/settings` and is made for the D-pad: big buttons,
   a pink focus ring and the browser's dark palette. X picks an option. For the home page
-  field, X or Triangle brings up the keyboard. R3 does nothing while you are
-  in View in VR, because the headset owns the pad there.
+  field, X or Triangle brings up the keyboard.
 - **On a Mac or phone:** open `http://192.168.1.50:9040/settings`. It
   follows the system's light or dark mode.
 
@@ -245,7 +245,7 @@ second press.
 - **Restart browser** needs the launcher payload (`tools/launcher`). The
   title asks the launcher for `status`, and goes ahead only if the reply
   names PPSA99020. It writes the page you were on to `open-url.txt` (the page
-  R3 left, when Settings itself is showing) and winds down exactly as for the
+  Settings was opened over, when Settings itself is showing) and winds down exactly as for the
   launcher's `stop`: media stopped, audio ports and sockets closed, the
   WebProcess ended. After the wind-down it asks for `status` once more. Then
   `title_exit.c` sends the launcher `kill -9` and `launch PPSA99020` on one
@@ -286,7 +286,7 @@ second press.
   *Restart browser* with downloads running asks for the second press with
   "1 download in progress; it will pause".
 - **Link server off** (`push-off`): the server now listens on 127.0.0.1 only,
-  instead of not running at all. R3 still opens Settings, but phones,
+  instead of not running at all. The menu still opens Settings, but phones,
   `ps5open` and the bookmarklet can't reach the PS5. Turn it back on from the
   PS5's Settings, or delete the file over FTP.
 
@@ -423,15 +423,14 @@ words to search for (DuckDuckGo Lite, as before).
 | R2 | open the bookmark or history entry in a new tab (Downloads: the details) |
 | Triangle | the keyboard for the address |
 | O or Options | close the menu |
-| L3 / R3 | close the menu, then home page / Settings |
-| touchpad | close the menu, then View in VR |
+| touchpad | the pointer (one finger), scroll the list (two); its press is X |
+| L3 / R3 | close the menu, then home page / View in VR |
 
 The bar: Back, Forward, Reload (Stop while loading), Home, the address
 field (the page's title and address), the tab count, Bookmark (☆ adds the
 page shown, ★ removes it), Gamepad mode (the controller; □ on it opens the
 button mapping, see *Gamepad mode*), Private browsing (the hat and glasses,
-see *Private browsing*), New tab (the home page) and Settings (⚙, as
-R3). History has *Clear
+see *Private browsing*), New tab (the home page) and Settings (⚙). History has *Clear
 all history* at the top (X twice). While a page loads (menu closed), the bar
 shows at the top with the page's title, address and a progress line, and
 goes 1.5 s after the load ends; the pad still drives the page.
@@ -512,7 +511,7 @@ format, which Back skips). At most **12 tabs** (a 13th is refused with a
 message). The browser's own pages, Settings and the button mapping, don't
 count: they open in a **browser page tab** next to the tab shown, one at a
 time (Settings from the mapping page loads in the same tab), never kept in
-the session file. O with nothing to go back to, R3 on Settings, or *Back
+the session file. O with nothing to go back to, or *Back
 to the page* (`POST /browser/page action=close`) closes it and shows the
 tab it was opened over. A browser page tab that goes on to a web page
 becomes an ordinary tab. Links with `target=_blank` and `window.open()` after a click open
@@ -1108,7 +1107,7 @@ Milestone 1 placeholder media interfaces) is gone.
 
 The knobs meant for users (JIT, painting, memory, hole punch, VP9, hardware
 decoding, sound, the link server, the home page) can be changed on the
-**Settings** page (R3 on the PS5, or `http://<ps5>:9040/settings`; see
+**Settings** page (the menu's ⚙ on the PS5, or `http://<ps5>:9040/settings`; see
 *Settings*). The table lists them all, debug knobs included.
 
 | | |
@@ -2093,8 +2092,9 @@ software path) on a sphere, dome or big flat screen. Nothing changes in
 WebKit (no patch): it is all in the title (`wpe-ps5/PS5RendererVR.cpp`,
 `apps/title/viewinvr.c`, its panel in `apps/title/browserdraw.c`).
 
-**Pad.** On a page: **touchpad button** = View in VR (the menu's footer
-says so; a TV message when any video of 640 px or more started was taken
+**Pad.** On a page: **R3** (press the right stick; the touchpad until
+2026-11-09, which is now the pointer) = View in VR (the menu's footer
+says so; it goes at R3's release, so L3 + R3 stays the performance overlay; a TV message when any video of 640 px or more started was taken
 out on 2026-11-04: nothing tells a VR video from a flat one reliably on
 every site, so it came up for flat videos most of the time). In VR the
 whole pad belongs to it:
@@ -2107,7 +2107,7 @@ whole pad belongs to it:
 | Triangle | next projection: flat, 180 SBS, 180 TB, 180 mono, 360 mono, 360 TB, 360 SBS, fisheye SBS |
 | Square | recentre (the video's front goes where you look; yaw only) |
 | O | cancels a seek being chosen (else as below) |
-| O, Options or touchpad | back to the TV, playback continues (also while the headset is coming up) |
+| O, Options or R3 | back to the TV, playback continues (also while the headset is coming up) |
 
 Skips and scrubbing move a target on the seek bar (with its time and how far
 from now in a bubble); the page gets one seek, 0.6 s after the last skip or
@@ -2127,8 +2127,8 @@ its time, length and buffered range every second while it shows (2 s
 otherwise); between answers the time moves on by the clock, and the panel is
 redrawn only when the second or the bar's pixel changes. The TV shows a card
 (`bui_draw_vr_tv`): "Playing in the PS VR2 headset", the title, the
-projection, the same seek bar, and "Back to the TV" with ○, Options and the
-touchpad. Without a
+projection, the same seek bar, and "Back to the TV" with ○, Options and
+R3. Without a
 connected headset the TV shows "PS VR2 not connected..." for 8 s and nothing
 else happens (no VR mode; see *No headset* below). VR also ends by itself,
 with a message on the TV, when the headset is unplugged, when no head pose
@@ -2227,7 +2227,7 @@ the headset to be released.
 (a 3840x1920 HLS stream with a plain address: 180 side by side, shown flat
 before). Order: YouTube's data, then the page's keywords, then the
 pictures, then a remembered choice on top.
-- *Pictures* (`apps/title/vrlayout.c`, plain C): on the touchpad the title
+- *Pictures* (`apps/title/vrlayout.c`, plain C): on R3 the title
   asks the render thread for three 128x128 luma thumbnails of the playing
   video 200 ms apart (`wpe_display_ps5_video_thumbnails`; a small shader
   averages 8 x 8 taps per cell of the converted RGBA frame, so hardware,
@@ -2295,10 +2295,10 @@ a generated world from six FFmpeg patterns, nothing periodic): `guess_a`
 buffers are rendered on a 60 Hz timer with a scripted head direction, and a
 screen capture request reads them back (`[vr] SHOT`). `/data/ps5webkit/vr-selftest`
 (only with `vr-sim`): after the first test URL loads, enters VR through the
-same path as the touchpad, captures the eye buffers looking front, right,
+same path as R3, captures the eye buffers looking front, right,
 back, left, up and down, cycles every projection, presses X, right, left, X,
-Square and O, then enters with the touchpad and leaves three more times
-(touchpad, Options, O)
+Square and O, then enters as R3 does and leaves three more times
+(R3, Options, O)
 (`RESULT ps5browser vr-selftest`). `/data/ps5webkit/vr-sim-untracked` (with
 `vr-sim` and `vr-selftest`): the simulated headset gives no head pose; the
 self-test enters and checks that VR ends by itself within 25 s
@@ -2393,8 +2393,8 @@ the title held VR mode (not reproduced). Fixes:
   with `psvr2_require_headset(1)` (the title) stops right after
   `sceHmd2Open` when the status is not 0 (or the read fails), closes Hmd2 and
   returns `PSVR2_NO_HEADSET`: no tracker, reprojection or VR mode. The TV
-  says "PS VR2 not connected. Connect the headset, turn it on and press the
-  touchpad again." and the log `[vr] PS VR2 not connected (device status 2,
+  says "PS VR2 not connected. Connect the headset, turn it on and press
+  R3 again." and the log `[vr] PS VR2 not connected (device status 2,
   ...): staying on the TV`. The spikes and `vr-probe` keep the old behaviour.
 - In VR the render thread reads the device status every second (`[vr]
   headset device status 0, worn (lens 66 mm) after 1.0 s`, and on every
@@ -2409,7 +2409,8 @@ the title held VR mode (not reproduced). Fixes:
   View in VR has the pad`). While View in VR has the pad, the system holding
   it (read failing or intercepted) for 10 s with no press getting through
   ends VR ("The system had the controller for 10 s"), so a system menu or
-  close is never stuck behind VR mode. O, Options and the touchpad all leave
+  close is never stuck behind VR mode. O, Options and R3 (the touchpad
+  until 2026-11-09) all leave
   (Options used to show the hint again), also while the headset comes up;
   the TV notice says so on its last line.
 - A stop asked while the headset was coming up could leave the title
@@ -3227,8 +3228,14 @@ right stick = scroll under the pointer; Options = the browser menu (address
 bar, tabs, bookmarks, history; see *Tabs, bookmarks, history*);
 Triangle = keyboard for the focused field (it also opens by itself when X
 focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
-R3 = Settings (XF86Tools; see *Settings*); L3 = home page; L3 + R3 =
-performance overlay; touchpad = View in VR. In gamepad mode none of these:
+R3 = View in VR (XF86Tools, sent at R3's release so the chord below still
+works; Settings is in the menu); L3 = home page; L3 + R3 =
+performance overlay; touchpad = a laptop's touchpad: one finger moves the
+pointer (about 1 px per touchpad unit when slow, up to 2.5 when fast), two
+fingers scroll under it (the page follows the fingers), its press clicks
+at the pointer and drags while held (no moves for 0.1 s after a press or
+release, so a click lands where the pointer was). In the menu it moves the
+menu's pointer and scrolls the list. In gamepad mode none of these:
 the page gets the pad (and the keys set for the site), and Options held 1 s
 leaves gamepad mode (see *Gamepad mode*).
 

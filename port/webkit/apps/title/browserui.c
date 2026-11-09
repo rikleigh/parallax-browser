@@ -1507,7 +1507,7 @@ static void toolbarActivate(int index)
         setMenu(FALSE);
         setPrivate(!privateMode);
         break;
-    case TB_SETTINGS: /* as R3 */
+    case TB_SETTINGS:
         setMenu(FALSE);
         ps5wk_open_settings();
         break;
@@ -1709,7 +1709,7 @@ static void menuButtons(guint32 pressed)
         }
         return;
     }
-    if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS) {
+    if (pressed & (WPE_DISPLAY_PS5_BUTTON_CROSS | WPE_DISPLAY_PS5_BUTTON_TOUCHPAD)) { /* the touchpad's press: as X */
         double x, y;
         if (wpe_display_ps5_get_pointer(display, &x, &y)) {
             const BUIHot* hot = hotAt(x, y);
@@ -1739,18 +1739,13 @@ static void menuButtons(guint32 pressed)
         editAddress();
         return;
     }
-    if (pressed & WPE_DISPLAY_PS5_BUTTON_TOUCHPAD) {
-        setMenu(FALSE);
-        ps5wk_vr_toggle();
-        return;
-    }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_L3) {
         toolbarActivate(TB_HOME);
         return;
     }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_R3) {
         setMenu(FALSE);
-        ps5wk_open_settings();
+        ps5wk_vr_toggle();
         return;
     }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_SQUARE) {

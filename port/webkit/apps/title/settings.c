@@ -82,7 +82,7 @@ static const Setting settings[] = {
     { "sound", KIND_FLAG, TYPE_BOOL, "audio-silent", "1", PS5WK_SETTINGS_BROWSER, "Sound",
         "Off plays every page at volume 0.", NULL, 0, 0 },
     { "link_server", KIND_FLAG, TYPE_BOOL, "push-off", "1", PS5WK_SETTINGS_BROWSER, "Link server on the network",
-        "Lets a phone or Mac send links here and open this page (port 9040). Off: only the PS5 itself can open Settings (R3).",
+        "Lets a phone or Mac send links here and open this page (port 9040). Off: only the PS5 itself can open Settings (from the browser menu).",
         NULL, 0, 0 },
     { "adblock", KIND_FLAG, TYPE_BOOL, "adblock-off", "1", 0, "Ad blocking",
         "Blocks ads and trackers with uBlock Origin Lite's network rules, cosmetic filters and scriptlets. Applies at once; sites where ads are allowed, and the lists, are below.",
@@ -757,7 +757,7 @@ const char ps5wk_settings_page[] =
     "<div class=\"card\"><p class=\"help\">Restart page: the page's process starts again with the settings above (Pages). Restart browser: the browser closes and opens again on the page you were on (Browser settings).</p>\n"
     "<div class=\"seg\"><button id=\"restartPage\">Restart page</button><button id=\"restartBrowser\">Restart browser</button></div></div>\n"
     "<p class=\"note\" id=\"where\"></p>\n"
-    "<p class=\"note\">On the PS5: R3 (press the right stick) opens and closes this page; O goes back. Ad blocking for the page you came from: the first card under Ad blocking.</p>\n"
+    "<p class=\"note\">On the PS5: Options, then Settings (⚙) in the browser menu opens this page; O goes back. Ad blocking for the page you came from: the first card under Ad blocking.</p>\n"
     "</div>\n"
     "<script>\n"
     "var S=null,pin='',started=0,polling=0;\n"
@@ -909,7 +909,7 @@ const char ps5wk_settings_page[] =
     "  }\n"
     "  var list=$('abSites');list.textContent='';\n"
     "  a.sites.forEach(function(s,i){var b=el('button',null,'Remove '+s);b.id='ab-rm-'+i;b.onclick=function(){adblock('block',s,a.sites.length>1?'ab-rm-'+(i?i-1:0):'abUpdate')};list.appendChild(b)});\n"
-    "  $('abSitesHelp').textContent=a.sites.length?'Remove a site to block ads there again.':'None yet. Allow ads on a site from its page: R3, then the button above.';\n"
+    "  $('abSitesHelp').textContent=a.sites.length?'Remove a site to block ads there again.':'None yet. Allow ads on a site from its page: Options, then Settings (⚙), then the button above.';\n"
     "  var l=a.list;\n"
     "  $('abList').textContent=l.version?'uBlock Origin Lite '+l.version+': '+l.rules+' rules, '+(l.origin=='update'?'downloaded '+when(l.generated):'bundled with the browser')+'. Last check for a new list: '+when(a.lastCheck)+' (once a day by itself).'+(a.scripting&&a.scripting.version?' Cosmetic filters for '+a.scripting.hosts+' site entries, '+(a.scripting.calls+a.scripting.isolatedCalls)+' scriptlet calls'+(a.scripting.site?'; on '+a.scripting.site+': '+(a.scripting.siteCalls+a.scripting.siteIsolatedCalls)+' scriptlets, '+a.scripting.siteCSS+' hiding rules'+(a.scripting.siteProcedurals?', '+a.scripting.siteProcedurals+' procedural':''):'')+'.':''):'No list yet.';\n"
     "  $('abStatus').textContent=a.status||'';\n"

@@ -15,7 +15,7 @@ play the video on a page in the **PS VR2** headset.
   with the JIT.
 - **Hardware video decoding** through the console's decoder: H.264, HEVC
   and VP9, up to 8K, including HLS streams.
-- **View in VR:** press the touchpad on a page that's playing a video to watch
+- **View in VR:** press R3 (the right stick) on a page that's playing a video to watch
   it in the PS VR2: 180° or 360°, side-by-side or top/bottom 3D, or fisheye.
   The layout is detected from the page and the picture, and the video is
   centred where you look.
@@ -37,6 +37,7 @@ play the video on a page in the **PS VR2** headset.
 | Button | On a page |
 | --- | --- |
 | Left stick / right stick | Move the pointer / scroll |
+| Touchpad | Like a laptop's: one finger moves the pointer, two fingers scroll, press to click (hold to drag) |
 | X | Click (Enter when the pointer is hidden) |
 | O | Back |
 | D-pad | Move between links |
@@ -45,8 +46,11 @@ play the video on a page in the **PS VR2** headset.
 | Triangle | Keyboard |
 | Square | Reload |
 | Options | Menu: address bar, tabs, bookmarks, history, downloads |
-| R3 / L3 | Settings / home page |
-| Touchpad button | View in VR |
+| R3 | View in VR |
+| L3 | Home page |
+| L3 + R3 | Performance overlay |
+
+Settings is in the menu (Options, then ⚙).
 
 | Button | In VR |
 | --- | --- |
@@ -56,7 +60,7 @@ play the video on a page in the **PS VR2** headset.
 | Triangle | Next projection |
 | Square | Recentre on where you look |
 | O | Cancel a seek you're choosing |
-| O, Options or touchpad | Back to the TV (playback continues) |
+| O, Options or R3 | Back to the TV (playback continues) |
 
 Any button shows the player panel in the headset: the seek bar, the time
 and the controls. It stays while the video is paused. A skip or scrub

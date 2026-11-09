@@ -60,13 +60,17 @@
  *   L1 / R1          Shift+Tab / Tab (previous / next focusable element)
  *   L2 / R2          ZoomOut / ZoomIn (XF86ZoomOut/In)
  *   Options          Menu (the browser opens its URL prompt)
- *   R3               Tools (XF86Tools; the browser opens its Settings page)
+ *   R3               Tools (XF86Tools; the browser's View in VR)
  *   L3               HomePage (XF86HomePage; the browser loads its home page)
  *   left stick       moves the drawn pointer
  *   right stick      scrolls under the pointer
+ *   touchpad         a laptop's touchpad: one finger moves the pointer, two
+ *                    scroll under it, a press clicks (and drags while held)
  *   (the application's button handler sees presses first; ps5browser takes
- *   the touchpad button for "View in VR", and the whole pad while in VR;
- *   Options for its menu, which puts the pad in UI mode while open)
+ *   the whole pad while in VR, and Options for its menu, which puts the pad
+ *   in UI mode while open; in UI mode the touchpad moves the UI's pointer
+ *   and scrolls it, and its press goes to the handler; gamepad mode leaves
+ *   the touchpad to the page)
  */
 
 static constexpr unsigned padIntervalMS = 8;
@@ -76,6 +80,10 @@ static constexpr double repeatInterval = 0.06;
 static constexpr double pointerShownFor = 8.0; // seconds after the last stick move
 static constexpr int stickDeadZone = 14; // of 127
 static constexpr double optionsHoldFor = 1.0; // gamepad mode: Options held this long is the browser's
+// The touchpad: a press or release shifts the finger a little; no pointer
+// moves for this long after one, so a click lands where the pointer was.
+static constexpr double touchClickStill = 0.10; // seconds
+static constexpr double touchpadWidth = 1920; // a DualSense's touch x is 0-1919
 
 // WPEScreen is abstract; the TV is one fixed screen.
 G_DECLARE_FINAL_TYPE(WPEScreenPS5, wpe_screen_ps5, WPE, SCREEN_PS5, WPEScreen)
@@ -128,7 +136,18 @@ struct _WPEDisplayPS5Private {
     double pointerY { 0 };
     double pointerMovedAt { -1000 };
     bool pointerDown { false };
+    uint32_t pointerDownBy { 0 }; // the button holding the click: Cross or the touchpad
+    bool returnDown { false }; // Cross sent Return down (the pointer was hidden)
     bool pointerWasVisible { false };
+    // The touchpad's fingers at the last read (how many, the first one's
+    // id, where they were on average), to move by what changed; the
+    // touchpad button's state, for touchClickStill.
+    uint8_t touchCount { 0 };
+    uint8_t touchID { 0 };
+    double touchX { 0 };
+    double touchY { 0 };
+    bool touchPressed { false };
+    double touchStillUntil { 0 };
     // Whether the pointer is over an editable node, from the application's
     // hit tests (wpe_display_ps5_set_pointer_over_editable); until it
     // reports one, any click counts as a click on a field.
@@ -570,34 +589,142 @@ static double stickValue(uint8_t raw)
     return (v < 0 ? -1 : 1) * x * x; // quadratic: fine control near the centre
 }
 
+// Moves the page's pointer by (dx, dy) view pixels and shows it.
+static void movePointer(WPEDisplayPS5* display, WPEView* view, double dx, double dy, double t)
+{
+    auto* priv = display->priv;
+    int width = wpe_view_get_width(view), height = wpe_view_get_height(view);
+    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
+    if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
+        priv->pointerX = width / 2.0;
+        priv->pointerY = height / 2.0;
+    }
+    priv->pointerX = std::fmin(std::fmax(priv->pointerX + dx, 0), width - 1);
+    priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, 0), height - 1);
+    priv->pointerMovedAt = t;
+    auto modifiers = priv->pointerDown ? WPE_MODIFIER_POINTER_BUTTON1 : static_cast<WPEModifiers>(0);
+    GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
+        eventTime(), modifiers, priv->pointerX, priv->pointerY, dx, dy));
+    wpe_view_event(view, event.get());
+    wpeDisplayPS5ScheduleRedraw(display);
+}
+
 // The left stick's pointer (page pointer events): moves it by the stick's
 // deflection; returns whether the pointer is shown now (and hides it when
 // its time is up).
 static bool stickPointer(WPEDisplayPS5* display, WPEView* view, double sx, double sy, double t)
 {
     auto* priv = display->priv;
-    int width = wpe_view_get_width(view), height = wpe_view_get_height(view);
-    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
     if (sx || sy) {
-        if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
-            priv->pointerX = width / 2.0;
-            priv->pointerY = height / 2.0;
-        }
         const double speed = 22.0; // px per tick at full deflection
-        double dx = sx * speed, dy = sy * speed;
-        priv->pointerX = std::fmin(std::fmax(priv->pointerX + dx, 0), width - 1);
-        priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, 0), height - 1);
-        priv->pointerMovedAt = t;
-        auto modifiers = priv->pointerDown ? WPE_MODIFIER_POINTER_BUTTON1 : static_cast<WPEModifiers>(0);
-        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
-            eventTime(), modifiers, priv->pointerX, priv->pointerY, dx, dy));
-        wpe_view_event(view, event.get());
-        wpeDisplayPS5ScheduleRedraw(display);
+        movePointer(display, view, sx * speed, sy * speed, t);
         return true;
     }
+    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
     if (priv->pointerWasVisible && !pointerVisible)
         wpeDisplayPS5ScheduleRedraw(display); // hide it
     return pointerVisible;
+}
+
+// What the touchpad's fingers did since the last read: how many there are
+// (0-2) and how far their average moved, in touchpad units. Nothing moves
+// on the read a finger lands or lifts (the count or the first finger's id
+// changed), nor for touchClickStill after the touchpad's press or release.
+// Called on every read, whoever has the pad, so it never jumps.
+struct TouchMove {
+    int fingers { 0 };
+    double dx { 0 };
+    double dy { 0 };
+};
+
+static TouchMove readTouch(WPEDisplayPS5* display, const PS5PadData& data, double t)
+{
+    auto* priv = display->priv;
+    bool pressed = data.buttons & PS5_PAD_TOUCHPAD;
+    if (pressed != priv->touchPressed) {
+        priv->touchPressed = pressed;
+        priv->touchStillUntil = t + touchClickStill;
+    }
+    int count = std::min<int>(data.touchCount, 2);
+    double x = 0, y = 0;
+    for (int i = 0; i < count; i++) {
+        x += data.touch[i].x / static_cast<double>(count);
+        y += data.touch[i].y / static_cast<double>(count);
+    }
+    uint8_t id = count ? data.touch[0].id : 0;
+    TouchMove move { count, 0, 0 };
+    if (count && count == priv->touchCount && id == priv->touchID && t >= priv->touchStillUntil) {
+        move.dx = x - priv->touchX;
+        move.dy = y - priv->touchY;
+    }
+    priv->touchCount = count;
+    priv->touchID = id;
+    priv->touchX = x;
+    priv->touchY = y;
+    return move;
+}
+
+// One finger's move in pointer pixels for a screen @width wide: about one
+// pixel per touchpad unit when slow, up to 2.5 when fast (as a laptop's
+// touchpad accelerates), so a slow stroke places the pointer precisely and
+// a quick flick crosses the screen.
+static double touchGain(const TouchMove& move, int width)
+{
+    double distance = std::hypot(move.dx, move.dy); // per 8 ms read
+    return std::fmin(2.5, 0.8 + distance * 0.03) * width / touchpadWidth;
+}
+
+// The touchpad on a page: one finger moves the pointer, two scroll under
+// it (the page follows the fingers, as on a laptop). Returns whether the
+// pointer moved.
+static bool touchPointer(WPEDisplayPS5* display, WPEView* view, const TouchMove& move, double t)
+{
+    if (!move.dx && !move.dy)
+        return false;
+    int width = wpe_view_get_width(view);
+    if (move.fingers == 1) {
+        double gain = touchGain(move, width);
+        movePointer(display, view, move.dx * gain, move.dy * gain, t);
+        return true;
+    }
+    auto* priv = display->priv;
+    bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
+    double px = pointerVisible ? priv->pointerX : width / 2.0;
+    double py = pointerVisible ? priv->pointerY : wpe_view_get_height(view) / 2.0;
+    const double k = 0.5 * width / touchpadWidth; // WebKit multiplies precise deltas by 2.5
+    GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
+        static_cast<WPEModifiers>(0), move.dx * k, move.dy * k, TRUE, FALSE, px, py));
+    wpe_view_event(view, event.get());
+    return false;
+}
+
+// A click at the pointer (Cross while the pointer is shown, or the
+// touchpad's press), held by @button until its release.
+static void pointerClickDown(WPEDisplayPS5* display, WPEView* view, uint32_t button, double t)
+{
+    auto* priv = display->priv;
+    if (priv->pointerX == 0 && priv->pointerY == 0) {
+        priv->pointerX = wpe_view_get_width(view) / 2.0;
+        priv->pointerY = wpe_view_get_height(view) / 2.0;
+    }
+    // A move to where the pointer already is first: the page hit tests it
+    // and the application learns what is under the pointer now (the page
+    // may have scrolled or changed under a still pointer). That answer
+    // reaches the main thread before any focus change the click causes,
+    // which decides whether the keyboard opens
+    // (wpeDisplayPS5FocusFollowsPressOnField).
+    GRefPtr<WPEEvent> move = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
+        eventTime(), static_cast<WPEModifiers>(0), priv->pointerX, priv->pointerY, 0, 0));
+    wpe_view_event(view, move.get());
+    priv->lastPressKind = _WPEDisplayPS5Private::PressKind::PointerClick;
+    priv->pointerDown = true;
+    priv->pointerDownBy = button;
+    guint count = wpe_view_compute_press_count(view, priv->pointerX, priv->pointerY, WPE_BUTTON_PRIMARY, eventTime());
+    GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, view, WPE_INPUT_SOURCE_MOUSE,
+        eventTime(), WPE_MODIFIER_POINTER_BUTTON1, WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, count));
+    wpe_view_event(view, event.get());
+    priv->pointerMovedAt = t;
+    wpeDisplayPS5ScheduleRedraw(display);
 }
 
 // The right stick's scrolling, under the pointer (or the centre).
@@ -881,7 +1008,7 @@ static void padScrollTestTick(WPEDisplayPS5* display)
 
 // UI mode: the pointer moves for the application's UI (no page events), the
 // right stick scrolls it, and held D-pad/shoulder buttons repeat.
-static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, uint32_t now, uint32_t pressed, double t)
+static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, const TouchMove& touch, uint32_t now, uint32_t pressed, double t)
 {
     auto* priv = display->priv;
     constexpr uint32_t repeatable = PS5_PAD_UP | PS5_PAD_DOWN | PS5_PAD_LEFT | PS5_PAD_RIGHT | PS5_PAD_L1 | PS5_PAD_R1 | PS5_PAD_L2 | PS5_PAD_R2;
@@ -906,15 +1033,20 @@ static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, uint32_t now,
         height = wpe_view_get_height(priv->activeView);
     }
     bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
-    double sx = stickValue(data.sticks[0]), sy = stickValue(data.sticks[1]);
-    if (sx || sy) {
+    const double speed = 22.0;
+    double dx = stickValue(data.sticks[0]) * speed, dy = stickValue(data.sticks[1]) * speed;
+    if (touch.fingers == 1 && (touch.dx || touch.dy)) {
+        double gain = touchGain(touch, width);
+        dx += touch.dx * gain;
+        dy += touch.dy * gain;
+    }
+    if (dx || dy) {
         if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
             priv->pointerX = width / 2.0;
             priv->pointerY = height / 2.0;
         }
-        const double speed = 22.0;
-        priv->pointerX = std::fmin(std::fmax(priv->pointerX + sx * speed, 0), width - 1);
-        priv->pointerY = std::fmin(std::fmax(priv->pointerY + sy * speed, 0), height - 1);
+        priv->pointerX = std::fmin(std::fmax(priv->pointerX + dx, 0), width - 1);
+        priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, 0), height - 1);
         priv->pointerMovedAt = t;
         wpeDisplayPS5ScheduleRedraw(display);
         if (priv->uiPointerCallback)
@@ -924,9 +1056,11 @@ static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, uint32_t now,
     } else if (priv->pointerWasVisible && !pointerVisible)
         wpeDisplayPS5ScheduleRedraw(display);
 
-    double ry = stickValue(data.sticks[3]);
-    if (ry && priv->uiPointerCallback)
-        priv->uiPointerCallback(display, priv->pointerX, priv->pointerY, ry * 14.0, priv->uiPointerCallbackData);
+    double scroll = stickValue(data.sticks[3]) * 14.0;
+    if (touch.fingers == 2)
+        scroll -= touch.dy * 0.5 * width / touchpadWidth; // the list follows the fingers
+    if (scroll && priv->uiPointerCallback)
+        priv->uiPointerCallback(display, priv->pointerX, priv->pointerY, scroll, priv->uiPointerCallbackData);
 }
 
 // The system's hold on the pad: logged when it changes (a read failing, the
@@ -988,6 +1122,7 @@ static void padTick(WPEDisplayPS5* display)
     if (readResult)
         return;
     data.buttons &= ~PS5_PAD_INTERCEPTED;
+    const TouchMove touch = readTouch(display, data, nowSeconds());
 
     // While the on-screen keyboard is up, the pad belongs to it.
     if (priv->pendingText) {
@@ -1011,8 +1146,11 @@ static void padTick(WPEDisplayPS5* display)
                 GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
                     eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
                 wpe_view_event(view, event.get());
-            } else if (held & PS5_PAD_CROSS)
+            }
+            if (priv->returnDown) {
                 sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
+                priv->returnDown = false;
+            }
             for (const auto& mapping : keyMappings) {
                 if ((held & mapping.button) && !(mapping.button & (PS5_PAD_L3 | PS5_PAD_R3))) // L3/R3 send at release
                     sendKey(view, mapping.keyval, mapping.keycode, mapping.modifiers, false);
@@ -1074,7 +1212,7 @@ static void padTick(WPEDisplayPS5* display)
         return;
     }
     if (priv->uiMode) {
-        uiTick(display, data, now, pressed, t);
+        uiTick(display, data, touch, now, pressed, t);
         return;
     }
     if (priv->gamepadMode) {
@@ -1082,41 +1220,42 @@ static void padTick(WPEDisplayPS5* display)
         return;
     }
 
-    // Left stick: pointer. Right stick: scroll under the pointer (or the centre).
+    // Left stick and the touchpad: pointer. Right stick and two fingers on
+    // the touchpad: scroll under the pointer (or the centre).
     bool pointerVisible = stickPointer(display, view, stickValue(data.sticks[0]), stickValue(data.sticks[1]), t);
+    if (touchPointer(display, view, touch, t))
+        pointerVisible = true;
     stickScroll(display, view, stickValue(data.sticks[2]), stickValue(data.sticks[3]), pointerVisible);
 
-    // Cross: click when the pointer is shown, otherwise Return.
-    if (pressed & PS5_PAD_CROSS) {
-        if (pointerVisible) {
-            // A move to where the pointer already is first: the page hit
-            // tests it and the application learns what is under the pointer
-            // now (the page may have scrolled or changed under a still
-            // pointer). That answer reaches the main thread before any focus
-            // change the click causes, which decides whether the keyboard
-            // opens (wpeDisplayPS5FocusFollowsPressOnField).
-            GRefPtr<WPEEvent> move = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
-                eventTime(), static_cast<WPEModifiers>(0), priv->pointerX, priv->pointerY, 0, 0));
-            wpe_view_event(view, move.get());
-            priv->lastPressKind = _WPEDisplayPS5Private::PressKind::PointerClick;
-            priv->pointerDown = true;
-            guint count = wpe_view_compute_press_count(view, priv->pointerX, priv->pointerY, WPE_BUTTON_PRIMARY, eventTime());
-            GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, view, WPE_INPUT_SOURCE_MOUSE,
-                eventTime(), WPE_MODIFIER_POINTER_BUTTON1, WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, count));
-            wpe_view_event(view, event.get());
-            priv->pointerMovedAt = t;
-        } else
-            sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), true);
+    // Cross: click when the pointer is shown, otherwise Return. The
+    // touchpad's press: always a click at the pointer. Whichever went down
+    // first holds the click; the other is ignored until it comes back up.
+    constexpr uint32_t clickButtons = PS5_PAD_CROSS | PS5_PAD_TOUCHPAD;
+    if (uint32_t extra = priv->pointerDown ? pressed & clickButtons : 0) {
+        priv->ignoredButtons |= extra;
+        priv->buttons &= ~extra;
+        pressed &= ~extra;
     }
-    if (released & PS5_PAD_CROSS) {
-        if (priv->pointerDown) {
-            priv->pointerDown = false;
-            GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
-                eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
-            wpe_view_event(view, event.get());
-            openKeyboardIfFocusStayed(display, priv->lastPress);
-        } else
-            sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
+    if (pressed & PS5_PAD_TOUCHPAD)
+        pointerClickDown(display, view, PS5_PAD_TOUCHPAD, t);
+    else if (pressed & PS5_PAD_CROSS) {
+        if (pointerVisible)
+            pointerClickDown(display, view, PS5_PAD_CROSS, t);
+        else {
+            sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), true);
+            priv->returnDown = true;
+        }
+    }
+    if (priv->pointerDown && (released & priv->pointerDownBy)) {
+        priv->pointerDown = false;
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), static_cast<WPEModifiers>(0), WPE_BUTTON_PRIMARY, priv->pointerX, priv->pointerY, 0));
+        wpe_view_event(view, event.get());
+        openKeyboardIfFocusStayed(display, priv->lastPress);
+    }
+    if ((released & PS5_PAD_CROSS) && priv->returnDown) {
+        sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), false);
+        priv->returnDown = false;
     }
 
     // L3 + R3 (both sticks pressed in): the performance overlay on or off.

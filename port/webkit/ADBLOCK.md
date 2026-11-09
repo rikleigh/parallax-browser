@@ -43,8 +43,8 @@ Files:
   cosmetic rules are part of the filter; the per-site user content is
   removed while an allowed site is shown).
   There is no pad shortcut: every button is taken (WPEDisplayPS5.cpp:
-  D-pad, X, O, Square, Triangle, L1/R1, L2/R2, Options, R3, L3, touchpad),
-  and R3 + one button press is short.
+  D-pad, X, O, Square, Triangle, L1/R1, L2/R2, Options, R3, L3, touchpad).
+  The switch is on the Settings page (Options, then ⚙).
 - **Lists:** the *Lists* card shows the uBO Lite version, the rule count and
   where the list came from (bundled or downloaded), the cosmetic filter and
   scriptlet counts (and those on the page shown), and has **Update lists
