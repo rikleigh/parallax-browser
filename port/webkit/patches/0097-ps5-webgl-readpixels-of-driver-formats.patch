@@ -1,0 +1,81 @@
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/FramebufferGL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/FramebufferGL.cpp
+index ca7caeeab2..6f09d8e3d5 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/FramebufferGL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/FramebufferGL.cpp
+@@ -31,6 +31,14 @@
+ #include "platform/PlatformMethods.h"
+ #include "platform/autogen/FeaturesGL_autogen.h"
+ 
++#if defined(ANGLE_PLATFORM_PS5)
++#    include <atomic>
++#    include <cstdio>
++#    include <vector>
++#    include "libANGLE/renderer/Format.h"
++#    include "libANGLE/renderer/renderer_utils.h"
++#endif
++
+ using namespace gl;
+ using angle::CheckedNumeric;
+ 
+@@ -829,6 +837,61 @@ angle::Result FramebufferGL::readPixels(const gl::Context *context,
+         packState.rowLength = area.width;
+     }
+ 
++#if defined(ANGLE_PLATFORM_PS5)
++    // PS5: the driver (Mesa on GLES 3) reads a normalized attachment as
++    // RGBA/UNSIGNED_BYTE or as its own GL_IMPLEMENTATION_COLOR_READ_FORMAT/TYPE,
++    // which is that of the format Mesa chose for it, not always the one ANGLE
++    // reports: a WebGL 1 RGB/UNSIGNED_SHORT_5_6_5 texture is RGBX8 in Mesa,
++    // and Unity's RGB/565 readPixels of it failed with GL_INVALID_OPERATION.
++    // Such reads are done as RGBA/UNSIGNED_BYTE and converted here.
++    if (functions->standard == STANDARD_GL_ES && !packBuffer && readFormat == format &&
++        readType == type && !(format == GL_RGBA && type == GL_UNSIGNED_BYTE) &&
++        readAttachment->getFormat().info->componentType == GL_UNSIGNED_NORMALIZED)
++    {
++        GLint nativeFormat = 0;
++        GLint nativeType   = 0;
++        functions->getIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &nativeFormat);
++        functions->getIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &nativeType);
++        const angle::FormatID destID = angle::Format::InternalFormatToID(glFormat.sizedInternalFormat);
++        if ((static_cast<GLenum>(nativeFormat) != format ||
++             static_cast<GLenum>(nativeType) != type) &&
++            destID != angle::FormatID::NONE && angle::Format::Get(destID).pixelWriteFunction)
++        {
++            static std::atomic<bool> logged{false};
++            if (!logged.exchange(true))
++            {
++                fprintf(stderr,
++                        "[webgl] title: readPixels format 0x%x type 0x%x read as RGBA8 and "
++                        "converted (the driver reads this framebuffer as 0x%x/0x%x)\n",
++                        format, type, nativeFormat, nativeType);
++            }
++            GLuint destRowBytes  = 0;
++            GLuint destSkipBytes = 0;
++            ANGLE_CHECK_GL_MATH(contextGL,
++                                glFormat.computeRowSkipBytes(type, clippedArea.width, packState,
++                                                             &destRowBytes, &destSkipBytes));
++            angle::CheckedNumeric<size_t> rgbaBytes = clippedArea.width;
++            rgbaBytes *= clippedArea.height;
++            rgbaBytes *= 4;
++            ANGLE_CHECK_GL_MATH(contextGL, rgbaBytes.IsValid());
++            std::vector<uint8_t> rgba(rgbaBytes.ValueOrDie());
++            gl::PixelPackState tightPack;
++            tightPack.alignment = 1;
++            ANGLE_TRY(stateManager->setPixelPackState(context, tightPack));
++            ANGLE_GL_TRY_ALWAYS_CHECK(
++                context, functions->readPixels(clippedArea.x, clippedArea.y, clippedArea.width,
++                                               clippedArea.height, GL_RGBA, GL_UNSIGNED_BYTE,
++                                               rgba.data()));
++            PackPixelsParams params(gl::Rectangle(0, 0, clippedArea.width, clippedArea.height),
++                                    angle::Format::Get(destID), destRowBytes, false, nullptr,
++                                    destSkipBytes);
++            PackPixels(params, angle::Format::Get(angle::FormatID::R8G8B8A8_UNORM),
++                       clippedArea.width * 4, rgba.data(), outPtr);
++            return angle::Result::Continue;
++        }
++    }
++#endif
++
+     // We want to use rowLength, but that might not be supported.
+     bool cannotSetDesiredRowLength =
+         packState.rowLength && !GetImplAs<ContextGL>(context)->getNativeExtensions().packSubimageNV;
