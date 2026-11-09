@@ -1213,6 +1213,10 @@ static void fillState(BUIState* s)
     s->historyCount = ps5wk_history()->len;
     s->downloadCount = ps5wk_downloads_count();
     s->downloadsActive = ps5wk_downloads_active(&s->downloadsProgress);
+    if (menuOpen && zone == ZONE_TOOLBAR && toolbarFocus == TB_HOME) { /* reads home-url.txt: only then */
+        int home = ps5wk_home_square(shownURI(), FALSE, NULL);
+        s->homeSquare = home == PS5WK_HOME_SET ? "Make this the home page" : home == PS5WK_HOME_RESET ? "Use the start page" : NULL;
+    }
     if (section == SEC_DOWNLOADS && zone == ZONE_LIST && listFocus < (int)s->downloadCount)
         ps5wk_downloads_hints((unsigned)listFocus, &s->downloadCross, &s->downloadSquare);
     if (detailsOpen && section == SEC_DOWNLOADS && detailsIndex < (int)s->downloadCount) {
@@ -1538,6 +1542,18 @@ static void toolbarActivate(int index)
 
 /* The gamepad button's □ (and the offer's): the mapping page for the site
  * shown, in a browser page tab (the game keeps its tab). */
+/* □ on the Home button: this page as the home page, or the start page
+ * again (ps5wk_home_square). The menu stays open; its hint changes. */
+static void setHomeFromMenu(void)
+{
+    char* message = NULL;
+    ps5wk_home_square(shownURI(), TRUE, &message);
+    if (message)
+        wpe_display_ps5_show_message(display, message, 3);
+    g_free(message);
+    redraw();
+}
+
 static void openGamepadPage(void)
 {
     if (menuOpen)
@@ -1775,6 +1791,8 @@ static void menuButtons(guint32 pressed)
             rowRemove(listFocus);
         else if (toolbarFocus == TB_GAMEPAD)
             openGamepadPage();
+        else if (toolbarFocus == TB_HOME)
+            setHomeFromMenu();
         return;
     }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_R2) {

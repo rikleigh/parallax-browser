@@ -205,3 +205,6 @@ void ps5wk_settings_forget_return(void);
 
 /* Private browsing (browserui.c): TRUE while the private session is shown. */
 gboolean ps5wk_browser_private(void);
+/* ps5browser.c: □ on the menu's Home button for the page shown (see there). */
+enum { PS5WK_HOME_NONE, PS5WK_HOME_SET, PS5WK_HOME_RESET };
+int ps5wk_home_square(const char* current, gboolean apply, char** message);

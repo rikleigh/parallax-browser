@@ -144,6 +144,7 @@ static const char* pushRequest(const char* text, const char* from, char** uriOut
 static void setShownURI(const char* uri);
 static void toggleSettings(void);
 static char* homeURL(void);
+static char* pushNormalize(const char* text, const char** error);
 
 static void* controlThread(void* unused)
 {
@@ -733,6 +734,57 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
 char* ps5wk_home_url(void)
 {
     return homeURL();
+}
+
+/* □ on the menu's Home button (browserui.c), for the page shown (current):
+ * PS5WK_HOME_SET makes it the home page; PS5WK_HOME_RESET goes back to the
+ * start page (the page shown is the home page already, or is the start
+ * page); PS5WK_HOME_NONE: nothing (Settings, the gamepad page, a page that
+ * isn't http(s), the start page as home). Never in private browsing: its
+ * pages leave nothing behind. apply: do it, and *message says so for the
+ * TV. The setting is Settings' Home page (settings.c, home-url.txt). */
+int ps5wk_home_square(const char* current, gboolean apply, char** message)
+{
+    if (message)
+        *message = NULL;
+    if (ps5wk_browser_private()) {
+        if (apply && message)
+            *message = g_strdup("Not in private browsing: its pages leave nothing behind");
+        return PS5WK_HOME_NONE;
+    }
+    char* home = homeURL();
+    gboolean custom = strcmp(home, PS5WK_HOME_URL) != 0;
+    gboolean start = current && !strcmp(current, PS5WK_START_URL);
+    const char* error = NULL;
+    char* uri = current && *current && !g_str_has_prefix(current, "parallax:") ? pushNormalize(current, &error) : NULL;
+    int action = uri && strcmp(uri, home) ? PS5WK_HOME_SET : custom && (start || uri) ? PS5WK_HOME_RESET : PS5WK_HOME_NONE;
+    g_free(home);
+    if (apply && action != PS5WK_HOME_NONE) {
+        char* escaped = action == PS5WK_HOME_SET ? g_uri_escape_string(uri, NULL, FALSE) : NULL;
+        char* body = g_strdup_printf("home_url=%s", escaped ? escaped : "");
+        char* result = NULL;
+        int changed = 0;
+        gboolean ok = ps5wk_settings_update(body, FALSE, &result, &changed);
+        spike_log("browser: home page %s%s", ok ? (action == PS5WK_HOME_SET ? "set from the menu" : "back to the start page") : "not saved: ",
+            ok ? "" : result ? result : "?");
+        if (message) {
+            if (!ok)
+                *message = g_strdup_printf("Home page not saved: %s", result ? result : "?");
+            else if (action == PS5WK_HOME_SET) {
+                GUri* parsed = g_uri_parse(uri, G_URI_FLAGS_ENCODED | G_URI_FLAGS_PARSE_RELAXED, NULL);
+                const char* host = parsed ? g_uri_get_host(parsed) : NULL;
+                *message = g_strdup_printf("Home page: %s", host && *host ? host : uri);
+                if (parsed)
+                    g_uri_unref(parsed);
+            } else
+                *message = g_strdup("Home page: the start page again");
+        }
+        g_free(result);
+        g_free(body);
+        g_free(escaped);
+    }
+    g_free(uri);
+    return action;
 }
 
 static char* homeURL(void)

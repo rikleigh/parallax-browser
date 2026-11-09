@@ -572,6 +572,10 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
     if (!list && s->toolbarFocus == TB_GAMEPAD) {
         x += hint(c, x, cy, "✕", s->gamepadOn ? "Gamepad mode off" : "Gamepad mode on") + 32;
         x += hint(c, x, cy, "□", "Set up buttons") + 32;
+    } else if (!list && s->toolbarFocus == TB_HOME) {
+        x += hint(c, x, cy, "✕", "Home") + 32;
+        if (s->homeSquare)
+            x += hint(c, x, cy, "□", s->homeSquare) + 32;
     } else if (!list && s->toolbarFocus == TB_PRIVATE)
         x += hint(c, x, cy, "✕", s->privateMode ? "Leave private browsing" : "Private browsing") + 32;
     else if (s->section == SEC_TABS) {

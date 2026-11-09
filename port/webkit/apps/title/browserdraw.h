@@ -73,6 +73,8 @@ typedef struct {
      * focused (NULL: nothing) */
     const char* downloadCross;
     const char* downloadSquare;
+    /* the footer on the Home button: what Square does (NULL: nothing) */
+    const char* homeSquare;
     /* a details card over the list, or NULL */
     const BUIDetails* details;
     int rowCount, listTop, listFocus;

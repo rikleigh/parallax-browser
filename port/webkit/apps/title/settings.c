@@ -91,7 +91,8 @@ static const Setting settings[] = {
         "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",
         NULL, 0, 0 },
     { "home_url", KIND_FILE, TYPE_TEXT, "home-url.txt", "", 0, "Home page",
-        "Opens when the browser starts. Empty: the built-in start page.", NULL, 0, 0 },
+        "Opens when the browser starts, in new tabs and with Home. Empty: the built-in start page. On the PS5: □ on the Home button in the browser menu makes the page shown the home page, or goes back to the start page.",
+        NULL, 0, 0 },
 };
 #define SETTING_COUNT (sizeof settings / sizeof settings[0])
 
@@ -797,7 +798,10 @@ const char ps5wk_settings_page[] =
     "      var save=el('button','primary','Save');save.id='b-'+s.id+'-save';\n"
     "      save.onclick=function(){set(s,input.value,save.id)};\n"
     "      input.onkeydown=function(e){if(e.key=='Enter')set(s,input.value,save.id)};\n"
-    "      row.appendChild(input);row.appendChild(save);c.appendChild(row);\n"
+    "      row.appendChild(input);row.appendChild(save);\n"
+    "      if(s.value){var reset=el('button',null,'Use the start page');reset.id='b-'+s.id+'-reset';\n"
+    "        reset.onclick=function(){set(s,'',save.id)};row.appendChild(reset)}\n"
+    "      c.appendChild(row);\n"
     "    }else{\n"
     "      var seg=el('div','seg');\n"
     "      options(s).forEach(function(o){\n"

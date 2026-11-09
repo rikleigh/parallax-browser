@@ -237,7 +237,8 @@ served by the link server in `ps5browser.c`).
   The start page also has a *Settings* tile. The page is
   `parallax://settings` and is made for the D-pad: big buttons,
   a pink focus ring and the browser's dark palette. X picks an option. For the home page
-  field, X or Triangle brings up the keyboard.
+  field, X or Triangle brings up the keyboard; *Use the start page* (shown
+  while another home page is set) goes back to the built-in one.
 - **On a Mac or phone:** open `http://192.168.1.50:9040/settings`. It
   follows the system's light or dark mode.
 
@@ -259,7 +260,7 @@ are saved as soon as you press a button.
 | Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
-| Home page (empty = the built-in start page) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | next start |
+| Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |
 
 The page also has these actions: *Clear cache*, *Clear cookies* and *Clear
 all website data* in the Storage card (`webkit_website_data_manager_clear`
@@ -457,14 +458,17 @@ words to search for (DuckDuckGo Lite, as before).
 | left stick | the pointer (the focus follows it) |
 | right stick | scroll the list |
 | L1 / R1 | previous / next list: Tabs, Bookmarks, History, Downloads |
-| Square | close the tab / delete the bookmark / delete the history entry (Downloads: see *Downloads*) |
+| Square | close the tab / delete the bookmark / delete the history entry (Downloads: see *Downloads*); on Home: the page shown becomes the home page, or, on the home page or the start page, the start page becomes it again; on Gamepad mode: the button mapping |
 | R2 | open the bookmark or history entry in a new tab (Downloads: the details) |
 | Triangle | the keyboard for the address |
 | O or Options | close the menu |
 | touchpad | the pointer (one finger), scroll the list (two); its press is X |
 | L3 / R3 | close the menu, then home page / View in VR |
 
-The bar: Back, Forward, Reload (Stop while loading), Home, the address
+The bar: Back, Forward, Reload (Stop while loading), Home (□ on it: *Make
+this the home page* for an http(s) page, *Use the start page* on the home
+page or the start page while another home page is set; the footer says
+which, the TV confirms it, and in private browsing it does nothing), the address
 field (the page's title and address), the tab count, Bookmark (☆ adds the
 page shown, ★ removes it), Gamepad mode (the controller; □ on it opens the
 button mapping, see *Gamepad mode*), Private browsing (the hat and glasses,
