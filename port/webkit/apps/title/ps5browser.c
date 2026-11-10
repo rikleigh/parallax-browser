@@ -1,5 +1,5 @@
 /*
- * ps5browser: the WebKit UIProcess as PS5 title PPSA99020 (Milestone 1).
+ * ps5browser: the WebKit UIProcess as PS5 title PPSA99207 (Milestone 1).
  *
  * WPE WebKit with the PS5 WPE Platform backend (wpe-ps5): the page is shown
  * on the TV through ps5-opengl, the DualSense drives it, and the WebProcess
@@ -31,6 +31,7 @@
 #include "common/title.h"
 #include "adblock.h"
 #include "browser.h"
+#include "runtime.h"
 #include "downloads.h"
 #include "qrcode.h"
 #include "settings.h"
@@ -1037,7 +1038,7 @@ static unsigned pushCookies(const char* text, char** domains)
 }
 
 /* The start page address: a launch argument with "://" (tools/launch.sh
- * PPSA99020 <url>), else PS5WK_PENDING_URL (tools/ps5open puts long URLs
+ * PPSA99207 <url>), else PS5WK_PENDING_URL (tools/ps5open puts long URLs
  * there before launching; read once, deleted, ignored after 10 minutes). */
 static char* startURLFromLaunch(int argc, char** argv)
 {
@@ -1379,7 +1380,7 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  * No CORS headers, and requests with an Origin header must come from the
  * address they were sent to, by IP or a local name: other web pages
  * (a form posted from a site, DNS rebinding) can't change settings. */
-#define PS5WK_TITLE_ID "PPSA99020"
+#define PS5WK_TITLE_ID "PPSA99207"
 #define PS5WK_LAUNCHER_PORT 9031
 
 /* title_exit.c (titles only): a title ID there is launched again after the
@@ -1618,7 +1619,7 @@ static gboolean launcherAsk(const char* command, char* reply, size_t size)
 /* "Restart browser": the launcher payload (tools/launcher) starts titles.
  * It must be there and see this title running; then the page to come back
  * to goes in PS5WK_PENDING_URL, the title winds down as for "quit", and
- * title_exit.c sends the launcher "kill -9" and "launch PPSA99020" on one
+ * title_exit.c sends the launcher "kill -9" and "launch PPSA99207" on one
  * connection (it reads the second line once the kill is done). NULL, or
  * why not. Never on another title: the launcher kills the running app,
  * which is this one. */
@@ -2687,6 +2688,16 @@ int main(int argc, char** argv)
     spike_log("ps5browser: WPE WebKit %u.%u.%u, pid %d, build %s", webkit_get_major_version(), webkit_get_minor_version(),
         webkit_get_micro_version(), (int)getpid(), ps5wk_title_build_id ? ps5wk_title_build_id() : "(payload)");
     spike_notify("Parallax Browser starting");
+    /* The runtime files (fonts, certificates, ICU data, the start page) from
+     * the title folder into /data/ps5webkit, before anything reads them. */
+    {
+        char why[200];
+        if (ps5wk_runtime_install(why, sizeof why) < 0) {
+            char message[300];
+            snprintf(message, sizeof message, "Parallax Browser couldn't install its files: %s", why);
+            spike_notify(message);
+        }
+    }
     memLog("main");
     startTitleProfiler();
     if (ps5wk_title_check_imports) {

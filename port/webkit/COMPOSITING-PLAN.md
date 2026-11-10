@@ -188,7 +188,7 @@ method matched exactly. Per tile, the same at every batch size (±2 %):
 
 ## M1 results (2026-11-01)
 
-Log-only PPSA99020 runs of the WC build (`build-wc`), compositing switch
+Log-only PPSA99207 runs of the WC build (`build-wc`), compositing switch
 off then on, `test-urls.txt` + `debug-screenshot` (960x540 captures of the
 composed back buffer at +2 s and +10 s). Diff = pixels whose largest channel
 difference is over 24 (and over 64), CPU path vs WC:
@@ -590,7 +590,7 @@ Video in WC mode, and View in VR with compositing on. Before: a composited
   during VR set it dirty; a new video frame does too). `PS5RendererVR.cpp`
   untouched.
 
-**Tests** (log-only PPSA99020 runs, same binary, `debug-screenshot`,
+**Tests** (log-only PPSA99207 runs, same binary, `debug-screenshot`,
 `video.html` with the synthetic clips; `?test=transform` and `?test=fill`
 are new, VIDEOSTATS now carries requestVideoFrameCallback counts):
 
@@ -1803,7 +1803,7 @@ is there.
   file lets it go that much further). Reduced coverage (GL cap) means 0:
   scrolling then waits for the WebProcess, as before.
 
-**Measured** (log-only PPSA99020, build 20261102-032153-edfee43cea, same
+**Measured** (log-only PPSA99207, build 20261102-032153-edfee43cea, same
 binary for both modes, flag on/off; `test/paint/scrolljank.html`
 uploaded to the console; `pad-scroll-test` = the stick as wheel events every
 8 ms, 4 s down / 4 s up / 1 s still. The fast row uses ry 1.0: 35 px per
@@ -2177,7 +2177,7 @@ New flag tokens (defaults on): `snap=0`, `unconsumed=0`. The `[ascroll]`
 line adds: root could not take, frame steps nothing took, sub-scroller moves
 in the title, snaps after wheel.
 
-**Results** (log-only PPSA99020, build 20261102-085929; `stickframe=1`
+**Results** (log-only PPSA99207, build 20261102-085929; `stickframe=1`
 unless noted; stick 1.5 s right, 1.5 s still, 1.5 s left, 2 s still):
 
 | test | events | where it settled |
@@ -2334,7 +2334,7 @@ now go after 50 ms (`BitmapTexturePool::setReleaseQuickly`, from
 pool's MB. New flag token `gesturenodes=0`: the title never sends the gesture
 nodes (the old behaviour), for A/B.
 
-**Results** (log-only PPSA99020, build 20261102-122550-2e90eec762 with the
+**Results** (log-only PPSA99207, build 20261102-122550-2e90eec762 with the
 pool change; `stickframe=1`; same package as the watchdog rewrite and the
 launch retry, whose `[watchdog web4] on:` line shows at every start; no
 watchdog report in any run; tile uploads 0.08-0.11 ms each):
@@ -2465,7 +2465,7 @@ Also seen, not changed: pad wheel events have no phases, so WebKit fires
 Chrome fires it once per gesture. The gallery uses its own 200 ms timer, so
 it isn't affected.
 
-**Checks on the final build** (20261102-140250, log-only PPSA99020):
+**Checks on the final build** (20261102-140250, log-only PPSA99207):
 `scrolljank.html?busy=30`, ry 0.5, `stickframe=1`: 56.0 moving frames/s,
 pad -> present 13.2 ms avg (2017 events in the title), no glide (the root
 doesn't snap); tile uploads 0.09-0.11 ms each (the console isn't slow).
@@ -2580,7 +2580,7 @@ New test page `test/paint/scrolllinked.html` (synthetic):
 - `scrolllinked-shots.py` reads the bars' rows in pad-scroll-test captures:
   the offset from row 150 (960x540) is the content lag in capture px.
 
-**Results** (log-only PPSA99020, final build 20261102-152836 with
+**Results** (log-only PPSA99207, final build 20261102-152836 with
 `stickframe=1`, pad-scroll-test ry 0.5 rx 0, 4 s down / 4 s up; "in step" = moving
 frames whose content was made at the presented position; frame rates from
 runs without captures, which stall the render thread ~110 ms each):
@@ -2667,7 +2667,7 @@ and `ps5wk-child` (`build` reconfigured from the CPU configuration: 534 +
   wc-async-scroll` when a file is there).
 - Fallbacks unchanged: no scene host, `WC=0` build, GL texture cap.
 
-**Checked on the console** (log-only PPSA99020, build
+**Checked on the console** (log-only PPSA99207, build
 20261102-165217-b39826f089, no flag files unless named; tile uploads
 0.092 ms each and start-page raster 2.9 ms/s, so the console wasn't slow):
 
@@ -2823,7 +2823,7 @@ graphics' "future" transforms, which nothing in the WC scene reads).
   5 s window: items, layers, WebProcess updates/s and ms, flush, scroll apply,
   compositing, DOM wheel, scene ms and culled layers, moving frames/s, clamped).
 
-### Measured (log-only PPSA99020, 2026-11-02 evening)
+### Measured (log-only PPSA99207, 2026-11-02 evening)
 
 Same binary for both columns (builds 20261102-182910 to -193330; "old" =
 `PS5WK_WC_CULL=0 PS5WK_LAYERPOS_SKIP=0 PS5WK_WC_EVENT_REGIONS=1
@@ -2996,7 +2996,7 @@ painted, so it doesn't cost frames.
   stick only goes down, the "up" half is still), e.g. `delay=30 secs=8
   ry=0.6 upry=0 pause=2` = 8 s down, 10 s still, repeated.
 
-### Measured (log-only PPSA99020, 2026-11-02 night)
+### Measured (log-only PPSA99207, 2026-11-02 night)
 
 Console health: start-page raster 2.7 ms/s, tile uploads 0.084-0.087 ms.
 
@@ -3143,7 +3143,7 @@ z-order lists equal the ones the last traversal saw. On the feed the
 container's stacking context also had P and D set in the same updates, so it
 applied about once per 5 s.
 
-### Measured (log-only PPSA99020, 2026-11-03)
+### Measured (log-only PPSA99207, 2026-11-03)
 
 Results feed, same pad pattern, windows at 450-600 composited layers
 (~400-600 items):

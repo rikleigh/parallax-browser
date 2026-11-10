@@ -6,7 +6,7 @@ paints per second and how many of them only ran accelerated animations, the
 longest gap between two scene paints ([wc] lines), presents/s, and the page's
 own ANIM-STATS line (rAF rate and longest rAF gap).
 
-The log: the log server's lines of one PPSA99020 run with test-urls.txt =
+The log: the log server's lines of one PPSA99207 run with test-urls.txt =
 file:///data/ps5webkit/paint/animations.html?auto and PS5WK_RENDER_LOG=2 in
 child.env (COMPOSITING-PLAN.md, M3 results)."""
 import re, sys

@@ -333,7 +333,7 @@ static void register_title(int fd, const char *tid, const char *src_arg)
 }
 
 /* Only our spike titles can be uninstalled: never the owner's titles, and
- * not the browser (PPSA99020) either. */
+ * not the browser (PPSA99207) either. */
 static const char *const uninstallable[] = {
     "PPSA99006", "PPSA99007", "PPSA99009", "PPSA99010", "PPSA99011",
     "PPSA99012", "PPSA99013", "PPSA99014", "PPSA99015",

@@ -4,7 +4,7 @@ WebKit 15486a0178, `PORT=WPE`, built with ps5-payload-sdk for a jailbroken PS5
 on 13.60. Goal of Milestone 1 (FEASIBILITY §1a, §4.8): browse on the TV with
 pages painted on the CPU.
 
-- **Title PPSA99020 = UIProcess** (`apps/title/ps5browser.c`) with the PS5 WPE
+- **Title PPSA99207 = UIProcess** (`apps/title/ps5browser.c`) with the PS5 WPE
   Platform backend (`wpe-ps5/`): the page on the TV through ps5-opengl's EGL
   window surface, DualSense input, the system keyboard (libSceImeDialog).
 - **Payload `ps5wk-child.elf` = WebProcess and NetworkProcess** (one
@@ -69,7 +69,7 @@ default it asks for no password.
   the PS5 is showing. For `ps5open` anywhere, link it onto your PATH:
   `ln -s "$PWD/tools/ps5open" /usr/local/bin/ps5open`.
   **If the browser isn't running**, ps5open starts it through the launcher
-  payload (`tools/launch.sh PPSA99020 <url>`) and the title opens that link
+  payload (`tools/launch.sh PPSA99207 <url>`) and the title opens that link
   instead of the start page. Long links (over 200 characters) go in
   `/data/ps5webkit/open-url.txt` over FTP first; the title reads that file
   once at startup, then deletes it. ps5open never closes another title. If
@@ -303,11 +303,11 @@ second press.
   it.
 - **Restart browser** needs the launcher payload (`tools/launcher`). The
   title asks the launcher for `status`, and goes ahead only if the reply
-  names PPSA99020. It writes the page you were on to `open-url.txt` (the page
+  names PPSA99207. It writes the page you were on to `open-url.txt` (the page
   Settings was opened over, when Settings itself is showing) and winds down exactly as for the
   launcher's `stop`: media stopped, audio ports and sockets closed, the
   WebProcess ended. After the wind-down it asks for `status` once more. Then
-  `title_exit.c` sends the launcher `kill -9` and `launch PPSA99020` on one
+  `title_exit.c` sends the launcher `kill -9` and `launch PPSA99207` on one
   connection (`spike_title_relaunch`). The launcher reads the second line
   only once the kill is done. Its kill only ever targets the running app,
   which is this title, and its `launch` refuses to start while any app is
@@ -401,8 +401,8 @@ started a new WebProcess with `JIT: on (PS5WK_JIT=dfg …)` and `painting on 2
 threads`, and the page reloaded from the title's own server with no stall.
 A test cookie was added, and *Clear cookies* removed it from
 `cookies.sqlite`. *Restart browser* wound down (0 audio streams, the audio
-server stopped). The launcher log showed `kill -9`, `OK killed PPSA99020`
-and `launch PPSA99020`, and the new title answered after about 4 s. With
+server stopped). The launcher log showed `kill -9`, `OK killed PPSA99207`
+and `launch PPSA99207`, and the new title answered after about 4 s. With
 the link server off, the restarted title listened on 127.0.0.1 only: the Mac
 got no answer, and the PS5 browser loaded Settings. Requests with a foreign
 `Origin` or `Host` got 403. Screen captures showed the page rendered by the
@@ -1028,6 +1028,42 @@ connection that got as far as connecting. Nothing reached the launcher's
 log, while the same request sent from the Mac did. https://example.com/ (the
 control) loaded, and no process crashed.
 
+## Title ID, version and runtime files (2026-11-10)
+
+For the homebrew catalog (ProsperoStore), which lists a release as a `.zip`
+with the title folder at the top and installs or updates only that folder in
+`/data/homebrew`:
+
+- **Title ID `PPSA99207`.** It was `PPSA99020` until 2026-11-10, which the
+  catalog already lists for another app (a console holds one title per ID).
+  Older notes below that name `PPSA99207` for runs before that date ran as
+  `PPSA99020`. Browser data in `/data/ps5webkit` doesn't depend on the ID.
+- **`apps/title/sce_sys/param.json` is committed**, next to `icon0.png`,
+  where the catalog reads `titleId` and `contentVersion`. `package.sh` starts
+  from it (TITLE, NAME and VR_ATTRS still override it for test titles).
+  `contentVersion` is `01.<minor>.<patch>` (0.1.0: `01.001.000`) and goes up
+  with every release, or consoles don't see the release as an update.
+- **The runtime files are in the title folder**, `runtime/` (fonts, the CA
+  bundle, ICU, XKB and MIME data, the start page, the logo: 330 files,
+  92 MB), with `runtime-files.txt` (the list) and `runtime-version` (a hash
+  of them). `apps/title/runtime.c` copies them into `/data/ps5webkit` right
+  after the unjail when the installed `runtime-version` differs: each file to
+  `<name>.tmp`, then renamed; the stamp last, so a copy cut short is redone
+  at the next start. Only listed paths are written (users/, settings, flags
+  and downloads are never touched), and a failure says so in a notification.
+  The list exists because a title can open files in `/app0` but not list its
+  folders: `opendir` gave EPERM (errno 1) on the console. `NO_RUNTIME=1
+  package.sh` leaves `runtime/` out for faster development uploads.
+- `tools/make-release.sh` zips `PPSA99207/` (with `LICENSE`, the notices and
+  `INSTALL.txt` inside), the start page without its test links in its
+  `runtime/`.
+
+Checked on the console (2026-11-10): with the runtime folders moved aside to
+`/data/ps5webkit-runtime-before`, the first start installed 330 files,
+91.7 MB, in 2.6 s; https://example.com/ loaded (certificates), its Arabic,
+Chinese and Cyrillic text rendered (fonts, ICU), and the start page came up;
+the next start logged `runtime: /data/ps5webkit is up to date`.
+
 ## Build
 
 ```sh
@@ -1036,7 +1072,7 @@ port/webkit/build.sh src                 # clone + patches (FRESH_SRC=1 re-appli
 port/webkit/build.sh configure           # cmake (log: toolchain/wpe-webkit/configure.log)
 NINJA_TARGETS="ps5wk-child ps5wk-shot ps5browser" port/webkit/build.sh build
 port/webkit/build.sh export-patches      # after editing the clone: commits -> patches/
-port/webkit/apps/title/package.sh        # title folder -> toolchain/wpe-webkit/titles/PPSA99020
+port/webkit/apps/title/package.sh        # title folder -> toolchain/wpe-webkit/titles/PPSA99207
 port/webkit/test/run-shot.sh [url]       # payload-only first light on the console
 
 # CPU-only build (no WC compositor), in toolchain/wpe-webkit/build-cpu:
@@ -1199,7 +1235,7 @@ Milestone 1 placeholder media interfaces) is gone.
   later hung in the launcher (`IpmWEf0`) and the console rebooted (11:44).
   **Never use sceAudioOut from a payload.**
   A title is an application the system cleans up after: 12 launch/SIGKILL
-  cycles of PPSA99020 in a row, each opening a port and leaving it open when
+  cycles of PPSA99207 in a row, each opening a port and leaving it open when
   killed (`/data/ps5webkit/audio-selftest`), all reopened it (handle
   0x20000000, Init 0).
 - So the WebProcess's `ps5audiosink` (port/deps/gst/gstps5audiosink.c,
@@ -1335,7 +1371,7 @@ for sceAudioOut, the pad and the IME.
 
 **Wind-down (checked on the console, below):**
 - `tools/launch.sh --stop`, and every time launch.sh is about to stop
-  PPSA99020, now sends the launcher's new `stop` command. The launcher
+  PPSA99207, now sends the launcher's new `stop` command. The launcher
   connects to the title's unix socket
   `/system_tmp/ps5wk/ps5browser-control.sock` and sends `quit`. This makes no
   system calls, so it works while services are slow.
@@ -1461,7 +1497,7 @@ title draws the frame under it.
   lines) and reports the hole (`RESULT ps5wk-shot holes`).
 
 **Measured** (2026-10-28; harness = `ps5wk-shot` at 1920x1080 with the null
-consumer; title = log-only PPSA99020 runs, audio-silent):
+consumer; title = log-only PPSA99207 runs, audio-silent):
 
 | | shown | dropped | WebProcess CPU | WebProcess `[render]` |
 |---|---|---|---|---|
@@ -2321,7 +2357,7 @@ the headset to be released.
   psvr2 took (Spike 3b/9 leaked it per session); a failed open undoes
   whatever was set up.
 - `package.sh` writes PS5VR's `attribute`/`attribute3` (0x62000000 /
-  0x04080c40) into PPSA99020's param.json: Hmd2 refuses a title without
+  0x04080c40) into PPSA99207's param.json: Hmd2 refuses a title without
   them (FEASIBILITY §3). Spikes 3b and 9 drew on the TV with the same values.
   Bisected on the console (2026-10-28, `vr-probe`, no headset connected):
   only attribute3 bit 0x400 is checked by `sceHmd2Initialize` (0x8a72001f
@@ -2633,7 +2669,7 @@ Checked on the console (13.60, `spikes/04-jsc/jit-check.sh`: the WPE build's
   touched memory costs page tables: the kernel's `page table CPU` count with
   ps5wk-shot + NetworkProcess + WebProcess peaked at ~6575/8192 with the JIT
   against ~6290 without (idle 5023).
-- **Title PPSA99020 with the JIT build** (log-only runs, 2026-10-28 evening):
+- **Title PPSA99207 with the JIT build** (log-only runs, 2026-10-28 evening):
   the WebProcess logs `JIT: on`, the NetworkProcess `JIT off`, and the
   title maps no RWX memory (flexible memory 284 MB at start, ~15 MB less
   than before, as the bigger image predicts). Start page, YouTube (4K60 VP9 in
@@ -2792,7 +2828,7 @@ direct painting about 1600 of 2 million pixels differ by antialiasing levels
 (max 56 of 255, at rotated cards' edges and the scrollbar), not visible in
 side-by-side crops.
 
-**Title** (log-only PPSA99020 run, defaults, 2026-10-29 00:26): YouTube 4K60
+**Title** (log-only PPSA99207 run, defaults, 2026-10-29 00:26): YouTube 4K60
 VP9 in Videodec2 with the hole punch at 47-60 frames/s shown, BBC News,
 Wikipedia, GitHub, Hacker News and YouTube's home page load, no crash.
 BBC News keeps repainting its whole view while idle: 26-30 updates/s at
@@ -3237,7 +3273,7 @@ a ping every 5 s, a health check before each round):
 
 ## Speedometer (2026-11-09)
 
-Speedometer 3.1 in the title (PPSA99020), with the browser's defaults (ad
+Speedometer 3.1 in the title (PPSA99207), with the browser's defaults (ad
 blocking on, GPU compositing, JIT all tiers). **browserbench.org: 5.70 ±
 0.19 before, 6.04 ± 0.16 and 6.07 ± 0.23 after.** The rounds were measured on
 a copy of the benchmark (release/3.1 branch, served from the Mac, with a
@@ -3593,7 +3629,7 @@ Other probes in `test/` (payloads, RESULT lines on stdout):
 (the F_DUPFD_CLOEXEC bug), `seqpacket/reserve` (RW or PROT_NONE
 reservations do not reduce `sceKernelAvailableFlexibleMemorySize`).
 
-### Title PPSA99020 on the TV (2026-10-28, night run)
+### Title PPSA99207 on the TV (2026-10-28, night run)
 
 **The title loads and shows pages on the TV.** Verified from the log and a
 screen readback (nobody watching the TV): example.com, Wikipedia and
@@ -3670,7 +3706,7 @@ after WebKit returns. **Built, not yet verified.**
 
 #### Packaging
 
-`apps/title/package.sh` -> `toolchain/wpe-webkit/titles/PPSA99020` (200 MB:
+`apps/title/package.sh` -> `toolchain/wpe-webkit/titles/PPSA99207` (200 MB:
 `eboot.bin` 109 MB + `ps5wk-child.elf` 90 MB + param.json + libc.prx).
 Title link specifics: `ps5-pie-webkit.ld` (WTF/JSC's page-aligned writable
 sections moved into the data segment, or the converter fails with "LLVM
@@ -3729,7 +3765,7 @@ payloads were being crash-reported; whether that is related is unknown.
 
 1. Verify the two unverified fixes above on the console (page-table count
    staying flat while browsing; children exiting without crash reports):
-   `tools/launch.sh PPSA99020` with `test-urls.txt` and watch
+   `tools/launch.sh PPSA99207` with `test-urls.txt` and watch
    `page table CPU` in the kernel log and `(output closed after ...)` lines.
 2. Owner on the TV: pad map, Options -> keyboard -> URL, X on links,
    scrolling, zoom (see the morning checklist in the session report).

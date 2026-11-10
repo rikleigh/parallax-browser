@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Build the release archive: the title, built and packaged with no log host
-# (a development build sends its log to this Mac), and the runtime files the
-# title reads from /data/ps5webkit (fonts, CA bundle, ICU data, XKB data, the
-# start page), laid out as on the console so the archive's data/ folder
-# copies straight onto /data.
+# Build the release archive: the title folder PPSA99207/ at the top (what the
+# homebrew catalog, ProsperoStore and ShadowMountPlus expect: it goes into
+# /data/homebrew), built and packaged with no log host (a development build
+# sends its log to this Mac). The runtime files the title reads from
+# /data/ps5webkit (fonts, CA bundle, ICU and XKB data, the start page without
+# its test links) are inside it, in runtime/: the title installs them when it
+# starts (apps/title/runtime.c).
 #   tools/make-release.sh [version]     -> dist/parallax-browser-<version>.zip
 # The version defaults to `git describe --tags --always --dirty`. The title's
 # debug binaries (for crash addresses) stay in dist/<name>-debug/. The build
@@ -14,16 +16,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
 # The WebKit build with WebGL and every patch (port/webkit/build.sh default).
 BLD="${BLD:-$ROOT/toolchain/wpe-webkit/build-webgl}"
-RUNTIME="$ROOT/toolchain/wpe-sysroot/share/ps5webkit-runtime"
-ICUDAT="$ROOT/toolchain/icu/src-76.1/icu/source/data/in/icudt76l.dat"
 version="${1:-$(git -C "$ROOT" describe --tags --always --dirty)}"
 name="parallax-browser-$version"
 out="$ROOT/dist/$name"
 stage="$ROOT/dist/$name-debug"
 
 [[ -f $BLD/build.ninja ]] || { echo "missing $BLD: run port/webkit/build.sh" >&2; exit 1; }
-[[ -f $RUNTIME/etc/ssl/cert.pem ]] || { echo "missing $RUNTIME: run port/deps/build.sh cacert fonts xkeyboard_config" >&2; exit 1; }
-[[ -f $ICUDAT ]] || { echo "missing $ICUDAT: run spikes/04-jsc/build.sh" >&2; exit 1; }
 
 # 1. The title with no log host.
 devhost="$(sed -n 's/^PS5WK_LOG_HOST:STRING=//p' "$BLD/CMakeCache.txt")"
@@ -35,9 +33,12 @@ trap restore EXIT
 echo "==> building with no log host"
 cmake -DPS5WK_LOG_HOST= "$BLD" >/dev/null
 ninja -C "$BLD" ps5wk-child ps5browser
-rm -rf "$stage"
-PS5WK_LOG_HOST= BLD="$BLD" OUT="$stage" "$ROOT/port/webkit/apps/title/package.sh"
-TITLE="$stage/PPSA99020"
+rm -rf "$stage"; mkdir -p "$stage"
+# The start page without its test links (they play local test media).
+sed '/<!-- tests:/,/<!-- \/tests -->/d' "$ROOT/port/webkit/runtime/start.html" > "$stage/start.html"
+! grep -q 'media/' "$stage/start.html" || { echo "start.html still links test media" >&2; exit 1; }
+PS5WK_LOG_HOST= BLD="$BLD" OUT="$stage" START_HTML="$stage/start.html" "$ROOT/port/webkit/apps/title/package.sh"
+TITLE="$stage/PPSA99207"
 # No address of this Mac or the console in the binaries.
 for host in "$devhost" "${PS5WK_LOG_HOST:-}" "${PS5_HOST:-}"; do
     [[ $host =~ ^[0-9]+(\.[0-9]+){3}$ ]] || continue
@@ -46,29 +47,25 @@ for host in "$devhost" "${PS5WK_LOG_HOST:-}" "${PS5_HOST:-}"; do
     fi
 done
 
-# 2. The archive.
+[[ -f $TITLE/runtime/runtime-version ]] || { echo "the title has no runtime/ (NO_RUNTIME set?)" >&2; exit 1; }
+cmp -s "$stage/start.html" "$TITLE/runtime/start.html" || { echo "the title's start page isn't the release one" >&2; exit 1; }
+
+# 2. The archive: PPSA99207/ at the top, LICENSE, the notices and INSTALL.txt in it.
 rm -rf "$out" "$out.zip"
-mkdir -p "$out/data/homebrew" "$out/data/ps5webkit/share/icu"
-rsync -a --exclude .DS_Store "$TITLE/" "$out/data/homebrew/PPSA99020/"
-rsync -aL --exclude .DS_Store "$RUNTIME/" "$out/data/ps5webkit/"
-mkdir -p "$out/data/ps5webkit/cache/fontconfig"
-: > "$out/data/ps5webkit/cache/fontconfig/.keep"   # FTP clients skip empty folders
-cp "$ICUDAT" "$out/data/ps5webkit/share/icu/icudt76l.dat"
-cp "$ROOT/port/webkit/runtime/parallax-logo.png" "$out/data/ps5webkit/"
-# The start page without its test links (they play local test media).
-sed '/<!-- tests:/,/<!-- \/tests -->/d' "$ROOT/port/webkit/runtime/start.html" > "$out/data/ps5webkit/start.html"
-! grep -q 'media/' "$out/data/ps5webkit/start.html" || { echo "start.html still links test media" >&2; exit 1; }
-cp "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$out/"
+app="$out/PPSA99207"
+mkdir -p "$app"
+rsync -a --exclude .DS_Store "$TITLE/" "$app/"
+cp "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$app/"
 
 # Nothing from Sony and no media: only our ELFs and the clean-room libc.prx.
 bad="$(cd "$out" && find . -type f \( -name '*.sprx' -o -name '*.self' -o -name '*.mp4' -o -name '*.ts' \
-    -o -name '*.webm' -o -name '*.pkg' -o \( -name '*.prx' ! -path './data/homebrew/PPSA99020/sce_module/libc.prx' \) \))"
+    -o -name '*.webm' -o -name '*.pkg' -o \( -name '*.prx' ! -path './PPSA99207/sce_module/libc.prx' \) \))"
 [[ -z $bad ]] || { echo "unexpected files in the release:" >&2; echo "$bad" >&2; exit 1; }
-cmp -s "$out/data/homebrew/PPSA99020/sce_module/libc.prx" "$ROOT/ref/PS5VR/app/tools/native-app/runtime/libc.prx" ||
+cmp -s "$app/sce_module/libc.prx" "$ROOT/ref/PS5VR/app/tools/native-app/runtime/libc.prx" ||
     { echo "sce_module/libc.prx is not PS5VR's clean-room libc" >&2; exit 1; }
 
 commit="$(git -C "$ROOT" rev-parse --short HEAD)"
-cat > "$out/INSTALL.txt" <<EOF
+cat > "$app/INSTALL.txt" <<EOF
 Parallax Browser $version (source: commit $commit)
 https://github.com/rikleigh/parallax-browser
 
@@ -83,19 +80,23 @@ Requirements
   - For View in VR: a PS VR2, paired and set up in the system settings.
 
 Install
-  1. Copy the data folder in this archive onto the console's /data over FTP,
-     merging folders. That puts the title in /data/homebrew/PPSA99020 and its
-     runtime files in /data/ps5webkit (about $(du -sh "$out/data/ps5webkit" | cut -f1 | tr -d ' ')).
-  2. Register /data/homebrew/PPSA99020 with your homebrew tool. Parallax
+  From ProsperoStore: install Parallax Browser there.
+  By hand:
+  1. Copy the PPSA99207 folder in this archive to /data/homebrew on the
+     console over FTP, so that it is /data/homebrew/PPSA99207.
+  2. Register /data/homebrew/PPSA99207 with your homebrew tool. Parallax
      Browser then appears on the home screen.
+  The first start copies the browser's runtime files (fonts, certificates,
+  Unicode data, the start page; about $(du -sh "$app/runtime" | cut -f1 | tr -d ' ')) into /data/ps5webkit.
 
 Update
-  Copy the data folder again, replacing files. Each PS5 user's bookmarks,
-  history, settings and downloads are kept: they live in
-  /data/ps5webkit/users, which the archive doesn't contain.
+  Replace /data/homebrew/PPSA99207 with the new folder (or update it from
+  the store). The next start brings the runtime files up to date. Each PS5
+  user's bookmarks, history, settings and downloads are kept: they live in
+  /data/ps5webkit/users, which updates never touch.
 
 Uninstall
-  Remove the title with your homebrew tool, then delete /data/homebrew/PPSA99020
+  Remove the title with your homebrew tool, then delete /data/homebrew/PPSA99207
   and, to remove your browsing data too, /data/ps5webkit.
 
 Not affiliated with or endorsed by Sony Interactive Entertainment. Licensed
@@ -104,7 +105,8 @@ THIRD-PARTY-NOTICES.md. The source, with the build steps, is at the address
 above.
 EOF
 
-(cd "$ROOT/dist" && COPYFILE_DISABLE=1 zip -qry -X "$name.zip" "$name")
+(cd "$out" && COPYFILE_DISABLE=1 zip -qry -X "../$name.zip" PPSA99207)
+rm -f "$stage/start.html"
 rm -rf "$out"
 ls -la "$ROOT/dist/$name.zip"
 shasum -a 256 "$ROOT/dist/$name.zip"

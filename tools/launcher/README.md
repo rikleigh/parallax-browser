@@ -17,7 +17,7 @@ tools/launch.sh --quit                 # stop the launcher
 ```
 
 Only titles listed in `PS5WK_OWN_TITLES` are stopped without `-f`. The
-default list is just PPSA99020 (the browser), so the owner's own titles are
+default list is just PPSA99207 (the browser), so the owner's own titles are
 never closed by accident. Never touch PPSA99008 (the owner's), PPSA99000
 (ProsperoStore) or PPSA99030 (the YouTube app used for the jailbreak).
 

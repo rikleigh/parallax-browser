@@ -19,7 +19,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
 PORT=9031
-OWN="${PS5WK_OWN_TITLES:-PPSA99020}"
+OWN="${PS5WK_OWN_TITLES:-PPSA99207}"
 FTP="ftp://$PS5_HOST:${PS5_FTP_PORT:-2121}"
 
 ask() { printf '%s\n' "$@" | socat -t 20 - "TCP:$PS5_HOST:$PORT" 2>/dev/null; }
@@ -88,6 +88,6 @@ if [[ "$ok" == OK && "$app" != none ]]; then
         echo "$running is running and isn't one of ours; use -f to close it" >&2
         exit 1
     fi
-    if [[ "$running" == PPSA99020 ]]; then stop_title || exit 1; else run kill || exit 1; fi
+    if [[ "$running" == PPSA99207 ]]; then stop_title || exit 1; else run kill || exit 1; fi
 fi
 run launch "$title" ${1:+"$1"}

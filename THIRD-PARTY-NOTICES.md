@@ -4,7 +4,7 @@ Parallax Browser is built from, links against or ships the following
 projects. Each keeps its own licence. The builds download them from their
 upstream sources; only patches are kept in this repository.
 
-## In the title (`PPSA99020`)
+## In the title (`PPSA99207`)
 
 | Component | Use | Licence |
 | --- | --- | --- |

@@ -4,7 +4,7 @@
 update, main-thread ms per update, presents/s ([wc] presents or CPU
 [present] page uploads), rAF/s (RAF-RATE lines).
 
-The log: the log server's lines of one PPSA99020 run with test-urls.txt,
+The log: the log server's lines of one PPSA99207 run with test-urls.txt,
 test-onload.js = scroll-raf.js and PS5WK_RENDER_LOG=2 in child.env
 (COMPOSITING-PLAN.md, M2 results)."""
 import re, sys

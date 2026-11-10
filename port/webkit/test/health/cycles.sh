@@ -3,7 +3,7 @@
 #   port/webkit/test/health/cycles.sh [N] [dwell s] [url]
 # Each cycle: a process list (test/ps/ps.elf through elfldr: payload.elf
 # count and any left over), the newest klog VM Stats line if a klog capture
-# is running (KLOG=<file>), launch PPSA99020 (start page unless url), wait
+# is running (KLOG=<file>), launch PPSA99207 (start page unless url), wait
 # <dwell> s, stop it, and the run's numbers from the title log (LOG=<file>,
 # the tools/logserver.sh output). Hold console.lock while it runs.
 # One line per cycle to stdout and $OUT (default /tmp/ps5wk-health.tsv).
@@ -41,7 +41,7 @@ for c in $(seq 1 "$N"); do
     before=$(vmstats); snap=$(snapshot)
     off=$(stat -f %z "$LOG")
     t0=$(date +%s)
-    "$ROOT/tools/launch.sh" PPSA99020 ${URL:+"$URL"} >/dev/null 2>&1 || echo "cycle $c: launch failed" >&2
+    "$ROOT/tools/launch.sh" PPSA99207 ${URL:+"$URL"} >/dev/null 2>&1 || echo "cycle $c: launch failed" >&2
     end=$((t0 + DWELL)); until [[ $(date +%s) -ge $end ]]; do perl -e 'select undef,undef,undef,0.5'; done
     "$ROOT/tools/launch.sh" --stop >/dev/null 2>&1 || echo "cycle $c: stop failed" >&2
     perl -e 'select undef,undef,undef,2'

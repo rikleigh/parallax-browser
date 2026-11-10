@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Open a link in the PS5 browser (title PPSA99020) from the Mac.
+# Open a link in the PS5 browser (title PPSA99207) from the Mac.
 #   ps5open <url>          bare hosts get https://, other words a search
 #   ps5open                the front Safari or Chrome tab
 #   ps5open -s | -c        the front tab of Safari (-s) or Chrome (-c)
@@ -9,7 +9,7 @@
 #                          front Chrome tab. PS5_CHROME_PROFILE picks a profile
 # Sends it to the browser's link server (http://$PS5_HOST:9040/open). If the
 # browser isn't running, starts it with the link through the launcher payload
-# (tools/launch.sh PPSA99020 <url>); it never closes another title.
+# (tools/launch.sh PPSA99207 <url>); it never closes another title.
 # PS5_HOST comes from env.sh next to this script, or the environment;
 # PS5_PIN if the console has /data/ps5webkit/push-pin.txt.
 set -uo pipefail
@@ -27,7 +27,7 @@ fi
 HOST="${PS5_HOST:-192.168.1.50}"
 PORT="${PS5_PUSH_PORT:-9040}"
 BASE="http://$HOST:$PORT"
-TITLE=PPSA99020
+TITLE=PPSA99207
 
 die() { echo "ps5open: $*" >&2; exit 1; }
 

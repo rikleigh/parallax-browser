@@ -83,23 +83,31 @@ moves a marker on the bar first; the video seeks when you stop.
   etaHEN, elfldr on port 9021 and ftpsrv on port 2121. The jailbreak is
   tethered, so run it again after every reboot.
 - A way to register homebrew titles from `/data/homebrew` (etaHEN or
-  ShadowMount+). The title ID is `PPSA99020`.
+  ShadowMount+). The title ID is `PPSA99207`.
 - For View in VR: a PS VR2, paired and set up in the system settings.
 
 ## Installing
 
+From **ProsperoStore**, once it is listed there: install Parallax Browser from the store. By hand:
+
 1. Download the zip from [Releases](https://github.com/rikleigh/parallax-browser/releases)
    and unpack it.
-2. Copy its `data` folder onto the console's `/data` over FTP, merging
-   folders. That puts the title in `/data/homebrew/PPSA99020` and its runtime
-   files (fonts, certificates, Unicode data, the start page) in
-   `/data/ps5webkit`.
-3. Register `/data/homebrew/PPSA99020` with your homebrew tool. Parallax
-   Browser then appears on the home screen.
+2. Copy its `PPSA99207` folder to `/data/homebrew` on the console over FTP,
+   so that it is `/data/homebrew/PPSA99207`.
+3. Register `/data/homebrew/PPSA99207` with your homebrew tool (etaHEN or
+   ShadowMount+). Parallax Browser then appears on the home screen.
 
-To update, copy the new `data` folder over the old one. Each PS5 user's
-bookmarks, history, settings and downloads live in `/data/ps5webkit/users`,
-which the zip doesn't contain, so they're kept.
+The first start copies the browser's runtime files (fonts, certificates,
+Unicode data, the start page) from the title into `/data/ps5webkit`.
+
+To update, replace the `PPSA99207` folder with the new one, or update from
+the store; the next start brings the runtime files up to date. Each PS5
+user's bookmarks, history, settings and downloads live in
+`/data/ps5webkit/users`, which updates never touch, so they're kept.
+
+Until 2026-11-10 the title ID was `PPSA99020`, which another app in the
+homebrew catalog uses. If you installed a build from before then, remove
+that title with your homebrew tool; your data in `/data/ps5webkit` stays.
 
 ## Security
 
@@ -180,14 +188,19 @@ the PS5 on macOS (Apple silicon). The steps, roughly:
 4. `port/webkit/build.sh` applies the patches in `port/webkit/patches/` to
    WebKit and builds it. `port/webkit/apps/title/package.sh` then writes the
    title folder ([port/webkit/README.md](port/webkit/README.md#build)).
-5. `tools/upload-title.sh toolchain/wpe-webkit/titles/PPSA99020` copies it
+5. `tools/upload-title.sh toolchain/wpe-webkit/titles/PPSA99207` copies it
    to the console. `tools/launch.sh` registers, starts and stops it. The
-   runtime files need copying to `/data/ps5webkit` once: take the
-   `data/ps5webkit` folder from a zip made by `tools/make-release.sh`.
+   title folder carries the runtime files (`runtime/`) and installs them
+   into `/data/ps5webkit` when it starts; `NO_RUNTIME=1` packages without
+   them, for a faster upload once the console has them.
 
 `tools/logserver.sh` collects the browser's log on the Mac.
-`tools/make-release.sh <version>` builds the release zip: the title with no
-log address built in, and the runtime files.
+`tools/make-release.sh <version>` builds the release zip: the `PPSA99207`
+folder at the top (as the homebrew catalog wants), with no log address
+built in. Raise `contentVersion` in
+`port/webkit/apps/title/sce_sys/param.json` for every release
+(`01.<minor>.<patch>`: 0.1.0 is `01.001.000`), so consoles see it as an
+update.
 
 ## Repository layout
 

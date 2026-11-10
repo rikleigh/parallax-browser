@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Package the browser as registered title PPSA99020: relink the ps5browser
+# Package the browser as registered title PPSA99207 (sce_sys/param.json): relink the ps5browser
 # objects and WebKit's static libraries (the link line CMake/ninja built for
 # the payload-style ps5browser ELF) as a native title with ps5-opengl, and put
 # the payload child (WebProcess/NetworkProcess) in the title folder.
 #
-#   port/webkit/apps/title/package.sh            -> toolchain/wpe-webkit/titles/PPSA99020
+#   port/webkit/apps/title/package.sh            -> toolchain/wpe-webkit/titles/PPSA99207
 #
 # Based on spikes/02-gl-egl/ps5-opengl/package-title.sh (PS5VR's native-app
 # tooling: CRT, PIE link script, converter, fake signer, libc.prx), with
@@ -17,7 +17,7 @@ ROOT="$(cd "$PORT/../.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
 . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
 
-TITLE="${TITLE:-PPSA99020}"
+TITLE="${TITLE:-PPSA99207}"
 NAME="${NAME:-Parallax Browser}"
 WK="$ROOT/toolchain/wpe-webkit"
 # The WebKit build with WebGL and every patch (port/webkit/build.sh default).
@@ -199,26 +199,51 @@ AB="$ROOT/toolchain/adblock"
 mkdir -p "$app/adblock"
 cp "$AB/adblock-rules.json" "$AB/adblock-info.ini" "$AB/adblock-scripting.txt" "$PORT/adblock/dnr-to-webkit.js" \
     "$PORT/adblock/ubol-scripting.js" "$app/adblock/"
-# View in VR: PS VR2 titles declare it in param.json (Hmd2 refuses a title
-# whose attribute words are 0 with 0x8a72001f, FEASIBILITY §3); PS5VR's
-# values, as Spikes 3b and 9 (both also drew on the TV with them).
-# VR_ATTRS=0 packages without them (no View in VR), VR_ATTRS=<attribute>:<attribute3>
-# (hex) with other values, for tests.
-python3 - "$PSGL/param.json" "$app/sce_sys/param.json" "$TITLE" "$NAME" "$ROOT/ref/PS5VR/app/sce_sys/param.json" "${VR_ATTRS:-}" <<'PY'
+# The runtime files: fonts, the CA bundle, ICU, XKB and MIME data (port/deps),
+# the start page and the logo, in runtime/. The title copies them into
+# /data/ps5webkit when it starts and runtime-version differs from the one
+# there (runtime.c): a store installs and updates only the title folder, and
+# the payload children can't see /app0. START_HTML: another start page
+# (make-release.sh: without the test links). NO_RUNTIME=1 leaves them out
+# (a faster upload while developing; the console keeps what it has).
+if [[ -z ${NO_RUNTIME:-} ]]; then
+    RUNTIME="$ROOT/toolchain/wpe-sysroot/share/ps5webkit-runtime"
+    ICUDAT="$ROOT/toolchain/icu/src-76.1/icu/source/data/in/icudt76l.dat"
+    [[ -f $RUNTIME/etc/ssl/cert.pem && -f $ICUDAT ]] ||
+        { echo "missing $RUNTIME or $ICUDAT: run port/deps/build.sh cacert fonts xkeyboard_config and spikes/04-jsc/build.sh" >&2; exit 1; }
+    rt="$app/runtime"; mkdir -p "$rt/share/icu"
+    rsync -aL --exclude .DS_Store "$RUNTIME/" "$rt/"
+    cp "$ICUDAT" "$rt/share/icu/icudt76l.dat"
+    cp "${START_HTML:-$PORT/runtime/start.html}" "$rt/start.html"
+    cp "$PORT/runtime/parallax-logo.png" "$rt/"
+    # The list of files: the title can open files in /app0 but not list its
+    # folders (EPERM), so runtime.c copies what this names.
+    (cd "$rt" && find . -type f ! -name runtime-version ! -name runtime-files.txt | sed 's|^\./||' | LC_ALL=C sort) > "$W/runtime-files.txt"
+    mv "$W/runtime-files.txt" "$rt/runtime-files.txt"
+    (cd "$rt" && find . -type f ! -name runtime-version -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16) > "$rt/runtime-version"
+    echo "runtime: $(find "$rt" -type f | wc -l | tr -d ' ') files, $(du -sh "$rt" | cut -f1), version $(cat "$rt/runtime-version")"
+fi
+# param.json: the committed sce_sys/param.json, which the homebrew catalog
+# reads too (titleId, contentVersion: raise contentVersion in every release,
+# 01.<minor>.<patch>, so consoles see an update). View in VR: PS VR2 titles
+# declare it there (Hmd2 refuses a title whose attribute words are 0 with
+# 0x8a72001f, FEASIBILITY §3); PS5VR's values, as Spikes 3b and 9.
+# TITLE/NAME other than the file's change the IDs and name (test titles);
+# VR_ATTRS=0 packages without the VR attributes (no View in VR),
+# VR_ATTRS=<attribute>:<attribute3> (hex) with other values, for tests.
+python3 - "$HERE/sce_sys/param.json" "$app/sce_sys/param.json" "$TITLE" "$NAME" "${VR_ATTRS:-}" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))
 title, name = sys.argv[3], sys.argv[4]
-p["titleId"] = title
-p["conceptId"] = title[4:]
-p["contentId"] = f"UP9000-{title}_00-PS5WEBKITBRWS01"
+if title != p["titleId"]:
+    p["titleId"] = title
+    p["conceptId"] = title[4:]
+    p["contentId"] = f"UP9000-{title}_00-PS5WEBKITBRWS01"
 p["localizedParameters"]["en-US"]["titleName"] = name
-vr = json.load(open(sys.argv[5]))
-for k in ("attribute", "attribute2", "attribute3"):
-    p[k] = vr.get(k, 0)
-if sys.argv[6]:
-    a = sys.argv[6].split(":") if sys.argv[6] != "0" else ["0", "0"]
+if sys.argv[5]:
+    a = sys.argv[5].split(":") if sys.argv[5] != "0" else ["0", "0"]
     p["attribute"], p["attribute2"], p["attribute3"] = int(a[0], 16), 0, int(a[1], 16)
-print("param.json: attribute 0x%x attribute3 0x%x (PS VR2)" % (p["attribute"], p["attribute3"]))
+print("param.json: %s %s, attribute 0x%x attribute3 0x%x (PS VR2)" % (p["titleId"], p["contentVersion"], p["attribute"], p["attribute3"]))
 open(sys.argv[2], "w").write(json.dumps(p, indent=2) + "\n")
 PY
 
