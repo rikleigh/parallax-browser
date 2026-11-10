@@ -1148,6 +1148,19 @@ static Cost estimateCost(unsigned codec, unsigned depth, int width, int height)
         return cost;
     double area = static_cast<double>(width) * height;
     double refArea = 3840.0 * 2160;
+    // HEVC above 4K: the title opens it at pipeline depth 2 (titlevdec.c),
+    // which takes far less than the 4K figures scaled by area: 7680x3840
+    // took 139 MB flexible and 941 MB + 9 x 42 MB direct, not 274 and 1707
+    // (which refused every 8K clip: the title has ~270 MB flexible free).
+    // A line through the two depth-2 opens in the logs, 4320x2160 (68 MB,
+    // 471 + 9 x 13.6 MB) and 7680x3840. 10-bit direct memory wasn't
+    // measured at depth 2: it stays scaled from 4K.
+    if (codec == PS5WK_VCODEC_HEVC && area > 3840.0 * 2176) {
+        double megapixels = area / 1e6;
+        cost.flexibleMB = 35 + 3.55 * megapixels;
+        cost.directMB = depth > 8 ? 730 * area / refArea : 256 + 36.1 * megapixels;
+        return cost;
+    }
     if (codec == PS5WK_VCODEC_H264) {
         refArea = 1920.0 * 1088;
         cost = { 110, 24 };
