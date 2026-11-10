@@ -120,11 +120,14 @@ footer span{display:inline-flex;align-items:center;gap:10px}
 </div>
 <script>
 /* The test pages are file: pages next to this one, which a parallax: page
- * can't link to: the browser opens them (POST /open, as from a phone). */
+ * can't link to: the browser opens them, as an address typed in the menu
+ * (POST /browser/address, which the browser's own pages may call without
+ * the link server's PIN; /open needs it, so with a PIN set these did
+ * nothing). */
 document.querySelectorAll(".pills a[href^='video.html']").forEach(function (a) {
     a.addEventListener("click", function (e) {
         e.preventDefault();
-        fetch("/open?url=" + encodeURIComponent("file:///data/ps5webkit/" + a.getAttribute("href")), { method: "POST" });
+        fetch("/browser/address?text=" + encodeURIComponent("file:///data/ps5webkit/" + a.getAttribute("href")), { method: "POST" });
     });
 });
 </script>
