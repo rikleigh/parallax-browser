@@ -395,14 +395,18 @@ static void setupEnvironment(const char* launchPath, bool network = false)
 //   PS5WK_JIT=baseline  LLInt + Baseline JIT (+ the regexp JIT)
 //   PS5WK_JIT=dfg       + DFG
 //   PS5WK_JIT=1 / ftl   + FTL (all tiers, the default)
-// JSC_* variables (JSC options, e.g. JSC_useFTLJIT=false) in child.env win.
+// JSC_* variables (JSC options, e.g. JSC_useFTLJIT=false) in child.env win,
+// except over Safer browsing: /data/ps5webkit/safer-browsing (Settings, the
+// menu's shield button) turns the JIT and WebAssembly off whatever else says
+// (the title turns WebGL off).
 static constexpr unsigned ps5wkJITPoolMB = 256;
 static void configureJIT()
 {
+    const bool safer = !access("/data/ps5webkit/safer-browsing", F_OK);
     const char* knob = getenv("PS5WK_JIT");
-    const char* mode = knob && *knob ? knob : "1";
+    const char* mode = safer ? "0" : knob && *knob ? knob : "1";
     bool off = !strcmp(mode, "0") || !strcmp(mode, "off");
-    setenv("JSC_useJIT", off ? "false" : "true", 0);
+    setenv("JSC_useJIT", off ? "false" : "true", safer);
     if (!strcmp(mode, "baseline"))
         setenv("JSC_useDFGJIT", "false", 0);
     if (!strcmp(mode, "baseline") || !strcmp(mode, "dfg"))
@@ -442,10 +446,11 @@ static void configureJIT()
     // PS5WK_WASM=0 in child.env turns it off; JSC_useWasm wins.
     const char* wasmKnob = getenv("PS5WK_WASM");
     const bool wasm = !off && !(wasmKnob && !strcmp(wasmKnob, "0"));
-    setenv("JSC_useWasm", wasm ? "true" : "false", 0);
+    setenv("JSC_useWasm", wasm ? "true" : "false", safer);
     const char* dfg = getenv("JSC_useDFGJIT");
     const char* ftl = getenv("JSC_useFTLJIT");
-    LOG("JIT: %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s), executable pool %s; WebAssembly %s", off ? "off, LLInt only" : "on", mode, getenv("JSC_useJIT"),
+    LOG("JIT: %s (%s=%s; JSC_useJIT=%s%s%s%s%s), executable pool %s; WebAssembly %s", off ? "off, LLInt only" : "on",
+        safer ? "Safer browsing, PS5WK_JIT" : "PS5WK_JIT", mode, getenv("JSC_useJIT"),
         dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "", ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "", pool,
         !strcmp(getenv("JSC_useWasm"), "true") ? "on" : "off");
 }

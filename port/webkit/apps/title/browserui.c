@@ -65,6 +65,8 @@ char* ps5wk_uri_from_input(const char* text);
 char* ps5wk_home_url(void);
 void ps5wk_open_settings(void);
 gboolean ps5wk_vr_buttons(guint32 pressed);
+gboolean ps5wk_safer_browsing(void);
+void ps5wk_safer_browsing_toggle(void);
 
 typedef struct Tab {
     char* url;
@@ -1201,6 +1203,7 @@ static void fillState(BUIState* s)
     s->starred = ps5wk_bookmark_find(shownURI()) >= 0;
     s->gamepadOn = ps5wk_gamepad_active();
     s->privateMode = privateMode;
+    s->saferOn = ps5wk_safer_browsing();
     s->title = shownTitle();
     s->uri = shownURI();
     s->tabCount = userTabCount();
@@ -1532,6 +1535,10 @@ static void toolbarActivate(int index)
     case TB_PRIVATE:
         setMenu(FALSE);
         setPrivate(!privateMode);
+        break;
+    case TB_SAFER:
+        setMenu(FALSE);
+        ps5wk_safer_browsing_toggle();
         break;
     case TB_SETTINGS:
         setMenu(FALSE);

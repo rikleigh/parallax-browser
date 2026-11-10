@@ -1,0 +1,60 @@
+<!doctype html>
+<!-- Safer browsing check (README: "Security"; settings.c: safer, jit,
+     wasm, webgl). Shows and logs what the page can use:
+       RESULT safer webgl yes|no webgl2 yes|no wasm yes|no loop <ms> ms
+     WebGL and WebGL 2: getContext on a fresh canvas. WebAssembly: the
+     global, and a tiny module compiled and run. loop: 30 million additions
+     in a hot loop, a few ms with the JIT and seconds without (the
+     WebProcess's "JIT:" log line says which for sure).
+     Upload to /data/ps5webkit/safer.html and open
+     file:///data/ps5webkit/safer.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Safer browsing check</title>
+<style>
+  body { background: #0b0a24; color: #eee; font: 28px/1.6 sans-serif; margin: 48px; }
+  h1 { margin: 0 0 16px; font-size: 38px; }
+  .yes { color: #7cf29a; } .no { color: #ff6b8b; }
+</style>
+</head>
+<body>
+<h1>Safer browsing check</h1>
+<div id="out">Checking…</div>
+<script>
+function gl(kind) {
+  try { return !!document.createElement('canvas').getContext(kind); } catch (e) { return false; }
+}
+function wasm() {
+  if (typeof WebAssembly !== 'object')
+    return false;
+  try {
+    // (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+    const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 7, 1, 96, 2, 127, 127, 1, 127, 3, 2, 1, 0, 7, 7, 1, 3, 97, 100, 100, 0, 0, 10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11]);
+    const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes));
+    return instance.exports.add(2, 3) === 5;
+  } catch (e) {
+    return false;
+  }
+}
+function loop() {
+  const start = performance.now();
+  let sum = 0;
+  for (let i = 0; i < 30000000; i++)
+    sum = (sum + i) | 0;
+  return Math.round(performance.now() - start) + (sum === 42 ? 1 : 0);
+}
+setTimeout(() => {
+  const r = { webgl: gl('webgl'), webgl2: gl('webgl2'), wasm: wasm() };
+  const ms = loop();
+  const yn = v => v ? 'yes' : 'no';
+  document.getElementById('out').innerHTML =
+    `WebGL: <span class="${yn(r.webgl)}">${yn(r.webgl)}</span><br>` +
+    `WebGL 2: <span class="${yn(r.webgl2)}">${yn(r.webgl2)}</span><br>` +
+    `WebAssembly: <span class="${yn(r.wasm)}">${yn(r.wasm)}</span><br>` +
+    `30 million additions: ${ms} ms`;
+  console.log(`RESULT safer webgl ${yn(r.webgl)} webgl2 ${yn(r.webgl2)} wasm ${yn(r.wasm)} loop ${ms} ms`);
+}, 500);
+</script>
+</body>
+</html>

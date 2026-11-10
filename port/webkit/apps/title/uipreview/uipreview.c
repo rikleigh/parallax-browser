@@ -321,6 +321,15 @@ int main(int argc, char** argv)
     menuShot("menu-toolbar-private", &s);
 
     s = baseState();
+    s.toolbarFocus = TB_SAFER;
+    menuShot("menu-toolbar-safer-off", &s);
+
+    s = baseState();
+    s.toolbarFocus = TB_SAFER;
+    s.saferOn = TRUE;
+    menuShot("menu-toolbar-safer-on", &s);
+
+    s = baseState();
     s.section = SEC_BOOKMARKS;
     s.rowCount = bookmarkCount;
     s.zone = ZONE_LIST;

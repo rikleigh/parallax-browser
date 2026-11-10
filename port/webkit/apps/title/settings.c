@@ -8,10 +8,14 @@
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
  *   flag files (no-hwdec, audio-silent, push-off, adblock-off,
- *     no-compositing): present = that feature off; the title reads them
- *     when it starts (no-compositing: WebKit in the title reads it whenever
- *     a page gets a new WebProcess). Opt-in flag files (perf-overlay):
- *     present = that feature on.
+ *     no-compositing, no-webgl): present = that feature off; the title
+ *     reads them when it starts (no-compositing: WebKit in the title reads
+ *     it whenever a page gets a new WebProcess; no-webgl: applied at once,
+ *     ps5browser.c applyWebContentSettings). Opt-in flag files
+ *     (perf-overlay, safer-browsing): present = that feature on.
+ *     safer-browsing overrides jit, wasm and webgl while present (each
+ *     WebProcess reads it at start, ps5wk-child.cpp configureJIT; the title
+ *     for WebGL) and leaves their own values alone for when it goes.
  *   home-url.txt: the page the browser opens when it starts, in the PS5
  *     user's own folder (profile.c), as KIND_FILE settings are.
  * Each setting says what applies it: a page restart (a new WebProcess), a
@@ -56,9 +60,19 @@ typedef struct {
  * (perf-overlay, read at start; ps5browser.c applies changes at once and
  * keeps the file in step with the pad's L3 + R3), ps5browser.c (the rest). */
 static const Setting settings[] = {
+    /* Security (the first four: the page's first section) */
+    { "safer", KIND_FLAG_ON, TYPE_BOOL, "safer-browsing", "0", PS5WK_SETTINGS_PAGE, "Safer browsing",
+        "Turns off the JavaScript JIT, WebAssembly and WebGL, where most attacks on browsers start. Pages run slower (scripts several times slower) and some games and 3D sites won't work. The three settings below keep their own values for when it's off. Also the shield button in the browser menu.",
+        NULL, 0, 0 },
     { "jit", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
-        "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes.",
+        "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes. Off also removes the most common way in for attacks.",
         "1=All tiers (fastest)|dfg=Up to DFG|baseline=Baseline only|0=Off (interpreter)", 0, 0 },
+    { "wasm", KIND_ENV, TYPE_BOOL, "PS5WK_WASM", "1", PS5WK_SETTINGS_PAGE, "WebAssembly",
+        "Compiled code that some games, editors and video tools run in the page. Needs the JIT (off with it).",
+        NULL, 0, 0 },
+    { "webgl", KIND_FLAG, TYPE_BOOL, "no-webgl", "1", 0, "WebGL",
+        "3D graphics for pages and games, on the PS5's GPU. Off: games and maps that need it show an error. Applies to pages loaded from now on.",
+        NULL, 0, 0 },
     { "paint_threads", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
         "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",
         "1=1|2=2|3=3|4=4|6=6|8=8", 1, 8 },
@@ -275,6 +289,17 @@ static void appendJSONString(GString* out, const char* s)
     g_string_append_c(out, '"');
 }
 
+/* The page's Security section: Safer browsing and what it turns off. */
+static gboolean isOverriddenBySafer(const Setting* s)
+{
+    return !strcmp(s->id, "jit") || !strcmp(s->id, "wasm") || !strcmp(s->id, "webgl");
+}
+
+static gboolean isSecurity(const Setting* s)
+{
+    return !strcmp(s->id, "safer") || isOverriddenBySafer(s);
+}
+
 static const char* scopeName(int scope)
 {
     return scope == PS5WK_SETTINGS_PAGE ? "page" : scope == PS5WK_SETTINGS_BROWSER ? "browser" : "none";
@@ -289,6 +314,14 @@ char* ps5wk_settings_json(const char* extra)
     g_mutex_lock(&lock);
     char* env = readEnv();
     gboolean pending[3] = { FALSE, FALSE, FALSE };
+    gboolean saferOn = FALSE;
+    for (size_t i = 0; i < SETTING_COUNT; i++) {
+        if (!strcmp(settings[i].id, "safer")) {
+            char* safer = currentValue(&settings[i], env);
+            saferOn = !strcmp(safer, "1");
+            g_free(safer);
+        }
+    }
     g_string_append(out, "\"settings\":[");
     for (size_t i = 0; i < SETTING_COUNT; i++) {
         const Setting* s = &settings[i];
@@ -302,8 +335,13 @@ char* ps5wk_settings_json(const char* extra)
         appendJSONString(out, s->fallback);
         g_string_append(out, ",\"inUse\":");
         appendJSONString(out, s->scope && applied[i] ? applied[i] : value);
-        g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\",\"key\":", scopeName(s->scope),
-            waiting ? "true" : "false", s->kind == KIND_ENV || s->scope == PS5WK_SETTINGS_PAGE ? "page" : "browser");
+        g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\"", scopeName(s->scope),
+            waiting ? "true" : "false", isSecurity(s) ? "security" : s->kind == KIND_ENV || s->scope == PS5WK_SETTINGS_PAGE ? "page" : "browser");
+        /* Safer browsing on (on disk): these say they are off whatever
+         * their own value is. */
+        if (saferOn && isOverriddenBySafer(s))
+            g_string_append(out, ",\"overridden\":true");
+        g_string_append(out, ",\"key\":");
         appendJSONString(out, s->name);
         g_string_append(out, ",\"label\":");
         appendJSONString(out, s->label);
@@ -329,7 +367,7 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append_c(out, '}');
         g_free(value);
     }
-    g_string_append_printf(out, "],\"pending\":{\"page\":%s,\"browser\":%s},\"groups\":{\"page\":\"Pages\",\"browser\":\"Browser\"},"
+    g_string_append_printf(out, "],\"pending\":{\"page\":%s,\"browser\":%s},\"groups\":{\"security\":\"Security\",\"page\":\"Pages\",\"browser\":\"Browser\"},"
         "\"statusSerial\":%u,\"status\":", pending[PS5WK_SETTINGS_PAGE] ? "true" : "false",
         pending[PS5WK_SETTINGS_BROWSER] ? "true" : "false", statusSerial);
     appendJSONString(out, status ? status : "");
@@ -748,6 +786,7 @@ const char ps5wk_settings_page[] =
     ".name{font-weight:600;font-size:1.1rem}\n"
     ".badge{font-size:.8rem;padding:.05rem .55rem;border-radius:1rem;border:1px solid var(--line);color:var(--muted);white-space:nowrap}\n"
     ".badge.wait{border-color:var(--warn);color:var(--warn);font-weight:600}\n"
+    ".card.overridden .seg{opacity:.55}\n"
     ".help{color:var(--muted);margin:.25rem 0 .6rem}\n"
     ".seg{display:flex;flex-wrap:wrap;gap:.5rem}\n"
     "button,input{font:inherit;color:inherit}\n"
@@ -825,9 +864,9 @@ const char ps5wk_settings_page[] =
     "  var list=$('list'),seen={};list.textContent='';\n"
     "  S.settings.forEach(function(s){\n"
     "    if(!seen[s.group]){seen[s.group]=1;list.appendChild(el('h2',null,S.groups[s.group]||s.group))}\n"
-    "    var c=el('div','card'),r=el('div','row');\n"
+    "    var c=el('div','card'+(s.overridden?' overridden':'')),r=el('div','row');\n"
     "    r.appendChild(el('span','name',s.label));\n"
-    "    r.appendChild(el('span','badge'+(s.pending?' wait':''),s.pending?'Changed: '+applies(s).toLowerCase():applies(s)));\n"
+    "    r.appendChild(el('span','badge'+(s.pending?' wait':''),s.overridden?'Off: Safer browsing is on':s.pending?'Changed: '+applies(s).toLowerCase():applies(s)));\n"
     "    c.appendChild(r);c.appendChild(el('p','help',s.help));\n"
     "    if(s.type=='text'){\n"
     "      var row=el('div','row'),input=el('input');input.id='in-'+s.id;input.value=s.value;input.placeholder='Built-in start page';\n"

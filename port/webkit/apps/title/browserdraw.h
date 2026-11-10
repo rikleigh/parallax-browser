@@ -11,7 +11,7 @@
 #include <glib.h>
 #include <wpe/ps5/wpe-ps5.h>
 
-enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_STAR, TB_GAMEPAD, TB_PRIVATE, TB_NEWTAB, TB_SETTINGS, TB_COUNT };
+enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_STAR, TB_GAMEPAD, TB_PRIVATE, TB_SAFER, TB_NEWTAB, TB_SETTINGS, TB_COUNT };
 enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_DOWNLOADS, SEC_COUNT };
 enum { ZONE_TOOLBAR, ZONE_LIST };
 enum { HOT_TOOLBAR, HOT_SECTION, HOT_ROW };
@@ -58,6 +58,8 @@ typedef struct {
     gboolean canBack, canForward, canNewTab, starred;
     /* gamepad mode on for the site shown; private browsing (the bar's tint) */
     gboolean gamepadOn, privateMode;
+    /* Safer browsing on (no JIT, WebAssembly or WebGL): the shield filled */
+    gboolean saferOn;
     const char* title;
     const char* uri;
     unsigned tabCount, maxTabs;

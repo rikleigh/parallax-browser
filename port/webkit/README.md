@@ -249,7 +249,12 @@ are saved as soon as you press a button.
 
 | Setting | Stored as | Applies |
 | --- | --- | --- |
+| **Security** (the page's first section) | | |
+| Safer browsing (default off; also the shield button in the browser menu): the JIT, WebAssembly and WebGL off whatever their own settings say, which keep their values for when it goes | `/data/ps5webkit/safer-browsing` when on (read by each WebProcess, `ps5wk-child.cpp` configureJIT, over any `JSC_*` line; and by the title for WebGL) | page restart (the menu button restarts the page itself) |
 | JavaScript JIT: all tiers (default) / up to DFG / Baseline only / off | `child.env`: `PS5WK_JIT=1/dfg/baseline/0` | page restart |
+| WebAssembly (default on; off with the JIT) | `PS5WK_WASM=0` when off | page restart |
+| WebGL (default on) | `/data/ps5webkit/no-webgl` when off (`webkit_settings_set_enable_webgl` on the WebKitSettings every tab shares) | at once, for pages loaded from then on |
+| **Pages** | | |
 | Painting threads: 1-8 (default 4; 1 = the old single-thread path) | `PS5WK_PAINT_THREADS` | page restart |
 | Fast scrolling (default on) | `PS5WK_SCROLL_COPY=0` when off | page restart |
 | Page memory limit: off / 2 / 3 (default) / 4 / 6 GB | `PS5WK_MEM_RESTART_MB` | page restart |
@@ -262,6 +267,20 @@ are saved as soon as you press a button.
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
 | Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |
 | Search engine for words typed in the address bar or the start page's field: Google (default), Bing, DuckDuckGo, DuckDuckGo Lite, Brave Search, Ecosia, Startpage | `search.txt` in the PS5 user's folder (no file: Google) | none |
+
+While Safer browsing is on, the JIT, WebAssembly and WebGL cards say *Off:
+Safer browsing is on* and their buttons dim (they can still be changed).
+The menu's shield button (between Private browsing and New tab; filled in
+cyan with a tick while on) toggles the flag through the same settings code,
+applies WebGL at once, says so on the TV and restarts the page shown in a
+new WebProcess. Checked on the console (2026-11-10) with
+`test/browser/safer.html`, which reports WebGL, WebGL 2, WebAssembly and
+the time of 30 million additions: on by default (14 ms); after the shield
+button, `JIT: off, LLInt only (Safer browsing ...); WebAssembly off` and no
+WebGL, WebGL 2 or WebAssembly (361 ms); back to all three after Safer
+browsing off in Settings and *Restart page*; WebGL alone off applied with
+no restart. The JIT's off switch also turns off JSC's regular-expression
+JIT (`disableAllJITOptions`).
 
 The page also has these actions: *Clear cache*, *Clear cookies* and *Clear
 all website data* in the Storage card (`webkit_website_data_manager_clear`

@@ -340,6 +340,61 @@ static void privateIcon(WPEDisplayPS5Canvas* c, int cx, int cy, guint32 color)
     wpe_display_ps5_canvas_fill(c, cx - 4, cy + 4, 8, 3, 1, color);
 }
 
+/* The Safer browsing button's icon: a shield, outlined; while Safer
+ * browsing is on, filled with a tick cut out of it. Drawn into a small
+ * image (the canvas has no curves), 4 x 4 samples a pixel. */
+#define SHIELD_W 32
+#define SHIELD_H 38
+static gboolean inShield(double x, double y, double inset)
+{
+    const double w = SHIELD_W - 2 * inset, h = SHIELD_H - 2 * inset;
+    x -= inset;
+    y -= inset;
+    if (x < 0 || x > w || y > h)
+        return FALSE;
+    const double half = w / 2, k = fabs(x - half) / half;
+    if (y < h * 0.10 * (1 - k * k)) /* the top dips a little in the middle */
+        return FALSE;
+    if (y <= h * 0.42)
+        return TRUE;
+    const double t = (y - h * 0.42) / (h * 0.58); /* the sides curve in to the point */
+    return fabs(x - half) <= half * (1 - t * t);
+}
+
+static double segmentDistance(double x, double y, double ax, double ay, double bx, double by)
+{
+    const double dx = bx - ax, dy = by - ay;
+    double t = ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy);
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return hypot(x - ax - t * dx, y - ay - t * dy);
+}
+
+static void shieldIcon(WPEDisplayPS5Canvas* c, int cx, int cy, gboolean on, guint32 color)
+{
+    static guint32 px[SHIELD_W * SHIELD_H];
+    for (int j = 0; j < SHIELD_H; j++) {
+        for (int i = 0; i < SHIELD_W; i++) {
+            int hits = 0;
+            for (int sj = 0; sj < 4; sj++) {
+                for (int si = 0; si < 4; si++) {
+                    const double x = i + (si + 0.5) / 4, y = j + (sj + 0.5) / 4;
+                    gboolean ink;
+                    if (on) {
+                        const double tick = fmin(segmentDistance(x, y, 9.5, 19, 14.5, 24.5), segmentDistance(x, y, 14.5, 24.5, 23, 13.5));
+                        ink = inShield(x, y, 1) && tick > 2.1;
+                    } else
+                        ink = inShield(x, y, 1) && !inShield(x, y, 4);
+                    hits += ink;
+                }
+            }
+            const unsigned a8 = (unsigned)(hits * 255 / 16);
+            px[j * SHIELD_W + i] = !a8 ? 0 : (a8 << 24) | ((((color >> 16) & 0xff) * a8 / 255) << 16)
+                | ((((color >> 8) & 0xff) * a8 / 255) << 8) | ((color & 0xff) * a8 / 255);
+        }
+    }
+    wpe_display_ps5_canvas_image(c, cx - SHIELD_W / 2, cy - SHIELD_H / 2, SHIELD_W, SHIELD_H, px, 255);
+}
+
 static void drawProgress(WPEDisplayPS5Canvas* c, int screenW, double progress)
 {
     if (progress < 0.05)
@@ -424,18 +479,20 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
         PX_A(s->privateMode ? PX_PRIVATE_BAR_2 : PX_SURFACE, 0xee), TRUE);
     wpe_display_ps5_canvas_fill(c, 0, BAR_H - 1, screenW, 1, 0, PX_A(s->privateMode ? PX_MAGENTA : PX_LINE, 0xff));
 
-    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "", "", "+", "⚙" };
-    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
+    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "", "", "", "+", "⚙" };
+    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
     int x = EDGE;
     for (int i = TB_BACK; i <= TB_HOME; i++) {
         drawButton(c, x, BTN_Y, BTN_W, BTN_H, labels[i], enabled[i] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == i, interactive ? i : -1);
         x += BTN_W + GAP;
     }
-    /* the right: settings, new tab, private, gamepad, bookmark, the tab count */
-    const int settingsX = screenW - EDGE - BTN_W, newTabX = settingsX - GAP - BTN_W, privateX = newTabX - GAP - BTN_W;
+    /* the right: settings, new tab, safer browsing, private, gamepad, bookmark, the tab count */
+    const int settingsX = screenW - EDGE - BTN_W, newTabX = settingsX - GAP - BTN_W, saferX = newTabX - GAP - BTN_W, privateX = saferX - GAP - BTN_W;
     const int gamepadX = privateX - GAP - BTN_W, starX = gamepadX - GAP - BTN_W, countX = starX - GAP - 64;
     drawButton(c, privateX, BTN_Y, BTN_W, BTN_H, labels[TB_PRIVATE], PX_TEXT, toolbar && s->toolbarFocus == TB_PRIVATE, interactive ? TB_PRIVATE : -1);
     privateIcon(c, privateX + BTN_W / 2, BTN_Y + BTN_H / 2, s->privateMode ? PX_PINK : PX_TEXT);
+    drawButton(c, saferX, BTN_Y, BTN_W, BTN_H, labels[TB_SAFER], PX_TEXT, toolbar && s->toolbarFocus == TB_SAFER, interactive ? TB_SAFER : -1);
+    shieldIcon(c, saferX + BTN_W / 2, BTN_Y + BTN_H / 2, s->saferOn, s->saferOn ? PX_CYAN_TEXT : PX_TEXT);
     drawButton(c, gamepadX, BTN_Y, BTN_W, BTN_H, labels[TB_GAMEPAD], PX_TEXT, toolbar && s->toolbarFocus == TB_GAMEPAD, interactive ? TB_GAMEPAD : -1);
     gamepadIcon(c, gamepadX + BTN_W / 2, BTN_Y + BTN_H / 2, s->gamepadOn ? PX_CYAN_TEXT : PX_TEXT);
     if (s->gamepadOn)
@@ -578,6 +635,8 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
             x += hint(c, x, cy, "□", s->homeSquare) + 32;
     } else if (!list && s->toolbarFocus == TB_PRIVATE)
         x += hint(c, x, cy, "✕", s->privateMode ? "Leave private browsing" : "Private browsing") + 32;
+    else if (!list && s->toolbarFocus == TB_SAFER)
+        x += hint(c, x, cy, "✕", s->saferOn ? "Safer browsing off (faster)" : "Safer browsing: no JIT, WebAssembly or WebGL") + 32;
     else if (s->section == SEC_TABS) {
         x += hint(c, x, cy, "✕", list ? "Switch" : "Select") + 32;
         x += hint(c, x, cy, "□", "Close tab") + 32;

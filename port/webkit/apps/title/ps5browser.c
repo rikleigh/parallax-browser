@@ -1486,6 +1486,69 @@ static gboolean restartPageOnMain(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* Safer browsing and WebGL (settings.c; README: "Security"). safer-browsing
+ * turns the JavaScript JIT and WebAssembly off in every WebProcess that
+ * starts (ps5wk-child.cpp configureJIT) and WebGL off here; no-webgl turns
+ * WebGL off alone. WebGL is one WebKitSettings, shared by every tab
+ * (private ones too): it applies to pages loaded from then on. */
+#define SAFER_BROWSING_FLAG "/data/ps5webkit/safer-browsing"
+#define NO_WEBGL_FLAG "/data/ps5webkit/no-webgl"
+static gboolean saferBrowsing;
+
+static gboolean flagFile(const char* path)
+{
+    int fd = open(path, O_RDONLY); /* not access(): see settings.c */
+    if (fd < 0)
+        return FALSE;
+    close(fd);
+    return TRUE;
+}
+
+static void applyWebContentSettings(void)
+{
+    saferBrowsing = flagFile(SAFER_BROWSING_FLAG);
+    gboolean webgl = !saferBrowsing && !flagFile(NO_WEBGL_FLAG);
+    WebKitSettings* settings = webView ? webkit_web_view_get_settings(webView) : NULL;
+    if (settings && webkit_settings_get_enable_webgl(settings) != webgl) {
+        webkit_settings_set_enable_webgl(settings, webgl);
+        spike_log("settings: WebGL %s%s", webgl ? "on" : "off", saferBrowsing ? " (Safer browsing)" : "");
+    }
+}
+
+/* From a route thread (Settings): WebKit's settings change on the main loop. */
+static gboolean applyWebContentSettingsOnMain(gpointer data)
+{
+    (void)data;
+    applyWebContentSettings();
+    return G_SOURCE_REMOVE;
+}
+
+gboolean ps5wk_safer_browsing(void)
+{
+    return saferBrowsing;
+}
+
+/* The browser menu's shield button: Safer browsing on or off, and the page
+ * shown again in a new WebProcess, which reads it (the JIT). */
+void ps5wk_safer_browsing_toggle(void)
+{
+    gboolean on = !flagFile(SAFER_BROWSING_FLAG);
+    char* message = NULL;
+    int changed = 0;
+    gboolean ok = ps5wk_settings_update(on ? "safer=1" : "safer=0", FALSE, &message, &changed);
+    spike_log("settings: Safer browsing %s from the menu: %s", on ? "on" : "off", message ? message : "");
+    g_free(message);
+    if (!ok) {
+        wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), "Couldn't change Safer browsing", 3);
+        return;
+    }
+    applyWebContentSettings();
+    wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), on
+        ? "Safer browsing: no JavaScript JIT, WebAssembly or WebGL. Pages run slower."
+        : "Safer browsing off: the JIT, WebAssembly and WebGL are back", 4);
+    g_idle_add(restartPageOnMain, NULL);
+}
+
 static void dataCleared(GObject* manager, GAsyncResult* result, gpointer data)
 {
     const char* what = data;
@@ -1691,6 +1754,7 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
         spike_log("settings from %s: %s (%.300s)", from, message, body);
         ps5wk_adblock_setting_changed(); /* applies at once (no restart) */
         applyPerfOverlaySetting();
+        g_idle_add(applyWebContentSettingsOnMain, NULL); /* WebGL at once; the JIT with the next WebProcess */
         if (ok || changed) {
             char* state = settingsState(message, trusted);
             pushReply(client, ok ? 200 : 503, "application/json", state);
@@ -2763,6 +2827,7 @@ int main(int argc, char** argv)
         "website-policies", policies,
         NULL));
     ps5wk_connect_web_view(webView);
+    applyWebContentSettings();
     ps5wk_gamepad_init(WPE_DISPLAY_PS5(display));
     ps5wk_vr_init(display, webView);
     /* After View in VR: the browser's button handler chains it. */
