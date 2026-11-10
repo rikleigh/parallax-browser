@@ -1,0 +1,86 @@
+<!doctype html>
+<!-- Web content may not connect to the console itself (WebKit patch 0107,
+     SoupNetworkSession: loopback, 0.0.0.0 and this PS5's own address are
+     refused once the TCP connection is up, before a byte is written).
+     This page tries what an attacking page would: fetch() POSTs whose body
+     carries a line-based command past the HTTP headers, here the launcher
+     payload's harmless "status" (tools/launcher, port 9031), and a
+     WebSocket. With the block, the launcher's log
+     (/data/ps5webkit/launcher.log) gets no "> POST" or "> status" lines from
+     these, and the browser's log has one line per attempt:
+       [ps5-net] refused a connection to this PS5 (<host>, port 9031): ...
+     The control (https://example.com/) must still load. Logs:
+       RESULT local-connections <target> refused|reached|failed (<ms> ms)
+     Upload to /data/ps5webkit/local-connections.html and open
+     file:///data/ps5webkit/local-connections.html?ip=<this PS5's LAN address>. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Local connections check</title>
+<style>
+  body { background: #0b0a24; color: #eee; font: 24px/1.5 sans-serif; margin: 40px; }
+  h1 { margin: 0 0 8px; font-size: 34px; }
+  p { color: #b9b5e0; max-width: 1400px; }
+  table { border-collapse: collapse; margin-top: 16px; }
+  td { padding: 6px 18px; border-bottom: 1px solid #3a3680; }
+  .ok { color: #7cf29a; } .bad { color: #ff6b8b; } .wait { color: #b9b5e0; }
+</style>
+</head>
+<body>
+<h1>Local connections check</h1>
+<p>Each row tries to reach a service on this PS5 the way a web page could. All but the control should fail.
+The launcher's log shows whether anything got through.</p>
+<table id="rows"></table>
+<script>
+const ip = new URLSearchParams(location.search).get('ip');
+const body = '\nstatus\n';
+const targets = [
+  { name: 'http://127.0.0.1:9031/', kind: 'fetch' },
+  { name: 'http://localhost:9031/', kind: 'fetch' },
+  { name: 'http://[::1]:9031/', kind: 'fetch' },
+  { name: 'http://0.0.0.0:9031/', kind: 'fetch' },
+  { name: 'http://127.0.0.2:9031/', kind: 'fetch' },
+  ...(ip ? [{ name: `http://${ip}:9031/`, kind: 'fetch' }, { name: `http://${ip}:2121/`, kind: 'fetch', body: '\r\nNOOP\r\n' }] : []),
+  { name: 'ws://127.0.0.1:9031/', kind: 'ws' },
+  { name: 'https://example.com/', kind: 'fetch', control: true },
+];
+const rows = document.getElementById('rows');
+
+function report(t, cell, outcome, ms) {
+  const good = t.control ? outcome === 'reached' : outcome !== 'reached';
+  cell.textContent = `${outcome} (${ms} ms)`;
+  cell.className = good ? 'ok' : 'bad';
+  console.log(`RESULT local-connections ${t.name} ${outcome} (${ms} ms)${t.control ? ' control' : ''}`);
+}
+
+function tryFetch(t, cell) {
+  const start = performance.now();
+  const opts = t.control ? { mode: 'no-cors' } : { method: 'POST', mode: 'no-cors', body: t.body || body, headers: { 'Content-Type': 'text/plain' } };
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000));
+  // A non-HTTP service answers with something fetch() rejects, so "failed"
+  // alone doesn't show the block: the logs do.
+  Promise.race([fetch(t.name, opts), timeout])
+    .then(() => report(t, cell, 'reached', Math.round(performance.now() - start)))
+    .catch(e => report(t, cell, e.message === 'timeout' ? 'timeout' : 'failed', Math.round(performance.now() - start)));
+}
+
+function tryWS(t, cell) {
+  const start = performance.now();
+  let done = false;
+  const ws = new WebSocket(t.name);
+  ws.onopen = () => { if (!done) { done = true; ws.close(); report(t, cell, 'reached', Math.round(performance.now() - start)); } };
+  ws.onerror = () => { if (!done) { done = true; report(t, cell, 'failed', Math.round(performance.now() - start)); } };
+  setTimeout(() => { if (!done) { done = true; ws.close(); report(t, cell, 'timeout', 8000); } }, 8000);
+}
+
+targets.forEach((t, i) => {
+  const tr = rows.insertRow();
+  tr.insertCell().textContent = t.control ? `${t.name} (control)` : t.name;
+  const cell = tr.insertCell();
+  cell.textContent = 'trying…';
+  cell.className = 'wait';
+  setTimeout(() => (t.kind === 'ws' ? tryWS : tryFetch)(t, cell), i * 400);
+});
+</script>
+</body>
+</html>

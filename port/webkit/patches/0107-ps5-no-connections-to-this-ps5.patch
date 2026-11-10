@@ -1,0 +1,76 @@
+diff --git a/Source/WebCore/platform/network/soup/SoupNetworkSession.cpp b/Source/WebCore/platform/network/soup/SoupNetworkSession.cpp
+index c0afe19b24..88e8825da2 100644
+--- a/Source/WebCore/platform/network/soup/SoupNetworkSession.cpp
++++ b/Source/WebCore/platform/network/soup/SoupNetworkSession.cpp
+@@ -55,6 +55,57 @@ static UTF8CString& initialAcceptLanguages()
+     return storage.get();
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: web content never connects to the console itself, by loopback or by
++// this PS5's own address. The jailbreak's services listen there (FTP on
++// 2121, elfldr on 9021, a launcher on 9031) and the line-based ones read
++// commands past an HTTP request's headers: a page's fetch() POST to
++// http://127.0.0.1:2121/ ran the FTP commands in its body, with no login.
++// The check runs once the TCP connection is up and before a byte is written,
++// on the address actually connected, so a name that resolves to 127.0.0.1
++// is refused too. The browser's own pages are parallax:// and never come
++// here. PS5WK_ALLOW_LOCAL_CONNECTIONS=1 (child.env) turns it off.
++static bool ps5ConnectsToThisConsole(GSocket* socket)
++{
++    GRefPtr<GSocketAddress> remote = adoptGRef(g_socket_get_remote_address(socket, nullptr));
++    if (!remote || !G_IS_INET_SOCKET_ADDRESS(remote.get()))
++        return false;
++    GInetAddress* address = g_inet_socket_address_get_address(G_INET_SOCKET_ADDRESS(remote.get()));
++    if (g_inet_address_get_is_loopback(address) || g_inet_address_get_is_any(address))
++        return true;
++    if (g_inet_address_get_family(address) == G_SOCKET_FAMILY_IPV6) {
++        // ::ffff:127.x.x.x
++        static const guint8 v4Mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
++        const guint8* bytes = g_inet_address_to_bytes(address);
++        if (!memcmp(bytes, v4Mapped, sizeof(v4Mapped)) && bytes[12] == 127)
++            return true;
++    }
++    // This PS5's own address on the LAN: the far end is the near end.
++    GRefPtr<GSocketAddress> local = adoptGRef(g_socket_get_local_address(socket, nullptr));
++    return local && G_IS_INET_SOCKET_ADDRESS(local.get())
++        && g_inet_address_equal(address, g_inet_socket_address_get_address(G_INET_SOCKET_ADDRESS(local.get())));
++}
++
++static void ps5NetworkEvent(SoupMessage* message, GSocketClientEvent event, GIOStream* connection, gpointer)
++{
++    if (event != G_SOCKET_CLIENT_CONNECTED || !G_IS_SOCKET_CONNECTION(connection))
++        return;
++    GSocket* socket = g_socket_connection_get_socket(G_SOCKET_CONNECTION(connection));
++    if (!ps5ConnectsToThisConsole(socket))
++        return;
++    GUri* uri = soup_message_get_uri(message);
++    g_message("[ps5-net] refused a connection to this PS5 (%s, port %d): web content may not reach the console's own services",
++        uri ? g_uri_get_host(uri) : "?", uri ? g_uri_get_port(uri) : -1);
++    // Nothing was sent yet; the request fails on its first write.
++    g_socket_shutdown(socket, TRUE, TRUE, nullptr);
++}
++
++static void ps5RequestQueued(SoupSession*, SoupMessage* message, gpointer)
++{
++    g_signal_connect(message, "network-event", G_CALLBACK(ps5NetworkEvent), nullptr);
++}
++#endif
++
+ #if !LOG_DISABLED || !RELEASE_LOG_DISABLED
+ inline static void soupLogPrinter(SoupLogger*, SoupLoggerLogLevel, char direction, const char* data, gpointer)
+ {
+@@ -124,6 +175,13 @@ SoupNetworkSession::SoupNetworkSession(PAL::SessionID sessionID)
+     soup_session_add_feature_by_type(m_soupSession.get(), SOUP_TYPE_HSTS_ENFORCER);
+     soup_session_add_feature_by_type(m_soupSession.get(), SOUP_TYPE_WEBSOCKET_EXTENSION_MANAGER);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    if (g_strcmp0(g_getenv("PS5WK_ALLOW_LOCAL_CONNECTIONS"), "1"))
++        g_signal_connect(m_soupSession.get(), "request-queued", G_CALLBACK(ps5RequestQueued), nullptr);
++    else
++        g_message("[ps5-net] PS5WK_ALLOW_LOCAL_CONNECTIONS=1: web content may connect to this PS5");
++#endif
++
+     if (!initialAcceptLanguages().isNull())
+         setAcceptLanguages(initialAcceptLanguages());
+ 

@@ -975,6 +975,40 @@ and the PS5 sent the 50 MB file back at 0.2 MB/s), so the download path's
 own ceiling wasn't reached. Not checked yet: the pad on the TV (the list,
 focus, X/Square/R2), the phone page in a real phone browser, a PIN set.
 
+## Connections to the console itself (patch 0107, 2026-11-10)
+
+Web content can't connect to the PS5 itself. The jailbreak's services listen
+there: ftpsrv on 2121, elfldr on 9021, the launcher on 9031, besides the link
+server on 9040. None of those ports is on WebKit's blocked-port list, and the
+line-based ones read commands that follow an HTTP request's headers. A
+request shaped like a page's `fetch()` POST (sent from the Mac, 2026-11-10)
+ran the FTP commands in its body with no login (`PWD`, `SYST`), and the
+launcher ran `status` the same way. ftpsrv also has `MTRW` (system
+partitions read-write) and active-mode `PORT`. elfldr is safe from this: it
+wants ELF bytes from the first byte.
+
+`SoupNetworkSession` (every network session, private ones too) watches each
+request's `network-event`. When its TCP connection is up, before a byte is
+written, a far end that is loopback (127/8, `::1`, `::ffff:127.x`), the
+unspecified address, or the near end's own address (this PS5 on the LAN)
+gets the socket shut down: the request fails on its first write. The check
+is on the address actually connected, so a name that resolves to
+127.0.0.1 is refused too. HTTP, WebSocket and preconnects all go through
+it. Log: `[ps5-net] refused a connection to this PS5 (<host>, port <n>)`.
+The browser's own pages are `parallax://` and never use the network.
+Off switch: `PS5WK_ALLOW_LOCAL_CONNECTIONS=1` in `child.env`.
+
+What it doesn't cover: other devices on the LAN (a router's page must keep
+working), and a compromised WebProcess, which opens sockets of its own.
+
+Checked on the console (2026-11-10) with `test/net/local-connections.html`:
+fetch() POSTs carrying the launcher's `status` to 127.0.0.1, localhost,
+`[::1]`, 0.0.0.0, 127.0.0.2 and the PS5's LAN address (9031 and 2121), and
+a WebSocket to 127.0.0.1:9031, all failed, with a `[ps5-net]` line for each
+connection that got as far as connecting. Nothing reached the launcher's
+log, while the same request sent from the Mac did. https://example.com/ (the
+control) loaded, and no process crashed.
+
 ## Build
 
 ```sh
