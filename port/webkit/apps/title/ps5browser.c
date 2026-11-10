@@ -721,8 +721,10 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
         "<style>body{font-family:sans-serif;background:#01001a;color:#f4f2ff;margin:64px;font-size:24px}"
         "a{color:#c7a8ff}a:focus{outline:3px solid #ff5cd6;outline-offset:4px}code{color:#b9b5e0;word-break:break-all}</style></head><body>"
         "<h1>This page keeps crashing</h1><p>The browser stopped reloading it after two crashes.</p>"
-        "<p><code>%s</code></p><p><a href=\"%s\">Try again</a> &middot; <a href=\"file:///data/ps5webkit/start.html\">Start page</a></p>"
-        "<p>O goes back.</p></body></html>", escaped, escaped);
+        "<p><code>%s</code></p><p><a href=\"%s\">Try again</a></p>"
+        "<p>O goes back; L3 opens the home page.</p></body></html>", escaped, escaped);
+    /* No link to the start page: a page with a site's address can't open
+     * file: or parallax: pages (parallaxSchemeInit), so L3 it is. */
     /* Not a failed load of the page itself, so Back still works. */
     webkit_web_view_load_alternate_html(view, html, lastCrashURI, NULL);
     g_free(html);
