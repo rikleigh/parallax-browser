@@ -35,8 +35,11 @@ play the video on a page in the **PS VR2** headset.
   cosmetic filters and scriptlets, with no site-specific code. It can be
   switched off per site.
 - **Link server:** open `http://<ps5-ip>:9040/` on a phone or computer, or
-  scan the QR code in the menu, to send links to the PS5, change settings
-  and fetch downloads.
+  scan the QR code on the start page or in Settings, to send links to the
+  PS5, change settings and fetch downloads. See *Security* below.
+- **Settings** (`parallax://settings`): Safer browsing, the home page (or □
+  on the menu's Home button), the search engine (Google by default), video,
+  memory, ad blocking, the link server, and clearing data.
 - The system on-screen keyboard for text fields.
 - The touchpad works as a mouse.
 
@@ -97,6 +100,44 @@ moves a marker on the bar first; the video seeks when you stop.
 To update, copy the new `data` folder over the old one. Each PS5 user's
 bookmarks, history, settings and downloads live in `/data/ps5webkit/users`,
 which the zip doesn't contain, so they're kept.
+
+## Security
+
+- **The link server is open to your local network by default.** Anyone on
+  the same network can send links to the PS5, see and control its tabs,
+  change settings and fetch downloads, much as they already can through
+  elfldr and FTP, which the jailbreak leaves open. To limit it, put a PIN
+  in `/data/ps5webkit/push-pin.txt` (read when the browser starts), or turn
+  the link server off in Settings (Settings still opens on the PS5).
+  Importing cookies is refused unless a
+  PIN or `/data/ps5webkit/push-cookie-key.txt` is set up. Pages in the
+  browser itself can't reach the link server, and while private browsing
+  is on it doesn't say which pages are open (downloads are kept, and
+  listed, as in normal browsing).
+- **The browser runs without a sandbox, and a malicious page could take
+  over the console.** The process that runs web pages is started like any
+  other payload: as root, outside the system's jail, with the jailbreak's
+  kernel access, and able to reach elfldr. A web page that exploits a bug
+  in WebKit (most often in the JavaScript JIT) would therefore get
+  everything: every user's cookies and logged-in sessions, the console's
+  files and account data, the kernel until the next reboot, a way to come
+  back after the next jailbreak, and a foothold on your network. No such
+  exploit for this browser is known, but WebKit has security bugs fixed
+  every month, and this build stays on the WebKit of its release. So:
+  browse sites you trust, keep ad blocking on, and for anything else turn
+  on **Safer browsing**: the shield button in the menu (Options), or
+  Settings. It turns off the JavaScript JIT, WebAssembly and WebGL, where
+  most exploits start. Scripts run several times slower and some games and
+  3D sites won't work. Don't sign in to accounts that matter, or import
+  cookies from another browser, on the PS5. If the console behaves oddly
+  after a visit, reboot it before you run the jailbreak again, and check
+  `/data/homebrew` and etaHEN's autoload for files you didn't put there.
+- **Pages can't reach the jailbreak's own services.** FTP, elfldr and
+  similar tools on the console take commands from anyone who connects, and
+  without a fix a page could have sent them some. The browser refuses every
+  connection from web content to the PS5 itself (its loopback or its own
+  network address). Other devices on your network stay reachable, so use
+  the jailbreak only on a home network you trust.
 
 ## Building
 
