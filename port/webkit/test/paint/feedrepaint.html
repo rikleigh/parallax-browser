@@ -1,0 +1,115 @@
+<!doctype html>
+<!-- Repaint correctness for a feed that appends (COMPOSITING-PLAN.md, "Feeds
+that repaint the whole page"). A fixed, deterministic timeline of the things a
+results feed does while it loads more: a child added and removed directly
+under the page's positioned top container, a tall placeholder section that is
+replaced by items (the document grows and shrinks), items inserted above
+others (siblings move), attribute and class flips on the feed's container
+with rules for its descendants (before and after styles are resolved, with
+clientWidth read in between), text and colour changes, a composited box.
+Everything stops after ~7 s at a fixed scroll position: the title's +10 s
+screenshot must be the same with the fixes on and off
+(test/paint/shot-diff.py). ?y=<px> sets the final scroll position. -->
+<meta charset="utf-8">
+<title>feed repaint</title>
+<style>
+html, body { margin: 0; background: #101418; color: #e8e8e8; font: 16px/1.3 sans-serif; }
+#app { position: absolute; left: 0; top: 0; right: 0; }
+#bar { position: fixed; left: 0; top: 0; right: 0; height: 56px; background: #20262c; z-index: 10; }
+#bar span { position: absolute; left: 24px; top: 16px; }
+#page { display: flex; flex-direction: column; margin-top: 56px; }
+#columns { display: flex; }
+#guide { width: 240px; flex: none; }
+#primary { flex: 1; min-width: 0; padding: 0 24px; }
+.section { display: block; margin: 0 0 16px; }
+.section.tinted { background: #18222c; }
+.placeholder { height: 3000px; }
+.item { position: relative; display: flex; height: 180px; margin: 12px 0; }
+.thumb { width: 320px; height: 180px; flex: none; border-radius: 12px; }
+.meta { padding: 0 16px; flex: 1; min-width: 0; }
+.title { font-size: 20px; }
+.label { position: absolute; right: 16px; bottom: 8px; padding: 2px 8px; background: #303840; border-radius: 4px; }
+.menu { position: absolute; right: 16px; top: 8px; width: 24px; height: 24px; border-radius: 12px; background: #404850; }
+.lift { will-change: transform; }
+.preview { position: absolute; z-index: 5; width: 320px; height: 180px; background: #c03030; }
+/* Descendant rules that the container's attribute and class turn on. */
+#feed[flag] .title { color: #ffd060; }
+#feed[flag] .item:nth-child(3n) .thumb { outline: 4px solid #60c0ff; }
+#feed.dense .item { height: 150px; }
+#feed.dense .thumb { height: 150px; }
+#feed.marked .label { background: #207040; }
+#feed[other] .menu { background: #a04080; }
+</style>
+<div id="app">
+  <div id="bar"><span id="status">feed repaint</span></div>
+  <div id="page">
+    <div id="columns">
+      <div id="guide"></div>
+      <div id="primary"><div id="feed"></div></div>
+    </div>
+  </div>
+</div>
+<script>
+const q = new URLSearchParams(location.search);
+const finalY = +(q.get("y") || 2600);
+const feed = document.getElementById("feed");
+const app = document.getElementById("app");
+let made = 0;
+function color(n) { return "hsl(" + (n * 47) % 360 + " 55% " + (30 + (n * 13) % 30) + "%)"; }
+function item() {
+  const n = made++;
+  const e = document.createElement("div");
+  e.className = "item" + (n % 5 == 2 ? " lift" : "");
+  e.innerHTML = '<div class="thumb" style="background:' + color(n) + '"></div><div class="meta"><div class="title">Item ' + n +
+    ' of the feed</div><div class="channel">channel ' + (n % 7) + '</div></div><div class="label">' + (n * 3 % 60) + ':00</div><div class="menu"></div>';
+  return e;
+}
+function section(count, tinted) {
+  const s = document.createElement("div");
+  s.className = "section" + (tinted ? " tinted" : "");
+  for (let i = 0; i < count; i++)
+    s.appendChild(item());
+  return s;
+}
+function read() { return feed.clientWidth + document.documentElement.scrollHeight; }
+const steps = [
+  () => { feed.appendChild(section(12, false)); },
+  // A child directly under the positioned top container, as a hover preview.
+  () => { const p = document.createElement("div"); p.className = "preview"; p.id = "preview"; p.style.left = "300px"; p.style.top = "400px"; app.appendChild(p); },
+  () => { window.scrollTo(0, 600); },
+  () => { document.getElementById("preview").remove(); },
+  // The next batch: a placeholder first, then the items in its place.
+  () => { const s = document.createElement("div"); s.className = "section placeholder tinted"; s.id = "pending"; feed.appendChild(s); },
+  () => { feed.setAttribute("flag", ""); read(); feed.removeAttribute("flag"); read(); feed.setAttribute("flag", ""); },
+  () => { document.getElementById("pending").replaceWith(section(9, true)); },
+  // Flips before the new items' styles are resolved, and after.
+  () => { feed.appendChild(section(6, false)); feed.removeAttribute("flag"); feed.setAttribute("flag", ""); feed.classList.add("marked"); read(); feed.classList.remove("marked"); feed.classList.add("marked"); },
+  () => { window.scrollTo(0, 1800); },
+  // Items inserted above others: the ones below move.
+  () => { feed.firstChild.insertBefore(item(), feed.firstChild.children[2]); feed.children[1].insertBefore(item(), feed.children[1].firstChild); },
+  () => { feed.classList.add("dense"); read(); feed.classList.remove("dense"); },
+  () => { feed.setAttribute("other", ""); read(); feed.removeAttribute("other"); feed.setAttribute("other", ""); },
+  // Changes to items that an attribute flip's kept list of candidates must still find.
+  () => { const titles = feed.querySelectorAll(".title"); titles[3].className = "channel"; titles[5].textContent = "Renamed"; feed.querySelectorAll(".channel")[4].className = "title"; feed.removeAttribute("flag"); read(); feed.setAttribute("flag", ""); },
+  () => { const p = document.createElement("div"); p.className = "preview"; p.style.left = "700px"; p.style.top = "2700px"; p.style.background = "#3050c0"; app.appendChild(p); },
+  () => { const s = document.createElement("div"); s.className = "section placeholder"; s.id = "pending"; feed.appendChild(s); read(); },
+  () => { document.getElementById("pending").replaceWith(section(8, false)); feed.classList.add("dense"); },
+  () => { feed.children[0].children[1].remove(); feed.children[2].children[0].querySelector(".thumb").style.background = "#ffffff"; },
+  () => { feed.removeAttribute("other"); read(); feed.classList.remove("marked"); read(); feed.classList.add("marked"); },
+  // The document grows by a composited box below everything (nothing is
+  // painted into the page layer for it), then grows again.
+  () => { const b = document.createElement("div"); b.id = "below"; b.style.cssText = "position:absolute;left:300px;width:400px;height:300px;will-change:transform;background:#806020"; b.style.top = (document.documentElement.scrollHeight + 500) + "px"; app.appendChild(b); },
+  () => { document.getElementById("below").style.height = "700px"; },
+  // Small changes far apart in one composited layer without a background.
+  () => { const lift = feed.querySelectorAll(".lift")[3]; lift.querySelector(".title").textContent = "Lifted and renamed"; lift.querySelector(".label").textContent = "9:59"; lift.querySelector(".menu").style.background = "#e0e040"; lift.querySelector(".thumb").style.outline = "4px solid #ff8080"; },
+  () => { window.scrollTo(0, finalY); },
+  () => { document.getElementById("status").textContent = "done: " + made + " items, height " + document.documentElement.scrollHeight; console.log("FEEDREPAINT done, scrollY " + window.scrollY + ", height " + document.documentElement.scrollHeight); },
+];
+let next = 0;
+function run() {
+  steps[next++]();
+  if (next < steps.length)
+    setTimeout(() => requestAnimationFrame(run), 300);
+}
+addEventListener("load", () => setTimeout(run, 500));
+</script>

@@ -1,0 +1,817 @@
+diff --git a/Source/WebCore/page/LocalFrameView.cpp b/Source/WebCore/page/LocalFrameView.cpp
+index b4468c93dd..531374b100 100644
+--- a/Source/WebCore/page/LocalFrameView.cpp
++++ b/Source/WebCore/page/LocalFrameView.cpp
+@@ -980,6 +980,15 @@ bool LocalFrameView::flushCompositingStateForThisFrame(const LocalFrame& rootFra
+     if (needsLayout())
+         return false;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: compositing updates after style changes wait for the rendering
++    // update (LocalFrameViewLayoutContext::updateCompositingLayersAfterStyleChange);
++    // one that is still pending here (script ran after the final layout step)
++    // runs before the layers are flushed.
++    if (m_layoutContext.updateCompositingLayersAfterLayoutIfNeeded() && needsLayout())
++        return false;
++#endif
++
+ #if PLATFORM(IOS_FAMILY)
+     if (RefPtr tileCache = legacyTileCache())
+         tileCache->doPendingRepaints();
+diff --git a/Source/WebCore/page/LocalFrameViewLayoutContext.cpp b/Source/WebCore/page/LocalFrameViewLayoutContext.cpp
+index bdd989acb6..c8509f706d 100644
+--- a/Source/WebCore/page/LocalFrameViewLayoutContext.cpp
++++ b/Source/WebCore/page/LocalFrameViewLayoutContext.cpp
+@@ -439,6 +439,26 @@ bool LocalFrameViewLayoutContext::updateCompositingLayersAfterStyleChange()
+ 
+     m_lastRepaintRectEnvironment = WTF::move(repaintRectEnvironment);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: a style recalc with no layout pending ran a whole compositing
++    // update at once (the requirements traversal visits every render layer
++    // after the first changed one in paint order). A page that changes styles
++    // and then reads clientWidth and the like, per item of a long feed, paid
++    // that several times per frame (7 % of the main thread while such a feed
++    // scrolled, 48 traversals for 34 rendering updates). The update is left
++    // pending instead, as after a layout: the rendering update's final layout
++    // step (LayoutOptions::UpdateCompositingLayers) runs it once, and
++    // LocalFrameView::flushCompositingStateForThisFrame never flushes with one
++    // pending. The layers' dirty bits stay set until then, so nothing is lost.
++    // PS5WK_DEFER_STYLE_COMPOSITING=0 (child.env): old behaviour.
++    static const bool deferred = !getenv("PS5WK_DEFER_STYLE_COMPOSITING") || strcmp(getenv("PS5WK_DEFER_STYLE_COMPOSITING"), "0");
++    if (deferred && view->usesCompositing()) {
++        m_updateCompositingLayersIsPending = true;
++        m_ps5ViewportContentsChangedIsPending = true;
++        protect(view->page())->scheduleRenderingUpdate({ RenderingUpdateStep::LayerFlush });
++        return false;
++    }
++#endif
+     return protect(view->compositor())->didRecalcStyleWithNoPendingLayout();
+ }
+ 
+@@ -646,6 +666,13 @@ void LocalFrameViewLayoutContext::updateCompositingLayersAfterLayout()
+ 
+     protect(renderView->compositor())->updateCompositingLayers(CompositingUpdateType::AfterLayout);
+     m_updateCompositingLayersIsPending = false;
++#if defined(PS5_PAYLOAD_SDK)
++    // What Document::resolveStyle does after a compositing update with no
++    // layout pending (animated images that came into view resume), for the
++    // update updateCompositingLayersAfterStyleChange left to this one.
++    if (std::exchange(m_ps5ViewportContentsChangedIsPending, false) && !needsLayout())
++        protect(view())->viewportContentsChanged();
++#endif
+ }
+ 
+ bool LocalFrameViewLayoutContext::updateCompositingLayersAfterLayoutIfNeeded()
+diff --git a/Source/WebCore/page/LocalFrameViewLayoutContext.h b/Source/WebCore/page/LocalFrameViewLayoutContext.h
+index 32f16bd3aa..de4868eda2 100644
+--- a/Source/WebCore/page/LocalFrameViewLayoutContext.h
++++ b/Source/WebCore/page/LocalFrameViewLayoutContext.h
+@@ -287,6 +287,9 @@ private:
+     bool m_visiblityAutoIsIgnored { false };
+     bool m_revealedWhenFoundIgnored { false };
+     bool m_updateCompositingLayersIsPending { false };
++#if defined(PS5_PAYLOAD_SDK)
++    bool m_ps5ViewportContentsChangedIsPending { false };
++#endif
+     bool m_repaintsBlocked { false };
+     ExcludedMarkerList m_excludedMarkers;
+     LayoutPhase m_layoutPhase { LayoutPhase::OutsideLayout };
+diff --git a/Source/WebCore/rendering/LayoutRepainter.cpp b/Source/WebCore/rendering/LayoutRepainter.cpp
+index 6b21156853..479d356f00 100644
+--- a/Source/WebCore/rendering/LayoutRepainter.cpp
++++ b/Source/WebCore/rendering/LayoutRepainter.cpp
+@@ -31,6 +31,13 @@
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// RenderElement.cpp ("Self layout without a full repaint").
++bool ps5SelfLayoutNeedsNoFullRepaint(const RenderElement&);
++void ps5NoteFullRepaintRequired(RenderElement&);
++void ps5ClearFullRepaintRequired(RenderElement&);
++#endif
++
+ LayoutRepainter::LayoutRepainter(RenderElement& renderer, std::optional<CheckForRepaint> checkForRepaintOverride, std::optional<ShouldAlwaysIssueFullRepaint> shouldAlwaysIssueFullRepaint, RepaintOutlineBounds repaintOutlineBounds)
+     : m_renderer(renderer)
+     , m_checkForRepaint(checkForRepaintOverride ? *checkForRepaintOverride == CheckForRepaint::Yes : m_renderer->checkForRepaintDuringLayout())
+@@ -50,6 +57,11 @@ bool LayoutRepainter::repaintAfterLayout()
+         return false;
+ 
+     auto requiresFullRepaint = m_forceFullRepaint || m_renderer->selfNeedsLayout() ? RequiresFullRepaint::Yes : RequiresFullRepaint::No;
++#if defined(PS5_PAYLOAD_SDK)
++    if (requiresFullRepaint == RequiresFullRepaint::Yes && !m_forceFullRepaint && ps5SelfLayoutNeedsNoFullRepaint(m_renderer.get()))
++        requiresFullRepaint = RequiresFullRepaint::No;
++    ps5ClearFullRepaintRequired(m_renderer.get());
++#endif
+     // Outline bounds are not used if we're doing a full repaint.
+     auto newRects = m_renderer->rectsForRepaintingAfterLayout(m_repaintContainer, (requiresFullRepaint == RequiresFullRepaint::Yes) ? RepaintOutlineBounds::No : m_repaintOutlineBounds);
+     return m_renderer->repaintAfterLayoutIfNeeded(m_repaintContainer, requiresFullRepaint, m_oldRects, newRects);
+diff --git a/Source/WebCore/rendering/RenderBlockFlow.cpp b/Source/WebCore/rendering/RenderBlockFlow.cpp
+index 54a4934fdd..fb97253a53 100644
+--- a/Source/WebCore/rendering/RenderBlockFlow.cpp
++++ b/Source/WebCore/rendering/RenderBlockFlow.cpp
+@@ -93,6 +93,13 @@
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// RenderElement.cpp ("Self layout without a full repaint").
++bool ps5SelfLayoutNeedsNoFullRepaint(const RenderElement&);
++void ps5NoteFullRepaintRequired(RenderElement&);
++void ps5ClearFullRepaintRequired(RenderElement&);
++#endif
++
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderBlockFlow);
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderBlockFlowRareData);
+ 
+@@ -1355,7 +1362,12 @@ void RenderBlockFlow::layoutBlockChild(RenderBox& child, MarginInfo& marginInfo,
+         // If the child moved, we have to repaint it as well as any floating/positioned
+         // descendants. An exception is if we need a layout. In this case, we know we're going to
+         // repaint ourselves (and the child) anyway.
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: or we will not repaint ourselves (RenderElement.cpp, "Self layout without a full repaint").
++        if (childHadLayout && (!selfNeedsLayout() || ps5SelfLayoutNeedsNoFullRepaint(*this)) && child.checkForRepaintDuringLayout())
++#else
+         if (childHadLayout && !selfNeedsLayout() && child.checkForRepaintDuringLayout())
++#endif
+             child.repaintDuringLayoutIfMoved(oldRect);
+     }
+ 
+diff --git a/Source/WebCore/rendering/RenderElement.cpp b/Source/WebCore/rendering/RenderElement.cpp
+index f845a29d3a..a01638f169 100644
+--- a/Source/WebCore/rendering/RenderElement.cpp
++++ b/Source/WebCore/rendering/RenderElement.cpp
+@@ -114,6 +114,11 @@
+ #include "TextAutoSizing.h"
+ #include "TextManipulationController.h"
+ #include "ViewTransition.h"
++#include "RenderBlockFlow.h"
++#include <wtf/WeakHashSet.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/text/StringBuilder.h>
++#include <wtf/SetForScope.h>
+ #include <wtf/MathExtras.h>
+ #include <wtf/StackStats.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -636,6 +641,22 @@ void RenderElement::setStyle(Style::ComputedStyle&& style, Style::DifferenceResu
+     diff.result = std::max(diff.result, minimalStyleDifference);
+     diff = adjustStyleDifference(diff);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5WK_REPAINT_LOG=1 (child.env): style changes that need a layout of a
++    // large box (its full repaint after that layout is the [repaint] line).
++    static const bool logLargeRepaints = getenv("PS5WK_REPAINT_LOG") && !strcmp(getenv("PS5WK_REPAINT_LOG"), "1");
++    if (logLargeRepaints && m_hasInitializedStyle && diff.result >= Style::DifferenceResult::LayoutOutOfFlowMovementOnly) {
++        if (CheckedPtr box = dynamicDowncast<RenderBox>(*this); box && box->borderBoxRect().width().toFloat() * box->borderBoxRect().height().toFloat() >= 3e6) {
++            StringBuilder attributes;
++            if (RefPtr element = this->element(); element && element->hasAttributes()) {
++                for (auto& attribute : element->attributes())
++                    attributes.append(' ', attribute.localName(), "='"_s, StringView(attribute.value()).left(100), '\'');
++            }
++            WTFLogAlways("[repaint] style change needing layout (difference %d, minimal %d) on %s%s", static_cast<int>(diff.result), static_cast<int>(minimalStyleDifference), renderName().characters(), attributes.toString().utf8().data()); // NOLINT
++        }
++    }
++#endif
++
+     Style::loadPendingResources(style, protect(document()), protect(element()).get());
+ 
+     auto didRepaint = repaintBeforeStyleChange(diff, m_style, style);
+@@ -1411,8 +1432,86 @@ void RenderElement::clearChildNeedsLayout()
+     setOutOfFlowChildNeedsStaticPositionLayoutBit(false);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Self layout without a full repaint (PS5). A box that needs layout itself
++// (not only its children) repaints its whole rect after the layout, because
++// that is what covers a style change that came with it, its own lines of
++// text, and its children that moved (they skip their own repaint when the
++// parent "repaints anyway"). On a long feed the page's top containers are
++// marked that way without any change of their own (a child added or removed
++// directly under them: a hover preview, the next batch of results), and each
++// time the whole document was invalidated: every tile of the page layer
++// painted again, 4-8 Mpx per time, 4-5 times the area the scroll uncovered.
++// A plain block or flex container with no lines of its own and no floats,
++// whose need for layout did not come from a style change (or anything else
++// that asks for a full repaint by name: the set below), is treated like one
++// whose children need layout: its children that moved repaint themselves
++// (RenderBlockFlow::layoutBlockChild, RenderFlexibleBox), and after layout
++// only what its rect gained or lost is repainted (repaintAfterLayoutIfNeeded's
++// rules for a box that was not laid out itself: a move, or a resize with a
++// size-dependent background, still repaints all of it).
++// PS5WK_SELF_LAYOUT_REPAINT=0 (child.env): old behaviour.
++static SingleThreadWeakHashSet<RenderElement>& ps5FullRepaintRequired()
++{
++    static NeverDestroyed<SingleThreadWeakHashSet<RenderElement>> set;
++    return set;
++}
++
++static bool ps5SelfLayoutRepaintEnabled()
++{
++    static const bool enabled = !getenv("PS5WK_SELF_LAYOUT_REPAINT") || strcmp(getenv("PS5WK_SELF_LAYOUT_REPAINT"), "0");
++    return enabled;
++}
++
++static bool ps5IsPlainContainer(const RenderElement& renderer)
++{
++    if (renderer.type() != RenderObject::Type::BlockFlow && renderer.type() != RenderObject::Type::FlexibleBox)
++        return false;
++    if (renderer.isAnonymous() || !renderer.element() || renderer.isDocumentElementRenderer() || renderer.isBody())
++        return false;
++    return true;
++}
++
++void ps5NoteFullRepaintRequired(RenderElement& renderer)
++{
++    if (ps5SelfLayoutRepaintEnabled() && ps5IsPlainContainer(renderer))
++        ps5FullRepaintRequired().add(renderer);
++}
++
++void ps5ClearFullRepaintRequired(RenderElement& renderer)
++{
++    if (!ps5FullRepaintRequired().isEmptyIgnoringNullReferences())
++        ps5FullRepaintRequired().remove(renderer);
++}
++
++bool ps5SelfLayoutNeedsNoFullRepaint(const RenderElement& renderer)
++{
++    if (!ps5SelfLayoutRepaintEnabled() || !ps5IsPlainContainer(renderer))
++        return false;
++    if (renderer.fragmentedFlowState() != RenderObject::FragmentedFlowState::NotInsideFlow)
++        return false;
++    // Not where the full repaint covers more than children that moved: a
++    // clip path, mask or filter (their resources ask for a full repaint
++    // without saying so here), children shifted after layout by
++    // align-content, and a fieldset's legend with the border's gap for it.
++    if (renderer.hasClipPath() || renderer.hasMask() || renderer.hasFilter() || !renderer.style().alignContent().isNormal())
++        return false;
++    if (renderer.element() && renderer.element()->hasTagName(HTMLNames::fieldsetTag))
++        return false;
++    if (CheckedPtr blockFlow = dynamicDowncast<RenderBlockFlow>(renderer)) {
++        if (blockFlow->childrenInline() || blockFlow->containsFloats() || blockFlow->multiColumnFlow())
++            return false;
++    }
++    return !ps5FullRepaintRequired().contains(renderer);
++}
++#endif
++
+ void RenderElement::setNeedsLayoutForStyleDifference(Style::Difference diff, const Style::ComputedStyle* oldStyle)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (diff >= Style::DifferenceResult::LayoutOutOfFlowMovementOnly)
++        ps5NoteFullRepaintRequired(*this);
++#endif
+     if (diff == Style::DifferenceResult::Layout)
+         setNeedsLayoutAndInvalidateContentLogicalWidths();
+     else if (diff == Style::DifferenceResult::LayoutOutOfFlowMovementOnly)
+@@ -1549,6 +1648,10 @@ template<typename FillLayers> static bool mustRepaintFillLayers(const RenderElem
+     );
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++extern const char* ps5RepaintWhy; // RenderObject.cpp
++#endif
++
+ bool RenderElement::repaintAfterLayoutIfNeeded(SingleThreadWeakPtr<const RenderLayerModelObject>&& repaintContainer, RequiresFullRepaint requiresFullRepaint, const RepaintRects& oldRects, const RepaintRects& newRects)
+ {
+     if (view().printing())
+@@ -1592,30 +1695,50 @@ bool RenderElement::repaintAfterLayoutIfNeeded(SingleThreadWeakPtr<const RenderL
+         return false;
+     };
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    const char* ps5Why = "after layout: edges";
++#define PS5_WHY(text) ps5Why = "after layout: " text
++#else
++#define PS5_WHY(text)
++#endif
+     auto fullRepaint = [&]() {
+-        if (requiresFullRepaint == RequiresFullRepaint::Yes)
++        if (requiresFullRepaint == RequiresFullRepaint::Yes) {
++            PS5_WHY("full repaint required (self layout or style)");
+             return true;
++        }
+ 
+-        if (oldClippedOverflowRect.isEmpty() || newClippedOverflowRect.isEmpty())
++        if (oldClippedOverflowRect.isEmpty() || newClippedOverflowRect.isEmpty()) {
++            PS5_WHY("old or new rect empty");
+             return true;
++        }
+ 
+-        if (!oldClippedOverflowRect.intersects(newClippedOverflowRect))
++        if (!oldClippedOverflowRect.intersects(newClippedOverflowRect)) {
++            PS5_WHY("moved away");
+             return true;
++        }
+ 
+         if (!haveOutlinesBoundsRects)
+             return false;
+ 
+         // If our outline bounds rect moved, we have to repaint everything.
+-        if (oldRects.outlineBoundsRect->location() != newRects.outlineBoundsRect->location())
++        if (oldRects.outlineBoundsRect->location() != newRects.outlineBoundsRect->location()) {
++            PS5_WHY("outline bounds moved");
+             return true;
++        }
+ 
+         // If our outline bounds rect resized (as a proxy for a border box resize),
+         // we have to repaint if we paint content that scales with the size.
+-        if (oldRects.outlineBoundsRect->size() != newRects.outlineBoundsRect->size() && mustFullRepaintOnSizeChange(*oldRects.outlineBoundsRect, *newRects.outlineBoundsRect))
++        if (oldRects.outlineBoundsRect->size() != newRects.outlineBoundsRect->size() && mustFullRepaintOnSizeChange(*oldRects.outlineBoundsRect, *newRects.outlineBoundsRect)) {
++            PS5_WHY("resized with a background, border, mask or filter that depends on the size");
+             return true;
++        }
+ 
+         return false;
+     }();
++#undef PS5_WHY
++#if defined(PS5_PAYLOAD_SDK)
++    SetForScope ps5WhyScope(ps5RepaintWhy, ps5Why);
++#endif
+ 
+     if (!repaintContainer)
+         repaintContainer = &view();
+diff --git a/Source/WebCore/rendering/RenderFlexibleBox.cpp b/Source/WebCore/rendering/RenderFlexibleBox.cpp
+index f8c27fbe9d..d78bc3266a 100644
+--- a/Source/WebCore/rendering/RenderFlexibleBox.cpp
++++ b/Source/WebCore/rendering/RenderFlexibleBox.cpp
+@@ -62,6 +62,13 @@
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// RenderElement.cpp ("Self layout without a full repaint").
++bool ps5SelfLayoutNeedsNoFullRepaint(const RenderElement&);
++void ps5NoteFullRepaintRequired(RenderElement&);
++void ps5ClearFullRepaintRequired(RenderElement&);
++#endif
++
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderFlexibleBox);
+ 
+ RenderFlexibleBox::RenderFlexibleBox(Type type, Element& element, Style::ComputedStyle&& style)
+@@ -231,7 +238,12 @@ void RenderFlexibleBox::repaintFlexItemsDuringLayoutIfMoved(const FlexItemBorder
+         // If the child moved, we have to repaint it as well as any floating/positioned
+         // descendants. An exception is if we need a layout. In this case, we know we're going to
+         // repaint ourselves (and the child) anyway.
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: or we will not repaint ourselves (RenderElement.cpp, "Self layout without a full repaint").
++        if ((!selfNeedsLayout() || ps5SelfLayoutNeedsNoFullRepaint(*this)) && flexItem.checkForRepaintDuringLayout())
++#else
+         if (!selfNeedsLayout() && flexItem.checkForRepaintDuringLayout())
++#endif
+             flexItem.repaintDuringLayoutIfMoved(oldFlexItemRects[index]);
+         ++index;
+     }
+diff --git a/Source/WebCore/rendering/RenderLayer.cpp b/Source/WebCore/rendering/RenderLayer.cpp
+index 5e8f948a3e..a57f5ed749 100644
+--- a/Source/WebCore/rendering/RenderLayer.cpp
++++ b/Source/WebCore/rendering/RenderLayer.cpp
+@@ -173,6 +173,9 @@
+ #include "WheelEventTestMonitor.h"
+ #include <ranges>
+ #include <stdio.h>
++#include <array>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/Scope.h>
+ #include <wtf/HexNumber.h>
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/StdLibExtras.h>
+@@ -187,6 +190,13 @@
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// RenderElement.cpp ("Self layout without a full repaint").
++bool ps5SelfLayoutNeedsNoFullRepaint(const RenderElement&);
++void ps5NoteFullRepaintRequired(RenderElement&);
++void ps5ClearFullRepaintRequired(RenderElement&);
++#endif
++
+ using namespace HTMLNames;
+ 
+ class ClipRects : public RefCounted<ClipRects> {
+@@ -602,6 +612,9 @@ void RenderLayer::removeOnlyThisLayer()
+         removeChild(*current);
+         m_parent->addChild(*current, nextSib);
+         current->setRepaintStatus(RepaintStatus::NeedsFullRepaint);
++#if defined(PS5_PAYLOAD_SDK)
++        ps5NoteFullRepaintRequired(current->renderer());
++#endif
+         if (isComposited())
+             current->updateRepaintRectsIncludingDescendants(RepaintRectsUpdate::Recompute);
+         current = next;
+@@ -1368,12 +1381,23 @@ void RenderLayer::recursiveUpdateLayerPositions(OptionSet<UpdateLayerPositionsFl
+ 
+         if (checkForRepaint && shouldRepaintAfterLayout() && newRects) {
+             auto needsFullRepaint = repaintStatus() == RepaintStatus::NeedsFullRepaint ? RequiresFullRepaint::Yes : RequiresFullRepaint::No;
++#if defined(PS5_PAYLOAD_SDK)
++            // A layer's box that was laid out itself for no reason of its own
++            // (RenderElement.cpp, "Self layout without a full repaint"); a
++            // layer without earlier rects is new here and repaints fully.
++            if (needsFullRepaint == RequiresFullRepaint::Yes && oldRects && ps5SelfLayoutNeedsNoFullRepaint(renderer()))
++                needsFullRepaint = RequiresFullRepaint::No;
++#endif
+             auto resolvedOldRects = valueOrDefault(oldRects);
+             renderer().repaintAfterLayoutIfNeeded(WTF::move(repaintContainer), needsFullRepaint, resolvedOldRects, *newRects);
+         }
+     };
+ 
+     repaintIfNecessary(flags.contains(CheckForRepaint));
++#if defined(PS5_PAYLOAD_SDK)
++    if (mode == Write && flags.contains(CheckForRepaint))
++        ps5ClearFullRepaintRequired(renderer());
++#endif
+ 
+ #define UPDATE_OR_VERIFY_STATE_BIT(dest, source) \
+     if (mode == Write) \
+@@ -1540,11 +1564,30 @@ bool RenderLayer::scheduledFullRepaintCoversContentPaintedBy(const RenderLayer&
+     // Only NeedsFullRepaint is repainted in full after layout, and only within this layer's visual overflow.
+     if (!isSelfPaintingLayer() || m_repaintStatus != RepaintStatus::NeedsFullRepaint)
+         return false;
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: no full repaint is coming for a box that was only laid out itself
++    // (RenderElement.cpp, "Self layout without a full repaint"), so what it
++    // paints repaints itself. A caller that does leave out its own repaint
++    // because of this answer must get the full repaint: from then on the box
++    // is not one that may do without it.
++    if (ps5SelfLayoutNeedsNoFullRepaint(renderer()))
++        return false;
++    auto covers = [&] {
++        ps5NoteFullRepaintRequired(const_cast<RenderLayerModelObject&>(renderer()));
++        return true;
++    };
++    if (&paintingLayer == this)
++        return covers();
++    auto paintingLayerRect = paintingLayer.cachedClippedOverflowRect();
++    auto layerRect = cachedClippedOverflowRect();
++    return paintingLayerRect && layerRect && paintingLayer.repaintContainer() == repaintContainer() && layerRect->contains(*paintingLayerRect) && covers();
++#else
+     if (&paintingLayer == this)
+         return true;
+     auto paintingLayerRect = paintingLayer.cachedClippedOverflowRect();
+     auto layerRect = cachedClippedOverflowRect();
+     return paintingLayerRect && layerRect && paintingLayer.repaintContainer() == repaintContainer() && layerRect->contains(*paintingLayerRect);
++#endif
+ }
+ 
+ void RenderLayer::computeRepaintRects(const RenderLayerModelObject* repaintContainer)
+@@ -4275,6 +4318,104 @@ void RenderLayer::paintList(LayerList layerIterator, GraphicsContext& context, c
+     LayerListMutationDetector mutationChecker(*this);
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // An index of a long list for the rendering update (PS5). The leaf-layer
++    // cull (ps5CanSkipPaintingOutsideDirtyRect) answers from each layer's own
++    // cache, but a pass over a z-order list of thousands of layers still
++    // loaded every one of them to read it (3-4 % of the main thread while a
++    // long feed scrolled, several passes per update). The answers are copied
++    // into one array per list, in list order: a pass then reads the array and
++    // touches only the layers it paints. Same key as the layers' caches (the
++    // rendering update, the layout and layer position counters, the root),
++    // and each entry is used only for the layer it was made for.
++    // PS5WK_PAINT_LIST_INDEX=0 (child.env): every layer asked, as before.
++    struct PS5PaintListIndex {
++        struct Entry {
++            const RenderLayer* layer;
++            LayoutRect bounds;
++            PS5PaintCull state;
++        };
++        const RenderLayer* owner { nullptr };
++        RenderLayer** listBegin { nullptr };
++        PS5PaintCullCache key;
++        Vector<Entry> entries;
++        bool inUse { false };
++    };
++    static const bool listIndexEnabled = (!getenv("PS5WK_PAINT_LIST_INDEX") || strcmp(getenv("PS5WK_PAINT_LIST_INDEX"), "0")) && (!getenv("PS5WK_PAINT_CULL") || strcmp(getenv("PS5WK_PAINT_CULL"), "0"));
++    bool cullApplies = listIndexEnabled && layerIterator.size() >= 64
++        && !paintingInfo.paintDirtyRect.isInfinite() && !paintingInfo.regionContext && !paintingInfo.overlapTestRequests && paintingInfo.rootLayer
++        && !paintFlags.containsAny({ PaintLayerFlag::CollectingEventRegion, PaintLayerFlag::PaintingOverlayScrollbars, PaintLayerFlag::PaintingReflection, PaintLayerFlag::AppliedTransform, PaintLayerFlag::PaintingSkipDescendantViewTransition })
++        && !paintingInfo.paintBehavior.containsAny({ PaintBehavior::FlattenCompositingLayers, PaintBehavior::Snapshotting });
++    if (cullApplies) {
++        static NeverDestroyed<std::array<PS5PaintListIndex, 2>> indexes;
++        static unsigned nextIndex;
++        PS5PaintListIndex* index = nullptr;
++        for (auto& candidate : indexes.get()) {
++            if (!candidate.inUse && candidate.owner == this && candidate.listBegin == layerIterator.begin())
++                index = &candidate;
++        }
++        if (!index) {
++            auto& candidate = indexes.get()[nextIndex++ % 2];
++            if (!candidate.inUse) {
++                candidate.owner = this;
++                candidate.listBegin = layerIterator.begin();
++                candidate.key = { };
++                candidate.entries.clear();
++                index = &candidate;
++            }
++        }
++        if (index) {
++            auto& layoutContext = renderer().view().frameView().layoutContext();
++            auto update = page().lastRenderingUpdateTimestamp();
++            auto& key = index->key;
++            if (key.root != paintingInfo.rootLayer || key.update != update || key.layouts != layoutContext.layoutUpdateCount() || key.positions != layoutContext.renderLayerPositionUpdateCount() || index->entries.size() != layerIterator.size()) {
++                key.root = paintingInfo.rootLayer;
++                key.update = update;
++                key.layouts = layoutContext.layoutUpdateCount();
++                key.positions = layoutContext.renderLayerPositionUpdateCount();
++                index->entries.resize(0);
++                index->entries.reserveCapacity(layerIterator.size());
++                for (auto* childLayer : layerIterator) {
++                    PS5PaintListIndex::Entry entry { childLayer, { }, PS5PaintCull::NotEligible };
++                    // The root itself is never skipped (ps5CanSkipPaintingOutsideDirtyRect).
++                    if (childLayer != paintingInfo.rootLayer) {
++                        auto& cache = childLayer->m_ps5PaintCull;
++                        if (cache.root != key.root || cache.update != key.update || cache.layouts != key.layouts || cache.positions != key.positions) {
++                            cache.root = key.root;
++                            cache.update = key.update;
++                            cache.layouts = key.layouts;
++                            cache.positions = key.positions;
++                            cache.state = childLayer->ps5PaintCullState(*paintingInfo.rootLayer, cache.bounds);
++                        }
++                        entry.bounds = cache.bounds;
++                        entry.state = cache.state;
++                    }
++                    index->entries.append(entry);
++                }
++            }
++            index->inUse = true;
++            auto release = makeScopeExit([index] {
++                index->inUse = false;
++            });
++            // A copy of the pointer: nothing below changes this list (painting
++            // never does), and the entries are checked against it anyway.
++            size_t position = 0;
++            for (auto* childLayer : layerIterator) {
++                if (position < index->entries.size()) {
++                    auto& entry = index->entries[position++];
++                    if (entry.layer == childLayer && entry.state == PS5PaintCull::Eligible && !entry.bounds.intersects(paintingInfo.paintDirtyRect)) {
++                        s_ps5PaintCull[0]++;
++                        s_ps5PaintCull[1]++;
++                        continue;
++                    }
++                }
++                childLayer->paintLayer(context, paintingInfo, paintFlags);
++            }
++            return;
++        }
++    }
++#endif
++
+     for (auto* childLayer : layerIterator) {
+         if (paintFlags.contains(PaintLayerFlag::PaintingSkipDescendantViewTransition)) {
+             if (childLayer->renderer().effectiveCapturedInViewTransition())
+diff --git a/Source/WebCore/rendering/RenderLayerModelObject.cpp b/Source/WebCore/rendering/RenderLayerModelObject.cpp
+index b3840a7263..f1d4bc7ad4 100644
+--- a/Source/WebCore/rendering/RenderLayerModelObject.cpp
++++ b/Source/WebCore/rendering/RenderLayerModelObject.cpp
+@@ -71,6 +71,13 @@
+ 
+ namespace WebCore {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// RenderElement.cpp ("Self layout without a full repaint").
++bool ps5SelfLayoutNeedsNoFullRepaint(const RenderElement&);
++void ps5NoteFullRepaintRequired(RenderElement&);
++void ps5ClearFullRepaintRequired(RenderElement&);
++#endif
++
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderLayerModelObject);
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(SVGPaintServerCache);
+ 
+@@ -128,6 +135,9 @@ bool RenderLayerModelObject::createLayerIfAllowed()
+     createLayer();
+     if (parent() && !needsLayout())
+         m_layer->setRepaintStatus(RepaintStatus::NeedsFullRepaint);
++#if defined(PS5_PAYLOAD_SDK)
++    ps5NoteFullRepaintRequired(*this);
++#endif
+     return true;
+ }
+ 
+diff --git a/Source/WebCore/rendering/RenderObject.cpp b/Source/WebCore/rendering/RenderObject.cpp
+index c93dbbe217..8efc81c042 100644
+--- a/Source/WebCore/rendering/RenderObject.cpp
++++ b/Source/WebCore/rendering/RenderObject.cpp
+@@ -101,6 +101,7 @@
+ #include "VisibleRectContext.h"
+ #include <algorithm>
+ #include <stdio.h>
++#include <wtf/text/StringBuilder.h>
+ #include <wtf/HexNumber.h>
+ #include <wtf/ScopedLambda.h>
+ #include <wtf/Seconds.h>
+@@ -982,11 +983,33 @@ static void requestCanvasPaintEventIfNeeded(const RenderObject& renderer, const
+         canvasRenderer->requestPaintEventIfNeeded(*renderElement);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++const char* ps5RepaintWhy;
++#endif
++
+ void RenderObject::repaintUsingContainer(SingleThreadWeakPtr<const RenderLayerModelObject>&& repaintContainer, const LayoutRect& r, ClipRepaintToLayer clipRepaintToLayer, RepaintRectIsPartial rectIsPartial) const
+ {
+     if (r.isEmpty())
+         return;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5WK_REPAINT_LOG=1 (child.env): who asks for large repaints (3 Mpx and
++    // more), and why when it is a repaint after layout (ps5RepaintWhy).
++    static const bool logLargeRepaints = getenv("PS5WK_REPAINT_LOG") && !strcmp(getenv("PS5WK_REPAINT_LOG"), "1");
++    if (logLargeRepaints && r.width().toFloat() * r.height().toFloat() >= 3e6) {
++        StringBuilder who;
++        who.append(renderName());
++        if (RefPtr element = dynamicDowncast<Element>(node())) {
++            who.append(' ', element->tagName());
++            if (element->hasID())
++                who.append('#', element->getIdAttribute());
++            if (element->hasClass())
++                who.append(" class='"_s, StringView(element->getAttribute(HTMLNames::classAttr)).left(60), '\'');
++        }
++        WTFLogAlways("[repaint] %.0fx%.0f+%.0f+%.0f by %s (%s)", r.width().toFloat(), r.height().toFloat(), r.x().toFloat(), r.y().toFloat(), who.toString().utf8().data(), ps5RepaintWhy ? ps5RepaintWhy : "direct"); // NOLINT
++    }
++#endif
++
+     if (!repaintContainer)
+         repaintContainer = &view();
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index 0dcf399a1d..ac7dbbc83d 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -468,6 +468,27 @@ void GraphicsLayerWC::setAnchorPoint(const FloatPoint3D& point)
+     noteLayerPropertyChanged(WCLayerChange::AnchorPoint);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: GraphicsLayer::setSize repaints the whole layer when its size changes,
++// which for a layer that is one bitmap is needed (the bitmap would stretch).
++// Here every layer is a grid of tiles: WCTileGrid::setSize keeps the tiles
++// whose rect is the same and drops the ones at the changed edges (new tiles
++// start dirty), and layout repaints what the page changed. On an infinite
++// feed the document's height changes twice for every batch of results (a
++// placeholder, then the items), and each time every tile of the page layer
++// was painted again: 6-8 Mpx per change, about half of all the pixels painted
++// while such a feed scrolled. Layers larger than one tile are not repainted
++// for a size change (as GraphicsLayerCA does for its tiled layers); a small
++// layer still is. PS5WK_WC_RESIZE_REPAINT=1 (child.env): old behaviour.
++bool GraphicsLayerWC::shouldRepaintOnSizeChange() const
++{
++    static const bool always = getenv("PS5WK_WC_RESIZE_REPAINT") && !strcmp(getenv("PS5WK_WC_RESIZE_REPAINT"), "1");
++    if (!drawsContent())
++        return false;
++    return always || (m_size.width() <= 512 && m_size.height() <= 512);
++}
++#endif
++
+ void GraphicsLayerWC::setSize(const FloatSize& size)
+ {
+     if (size == m_size)
+@@ -475,6 +496,15 @@ void GraphicsLayerWC::setSize(const FloatSize& size)
+     GraphicsLayer::setSize(size);
+     m_tiledBacking->setSize(size);
+     noteLayerPropertyChanged(WCLayerChange::Size);
++#if defined(PS5_PAYLOAD_SDK)
++    // The scene's backing store takes its size with a Background change
++    // (WCScene: backingStore.setSize) and draws its tiles scaled to the
++    // layer's size until then. The whole-layer repaint of a size change used
++    // to bring one; without it (shouldRepaintOnSizeChange) one is noted here.
++    // Nothing is painted for it: only dirty tiles are.
++    if (drawsContent())
++        noteLayerPropertyChanged(WCLayerChange::Background);
++#endif
+ }
+ 
+ void GraphicsLayerWC::setBoundsOrigin(const FloatPoint& origin)
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index c34594bd43..090817b518 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -118,6 +118,9 @@ public:
+     void syncPosition(const WebCore::FloatPoint&) override;
+     void setAnchorPoint(const WebCore::FloatPoint3D&) override;
+     void setSize(const WebCore::FloatSize&) override;
++#if defined(PS5_PAYLOAD_SDK)
++    bool shouldRepaintOnSizeChange() const override;
++#endif
+     void setBoundsOrigin(const WebCore::FloatPoint&) override;
+     void syncBoundsOrigin(const WebCore::FloatPoint&) override;
+     void setTransform(const WebCore::TransformationMatrix&) override;
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+index 92049bfe67..f3089ec768 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -97,6 +97,12 @@ static uint64_t recordMinPixels()
+     return pixels;
+ }
+ 
++static bool recordSmallParts()
++{
++    static bool enabled = envUnsigned("PS5WK_WC_PAINT_PASSES", 4, 0, 64);
++    return enabled;
++}
++
+ static WorkerPool& paintPool()
+ {
+     static NeverDestroyed<Ref<WorkerPool>> pool = WorkerPool::create("WCPaint"_s, std::max(1u, paintThreads() - (paintAsync() ? 0 : 1)));
+@@ -425,6 +431,82 @@ static void paintDirect(GraphicsLayerWC& layer, const IntRect& layerRect, const
+     layer.paintGraphicsLayerContents(context, layerRect);
+ }
+ 
++// The rects one recording paints, from the rects of the dirty region. Each
++// rect painted is a pass over the layer's whole paint order (on a long feed
++// the root's z-order list has thousands of entries, about 0.7 ms per pass
++// whatever the rect's size), and a frame with a few thumbnails arriving and a
++// new tile row had 10 and more rects: the passes, not the pixels, were the
++// main thread's painting time. Rects are merged while the merged rect is not
++// much larger than the two together, and then down to at most 4 (what a
++// merged rect covers beyond the dirty region is recorded but never replayed:
++// each tile part replays only its own rect). PS5WK_WC_PAINT_PASSES=0
++// (child.env): one pass per region rect, as before.
++static Vector<IntRect, 1> paintPasses(const Region& region)
++{
++    auto rects = region.rects();
++    static const unsigned maxPasses = envUnsigned("PS5WK_WC_PAINT_PASSES", 4, 0, 64);
++    if (!maxPasses || rects.size() < 2)
++        return rects;
++    auto area = [](const IntRect& rect) {
++        return static_cast<int64_t>(rect.width()) * rect.height();
++    };
++    // The search below is cubic in the number of rects: a region of many
++    // (they come in bands, top to bottom) is first halved, neighbour with
++    // neighbour, until 32 are left.
++    while (rects.size() > 32) {
++        size_t kept = 0;
++        for (size_t i = 0; i < rects.size(); i += 2) {
++            auto merged = rects[i];
++            if (i + 1 < rects.size())
++                merged.unite(rects[i + 1]);
++            rects[kept++] = merged;
++        }
++        rects.shrink(kept);
++    }
++    while (rects.size() > 1) {
++        // The pair whose union wastes the least.
++        size_t bestA = 0, bestB = 0;
++        int64_t bestWaste = std::numeric_limits<int64_t>::max();
++        int64_t bestSum = 0;
++        for (size_t a = 0; a < rects.size(); ++a) {
++            for (size_t b = a + 1; b < rects.size(); ++b) {
++                int64_t sum = area(rects[a]) + area(rects[b]);
++                int64_t waste = area(unionRect(rects[a], rects[b])) - sum;
++                if (waste < bestWaste) {
++                    bestWaste = waste;
++                    bestSum = sum;
++                    bestA = a;
++                    bestB = b;
++                }
++            }
++        }
++        // Cheap enough to merge anyway: the extra area is under 128x128
++        // pixels or under half of what the two rects cover.
++        bool cheap = bestWaste <= 16384 || bestWaste * 2 <= bestSum;
++        if (!cheap && rects.size() <= maxPasses)
++            break;
++        rects[bestA].unite(rects[bestB]);
++        rects.removeAt(bestB);
++    }
++    // A merged rect may now cover part of another: what both cover would be
++    // painted twice into the recording (text and translucent fills darker on
++    // a layer without an opaque background). Rects that touch become one.
++    for (bool merged = true; merged;) {
++        merged = false;
++        for (size_t a = 0; a < rects.size() && !merged; ++a) {
++            for (size_t b = a + 1; b < rects.size(); ++b) {
++                if (rects[a].intersects(rects[b])) {
++                    rects[a].unite(rects[b]);
++                    rects.removeAt(b);
++                    merged = true;
++                    break;
++                }
++            }
++        }
++    }
++    return rects;
++}
++
+ Vector<WCTilePainter::Part> WCTilePainter::paintLayer(GraphicsLayerWC& layer, const Vector<Part>& parts, float deviceScaleFactor, Vector<WCTileUpdate>& tileUpdates)
+ {
+     auto start = MonotonicTime::now();
+@@ -460,7 +542,8 @@ Vector<WCTilePainter::Part> WCTilePainter::paintLayer(GraphicsLayerWC& layer, co
+ 
+     sk_sp<SkPicture> picture;
+     double recordMS = 0;
+-    if (paintThreads() > 1 && pixels >= recordMinPixels()) {
++    // Several parts are recorded once even when small (a pass each otherwise).
++    if (paintThreads() > 1 && (pixels >= recordMinPixels() || (placed.size() > 1 && recordSmallParts()))) {
+         // Recorded in the layer's device pixels, with a bounding box
+         // hierarchy so each band's replay visits only its own operations.
+         SkPictureRecorder recorder;
+@@ -473,7 +556,7 @@ Vector<WCTilePainter::Part> WCTilePainter::paintLayer(GraphicsLayerWC& layer, co
+             GraphicsContextSkia context(*recordingCanvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM, nullptr, GraphicsContext::IsDeferred::Yes);
+             context.beginRecording(GraphicsContextSkia::RecordingMode::Tile);
+             context.applyDeviceScaleFactor(deviceScaleFactor);
+-            for (auto& rect : region.rects()) {
++            for (auto& rect : paintPasses(region)) {
+                 GraphicsContextStateSaver saver(context);
+                 context.clip(FloatRect(rect));
+                 layer.paintGraphicsLayerContents(context, rect);

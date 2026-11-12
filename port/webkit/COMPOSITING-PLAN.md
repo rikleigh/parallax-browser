@@ -3203,3 +3203,150 @@ items instead of 5-7). `[render] paint cull` should show most layers skipped,
 and `[render] style invalidation` should show nearly all elements answered by
 the prefilter. To compare with the old behaviour, use the three child.env
 lines above.
+
+## Feeds that repaint the whole page as they grow (patch 0108, 2026-11-10)
+
+Owner: after scrolling a video site's results feed for a while the loading
+spinner shows, then "things start to degrade": fps drops and new thumbnails
+are slow to come in.
+
+### How it was measured
+
+Log-only PPSA99207 runs, `pad-scroll-test delay=30 secs=8 ry=0.6 upry=0
+pause=2 shots=0` (8 s of stick, 10 s still), a results feed for 215 s.
+`test/paint/feed-bench-summary.py <log>...` reads a run up to the point the
+feed stopped growing: distance scrolled, moving frames/s over the seconds the
+stick was held (the second half of the distance separately), the share of
+those seconds stuck at the end of the feed, and per 1000 px of feed the
+WebProcess's CPU, update time, tile recording time, megapixels painted and
+compositing time.
+
+Three things make single runs hard to compare, so every comparison below is
+the same build with the fixes switched off in child.env, on the same query:
+- The site serves a shorter feed when the same query is run again and again
+  (100000 px, then 35000 px on the fourth run). Use a query at most twice.
+- Early in a feed the stalls at its end are the site's own pacing and the
+  network: the WebProcess is at 0.3-0.5 cores while 40-50 % of the held
+  seconds are spent at the end. The engine's cost shows later, when the feed
+  is long (the second-half column).
+- The console's Wi-Fi fell to 0.3 MB/s during the session (uploads of 15
+  minutes, slower "load more"); a restart of the console fixed it.
+
+Baseline (build 20261110-080428): 23 moving frames/s over the held seconds,
+47-64 % of them at the end of the feed, 52 frames/s when the page could
+scroll. A profile of the held seconds: the WebProcess main thread 80-90 %
+busy; 44 % in the page's script (with what it calls), compositing
+requirements 12 %, tile painting 11 %, descendant style invalidation 8 %,
+intersection observers 6 %.
+
+### What was wrong
+
+1. **Every tile of the page layer was painted again whenever the document's
+   height changed.** `GraphicsLayer::setSize` calls `setNeedsDisplay()` when
+   `shouldRepaintOnSizeChange()`, which is right for a layer that is one
+   bitmap. A results feed changes the document's height twice per batch (a
+   7000 px placeholder, then the items): 6-8 Mpx each time, 139-159 of 305-311
+   Mpx painted in a 150 s run (`PS5WK_WC_LAYER_LOG=1`: the dirty rects of each
+   paint; the full-document rects had no renderer behind them).
+2. **The page's positioned top container repainted the whole document** when
+   it was laid out itself without any change of its own (a child added or
+   removed directly under it: a hover preview). A box that needs layout
+   itself repaints its whole rect, and its children that moved rely on that.
+3. **A compositing update after every style recalc without a pending
+   layout**, several per frame when the page changes styles and reads
+   `clientWidth` per item (2626 compositing updates for 4378 rendering
+   updates).
+4. **Main-thread painting time went with the number of dirty rects, not the
+   pixels.** Each rect of the dirty region was a pass over the layer's paint
+   order (the root's z-order list has thousands of entries on a long feed,
+   ~0.7 ms per pass): 10 and more per update. Recording took 27 ms per Mpx
+   in one window and 14 in another.
+5. Each pass loaded every layer of the list to read its cull answer.
+
+### Fixes (source tree `src-webgl`, each with a child.env switch)
+
+- `GraphicsLayerWC::shouldRepaintOnSizeChange`: false for a layer larger than
+  one tile (`WCTileGrid::setSize` already keeps the tiles whose rect is the
+  same and drops the edge ones; new tiles start dirty).
+  `PS5WK_WC_RESIZE_REPAINT=1` = old.
+- Self layout without a full repaint (`RenderElement.cpp`,
+  `ps5SelfLayoutNeedsNoFullRepaint`; `LayoutRepainter`, the layer's repaint
+  in `RenderLayer::recursiveUpdateLayerPositions`,
+  `scheduledFullRepaintCoversContentPaintedBy`): a plain block or flex
+  container (not anonymous, not html/body, no lines of its own, no floats,
+  not fragmented) whose need for layout did not come from a style change or
+  another request for a full repaint is repainted like one whose children
+  need layout; its children that moved repaint themselves
+  (`RenderBlockFlow::layoutBlockChild`, `RenderFlexibleBox`).
+  `PS5WK_SELF_LAYOUT_REPAINT=0` = old.
+- `LocalFrameViewLayoutContext::updateCompositingLayersAfterStyleChange`
+  leaves the compositing update pending for the rendering update's final
+  layout step; `LocalFrameView::flushCompositingStateForThisFrame` runs one
+  that is still pending. `PS5WK_DEFER_STYLE_COMPOSITING=0` = old.
+- `WCTilePainter` `paintPasses`: the region's rects are merged while that
+  wastes little, and down to 4; several small parts are recorded once
+  instead of painted one by one. `PS5WK_WC_PAINT_PASSES=0` = old.
+- `RenderLayer::paintList`: for a list of 64 layers or more, the cull
+  answers of the rendering update in one array per list.
+  `PS5WK_PAINT_LIST_INDEX=0` = old.
+- `PS5WK_REPAINT_LOG=1`: `[repaint]` lines for repaints of 3 Mpx and more
+  (who, and why after a layout) and for style changes that need a layout of
+  a large box.
+
+Tried and removed: keeping the candidates of a descendant style
+invalidation walk for the next walk of the same root and rule sets. Of ~115
+walks per update, ~1 was answered from a kept list: the walks are per item,
+not repeats on one container, and nearly all of them cross subtrees whose
+style is still invalid.
+
+### Measured (2026-11-10, same build, fixes on vs off in child.env)
+
+| feed (px scrolled) | | moving frames/s | second half | seconds at 50 fps or more | tile recording ms per 1000 px | Mpx per 1000 px | WebProcess CPU s per 1000 px |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A (100000), first three fixes only | off | 24.2 | 23.7 | 21 % | 112 | 7.5 | 1.13 |
+| | on | 26.2 | 26.5 | 19 % | 127 | 4.8 | 1.23 |
+| B (104000-122000) | off | 27.7 | 20.7 | 28 % | 128 | 6.6 | 1.22 |
+| | on | 32.2 | 25.6 | 35 % | 105 | 4.9 | 1.05 |
+| C (117000-119000) | off | 29.0 | 24.6 | 30 % | 121 | 7.1 | 1.24 |
+| | on | 28.3 | 26.4 | 25 % | 84 | 5.3 | 1.14 |
+| D (119000) | off | 29.4 | 23.5 | 26 % | 120 | 5.9 | 1.01 |
+| | on | 31.1 | 26.1 | 33 % | 89 | 5.0 | 1.06 |
+
+Over B-D: moving frames/s +6 % (-2 to +16), the second half of the feed
++14 % (+7 to +24), tile recording -25 %, pixels painted -22 %, WebProcess
+CPU per distance -6 % (-14 to +5). Full-document paints in a 150 s run:
+139 Mpx in 24 paints before, 13 Mpx in 3 after the first two fixes.
+
+Correctness: `test/paint/feedrepaint.html` (a fixed timeline of what a feed
+does while it loads more, stopping at a set scroll position) at four scroll
+positions, screenshots at +2 s and +10 s, fixes on vs off:
+`shot-diff.py` 0.00 % on all eight.
+
+### What is left
+
+The gain is modest: with the fixes on, a long feed still spends its time in
+the page's script (43 % of the busy main thread), the compositing
+requirements traversal (12.6 %: a full pass over 5000-8000 render layers
+whenever the feed's stacking context is dirty; `pushMappingsToAncestor`
+is 30 % of it), descendant style invalidation (9 %), intersection observers
+(8.5 %, half of it the loop over ~4000 targets), layout with the layer
+position and z-order rebuild (8 %) and tile painting (8.6 %). Hover previews
+start and stop a video pipeline at every pause. Early in a feed the stalls
+are the site's pacing and the network, not the browser.
+
+**Review (a second model, reading the diff and the tree):** two defects,
+both fixed before the last runs. Without the whole-layer repaint a size
+change could reach the scene with no `Background` change, and the scene
+drew the layer's tiles scaled to the new size until the next repaint
+(`GraphicsLayerWC::setSize` now notes `Background` for a layer that draws;
+nothing is painted for it). Merged paint passes could overlap, and what two
+of them covered was painted twice into the recording (rects that touch are
+now one pass; a region of more than 32 rects is halved first). Hardened
+after it: no self-layout shortcut for a box with a clip path, mask or
+filter, with `align-content`, or for a fieldset. Left as it is: an
+opacity-only animation started by script outside the rendering update may
+start on the compositor one update later (as it already does when a layout
+is pending). `feedrepaint.html` gained the two cases the review named (a
+composited box below everything that makes the document taller; several
+small changes in one composited layer without a background): 0.00 % on all
+eight screenshots, build 20261110-134407.
