@@ -1,0 +1,179 @@
+diff --git a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+index 16eb9a0dea..70bb0b170e 100644
+--- a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
++++ b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+@@ -149,6 +149,15 @@ RefPtr<SharedMemory> SharedMemory::map(Handle&& handle, Protection protection, C
+     // FIXME: https://bugs.webkit.org/show_bug.cgi?id=305633
+     ASSERT_UNUSED(copyOnWrite, copyOnWrite == CopyOnWrite::No);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // The size in a handle is the sender's word. A mapping longer than the object faults where
++    // it is read, and on the PS5 the reader of a WebProcess's handles is the title (its GPU
++    // side: WebGPU's writeBuffer and writeTexture). An object the sender shrinks afterwards
++    // still gets past this.
++    struct stat status;
++    if (!fstat(handle.m_handle.value(), &status) && status.st_size >= 0 && static_cast<uint64_t>(status.st_size) < handle.size())
++        return nullptr;
++#endif
+     void* data = mmap(0, handle.size(), accessModeMMap(protection), MAP_SHARED, handle.m_handle.value(), 0);
+     if (data == MAP_FAILED)
+         return nullptr;
+diff --git a/Source/WebGPU/WebGPUDawn/Buffer.cpp b/Source/WebGPU/WebGPUDawn/Buffer.cpp
+index c39a306ade..d3979077c5 100644
+--- a/Source/WebGPU/WebGPUDawn/Buffer.cpp
++++ b/Source/WebGPU/WebGPUDawn/Buffer.cpp
+@@ -49,6 +49,12 @@ RefPtr<Buffer> DeviceImpl::createBuffer(const BufferDescriptor& descriptor)
+     wgpu::Limits limits;
+     bool sizeIsValid = m_device.GetLimits(&limits) == wgpu::Status::Success && descriptor.size <= limits.maxBufferSize;
+     auto charge = MemoryCharge::tryTake(sizeIsValid ? descriptor.size : 0);
++    if (!sizeIsValid) {
++        // Dawn maps even the error buffer it makes for such a size, with `size` bytes of the
++        // title's memory that nothing counts: no mapping for it.
++        dawnDescriptor.mappedAtCreation = false;
++        mappedAtCreation = false;
++    }
+     if (!charge) {
+         m_device.InjectError(wgpu::ErrorType::OutOfMemory, "GPUDevice.createBuffer: over the browser's memory budget for WebGPU");
+         dawnDescriptor.mappedAtCreation = false;
+@@ -225,6 +231,10 @@ void BufferImpl::destroy()
+     m_mappingSize = 0;
+     m_buffer.Destroy();
+     m_charge.release();
++    // Dawn frees the memory at its next tick, which nothing else may ask for: without it a
++    // page that only creates and destroys buffers stays under the budget and takes any amount.
++    if (RefPtr instance = m_device->instance())
++        instance->pumpSoon();
+ }
+ 
+ void BufferImpl::generateAValidationError()
+diff --git a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+index b59694e8bc..dcf0f71404 100644
+--- a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
++++ b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+@@ -362,10 +362,16 @@ void PresentationContextImpl::readPixels(uint32_t bufferIndex, CompletionHandler
+     // A buffer of its own, so that this neither waits for the frames that are being presented
+     // nor holds them up. Reading the canvas is rare.
+     auto& configuration = *m_configuration;
++    // Counted like any buffer until the read is answered: a page can ask for many at once.
++    auto charge = MemoryCharge::tryTake(configuration.readbackSize);
++    if (!charge) {
++        completionHandler({ }, 0, 0, configuration.format);
++        return;
++    }
+     wgpu::Buffer buffer = createReadbackBuffer();
+     copyToReadbackBuffer(texture->dawnTexture(), buffer);
+ 
+-    buffer.MapAsync(wgpu::MapMode::Read, 0, static_cast<size_t>(configuration.readbackSize), wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(completionHandler)), buffer, readbackSize = static_cast<size_t>(configuration.readbackSize), bytesPerRow = configuration.bytesPerRow, paddedBytesPerRow = configuration.paddedBytesPerRow, width = configuration.width, height = configuration.height, format = configuration.format](wgpu::MapAsyncStatus status, wgpu::StringView) {
++    buffer.MapAsync(wgpu::MapMode::Read, 0, static_cast<size_t>(configuration.readbackSize), wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(completionHandler)), charge = WTF::move(*charge), buffer, readbackSize = static_cast<size_t>(configuration.readbackSize), bytesPerRow = configuration.bytesPerRow, paddedBytesPerRow = configuration.paddedBytesPerRow, width = configuration.width, height = configuration.height, format = configuration.format](wgpu::MapAsyncStatus status, wgpu::StringView) {
+         auto* data = status == wgpu::MapAsyncStatus::Success ? static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, readbackSize)) : nullptr;
+         if (!data) {
+             pending->handler()({ }, 0, 0, format);
+diff --git a/Source/WebGPU/WebGPUDawn/Texture.cpp b/Source/WebGPU/WebGPUDawn/Texture.cpp
+index 74697e2b6c..93900fe0dc 100644
+--- a/Source/WebGPU/WebGPUDawn/Texture.cpp
++++ b/Source/WebGPU/WebGPUDawn/Texture.cpp
+@@ -26,6 +26,8 @@
+ #include "config.h"
+ #include "Texture.h"
+ 
++#include "Instance.h"
++
+ #include "Conversions.h"
+ #include "Device.h"
+ #include "PresentationContext.h"
+@@ -64,7 +66,9 @@ RefPtr<Texture> DeviceImpl::createTexture(const TextureDescriptor& descriptor)
+         m_device.InjectError(wgpu::ErrorType::OutOfMemory, "GPUDevice.createTexture: over the browser's memory budget for WebGPU");
+         return TextureImpl::create(m_device.CreateErrorTexture(&dawnDescriptor), { });
+     }
+-    return TextureImpl::create(m_device.CreateTexture(&dawnDescriptor), WTF::move(*charge));
++    Ref texture = TextureImpl::create(m_device.CreateTexture(&dawnDescriptor), WTF::move(*charge));
++    texture->setInstance(instance().get());
++    return texture;
+ }
+ 
+ TextureImpl::TextureImpl(wgpu::Texture&& texture, PresentationContextImpl* presentationContext, MemoryCharge&& charge)
+@@ -120,6 +124,9 @@ void TextureImpl::destroy()
+         return;
+     m_texture.Destroy();
+     m_charge.release();
++    // Dawn frees the memory at its next tick (see BufferImpl::destroy()).
++    if (RefPtr instance = m_instance.get())
++        instance->pumpSoon();
+ }
+ 
+ void TextureImpl::undestroy()
+diff --git a/Source/WebGPU/WebGPUDawn/Texture.h b/Source/WebGPU/WebGPUDawn/Texture.h
+index 07eee46374..db52f8c324 100644
+--- a/Source/WebGPU/WebGPUDawn/Texture.h
++++ b/Source/WebGPU/WebGPUDawn/Texture.h
+@@ -33,6 +33,7 @@
+ 
+ namespace WebGPU::Dawn {
+ 
++class InstanceImpl;
+ class PresentationContextImpl;
+ 
+ // https://gpuweb.github.io/gpuweb/#gputexture
+@@ -49,6 +50,9 @@ public:
+         return adoptRef(*new TextureImpl(WTF::move(texture), nullptr, WTF::move(charge)));
+     }
+ 
++    // The instance whose pump frees the texture's memory after destroy().
++    void setInstance(InstanceImpl* instance) { m_instance = instance; }
++
+     static Ref<TextureImpl> createCanvasBacking(wgpu::Texture&& texture, PresentationContextImpl& presentationContext, MemoryCharge&& charge)
+     {
+         return adoptRef(*new TextureImpl(WTF::move(texture), &presentationContext, WTF::move(charge)));
+@@ -73,6 +77,7 @@ private:
+ 
+     // The texture's estimated size against the title's WebGPU memory budget, until its memory
+     // is freed (destroy(), or releaseCanvasBacking() for a canvas's).
++    ThreadSafeWeakPtr<InstanceImpl> m_instance;
+     MemoryCharge m_charge;
+ 
+     wgpu::Texture m_texture;
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+index 23485cfa3d..dca31e6827 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+@@ -12,6 +12,7 @@
+ #include <WebCore/PlatformDisplay.h>
+ #include <epoxy/egl.h>
+ #include <epoxy/gl.h>
++#include <wtf/Lock.h>
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/NeverDestroyed.h>
+ 
+@@ -25,7 +26,7 @@ namespace PS5WebGLLayers {
+ 
+ namespace {
+ 
+-// RemoteGPU's work queue only: a native ES context of the compositor's share group, current
++// RemoteGPU's work queues, one at a time (readerLock): a native ES context of the compositor's share group, current
+ // there for the length of a read, and the texture the title's frame is copied into.
+ struct Reader {
+     std::unique_ptr<WebCore::GLContext> context;
+@@ -141,6 +142,9 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+     if (frameWidth <= 0 || frameHeight <= 0 || frameWidth > 8192 || frameHeight > 8192)
+         return false;
+ 
++    // Each RemoteGPU has a work queue of its own, and they share the reader.
++    static Lock readerLock;
++    Locker locker { readerLock };
+     auto& state = reader();
+     if (!state.context && !state.failed) {
+         bindESAPI();
+@@ -177,7 +181,12 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+         if (void* done = copy(key, state.texture, false)) {
+             glDeleteSync(static_cast<GLsync>(done));
+             const size_t bytes = static_cast<size_t>(frameWidth) * frameHeight * 4;
+-            if (rgba.size() == bytes || rgba.tryGrow(bytes - rgba.size())) {
++            rgba.shrink(0);
++            // The stream's size may have changed since it was asked for: the copy then covered
++            // part of the texture only, and the rest is an earlier read's picture (any page's).
++            int copiedWidth = 0, copiedHeight = 0;
++            const bool sameSize = frameSize(key, &copiedWidth, &copiedHeight) && copiedWidth == frameWidth && copiedHeight == frameHeight;
++            if (sameSize && rgba.tryGrow(bytes)) {
+                 if (readWithCompute(state, frameWidth, frameHeight, rgba.mutableSpan()))
+                     ok = true;
+             }

@@ -25,7 +25,7 @@ on RADV, or GLES on ps5-opengl) decided by cheap spikes before any WebKit work._
 
 `WEBGPU=1 port/webkit/build.sh` builds WebKit with `ENABLE_WEBGPU` and
 `USE_DAWN` into `toolchain/wpe-webkit/build-webgpu`; `package.sh` with that
-build dir links RADV in. WebKit side, patches 0109 to 0124:
+build dir links RADV in. WebKit side, patches 0109 to 0125:
 
 - `Source/WebGPU/WebGPUDawn/`: WebKit's `WebGPUCpp.h` implemented over Dawn
   (29 files). It runs in the title, on RemoteGPU's work queue thread; the
@@ -131,11 +131,19 @@ regression 29/29, a three.js WebGL example at 60 frames/s, no `navigator.gpu`.
 - `<img>` sources are drawn premultiplied and read back: colour under partial
   alpha loses precision and is gone where alpha is 0.
 - Not done from P6: an on-disk pipeline cache (RADV's own is off in the
-  title, it defaults to a folder a title cannot write; Dawn's caching
-  interface is not implemented), the WebGPU CTS, and a review of the
-  title-side code against a hostile WebProcess (known: layer keys can be made
-  to collide, which loses a canvas, not the title; texture sizes in the
-  budget are estimates).
+  title; Dawn's caching interface is not implemented, and a cache on disk
+  holds data derived from visited pages, so it needs clearing with browsing
+  data and keeping out of private browsing first) and the WebGPU CTS.
+- A review of the title-side code against a hostile WebProcess was done by
+  reading (no hostile process was run); its findings that could be fixed in
+  place are in 0125. Left: video stream keys are 64 random bits with no
+  check of which WebProcess owns the stream (the same for WebGL's
+  `texImage2D(video)`; GLib's generator, not a cryptographic one); a shared
+  memory object shrunk after it was mapped still faults in the title;
+  Dawn's staging copies for `writeBuffer`/`writeTexture` and two large
+  allocations for a canvas frame (up to 256 MB each) are not in the budget
+  and abort the title if they fail; layer keys can be made to collide (loses
+  a canvas); texture sizes in the budget are estimates.
 - Device loss has not been provoked on the console. A GPU fault in either
   driver still ends the title.
 - A buffer unmapped after writing sends its bytes inline in an IPC message up
