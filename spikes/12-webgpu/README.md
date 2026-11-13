@@ -25,7 +25,7 @@ on RADV, or GLES on ps5-opengl) decided by cheap spikes before any WebKit work._
 
 `WEBGPU=1 port/webkit/build.sh` builds WebKit with `ENABLE_WEBGPU` and
 `USE_DAWN` into `toolchain/wpe-webkit/build-webgpu`; `package.sh` with that
-build dir links RADV in. WebKit side, patches 0109 to 0122:
+build dir links RADV in. WebKit side, patches 0109 to 0124:
 
 - `Source/WebGPU/WebGPUDawn/`: WebKit's `WebGPUCpp.h` implemented over Dawn
   (29 files). It runs in the title, on RemoteGPU's work queue thread; the
@@ -54,7 +54,7 @@ console). Console,
 | adapter, device, compute, offscreen-readback, errors, buffer-map | 11/11, 29/29, 6/6, 7/7, 11/11, 11/11 |
 | triangle, cube, resize, two-canvases, todataurl | 3/3, 3/3, 10/10, 7/7, 11/11; 60 frames/s at every size up to 1920x1080, three canvases together included |
 | copy-external-image | 16/16: canvas, ImageBitmap, OffscreenCanvas, `<img>` and ImageData sources (0117) |
-| video-texture | 2/5: `importExternalTexture` throws InvalidStateError (no external textures yet), and a `<video>` source copies black (the player cannot paint its frames into a bitmap) |
+| video-texture | 5/5 (`results/console-2026-11-13-e.log`): `copyExternalImageToTexture` from a `<video>` (0123) and `importExternalTexture` (0124), both from the title's decoded frames, read back with a compute pass (1.2 ms for 1920x1080; `glReadPixels` took 34 ms). An external texture imported every frame from a 1080p video draws at 38.5 frames/s |
 | ml-transformers (transformers.js 3.8.1 on ONNX Runtime Web, all-MiniLM-L6-v2) | 4/4: WebGPU fp32 matches WebAssembly to 1.00000, fp16 (`shader-f16`) to 0.99998; a warm run takes 38 ms on WebGPU, 106 ms on one-thread WebAssembly |
 | WebGL regression (`webgl/readpixels.html`, WebGPU on) | 29/29 |
 
@@ -123,9 +123,11 @@ regression 29/29, a three.js WebGL example at 60 frames/s, no `navigator.gpu`.
 
 ## Open
 
-- Video in WebGPU: external textures, and `<video>` as a source for
-  `copyExternalImageToTexture` (both need the title's decoded frames, as
-  WebGL's `texImage2D(video)` has).
+- Video in WebGPU works for hardware-decoded `<video>` elements only (the
+  ones with a stream in the title). A WebCodecs `VideoFrame`, or a video
+  without such a stream, gives InvalidStateError from `importExternalTexture`
+  and black from a copy. An imported 1080p video holds 38.5 frames/s, not 60
+  (the frame goes GPU to CPU to GPU: 8 MB each way).
 - `<img>` sources are drawn premultiplied and read back: colour under partial
   alpha loses precision and is gone where alpha is 0.
 - Not done from P6: an on-disk pipeline cache (RADV's own is off in the

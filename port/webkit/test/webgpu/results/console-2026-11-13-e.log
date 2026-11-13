@@ -1,0 +1,13 @@
+RESULT webgpu-adapter summary PASS 11/11
+RESULT webgpu-device summary PASS 29/29
+RESULT webgpu-compute summary PASS 6/6
+RESULT webgpu-offscreen-readback summary PASS 7/7
+RESULT webgpu-errors summary PASS 11/11
+RESULT webgpu-buffer-map summary PASS 11/11
+RESULT webgpu-triangle summary PASS 3/3
+RESULT webgpu-cube summary PASS 3/3
+RESULT webgpu-resize summary PASS 10/10
+RESULT webgpu-two-canvases summary PASS 7/7
+RESULT webgpu-todataurl summary PASS 11/11
+RESULT webgpu-copy-external-image summary PASS 16/16
+RESULT webgpu-video-texture summary PASS 5/5

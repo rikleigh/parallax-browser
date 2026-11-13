@@ -1,0 +1,519 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUExternalTextureDescriptor.h b/Source/WebCore/Modules/WebGPU/GPUExternalTextureDescriptor.h
+index 6f6212f15a..c78e1bfc6f 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUExternalTextureDescriptor.h
++++ b/Source/WebCore/Modules/WebGPU/GPUExternalTextureDescriptor.h
+@@ -27,6 +27,10 @@
+ 
+ #include "GPUObjectDescriptorBase.h"
+ #include "HTMLVideoElement.h"
++#if USE(DAWN)
++#include "MediaPlayer.h"
++#include "MediaPlayerPrivate.h"
++#endif
+ #include "PredefinedColorSpace.h"
+ #include "WebCodecsVideoFrame.h"
+ #include "WebGPUExternalTextureDescriptor.h"
+@@ -93,6 +97,28 @@ struct GPUExternalTextureDescriptor : public GPUObjectDescriptorBase {
+ #endif
+     }
+ 
++#if USE(DAWN)
++    static uint64_t ps5VideoStreamKeyForSource(const GPUVideoSource& videoSource)
++    {
++        auto keyOf = [](const HTMLVideoElement& videoElement) -> uint64_t {
++            RefPtr player = videoElement.player();
++            return player && player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0;
++        };
++#if ENABLE(WEB_CODECS)
++        return WTF::switchOn(videoSource,
++            [&](const Ref<HTMLVideoElement>& videoElement) -> uint64_t {
++                return keyOf(videoElement.get());
++            },
++            [&](const Ref<WebCodecsVideoFrame>&) -> uint64_t {
++                return 0;
++            }
++        );
++#else
++        return keyOf(videoSource.get());
++#endif
++    }
++#endif
++
+     std::optional<WebCore::MediaPlayerIdentifier> mediaIdentifier() const
+     {
+ #if ENABLE(WEB_CODECS)
+@@ -127,6 +153,9 @@ struct GPUExternalTextureDescriptor : public GPUObjectDescriptorBase {
+             visibleSizeForSource(source),
+ #else
+             { },
++#endif
++#if ENABLE(VIDEO) && USE(DAWN)
++            ps5VideoStreamKeyForSource(source),
+ #endif
+         };
+     }
+diff --git a/Source/WebCore/Modules/WebGPU/WebGPUExternalTextureDescriptor.h b/Source/WebCore/Modules/WebGPU/WebGPUExternalTextureDescriptor.h
+index 16cc92a250..7e51e24af3 100644
+--- a/Source/WebCore/Modules/WebGPU/WebGPUExternalTextureDescriptor.h
++++ b/Source/WebCore/Modules/WebGPU/WebGPUExternalTextureDescriptor.h
+@@ -54,6 +54,9 @@ struct WebGPUExternalTextureDescriptor : public WebGPUObjectDescriptorBase {
+     // WebCodecs frame carries a display size of its own, and a video element's intrinsic size accounts
+     // for its aspect ratio. Empty when the source could not say, and then the decoded size stands in.
+     IntSize visibleSize;
++    // PS5 (Dawn): the title's video stream of a hardware-decoded video element
++    // (MediaPlayerPrivate::ps5VideoStreamKey()); 0 for other sources.
++    uint64_t ps5VideoStreamKey { 0 };
+ };
+ 
+ } // namespace WebCore
+diff --git a/Source/WebGPU/WebGPUCpp.h b/Source/WebGPU/WebGPUCpp.h
+index 454557b3e3..ac0475f8e3 100644
+--- a/Source/WebGPU/WebGPUCpp.h
++++ b/Source/WebGPU/WebGPUCpp.h
+@@ -1445,6 +1445,9 @@ public:
+ #if PLATFORM(COCOA)
+     virtual RefPtr<ExternalTexture> importExternalTexture(const ExternalTextureDescriptor&) = 0;
+ #endif
++    // PS5 (Dawn): an external texture showing one video frame, given as RGBA8 rows from the
++    // picture's top (the title reads its decoded frames back: PS5WebGPUVideoRead.cpp).
++    virtual RefPtr<ExternalTexture> ps5ImportExternalTexture(std::span<const uint8_t>, uint32_t, uint32_t) { return nullptr; }
+     virtual RefPtr<BindGroupLayout> createBindGroupLayout(const BindGroupLayoutDescriptor&) = 0;
+     virtual RefPtr<PipelineLayout> createPipelineLayout(const PipelineLayoutDescriptor&) = 0;
+     virtual RefPtr<BindGroup> createBindGroup(const BindGroupDescriptor&) = 0;
+diff --git a/Source/WebGPU/WebGPUDawn/BindGroup.cpp b/Source/WebGPU/WebGPUDawn/BindGroup.cpp
+index 43b8a3acec..2b7e8e7d00 100644
+--- a/Source/WebGPU/WebGPUDawn/BindGroup.cpp
++++ b/Source/WebGPU/WebGPUDawn/BindGroup.cpp
+@@ -30,6 +30,7 @@
+ #include "Buffer.h"
+ #include "Conversions.h"
+ #include "Device.h"
++#include "ExternalTexture.h"
+ #include "Sampler.h"
+ #include "Texture.h"
+ #include "TextureView.h"
+@@ -41,7 +42,11 @@ RefPtr<BindGroup> DeviceImpl::createBindGroup(const BindGroupDescriptor& descrip
+     // https://gpuweb.github.io/gpuweb/#dom-gpudevice-createbindgroup
+     auto label = descriptor.label.utf8();
+ 
+-    auto entries = WTF::map(descriptor.entries, [](auto& entry) {
++    // Chained from the entries: no reallocation.
++    Vector<wgpu::ExternalTextureBindingEntry> externalTextureEntries;
++    externalTextureEntries.reserveInitialCapacity(descriptor.entries.size());
++
++    auto entries = WTF::map(descriptor.entries, [&](auto& entry) {
+         wgpu::BindGroupEntry dawnEntry;
+         dawnEntry.binding = entry.binding;
+         WTF::switchOn(entry.resource, [&](const Ref<Sampler>& sampler) {
+@@ -54,9 +59,16 @@ RefPtr<BindGroup> DeviceImpl::createBindGroup(const BindGroupDescriptor& descrip
+             dawnEntry.buffer = fromAPI(bufferBinding.buffer.get()).dawnBuffer();
+             dawnEntry.offset = bufferBinding.offset;
+             dawnEntry.size = bufferBinding.size.value_or(wgpu::kWholeSize);
+-        }, [&](const Ref<ExternalTexture>&) {
+-            // No external texture is valid (see ExternalTextureImpl), so the entry binds nothing
+-            // and Dawn's validation rejects the bind group.
++        }, [&](const Ref<ExternalTexture>& externalTexture) {
++            // One without a frame (ExternalTextureImpl) binds nothing, and Dawn's validation
++            // rejects the bind group.
++            auto& dawnExternalTexture = static_cast<const ExternalTextureImpl&>(externalTexture.get()).dawnExternalTexture();
++            if (!dawnExternalTexture)
++                return;
++            wgpu::ExternalTextureBindingEntry chained;
++            chained.externalTexture = dawnExternalTexture;
++            externalTextureEntries.append(WTF::move(chained));
++            dawnEntry.nextInChain = &externalTextureEntries.last();
+         });
+         return dawnEntry;
+     });
+diff --git a/Source/WebGPU/WebGPUDawn/Device.cpp b/Source/WebGPU/WebGPUDawn/Device.cpp
+index 21d0cdb747..9c4eb8db5d 100644
+--- a/Source/WebGPU/WebGPUDawn/Device.cpp
++++ b/Source/WebGPU/WebGPUDawn/Device.cpp
+@@ -27,6 +27,8 @@
+ #include "Device.h"
+ 
+ #include "Conversions.h"
++#include "ExternalTexture.h"
++#include "MemoryBudget.h"
+ #include "Queue.h"
+ #include "XRBinding.h"
+ 
+@@ -276,4 +278,50 @@ void DeviceImpl::setLabel(String&& label)
+     m_device.SetLabel(stringView(labelUTF8));
+ }
+ 
++// https://gpuweb.github.io/gpuweb/#dom-gpudevice-importexternaltexture, for one video frame the
++// title read back: an RGBA8 texture of its own as the external texture's only plane. The bytes
++// are sRGB-encoded and are sampled as they are (identity transfer functions and gamut matrix),
++// as a copy of the frame into an rgba8unorm texture would be.
++RefPtr<ExternalTexture> DeviceImpl::ps5ImportExternalTexture(std::span<const uint8_t> rgba, uint32_t width, uint32_t height)
++{
++    const uint64_t bytes = static_cast<uint64_t>(width) * height * 4;
++    if (!width || !height || width > 8192 || height > 8192 || rgba.size() < bytes)
++        return nullptr;
++    auto charge = MemoryCharge::tryTake(bytes);
++    if (!charge) {
++        // Over the title's WebGPU memory budget: an external texture that is not valid.
++        return ExternalTextureImpl::create();
++    }
++
++    wgpu::TextureDescriptor textureDescriptor;
++    textureDescriptor.size = { width, height, 1 };
++    textureDescriptor.format = wgpu::TextureFormat::RGBA8Unorm;
++    textureDescriptor.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
++    wgpu::Texture texture = m_device.CreateTexture(&textureDescriptor);
++    if (!texture)
++        return ExternalTextureImpl::create();
++
++    wgpu::TexelCopyTextureInfo destination;
++    destination.texture = texture;
++    wgpu::TexelCopyBufferLayout layout;
++    layout.bytesPerRow = width * 4;
++    layout.rowsPerImage = height;
++    wgpu::Extent3D extent { width, height, 1 };
++    m_device.GetQueue().WriteTexture(&destination, rgba.data(), static_cast<size_t>(bytes), &layout, &extent);
++
++    static const float identityTransfer[7] = { 1, 1, 0, 1, 0, 0, 0 }; // g, a, b, c, d, e, f: x
++    static const float identityGamut[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
++    wgpu::ExternalTextureDescriptor descriptor;
++    descriptor.plane0 = texture.CreateView();
++    descriptor.cropSize = { width, height };
++    descriptor.apparentSize = { width, height };
++    descriptor.srcTransferFunctionParameters = identityTransfer;
++    descriptor.dstTransferFunctionParameters = identityTransfer;
++    descriptor.gamutConversionMatrix = identityGamut;
++    wgpu::ExternalTexture externalTexture = m_device.CreateExternalTexture(&descriptor);
++    if (!externalTexture)
++        return ExternalTextureImpl::create();
++    return ExternalTextureImpl::create(WTF::move(externalTexture), WTF::move(texture), WTF::move(*charge));
++}
++
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebGPU/WebGPUDawn/Device.h b/Source/WebGPU/WebGPUDawn/Device.h
+index 5749bd7778..babfa0258c 100644
+--- a/Source/WebGPU/WebGPUDawn/Device.h
++++ b/Source/WebGPU/WebGPUDawn/Device.h
+@@ -51,6 +51,7 @@ public:
+ 
+     RefPtr<Buffer> createBuffer(const BufferDescriptor&) final;
+     RefPtr<Texture> createTexture(const TextureDescriptor&) final;
++    RefPtr<ExternalTexture> ps5ImportExternalTexture(std::span<const uint8_t> rgba, uint32_t width, uint32_t height) final;
+     RefPtr<Sampler> createSampler(const SamplerDescriptor&) final;
+     RefPtr<BindGroupLayout> createBindGroupLayout(const BindGroupLayoutDescriptor&) final;
+     RefPtr<PipelineLayout> createPipelineLayout(const PipelineLayoutDescriptor&) final;
+diff --git a/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp b/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp
+index ede4a1a085..bc5ffc0a5d 100644
+--- a/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp
++++ b/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp
+@@ -26,23 +26,39 @@
+ #include "config.h"
+ #include "ExternalTexture.h"
+ 
++#include "Conversions.h"
++
+ namespace WebGPU::Dawn {
+ 
+ void ExternalTextureImpl::destroy()
+ {
++    // The frame's lifetime ended (the task that imported it is over): bind groups made with it
++    // are no longer usable, and its texture goes.
++    // Once: WebCore destroys it again when the video's next frame arrives.
++    if (std::exchange(m_destroyed, true))
++        return;
++    if (m_externalTexture)
++        m_externalTexture.Destroy();
++    if (m_texture)
++        m_texture.Destroy();
++    m_charge = { };
+ }
+ 
+ void ExternalTextureImpl::undestroy()
+ {
+ }
+ 
+-void ExternalTextureImpl::setLabel(String&&)
++void ExternalTextureImpl::setLabel(String&& label)
+ {
++    if (!m_externalTexture)
++        return;
++    auto labelUTF8 = label.utf8();
++    m_externalTexture.SetLabel(stringView(labelUTF8));
+ }
+ 
+ bool ExternalTextureImpl::isValid() const
+ {
+-    return false;
++    return !!m_externalTexture;
+ }
+ 
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebGPU/WebGPUDawn/ExternalTexture.h b/Source/WebGPU/WebGPUDawn/ExternalTexture.h
+index b90e24e8fc..7e8f8fb3ee 100644
+--- a/Source/WebGPU/WebGPUDawn/ExternalTexture.h
++++ b/Source/WebGPU/WebGPUDawn/ExternalTexture.h
+@@ -25,13 +25,17 @@
+ 
+ #pragma once
+ 
++#include "MemoryBudget.h"
+ #include <WebGPU/WebGPUCpp.h>
++#include <webgpu/webgpu_cpp.h>
+ #include <wtf/TZoneMallocInlines.h>
++#include <wtf/ThreadSafeWeakPtr.h>
+ 
+ namespace WebGPU::Dawn {
+ 
+ // https://gpuweb.github.io/gpuweb/#gpuexternaltexture
+-// A stub: video frames are not imported yet, so nothing creates one, and one is never valid.
++// One video frame in an RGBA8 texture of its own (DeviceImpl::ps5ImportExternalTexture). Without
++// a Dawn external texture (create()) it is never valid.
+ class ExternalTextureImpl final : public ExternalTexture {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(ExternalTextureImpl);
+ public:
+@@ -39,6 +43,16 @@ public:
+     {
+         return adoptRef(*new ExternalTextureImpl);
+     }
++    static Ref<ExternalTextureImpl> create(wgpu::ExternalTexture&& externalTexture, wgpu::Texture&& texture, MemoryCharge&& charge)
++    {
++        Ref result = adoptRef(*new ExternalTextureImpl);
++        result->m_externalTexture = WTF::move(externalTexture);
++        result->m_texture = WTF::move(texture);
++        result->m_charge = WTF::move(charge);
++        return result;
++    }
++
++    const wgpu::ExternalTexture& dawnExternalTexture() const { return m_externalTexture; }
+ 
+     void destroy() final;
+     void undestroy() final;
+@@ -47,6 +61,11 @@ public:
+ 
+ private:
+     ExternalTextureImpl() = default;
++
++    wgpu::ExternalTexture m_externalTexture;
++    wgpu::Texture m_texture;
++    MemoryCharge m_charge;
++    bool m_destroyed { false };
+ };
+ 
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
+index d26c023416..2748c42e53 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
+@@ -35,6 +35,9 @@
+ #include "RemoteCommandEncoder.h"
+ #include "RemoteComputePipeline.h"
+ #include "RemoteDeviceMessages.h"
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
++#include "PS5WebGLLayers.h"
++#endif
+ #include "RemoteExternalTexture.h"
+ #include "RemoteGPU.h"
+ #include "RemoteMediaPlayerManagerProxy.h"
+@@ -443,6 +446,31 @@ void RemoteDevice::resolveDeviceLostPromise(CompletionHandler<void(::WebGPU::Dev
+     });
+ }
+ 
++#if USE(DAWN)
++// PS5: importExternalTexture(video). Always an object for the identifier (the page's proxy
++// names it from now on): without a frame of the stream yet, one black pixel.
++void RemoteDevice::importExternalTextureFromVideoStreamPS5(uint64_t streamKey, WebGPUIdentifier identifier)
++{
++    Vector<uint8_t> pixels;
++    uint32_t width = 0, height = 0;
++#if ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
++    if (!PS5WebGLLayers::readVideoFramePixels(streamKey, pixels, width, height))
++        width = height = 0;
++#else
++    UNUSED_PARAM(streamKey);
++#endif
++    if (!width || !height) {
++        pixels = Vector<uint8_t> { 0, 0, 0, 255 };
++        width = height = 1;
++    }
++    RefPtr externalTexture = m_backing->ps5ImportExternalTexture(pixels.span(), width, height);
++    MESSAGE_CHECK(externalTexture);
++    Ref objectHeap = m_objectHeap.get();
++    auto remoteExternalTexture = RemoteExternalTexture::create(*externalTexture, objectHeap, protect(m_streamConnection), protect(m_gpu), identifier);
++    objectHeap->addObject(identifier, remoteExternalTexture);
++}
++#endif
++
+ void RemoteDevice::setLabel(String&& label)
+ {
+     m_backing->setLabel(WTF::move(label));
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.h
+index 1a8a4a9e27..1984e3b025 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.h
+@@ -147,6 +147,9 @@ private:
+     void resolveUncapturedErrorEvent(CompletionHandler<void(bool, std::optional<::WebGPU::Error>&&)>&&);
+     void resolveDeviceLostPromise(CompletionHandler<void(::WebGPU::DeviceLostReason)>&&);
+ 
++#if USE(DAWN)
++    void importExternalTextureFromVideoStreamPS5(uint64_t streamKey, WebGPUIdentifier);
++#endif
+     void setLabel(String&&);
+     void setSharedVideoFrameSemaphore(IPC::Semaphore&&);
+     void setSharedVideoFrameMemory(WebCore::SharedMemoryHandle&&);
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.messages.in
+index 53ffa351ab..f370c32a0a 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.messages.in
+@@ -60,6 +60,9 @@ messages -> RemoteDevice Stream {
+     void ImportExternalTextureFromVideoFrame(WebKit::WebGPU::ExternalTextureDescriptor descriptor, WebKit::WebGPUIdentifier identifier) NotStreamEncodable
+     void UpdateExternalTexture(WebKit::WebGPUIdentifier externalTextureIdentifier, WebCore::MediaPlayerIdentifier mediaIdentifier)
+ #endif
++#if USE(DAWN)
++    void ImportExternalTextureFromVideoStreamPS5(uint64_t streamKey, WebKit::WebGPUIdentifier identifier)
++#endif
+ }
+ 
+ #endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+index 2b6f868687..23485cfa3d 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+@@ -35,8 +35,94 @@ struct Reader {
+     int width { 0 };
+     int height { 0 };
+     unsigned reads { 0 };
++    // The fast path: a compute pass packs the frame into a buffer, which is mapped and copied
++    // (glReadPixels of a 1920x1080 texture took 34 ms: the driver converts its layout on the CPU).
++    GLuint program { 0 };
++    GLint sizeLocation { -1 };
++    GLuint buffer { 0 };
++    size_t bufferBytes { 0 };
++    bool computeFailed { false };
+ };
+ 
++constexpr GLuint outputBinding = 6;
++
++bool readWithCompute(Reader& state, int width, int height, std::span<uint8_t> rgba)
++{
++    if (state.computeFailed)
++        return false;
++    auto fail = [&](const char* why) {
++        WTFLogAlways("[webgpu] title: video frames are read with glReadPixels (%s, GL error 0x%x)", why, glGetError());
++        state.computeFailed = true;
++        return false;
++    };
++    if (!state.program) {
++        static const char* source = R"(#version 310 es
++precision highp float;
++precision highp int;
++layout(local_size_x = 8, local_size_y = 8) in;
++uniform highp sampler2D u_frame;
++uniform ivec2 u_size;
++layout(std430, binding = 6) writeonly buffer Output { uint px[]; };
++void main()
++{
++    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (p.x >= u_size.x || p.y >= u_size.y)
++        return;
++    px[p.y * u_size.x + p.x] = packUnorm4x8(texelFetch(u_frame, p, 0));
++}
++)";
++        GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
++        glShaderSource(shader, 1, &source, nullptr);
++        glCompileShader(shader);
++        GLint ok = 0;
++        glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++        if (!ok) {
++            glDeleteShader(shader);
++            return fail("compute shader");
++        }
++        state.program = glCreateProgram();
++        glAttachShader(state.program, shader);
++        glLinkProgram(state.program);
++        glDeleteShader(shader);
++        glGetProgramiv(state.program, GL_LINK_STATUS, &ok);
++        if (!ok)
++            return fail("compute program");
++        state.sizeLocation = glGetUniformLocation(state.program, "u_size");
++        glUseProgram(state.program);
++        glUniform1i(glGetUniformLocation(state.program, "u_frame"), 0);
++    }
++    const size_t bytes = static_cast<size_t>(width) * height * 4;
++    if (state.bufferBytes != bytes) {
++        if (state.buffer)
++            glDeleteBuffers(1, &state.buffer);
++        glGenBuffers(1, &state.buffer);
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER, state.buffer);
++        glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_DYNAMIC_READ);
++        state.bufferBytes = bytes;
++    }
++    while (glGetError() != GL_NO_ERROR) { }
++    glUseProgram(state.program);
++    glUniform2i(state.sizeLocation, width, height);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, state.texture);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, outputBinding, state.buffer);
++    glDispatchCompute((width + 7) / 8, (height + 7) / 8, 1);
++    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, outputBinding, 0);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glUseProgram(0);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, state.buffer);
++    const void* mapped = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT);
++    if (mapped)
++        memcpy(rgba.data(), mapped, bytes);
++    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
++    if (!mapped || glGetError() != GL_NO_ERROR)
++        return fail("dispatch or map");
++    return true;
++}
++
++
+ Reader& reader()
+ {
+     static NeverDestroyed<Reader> instance;
+@@ -91,7 +177,11 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+         if (void* done = copy(key, state.texture, false)) {
+             glDeleteSync(static_cast<GLsync>(done));
+             const size_t bytes = static_cast<size_t>(frameWidth) * frameHeight * 4;
+-            if (rgba.tryGrow(bytes)) {
++            if (rgba.size() == bytes || rgba.tryGrow(bytes - rgba.size())) {
++                if (readWithCompute(state, frameWidth, frameHeight, rgba.mutableSpan()))
++                    ok = true;
++            }
++            if (!ok && rgba.size() == bytes) {
+                 glBindFramebuffer(GL_FRAMEBUFFER, state.framebuffer);
+                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, state.texture, 0);
+                 glPixelStorei(GL_PACK_ALIGNMENT, 4);
+@@ -110,7 +200,7 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+         width = frameWidth;
+         height = frameHeight;
+         if (!state.reads++ || !(state.reads % 600))
+-            WTFLogAlways("[webgpu] title: video frame %dx%d read for a WebGPU texture in %.2f ms (%u reads)", frameWidth, frameHeight, (MonotonicTime::now() - start).milliseconds(), state.reads);
++            WTFLogAlways("[webgpu] title: video frame %dx%d read for a WebGPU texture in %.2f ms (%u reads, %s)", frameWidth, frameHeight, (MonotonicTime::now() - start).milliseconds(), state.reads, state.computeFailed ? "glReadPixels" : "compute pass");
+     } else if (!state.reads++)
+         WTFLogAlways("[webgpu] title: video frame %dx%d could not be read", frameWidth, frameHeight);
+     return ok;
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp
+index e6e779c2c6..022f0aa8c0 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp
+@@ -166,6 +166,18 @@ RefPtr<::WebGPU::ExternalTexture> RemoteDeviceProxy::importExternalTexture(const
+     auto result = RemoteExternalTextureProxy::create(*this, m_convertToBackingContext, identifier);
+     result->setLabel(WTF::move(convertedDescriptor->label));
+     return result;
++#elif USE(DAWN)
++    // PS5: the title has the video's decoded frames (as for WebGL's texImage2D(video)); it makes
++    // the external texture from the stream's newest one. Other sources (a WebCodecs frame, a
++    // software-decoded video) have no stream there: InvalidStateError for the page.
++    if (!descriptor.ps5VideoStreamKey)
++        return nullptr;
++    auto sendResult = send(Messages::RemoteDevice::ImportExternalTextureFromVideoStreamPS5(descriptor.ps5VideoStreamKey, identifier));
++    if (sendResult != IPC::Error::NoError)
++        return nullptr;
++    auto result = RemoteExternalTextureProxy::create(*this, m_convertToBackingContext, identifier);
++    result->setLabel(WTF::move(convertedDescriptor->label));
++    return result;
+ #else
+     // No external (video) textures on this port yet (PS5, Dawn). Nothing was sent, so the GPU process
+     // has no object for the identifier: a proxy for it would name an unknown object in every

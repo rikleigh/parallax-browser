@@ -1,0 +1,347 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+index 3828f94826..ab73a1784f 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
++++ b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+@@ -45,6 +45,10 @@
+ #include "ImageBuffer.h"
+ #include "ImageData.h"
+ #include "JSDOMConvertNull.h"
++#if USE(DAWN)
++#include "MediaPlayer.h"
++#include "MediaPlayerPrivate.h"
++#endif
+ #include "JSDOMPromiseDeferred.h"
+ #include "OffscreenCanvas.h"
+ #include "PixelBuffer.h"
+@@ -740,6 +744,33 @@ static void imageBytesForSource(WebGPUIntegration& gpu, WebGPU::Queue& backing,
+             IntSize videoSize(videoElement->videoWidth(), videoElement->videoHeight());
+             if (videoSize.isEmpty() || videoSize.width() > 16384 || videoSize.height() > 16384)
+                 return callback({ }, 0, 0);
++#if USE(DAWN)
++            // A hardware-decoded video's frames are the title's (as for WebGL's texImage2D): its
++            // newest one, read back there. Video is opaque, so premultiplying changes nothing.
++            if (RefPtr player = videoElement->player()) {
++                if (uint64_t key = player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0) {
++                    Vector<uint8_t> frame;
++                    uint32_t frameWidth = 0, frameHeight = 0;
++                    if (backing.ps5ReadVideoStreamFrame(key, frame, frameWidth, frameHeight)) {
++                        const uint32_t width = videoSize.width(), height = videoSize.height();
++                        if (frameWidth == width && frameHeight == height)
++                            return callback(frame.span(), width, height);
++                        // Decoded at another size than the element reports: the nearest pixels.
++                        Vector<uint8_t> scaled;
++                        if (!scaled.tryGrow(static_cast<size_t>(width) * height * 4))
++                            return callback({ }, 0, 0);
++                        auto source = frame.span();
++                        auto target = scaled.mutableSpan();
++                        for (uint32_t y = 0; y < height; ++y) {
++                            const size_t sourceRow = static_cast<size_t>(static_cast<uint64_t>(y) * frameHeight / height) * frameWidth;
++                            for (uint32_t x = 0; x < width; ++x)
++                                memcpySpan(target.subspan((static_cast<size_t>(y) * width + x) * 4, 4), source.subspan((sourceRow + static_cast<uint64_t>(x) * frameWidth / width) * 4, 4));
++                        }
++                        return callback(scaled.span(), width, height);
++                    }
++                }
++            }
++#endif
+             RefPtr imageBuffer = ImageBuffer::create(videoSize, RenderingMode::Unaccelerated, RenderingPurpose::Unspecified, 1, ColorSpace::SRGB(), PixelFormat::BGRA8);
+             if (!imageBuffer)
+                 return callback({ }, 0, 0);
+diff --git a/Source/WebGPU/WebGPUCpp.h b/Source/WebGPU/WebGPUCpp.h
+index 027e77e442..454557b3e3 100644
+--- a/Source/WebGPU/WebGPUCpp.h
++++ b/Source/WebGPU/WebGPUCpp.h
+@@ -1582,6 +1582,12 @@ public:
+     virtual void writeTexture(const TexelCopyTextureInfo& destination, std::span<const uint8_t> data, const TexelCopyBufferLayout&, const Extent3D& writeSize) = 0;
+ #if PLATFORM(COCOA)
+     virtual void copyExternalImageToTexture(const ImageCopyExternalImage& source, const ImageCopyTextureTagged& destination, const Extent3D& copySize) = 0;
++#endif
++#if USE(DAWN)
++    // PS5: the newest decoded frame of one of the title's video streams
++    // (MediaPlayerPrivate::ps5VideoStreamKey()) as RGBA8 rows from the picture's top. False: no
++    // frame. Only the WebProcess's proxy has it: the frames are the title's.
++    virtual bool ps5ReadVideoStreamFrame(uint64_t, Vector<uint8_t>&, uint32_t&, uint32_t&) { return false; }
+ #endif
+     virtual void setLabel(String&&) = 0;
+     virtual bool isValid() const = 0;
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
+index d8cc3a7925..16e2cef10f 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
+@@ -39,6 +39,10 @@
+ #include <WebCore/WebGPUImageCopyTextureTagged.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
++#include "PS5WebGLLayers.h"
++#endif
++
+ #if PLATFORM(COCOA) && ENABLE(VIDEO)
+ #include "GPUConnectionToWebProcess.h"
+ #include "RemoteVideoFrameObjectHeap.h"
+@@ -275,6 +279,25 @@ void RemoteQueue::copyExternalImageFromVideoFrameToTexture(
+ }
+ #endif
+ 
++#if USE(DAWN)
++// PS5: copyExternalImageToTexture(video). The title has the decoded frames; the page converts
++// the pixels to the destination's format, as it does for its other sources.
++void RemoteQueue::readVideoStreamFramePS5(uint64_t streamKey, CompletionHandler<void(std::optional<WebCore::SharedMemoryHandle>&&, uint32_t, uint32_t)>&& completionHandler)
++{
++#if ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
++    Vector<uint8_t> pixels;
++    uint32_t width = 0, height = 0;
++    if (PS5WebGLLayers::readVideoFramePixels(streamKey, pixels, width, height)) {
++        if (auto handle = WebCore::SharedMemoryHandle::createCopy(pixels.span(), WebCore::SharedMemoryProtection::ReadOnly))
++            return completionHandler(WTF::move(handle), width, height);
++    }
++#else
++    UNUSED_PARAM(streamKey);
++#endif
++    completionHandler(std::nullopt, 0, 0);
++}
++#endif
++
+ void RemoteQueue::setLabel(String&& label)
+ {
+     protect(m_backing)->setLabel(WTF::move(label));
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
+index 5471614150..bc104507ff 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
+@@ -121,6 +121,10 @@ private:
+         const WebGPU::ImageDataLayout&,
+         const WebGPU::Extent3D& size);
+ 
++#if USE(DAWN)
++    void readVideoStreamFramePS5(uint64_t streamKey, CompletionHandler<void(std::optional<WebCore::SharedMemoryHandle>&&, uint32_t, uint32_t)>&&);
++#endif
++
+     void copyExternalImageToTexture(
+         const WebGPU::ImageCopyExternalImage& source,
+         const WebGPU::ImageCopyTextureTagged& destination,
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
+index f0a8522acd..a5e5bac178 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
+@@ -46,6 +46,9 @@ messages -> RemoteQueue Stream {
+     // message or named by a media player the GPU process resolves itself, so there is no identifier
+     // on another stream to race against.
+     void CopyExternalImageFromVideoFrameToTexture(WebKit::WebGPU::ImageCopyExternalImageVideoSource source, WebKit::WebGPU::ImageCopyTextureTagged destination, WebKit::WebGPU::Extent3D copySize) NotStreamEncodable
++#endif
++#if USE(DAWN)
++    void ReadVideoStreamFramePS5(uint64_t streamKey) -> (std::optional<WebCore::SharedMemory::Handle> pixels, uint32_t width, uint32_t height) Synchronous NotStreamEncodableReply
+ #endif
+     void SetLabel(String label)
+ }
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index bc5f1c2dcf..950bb42181 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -105,6 +105,9 @@ VideoFrameSizeFunction videoFrameSizeFunction();
+ // newest frame of the stream into the texture's native object, the
+ // context's next commands after it on the GPU. False: no frame, no copy.
+ bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY);
++// RemoteGPU's work queue (PS5WebGPUVideoRead.cpp, WebGPU builds): the newest frame of the
++// stream as RGBA8 rows from the picture's top. False: no frame.
++bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);
+ // eglBindAPI(EGL_OPENGL_ES_API) on this thread (ps5-opengl's EGL).
+ void bindESAPI();
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+new file mode 100644
+index 0000000000..2b6f868687
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+@@ -0,0 +1,122 @@
++/*
++ * PS5: a video stream's current frame as pixels, for WebGPU (spikes/12-webgpu).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ */
++
++#include "config.h"
++#include "PS5WebGLLayers.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
++
++#include <WebCore/GLContext.h>
++#include <WebCore/PlatformDisplay.h>
++#include <epoxy/egl.h>
++#include <epoxy/gl.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/NeverDestroyed.h>
++
++// The title's GPU submission lock (port/webkit/apps/title/titleradv.c): this is GL work on
++// Dawn's thread.
++extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
++extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
++
++namespace WebKit {
++namespace PS5WebGLLayers {
++
++namespace {
++
++// RemoteGPU's work queue only: a native ES context of the compositor's share group, current
++// there for the length of a read, and the texture the title's frame is copied into.
++struct Reader {
++    std::unique_ptr<WebCore::GLContext> context;
++    bool failed { false };
++    GLuint texture { 0 };
++    GLuint framebuffer { 0 };
++    int width { 0 };
++    int height { 0 };
++    unsigned reads { 0 };
++};
++
++Reader& reader()
++{
++    static NeverDestroyed<Reader> instance;
++    return instance;
++}
++
++} // namespace
++
++bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
++{
++    auto copy = copyVideoFrameFunction();
++    auto frameSize = videoFrameSizeFunction();
++    int frameWidth = 0, frameHeight = 0;
++    if (!key || !copy || !frameSize || !frameSize(key, &frameWidth, &frameHeight))
++        return false;
++    if (frameWidth <= 0 || frameHeight <= 0 || frameWidth > 8192 || frameHeight > 8192)
++        return false;
++
++    auto& state = reader();
++    if (!state.context && !state.failed) {
++        bindESAPI();
++        auto& display = WebCore::PlatformDisplay::sharedDisplay();
++        state.context = WebCore::GLContext::create(display.glDisplay(), WebCore::GLContext::Target::Surfaceless, display.sharingGLContext());
++        state.failed = !state.context;
++        WTFLogAlways("[webgpu] title: video read context %s", state.failed ? "could not be made: video sources stay black" : "ready");
++    }
++    if (!state.context)
++        return false;
++
++    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    if (ps5wk_gpu_submit_lock)
++        ps5wk_gpu_submit_lock();
++    bool ok = false;
++    auto start = MonotonicTime::now();
++    bindESAPI();
++    if (eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, static_cast<EGLContext>(state.context->platformContext()))) {
++        if (!state.texture || state.width != frameWidth || state.height != frameHeight) {
++            if (state.texture)
++                glDeleteTextures(1, &state.texture);
++            if (!state.framebuffer)
++                glGenFramebuffers(1, &state.framebuffer);
++            glGenTextures(1, &state.texture);
++            glBindTexture(GL_TEXTURE_2D, state.texture);
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frameWidth, frameHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            glBindTexture(GL_TEXTURE_2D, 0);
++            state.width = frameWidth;
++            state.height = frameHeight;
++        }
++        // Row 0 of the copy is the picture's top (flipY false), and so is the first row read.
++        if (void* done = copy(key, state.texture, false)) {
++            glDeleteSync(static_cast<GLsync>(done));
++            const size_t bytes = static_cast<size_t>(frameWidth) * frameHeight * 4;
++            if (rgba.tryGrow(bytes)) {
++                glBindFramebuffer(GL_FRAMEBUFFER, state.framebuffer);
++                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, state.texture, 0);
++                glPixelStorei(GL_PACK_ALIGNMENT, 4);
++                glReadPixels(0, 0, frameWidth, frameHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.mutableSpan().data());
++                glBindFramebuffer(GL_FRAMEBUFFER, 0);
++                ok = glGetError() == GL_NO_ERROR;
++            }
++        }
++        glFlush();
++        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    }
++    if (ps5wk_gpu_submit_unlock)
++        ps5wk_gpu_submit_unlock();
++
++    if (ok) {
++        width = frameWidth;
++        height = frameHeight;
++        if (!state.reads++ || !(state.reads % 600))
++            WTFLogAlways("[webgpu] title: video frame %dx%d read for a WebGPU texture in %.2f ms (%u reads)", frameWidth, frameHeight, (MonotonicTime::now() - start).milliseconds(), state.reads);
++    } else if (!state.reads++)
++        WTFLogAlways("[webgpu] title: video frame %dx%d could not be read", frameWidth, frameHeight);
++    return ok;
++}
++
++} // namespace PS5WebGLLayers
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index fa44b187d1..880d4a46e6 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -61,6 +61,7 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+             GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+             GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
+             GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
++            GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+ 
+             UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+ 
+diff --git a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+index ef5d4b7451..090cfa6ea1 100644
+--- a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
++++ b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+@@ -458,6 +458,7 @@
+ 
+     [NotSentFromWebContent] MessageParamReply RemoteAudioVideoRendererProxyManager.Create handle SharedTimebaseHandle
+     [NotSentFromWebContent] MessageParamReply RemoteCompositorIntegration.ReadPixelsPS5 pixels
++    [NotSentFromWebContent] MessageParamReply RemoteQueue.ReadVideoStreamFramePS5 pixels
+ }
+ 
+ [UnsafeWrapper] WebCore::SharedMemoryHandle {
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
+index c25791101e..9b9e19128c 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
+@@ -95,6 +95,26 @@ void RemoteQueueProxy::writeBuffer(::WebGPU::Buffer& buffer, uint64_t bufferOffs
+     }
+ }
+ 
++#if USE(DAWN)
++bool RemoteQueueProxy::ps5ReadVideoStreamFrame(uint64_t streamKey, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
++{
++    auto sendResult = sendSync(Messages::RemoteQueue::ReadVideoStreamFramePS5(streamKey));
++    if (!sendResult.succeeded())
++        return false;
++    auto [handle, frameWidth, frameHeight] = sendResult.takeReply();
++    if (!handle || !frameWidth || !frameHeight)
++        return false;
++    RefPtr memory = WebCore::SharedMemory::map(WTF::move(*handle), WebCore::SharedMemory::Protection::ReadOnly);
++    auto byteCount = CheckedSize { frameWidth } * static_cast<size_t>(frameHeight) * static_cast<size_t>(4);
++    if (!memory || byteCount.hasOverflowed() || memory->size() < byteCount.value())
++        return false;
++    rgba = memory->span().first(byteCount.value());
++    width = frameWidth;
++    height = frameHeight;
++    return true;
++}
++#endif
++
+ void RemoteQueueProxy::writeTexture(const ::WebGPU::TexelCopyTextureInfo& destination, std::span<const uint8_t> data, const ::WebGPU::TexelCopyBufferLayout& dataLayout, const ::WebGPU::Extent3D& writeSize)
+ {
+     auto convertedDestination = m_convertToBackingContext->convertToBacking(destination);
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
+index 1288ff99a3..13412ccd34 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
+@@ -63,6 +63,9 @@ public:
+     void writeTexture(const ::WebGPU::TexelCopyTextureInfo& destination, std::span<const uint8_t> data, const ::WebGPU::TexelCopyBufferLayout&, const ::WebGPU::Extent3D& writeSize) final;
+ #if PLATFORM(COCOA)
+     void copyExternalImageToTexture(const ::WebGPU::ImageCopyExternalImage& source, const ::WebGPU::ImageCopyTextureTagged& destination, const ::WebGPU::Extent3D& copySize) final;
++#endif
++#if USE(DAWN)
++    bool ps5ReadVideoStreamFrame(uint64_t streamKey, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) final;
+ #endif
+     void setLabel(String&&) final;
+     bool isValid() const final;
