@@ -2,7 +2,7 @@
 # Build Spike 12 P1 (Dawn on RADV beside ps5-opengl) as a registered title.
 # The RADV object and the GL side are P0b's (run its build-title.sh once).
 #   spikes/12-webgpu/p1-dawn-title/build-title.sh [TITLE_ID]
-# Needs build/radv-ps5/install from build-radv.sh.
+# Needs build/radv-ps5/install from port/deps/build.sh radv.
 # RADV and ps5-opengl each carry a Mesa 26.2 (4163 global symbols in common):
 # RADV is linked into one relocatable object first and every symbol but the
 # ICD's three entry points made local, so the two never meet at link time.
@@ -15,9 +15,9 @@ PREFIX="$ROOT/toolchain/ps5-opengl-gles-noprof-m8"
 RADV="$ROOT/build/radv-ps5"
 LLVM=/opt/homebrew/opt/llvm@18/bin
 OBJ="$HERE/build/obj"; mkdir -p "$OBJ"
-[[ -f $RADV/install/lib/libvulkan_radeon.ps5.a ]] || { echo "run build-radv.sh first" >&2; exit 1; }
+[[ -f $RADV/install/lib/libvulkan_radeon.ps5.a ]] || { echo "run port/deps/build.sh radv first" >&2; exit 1; }
 
-"$ROOT/spikes/12-webgpu/p0b-radv/radv-object.sh"
+"$ROOT/port/deps/radv/radv-object.sh"
 
 CF=(-O2 -g -Wall -Werror -ffunction-sections -fdata-sections -I"$ROOT/spikes" -I"$HERE/src" -I"$P0B/src"
     -DLOG_HOST="\"$PS5WK_LOG_HOST\"" -DLOG_PORT="$PS5WK_LOG_PORT")

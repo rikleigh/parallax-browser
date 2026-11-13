@@ -951,6 +951,22 @@ step_dawn() {
     fix_sysroot; cleanup dawn
 }
 
+# RADV (the Vulkan driver under Dawn, WebGPU builds): Mesa with the PS5 winsys
+# from ref/PS5_Mesa at a pinned revision, built against this repo's payload
+# SDK and libc++ into build/radv-ps5, then relinked as one object with only
+# the ICD entry points global (ps5-opengl has a Mesa of its own). Needs
+# ref/PS5_Mesa, ref/mihawk-PS5_PayloadSDK, Homebrew llvm/libclc/
+# spirv-llvm-translator/llvm@18 and the meson venv that
+# spikes/02-gl-egl/ps5-opengl/build.sh makes (port/deps/radv/*.sh).
+# apps/title/package.sh links build/radv-ps5/radv-local.o.
+step_radv() {
+    log "radv (Vulkan driver for WebGPU builds; port/deps/radv)"
+    local t0=$SECONDS
+    "$HERE/radv/build-radv.sh"
+    "$HERE/radv/radv-object.sh"
+    echo "radv: built in $((SECONDS - t0)) s"
+}
+
 # MIME types by file extension (no shared-mime-info on the console): a
 # hand-written globs2 for xdgmime (WebKit's and GIO's copies); the children
 # set XDG_DATA_DIRS=/data/ps5webkit/share.
@@ -965,13 +981,13 @@ STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv p
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
           cacert fonts mime xkeyboard_config)
 STEPS_M2=(dav1d ffmpeg libogg libvorbis opus gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
-# Not in any default set (spike 12, WebGPU): build.sh dawn
-STEPS_GPU=(dawn)
+# Not in any default set (WebGPU builds): build.sh dawn radv
+STEPS_GPU=(dawn radv)
 
 if [ "${1:-}" = "--list" ]; then
     echo "# Milestone 1 (default)"; printf '%s\n' "${STEPS_M1[@]}" | tr _ -
     echo "# Milestone 2 (media): build.sh m2"; printf '%s\n' "${STEPS_M2[@]}" | tr _ -
-    echo "# WebGPU (spike 12): build.sh dawn"; printf '%s\n' "${STEPS_GPU[@]}" | tr _ -
+    echo "# WebGPU builds: build.sh dawn radv"; printf '%s\n' "${STEPS_GPU[@]}" | tr _ -
     exit 0
 fi
 STEPS=("$@")

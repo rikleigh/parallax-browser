@@ -100,7 +100,7 @@ AGCDRIVER="$PREFIX/lib/libSceAgcDriver.so"
 webgpu_inputs=()
 rm -f "$W/obj/cpu_model.o" "$W/obj/titleradv.o"
 if grep -q '^USE_DAWN:BOOL=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
-    "$ROOT/spikes/12-webgpu/p0b-radv/radv-object.sh"
+    "$ROOT/port/deps/radv/radv-object.sh"
     prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titleradv.c" -o "$W/obj/titleradv.o"
     webgpu_inputs=("$ROOT/build/radv-ps5/radv-local.o" --wrap=dlclose)
     AGCDRIVER="$SYS/lib/libSceAgcDriver.so"

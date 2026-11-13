@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RADV as one object a title can link next to ps5-opengl (which carries its
 # own Mesa 26.2: 4163 global symbols in common).
-#   spikes/12-webgpu/p0b-radv/radv-object.sh   -> build/radv-ps5/radv-local.o
+#   port/deps/radv/radv-object.sh   -> build/radv-ps5/radv-local.o
 # Needs build/radv-ps5/install from build-radv.sh. Used by the spike titles
 # and by port/webkit/apps/title/package.sh (WebGPU builds).
 set -euo pipefail
@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 RADV="$ROOT/build/radv-ps5"
 LLVM=/opt/homebrew/opt/llvm@18/bin
 A="$RADV/install/lib/libvulkan_radeon.ps5.a"
-[[ -f $A ]] || { echo "run spikes/12-webgpu/p0b-radv/build-radv.sh first" >&2; exit 1; }
+[[ -f $A ]] || { echo "run port/deps/build.sh radv first" >&2; exit 1; }
 [[ -f $RADV/radv-local.o && ! $A -nt $RADV/radv-local.o ]] && exit 0
 # The SDK's prospero-lld wrapper adds a link script that breaks -r.
 "$LLVM/ld.lld" -m elf_x86_64 -r --whole-archive "$A" -o "$RADV/radv-whole.o"

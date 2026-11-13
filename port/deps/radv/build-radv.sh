@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build RADV (Mesa 26.2 with the PS5 winsys, mpereiraesaa/PS5_Mesa) as a
 # static archive for the browser title, with OUR payload SDK and libc++.
-#   spikes/12-webgpu/p0b-radv/build-radv.sh [--clean]
+#   port/deps/radv/build-radv.sh [--clean]      (port/deps/build.sh radv runs this and radv-object.sh)
+# Came out of spike 12 (spikes/12-webgpu/p0b-radv/NOTES.md has the why of each choice).
 # Adapted from ref/PS5_Vulkan/tools/build-radv.sh (release variant). Differences:
 # our toolchain/ps5-payload-sdk instead of the PS5_Vulkan SDK fork; only the
 # fork's platform headers (ps5platform/*.h: AGC, kernel, VideoOut

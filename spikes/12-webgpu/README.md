@@ -141,6 +141,5 @@ regression 29/29, a three.js WebGL example at 60 frames/s, no `navigator.gpu`.
 - A buffer unmapped after writing sends its bytes inline in an IPC message up
   to WebKit's usual threshold; with little address space left that
   allocation is fatal for the WebProcess (seen once, before 0118).
-- RADV is built by `p0b-radv/build-radv.sh`, not yet by `port/deps`.
 - Only one model has run (90 MB). Nothing larger, no image model, no
   ONNX Runtime Web without transformers.js.

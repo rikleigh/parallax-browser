@@ -36,7 +36,7 @@ only after `vkWaitForFences`, and every checked frame was complete.
 
 ## How it is built
 
-`build-radv.sh` builds `libvulkan_radeon.a` (269 MB with debug info) from
+`port/deps/radv/build-radv.sh` (run by `port/deps/build.sh radv`) builds `libvulkan_radeon.a` (269 MB with debug info) from
 `ref/PS5_Mesa` at `01d70579` (the revision `ref/PS5_Vulkan` pins), following
 `ref/PS5_Vulkan/tools/build-radv.sh release` but with **our** payload SDK and
 libc++ 19. The only thing taken from the PS5_Vulkan SDK fork is its
@@ -94,7 +94,7 @@ RADV costs roughly 20 MB of title image, which is flexible memory.
 ## Run it
 
 ```
-spikes/12-webgpu/p0b-radv/build-radv.sh
+port/deps/build.sh radv
 spikes/12-webgpu/p0b-radv/build-title.sh
 PS5WK_OWN_TITLES="PPSA99207 PPSA99012" tools/launch.sh --install spikes/12-webgpu/p0b-radv/build/titles/PPSA99012
 curl ftp://$PS5_HOST:2121/data/ps5webkit/12-webgpu-p0b.log
