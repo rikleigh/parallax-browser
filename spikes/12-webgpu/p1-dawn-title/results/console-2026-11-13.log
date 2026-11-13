@@ -1,0 +1,19 @@
+title 12-webgpu-p1 pid 187: unjailed 1, file log on, tcp log to <mac>:9999 connected (errno 0)
+RESULT 12-webgpu-p1 gl-present PASS 4.6 (Core Profile) Mesa 26.2.0, surface 1920x1080
+[mem] before Dawn            largest free direct block 11421.4 MB, flexible free 266.0 MB
+adapter: backend 6 type 2 "PlayStation 5 GPU (RADV NAVI21)" "radv: Mesa 26.2.0"
+RESULT 12-webgpu-p1 dawn-adapter PASS "PlayStation 5 GPU (RADV NAVI21)" (radv: Mesa 26.2.0) core, 35 features (shader-f16 1, texture-compression-bc 1, timestamp-query 1, float32-filterable 1); maxTextureDimension2D 16384, maxBufferSize 4095 MB, maxStorageBufferBindingSize 4095 MB, maxComputeWorkgroupsPerDimension 65535; 1 ms
+RESULT 12-webgpu-p1 dawn-device PASS device in 0 ms
+[mem] after Dawn device      largest free direct block 11404.0 MB, flexible free 266.0 MB
+RESULT 12-webgpu-p1 dawn-triangle PASS 1920x1080 WGSL triangle: centre 8,250,64 (want 8,250,64) corner 0,0,255; module 0.2 ms, pipeline 3.4 ms, first frame + readback 1.1 ms, 0 device errors
+RESULT 12-webgpu-p1 dawn-compute PASS 4096 values, 0 wrong; module + pipeline 1.0 ms, dispatch + copy + MapAsync 0.32 ms, 0 device errors
+RESULT 12-webgpu-p1 dawn-shader-compile PASS a lit, textured, 5-octave-noise shader (vs + fs): WGSL module 0.9 ms, pipeline (Tint to SPIR-V, then RADV) 12.0 ms cold
+[mem] after pipelines        largest free direct block 11374.0 MB, flexible free 266.0 MB
+RESULT 12-webgpu-p1 dawn-present PASS 8 frames right in the GL texture; 600 frames of 1920x1080: Dawn draw + CopyTextureToBuffer + MapAsync 0.23 ms, memcpy to the GL buffer 0.57 ms, GL SSBO pass 0.54 ms CPU: 1.34 ms a frame on the CPU; 59.9 frames/s end to end, GL presented 600; 0 device errors
+[mem] after 600 frames       largest free direct block 11364.0 MB, flexible free 266.0 MB
+dawn device lost (2): Device was destroyed.
+RESULT 12-webgpu-p1 dawn-stack PASS high-water 248 KiB of an 8 MiB stack (WGSL compile, Tint, RADV's compiler, all on Dawn's thread)
+GL presented 180 frames in the last 3 s; 0 GL errors, 0 failed swaps in all
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

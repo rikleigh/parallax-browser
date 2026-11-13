@@ -1,0 +1,1443 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUCompositorIntegration.h b/Source/WebCore/Modules/WebGPU/GPUCompositorIntegration.h
+index f11e7c2f3e..98d79f12f0 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUCompositorIntegration.h
++++ b/Source/WebCore/Modules/WebGPU/GPUCompositorIntegration.h
+@@ -60,6 +60,12 @@ public:
+     void paintCompositedResultsToCanvas(WebCore::ImageBuffer&, uint32_t);
+     void updateContentsHeadroom(float);
+ 
++#if USE(DAWN)
++    // PS5 (WebGPUCompositorIntegration.h).
++    uint64_t ps5LayerKey() const { return m_backing->ps5LayerKey(); }
++    bool ps5ReadPixels(uint32_t bufferIndex, bool currentFrame, bool opaque, ImageBuffer& destination) { return m_backing->ps5ReadPixels(bufferIndex, currentFrame, opaque, destination); }
++#endif
++
+ private:
+     GPUCompositorIntegration(Ref<WebGPUCompositorIntegration>&& backing)
+         : m_backing(WTF::move(backing))
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h
+index a0651a6f25..53da93a4a1 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h
+@@ -81,6 +81,14 @@ public:
+     // RemoteCompositorIntegration: the title's WC scene). Called on the implementation's thread.
+     void setFrameSink(FrameSink&& sink) { m_frameSink = WTF::move(sink); }
+     void frameWasPresented(uint32_t frameIndex, std::span<const uint8_t>, uint32_t width, uint32_t height, ::WebGPU::TextureFormat, ::WebGPU::CanvasAlphaMode);
++    // What a render buffer's texture holds now (::WebGPU::PresentationContext::readPixels): the
++    // frame being drawn, or the last one. An empty span when there is nothing to read.
++    void readPixels(uint32_t bufferIndex, CompletionHandler<void(std::span<const uint8_t>, uint32_t width, uint32_t height, ::WebGPU::TextureFormat)>&& completionHandler)
++    {
++        if (RefPtr presentationContext = m_presentationContext)
++            return presentationContext->readPixels(bufferIndex, WTF::move(completionHandler));
++        completionHandler({ }, 0, 0, ::WebGPU::TextureFormat::Bgra8unorm);
++    }
+ #endif
+ 
+     void withDisplayBufferAsNativeImage(uint32_t bufferIndex, Function<void(WebCore::NativeImage*)>) final;
+diff --git a/Source/WebCore/Modules/WebGPU/WebGPUCompositorIntegration.h b/Source/WebCore/Modules/WebGPU/WebGPUCompositorIntegration.h
+index ec354ec4c7..bcb28ae9af 100644
+--- a/Source/WebCore/Modules/WebGPU/WebGPUCompositorIntegration.h
++++ b/Source/WebCore/Modules/WebGPU/WebGPUCompositorIntegration.h
+@@ -65,6 +65,20 @@ public:
+     virtual void withDisplayBufferAsNativeImage(uint32_t bufferIndex, Function<void(NativeImage*)>) = 0;
+     virtual void paintCompositedResultsToCanvas(ImageBuffer&, uint32_t bufferIndex) = 0;
+     virtual void updateContentsHeadroom(float) = 0;
++#if USE(DAWN)
++    // PS5: the canvas's frames are shown by the title, which finds them by this key (the display
++    // delegate's ps5WebGLLayerKey(); WebKit's PS5WebGPUCanvas.h). WebGPU keys carry the tag, WebGL's
++    // are small context numbers. 0: this integration shows nothing.
++    static constexpr uint64_t ps5LayerKeyTag = 1ull << 63;
++    static constexpr uint64_t ps5LayerKeyForIdentifier(uint64_t identifier) { return identifier | ps5LayerKeyTag; }
++    virtual uint64_t ps5LayerKey() const { return 0; }
++    // PS5: the pixels of a render buffer into an unaccelerated buffer of the canvas's size.
++    // currentFrame: what the buffer's texture holds now (the frame being drawn, or the last one
++    // when no new one was started); otherwise the newest frame the title has been handed for
++    // display. opaque: the canvas's alpha mode (its alpha channel reads as 1). False, and the
++    // buffer untouched, when there is nothing to read.
++    virtual bool ps5ReadPixels(uint32_t /* bufferIndex */, bool /* currentFrame */, bool /* opaque */, ImageBuffer&) { return false; }
++#endif
+     virtual bool isRemoteCompositorIntegrationProxy() const { return false; }
+     virtual bool isWebGPUCompositorIntegrationImpl() const { return false; }
+ 
+diff --git a/Source/WebCore/SourcesWPE.txt b/Source/WebCore/SourcesWPE.txt
+index af0d1d335c..2ab9cabc11 100644
+--- a/Source/WebCore/SourcesWPE.txt
++++ b/Source/WebCore/SourcesWPE.txt
+@@ -46,6 +46,8 @@ editing/atspi/FrameSelectionAtspi.cpp
+ editing/glib/EditorGLib.cpp
+ editing/glib/WebContentReaderGLib.cpp
+ 
++html/canvas/GPUCanvasContextPS5.cpp
++
+ loader/soup/ResourceLoaderSoup.cpp
+ 
+ page/glib/DragControllerGLib.cpp
+diff --git a/Source/WebCore/html/canvas/GPUCanvasContext.cpp b/Source/WebCore/html/canvas/GPUCanvasContext.cpp
+index 9a7ac28be1..717405bd5b 100644
+--- a/Source/WebCore/html/canvas/GPUCanvasContext.cpp
++++ b/Source/WebCore/html/canvas/GPUCanvasContext.cpp
+@@ -33,7 +33,8 @@ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(GPUCanvasContext);
+ 
+-#if !PLATFORM(COCOA)
++// The PS5 (Dawn) has GPUCanvasContextPS5.cpp.
++#if !PLATFORM(COCOA) && !USE(DAWN)
+ std::unique_ptr<GPUCanvasContext> GPUCanvasContext::create(CanvasBase&, GPU&, Document*)
+ {
+     return nullptr;
+diff --git a/Source/WebCore/html/canvas/GPUCanvasContextPS5.cpp b/Source/WebCore/html/canvas/GPUCanvasContextPS5.cpp
+new file mode 100644
+index 0000000000..31a644c44b
+--- /dev/null
++++ b/Source/WebCore/html/canvas/GPUCanvasContextPS5.cpp
+@@ -0,0 +1,420 @@
++/*
++ * PS5: WebGPU canvases over Dawn in the title (spikes/12-webgpu, P3).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ * Modelled on GPUCanvasContextCocoa.mm (Copyright (C) 2021-2025 Apple Inc.).
++ */
++
++#include "config.h"
++#include "GPUCanvasContextPS5.h"
++
++#if USE(DAWN)
++
++#include "ContextDestructionObserverInlines.h"
++#include "Document.h"
++#include "EventLoop.h"
++#include "GPUAdapter.h"
++#include "GPUCanvasConfiguration.h"
++#include "GPUDevice.h"
++#include "GPUPresentationContext.h"
++#include "GPUPresentationContextDescriptor.h"
++#include "GPUTextureDescriptor.h"
++#include "ImageBuffer.h"
++#include "InspectorInstrumentation.h"
++#include "NativeImage.h"
++#include "PredefinedColorSpace.h"
++#include "ScriptExecutionContext.h"
++#include <wtf/TZoneMallocInlines.h>
++#include <wtf/text/MakeString.h>
++
++namespace WebCore {
++
++namespace {
++
++// Only names the canvas: the title shows the frames it reads back itself, by this key.
++class GPULayerDelegatePS5 final : public GraphicsLayerContentsDisplayDelegate {
++public:
++    static Ref<GPULayerDelegatePS5> create(uint64_t key) { return adoptRef(*new GPULayerDelegatePS5(key)); }
++
++    void setDisplayBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&&) final { }
++    void display(CoordinatedPlatformLayer&, std::optional<Damage>&&) final { }
++#if defined(PS5_PAYLOAD_SDK)
++    uint64_t ps5WebGLLayerKey() const final { return m_key; }
++#endif
++
++private:
++    explicit GPULayerDelegatePS5(uint64_t key)
++        : m_key(key)
++    {
++    }
++
++    const uint64_t m_key;
++};
++
++} // namespace
++
++WTF_MAKE_TZONE_ALLOCATED_IMPL(GPUCanvasContextPS5);
++
++std::unique_ptr<GPUCanvasContext> GPUCanvasContext::create(CanvasBase& canvas, GPU& gpu, Document* document)
++{
++    auto context = GPUCanvasContextPS5::create(canvas, gpu, document);
++    if (context)
++        context->suspendIfNeeded();
++    return context;
++}
++
++std::unique_ptr<GPUCanvasContextPS5> GPUCanvasContextPS5::create(CanvasBase& canvas, GPU& gpu, Document*)
++{
++    RefPtr compositorIntegration = gpu.createCompositorIntegration();
++    if (!compositorIntegration)
++        return nullptr;
++    RefPtr presentationContext = gpu.createPresentationContext(GPUPresentationContextDescriptor { *compositorIntegration });
++    if (!presentationContext)
++        return nullptr;
++    return std::unique_ptr<GPUCanvasContextPS5>(new GPUCanvasContextPS5(canvas, compositorIntegration.releaseNonNull(), presentationContext.releaseNonNull()));
++}
++
++GPUCanvasContext::CanvasType GPUCanvasContextPS5::htmlOrOffscreenCanvas() const
++{
++    if (RefPtr canvas = htmlCanvas())
++        return canvas.releaseNonNull();
++#if ENABLE(OFFSCREEN_CANVAS)
++    return downcast<OffscreenCanvas>(canvasBase());
++#else
++    RELEASE_ASSERT_NOT_REACHED();
++#endif
++}
++
++GPUCanvasContextPS5::GPUCanvasContextPS5(CanvasBase& canvas, Ref<GPUCompositorIntegration>&& compositorIntegration, Ref<GPUPresentationContext>&& presentationContext)
++    : GPUCanvasContext(canvas)
++    , m_compositorIntegration(WTF::move(compositorIntegration))
++    , m_presentationContext(WTF::move(presentationContext))
++    , m_layerContentsDisplayDelegate(GPULayerDelegatePS5::create(m_compositorIntegration->ps5LayerKey()))
++    , m_width(static_cast<GPUIntegerCoordinate>(canvas.size().width()))
++    , m_height(static_cast<GPUIntegerCoordinate>(canvas.size().height()))
++{
++}
++
++GPUCanvasContextPS5::~GPUCanvasContextPS5()
++{
++    CanvasRenderingContext::updateMemoryCost(0);
++
++    if (auto configuration = std::exchange(m_configuration, std::nullopt))
++        InspectorInstrumentation::didChangeGPUDeviceClientNodes(configuration->device);
++}
++
++void GPUCanvasContextPS5::didUpdateCanvasSizeProperties(bool)
++{
++    if (RefPtr currentTexture = m_currentTexture) {
++        currentTexture->destroy();
++        m_currentTexture = nullptr;
++    }
++    updateMemoryCost();
++    auto newSize = canvasBase().size();
++    auto newWidth = static_cast<GPUIntegerCoordinate>(newSize.width());
++    auto newHeight = static_cast<GPUIntegerCoordinate>(newSize.height());
++    if (m_width == newWidth && m_height == newHeight)
++        return;
++
++    m_width = newWidth;
++    m_height = newHeight;
++
++    // The size is part of the configuration in the title: the same configuration again, with
++    // render buffers of the new size. The canvas reads as transparent black until it is drawn.
++    auto configuration = WTF::move(m_configuration);
++    m_configuration.reset();
++    unconfigure();
++    if (configuration) {
++        GPUCanvasConfiguration canvasConfiguration {
++            configuration->device,
++            configuration->format,
++            configuration->usage,
++            configuration->viewFormats,
++            configuration->colorSpace,
++            configuration->toneMapping,
++            configuration->compositingAlphaMode,
++        };
++        if (configure(WTF::move(canvasConfiguration), true).hasException())
++            InspectorInstrumentation::didChangeGPUDeviceClientNodes(configuration->device);
++    }
++}
++
++RefPtr<ImageBuffer> GPUCanvasContextPS5::createReadBuffer() const
++{
++    const auto size = canvasBase().size();
++    if (size.isEmpty())
++        return nullptr;
++    // In this process, on the CPU: the pixels arrive in shared memory and are put into it.
++    return ImageBuffer::create(size, RenderingMode::Unaccelerated, RenderingPurpose::Canvas, 1, colorSpace(), PixelFormat::BGRA8);
++}
++
++RefPtr<ImageBuffer> GPUCanvasContextPS5::surfaceBufferToImageBuffer(SurfaceBuffer sourceBuffer)
++{
++    RefPtr scriptExecutionContext = protect(canvasBase())->scriptExecutionContext();
++    if (!scriptExecutionContext)
++        return nullptr;
++    // A new buffer for every read, transparent black to start with. Nothing is cached: what the
++    // page has submitted to the texture since the last read is not known here.
++    RefPtr buffer = createReadBuffer();
++    if (!buffer || !m_configuration)
++        return buffer;
++
++    // The inspector reads what is on screen: the newest frame the title was handed. Everything
++    // else reads the texture, which holds the frame being drawn in this task, or else the last
++    // frame drawn (presenting and expiring a frame leave the contents of its texture, and the
++    // next frame starts by clearing it).
++    bool currentFrame = sourceBuffer != SurfaceBuffer::DisplayBufferForInspector;
++    if (!currentFrame && !m_configuration->hasPresentedFrame)
++        return buffer;
++    m_compositorIntegration->ps5ReadPixels(frameIndex, currentFrame, isOpaque(), *buffer);
++    return buffer;
++}
++
++RefPtr<NativeImage> GPUCanvasContextPS5::surfaceBufferToNativeImage(SurfaceBuffer sourceBuffer)
++{
++    return ImageBuffer::sinkIntoNativeImage(surfaceBufferToImageBuffer(sourceBuffer));
++}
++
++RefPtr<ImageBuffer> GPUCanvasContextPS5::transferToImageBuffer()
++{
++    RefPtr scriptExecutionContext = protect(canvasBase())->scriptExecutionContext();
++    if (!scriptExecutionContext)
++        return nullptr;
++    RefPtr buffer = createReadBuffer();
++    if (!buffer || !m_configuration)
++        return buffer;
++    m_compositorIntegration->ps5ReadPixels(frameIndex, true, isOpaque(), *buffer);
++    // Transferring a frame away ends it: the texture the page drew into expires, and the next
++    // getCurrentTexture() starts a new frame, cleared. The frame is not shown.
++    expireCurrentTexture();
++    m_compositingResultsNeedsUpdating = false;
++    m_presentationContext->present(frameIndex);
++    updateMemoryCost();
++    return buffer;
++}
++
++GPUCanvasContext::CanvasType GPUCanvasContextPS5::canvas()
++{
++    return htmlOrOffscreenCanvas();
++}
++
++static bool equalConfigurations(const auto& a, const auto& b)
++{
++    return a.device.ptr()   == b.device.ptr()
++        && a.format         == b.format
++        && a.usage          == b.usage
++        && a.viewFormats    == b.viewFormats
++        && a.colorSpace     == b.colorSpace;
++}
++
++static bool isSupportedContextFormat(GPUTextureFormat format)
++{
++    return format == GPUTextureFormat::Bgra8unorm || format == GPUTextureFormat::Rgba8unorm || format == GPUTextureFormat::Rgba16float;
++}
++
++ExceptionOr<void> GPUCanvasContextPS5::configure(GPUCanvasConfiguration&& configuration, bool dueToReshape)
++{
++    if (isConfigured()) {
++        if (dueToReshape && equalConfigurations(*m_configuration, configuration))
++            return { };
++
++        // The title's presentation context keeps its textures until it is unconfigured, and so
++        // does the proxy of it in this process: every configure() follows an unconfigure().
++        unconfigure();
++    }
++
++    if (configuration.usage & GPUTextureUsage::TRANSIENT_ATTACHMENT)
++        return Exception { ExceptionCode::TypeError, "GPUCanvasContext.configure: Can not configure a canvas with a transient backing"_s };
++
++    if (auto error = protect(configuration.device)->errorValidatingSupportedFormat(configuration.format))
++        return Exception { ExceptionCode::TypeError, makeString("GPUCanvasContext.configure: Unsupported texture format: "_s, *error) };
++
++    for (auto viewFormat : configuration.viewFormats) {
++        if (auto error = protect(configuration.device)->errorValidatingSupportedFormat(viewFormat))
++            return Exception { ExceptionCode::TypeError, makeString("Unsupported texture view format: "_s, *error) };
++    }
++
++    if (!isSupportedContextFormat(configuration.format))
++        return Exception { ExceptionCode::TypeError, "GPUCanvasContext.configure: Unsupported context format."_s };
++
++    // No HDR output: an rgba16float canvas is drawn in half floats, and shown and read back
++    // clamped to 8 bits (RemoteCompositorIntegration in the title converts each frame).
++    configuration.toneMapping.mode = GPUCanvasToneMappingMode::Standard;
++
++    bool reportValidationErrors = !dueToReshape;
++    if (!m_presentationContext->configure(configuration, m_width, m_height, reportValidationErrors))
++        return Exception { ExceptionCode::InvalidStateError, "GPUCanvasContext.configure: Unable to configure."_s };
++
++    m_configuration = {
++        configuration.device,
++        configuration.format,
++        configuration.usage,
++        configuration.viewFormats,
++        configuration.colorSpace,
++        configuration.toneMapping,
++        configuration.alphaMode,
++        false,
++    };
++    if (!dueToReshape)
++        InspectorInstrumentation::didChangeGPUDeviceClientNodes(m_configuration->device);
++    return { };
++}
++
++ExceptionOr<void> GPUCanvasContextPS5::configure(GPUCanvasConfiguration&& configuration)
++{
++    return configure(WTF::move(configuration), false);
++}
++
++void GPUCanvasContextPS5::unconfigure()
++{
++    m_presentationContext->unconfigure();
++    auto configuration = std::exchange(m_configuration, std::nullopt);
++    m_currentTexture = nullptr;
++    // The frame that was being drawn went with its texture.
++    m_compositingResultsNeedsUpdating = false;
++    updateMemoryCost();
++    ASSERT(!isConfigured());
++
++    if (configuration)
++        InspectorInstrumentation::didChangeGPUDeviceClientNodes(configuration->device);
++}
++
++std::optional<GPUCanvasConfiguration> GPUCanvasContextPS5::getConfiguration() const
++{
++    std::optional<GPUCanvasConfiguration> configuration;
++    if (m_configuration) {
++        configuration.emplace(GPUCanvasConfiguration {
++            m_configuration->device,
++            m_configuration->format,
++            m_configuration->usage,
++            m_configuration->viewFormats,
++            m_configuration->colorSpace,
++            m_configuration->toneMapping,
++            m_configuration->compositingAlphaMode,
++        });
++    }
++
++    return configuration;
++}
++
++ExceptionOr<Ref<GPUTexture>> GPUCanvasContextPS5::getCurrentTexture()
++{
++    if (!isConfigured())
++        return Exception { ExceptionCode::InvalidStateError, "GPUCanvasContext.getCurrentTexture: canvas is not configured"_s };
++
++    RefPtr currentTexture = m_currentTexture;
++    if (currentTexture)
++        return currentTexture.releaseNonNull();
++
++    willUpdateDisplayBufferContents();
++    // The first time after configure() this makes the texture in the title; every time after
++    // that it revives the same one, which starts the frame cleared to transparent black.
++    m_currentTexture = m_presentationContext->getCurrentTexture(frameIndex);
++    currentTexture = m_currentTexture;
++    if (!currentTexture)
++        return Exception { ExceptionCode::InvalidStateError, "GPUCanvasContext.getCurrentTexture: no texture"_s };
++    updateMemoryCost();
++
++    // The texture expires once the task it was handed out in has run to completion, so that the
++    // next task draws a new frame instead of drawing over the frame this one has finished.
++    // Presenting expires it too, but that happens later in the rendering update than the
++    // animation frame callbacks do (GPUCanvasContextCocoa.mm).
++    if (RefPtr scriptExecutionContext = protect(canvasBase())->scriptExecutionContext()) {
++        protect(scriptExecutionContext->eventLoop())->queueTask(TaskSource::WebGPU, [weakThis = WeakPtr { *this }, texture = currentTexture] {
++            RefPtr protectedThis = weakThis.get();
++            // Anything which expired the texture in the meantime, presenting above all, has already
++            // moved on to a new frame.
++            if (!protectedThis || protectedThis->m_currentTexture != texture)
++                return;
++            protectedThis->expireCurrentTexture();
++        });
++    }
++
++    return currentTexture.releaseNonNull();
++}
++
++bool GPUCanvasContextPS5::isOpaque() const
++{
++    if (m_configuration)
++        return m_configuration->compositingAlphaMode == GPUCanvasAlphaMode::Opaque;
++    return true;
++}
++
++ColorSpace GPUCanvasContextPS5::colorSpace() const
++{
++    if (!m_configuration)
++        return ColorSpace::SRGB();
++    return toColorSpace(m_configuration->colorSpace);
++}
++
++RefPtr<GraphicsLayerContentsDisplayDelegate> GPUCanvasContextPS5::layerContentsDisplayDelegate()
++{
++    return m_layerContentsDisplayDelegate.ptr();
++}
++
++void GPUCanvasContextPS5::expireCurrentTexture()
++{
++    // Only flags the texture in the title: its contents stay, for presenting and for reading.
++    if (RefPtr currentTexture = m_currentTexture)
++        currentTexture->destroy();
++    m_currentTexture = nullptr;
++}
++
++void GPUCanvasContextPS5::present()
++{
++    if (!m_configuration)
++        return;
++
++    m_compositingResultsNeedsUpdating = false;
++    m_configuration->hasPresentedFrame = true;
++    expireCurrentTexture();
++    m_presentationContext->present(frameIndex);
++    updateMemoryCost();
++}
++
++void GPUCanvasContextPS5::prepareForDisplay()
++{
++    // Presenting is a readback of the whole canvas in the title: only frames that were started
++    // since the last one are presented.
++    if (!isConfigured() || !m_compositingResultsNeedsUpdating)
++        return;
++
++#if ENABLE(OFFSCREEN_CANVAS)
++    // An OffscreenCanvas has no layer of its own. Its placeholder canvas, if it has one, is
++    // given an image buffer read from the texture (OffscreenCanvas::commitToPlaceholderCanvas),
++    // so the title is not asked to read the frame back for display.
++    if (is<OffscreenCanvas>(canvasBase())) {
++        present();
++        return;
++    }
++#endif
++
++    // A canvas that is in no document has no layer: the title is not asked to read back frames
++    // nobody sees (as WebGL does in HTMLCanvasElement::prepareForDisplay). The frame stays
++    // unpresented; once the canvas is back, the next frame drawn is shown.
++    if (RefPtr canvas = htmlCanvas(); canvas && !canvas->isInTreeScope())
++        return;
++
++    m_compositorIntegration->prepareForDisplay(frameIndex, [weakThis = WeakPtr { *this }] {
++        if (RefPtr protectedThis = weakThis.get())
++            protectedThis->present();
++    });
++}
++
++void GPUCanvasContextPS5::willUpdateDisplayBufferContents()
++{
++    m_compositingResultsNeedsUpdating = true;
++    willUpdateCanvasContents();
++}
++
++void GPUCanvasContextPS5::updateMemoryCost() const
++{
++    // Computes only a rough ballpark figure to drive garbage collection.
++    size_t newMemoryCost = 0;
++    if (m_currentTexture)
++        newMemoryCost += m_currentTexture->estimatedMemoryCost();
++    CanvasRenderingContext::updateMemoryCost(newMemoryCost);
++}
++
++} // namespace WebCore
++
++#endif // USE(DAWN)
+diff --git a/Source/WebCore/html/canvas/GPUCanvasContextPS5.h b/Source/WebCore/html/canvas/GPUCanvasContextPS5.h
+new file mode 100644
+index 0000000000..dede253422
+--- /dev/null
++++ b/Source/WebCore/html/canvas/GPUCanvasContextPS5.h
+@@ -0,0 +1,110 @@
++/*
++ * PS5: WebGPU canvases over Dawn in the title (spikes/12-webgpu, P3).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ * Modelled on GPUCanvasContextCocoa.h (Copyright (C) 2021-2023 Apple Inc.).
++ */
++
++#pragma once
++
++#if USE(DAWN)
++
++#include "GPU.h"
++#include "GPUBasedCanvasRenderingContext.h"
++#include "GPUCanvasConfiguration.h"
++#include "GPUCanvasContext.h"
++#include "GPUCompositorIntegration.h"
++#include "GPUPresentationContext.h"
++#include "GPUTexture.h"
++#include "GraphicsLayerContentsDisplayDelegate.h"
++#include "HTMLCanvasElement.h"
++#include "OffscreenCanvas.h"
++#include <wtf/Ref.h>
++#include <wtf/RefPtr.h>
++
++namespace WebCore {
++
++class Document;
++
++// The canvas context where the WebGPU implementation shares no textures with the compositor
++// (Dawn on RADV in the title, the compositor on ps5-opengl).
++//
++// - One render buffer, index 0. Its size travels in the canvas configuration, so a canvas whose
++//   size changes is unconfigured and configured again with the same configuration.
++// - Display: prepareForDisplay() presents the frame in the title, which reads it back and shows
++//   it in the layer this context's display delegate names by key (ps5WebGLLayerKey; WebKit's
++//   PS5WebGPUCanvas.h). No pixels pass through this process for display.
++// - Reading (toDataURL, drawImage, createImageBitmap, toBlob): a synchronous read of the render
++//   buffer's texture, whose contents stay after the frame is presented, into an unaccelerated
++//   image buffer (GPUCompositorIntegration::ps5ReadPixels).
++class GPUCanvasContextPS5 final : public GPUCanvasContext {
++    WTF_MAKE_TZONE_ALLOCATED(GPUCanvasContextPS5);
++public:
++    static std::unique_ptr<GPUCanvasContextPS5> create(CanvasBase&, GPU&, Document*);
++
++    ~GPUCanvasContextPS5();
++
++    ColorSpace colorSpace() const override;
++    bool compositingResultsNeedUpdating() const override { return m_compositingResultsNeedsUpdating; }
++    RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() override;
++    bool needsPreparationForDisplay() const override { return true; }
++    void prepareForDisplay() override;
++    bool isOpaque() const override;
++    void didUpdateCanvasSizeProperties(bool) override;
++
++    RefPtr<ImageBuffer> surfaceBufferToImageBuffer(SurfaceBuffer) override;
++    RefPtr<NativeImage> surfaceBufferToNativeImage(SurfaceBuffer) override;
++    bool isSurfaceBufferTransparentBlack(SurfaceBuffer) const final { return false; }
++
++    // GPUCanvasContext methods:
++    CanvasType canvas() override;
++    ExceptionOr<void> configure(GPUCanvasConfiguration&&) override;
++    void unconfigure() override;
++    std::optional<GPUCanvasConfiguration> getConfiguration() const override;
++    GPUDevice* device() const override { return m_configuration ? m_configuration->device.ptr() : nullptr; }
++    ExceptionOr<Ref<GPUTexture>> getCurrentTexture() override;
++    RefPtr<ImageBuffer> transferToImageBuffer() override;
++
++private:
++    GPUCanvasContextPS5(CanvasBase&, Ref<GPUCompositorIntegration>&&, Ref<GPUPresentationContext>&&);
++
++    // The only render buffer.
++    static constexpr uint32_t frameIndex = 0;
++
++    bool isConfigured() const { return static_cast<bool>(m_configuration); }
++
++    CanvasType htmlOrOffscreenCanvas() const;
++    ExceptionOr<void> configure(GPUCanvasConfiguration&&, bool dueToReshape);
++    void willUpdateDisplayBufferContents();
++    void expireCurrentTexture();
++    void present();
++    RefPtr<ImageBuffer> createReadBuffer() const;
++    void updateMemoryCost() const;
++
++    struct Configuration {
++        Ref<GPUDevice> device;
++        GPUTextureFormat format { GPUTextureFormat::R8unorm };
++        GPUTextureUsageFlags usage { GPUTextureUsage::RENDER_ATTACHMENT };
++        Vector<GPUTextureFormat> viewFormats;
++        PredefinedColorSpace colorSpace { PredefinedColorSpace::SRGB };
++        GPUCanvasToneMapping toneMapping;
++        GPUCanvasAlphaMode compositingAlphaMode { GPUCanvasAlphaMode::Opaque };
++        // A frame of this configuration has been presented: the title has, or will soon have, a
++        // frame of it to show.
++        bool hasPresentedFrame { false };
++    };
++    std::optional<Configuration> m_configuration;
++
++    const Ref<GPUCompositorIntegration> m_compositorIntegration;
++    const Ref<GPUPresentationContext> m_presentationContext;
++    const Ref<GraphicsLayerContentsDisplayDelegate> m_layerContentsDisplayDelegate;
++    RefPtr<GPUTexture> m_currentTexture;
++
++    GPUIntegerCoordinate m_width { 0 };
++    GPUIntegerCoordinate m_height { 0 };
++    // A frame was started (getCurrentTexture) and has not been presented.
++    bool m_compositingResultsNeedsUpdating { false };
++};
++
++} // namespace WebCore
++
++#endif // USE(DAWN)
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp
+index 3cb19d57f0..6c6102601b 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp
+@@ -36,6 +36,9 @@
+ #include "WebGPUObjectHeap.h"
+ #include <WebCore/WebGPUCompositorIntegration.h>
+ #include <WebCore/WebGPUDevice.h>
++#if USE(DAWN)
++#include "PS5WebGPUCanvas.h"
++#endif
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ #define MESSAGE_CHECK_COMPLETION(assertion, completion) MESSAGE_CHECK_COMPLETION_BASE(assertion, m_streamConnection, completion)
+@@ -51,10 +54,20 @@ RemoteCompositorIntegration::RemoteCompositorIntegration(WebCore::WebGPUComposit
+     , m_gpu(gpu)
+     , m_identifier(identifier)
+ {
++#if USE(DAWN)
++    ps5CreateCanvas(gpu);
++#endif
+     protect(m_streamConnection)->startReceivingMessages(*this, Messages::RemoteCompositorIntegration::messageReceiverName(), m_identifier.toUInt64());
+ }
+ 
++#if USE(DAWN)
++RemoteCompositorIntegration::~RemoteCompositorIntegration()
++{
++    ps5DestroyCanvas();
++}
++#else
+ RemoteCompositorIntegration::~RemoteCompositorIntegration() = default;
++#endif
+ 
+ void RemoteCompositorIntegration::destruct()
+ {
+@@ -74,6 +87,9 @@ void RemoteCompositorIntegration::paintCompositedResultsToCanvas(WebCore::Render
+ void RemoteCompositorIntegration::stopListeningForIPC()
+ {
+     protect(m_streamConnection)->stopReceivingMessages(Messages::RemoteCompositorIntegration::messageReceiverName(), m_identifier.toUInt64());
++#if USE(DAWN)
++    ps5DestroyCanvas();
++#endif
+ }
+ 
+ #if PLATFORM(COCOA)
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h
+index ca70320f07..7d47ce2af3 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h
+@@ -42,6 +42,9 @@
+ #if PLATFORM(COCOA)
+ #include <wtf/MachSendRight.h>
+ #include <wtf/Vector.h>
++#elif USE(DAWN)
++#include <WebCore/SharedMemory.h>
++#include <wtf/RefPtr.h>
+ #endif
+ 
+ namespace WebCore {
+@@ -58,6 +61,9 @@ class StreamServerConnection;
+ namespace WebKit {
+ 
+ class RemoteGPU;
++#if USE(DAWN)
++class PS5WebGPUCanvas;
++#endif
+ 
+ namespace WebGPU {
+ class ObjectHeap;
+@@ -95,6 +101,14 @@ private:
+ 
+ #if PLATFORM(COCOA)
+     void recreateRenderBuffers(int width, int height, WebCore::ColorSpace&&, WebCore::AlphaPremultiplication, ::WebGPU::TextureFormat, unsigned bufferCount, WebKit::WebGPUIdentifier deviceIdentifier, CompletionHandler<void(Vector<MachSendRight>&&)>&&);
++#elif USE(DAWN)
++    // PS5 (RemoteCompositorIntegrationPS5.cpp): the canvas in the title's WC scene, and reading
++    // it. The pixels are 8-bit BGRA or RGBA, tightly packed, top row first, in shared memory
++    // that is made here; no handle and no size when there is nothing to read.
++    using ReadPixelsPS5Reply = CompletionHandler<void(std::optional<WebCore::SharedMemory::Handle>&&, uint32_t width, uint32_t height, ::WebGPU::TextureFormat, ::WebGPU::CanvasAlphaMode)>;
++    void readPixelsPS5(uint32_t bufferIndex, bool currentFrame, ReadPixelsPS5Reply&&);
++    void ps5CreateCanvas(RemoteGPU&);
++    void ps5DestroyCanvas();
+ #endif
+ 
+     void prepareForDisplay(uint32_t frameIndex, CompletionHandler<void(Seconds, Seconds)>&&);
+@@ -105,6 +119,9 @@ private:
+     const Ref<IPC::StreamServerConnection> m_streamConnection;
+     WeakRef<RemoteGPU> m_gpu;
+     WebGPUIdentifier m_identifier;
++#if USE(DAWN)
++    RefPtr<PS5WebGPUCanvas> m_ps5Canvas;
++#endif
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in
+index 660fe261be..c2b3784cd7 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in
+@@ -34,6 +34,9 @@ messages -> RemoteCompositorIntegration Stream {
+ #endif
+     void PrepareForDisplay(uint32_t frameIndex) -> (Seconds gpuFrameCost, Seconds presentStall) Synchronous NotStreamEncodableReply // Because CanvasRenderingContext::prepareForDisplay() requires the layer contents synchronously, this needs to be Synchronous.
+     void PaintCompositedResultsToCanvas(WebCore::RenderingResourceIdentifier imageBuffer, uint32_t bufferIndex) -> () Synchronous
++#if USE(DAWN)
++    void ReadPixelsPS5(uint32_t bufferIndex, bool currentFrame) -> (std::optional<WebCore::SharedMemory::Handle> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, ::WebGPU::CanvasAlphaMode alphaMode) Synchronous NotStreamEncodableReply
++#endif
+     void Destruct()
+     void UpdateContentsHeadroom(float headroom)
+ }
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+index 99aa4209fe..4bfa65e690 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+@@ -65,6 +65,8 @@ void PS5WebGLLayer::setBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&&
+     }
+     // A frame the compositor never drew (the page drew faster than it shows).
+     retire(WTF::move(unshown));
++    if (m_paintsOnArrival)
++        m_arrivals++;
+ }
+ 
+ void PS5WebGLLayer::detach()
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index 7a3419fc80..ff22b827f7 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -43,6 +43,14 @@ public:
+     // take (for the compositor's GL memory lines and its texture cap).
+     void setDrawingBufferBytes(uint64_t bytes) { m_drawingBufferBytes = bytes; }
+     uint64_t drawingBufferBytes() const { return m_drawingBufferBytes; }
++    // For a layer whose frames arrive on their own, after the WebProcess's layer
++    // update for them (a WebGPU canvas, PS5WebGPUCanvas.h: Dawn reads each frame
++    // back asynchronously). Set before the layer is added; the scene then paints
++    // when a frame has arrived (WCScene::webGLLayersNeedPaint), as it does for
++    // video. WebGL's frames are ready before their update, and count nothing.
++    void setPaintsOnArrival() { m_paintsOnArrival = true; }
++    // Any thread: the frames set so far on a layer that paints on arrival; else 0.
++    uint64_t arrivals() const { return m_arrivals; }
+ 
+     // Render thread (TextureMapperPlatformLayer): the newest buffer.
+     void paintToTextureMapper(WebCore::TextureMapper&, const WebCore::FloatRect&, const WebCore::TransformationMatrix& modelViewMatrix, float opacity) final;
+@@ -55,6 +63,8 @@ private:
+     std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_shown WTF_GUARDED_BY_LOCK(m_lock);
+     bool m_detached WTF_GUARDED_BY_LOCK(m_lock) { false };
+     std::atomic<uint64_t> m_drawingBufferBytes { 0 };
++    bool m_paintsOnArrival { false };
++    std::atomic<uint64_t> m_arrivals { 0 };
+ };
+ 
+ namespace PS5WebGLLayers {
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+new file mode 100644
+index 0000000000..fdb43db4b8
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+@@ -0,0 +1,122 @@
++/*
++ * PS5: WebGPU canvases as WC contents layers (spikes/12-webgpu).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ */
++
++#include "config.h"
++#include "PS5WebGPUCanvas.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
++
++#include "PS5WebGLLayers.h"
++#include <WebCore/BitmapTexture.h>
++#include <WebCore/CoordinatedPlatformLayerBuffer.h>
++#include <WebCore/PixelFormat.h>
++#include <WebCore/TextureMapper.h>
++#include <wtf/StdLibExtras.h>
++
++namespace WebKit {
++using namespace WebCore;
++
++namespace {
++
++// One frame as the layer's buffer. The texture is made and filled on the
++// render thread at the first paint (BitmapTexture's PS5 upload path: a
++// staging ring, no glTexSubImage2D), and dies there with the buffer
++// (PS5WebGLLayers::collectGarbage).
++class FrameBuffer final : public CoordinatedPlatformLayerBuffer {
++public:
++    explicit FrameBuffer(Ref<PS5WebGPUCanvas::Frame>&& frame)
++        : CoordinatedPlatformLayerBuffer(Type::RGB, IntSize(frame->width, frame->height), { }, nullptr)
++        , m_frame(WTF::move(frame))
++    {
++    }
++
++private:
++    void paintToTextureMapper(TextureMapper& textureMapper, const FloatRect& targetRect, const TransformationMatrix& modelViewMatrix, float opacity) final
++    {
++        if (!m_texture) {
++            const bool opaque = m_frame->alphaMode == ::WebGPU::CanvasAlphaMode::Opaque;
++            const bool bgra = m_frame->format == ::WebGPU::TextureFormat::Bgra8unorm || m_frame->format == ::WebGPU::TextureFormat::Bgra8unormSRGB;
++            // An opaque canvas's alpha channel is whatever the page drew: X formats ignore it.
++            const PixelFormat pixelFormat = bgra ? (opaque ? PixelFormat::BGRX8 : PixelFormat::BGRA8) : (opaque ? PixelFormat::RGBX8 : PixelFormat::RGBA8);
++            OptionSet<BitmapTexture::Flags> flags;
++            if (!opaque)
++                flags.add(BitmapTexture::Flags::SupportsAlpha);
++            m_texture = BitmapTexture::create(size(), flags);
++            m_texture->updateContents(m_frame->pixels.span().data(), IntRect(IntPoint(), size()), IntPoint(), size().width() * 4, pixelFormat);
++        }
++        textureMapper.drawTexture(*m_texture, targetRect, modelViewMatrix, opacity);
++    }
++
++    const Ref<PS5WebGPUCanvas::Frame> m_frame;
++    RefPtr<BitmapTexture> m_texture;
++};
++
++} // namespace
++
++Ref<PS5WebGPUCanvas> PS5WebGPUCanvas::create(ProcessIdentifier webProcess, uint64_t key)
++{
++    return adoptRef(*new PS5WebGPUCanvas(webProcess, key));
++}
++
++PS5WebGPUCanvas::PS5WebGPUCanvas(ProcessIdentifier webProcess, uint64_t key)
++    : m_webProcess(webProcess)
++    , m_key(key)
++    , m_layer(PS5WebGLLayer::create())
++{
++    // Frames arrive when Dawn has read them back, after the page's layer update.
++    m_layer->setPaintsOnArrival();
++    PS5WebGLLayers::add(m_webProcess, m_key, m_layer);
++    WTFLogAlways("[webgpu] title: canvas %" PRIx64 " of WebProcess %" PRIu64, m_key & ~keyTag, m_webProcess.toUInt64());
++}
++
++PS5WebGPUCanvas::~PS5WebGPUCanvas()
++{
++    m_layer->detach();
++    PS5WebGLLayers::remove(m_webProcess, m_key);
++}
++
++void PS5WebGPUCanvas::frameWasPresented(std::span<const uint8_t> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, ::WebGPU::CanvasAlphaMode alphaMode)
++{
++    switch (format) {
++    case ::WebGPU::TextureFormat::Bgra8unorm:
++    case ::WebGPU::TextureFormat::Bgra8unormSRGB:
++    case ::WebGPU::TextureFormat::Rgba8unorm:
++    case ::WebGPU::TextureFormat::Rgba8unormSRGB:
++        break;
++    default:
++        if (!std::exchange(m_loggedFormat, true))
++            WTFLogAlways("[webgpu] title: canvas %" PRIx64 ": frames in texture format %u are not shown (8-bit BGRA and RGBA only)", m_key & ~keyTag, static_cast<unsigned>(format));
++        return;
++    }
++    const size_t bytes = static_cast<size_t>(width) * height * 4;
++    if (!width || !height || pixels.size() < bytes)
++        return;
++
++    Ref frame = adoptRef(*new Frame);
++    frame->pixels.append(pixels.first(bytes));
++    frame->width = width;
++    frame->height = height;
++    frame->format = format;
++    frame->alphaMode = alphaMode;
++    {
++        Locker locker { m_lock };
++        m_lastFrame = frame.ptr();
++    }
++    // The frame's pixels, and its texture once painted.
++    m_layer->setDrawingBufferBytes(2 * bytes);
++    m_layer->setBuffer(makeUnique<FrameBuffer>(WTF::move(frame)));
++    if (!std::exchange(m_loggedFirstFrame, true))
++        WTFLogAlways("[webgpu] title: canvas %" PRIx64 ": first frame, %ux%u, format %u, %s", m_key & ~keyTag, width, height, static_cast<unsigned>(format), alphaMode == ::WebGPU::CanvasAlphaMode::Opaque ? "opaque" : "premultiplied");
++}
++
++RefPtr<PS5WebGPUCanvas::Frame> PS5WebGPUCanvas::lastFrame() const
++{
++    Locker locker { m_lock };
++    return m_lastFrame;
++}
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
+new file mode 100644
+index 0000000000..f3ac866f1f
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
+@@ -0,0 +1,74 @@
++/*
++ * PS5: WebGPU canvases as WC contents layers (spikes/12-webgpu).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ */
++
++#pragma once
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
++
++#include <WebCore/ProcessIdentifier.h>
++#include <WebCore/WebGPUCppAPI.h>
++#include <span>
++#include <wtf/Function.h>
++#include <wtf/Lock.h>
++#include <wtf/Ref.h>
++#include <wtf/RefPtr.h>
++#include <wtf/ThreadSafeRefCounted.h>
++#include <wtf/Vector.h>
++
++namespace WebKit {
++
++class PS5WebGLLayer;
++
++// A WebGPU canvas in the title: the frames Dawn hands over as pixels
++// (WebGPU::PresentationContextDescriptor::presentFrame; Dawn on RADV shares
++// no textures with ps5-opengl), shown through the same layer registry as
++// WebGL's drawing buffers (PS5WebGLLayers.h; the page's WC scene finds the
++// layer by key and draws it). The newest frame's pixels are kept for
++// readback (toDataURL, drawImage).
++//
++// One per RemoteCompositorIntegration. Frames arrive on RemoteGPU's work
++// queue; the texture upload happens on the compositor's render thread, when
++// the layer is painted (TextureMapper's PS5 upload path).
++class PS5WebGPUCanvas final : public ThreadSafeRefCounted<PS5WebGPUCanvas> {
++public:
++    // The pixels of one frame: tightly packed 8-bit rows, top row first.
++    struct Frame : public ThreadSafeRefCounted<Frame> {
++        Vector<uint8_t> pixels;
++        uint32_t width { 0 };
++        uint32_t height { 0 };
++        ::WebGPU::TextureFormat format { ::WebGPU::TextureFormat::Bgra8unorm };
++        ::WebGPU::CanvasAlphaMode alphaMode { ::WebGPU::CanvasAlphaMode::Opaque };
++    };
++
++    // key: what the WebProcess's GraphicsLayerContentsDisplayDelegate::ps5WebGLLayerKey()
++    // returns for this canvas (layerKey() of its compositor integration's identifier).
++    static Ref<PS5WebGPUCanvas> create(WebCore::ProcessIdentifier, uint64_t key);
++    ~PS5WebGPUCanvas();
++
++    // WebGPU layer keys carry this bit; WebGL's are small context numbers.
++    static constexpr uint64_t keyTag = 1ull << 63;
++    static constexpr uint64_t layerKey(uint64_t compositorIntegrationIdentifier) { return compositorIntegrationIdentifier | keyTag; }
++
++    // Work queue: a presented frame, borrowed for the call. Formats other than
++    // the 8-bit BGRA and RGBA ones are not shown (logged once).
++    void frameWasPresented(std::span<const uint8_t>, uint32_t width, uint32_t height, ::WebGPU::TextureFormat, ::WebGPU::CanvasAlphaMode);
++    // Any thread: the newest frame, or null before the first.
++    RefPtr<Frame> lastFrame() const;
++
++private:
++    PS5WebGPUCanvas(WebCore::ProcessIdentifier, uint64_t key);
++
++    const WebCore::ProcessIdentifier m_webProcess;
++    const uint64_t m_key;
++    const Ref<PS5WebGLLayer> m_layer;
++    mutable Lock m_lock;
++    RefPtr<Frame> m_lastFrame WTF_GUARDED_BY_LOCK(m_lock);
++    bool m_loggedFormat { false };
++    bool m_loggedFirstFrame { false };
++};
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
+new file mode 100644
+index 0000000000..f5dd923879
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
+@@ -0,0 +1,243 @@
++/*
++ * PS5: a WebGPU canvas's compositor integration in the title (spikes/12-webgpu, P3).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ *
++ * Dawn (on RADV) shares no textures with the compositor (ps5-opengl), so the
++ * implementation's presentation context reads each presented frame back and
++ * hands it to the frame sink set here, which gives it to the canvas's
++ * PS5WebGPUCanvas: a layer in the registry the WC scene looks contents up in,
++ * under the key the WebProcess's display delegate names
++ * (WebCore::WebGPUCompositorIntegration::ps5LayerKeyForIdentifier of this
++ * integration's identifier).
++ *
++ * Reading a canvas (ReadPixelsPS5, synchronous): the texture's contents now,
++ * through the presentation context's readPixels (asynchronous in Dawn; the
++ * reply is sent from its callback, on this work queue), or the newest frame
++ * the canvas was handed. Either way as 8-bit pixels in shared memory made
++ * here, of a size that comes from the implementation, never from the message.
++ *
++ * Everything here runs on RemoteGPU's work queue.
++ */
++
++#include "config.h"
++#include "RemoteCompositorIntegration.h"
++
++#if ENABLE(GPU_PROCESS) && USE(DAWN)
++
++#include "GPUConnectionToWebProcess.h"
++#include "Logging.h"
++#include "PS5WebGPUCanvas.h"
++#include "RemoteGPU.h"
++#include "StreamServerConnection.h"
++#include <WebCore/SharedMemory.h>
++#include <WebCore/WebGPUCompositorIntegrationImpl.h>
++#include <wtf/CheckedArithmetic.h>
++#include <wtf/StdLibExtras.h>
++
++#define MESSAGE_CHECK_COMPLETION(assertion, completion) MESSAGE_CHECK_COMPLETION_BASE(assertion, m_streamConnection, completion)
++
++namespace WebKit {
++
++static_assert(PS5WebGPUCanvas::layerKey(1) == WebCore::WebGPUCompositorIntegration::ps5LayerKeyForIdentifier(1), "the title and the WebProcess name a canvas's layer by the same key");
++
++namespace {
++
++// As many render buffers as the implementation has (PresentationContextImpl::maximumRenderBuffers).
++constexpr uint32_t maximumRenderBuffers = 3;
++// The implementation's bound on a canvas's render buffer (PresentationContextImpl::maximumRenderBufferBytes).
++constexpr size_t maximumReadbackBytes = 256 * MB;
++
++bool is8BitFormat(::WebGPU::TextureFormat format)
++{
++    switch (format) {
++    case ::WebGPU::TextureFormat::Bgra8unorm:
++    case ::WebGPU::TextureFormat::Bgra8unormSRGB:
++    case ::WebGPU::TextureFormat::Rgba8unorm:
++    case ::WebGPU::TextureFormat::Rgba8unormSRGB:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// width * height * bytesPerPixel, or nothing when that is zero, overflows or is over the bound.
++std::optional<size_t> frameBytes(uint32_t width, uint32_t height, unsigned bytesPerPixel)
++{
++    auto bytes = CheckedSize { width } * height * bytesPerPixel;
++    if (bytes.hasOverflowed() || !bytes.value() || bytes.value() > maximumReadbackBytes)
++        return std::nullopt;
++    return bytes.value();
++}
++
++// A half float, clamped to [0, 1], as a byte. No HDR output: an rgba16float canvas is shown and
++// read as 8-bit RGBA, its values taken as they are (the canvas's colour space encoding).
++const std::array<uint8_t, 65536>& halfToByteTable()
++{
++    static const std::array<uint8_t, 65536>* table = [] {
++        auto* bytes = new std::array<uint8_t, 65536>;
++        for (unsigned half = 0; half < 65536; ++half) {
++            unsigned exponent = (half >> 10) & 0x1f;
++            unsigned mantissa = half & 0x3ff;
++            double value;
++            if (!exponent)
++                value = std::ldexp(static_cast<double>(mantissa), -24);
++            else if (exponent == 31)
++                value = mantissa ? 0 : 1; // NaN: 0; infinity: clamped (the sign is below)
++            else
++                value = std::ldexp(static_cast<double>(mantissa | 0x400), static_cast<int>(exponent) - 25);
++            if (half & 0x8000)
++                value = 0;
++            (*bytes)[half] = static_cast<uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255));
++        }
++        return bytes;
++    }();
++    return *table;
++}
++
++// source: width * height RGBA half floats; destination: as many RGBA bytes.
++void convertRGBA16FloatToRGBA8(std::span<const uint8_t> source, std::span<uint8_t> destination)
++{
++    auto& table = halfToByteTable();
++    size_t components = std::min(source.size() / 2, destination.size());
++    for (size_t i = 0; i < components; ++i) {
++        uint16_t half = static_cast<uint16_t>(source[2 * i] | (source[2 * i + 1] << 8));
++        destination[i] = table[half];
++    }
++}
++
++// 8-bit pixels for a frame in one of the formats a canvas has, with the format they are in:
++// the frame's own pixels, or `storage` for a converted rgba16float frame. Nothing for a frame
++// whose size and pixels do not agree, or of another format.
++struct Pixels8 {
++    std::span<const uint8_t> pixels;
++    ::WebGPU::TextureFormat format;
++};
++std::optional<Pixels8> pixelsAs8Bit(std::span<const uint8_t> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, Vector<uint8_t>& storage)
++{
++    if (is8BitFormat(format)) {
++        auto bytes = frameBytes(width, height, 4);
++        if (!bytes || pixels.size() < *bytes)
++            return std::nullopt;
++        return Pixels8 { pixels.first(*bytes), format };
++    }
++    if (format == ::WebGPU::TextureFormat::Rgba16float) {
++        auto sourceBytes = frameBytes(width, height, 8);
++        if (!sourceBytes || pixels.size() < *sourceBytes)
++            return std::nullopt;
++        if (!storage.tryReserveCapacity(*sourceBytes / 2))
++            return std::nullopt;
++        storage.resize(*sourceBytes / 2);
++        convertRGBA16FloatToRGBA8(pixels.first(*sourceBytes), storage.mutableSpan());
++        return Pixels8 { storage.span(), ::WebGPU::TextureFormat::Rgba8unorm };
++    }
++    return std::nullopt;
++}
++
++// The reply to ReadPixelsPS5, which is sent exactly once: with pixels, or, when this is
++// destroyed unanswered (the implementation dropped its callback: its instance or device went),
++// with none, so that the WebProcess is not left waiting.
++class PendingRead {
++    WTF_MAKE_NONCOPYABLE(PendingRead);
++    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(PendingRead);
++public:
++    using Reply = CompletionHandler<void(std::optional<WebCore::SharedMemory::Handle>&&, uint32_t, uint32_t, ::WebGPU::TextureFormat, ::WebGPU::CanvasAlphaMode)>;
++
++    explicit PendingRead(Reply&& reply)
++        : m_reply(WTF::move(reply))
++    {
++    }
++
++    ~PendingRead()
++    {
++        if (m_reply)
++            fail();
++    }
++
++    void fail()
++    {
++        m_reply(std::nullopt, 0, 0, ::WebGPU::TextureFormat::Bgra8unorm, ::WebGPU::CanvasAlphaMode::Opaque);
++    }
++
++    // 8-bit pixels, checked by the caller: at least width * height * 4 bytes.
++    void succeed(std::span<const uint8_t> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, ::WebGPU::CanvasAlphaMode alphaMode)
++    {
++        auto bytes = frameBytes(width, height, 4);
++        if (!bytes || pixels.size() < *bytes)
++            return fail();
++        RefPtr memory = WebCore::SharedMemory::allocate(*bytes);
++        if (!memory)
++            return fail();
++        memcpySpan(memory->mutableSpan(), pixels.first(*bytes));
++        // Writable: the WebProcess sets the alpha channel of an opaque canvas in place. Nothing
++        // here looks at the memory again.
++        auto handle = memory->createHandle(WebCore::SharedMemory::Protection::ReadWrite);
++        if (!handle)
++            return fail();
++        m_reply(WTF::move(handle), width, height, format, alphaMode);
++    }
++
++private:
++    Reply m_reply;
++};
++
++} // namespace
++
++void RemoteCompositorIntegration::ps5CreateCanvas(RemoteGPU& gpu)
++{
++    RefPtr connection = gpu.gpuConnectionToWebProcess();
++    RefPtr implementation = dynamicDowncast<WebCore::WebGPUCompositorIntegrationImpl>(m_backing.get());
++    if (!connection || !implementation)
++        return;
++
++    Ref canvas = PS5WebGPUCanvas::create(connection->webProcessIdentifier(), PS5WebGPUCanvas::layerKey(m_identifier.toUInt64()));
++    m_ps5Canvas = canvas.ptr();
++    // The sink keeps the canvas, not this: frames can arrive for as long as the implementation's
++    // presentation context lives. ps5DestroyCanvas() takes the sink away again.
++    implementation->setFrameSink([canvas = WTF::move(canvas), storage = Vector<uint8_t> { }](uint32_t, std::span<const uint8_t> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, ::WebGPU::CanvasAlphaMode alphaMode) mutable {
++        if (auto frame = pixelsAs8Bit(pixels, width, height, format, storage))
++            canvas->frameWasPresented(frame->pixels, width, height, frame->format, alphaMode);
++    });
++}
++
++void RemoteCompositorIntegration::ps5DestroyCanvas()
++{
++    if (!m_ps5Canvas)
++        return;
++    if (RefPtr implementation = dynamicDowncast<WebCore::WebGPUCompositorIntegrationImpl>(m_backing.get()))
++        implementation->setFrameSink(nullptr);
++    // The last reference: its layer leaves the registry, and the scene draws nothing more of it.
++    m_ps5Canvas = nullptr;
++}
++
++void RemoteCompositorIntegration::readPixelsPS5(uint32_t bufferIndex, bool currentFrame, ReadPixelsPS5Reply&& completionHandler)
++{
++    auto pending = makeUnique<PendingRead>(WTF::move(completionHandler));
++    // The WebProcess only ever names a render buffer the implementation has.
++    MESSAGE_CHECK_COMPLETION(bufferIndex < maximumRenderBuffers, pending->fail());
++
++    if (!currentFrame) {
++        if (RefPtr frame = m_ps5Canvas ? m_ps5Canvas->lastFrame() : nullptr) {
++            if (is8BitFormat(frame->format))
++                return pending->succeed(frame->pixels.span(), frame->width, frame->height, frame->format, frame->alphaMode);
++        }
++        // No frame has arrived yet: what the texture holds is the frame on its way.
++    }
++
++    RefPtr implementation = dynamicDowncast<WebCore::WebGPUCompositorIntegrationImpl>(m_backing.get());
++    if (!implementation)
++        return pending->fail();
++    // The alpha mode of the texture's configuration is not known here: the WebProcess, which
++    // configured it, applies its own to a read of the current frame.
++    implementation->readPixels(bufferIndex, [pending = WTF::move(pending)](std::span<const uint8_t> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format) {
++        Vector<uint8_t> storage;
++        if (auto frame = pixelsAs8Bit(pixels, width, height, format, storage))
++            return pending->succeed(frame->pixels, width, height, frame->format, ::WebGPU::CanvasAlphaMode::Opaque);
++        pending->fail();
++    });
++}
++
++} // namespace WebKit
++
++#undef MESSAGE_CHECK_COMPLETION
++
++#endif // ENABLE(GPU_PROCESS) && USE(DAWN)
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 710259f3b6..2e0143abdb 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -131,6 +131,7 @@ public:
+ #if HAVE_PS5_WEBGL_LAYERS
+     RefPtr<PS5WebGLLayer> webGLLayer; // the same, for a WebGL canvas
+     uint64_t webGLLayerKey { 0 };
++    uint64_t webGLArrivalsSeen { 0 }; // PS5WebGLLayer::arrivals() at the last webGLLayersNeedPaint()
+ #endif
+     // Async scrolling: the scrolling tree's last values for this layer (an
+     // update from the WebProcess that sets them clears these).
+@@ -516,6 +517,24 @@ unsigned WCScene::webGLLayerCount() const
+ #endif
+ }
+ 
++bool WCScene::webGLLayersNeedPaint()
++{
++    bool needPaint = false;
++#if HAVE_PS5_WEBGL_LAYERS
++    for (auto& entry : m_layers) {
++        auto& layer = *entry.value;
++        if (!layer.webGLLayer)
++            continue;
++        // Once for each arrival, shown or not (a hidden canvas's frames stay pending).
++        if (uint64_t arrivals = layer.webGLLayer->arrivals(); arrivals != layer.webGLArrivalsSeen) {
++            layer.webGLArrivalsSeen = arrivals;
++            needPaint = true;
++        }
++    }
++#endif
++    return needPaint;
++}
++
+ bool WCScene::videoLayersNeedPaint() const
+ {
+     if (!m_videoLayerCount)
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+index 7ac603a685..86c475e18e 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.h
+@@ -80,6 +80,9 @@ public:
+     // (video plays at its own rate, without updates from the WebProcess).
+     bool videoLayersNeedPaint() const;
+     unsigned videoLayerCount() const { return m_videoLayerCount; }
++    // A WebGPU canvas's layer was handed a frame since this was last asked
++    // (they arrive from Dawn's readback, without updates from the WebProcess).
++    bool webGLLayersNeedPaint();
+     // Layers showing a WebGL canvas (counted when asked).
+     unsigned webGLLayerCount() const;
+     // The WebProcess whose page this is (WebGL layers are found by it).
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index f1427d92b6..fa44b187d1 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -58,6 +58,8 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+         list(APPEND WebKit_SOURCES
+             GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+             GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++            GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
++            GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
+             GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+ 
+             UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+diff --git a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+index ab9c845a46..ef5d4b7451 100644
+--- a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
++++ b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+@@ -457,6 +457,7 @@
+     [DebugOnly] MessageParamReply IPCStreamTester.SyncMessageReturningSharedMemory1 handle
+ 
+     [NotSentFromWebContent] MessageParamReply RemoteAudioVideoRendererProxyManager.Create handle SharedTimebaseHandle
++    [NotSentFromWebContent] MessageParamReply RemoteCompositorIntegration.ReadPixelsPS5 pixels
+ }
+ 
+ [UnsafeWrapper] WebCore::SharedMemoryHandle {
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 034b7808b8..6f22500094 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -911,9 +911,19 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     bool videoFrame = !m_dirty && !m_animating && scene.videoLayersNeedPaint();
+     if (videoFrame)
+         m_stats.videoPaints++;
+-    if (m_dirty || m_animating || videoFrame) {
++    // WebGPU canvases: a frame Dawn has read back since the last look (asked
++    // every frame: a paint that happens anyway shows it too).
++    bool canvasFrame = scene.webGLLayersNeedPaint();
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL)
++    // The frames these replaced (each with its pixels) go now, not at the
++    // page's next update, which a canvas drawn outside rendering updates may
++    // not send for a while.
++    if (canvasFrame)
++        PS5WebGLLayers::collectGarbage();
++#endif
++    if (m_dirty || m_animating || videoFrame || canvasFrame) {
+         auto start = MonotonicTime::now();
+-        if (!m_dirty && !videoFrame)
++        if (!m_dirty && !videoFrame && !canvasFrame)
+             m_stats.animationPaints++;
+         // Animations are sampled at the time the frame goes on screen, so
+         // they move evenly whenever in the frame this runs.
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp
+index 9bee3a61f5..1697d78c3e 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp
+@@ -33,6 +33,11 @@
+ #include "RemoteGPUProxy.h"
+ #include "WebGPUConvertToBackingContext.h"
+ #include <WebCore/ImageBuffer.h>
++#if USE(DAWN)
++#include <WebCore/PixelBuffer.h>
++#include <WebCore/SharedMemory.h>
++#include <wtf/CheckedArithmetic.h>
++#endif
+ #include <WebCore/WebGPUCppAPI.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+@@ -64,6 +69,59 @@ Vector<MachSendRight> RemoteCompositorIntegrationProxy::recreateRenderBuffers(in
+     auto [renderBuffers] = sendResult.takeReply();
+     return WTF::move(renderBuffers);
+ }
++#elif USE(DAWN)
++bool RemoteCompositorIntegrationProxy::ps5ReadPixels(uint32_t bufferIndex, bool currentFrame, bool opaque, WebCore::ImageBuffer& destination)
++{
++    auto sendResult = sendSync(Messages::RemoteCompositorIntegration::ReadPixelsPS5(bufferIndex, currentFrame));
++    if (!sendResult.succeeded())
++        return false;
++    auto [handle, width, height, format, alphaMode] = sendResult.takeReply();
++    if (!handle)
++        return false;
++
++    // Frames of another size are of an earlier configuration of the canvas: it reads as cleared.
++    auto size = destination.backendSize();
++    if (size.isEmpty() || width != static_cast<uint32_t>(size.width()) || height != static_cast<uint32_t>(size.height()))
++        return false;
++
++    WebCore::PixelFormat pixelFormat;
++    switch (format) {
++    case ::WebGPU::TextureFormat::Bgra8unorm:
++    case ::WebGPU::TextureFormat::Bgra8unormSRGB:
++        pixelFormat = WebCore::PixelFormat::BGRA8;
++        break;
++    case ::WebGPU::TextureFormat::Rgba8unorm:
++    case ::WebGPU::TextureFormat::Rgba8unormSRGB:
++        pixelFormat = WebCore::PixelFormat::RGBA8;
++        break;
++    default:
++        return false;
++    }
++
++    RefPtr memory = WebCore::SharedMemory::map(WTF::move(*handle), WebCore::SharedMemory::Protection::ReadWrite);
++    auto byteCount = CheckedSize { width } * static_cast<size_t>(height) * static_cast<size_t>(4);
++    if (!memory || byteCount.hasOverflowed() || memory->size() < byteCount.value())
++        return false;
++    auto pixels = memory->mutableSpan().first(byteCount.value());
++
++    // A frame the title kept says what it was presented as; the texture is of the canvas's
++    // current configuration.
++    if (!currentFrame)
++        opaque = alphaMode == ::WebGPU::CanvasAlphaMode::Opaque;
++    // An opaque canvas's alpha channel is whatever the page drew, and reads as 1. A
++    // premultiplied canvas's pixels are premultiplied, as the image buffer's are.
++    if (opaque) {
++        for (size_t i = 3; i < pixels.size(); i += 4)
++            pixels[i] = 0xff;
++    }
++
++    WebCore::PixelBufferFormat sourceFormat { WebCore::AlphaPremultiplication::Premultiplied, pixelFormat, destination.colorSpace() };
++    auto source = WebCore::PixelBufferSourceView::create(sourceFormat, size, pixels);
++    if (!source)
++        return false;
++    destination.putPixelBuffer(*source, WebCore::IntRect { { }, size });
++    return true;
++}
+ #endif
+ 
+ void RemoteCompositorIntegrationProxy::prepareForDisplay(uint32_t frameIndex, CompletionHandler<void()>&& completionHandler)
+@@ -72,7 +130,12 @@ void RemoteCompositorIntegrationProxy::prepareForDisplay(uint32_t frameIndex, Co
+     auto [gpuFrameCost, presentStall] = sendResult.takeReplyOr(Seconds { 0 }, Seconds { 0 });
+     m_lastFrameGPUCost = gpuFrameCost;
+     m_lastFramePresentStall = presentStall;
++#if !USE(DAWN)
++    // PS5 (Dawn): the title's compositor integration has presented the frame in PrepareForDisplay
++    // (WebGPUCompositorIntegrationImplDawn.cpp). A Present message on top of it would read the
++    // same frame back, and show it, a second time.
+     protect(m_presentationContext)->present(frameIndex);
++#endif
+ 
+     completionHandler();
+ }
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.h b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.h
+index 46ecba8b96..f425deb4b8 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.h
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.h
+@@ -92,6 +92,11 @@ private:
+ 
+ #if PLATFORM(COCOA)
+     Vector<MachSendRight> recreateRenderBuffers(int width, int height, WebCore::ColorSpace&&, WebCore::AlphaPremultiplication, ::WebGPU::TextureFormat, unsigned bufferCount, ::WebGPU::Device&) override;
++#elif USE(DAWN)
++    // PS5: the title names the canvas's layer by the same key (PS5WebGPUCanvas::layerKey of the
++    // RemoteCompositorIntegration's identifier, which is this one).
++    uint64_t ps5LayerKey() const final { return ps5LayerKeyForIdentifier(m_backing.toUInt64()); }
++    bool ps5ReadPixels(uint32_t bufferIndex, bool currentFrame, bool opaque, WebCore::ImageBuffer&) final;
+ #endif
+ 
+     void prepareForDisplay(uint32_t frameIndex, CompletionHandler<void()>&&) override;

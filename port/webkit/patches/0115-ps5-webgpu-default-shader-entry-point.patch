@@ -1,0 +1,18 @@
+diff --git a/Source/WebGPU/WebGPUDawn/ProgrammableStage.h b/Source/WebGPU/WebGPUDawn/ProgrammableStage.h
+index 22c92f1547..021d67c9c3 100644
+--- a/Source/WebGPU/WebGPUDawn/ProgrammableStage.h
++++ b/Source/WebGPU/WebGPUDawn/ProgrammableStage.h
+@@ -57,9 +57,10 @@ public:
+     void apply(DawnStage& dawnStage) const
+     {
+         dawnStage.module = m_module;
+-        // An undefined string view (a null entry point) is the only entry point of the module for
+-        // the stage.
+-        dawnStage.entryPoint = stringView(m_entryPoint);
++        // An undefined string view is the only entry point of the module for the stage. A page
++        // that leaves entryPoint out arrives here as an empty string, not a null one (the IDL
++        // dictionaries give no way to tell them apart), and no entry point is named "".
++        dawnStage.entryPoint = m_entryPoint.length() ? stringView(m_entryPoint) : wgpu::StringView { };
+         dawnStage.constantCount = m_constants.size();
+         dawnStage.constants = m_constants.span().data();
+     }

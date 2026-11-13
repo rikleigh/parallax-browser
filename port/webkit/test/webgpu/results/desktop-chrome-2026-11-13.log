@@ -1,0 +1,152 @@
+# WebGPU test pages, desktop run of 2026-11-13
+# Google Chrome 157.0.8103.51, headless (--headless=new, default GPU flags, --autoplay-policy=no-user-gesture-required), macOS 15.5, Apple M4 Max
+# Served over http://localhost with python3 -m http.server from a directory holding webgpu/ (this directory) and
+# media/ (toolchain/wpe-webkit/media, made by port/webkit/test/media/make-media.sh), so video-texture.html found its default clip.
+# Console lines collected over the DevTools protocol; RESULT lines only, in page order.
+# adapter.html
+RESULT webgpu-adapter navigator-gpu PASS secure context true
+RESULT webgpu-adapter request-adapter PASS
+RESULT webgpu-adapter request-adapter-low-power PASS apple metal-3
+RESULT webgpu-adapter request-adapter-high-performance PASS apple metal-3
+RESULT webgpu-adapter request-adapter-fallback PASS no fallback adapter (null)
+RESULT webgpu-adapter info PASS vendor="apple" architecture="metal-3" device="" description="" subgroupMinSize=32 subgroupMaxSize=32 isFallbackAdapter=false
+RESULT webgpu-adapter features PASS 25: atomic-vec2u-min-max bgra8unorm-storage clip-distances core-features-and-limits depth-clip-control depth32float-stencil8 dual-source-blending float32-blendable float32-filterable indirect-first-instance primitive-index rg11b10ufloat-renderable shader-f16 subgroup-size-control subgroups texture-component-swizzle texture-compression-astc texture-compression-astc-sliced-3d texture-compression-bc texture-compression-bc-sliced-3d texture-compression-etc2 texture-compression-unaligned texture-formats-tier1 texture-formats-tier2 timestamp-query
+RESULT webgpu-adapter limits PASS 36 limits, all at least the default
+RESULT webgpu-adapter is-fallback-adapter PASS adapter.info.isFallbackAdapter=false adapter.isFallbackAdapter=undefined
+RESULT webgpu-adapter preferred-canvas-format PASS bgra8unorm
+RESULT webgpu-adapter wgsl-language-features PASS 13: buffer_view immediate_address_space linear_indexing packed_4x8_integer_dot_product pointer_composite_access readonly_and_readwrite_storage_textures subgroup_id subgroup_uniformity swizzle_assignment texture_and_sampler_let texture_formats_tier1 uniform_buffer_standard_layout unrestricted_pointer_parameters
+RESULT webgpu-adapter summary PASS 11/11
+# device.html
+RESULT webgpu-device request-device PASS
+RESULT webgpu-device default-features PASS 1 feature(s): core-features-and-limits
+RESULT webgpu-device default-limits PASS 31 limits are the defaults
+RESULT webgpu-device feature-atomic-vec2u-min-max PASS
+RESULT webgpu-device feature-bgra8unorm-storage PASS
+RESULT webgpu-device feature-clip-distances PASS
+RESULT webgpu-device feature-core-features-and-limits PASS
+RESULT webgpu-device feature-depth-clip-control PASS
+RESULT webgpu-device feature-depth32float-stencil8 PASS
+RESULT webgpu-device feature-dual-source-blending PASS
+RESULT webgpu-device feature-float32-blendable PASS
+RESULT webgpu-device feature-float32-filterable PASS
+RESULT webgpu-device feature-indirect-first-instance PASS
+RESULT webgpu-device feature-primitive-index PASS
+RESULT webgpu-device feature-rg11b10ufloat-renderable PASS
+RESULT webgpu-device feature-shader-f16 PASS
+RESULT webgpu-device feature-subgroup-size-control PASS
+RESULT webgpu-device feature-subgroups PASS
+RESULT webgpu-device feature-texture-component-swizzle PASS
+RESULT webgpu-device feature-texture-compression-astc PASS
+RESULT webgpu-device feature-texture-compression-astc-sliced-3d PASS
+RESULT webgpu-device feature-texture-compression-bc PASS
+RESULT webgpu-device feature-texture-compression-bc-sliced-3d PASS
+RESULT webgpu-device feature-texture-compression-etc2 PASS
+RESULT webgpu-device feature-texture-compression-unaligned PASS
+RESULT webgpu-device feature-texture-formats-tier1 PASS
+RESULT webgpu-device feature-texture-formats-tier2 PASS
+RESULT webgpu-device feature-timestamp-query PASS
+RESULT webgpu-device required-limit-granted PASS maxTextureDimension2D=16384
+RESULT webgpu-device unsupported-feature-rejects PASS TypeError: Failed to execute 'requestDevice' on 'GPUAdapter': Failed to read the 'requiredFeatures' property from 'GPUDeviceDescriptor': The provided value 'not-a-webgpu-feature' is not a valid enum value of type GPUFeatureName.
+RESULT webgpu-device over-limit-rejects PASS maxBindGroups=5: OperationError: Failed to execute 'requestDevice' on 'GPUAdapter': Required limit (5) is greater than the supported limit (4). - While validating maxBindGroups - While validating required limits
+RESULT webgpu-device second-request-device PASS rejected: OperationError: Failed to execute 'requestDevice' on 'GPUAdapter': adapter is "consumed": it has already been used to create a device at CreateDeviceInternal (../../third_party/dawn/src/dawn/native/Adapter.cpp:309)
+RESULT webgpu-device label PASS
+RESULT webgpu-device submitted-work-done PASS 2.8 ms
+RESULT webgpu-device destroy-lost PASS reason destroyed, message "Device was destroyed."
+RESULT webgpu-device summary PASS 35/35
+# compute.html
+RESULT webgpu-compute fill PASS 4096 values right (last 12292)
+RESULT webgpu-compute indirect PASS 4096 values right (last 20486)
+RESULT webgpu-compute matrix PASS 64x64 product matches JavaScript (c[0]=-95, c[last]=42)
+RESULT webgpu-compute async-pipeline PASS 4096 values right (last 12292), pipeline ready after 0.5 ms
+RESULT webgpu-compute timing PASS first pipeline to work done 5.3 ms; 100 dispatches submitted in 0.2 ms, read back after 2.6 ms
+RESULT webgpu-compute summary PASS 5/5
+# offscreen-readback.html
+RESULT webgpu-offscreen-readback triangle PASS centre red, corners blue, upright
+RESULT webgpu-offscreen-readback msaa-resolve PASS centre red, corner blue, 409 blended edge pixels
+RESULT webgpu-offscreen-readback depth PASS the near quad stays in front of the later far one
+RESULT webgpu-offscreen-readback write-texture-sample PASS four quadrants right, first texel row at the top
+RESULT webgpu-offscreen-readback write-buffer-copy PASS 256 bytes right (two copies, untouched bytes zero)
+RESULT webgpu-offscreen-readback rgba16float PASS centre 1.5,0.25,-1,1 and corner 0.25,0.5,2,1 kept
+RESULT webgpu-offscreen-readback mip-levels PASS levels 64, 32, 16 hold red, green, blue; a view of level 2 samples blue
+RESULT webgpu-offscreen-readback summary PASS 7/7
+# errors.html
+RESULT webgpu-errors scope-bad-buffer PASS Buffer usages (BufferUsage::(MapRead|MapWrite)) is invalid. If a buffer usage contains BufferUsage::MapRead the only other allowed usage is BufferUsage::CopyDst...
+RESULT webgpu-errors mapped-at-creation-size PASS threw RangeError: Failed to execute 'createBuffer' on 'GPUDevice': createBuffer failed, size (5) is not a multiple of 4 when mappedAtCreation == true
+RESULT webgpu-errors scope-bad-bind-group PASS Binding usage (BufferUsage::Storage) of [Buffer (unlabeled)] doesn't match expected usage (BufferUsage::Uniform). - While validating entries[0] against { bindi...
+RESULT webgpu-errors scope-out-of-memory PASS validation error (over maxBufferSize 268435456): Buffer size (1125899906842624) exceeds the max buffer size limit (268435456). - While calling [Device].CreateBuffer([BufferDescriptor]).
+RESULT webgpu-errors nested-scopes PASS inner catches, other filters pass the error out, one error per scope
+RESULT webgpu-errors pop-empty-stack PASS OperationError: No error scopes to pop
+RESULT webgpu-errors uncaptured-error PASS Buffer usages (BufferUsage::(MapRead|MapWrite)) is invalid. If a buffer usage contains BufferUsage::MapRead the only other allowed usage is BufferUsage::CopyDst...
+RESULT webgpu-errors wgsl-compilation-info PASS line 3 column 19 offset 79 length 12: unresolved value 'not_declared'
+RESULT webgpu-errors pipeline-async-rejects PASS GPUPipelineError reason validation: Entry point ""no_such_entry_point"" doesn't exist in the shader module [ShaderModule (unlabeled)]. ...
+RESULT webgpu-errors destroyed-buffer PASS mapAsync rejects (OperationError), writeBuffer and submit are validation errors
+RESULT webgpu-errors summary PASS 10/10
+# triangle.html
+RESULT webgpu-triangle configure PASS bgra8unorm 640x360
+RESULT webgpu-triangle first-frame-readback PASS drawImage + getImageData give 51,102,153,255
+RESULT webgpu-triangle animation PASS 30 frames, 61.9 fps, 0.09 ms of JavaScript per frame
+RESULT webgpu-triangle summary PASS 3/3
+# cube.html
+RESULT webgpu-cube setup PASS bgra8unorm, 36 indices
+RESULT webgpu-cube animation PASS 120 frames, 59.6 fps, 0.35 ms of JavaScript per frame
+RESULT webgpu-cube centre-pixel PASS centre 28,35,70,255, corner 26,26,31,255
+RESULT webgpu-cube summary PASS 3/3
+# resize.html
+RESULT webgpu-resize initial-320x180 PASS 320x180 bgra8unorm, 63.7 fps
+RESULT webgpu-resize size-640x360 PASS 640x360 bgra8unorm, 61.6 fps
+RESULT webgpu-resize size-1280x720 PASS 1280x720 bgra8unorm, 60.3 fps
+RESULT webgpu-resize size-1920x1080 PASS 1920x1080 bgra8unorm, 60.6 fps
+RESULT webgpu-resize size-16x16 PASS 16x16 bgra8unorm, 61.0 fps
+RESULT webgpu-resize size-320x180 PASS 320x180 bgra8unorm, 60.3 fps
+RESULT webgpu-resize unconfigure PASS throws InvalidStateError while unconfigured; 320x180 bgra8unorm, 60.1 fps
+RESULT webgpu-resize format-rgba16float PASS 320x180 rgba16float, 60.2 fps; getConfiguration() reports format rgba16float, toneMapping extended; back to bgra8unorm
+RESULT webgpu-resize device-change PASS second device: 320x180 bgra8unorm, 60.2 fps; first device again
+RESULT webgpu-resize uncaptured-errors PASS none
+RESULT webgpu-resize summary PASS 10/10
+# two-canvases.html
+RESULT webgpu-two-canvases configure PASS canvases a and b on one device, c on a second
+RESULT webgpu-two-canvases canvas-a PASS 204,51,51,255
+RESULT webgpu-two-canvases canvas-b PASS 51,204,51,255
+RESULT webgpu-two-canvases canvas-c-second-device PASS 51,51,204,255
+RESULT webgpu-two-canvases animation PASS 60 frames of three canvases, 60.3 fps, 0.11 ms of JavaScript per frame
+RESULT webgpu-two-canvases detach-reattach PASS drawn through 36 frames out of and back in the document, then read back right
+RESULT webgpu-two-canvases uncaptured-errors PASS none
+RESULT webgpu-two-canvases summary PASS 7/7
+# todataurl.html
+RESULT webgpu-todataurl same-task-toDataURL PASS the pattern
+RESULT webgpu-todataurl same-task-toBlob PASS the pattern
+RESULT webgpu-todataurl same-task-createImageBitmap PASS the pattern
+RESULT webgpu-todataurl same-task-drawImage PASS the pattern
+RESULT webgpu-todataurl later-frame-toDataURL PASS the pattern (the presented frame is kept)
+RESULT webgpu-todataurl later-frame-toBlob PASS the pattern (the presented frame is kept)
+RESULT webgpu-todataurl later-frame-createImageBitmap PASS cleared (transparent black)
+RESULT webgpu-todataurl later-frame-drawImage PASS cleared (transparent black)
+RESULT webgpu-todataurl alpha-opaque PASS drawImage and toDataURL give 128,64,0,255
+RESULT webgpu-todataurl alpha-premultiplied PASS drawImage and toDataURL give 255,128,0,128
+RESULT webgpu-todataurl uncaptured-errors PASS none
+RESULT webgpu-todataurl summary PASS 11/11
+# copy-external-image.html
+RESULT webgpu-copy-external-image canvas-2d-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image canvas-2d-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-bitmap-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-bitmap-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image offscreen-canvas-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image offscreen-canvas-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-element-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-element-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-data-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-data-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image canvas-2d-to-bgra8unorm PASS four quadrants, red and blue the right way round
+RESULT webgpu-copy-external-image alpha-canvas-2d-straight PASS 255,128,0,128
+RESULT webgpu-copy-external-image alpha-canvas-2d-premultiplied PASS 128,64,0,128
+RESULT webgpu-copy-external-image alpha-image-bitmap-straight PASS 255,128,0,128
+RESULT webgpu-copy-external-image alpha-image-bitmap-premultiplied PASS 128,64,0,128
+RESULT webgpu-copy-external-image uncaptured-errors PASS none
+RESULT webgpu-copy-external-image summary PASS 16/16
+# video-texture.html
+RESULT webgpu-video-texture setup PASS texture_external pipeline for bgra8unorm
+RESULT webgpu-video-texture external-texture PASS 120 frames, 60.0 fps, 0.34 ms of JavaScript per frame; brightest channel 255, 63 colours on a 32x32 grid; video time 0.01 to 1.98 s
+RESULT webgpu-video-texture copy-external-image PASS 1920x1080 copied and read back in 6.0 ms; brightest channel 255, 60 colours on a 32x32 grid
+RESULT webgpu-video-texture video-frame-callback PASS 10 callbacks in 309 ms, each imported and drawn; last frame 1920x1080 at media time 2.300, presentedFrames 70
+RESULT webgpu-video-texture uncaptured-errors PASS none
+RESULT webgpu-video-texture summary PASS 5/5

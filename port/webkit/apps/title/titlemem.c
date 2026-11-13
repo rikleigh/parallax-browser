@@ -468,6 +468,10 @@ double ps5wk_title_direct_mb(void)
  * in builds without WebGL). */
 void ps5wk_webgl_mem_stats(unsigned* contexts, unsigned* made, double* drawingBufferMB) __attribute__((weak));
 
+/* WebKit's WebGPU buffers and textures in the title, against their budget
+ * (Source/WebGPU/WebGPUDawn/MemoryBudget.cpp; weak: absent without WebGPU). */
+void ps5wk_webgpu_mem_stats(double* usedMB, double* peakMB, double* budgetMB, unsigned* refused) __attribute__((weak));
+
 void ps5wk_title_mem_log(const char* milestone)
 {
     dheap_stats_t h;
@@ -488,10 +492,18 @@ void ps5wk_title_mem_log(const char* milestone)
         if (made)
             snprintf(webgl, sizeof webgl, "; WebGL %u contexts (%u made), drawing buffers ~%.1f MB", contexts, made, mb);
     }
+    char webgpu[128] = "";
+    if (ps5wk_webgpu_mem_stats) {
+        double used = 0, peak = 0, budget = 0;
+        unsigned refused = 0;
+        ps5wk_webgpu_mem_stats(&used, &peak, &budget, &refused);
+        if (budget > 0)
+            snprintf(webgpu, sizeof webgpu, "; WebGPU buffers and textures %.1f MB (peak %.1f, budget %.0f, %u refused)", used, peak, budget, refused);
+    }
     spike_log("[mem] %s: flexible %.1f MB free; direct memory %.1f MB in use; direct heap %.1f MB mapped (peak %.1f, %llu libc fallbacks, init %s); "
               "anon mmaps %.1f MB in %u (peak %.1f MB, %llu made, %llu failed, %llu zero fills, %llu passed through); "
-              "thread stacks %u live, %.1f MB (%u created, %u libc)%s",
+              "thread stacks %u live, %.1f MB (%u created, %u libc)%s%s",
         milestone, dmem_flexible_free() / 1048576.0, ps5wk_title_direct_mb(), h.mapped / 1048576.0, h.peak / 1048576.0, h.libc_fallbacks,
         h.init_step, (mapped - sb) / 1048576.0, n, peak / 1048576.0, dmap_count, dmap_failures, dmap_zero_fills,
-        dmap_passthrough, live, sb / 1048576.0, created, threads_libc, webgl);
+        dmap_passthrough, live, sb / 1048576.0, created, threads_libc, webgl, webgpu);
 }

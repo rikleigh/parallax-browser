@@ -51,6 +51,13 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 WK="$ROOT/toolchain/wpe-webkit"
 WC="${WC:-1}"
 WEBGL="${WEBGL:-1}"
+# WEBGPU=1: WebGPU on Dawn + RADV (spikes/12-webgpu), on top of WEBGL=1's
+# tree. Its own build dir, build-webgpu, until it ships.
+WEBGPU="${WEBGPU:-0}"
+if [ "$WEBGPU" = 1 ]; then
+    [ "$WEBGL" = 1 ] || { echo "WEBGPU=1 needs WEBGL=1 (the GPU process side in the title)" >&2; exit 2; }
+    BLD="${BLD:-$WK/build-webgpu}"
+fi
 if [ "$WEBGL" = 1 ]; then
     SRC="${SRC:-$WK/src-webgl}"
     BLD="${BLD:-$WK/build-webgl}"
@@ -203,6 +210,10 @@ if [ "$WEBGL" = 1 ]; then
     if [ "${WEB_AUDIO:-1}" = 1 ]; then
         WEBKIT_OPTIONS+=(-DENABLE_WEB_AUDIO=ON)
     fi
+fi
+if [ "$WEBGPU" = 1 ]; then
+    # Later -D wins over the -DENABLE_WEBGPU=OFF above.
+    WEBKIT_OPTIONS+=(-DENABLE_WEBGPU=ON -DUSE_DAWN=ON)
 fi
 if [ "$WC" = 1 ]; then
     WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=ON -DUSE_GRAPHICS_LAYER_WC=ON)

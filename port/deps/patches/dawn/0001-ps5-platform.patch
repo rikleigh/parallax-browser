@@ -1,0 +1,79 @@
+PS5 (ps5webkit spike 12 P0a): a DAWN_PLATFORM_IS(PS5) on the POSIX path, keyed on
+prospero-clang's __PROSPERO__. No executable/module path lookups (no
+/proc/self/exe, no dladdr); in CMake (PS5 is set by ps5-payload-sdk's
+prospero.cmake) no DRM utilities and no fd-based Vulkan external memory or
+semaphore services.
+
+--- a/src/utils/platform.h
++++ b/src/utils/platform.h
+@@ -94,6 +94,13 @@
+ #define DAWN_PLATFORM_IS_EMSCRIPTEN 1
+ #define DAWN_PLATFORM_IS_POSIX 1
+ #include <emscripten/emscripten.h>
++
++#elif defined(__PROSPERO__)
++// PS5 (ps5-payload-sdk, a FreeBSD 9 derived libc): POSIX, and nothing else.
++// A statically linked title: no dlopen of a Vulkan loader or libEGL; the host
++// program hands Dawn the drivers' entry points (BackendVk.cpp, BackendGL.cpp).
++#define DAWN_PLATFORM_IS_PS5 1
++#define DAWN_PLATFORM_IS_POSIX 1
+ 
+ #else
+ #error "Unsupported platform."
+@@ -241,6 +248,9 @@
+ #if !defined(DAWN_PLATFORM_IS_EMSCRIPTEN)
+ #define DAWN_PLATFORM_IS_EMSCRIPTEN 0
+ #endif
++#if !defined(DAWN_PLATFORM_IS_PS5)
++#define DAWN_PLATFORM_IS_PS5 0
++#endif
+ 
+ #if !defined(DAWN_PLATFORM_IS_X86)
+ #define DAWN_PLATFORM_IS_X86 0
+--- a/src/dawn/common/SystemUtils.cpp
++++ b/src/dawn/common/SystemUtils.cpp
+@@ -149,7 +149,8 @@
+     // UNIMPLEMENTED
+     return {};
+ }
+-#elif DAWN_PLATFORM_IS(EMSCRIPTEN)
++#elif DAWN_PLATFORM_IS(EMSCRIPTEN) || DAWN_PLATFORM_IS(PS5)
++// PS5: no /proc/self/exe; nothing is loaded relative to the executable.
+ std::optional<std::string> GetExecutablePath() {
+     return {};
+ }
+@@ -203,7 +204,8 @@
+ std::optional<std::string> GetModulePath() {
+     return {};
+ }
+-#elif DAWN_PLATFORM_IS(EMSCRIPTEN)
++#elif DAWN_PLATFORM_IS(EMSCRIPTEN) || DAWN_PLATFORM_IS(PS5)
++// PS5: one static executable, no dladdr.
+ std::optional<std::string> GetModulePath() {
+     return {};
+ }
+--- a/src/dawn/common/CMakeLists.txt
++++ b/src/dawn/common/CMakeLists.txt
+@@ -161,7 +161,8 @@
+         Vulkan::Headers)
+ endif ()
+ 
+-if (DAWN_ENABLE_VULKAN AND UNIX AND NOT ANDROID AND NOT APPLE)
++# PS5 (set by ps5-payload-sdk's prospero.cmake): no DRM, no <sys/sysmacros.h>.
++if (DAWN_ENABLE_VULKAN AND UNIX AND NOT ANDROID AND NOT APPLE AND NOT PS5)
+     list(APPEND private_headers
+         "DRMUtils.h"
+     )
+--- a/src/dawn/native/CMakeLists.txt
++++ b/src/dawn/native/CMakeLists.txt
+@@ -872,7 +872,9 @@
+             "vulkan/external_memory/MemoryServiceImplementationAHardwareBuffer.cpp"
+             "vulkan/external_semaphore/SemaphoreServiceImplementationFD.cpp"
+         )
+-    elseif (UNIX AND NOT APPLE)
++    elseif (UNIX AND NOT APPLE AND NOT PS5)
++        # PS5: no dma-buf or opaque-fd external memory, no semaphore fds; the
++        # services then report "unsupported", as they do on macOS.
+         list(APPEND private_headers
+             "vulkan/external_memory/MemoryServiceImplementationDmaBuf.h"
+             "vulkan/external_memory/MemoryServiceImplementationOpaqueFD.h"

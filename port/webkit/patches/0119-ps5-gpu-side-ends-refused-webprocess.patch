@@ -1,0 +1,77 @@
+diff --git a/Source/WebKit/GPUProcess/GPUProcess.cpp b/Source/WebKit/GPUProcess/GPUProcess.cpp
+index 7f27a81fcc..cd16c870f4 100644
+--- a/Source/WebKit/GPUProcess/GPUProcess.cpp
++++ b/Source/WebKit/GPUProcess/GPUProcess.cpp
+@@ -1047,9 +1047,34 @@ void GPUProcess::runDisplayListDataTestsForTesting(CompletionHandler<void(Vector
+     completionHandler(testDisplayListData());
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++static Function<void(WebCore::ProcessIdentifier, IPC::MessageName)>& ps5TerminateWebProcessHandler()
++{
++    static NeverDestroyed<Function<void(WebCore::ProcessIdentifier, IPC::MessageName)>> handler;
++    return handler;
++}
++
++void GPUProcess::ps5SetTerminateWebProcessHandler(Function<void(WebCore::ProcessIdentifier, IPC::MessageName)>&& handler)
++{
++    RELEASE_ASSERT(RunLoop::isMain());
++    ps5TerminateWebProcessHandler() = WTF::move(handler);
++}
++#endif
++
+ void GPUProcess::terminateWebProcess(WebCore::ProcessIdentifier identifier, IPC::MessageName invalidMessageName)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: in the title there is no GPUProcessProxy at the far end of the parent connection
++    // (AuxiliaryProcess::ps5InitializeInTitle), and a WebProcess whose message was refused
++    // would stay as it is: its connection closed, its main thread waiting on it for good.
++    // Any thread (message checks run on the work queues).
++    callOnMainRunLoop([identifier, invalidMessageName] {
++        if (auto& handler = ps5TerminateWebProcessHandler())
++            handler(identifier, invalidMessageName);
++    });
++#else
+     protect(parentProcessConnection())->send(Messages::GPUProcessProxy::TerminateWebProcess(identifier, invalidMessageName), 0);
++#endif
+ }
+ 
+ #if PLATFORM(COCOA) && ENABLE(MEDIA_STREAM)
+diff --git a/Source/WebKit/GPUProcess/GPUProcess.h b/Source/WebKit/GPUProcess/GPUProcess.h
+index 9fb229f058..93192904ea 100644
+--- a/Source/WebKit/GPUProcess/GPUProcess.h
++++ b/Source/WebKit/GPUProcess/GPUProcess.h
+@@ -115,6 +115,9 @@ public:
+     {
+         createGPUConnectionToWebProcess(identifier, sessionID, WTF::move(connectionHandle), WTF::move(parameters), [] { });
+     }
++    // What ends a WebProcess whose message this side refused (the title's WebProcessProxy).
++    // Set on the main run loop, called there.
++    void ps5SetTerminateWebProcessHandler(Function<void(WebCore::ProcessIdentifier, IPC::MessageName)>&&);
+     void ps5SharedPreferencesForWebProcessDidChange(WebCore::ProcessIdentifier identifier, SharedPreferencesForWebProcess&& sharedPreferences)
+     {
+         sharedPreferencesForWebProcessDidChange(identifier, WTF::move(sharedPreferences), [] { });
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+index ac43f019fd..3ccb6f2598 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+@@ -10,6 +10,7 @@
+ #include "GPUProcess.h"
+ #include "GPUProcessConnectionParameters.h"
+ #include "PS5WCHost.h"
++#include "ProcessTerminationReason.h"
+ #include "WebProcessProxy.h"
+ #include <WebCore/GLContext.h>
+ #include <WebCore/PlatformDisplaySurfaceless.h>
+@@ -117,6 +118,11 @@ void createGPUProcessConnection(WebProcessProxy& webProcess, IPC::Connection::Ha
+             WTFLogAlways("[webgl] title: no EGL display, so no WebGL");
+         } else {
+             GPUProcess::singleton().ps5InitializeInTitle();
++            GPUProcess::singleton().ps5SetTerminateWebProcessHandler([](WebCore::ProcessIdentifier identifier, IPC::MessageName messageName) {
++                WTFLogAlways("[webgl] title: the GPU side refused %s from WebProcess %" PRIu64 ": ending that process", IPC::description(messageName).characters(), identifier.toUInt64());
++                if (RefPtr process = WebProcessProxy::processForIdentifier(identifier))
++                    process->requestTermination(ProcessTerminationReason::RequestedByGPUProcess, messageName);
++            });
+             #if USE(DAWN)
+             // RADV's on-disk shader cache defaults to /app0/radv-shader-cache, which a title
+             // cannot write. Off until it has a folder of its own (spikes/12-webgpu).

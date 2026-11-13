@@ -1,0 +1,31 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+index dbf1ca9f0a..22c411435f 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
++++ b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+@@ -1117,7 +1117,7 @@ static bool isStateValid(const auto& source, const std::optional<GPUOrigin2D>& o
+ 
+ // FIXME: https://bugs.webkit.org/show_bug.cgi?id=263692 - this code should be removed, it is to unblock
+ // compiler <-> pipeline dependencies
+-#if PLATFORM(COCOA)
++#if PLATFORM(COCOA) || USE(DAWN) // portable CPU code; the PS5 has no GPU-resident sources
+ static uint32_t LEGACY_NODELETE convertRGBA8888ToRGB10A2(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+ {
+     uint32_t r0 = (static_cast<uint32_t>(r) << 2) | (static_cast<uint32_t>(r) >> 6);
+@@ -1145,7 +1145,7 @@ static MallocSpan<uint8_t> copyToDestinationFormat(std::span<const uint8_t> rgba
+     if (sourceOrigin)
+         populdateXYFromOrigin(*sourceOrigin, sourceX, sourceY);
+ 
+-#if PLATFORM(COCOA)
++#if PLATFORM(COCOA) || USE(DAWN) // portable CPU code; the PS5 has no GPU-resident sources
+     auto sizeInBytes = rgbaBytes.size();
+     auto flipAndPremultiply = [&](auto& data, bool flipY, bool premultiplyAlpha, auto oneValue) {
+         if (!rows || (!flipY && !premultiplyAlpha))
+@@ -1175,7 +1175,7 @@ static MallocSpan<uint8_t> copyToDestinationFormat(std::span<const uint8_t> rgba
+ #endif
+ 
+     supportedFormat = true;
+-#if PLATFORM(COCOA)
++#if PLATFORM(COCOA) || USE(DAWN) // portable CPU code; the PS5 has no GPU-resident sources
+     switch (format) {
+     case GPUTextureFormat::R8unorm: {
+         auto data = MallocSpan<uint8_t>::malloc(sizeInBytes / 4);

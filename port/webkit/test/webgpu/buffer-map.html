@@ -1,0 +1,184 @@
+<!doctype html>
+<!-- WebGPU buffer mapping, as ML libraries use it (ONNX Runtime Web uploads
+     every tensor through a buffer mapped at creation and reads results back
+     through mapAsync). Nothing is drawn. Cases: a buffer mapped at creation
+     gives a range of its whole size, and what is written there is what a
+     read-back buffer holds; getMappedRange(offset, size) is that part;
+     two disjoint ranges of one mapping; mapAsync(READ, offset, size) and
+     the ranges it allows; the same round trip at 1, 16 and 64 MiB; typed
+     array views over a range; mapAsync(WRITE); requestAdapter() again after
+     a device was made still lists the same features.
+     Log lines: RESULT webgpu-buffer-map <case> PASS|FAIL <why>, then the
+     summary. Open file:///data/ps5webkit/webgpu/buffer-map.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU buffer mapping</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU buffer mapping</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+T.run('buffer-map', async () => {
+  const made = await T.getDevice(undefined, undefined, 'request-device');
+  if (!made) return;
+  const { adapter, device } = made;
+  const featuresBefore = [...adapter.features].sort().join(' ');
+
+  function pattern(size, seed) {
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i++) bytes[i] = (i * 7 + seed + (i >> 8)) & 255;
+    return bytes;
+  }
+  function firstDifference(got, want) {
+    if (got.length !== want.length) return 'length ' + got.length + ', expected ' + want.length;
+    for (let i = 0; i < want.length; i++)
+      if (got[i] !== want[i]) return 'byte ' + i + ' is ' + got[i] + ', expected ' + want[i];
+    return '';
+  }
+  // Uploads through mappedAtCreation, copies on the GPU, reads through mapAsync: ONNX Runtime's path.
+  async function roundTrip(size, seconds) {
+    const want = pattern(size, size & 255);
+    const upload = device.createBuffer({ size, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+    const range = upload.getMappedRange();
+    T.assert(range.byteLength === size, 'getMappedRange() of a ' + size + ' byte buffer mapped at creation has ' + range.byteLength + ' bytes');
+    new Uint8Array(range).set(want);
+    upload.unmap();
+    const storage = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const read = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(upload, 0, storage, 0, size);
+    encoder.copyBufferToBuffer(storage, 0, read, 0, size);
+    device.queue.submit([encoder.finish()]);
+    const before = performance.now();
+    await Promise.race([read.mapAsync(GPUMapMode.READ), new Promise((_, reject) => setTimeout(() => reject(new Error('mapAsync did not settle in ' + seconds + ' s')), seconds * 1000))]);
+    const result = read.getMappedRange();
+    T.assert(result.byteLength === size, 'getMappedRange() after mapAsync(READ) of a ' + size + ' byte buffer has ' + result.byteLength + ' bytes');
+    const difference = firstDifference(new Uint8Array(result, 0, size), want);
+    read.unmap();
+    for (const buffer of [upload, storage, read]) buffer.destroy();
+    T.assert(!difference, difference);
+    return size + ' bytes round trip, mapAsync after ' + (performance.now() - before).toFixed(1) + ' ms';
+  }
+
+  await T.test('mapped-at-creation', () => roundTrip(48, 10), device);
+  await T.test('odd-multiple-of-4', () => roundTrip(1028, 10), device);
+
+  await T.test('mapped-at-creation-no-map-usage', async () => {
+    // A buffer that can never be mapped again is still mapped at creation (ONNX Runtime's storage buffers).
+    const want = pattern(256, 3);
+    const buffer = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+    const range = buffer.getMappedRange();
+    T.assert(range.byteLength === 256, 'range has ' + range.byteLength + ' bytes');
+    new Uint8Array(range).set(want);
+    buffer.unmap();
+    const read = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, read, 0, 256);
+    device.queue.submit([encoder.finish()]);
+    await T.step(read.mapAsync(GPUMapMode.READ), 'mapAsync');
+    const difference = firstDifference(new Uint8Array(read.getMappedRange()), want);
+    read.unmap();
+    T.assert(!difference, difference);
+    return '256 bytes written through a STORAGE buffer mapped at creation';
+  }, device);
+
+  await T.test('partial-ranges', async () => {
+    const buffer = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+    const a = buffer.getMappedRange(8, 16);
+    const b = buffer.getMappedRange(32);
+    T.assert(a.byteLength === 16, 'getMappedRange(8, 16) has ' + a.byteLength + ' bytes');
+    T.assert(b.byteLength === 32, 'getMappedRange(32) of a 64 byte buffer has ' + b.byteLength + ' bytes');
+    let threw = '';
+    try { buffer.getMappedRange(16, 16); } catch (e) { threw = e.name; }
+    T.assert(threw === 'OperationError', 'a range overlapping one handed out threw ' + (threw || 'nothing') + ', expected OperationError');
+    new Uint8Array(a).fill(0xAA);
+    new Uint8Array(b).fill(0xBB);
+    buffer.unmap();
+    T.assert(a.byteLength === 0 && b.byteLength === 0, 'ranges are not detached by unmap()');
+    const read = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, read, 0, 64);
+    device.queue.submit([encoder.finish()]);
+    await T.step(read.mapAsync(GPUMapMode.READ, 8, 40), 'mapAsync(READ, 8, 40)');
+    threw = '';
+    try { read.getMappedRange(); } catch (e) { threw = e.name; }
+    T.assert(threw === 'OperationError', 'getMappedRange() outside a partial mapping threw ' + (threw || 'nothing') + ', expected OperationError');
+    const part = new Uint8Array(read.getMappedRange(8, 40));
+    T.assert(part.length === 40, 'getMappedRange(8, 40) has ' + part.length + ' bytes');
+    T.assert(part[0] === 0xAA && part[15] === 0xAA && part[16] === 0 && part[24] === 0xBB && part[39] === 0xBB,
+      'contents wrong: ' + [part[0], part[15], part[16], part[24], part[39]].join(','));
+    read.unmap();
+    return 'two disjoint ranges written, a partial mapping read';
+  }, device);
+
+  await T.test('typed-views', async () => {
+    const buffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+    const range = buffer.getMappedRange();
+    new Float32Array(range, 0, 4).set([1.5, -2, 3.25, 4]);
+    new Int32Array(range, 16, 4).set([-1, 2, -3, 4]);
+    buffer.unmap();
+    const read = device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, read, 0, 32);
+    device.queue.submit([encoder.finish()]);
+    await T.step(read.mapAsync(GPUMapMode.READ), 'mapAsync');
+    const result = read.getMappedRange();
+    const floats = [...new Float32Array(result, 0, 4)], ints = [...new Int32Array(result, 16, 4)];
+    read.unmap();
+    T.assert(floats.join() === '1.5,-2,3.25,4' && ints.join() === '-1,2,-3,4', 'read ' + floats.join() + ' and ' + ints.join());
+    return 'Float32Array and Int32Array views over one range';
+  }, device);
+
+  await T.test('map-write', async () => {
+    const want = pattern(128, 9);
+    const buffer = device.createBuffer({ size: 128, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC });
+    await T.step(buffer.mapAsync(GPUMapMode.WRITE), 'mapAsync(WRITE)');
+    new Uint8Array(buffer.getMappedRange()).set(want);
+    buffer.unmap();
+    const read = device.createBuffer({ size: 128, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, read, 0, 128);
+    device.queue.submit([encoder.finish()]);
+    await T.step(read.mapAsync(GPUMapMode.READ), 'mapAsync(READ)');
+    const difference = firstDifference(new Uint8Array(read.getMappedRange()), want);
+    read.unmap();
+    T.assert(!difference, difference);
+    return '128 bytes written through mapAsync(WRITE)';
+  }, device);
+
+  await T.test('remap', async () => {
+    // The same read buffer mapped, unmapped and mapped again with new contents.
+    const read = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    for (let round = 1; round <= 3; round++) {
+      device.queue.writeBuffer(read, 0, new Uint32Array([round, round * 2, round * 3, round * 4]));
+      await T.step(read.mapAsync(GPUMapMode.READ), 'mapAsync round ' + round);
+      const got = [...new Uint32Array(read.getMappedRange())];
+      read.unmap();
+      T.assert(got.join() === [round, round * 2, round * 3, round * 4].join(), 'round ' + round + ' read ' + got.join());
+    }
+    return 'three rounds';
+  }, device);
+
+  for (const mib of [1, 16, 64])
+    await T.test('round-trip-' + mib + 'MiB', () => roundTrip(mib << 20, 30), device);
+
+  await T.test('adapter-again', async () => {
+    const again = await T.step(navigator.gpu.requestAdapter(), 'requestAdapter');
+    T.assert(again, 'requestAdapter() returned null after a device was made');
+    const features = [...again.features].sort().join(' ');
+    T.assert(features === featuresBefore, 'features changed: before "' + featuresBefore + '", now "' + features + '"');
+    const third = await T.step(navigator.gpu.requestAdapter(), 'requestAdapter');
+    T.assert(third.features.has('shader-f16') === adapter.features.has('shader-f16'), 'shader-f16 differs on a third adapter');
+    return again.features.size + ' features, the same as before the device';
+  }, device);
+});
+</script>
+</body>
+</html>

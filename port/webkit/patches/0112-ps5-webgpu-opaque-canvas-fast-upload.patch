@@ -1,0 +1,18 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+index fdb43db4b8..c81f9f6d0c 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+@@ -38,8 +38,11 @@ private:
+         if (!m_texture) {
+             const bool opaque = m_frame->alphaMode == ::WebGPU::CanvasAlphaMode::Opaque;
+             const bool bgra = m_frame->format == ::WebGPU::TextureFormat::Bgra8unorm || m_frame->format == ::WebGPU::TextureFormat::Bgra8unormSRGB;
+-            // An opaque canvas's alpha channel is whatever the page drew: X formats ignore it.
+-            const PixelFormat pixelFormat = bgra ? (opaque ? PixelFormat::BGRX8 : PixelFormat::BGRA8) : (opaque ? PixelFormat::RGBX8 : PixelFormat::RGBA8);
++            // BGRA8 or RGBA8 only: the X formats miss BitmapTexture's PS5 upload path and go through
++            // glTexSubImage2D (35 ms at 1920x1080: a full-screen canvas ran at 29 frames/s). An
++            // opaque canvas's alpha channel is whatever the page drew; its texture has no
++            // SupportsAlpha, so it is drawn without blending and the channel is not looked at.
++            const PixelFormat pixelFormat = bgra ? PixelFormat::BGRA8 : PixelFormat::RGBA8;
+             OptionSet<BitmapTexture::Flags> flags;
+             if (!opaque)
+                 flags.add(BitmapTexture::Flags::SupportsAlpha);

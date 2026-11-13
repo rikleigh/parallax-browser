@@ -877,6 +877,80 @@ step_fonts() {
     install -m644 "$HERE/runtime/etc/fonts/fonts.conf" "$RUNTIME/etc/fonts/fonts.conf"
 }
 
+# Dawn (WebGPU, spike 12 P0a): one static archive, libwebgpu_dawn.a, holding
+# dawn_native + Tint + abseil + the wgpu* procs, with the Vulkan, OpenGL ES and
+# null backends. The host program supplies the drivers' entry points
+# (port/deps/patches/dawn; spikes/12-webgpu/p0a-dawn/NOTES.md):
+#   void *dawn_ps5_vk_get_instance_proc_addr(void);
+#   void *dawn_ps5_egl_get_proc_address(const char *name);
+# Dawn's third-party trees come as their own pinned tarballs (DEPS of the Dawn
+# commit); the code generator's jinja2/markupsafe are PyPI sdists, run with the
+# host python3.
+DAWN_COMMIT=088a8d00efd1c70b58c549d355401d115904b648   # branch point of chromium/8103 (M157)
+step_dawn() {
+    log "dawn ${DAWN_COMMIT:0:12} (WebGPU: Vulkan + OpenGL ES + null backends, Tint)"
+    local gh=https://github.com tp
+    # dawn_dep <dir under third_party> <url> <sha256> <file>: a fresh directory
+    dawn_dep() {
+        fetch "$2" "$3" "$4"
+        rm -rf "${tp:?}/$1"; mkdir -p "$tp/$1"
+        tar -xf "$FETCHED" -C "$tp/$1" --strip-components=1
+    }
+    fetch $gh/google/dawn/archive/$DAWN_COMMIT.tar.gz \
+        f5ff77afd294d706c62ad478bdaa49429bf057f8fa80f968f5b2fd15334ef375 dawn-$DAWN_COMMIT.tar.gz
+    unpack dawn "$FETCHED"
+    tp="$SRC/third_party"
+    dawn_dep abseil-cpp $gh/abseil/abseil-cpp/archive/7f008af1930f59d869a816795ac5d445e3628e4d.tar.gz \
+        e74737a89933b4beb590633d0333399d4cf069c99c70145f6a0a40b65362a86d dawn-abseil-cpp-7f008af1.tar.gz
+    dawn_dep spirv-headers/src $gh/KhronosGroup/SPIRV-Headers/archive/86f980c731e62ae4eaf383d320449d71687936bf.tar.gz \
+        d11ef011d0788ed002d7cc96224d298f43b126cabe887cd4d46199cb19ecf386 dawn-SPIRV-Headers-86f980c7.tar.gz
+    dawn_dep spirv-tools/src $gh/KhronosGroup/SPIRV-Tools/archive/e56740d931256cc464d4d1a76149f69469c33f70.tar.gz \
+        33813160942db93b56232ab93887b39dc0c25b2fa934469fb2428dab5a5626c9 dawn-SPIRV-Tools-e56740d9.tar.gz
+    dawn_dep vulkan-headers/src $gh/KhronosGroup/Vulkan-Headers/archive/c46850864f4661461b0f6cb9922c058ffea4915e.tar.gz \
+        539ff8eaa4abf22fddbd98225c68a0c5ddb940075a4048c8b7f5d04449070a4e dawn-Vulkan-Headers-c4685086.tar.gz
+    dawn_dep vulkan-utility-libraries/src $gh/KhronosGroup/Vulkan-Utility-Libraries/archive/90738f6edfa19561a978fc5f97543ba37075ba9d.tar.gz \
+        73d3f3b6385f6ea6f6bbc6908ac984f1e26632cb258ab34a0435d06bf3f7bd7a dawn-Vulkan-Utility-Libraries-90738f6e.tar.gz
+    dawn_dep EGL-Registry/src $gh/KhronosGroup/EGL-Registry/archive/db3425b8246136faccb5e2782b5694960bd6edf1.tar.gz \
+        3d6b42b23da8030f5b29ade07d7384c5f885e713f17f04650f6cd4b8329b88e8 dawn-EGL-Registry-db3425b8.tar.gz
+    # OpenGL-Registry is a 112 MB archive and only xml/gl.xml is read.
+    fetch https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/6af574a14089ccfee87efe230ebcdd8742859813/xml/gl.xml \
+        b9ca2cfa5c676e901c20d34af3407f1687cde0f1336a5ff7a8974d04c7494ad3 dawn-gl-6af574a1.xml
+    mkdir -p "$tp/OpenGL-Registry/src/xml"; cp "$FETCHED" "$tp/OpenGL-Registry/src/xml/gl.xml"
+    # generator_lib.py imports <dir>/../jinja2: keep the package directory names
+    dawn_dep .jinja2 https://files.pythonhosted.org/packages/source/J/Jinja2/Jinja2-3.1.2.tar.gz \
+        31351a702a408a9e7595a8fc6150fc3f43bb6bf7e319770cbc0db9df9437e852 dawn-Jinja2-3.1.2.tar.gz
+    dawn_dep .markupsafe https://files.pythonhosted.org/packages/source/M/MarkupSafe/MarkupSafe-2.1.5.tar.gz \
+        d283d37a890ba4c1ae73ffadf8046435c76e7bc2247bbb63c00bd1a709c6544b dawn-MarkupSafe-2.1.5.tar.gz
+    unset -f dawn_dep
+    local t0=$SECONDS
+    # NDEBUG: Dawn insists on it or DAWN_ENABLE_ASSERTS (cmake_pkg empties the
+    # release flags). TINT_BUILD_AS_OTHER_OS: Tint's *_other.cc (no terminal
+    # queries, no /proc/self/exe, no child processes) instead of the Linux ones.
+    cmake_pkg dawn \
+        -DPython3_EXECUTABLE="$(command -v python3)" \
+        -DCMAKE_C_FLAGS_RELEASE=-DNDEBUG -DCMAKE_CXX_FLAGS_RELEASE=-DNDEBUG -DTINT_BUILD_AS_OTHER_OS=ON \
+        -DDAWN_JINJA2_DIR="$tp/.jinja2/src/jinja2" -DDAWN_MARKUPSAFE_DIR="$tp/.markupsafe/src/markupsafe" \
+        -DDAWN_FETCH_DEPENDENCIES=OFF -DDAWN_BUILD_MONOLITHIC_LIBRARY=STATIC -DDAWN_ENABLE_INSTALL=ON \
+        -DDAWN_ENABLE_VULKAN=ON -DDAWN_ENABLE_OPENGLES=ON -DDAWN_ENABLE_NULL=ON \
+        -DDAWN_ENABLE_DESKTOP_GL=OFF -DDAWN_ENABLE_D3D11=OFF -DDAWN_ENABLE_D3D12=OFF -DDAWN_ENABLE_METAL=OFF \
+        -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF -DDAWN_USE_GLFW=OFF \
+        -DDAWN_BUILD_SAMPLES=OFF -DDAWN_BUILD_TESTS=OFF -DDAWN_BUILD_PROTOBUF=OFF \
+        -DDAWN_ENABLE_SPIRV_VALIDATION=OFF -DDAWN_WERROR=OFF \
+        -DTINT_BUILD_CMD_TOOLS=OFF -DTINT_BUILD_TESTS=OFF -DTINT_BUILD_IR_BINARY=OFF \
+        -DTINT_BUILD_WGSL_READER=ON -DTINT_BUILD_SPV_WRITER=ON -DTINT_BUILD_GLSL_WRITER=ON \
+        -DTINT_BUILD_SPV_READER=OFF -DTINT_BUILD_WGSL_WRITER=OFF -DTINT_BUILD_HLSL_WRITER=OFF \
+        -DTINT_BUILD_MSL_WRITER=OFF -DTINT_BUILD_GLSL_VALIDATOR=OFF
+    echo "dawn: built in $((SECONDS - t0)) s"
+    # Dawn's install rules leave out dawn::platform::Platform (its code is in
+    # the archive; DawnInstanceDescriptor::platform takes one).
+    install -d "$SYSROOT/include/dawn/platform"
+    install -m644 "$SRC"/include/dawn/platform/*.h "$SYSROOT/include/dawn/platform/"
+    # The exported CMake package carries abseil's host-probed link flags
+    # (-lrt, EXECINFO_LIBRARY-NOTFOUND) and an absolute path: link the archive.
+    rm -rf "$SYSROOT/lib/cmake/Dawn"
+    fix_sysroot; cleanup dawn
+}
+
 # MIME types by file extension (no shared-mime-info on the console): a
 # hand-written globs2 for xdgmime (WebKit's and GIO's copies); the children
 # set XDG_DATA_DIRS=/data/ps5webkit/share.
@@ -891,10 +965,13 @@ STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv p
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
           cacert fonts mime xkeyboard_config)
 STEPS_M2=(dav1d ffmpeg libogg libvorbis opus gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
+# Not in any default set (spike 12, WebGPU): build.sh dawn
+STEPS_GPU=(dawn)
 
 if [ "${1:-}" = "--list" ]; then
     echo "# Milestone 1 (default)"; printf '%s\n' "${STEPS_M1[@]}" | tr _ -
     echo "# Milestone 2 (media): build.sh m2"; printf '%s\n' "${STEPS_M2[@]}" | tr _ -
+    echo "# WebGPU (spike 12): build.sh dawn"; printf '%s\n' "${STEPS_GPU[@]}" | tr _ -
     exit 0
 fi
 STEPS=("$@")

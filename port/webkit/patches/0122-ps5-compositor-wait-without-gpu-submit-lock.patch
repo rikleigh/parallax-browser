@@ -1,0 +1,37 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 6f22500094..71cd36e29d 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -65,6 +65,10 @@
+ #include <wtf/RunLoop.h>
+ #include <wtf/Vector.h>
+ 
++// The title's GPU submission lock (WebGPU builds; port/webkit/apps/title/titleradv.c).
++extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
++extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
++
+ namespace WebKit {
+ using namespace WebCore;
+ 
+@@ -874,10 +878,17 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     if (mayWait && m_expectingUpdate && !hasPending()) {
+         int64_t waitUS = std::min<int64_t>(displayUS - 6000 - g_get_monotonic_time(), 10000);
+         if (waitUS > 0) {
+-            Locker locker { m_lock };
+-            m_stateChanged.waitFor(m_lock, Seconds::fromMicroseconds(waitUS), [&] {
+-                return !m_queue.isEmpty();
+-            });
++            // Not with the GPU submission lock (the render thread holds it around a frame's GL
++            // work): Dawn would wait as long to submit a canvas's frame.
++            const bool heldSubmitLock = ps5wk_gpu_submit_unlock && ps5wk_gpu_submit_unlock();
++            {
++                Locker locker { m_lock };
++                m_stateChanged.waitFor(m_lock, Seconds::fromMicroseconds(waitUS), [&] {
++                    return !m_queue.isEmpty();
++                });
++            }
++            if (heldSubmitLock)
++                ps5wk_gpu_submit_lock();
+         }
+         if (hasPending()) {
+             m_stats.lateUpdates++;

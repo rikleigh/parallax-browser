@@ -1,0 +1,24 @@
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp
+index 04567f9d79..e6e779c2c6 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteDeviceProxy.cpp
+@@ -162,11 +162,18 @@ RefPtr<::WebGPU::ExternalTexture> RemoteDeviceProxy::importExternalTexture(const
+     auto sendResult = send(Messages::RemoteDevice::ImportExternalTextureFromVideoFrame(WTF::move(*convertedDescriptor), identifier));
+     if (sendResult != IPC::Error::NoError)
+         return nullptr;
+-#endif
+ 
+     auto result = RemoteExternalTextureProxy::create(*this, m_convertToBackingContext, identifier);
+     result->setLabel(WTF::move(convertedDescriptor->label));
+     return result;
++#else
++    // No external (video) textures on this port yet (PS5, Dawn). Nothing was sent, so the GPU process
++    // has no object for the identifier: a proxy for it would name an unknown object in every
++    // later message, which fails that side's message checks and closes the connection (the page
++    // then hung on a full stream buffer). The page gets an InvalidStateError instead.
++    UNUSED_VARIABLE(identifier);
++    return nullptr;
++#endif
+ }
+ 
+ #if PLATFORM(COCOA)

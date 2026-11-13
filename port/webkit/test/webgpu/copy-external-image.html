@@ -1,0 +1,149 @@
+<!doctype html>
+<!-- WebGPU textures from web content: queue.copyExternalImageToTexture is
+     how every engine uploads its images, and each kind of source has its
+     own decode and upload path. Nothing is shown but the log. The source is
+     a 64x64 pattern of four quadrants (red top left, green top right, blue
+     bottom left, white bottom right) painted with a 2D canvas; the texture
+     is read back with copyTextureToBuffer. Cases, each as
+     <source>-flipY-false (the pattern as painted) and <source>-flipY-true
+     (top and bottom swapped): canvas-2d; image-bitmap
+     (createImageBitmap of the canvas); offscreen-canvas (SKIP where there is
+     no OffscreenCanvas); image-element (an HTMLImageElement loaded from the
+     canvas's toDataURL() PNG); image-data (ImageData through
+     createImageBitmap). canvas-2d-to-bgra8unorm: the same into a bgra8unorm
+     texture (channel order). alpha-<source>-straight and
+     alpha-<source>-premultiplied, for canvas-2d and image-bitmap: a source
+     filled with 255,128,0 at alpha 128 copied with premultipliedAlpha false
+     (255,128,0,128 in the texture) and true (128,64,0,128), within 4 of 255
+     as the source has already been through 8-bit premultiplication. Log
+     lines: RESULT webgpu-copy-external-image <case> PASS|FAIL|SKIP <why>,
+     then RESULT webgpu-copy-external-image summary PASS|FAIL <n>/<m>. Upload
+     the directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/copy-external-image.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU copyExternalImageToTexture</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU copyExternalImageToTexture</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const SIZE = 64;
+
+function patternCanvas() {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = SIZE;
+  T.paintQuadrants(canvas.getContext('2d'), SIZE, SIZE);
+  return canvas;
+}
+function translucentCanvas() {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = SIZE;
+  const context = canvas.getContext('2d');
+  context.fillStyle = 'rgba(255, 128, 0, ' + 128 / 255 + ')';
+  context.fillRect(0, 0, SIZE, SIZE);
+  return canvas;
+}
+function loadImage(url) {
+  return T.step(new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('the image did not load'));
+    image.src = url;
+  }), 'image load');
+}
+
+// name -> a function making the source (null: this browser has no such thing).
+const SOURCES = {
+  'canvas-2d': async () => patternCanvas(),
+  'image-bitmap': () => T.step(createImageBitmap(patternCanvas()), 'createImageBitmap(canvas)'),
+  'offscreen-canvas': async () => {
+    if (typeof OffscreenCanvas === 'undefined') return null;
+    const canvas = new OffscreenCanvas(SIZE, SIZE);
+    const context = canvas.getContext('2d');
+    T.assert(context, 'OffscreenCanvas.getContext("2d") returned ' + context);
+    T.paintQuadrants(context, SIZE, SIZE);
+    return canvas;
+  },
+  'image-element': () => loadImage(patternCanvas().toDataURL('image/png')),
+  'image-data': () => {
+    const data = patternCanvas().getContext('2d').getImageData(0, 0, SIZE, SIZE);
+    return T.step(createImageBitmap(data), 'createImageBitmap(ImageData)');
+  },
+};
+
+T.run('copy-external-image', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device } = g;
+
+  async function copied(source, options, format = 'rgba8unorm') {
+    const texture = device.createTexture({
+      size: [SIZE, SIZE], format,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    device.queue.copyExternalImageToTexture(Object.assign({ source }, options.source), Object.assign({ texture }, options.destination), [SIZE, SIZE]);
+    const image = await T.readTexture(device, texture);
+    texture.destroy();
+    return image;
+  }
+
+  for (const name of Object.keys(SOURCES)) {
+    let source = null, failure = null;
+    try {
+      source = await SOURCES[name]();
+    } catch (e) {
+      failure = e;
+    }
+    for (const flipY of [false, true]) {
+      const label = name + '-flipY-' + flipY;
+      if (!failure && source === null) {
+        T.skip(label, 'no ' + (name === 'offscreen-canvas' ? 'OffscreenCanvas' : name));
+        continue;
+      }
+      await T.test(label, async () => {
+        if (failure) throw new Error('making the source: ' + T.describe(failure));
+        const image = await copied(source, { source: { flipY } });
+        const wrong = T.quadrantsMismatch(image, flipY);
+        T.assert(!wrong, wrong);
+        return flipY ? 'four quadrants, top and bottom swapped' : 'four quadrants as painted';
+      }, device);
+    }
+  }
+
+  await T.test('canvas-2d-to-bgra8unorm', async () => {
+    const image = await copied(patternCanvas(), {}, 'bgra8unorm');
+    const wrong = T.quadrantsMismatch(image);
+    T.assert(!wrong, wrong);
+    return 'four quadrants, red and blue the right way round';
+  }, device);
+
+  const translucent = {
+    'canvas-2d': async () => translucentCanvas(),
+    'image-bitmap': () => T.step(createImageBitmap(translucentCanvas()), 'createImageBitmap(canvas)'),
+  };
+  for (const name of Object.keys(translucent)) {
+    for (const premultipliedAlpha of [false, true]) {
+      await T.test('alpha-' + name + (premultipliedAlpha ? '-premultiplied' : '-straight'), async () => {
+        const source = await translucent[name]();
+        const image = await copied(source, { destination: { premultipliedAlpha } });
+        const want = premultipliedAlpha ? [128, 64, 0, 128] : [255, 128, 0, 128];
+        T.expectPixel(image, SIZE / 2, SIZE / 2, want, 'premultipliedAlpha ' + premultipliedAlpha, 4);
+        T.expectPixel(image, 1, 1, want, 'premultipliedAlpha ' + premultipliedAlpha, 4);
+        return T.show(T.pixel(image, SIZE / 2, SIZE / 2));
+      }, device);
+    }
+  }
+
+  T.report('uncaptured-errors', T.uncaptured.length === 0, T.uncaptured.length ? T.uncaptured.join(' | ') : 'none');
+});
+</script>
+</body>
+</html>

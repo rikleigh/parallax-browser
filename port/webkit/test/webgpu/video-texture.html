@@ -1,0 +1,228 @@
+<!doctype html>
+<!-- WebGPU with video: a playing HTMLVideoElement as a texture, the way
+     video players with effects and 360 viewers use it. The clip is
+     ?src=<url>, by default ../media/sync-1080p30-h264.mp4 (the synthetic
+     clip of test/media/make-media.sh, which its --upload puts in
+     /data/ps5webkit/media/, next to this directory on the console; the
+     repository holds no media). If the video is not playing within 10 s the
+     page logs RESULT webgpu-video-texture video SKIP no video source and
+     stops: that is not a WebGPU failure. On screen: the video element
+     (small, left) and a 640x360 WebGPU canvas showing the same picture.
+     Cases: external-texture: every frame importExternalTexture({ source:
+     video }) is sampled with texture_external and
+     textureSampleBaseClampToEdge onto the canvas, 120 frames, the frame
+     rate logged, and one frame read through drawImage must not be black;
+     copy-external-image: copyExternalImageToTexture from the video into an
+     rgba8unorm texture of the video's size, read back, not black;
+     video-frame-callback: 10 requestVideoFrameCallback callbacks, each
+     importing and drawing the frame (SKIP where the element has no
+     requestVideoFrameCallback). The canvas keeps following the video
+     afterwards. Log lines: RESULT webgpu-video-texture <case>
+     PASS|FAIL|SKIP <why>, then RESULT webgpu-video-texture summary
+     PASS|FAIL <n>/<m>. Upload the directory to /data/ps5webkit/webgpu/ and
+     open file:///data/ps5webkit/webgpu/video-texture.html[?src=<url>]. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU video texture</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  video { width: 320px; height: 180px; border: 2px solid #555; margin-right: 12px; vertical-align: top; }
+  canvas { width: 640px; height: 360px; border: 2px solid #555; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU video texture</h1>
+<div id="row"><canvas id="canvas" width="640" height="360"></canvas></div>
+<div id="status">starting</div>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const DEFAULT_CLIP = '../media/sync-1080p30-h264.mp4';
+const WGSL = `
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var t: texture_external;
+struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                                vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  let xy = corners[i];
+  return V(vec4f(xy, 0.0, 1.0), vec2f(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5));
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  return textureSampleBaseClampToEdge(t, s, v.uv);
+}`;
+
+// Resolves with '' once the video is playing and has a frame, or with why it is not.
+function startVideo(video, url) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = why => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      resolve(why);
+    };
+    const state = () => 'readyState ' + video.readyState + ', networkState ' + video.networkState + ', currentTime ' + video.currentTime.toFixed(2);
+    const timer = setTimeout(() => finish('not playing after 10 s (' + state() + ')'), 10000);
+    const poll = setInterval(() => {
+      if (video.readyState >= 2 && video.videoWidth > 0 && !video.paused && video.currentTime > 0) finish('');
+    }, 50);
+    video.addEventListener('error', () => finish('video error ' + (video.error ? video.error.code + ' ' + video.error.message : '')));
+    video.muted = true;
+    video.loop = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+    // A clip from another http origin has to be fetched with CORS to be usable as a texture.
+    try {
+      const resolved = new URL(url, location.href);
+      if (/^https?:$/.test(resolved.protocol) && resolved.origin !== location.origin) video.crossOrigin = 'anonymous';
+    } catch (e) {}
+    video.src = url;
+    const playing = video.play();
+    if (playing && playing.catch) playing.catch(e => finish('play() rejected: ' + T.describe(e)));
+  });
+}
+
+// How much picture there is: the brightest channel and the number of different colours on a grid.
+function picture(image) {
+  let brightest = 0;
+  const colours = new Set();
+  const stepX = Math.max(1, image.width >> 5), stepY = Math.max(1, image.height >> 5);
+  for (let y = stepY >> 1; y < image.height; y += stepY)
+    for (let x = stepX >> 1; x < image.width; x += stepX) {
+      const [r, g, b] = T.pixel(image, x, y);
+      brightest = Math.max(brightest, r, g, b);
+      colours.add((r >> 4) << 8 | (g >> 4) << 4 | (b >> 4));
+    }
+  return { brightest, colours: colours.size, text: 'brightest channel ' + brightest + ', ' + colours.size + ' colours on a 32x32 grid' };
+}
+
+T.run('video-texture', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device, format } = g;
+  const canvas = document.getElementById('canvas'), status = document.getElementById('status');
+
+  const url = new URLSearchParams(location.search).get('src') || DEFAULT_CLIP;
+  const video = document.createElement('video');
+  document.getElementById('row').insertBefore(video, canvas);
+  const why = await startVideo(video, url);
+  if (why) {
+    T.skip('video', 'no video source: ' + url + ' ' + why);
+    return;
+  }
+  T.info('video ' + url + ' ' + video.videoWidth + 'x' + video.videoHeight + ', duration ' + video.duration.toFixed(1) + ' s');
+
+  let context, pipeline, sampler;
+  if (!await T.test('setup', async () => {
+    context = canvas.getContext('webgpu');
+    T.assert(context, 'canvas.getContext("webgpu") returned ' + context);
+    context.configure({ device, format, alphaMode: 'opaque' });
+    const module = device.createShaderModule({ code: WGSL });
+    pipeline = await T.step(device.createRenderPipelineAsync({
+      layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+    }), 'createRenderPipelineAsync');
+    sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    return 'texture_external pipeline for ' + format;
+  }, device)) return;
+
+  // Imports the video's current frame and draws it over the canvas. The
+  // external texture lives only for this task, so it is imported every time.
+  function drawVideo() {
+    const external = device.importExternalTexture({ source: video });
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: sampler }, { binding: 1, resource: external }],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(6);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  let seen = null, seenError = null, shown = 0, shownAt = 0;
+  const animation = T.animate((now, frame) => {
+    drawVideo();
+    if (frame === 60) {
+      try {
+        seen = picture(T.snapshot(canvas, canvas.width, canvas.height));
+      } catch (e) {
+        seenError = e;
+      }
+    }
+    if (now - shownAt >= 1000) {
+      if (shownAt) status.textContent = ((frame - shown) * 1000 / (now - shownAt)).toFixed(1) + ' fps, frame ' + frame + ', video at ' + video.currentTime.toFixed(2) + ' s';
+      shown = frame;
+      shownAt = now;
+    }
+  }, 120, 30000);
+
+  await T.test('external-texture', async () => {
+    const before = video.currentTime;
+    const m = await animation.measured;
+    if (seenError) throw new Error('drawImage of the canvas: ' + T.describe(seenError));
+    T.assert(seen, 'frame 60 was not read');
+    T.assert(seen.brightest > 16, 'the canvas is black (' + seen.text + ')');
+    return '120 frames, ' + m.fps.toFixed(1) + ' fps, ' + m.jsMs.toFixed(2) + ' ms of JavaScript per frame; ' + seen.text +
+      '; video time ' + before.toFixed(2) + ' to ' + video.currentTime.toFixed(2) + ' s';
+  }, device);
+
+  await T.test('copy-external-image', async () => {
+    const width = video.videoWidth, height = video.videoHeight;
+    T.assert(width <= device.limits.maxTextureDimension2D && height <= device.limits.maxTextureDimension2D, 'the video is ' + width + 'x' + height);
+    const texture = device.createTexture({
+      size: [width, height], format: 'rgba8unorm',
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const before = performance.now();
+    device.queue.copyExternalImageToTexture({ source: video }, { texture }, [width, height]);
+    const image = await T.readTexture(device, texture);
+    const ms = performance.now() - before;
+    texture.destroy();
+    const p = picture(image);
+    T.assert(p.brightest > 16, 'the texture is black (' + p.text + ')');
+    return width + 'x' + height + ' copied and read back in ' + ms.toFixed(1) + ' ms; ' + p.text;
+  }, device);
+
+  if (!video.requestVideoFrameCallback) {
+    T.skip('video-frame-callback', 'no HTMLVideoElement.requestVideoFrameCallback');
+  } else {
+    await T.test('video-frame-callback', async () => {
+      const WANT = 10;
+      let last = null;
+      const before = performance.now();
+      await T.step(new Promise((resolve, reject) => {
+        let count = 0;
+        const onFrame = (now, metadata) => {
+          try {
+            drawVideo();
+          } catch (e) {
+            reject(e);
+            return;
+          }
+          last = metadata;
+          if (++count === WANT) resolve();
+          else video.requestVideoFrameCallback(onFrame);
+        };
+        video.requestVideoFrameCallback(onFrame);
+      }), WANT + ' video frame callbacks');
+      const ms = performance.now() - before;
+      return WANT + ' callbacks in ' + ms.toFixed(0) + ' ms, each imported and drawn; last frame ' + last.width + 'x' + last.height +
+        ' at media time ' + Number(last.mediaTime).toFixed(3) + ', presentedFrames ' + last.presentedFrames;
+    }, device);
+  }
+
+  T.report('uncaptured-errors', T.uncaptured.length === 0, T.uncaptured.length ? T.uncaptured.join(' | ') : 'none');
+});
+</script>
+</body>
+</html>

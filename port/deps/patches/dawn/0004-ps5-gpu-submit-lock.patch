@@ -1,0 +1,52 @@
+PS5 (ps5webkit spike 12): vkQueueSubmit under the title's GPU submission lock.
+The title has two drivers on one GPU: ps5-opengl (the browser's compositor)
+and RADV. One queue submit becomes one or more AGC submissions that rely on
+the state the first one set, and ps5-opengl's frame does the same; a
+submission of the other driver in between ran those with the wrong state
+(layers drawn without blending, broken geometry in the canvas). The title
+defines the lock (port/webkit/apps/title/titleradv.c); weak, so absent
+elsewhere:
+    extern "C" void ps5wk_gpu_submit_lock(void);
+    extern "C" int ps5wk_gpu_submit_unlock(void);
+
+--- a/src/dawn/native/vulkan/QueueVk.cpp	2026-11-13 10:29:02
++++ b/src/dawn/native/vulkan/QueueVk.cpp	2026-11-13 10:29:10
+@@ -53,6 +53,28 @@
+ #include "src/utils/compiler.h"
+ #include "src/utils/numeric.h"
+ 
++#if DAWN_PLATFORM_IS(PS5)
++// PS5 title: RADV shares the GPU with ps5-opengl (the browser's compositor). One queue submit
++// becomes one or more AGC submissions that rely on the state the first one set, so none of
++// the other driver's may fall between them. The title has the lock (weak: absent elsewhere).
++extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
++extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
++namespace {
++struct Ps5GpuSubmitLock {
++    Ps5GpuSubmitLock() {
++        if (ps5wk_gpu_submit_lock) {
++            ps5wk_gpu_submit_lock();
++        }
++    }
++    ~Ps5GpuSubmitLock() {
++        if (ps5wk_gpu_submit_unlock) {
++            ps5wk_gpu_submit_unlock();
++        }
++    }
++};
++}  // namespace
++#endif
++
+ namespace dawn::native::vulkan {
+ 
+ namespace {
+@@ -346,6 +368,9 @@
+     platform::metrics::DawnHistogramTimer timer(device->GetPlatform());
+     {
+         TRACE_EVENT(DAWN_TRACE_CATEGORY("recording"), "vkQueueSubmit");
++#if DAWN_PLATFORM_IS(PS5)
++        Ps5GpuSubmitLock ps5GpuSubmitLock;
++#endif
+         DAWN_TRY_WITH_CLEANUP(
+             CheckVkSuccess(device->fn.QueueSubmit(mQueue, 1, &submitInfo, fence), "vkQueueSubmit"),
+             {

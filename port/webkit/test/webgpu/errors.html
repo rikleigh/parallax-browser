@@ -1,0 +1,317 @@
+<!doctype html>
+<!-- WebGPU error reporting: pages and engines lean on error scopes and
+     compilation messages to tell the user what went wrong, and an
+     implementation that drops them fails silently. Nothing is drawn.
+     Cases: scope-bad-buffer: a buffer with MAP_READ | MAP_WRITE usage is a
+     validation error caught by pushErrorScope('validation') /
+     popErrorScope(); mapped-at-creation-size: createBuffer with
+     mappedAtCreation and a size that is not a multiple of 4 (the
+     specification throws a RangeError; an implementation that reports a
+     validation error instead passes too, logged); scope-bad-bind-group: a
+     buffer without UNIFORM usage bound as a uniform; scope-out-of-memory:
+     an absurdly large buffer inside an out-of-memory scope inside a
+     validation scope (either may catch it: logged); nested-scopes: the
+     inner scope catches, a scope of another filter lets the error through
+     to the outer one, and scopes pop in order; pop-empty-stack rejects;
+     uncaptured-error: an error outside any scope fires the device's
+     uncapturederror event (the page then asks for onSubmittedWorkDone:
+     Chrome holds the event back until the page next hears from the GPU); wgsl-compilation-info: a shader with a mistake
+     on line 3 gives a getCompilationInfo() error message with lineNum 3,
+     and a pipeline made from it fails inside a scope; pipeline-async-rejects:
+     createRenderPipelineAsync rejects with a GPUPipelineError, reason
+     "validation"; destroyed-buffer: mapAsync rejects and writeBuffer is a
+     validation error after destroy(). Log lines: RESULT webgpu-errors
+     <case> PASS|FAIL <why>, then RESULT webgpu-errors summary PASS|FAIL
+     <n>/<m>. Upload the directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/errors.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU errors</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU errors</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const GOOD_WGSL = `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  return vec4f(f32(i) - 1.0, f32(i & 1u) * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f {
+  return vec4f(1.0);
+}`;
+
+// The mistake is on line 3 (the first line is the one after the backtick's).
+const BAD_WGSL = `@vertex fn vs() -> @builtin(position) vec4f {
+  let a = 1.0;
+  return vec4f(a, not_declared, 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f {
+  return vec4f(1.0);
+}`;
+
+const short = (text, n = 160) => { text = String(text); return text.length > n ? text.slice(0, n) + '...' : text; };
+
+T.run('errors', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device } = g;
+
+  function expectValidation(error, what) {
+    T.assert(error, what + ': no error in the scope');
+    T.assert(error instanceof GPUValidationError, what + ': the scope caught a ' + T.errorKind(error) + ' error');
+    T.assert(error instanceof GPUError && typeof error.message === 'string' && error.message.length, what + ': the error has no message');
+  }
+  const badBuffer = () => device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE });
+
+  await T.test('scope-bad-buffer', async () => {
+    const error = await T.errorScope(device, 'validation', badBuffer);
+    expectValidation(error, 'MAP_READ | MAP_WRITE buffer');
+    const none = await T.errorScope(device, 'validation', () => device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST }).destroy());
+    T.assert(none === null, 'a valid createBuffer gave ' + T.errorKind(none) + ': ' + (none && none.message));
+    return short(error.message);
+  });
+
+  await T.test('mapped-at-creation-size', async () => {
+    let thrown = null;
+    const error = await T.errorScope(device, 'validation', () => {
+      try {
+        device.createBuffer({ size: 5, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+      } catch (e) {
+        thrown = e;
+      }
+    });
+    if (thrown) {
+      T.assert(thrown instanceof RangeError, 'threw ' + T.describe(thrown) + ', expected a RangeError');
+      return 'threw ' + short(T.describe(thrown)) + (error ? ' and also raised a ' + T.errorKind(error) + ' error' : '');
+    }
+    expectValidation(error, 'size 5 with mappedAtCreation (nothing thrown)');
+    return 'validation error (the specification throws a RangeError): ' + short(error.message);
+  });
+
+  await T.test('scope-bad-bind-group', async () => {
+    const layout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
+    const notUniform = device.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE });
+    const error = await T.errorScope(device, 'validation', () => {
+      device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: notUniform } }] });
+    });
+    expectValidation(error, 'a STORAGE buffer bound as a uniform');
+    const uniform = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM });
+    const none = await T.errorScope(device, 'validation', () => {
+      device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: uniform } }] });
+    });
+    T.assert(none === null, 'a valid createBindGroup gave ' + T.errorKind(none) + ': ' + (none && none.message));
+    return short(error.message);
+  });
+
+  await T.test('scope-out-of-memory', async () => {
+    const size = 2 ** 50;   // about a million gigabytes, far past maxBufferSize
+    let inner = null, thrown = null;
+    const outer = await T.errorScope(device, 'validation', async () => {
+      inner = await T.errorScope(device, 'out-of-memory', () => {
+        try {
+          device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST });
+        } catch (e) {
+          thrown = e;
+        }
+      });
+    });
+    T.assert(!thrown, 'createBuffer threw ' + T.describe(thrown));
+    T.assert(inner || outer, 'a buffer of 2^50 bytes raised no error in either scope');
+    if (inner) {
+      T.assert(inner instanceof GPUOutOfMemoryError, 'the out-of-memory scope caught a ' + T.errorKind(inner) + ' error');
+      T.assert(!outer, 'both scopes caught an error');
+      return 'out-of-memory error: ' + short(inner.message);
+    }
+    expectValidation(outer, 'buffer of 2^50 bytes');
+    return 'validation error (over maxBufferSize ' + device.limits.maxBufferSize + '): ' + short(outer.message);
+  });
+
+  // The browser's own budget for WebGPU memory (1536 MB on the PS5): what goes over it is
+  // refused before the driver is asked, as an out-of-memory error, and destroying gives it back.
+  await T.test('memory-budget', async () => {
+    const MiB = 1 << 20;
+    // 128 MiB buffers (a device's default maxBufferSize is 256 MiB) until one is refused.
+    const buffers = [];
+    let refusedAt = 0, refusal = null;
+    for (let i = 1; i <= 20 && !refusal; i++) {
+      refusal = await T.errorScope(device, 'out-of-memory', () => {
+        buffers.push(device.createBuffer({ size: 128 * MiB, usage: GPUBufferUsage.COPY_DST }));
+      });
+      if (refusal) refusedAt = i;
+    }
+    for (const buffer of buffers) buffer.destroy();
+    if (!refusal)
+      return '20 buffers of 128 MiB raised no out-of-memory error: no budget here (another browser)';
+    T.assert(refusal instanceof GPUOutOfMemoryError, 'buffer ' + refusedAt + ' raised a ' + T.errorKind(refusal) + ' error');
+    T.assert(refusedAt > 4, 'buffer ' + refusedAt + ' of 128 MiB was refused already');
+    const texture = await T.errorScope(device, 'out-of-memory', () => {
+      device.createTexture({ size: [8192, 8192, 2], format: 'rgba32float', usage: GPUTextureUsage.TEXTURE_BINDING });
+    });
+    T.assert(texture instanceof GPUOutOfMemoryError, 'an 8192x8192 rgba32float texture of two layers (2 GiB) raised ' + (texture ? 'a ' + T.errorKind(texture) + ' error' : 'no error'));
+    // Destroying gave the memory back: the same number of buffers fits again.
+    const again = [];
+    const error = await T.errorScope(device, 'out-of-memory', () => {
+      for (let i = 1; i < refusedAt; i++)
+        again.push(device.createBuffer({ size: 128 * MiB, usage: GPUBufferUsage.COPY_DST }));
+    });
+    for (const buffer of again) buffer.destroy();
+    T.assert(!error, (refusedAt - 1) + ' buffers after destroying the first lot raised ' + T.errorKind(error) + ': ' + (error && error.message));
+    return 'buffer ' + refusedAt + ' of 128 MiB refused (' + short(refusal.message) + '); the same ' + (refusedAt - 1) + ' fit again after destroy()';
+  });
+
+  await T.test('nested-scopes', async () => {
+    // The inner validation scope catches; the outer sees nothing.
+    device.pushErrorScope('validation');
+    device.pushErrorScope('validation');
+    badBuffer();
+    let inner = await T.step(device.popErrorScope(), 'popErrorScope (inner)');
+    let outer = await T.step(device.popErrorScope(), 'popErrorScope (outer)');
+    expectValidation(inner, 'inner validation scope');
+    T.assert(outer === null, 'the outer scope also got ' + T.errorKind(outer));
+    // Scopes of other filters let a validation error through to the outer scope.
+    device.pushErrorScope('validation');
+    device.pushErrorScope('out-of-memory');
+    device.pushErrorScope('internal');
+    badBuffer();
+    const internal = await T.step(device.popErrorScope(), 'popErrorScope (internal)');
+    inner = await T.step(device.popErrorScope(), 'popErrorScope (out-of-memory)');
+    outer = await T.step(device.popErrorScope(), 'popErrorScope (outer validation)');
+    T.assert(internal === null, 'the internal scope caught a ' + T.errorKind(internal) + ' error');
+    T.assert(inner === null, 'the out-of-memory scope caught a ' + T.errorKind(inner) + ' error');
+    expectValidation(outer, 'outer validation scope');
+    // A scope keeps only its first error.
+    device.pushErrorScope('validation');
+    badBuffer();
+    device.createTexture({ size: [0, 0], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING });
+    const first = await T.step(device.popErrorScope(), 'popErrorScope (two errors)');
+    expectValidation(first, 'scope with two errors');
+    return 'inner catches, other filters pass the error out, one error per scope';
+  });
+
+  await T.test('pop-empty-stack', async () => {
+    try {
+      const value = await T.step(device.popErrorScope(), 'popErrorScope with no scope');
+      throw new Error('resolved with ' + value);
+    } catch (e) {
+      T.assert(e.name === 'OperationError', 'expected an OperationError rejection, got ' + T.describe(e));
+      return short(T.describe(e));
+    }
+  });
+
+  await T.test('uncaptured-error', async () => {
+    const before = T.uncaptured.length;
+    // Chrome delivers the event with the next answer from its GPU process,
+    // and an idle page gets none: ask for one, as a page that draws does
+    // every frame.
+    const nudge = () => device.queue.onSubmittedWorkDone().catch(() => {});
+    const event = await T.step(new Promise(resolve => {
+      device.addEventListener('uncapturederror', resolve, { once: true });
+      badBuffer();
+      nudge();
+    }), 'uncapturederror event', 5000);
+    T.assert(event instanceof GPUUncapturedErrorEvent, 'the event is a ' + (event && event.constructor.name));
+    expectValidation(event.error, 'event.error');
+    T.assert(T.uncaptured.length === before + 1, 'a second listener saw ' + (T.uncaptured.length - before) + ' events');
+    // device.onuncapturederror too.
+    const viaAttribute = await T.step(new Promise(resolve => {
+      device.onuncapturederror = resolve;
+      badBuffer();
+      nudge();
+    }), 'onuncapturederror attribute', 5000);
+    device.onuncapturederror = null;
+    expectValidation(viaAttribute.error, 'onuncapturederror event.error');
+    return short(event.error.message);
+  });
+
+  await T.test('wgsl-compilation-info', async () => {
+    let module;
+    const moduleError = await T.errorScope(device, 'validation', () => { module = device.createShaderModule({ code: BAD_WGSL }); });
+    expectValidation(moduleError, 'createShaderModule with bad WGSL');
+    const info = await T.step(module.getCompilationInfo(), 'getCompilationInfo');
+    T.assert(info && info.messages, 'getCompilationInfo() gave ' + info);
+    const errors = Array.from(info.messages).filter(m => m.type === 'error');
+    T.assert(errors.length, info.messages.length + ' messages, none of type error');
+    const m = errors[0];
+    T.assert(m.lineNum === 3, 'the error is on line ' + m.lineNum + ', expected 3: ' + m.message);
+    T.assert(typeof m.message === 'string' && m.message.length, 'the error message is empty');
+    const pipelineError = await T.errorScope(device, 'validation', () => {
+      device.createRenderPipeline({
+        layout: 'auto', vertex: { module, entryPoint: 'vs' },
+        fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+      });
+    });
+    expectValidation(pipelineError, 'createRenderPipeline with the bad module');
+    // A good module has no error messages.
+    const good = await T.step(device.createShaderModule({ code: GOOD_WGSL }).getCompilationInfo(), 'getCompilationInfo (good module)');
+    const goodErrors = Array.from(good.messages).filter(x => x.type === 'error');
+    T.assert(!goodErrors.length, 'a good module has an error message: ' + (goodErrors[0] && goodErrors[0].message));
+    return 'line ' + m.lineNum + ' column ' + m.linePos + ' offset ' + m.offset + ' length ' + m.length + ': ' + short(m.message, 100);
+  });
+
+  await T.test('pipeline-async-rejects', async () => {
+    const module = device.createShaderModule({ code: GOOD_WGSL });
+    const descriptor = entryPoint => ({
+      layout: 'auto', vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint, targets: [{ format: 'rgba8unorm' }] },
+    });
+    let rejected = null;
+    // The rejection is the report: the device must see no error.
+    const deviceError = await T.errorScope(device, 'validation', async () => {
+      try {
+        await T.step(device.createRenderPipelineAsync(descriptor('no_such_entry_point')), 'createRenderPipelineAsync (bad)');
+      } catch (e) {
+        rejected = e;
+      }
+    });
+    T.assert(rejected, 'createRenderPipelineAsync with a missing entry point resolved');
+    T.assert(!/^timeout after/.test(rejected.message), rejected.message);
+    T.assert(typeof GPUPipelineError !== 'undefined' && rejected instanceof GPUPipelineError, 'rejected with ' + T.describe(rejected) + ', expected a GPUPipelineError');
+    T.assert(rejected.reason === 'validation', 'reason is "' + rejected.reason + '"');
+    T.assert(deviceError === null, 'the device also got a ' + T.errorKind(deviceError) + ' error: ' + (deviceError && deviceError.message));
+    const pipeline = await T.step(device.createRenderPipelineAsync(descriptor('fs')), 'createRenderPipelineAsync (good)');
+    T.assert(pipeline instanceof GPURenderPipeline, 'the good descriptor resolved with ' + pipeline);
+    return 'GPUPipelineError reason ' + rejected.reason + ': ' + short(rejected.message, 100);
+  });
+
+  await T.test('destroyed-buffer', async () => {
+    const buffer = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const writable = device.createBuffer({ size: 64, usage: GPUBufferUsage.COPY_DST });
+    buffer.destroy();
+    buffer.destroy();   // twice is allowed
+    writable.destroy();
+    let rejected = null;
+    const mapError = await T.errorScope(device, 'validation', async () => {
+      try {
+        await T.step(buffer.mapAsync(GPUMapMode.READ), 'mapAsync on a destroyed buffer');
+      } catch (e) {
+        rejected = e;
+      }
+    });
+    T.assert(rejected, 'mapAsync on a destroyed buffer resolved');
+    T.assert(rejected.name === 'OperationError', 'mapAsync rejected with ' + T.describe(rejected) + ', expected an OperationError');
+    expectValidation(mapError, 'mapAsync on a destroyed buffer');
+    const writeError = await T.errorScope(device, 'validation', () => device.queue.writeBuffer(writable, 0, new Uint8Array(16)));
+    expectValidation(writeError, 'writeBuffer to a destroyed buffer');
+    const copyError = await T.errorScope(device, 'validation', () => {
+      const source = device.createBuffer({ size: 64, usage: GPUBufferUsage.COPY_SRC });
+      const encoder = device.createCommandEncoder();
+      encoder.copyBufferToBuffer(source, 0, writable, 0, 64);
+      device.queue.submit([encoder.finish()]);
+    });
+    expectValidation(copyError, 'submit using a destroyed buffer');
+    return 'mapAsync rejects (' + rejected.name + '), writeBuffer and submit are validation errors';
+  });
+
+  if (T.uncaptured.length > 2)
+    T.info('uncaptured errors beyond the two the uncaptured-error case makes: ' + (T.uncaptured.length - 2));
+});
+</script>
+</body>
+</html>

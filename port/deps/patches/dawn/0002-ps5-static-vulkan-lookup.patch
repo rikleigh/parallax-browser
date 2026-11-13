@@ -1,0 +1,57 @@
+PS5 (ps5webkit spike 12 P0a): the Vulkan backend takes vkGetInstanceProcAddr
+from the host program instead of dlopen("libvulkan.so.1"):
+    extern "C" void* dawn_ps5_vk_get_instance_proc_addr(void);
+The driver is an ICD linked into the title; null means no Vulkan.
+
+--- a/src/dawn/native/vulkan/BackendVk.cpp
++++ b/src/dawn/native/vulkan/BackendVk.cpp
+@@ -69,6 +69,10 @@
+ constexpr char kVulkanLibName[] = "libvulkan.dylib";
+ #elif DAWN_PLATFORM_IS(FUCHSIA)
+ constexpr char kVulkanLibName[] = "libvulkan.so";
++#elif DAWN_PLATFORM_IS(PS5)
++// PS5: there is no Vulkan loader to dlopen. The driver (an ICD) is linked into
++// the executable, and VulkanFunctions::LoadGlobalProcs asks the host program
++// for its vkGetInstanceProcAddr.
+ #else
+ #error "Unimplemented Vulkan backend platform"
+ #endif
+@@ -370,7 +374,9 @@
+ 
+     switch (icd) {
+         case ICD::None: {
++#if !DAWN_PLATFORM_IS(PS5)
+             DAWN_TRY(LoadVulkan(kVulkanLibName));
++#endif
+             // Succesfully loaded driver; break.
+             break;
+         }
+--- a/src/dawn/native/vulkan/VulkanFunctions.cpp
++++ b/src/dawn/native/vulkan/VulkanFunctions.cpp
+@@ -88,10 +88,26 @@
+         }                                                                      \
+     } while (0)
+ 
++#if DAWN_PLATFORM_IS(PS5)
++// PS5: defined by the host program. Returns the statically linked driver's
++// vkGetInstanceProcAddr (for a Mesa ICD, its vk_icdGetInstanceProcAddr), or
++// null when there is no Vulkan driver.
++extern "C" void* dawn_ps5_vk_get_instance_proc_addr(void);
++#endif
++
+ MaybeError VulkanFunctions::LoadGlobalProcs(const DynamicLib& vulkanLib) {
++#if DAWN_PLATFORM_IS(PS5)
++    GetInstanceProcAddr =
++        reinterpret_cast<PFN_vkGetInstanceProcAddr>(dawn_ps5_vk_get_instance_proc_addr());
++    if (GetInstanceProcAddr == nullptr) {
++        return DAWN_UNRECOVERABLE_ERROR(
++            "dawn_ps5_vk_get_instance_proc_addr() returned null: no Vulkan driver");
++    }
++#else
+     if (!vulkanLib.GetProc(&GetInstanceProcAddr, "vkGetInstanceProcAddr")) {
+         return DAWN_UNRECOVERABLE_ERROR("Couldn't get vkGetInstanceProcAddr");
+     }
++#endif
+ 
+     GET_GLOBAL_PROC(CreateInstance);
+     GET_GLOBAL_PROC(EnumerateInstanceExtensionProperties);

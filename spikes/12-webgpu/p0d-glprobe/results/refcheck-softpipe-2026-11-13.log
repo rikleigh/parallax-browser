@@ -1,0 +1,160 @@
+# refcheck 2026-11-13 00:51: the probe over softpipe (not the PS5 driver), GL 4.6 / ES 3.2 by override
+ps5webkit P0d GL probe, host harness (suite 12-p0d-glprobe-ref)
+[ps5-egl] versions core=46 compat=46 es2=32 api=gl requested=4.6 profile=0001
+RESULT 12-p0d-glprobe-ref ctx-core46 PASS GL "4.6 (Core Profile) Mesa 26.2.0" GLSL "4.60", surfaceless, no share context (the compositor's)
+[ps5-egl] versions core=46 compat=46 es2=32 api=es requested=3.2 profile=0000
+RESULT 12-p0d-glprobe-ref ctx-anchor-es32 PASS GL "OpenGL ES 3.2 Mesa 26.2.0" in the core context's share group, client type OpenGL_ES version 3, current surfaceless with EGL_OPENGL_API bound
+== egl
+RESULT 12-p0d-glprobe-ref egl-display PASS eglInitialize 1.4, version "1.4 PS5 experimental" vendor "PS5 Mesa experimental" apis "OpenGL OpenGL_ES" client extensions NULL
+  EGL display extensions: EGL_KHR_create_context EGL_KHR_create_context_no_error EGL_EXT_create_context_robustness EGL_KHR_no_config_context EGL_KHR_surfaceless_context EGL_PS5_texture_descriptor_export
+RESULT 12-p0d-glprobe-ref egl-dawn-required FAIL EGL>=1.4 yes, OpenGL_ES api yes, create_context_robustness yes, fence_sync|reusable_sync NO (all four are hard requirements). +EGL_EXT_create_context_robustness -EGL_KHR_fence_sync -EGL_KHR_reusable_sync +EGL_KHR_create_context +EGL_KHR_no_config_context +EGL_KHR_surfaceless_context -EGL_KHR_wait_sync -EGL_KHR_image_base -EGL_KHR_gl_colorspace -EGL_EXT_pixel_format_float -EGL_ANDROID_native_fence_sync +EGL_KHR_create_context_no_error 
+RESULT 12-p0d-glprobe-ref egl-sync FAIL EGL_KHR_fence_sync absent, EGL_KHR_reusable_sync absent, EGL_KHR_wait_sync absent; through eglGetProcAddress (0 of 14): -eglCreateSyncKHR -eglDestroySyncKHR -eglClientWaitSyncKHR -eglGetSyncAttribKHR -eglSignalSyncKHR -eglWaitSyncKHR -eglCreateSync -eglDestroySync -eglClientWaitSync -eglGetSyncAttrib -eglWaitSync -eglCreateImageKHR -eglDestroyImageKHR -eglDupNativeFenceFDANDROID 
+RESULT 12-p0d-glprobe-ref egl-getproc-egl FAIL 0 of 33 EGL 1.0-1.4 entry points resolve through the facade's eglGetProcAddress (Dawn loads them all through its getProc; with fewer, the embedder passes its own getProc: RequestAdapterOptionsGetGLProc)
+== ctx-dawn
+RESULT 12-p0d-glprobe-ref ctx-dawn-es31 PASS ES 3.1 asked for with EGL_NO_CONFIG and no share context, current surfaceless: GL "OpenGL ES 3.2 Mesa 26.2.0" GLSL "OpenGL ES GLSL ES 3.20", 133 extensions
+Mesa: error: GL_INVALID_ENUM in glGetIntegerv(pname=GL_RESET_NOTIFICATION_STRATEGY)
+Mesa: error: GL_INVALID_ENUM in glGetIntegerv(pname=GL_RESET_NOTIFICATION_STRATEGY)
+Mesa: error: GL_INVALID_ENUM in glGetBooleanv(pname=GL_CONTEXT_ROBUST_ACCESS)
+RESULT 12-p0d-glprobe-ref ctx-dawn-robust PASS ES 3.1 + EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT + LOSE_CONTEXT_ON_RESET_EXT accepted: GL_CONTEXT_FLAGS 0x4 (ok), robust access bit set, GL_CONTEXT_ROBUST_ACCESS 0 (INVALID_ENUM), reset strategy ? (INVALID_ENUM), glGetGraphicsResetStatus NO_ERROR (ok) (the strategy asked for is not what the context reports)
+  EGL 1.5 robustness attributes (0x31B2/0x31BD): refused (0x3004); Dawn uses the EXT ones below EGL 1.5
+Mesa: error: GL_INVALID_ENUM in glGetIntegerv(pname=GL_RESET_NOTIFICATION_STRATEGY)
+Mesa: error: GL_INVALID_ENUM in glGetBooleanv(pname=GL_CONTEXT_ROBUST_ACCESS)
+RESULT 12-p0d-glprobe-ref reset-status PASS anchor context (created without robustness attributes): GL_CONTEXT_FLAGS 0x0 (ok), robust access bit clear, GL_CONTEXT_ROBUST_ACCESS 0 (INVALID_ENUM), reset strategy ? (INVALID_ENUM), glGetGraphicsResetStatus NO_ERROR (ok)
+== caps
+RESULT 12-p0d-glprobe-ref caps-strings PASS GL_VERSION "OpenGL ES 3.2 Mesa 26.2.0" GL_RENDERER "softpipe" GL_VENDOR "Mesa" GL_SHADING_LANGUAGE_VERSION "OpenGL ES GLSL ES 3.20", 133 extensions
+  GL extensions: GL_ANGLE_pack_reverse_row_order GL_ANGLE_texture_compression_dxt3 GL_ANGLE_texture_compression_dxt5 GL_APPLE_sync GL_APPLE_texture_max_level GL_EXT_EGL_image_storage GL_EXT_EGL_image_storage_compression GL_EXT_base_instance GL_EXT_blend_func_extended GL_EXT_blend_minmax GL_EXT_buffer_storage GL_EXT_clear_texture GL_EXT_clip_control GL_EXT_clip_cull_distance GL_EXT_color_buffer_float GL_EXT_color_buffer_half_float GL_EXT_compressed_ETC1_RGB8_sub_texture GL_EXT_conservative_depth GL_EXT_copy_image GL_EXT_debug_label GL_EXT_depth_clamp GL_EXT_discard_framebuffer GL_EXT_disjoint_timer_query GL_EXT_draw_buffers GL_EXT_draw_buffers_indexed GL_EXT_draw_elements_base_vertex GL_EXT_draw_instanced GL_EXT_float_blend GL_EXT_frag_depth GL_EXT_geometry_point_size GL_EXT_geometry_shader GL_EXT_gpu_shader5 GL_EXT_instanced_arrays GL_EXT_map_buffer_range GL_EXT_multi_draw_arrays 
+  GL extensions: GL_EXT_multi_draw_indirect GL_EXT_occlusion_query_boolean GL_EXT_primitive_bounding_box GL_EXT_read_format_bgra GL_EXT_render_snorm GL_EXT_sRGB GL_EXT_sRGB_write_control GL_EXT_separate_shader_objects GL_EXT_shader_implicit_conversions GL_EXT_shader_integer_mix GL_EXT_shader_io_blocks GL_EXT_shadow_samplers GL_EXT_texture_border_clamp GL_EXT_texture_buffer GL_EXT_texture_compression_bptc GL_EXT_texture_compression_dxt1 GL_EXT_texture_compression_rgtc GL_EXT_texture_compression_s3tc GL_EXT_texture_compression_s3tc_srgb GL_EXT_texture_cube_map_array GL_EXT_texture_filter_anisotropic GL_EXT_texture_format_BGRA8888 GL_EXT_texture_mirror_clamp_to_edge GL_EXT_texture_norm16 GL_EXT_texture_query_lod GL_EXT_texture_rg GL_EXT_texture_sRGB_R8 GL_EXT_texture_sRGB_RG8 GL_EXT_texture_sRGB_decode GL_EXT_texture_storage GL_EXT_texture_storage_compression GL_EXT_texture_type_2_10_10_10_REV 
+  GL extensions: GL_EXT_texture_view GL_EXT_unpack_subimage GL_KHR_context_flush_control GL_KHR_debug GL_KHR_no_error GL_KHR_parallel_shader_compile GL_KHR_texture_compression_astc_ldr GL_KHR_texture_compression_astc_sliced_3d GL_MESA_bgra GL_MESA_framebuffer_flip_y GL_MESA_sampler_objects GL_MESA_shader_integer_functions GL_NV_conditional_render GL_NV_draw_buffers GL_NV_fbo_color_attachments GL_NV_generate_mipmap_sRGB GL_NV_image_formats GL_NV_pack_subimage GL_NV_pixel_buffer_object GL_NV_read_buffer GL_NV_read_depth GL_NV_read_depth_stencil GL_NV_read_stencil GL_NV_shader_noperspective_interpolation GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_EGL_image_external_essl3 GL_OES_EGL_sync GL_OES_compressed_ETC1_RGB8_texture GL_OES_copy_image GL_OES_depth24 GL_OES_depth_texture GL_OES_depth_texture_cube_map GL_OES_draw_buffers_indexed GL_OES_draw_elements_base_vertex GL_OES_element_index_uint 
+  GL extensions: GL_OES_fbo_render_mipmap GL_OES_geometry_point_size GL_OES_geometry_shader GL_OES_get_program_binary GL_OES_gpu_shader5 GL_OES_mapbuffer GL_OES_packed_depth_stencil GL_OES_primitive_bounding_box GL_OES_required_internalformat GL_OES_rgb8_rgba8 GL_OES_shader_image_atomic GL_OES_shader_io_blocks GL_OES_standard_derivatives GL_OES_stencil8 GL_OES_surfaceless_context GL_OES_texture_3D GL_OES_texture_border_clamp GL_OES_texture_buffer GL_OES_texture_cube_map_array GL_OES_texture_float GL_OES_texture_float_linear GL_OES_texture_half_float GL_OES_texture_half_float_linear GL_OES_texture_npot GL_OES_texture_stencil8 GL_OES_texture_storage_multisample_2d_array GL_OES_texture_view GL_OES_vertex_array_object GL_OES_vertex_half_float GL_OES_viewport_array 
+RESULT 12-p0d-glprobe-ref caps-limits-texture PASS MAX_TEXTURE_SIZE 16384 MAX_3D_TEXTURE_SIZE 2048 MAX_ARRAY_TEXTURE_LAYERS 256 MAX_CUBE_MAP_TEXTURE_SIZE 4096 MAX_RENDERBUFFER_SIZE 16384 MAX_TEXTURE_BUFFER_SIZE 65536 MAX_COLOR_ATTACHMENTS 8 MAX_DRAW_BUFFERS 8 MAX_SAMPLES 1 MAX_COLOR_TEXTURE_SAMPLES 1 MAX_DEPTH_TEXTURE_SAMPLES 1 MAX_INTEGER_SAMPLES 1 MAX_FRAMEBUFFER_WIDTH 16384 MAX_FRAMEBUFFER_LAYERS 256 MAX_TEXTURE_MAX_ANISOTROPY 16 MAX_TEXTURE_LOD_BIAS 16
+RESULT 12-p0d-glprobe-ref caps-limits-buffers PASS MAX_UNIFORM_BUFFER_BINDINGS 108 MAX_UNIFORM_BLOCK_SIZE 65536 UNIFORM_BUFFER_OFFSET_ALIGNMENT 16 MAX_VERTEX_UNIFORM_BLOCKS 15 MAX_FRAGMENT_UNIFORM_BLOCKS 15 MAX_COMPUTE_UNIFORM_BLOCKS 15 MAX_COMBINED_UNIFORM_BLOCKS 69 MAX_SHADER_STORAGE_BUFFER_BINDINGS 64 MAX_SHADER_STORAGE_BLOCK_SIZE 134217728 (as GLint 134217728) SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT 4 MAX_COMBINED_SHADER_STORAGE_BLOCKS 64 MAX_ELEMENT_INDEX 4294967295 MAX_ELEMENTS_VERTICES 3000
+RESULT 12-p0d-glprobe-ref caps-limits-compute PASS MAX_COMPUTE_WORK_GROUP_COUNT 65535 65535 65535 MAX_COMPUTE_WORK_GROUP_SIZE 1024 1024 1024 MAX_COMPUTE_WORK_GROUP_INVOCATIONS 1024 MAX_COMPUTE_SHARED_MEMORY_SIZE 32768 MAX_COMPUTE_SHADER_STORAGE_BLOCKS 16 MAX_COMPUTE_IMAGE_UNIFORMS 32 MAX_COMPUTE_TEXTURE_IMAGE_UNITS 32 MAX_COMPUTE_UNIFORM_COMPONENTS 16384 MAX_COMPUTE_ATOMIC_COUNTERS 4096
+RESULT 12-p0d-glprobe-ref caps-limits-stages PASS MAX_VERTEX_ATTRIBS 16 MAX_VERTEX_ATTRIB_BINDINGS 16 MAX_VERTEX_ATTRIB_STRIDE 2048 MAX_VERTEX_ATTRIB_RELATIVE_OFFSET 2047 MAX_VARYING_VECTORS 32 MAX_VARYING_COMPONENTS 128 MAX_VERTEX_OUTPUT_COMPONENTS 128 MAX_FRAGMENT_INPUT_COMPONENTS 128 MAX_TEXTURE_IMAGE_UNITS 32 MAX_VERTEX_TEXTURE_IMAGE_UNITS 32 MAX_COMBINED_TEXTURE_IMAGE_UNITS 128 MAX_IMAGE_UNITS 256 MAX_VERTEX_IMAGE_UNIFORMS 32 MAX_FRAGMENT_IMAGE_UNIFORMS 32 MAX_COMBINED_IMAGE_UNIFORMS 96 MAX_VERTEX_SHADER_STORAGE_BLOCKS 16 MAX_FRAGMENT_SHADER_STORAGE_BLOCKS 16 MAX_VERTEX_UNIFORM_VECTORS 4096 MAX_FRAGMENT_UNIFORM_VECTORS 4096
+RESULT 12-p0d-glprobe-ref caps-webgpu-compat-limits PASS 25 limits as Dawn derives them against WebGPU compatibility defaults: 0 below
+== procs
+RESULT 12-p0d-glprobe-ref gl-procs-es32 PASS 358 of 358 OpenGL ES 2.0-3.2 core commands resolve through eglGetProcAddress (Dawn's loader asks for every one); an invented name resolves: no
+RESULT 12-p0d-glprobe-ref gl-procs-ext PASS 26 of 28 extension entry points resolve (informational); absent: glDrawArraysInstancedBaseInstanceANGLE glPolygonModeNV 
+== ext
+  of the extensions Dawn's GL backend looks at, present (GL_ dropped): EXT_color_buffer_float EXT_color_buffer_half_float OES_texture_stencil8 EXT_texture_format_BGRA8888 EXT_texture_storage EXT_read_format_bgra EXT_texture_compression_s3tc EXT_texture_compression_s3tc_srgb EXT_texture_compression_dxt1 EXT_texture_compression_rgtc EXT_texture_compression_bptc KHR_texture_compression_astc_ldr KHR_texture_compression_astc_sliced_3d EXT_texture_norm16 EXT_render_snorm EXT_float_blend EXT_blend_func_extended EXT_texture_filter_anisotropic EXT_conservative_depth OES_EGL_sync OES_EGL_image EXT_base_instance EXT_clip_cull_distance EXT_clip_control EXT_depth_clamp EXT_disjoint_timer_query EXT_texture_buffer OES_texture_buffer OES_copy_image EXT_copy_image OES_draw_buffers_indexed OES_draw_elements_base_vertex EXT_sRGB_write_control EXT_texture_sRGB_decode OES_texture_float_linear EXT_texture_view OES_texture_view 
+RESULT 12-p0d-glprobe-ref gl-dawn-hard-requirements PASS ES 3.2 yes (so EXT_color_buffer_float present and KHR_robustness absent are not needed for adapter creation); glGetGraphicsResetStatus resolves
+RESULT 12-p0d-glprobe-ref gl-extensions-dawn PASS 41 of 53 extensions Dawn's GL backend looks at are present; absent (GL_ dropped; none is a hard requirement): KHR_robustness APPLE_texture_format_BGRA8888 NV_sRGB_formats EXT_multisampled_render_to_texture OES_sample_variables OES_sample_shading AMD_gpu_shader_half_float AMD_gpu_shader_int16 ANGLE_base_vertex_base_instance EXT_polygon_offset_clamp EXT_shader_framebuffer_fetch NV_polygon_mode 
+RESULT 12-p0d-glprobe-ref gl-dawn-features PASS texture-compression-bc yes (s3tc 1, s3tc_srgb 1, rgtc 1, bptc 1), texture-compression-astc yes, texture-compression-etc2 yes (ES 3.0 core), dual-source-blending yes, unorm16 formats yes, float32-blendable yes, shader-f16 no, msaa-render-to-single-sampled no, shared-fence-egl-sync needs EGL_KHR_wait_sync too, indirect-first-instance no (desktop GL only), anisotropic filtering yes, BGRA8 internal format GL_BGRA8_EXT, sample variables yes (ES 3.2)
+== shader-frontend
+RESULT 12-p0d-glprobe-ref shader-compile-compute PASS glCompileShader only (Mesa front end; no link, no PSBC): cs0 ok 14.1 ms; cs1 ok 4.2 ms; cs2 ok 3.5 ms;  total 22.9 ms (ssbo+ubo+arrayLength; image load/store rgba8/r32f/rgba16f/rgba32ui; samplers+shared+barrier+atomicAdd at 320 es)
+RESULT 12-p0d-glprobe-ref shader-compile-render PASS vertex ok, fragment ok (UBO, fragment SSBO, shadow + stencil samplers, MRT, gl_FragDepth, discard) 
+== formats
+RESULT 12-p0d-glprobe-ref formats-color-rt PASS glTexStorage2D + FBO completeness, C complete / I incomplete / E error; 0 needed formats not renderable: R8:C RG8:C RGBA8:C SRGB8_A8:C BGRA8_EXT:C RGB10_A2:C R16F:C RG16F:C RGBA16F:C R32F:C RG32F:C RGBA32F:C R11F_G11F_B10F:C R8UI:C R8I:C RG8UI:C RGBA8UI:C RGBA8I:C R16UI:C RG16UI:C RGBA16UI:C RGBA16I:C R32UI:C RG32UI:C RGBA32UI:C RGBA32I:C RGB10_A2UI:C R16_EXT:C RGBA16_EXT:C RGBA8_SNORM:C RGB9_E5:I 
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+RESULT 12-p0d-glprobe-ref formats-depth-stencil-rt PASS depth/stencil textures as the only attachment, single-sample / 4x multisample texture: DEPTH_COMPONENT16:C/4x:E DEPTH_COMPONENT24:C/4x:E DEPTH24_STENCIL8:C/4x:E DEPTH_COMPONENT32F:C/4x:E DEPTH32F_STENCIL8:C/4x:E STENCIL_INDEX8:C/4x:E 
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+RESULT 12-p0d-glprobe-ref formats-msaa FAIL GL_SAMPLES for GL_TEXTURE_2D_MULTISAMPLE and a 4x glTexStorage2DMultisample attachment: RGBA8:max 1,4x:E SRGB8_A8:max 1,4x:E RGBA16F:max 1,4x:E RGBA32F:max 1,4x:E R8:max 1,4x:E RG8:max 1,4x:E RGB10_A2:max 1,4x:E RGBA8UI:max 1,4x:E DEPTH24_STENCIL8:max 1,4x:E DEPTH_COMPONENT32F:max 1,4x:E 
+RESULT 12-p0d-glprobe-ref formats-compressed-list PASS GL_COMPRESSED_TEXTURE_FORMATS: 51 (BC/S3TC/RGTC/BPTC 12 of 16, ETC2/EAC 10 of 10, ASTC LDR 28 of 28, other 1)
+== sanity
+RESULT 12-p0d-glprobe-ref sanity-draw PASS clear + red left half into an RGBA8 texture FBO: left 255,0,0,255 right 0,0,255,255, fbo 0x8cd5, GL error ok
+== compute-ssbo
+RESULT 12-p0d-glprobe-ref time-compute-first-compile PASS compile + link 24.2 ms, first glDispatchCompute + glMemoryBarrier + glFinish 3.6 ms, GL error ok
+RESULT 12-p0d-glprobe-ref compute-ssbo-map PASS glDispatchCompute(17,1,1) x 64 writing 1024 uints, glMapBufferRange(READ): 0 of 1040 words wrong , map ok (ES has no glGetBufferSubData: eglGetProcAddress says present)
+RESULT 12-p0d-glprobe-ref compute-ssbo-copyread PASS glCopyBufferSubData to a second buffer, mapped: 0 of 1040 words wrong , GL error ok
+RESULT 12-p0d-glprobe-ref compute-ubo-std140 PASS uniform block {uint mul@0, uint add@4, vec4 pad@16, uint count@32} bound with glBindBufferRange at offset 256: data[i] = i*5+11+100: 0 of 1040 words wrong , GL error ok
+RESULT 12-p0d-glprobe-ref compute-ssbo-arraylength PASS data.length() with glBindBufferBase: 1040 (want 1040); with glBindBufferRange(offset 256, 512 words): 512 (want 512), and the writes through the range: 0 words wrong ; count read from the UBO 1024, GL error ok
+== compute-image
+RESULT 12-p0d-glprobe-ref compute-image-store-rgba8 PASS imageStore to an rgba8 image, glDispatchCompute(4,4,1) x 8x8, read through an FBO: 0 of 1024 texels wrong , GL error ok
+RESULT 12-p0d-glprobe-ref compute-image-store-r32f PASS imageStore to an r32f image, read through an FBO as GL_RGBA/GL_FLOAT: 0 of 1024 texels wrong 
+RESULT 12-p0d-glprobe-ref compute-image-load PASS imageLoad from the r32f and rgba8 images written by the first dispatch into a third: 0 of 1024 texels wrong (0 with the r32f value wrong) , GL error ok
+RESULT 12-p0d-glprobe-ref compute-image-r32f-readwrite PASS imageLoad + imageStore on one r32f image (GL_READ_WRITE), f = f*2+1 in place: 0 of 1024 texels wrong , GL error ok
+== indirect
+RESULT 12-p0d-glprobe-ref indirect-draw-arrays PASS glDrawArraysIndirect at offset 16 {6,1,first 6}: left 0,0,255 right 255,0,0 (want blue, red); at offset 0 {6,1,first 0}: left 0,255,0 (want green); GL error ok
+RESULT 12-p0d-glprobe-ref indirect-draw-elements PASS glDrawElementsIndirect(GL_UNSIGNED_SHORT) at offset 20 {6,1,firstIndex 3,baseVertex 6}: left 0,0,255 right 255,0,0 (want blue, red), GL error ok
+RESULT 12-p0d-glprobe-ref indirect-dispatch PASS glDispatchComputeIndirect(8) with {4,2,1} in the buffer: 0 of 80 words wrong , GL error ok
+== compute-more
+RESULT 12-p0d-glprobe-ref memory-barrier-texture PASS imageStore green, glMemoryBarrier(GL_ALL_BARRIER_BITS), sampled by a draw: 0,255,0; imageStore red over it, sampled again: 255,0,0 (want green then red), GL error ok
+RESULT 12-p0d-glprobe-ref compute-to-vertex-buffer PASS compute writes six vertices (right half) into a buffer drawn as GL_ARRAY_BUFFER: left 0,0,255 right 255,0,0 (want blue, red); rewritten to the left half: left 255,0,0 right 0,0,255 (want red, blue), GL error ok
+RESULT 12-p0d-glprobe-ref fragment-ssbo PASS fragment shader reads c[1] of a std430 storage buffer and its length (3): 255,255,0,255 (want 255,255,0,255), GL error ok (GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS 16)
+RESULT 12-p0d-glprobe-ref compute-texture-sample PASS texelFetch + textureLod of an RGBA8 texture in compute: 0 of 1024 texels wrong , GL error ok
+RESULT 12-p0d-glprobe-ref compute-8-ssbos PASS eight storage buffers bound at 0-7: v[0] = 100 101 102 103 104 105 106 107 (want 100..107), sum of the seven v[1] read back 28 (want 28), GL error ok
+RESULT 12-p0d-glprobe-ref compute-shared-memory PASS shared uint tmp[64], each invocation writes its slot, barrier(), reads the mirrored slot: 0 of 256 words wrong , GL error ok
+RESULT 12-p0d-glprobe-ref compute-atomic PASS 1024 invocations of atomicAdd(counter, 1) and atomicMax(highest, id): counter 1024 (want 1024), highest 1023 (want 1023), GL error ok
+== copy-image
+RESULT 12-p0d-glprobe-ref copy-image-2d PASS glCopyImageSubData 8x8 from (4,4) of an uploaded RGBA8 texture to (16,8) of a zeroed one: 0 of 1024 texels wrong , GL error ok
+RESULT 12-p0d-glprobe-ref copy-image-2darray PASS 2D -> layer 2 of a 2D array: 0 of 256 texels wrong  (fbo 0x8cd5), layer 1 untouched: 0 wrong ; layer 2 -> 2D: 0 of 1024 wrong ; GL errors ok, ok
+RESULT 12-p0d-glprobe-ref copy-image-mip PASS level 0 -> level 1 of a two-level texture: 0 of 256 texels wrong , GL error ok
+RESULT 12-p0d-glprobe-ref copy-image-rendered PASS source drawn by the GPU, copied whole, then a 4x4 glTexSubImage2D over the copy's corner: left 255,0,0 right 0,0,255 corner 0,255,0 (want red, blue, green), GL error ok
+== sync
+RESULT 12-p0d-glprobe-ref sync-gl-fence PASS glFenceSync after 50 draws; glClientWaitSync(0, 0) 0x911a, then (FLUSH_COMMANDS, 1 s) 0x911a ALREADY_SIGNALED in 0.00 ms, GL_SYNC_STATUS SIGNALED, GL error ok (Dawn waits with EGL sync objects, not these)
+== ubo
+RESULT 12-p0d-glprobe-ref ubo-std140 PASS std140 {float a; vec3 b; vec2 c; float arr[2]} offsets 0,16,32,48 stride 16 size 80 (want 0,16,32,48 stride 16 size 80); bound with glBindBufferRange at 256: 64,128,191,255 (want 64,128,191,255); after glBufferSubData of a: 128 (want 128), GL error ok
+== draws
+RESULT 12-p0d-glprobe-ref draw-instanced-divisor PASS glDrawArraysInstanced x2 with glVertexAttribDivisor colour + offset: left 255,0,0 right 0,255,0; glDrawElementsInstanced: left 255,0,0 right 0,255,0 (want red, green), GL error ok
+RESULT 12-p0d-glprobe-ref draw-elements-instanced-base-vertex PASS glDrawElementsInstancedBaseVertex(6 indices, 2 instances, base vertex 6): left 255,0,0 right 0,255,0 (want red, green; blue means the base vertex was ignored), GL error ok
+RESULT 12-p0d-glprobe-ref base-instance PASS glDrawArraysInstancedBaseInstanceEXT(1 instance, base instance 2): left 0,0,255 right 255,255,0 (want blue, yellow), GL error ok
+RESULT 12-p0d-glprobe-ref draw-elements-base-vertex PASS glDrawElementsBaseVertex(base vertex 6): 255,0,0 (want red; blue means the base vertex was ignored), GL error ok
+RESULT 12-p0d-glprobe-ref mrt-4 PASS glDrawBuffers(4): 255,0,0 0,255,0 0,0,255 255,255,0 (want red green blue yellow), fbo 0x8cd5, GL error ok
+== restart
+RESULT 12-p0d-glprobe-ref primitive-restart PASS GL_PRIMITIVE_RESTART_FIXED_INDEX, strip 0 1 2 R 3 4 5: uint16 left 255,0,0 middle 0,0,255 right 255,0,0; uint32 left 255,0,0 middle 0,0,255 right 255,0,0 (want red, blue, red), GL error ok
+== pbo
+RESULT 12-p0d-glprobe-ref readpixels-pbo PASS glReadPixels into a GL_PIXEL_PACK_BUFFER, mapped: 0 of 1024 texels wrong, GL error ok
+RESULT 12-p0d-glprobe-ref texsubimage-pbo PASS glTexSubImage2D from a GL_PIXEL_UNPACK_BUFFER, read through an FBO: 0 of 1024 texels wrong , GL error ok
+== float-rt
+RESULT 12-p0d-glprobe-ref float-rt-rgba16f PASS draw (2.5, -1, 1000, 0.5) left over a clear to (0.5, 2, 0.125, 1), glReadPixels(GL_RGBA, GL_FLOAT): left 2.5,-1,1000,0.5 right 0.5,2,0.125,1, GL error ok
+RESULT 12-p0d-glprobe-ref float-rt-rgba32f PASS draw (2.5, -1, 1000, 0.5) left over a clear to (0.5, 2, 0.125, 1), glReadPixels(GL_RGBA, GL_FLOAT): left 2.5,-1,1000,0.5 right 0.5,2,0.125,1, GL error ok
+RESULT 12-p0d-glprobe-ref float-rt-rg16f PASS draw (2.5, -1, 1000, 0.5) left over a clear to (0.5, 2, 0.125, 1), glReadPixels(GL_RGBA, GL_FLOAT): left 2.5,-1,0,1 right 0.5,2,0,1, GL error ok
+RESULT 12-p0d-glprobe-ref float-rt-r32f PASS draw (2.5, -1, 1000, 0.5) left over a clear to (0.5, 2, 0.125, 1), glReadPixels(GL_RGBA, GL_FLOAT): left 2.5,0,0,1 right 0.5,0,0,1, GL error ok
+RESULT 12-p0d-glprobe-ref float-rt-r11g11b10f PASS draw (2.5, 0.25, 1000, 0.5) left over a clear to (0.5, 2, 0.125, 1), glReadPixels(GL_RGBA, GL_FLOAT): left 2.5,0.25,992,1 right 0.5,2,0.125,1, GL error ok
+RESULT 12-p0d-glprobe-ref readpixels-float PASS RGBA16F: GL_IMPLEMENTATION_COLOR_READ_FORMAT 0x1908 TYPE 0x140b; glReadPixels(GL_RGBA, GL_HALF_FLOAT) ok: 0x3c00 0x4000 0xc000 0x3800 (1, 2, -2, 0.5 are 3c00 4000 c000 3800); GL_RGBA/GL_FLOAT is checked by the float-rt results
+== depth
+RESULT 12-p0d-glprobe-ref depth-stencil-d16 PASS attached to an RGBA8 FBO: depth test ok (left 255,0,0 right 0,255,0), stencil test n/a (left 0,0,0 right 0,0,0), sampled depth ok (64 / 191, want 64 / 191, ok), sampled stencil n/a (0 / 0, want 90 / 0, ok), GL error ok
+RESULT 12-p0d-glprobe-ref depth-stencil-d24 PASS attached to an RGBA8 FBO: depth test ok (left 255,0,0 right 0,255,0), stencil test n/a (left 0,0,0 right 0,0,0), sampled depth ok (64 / 191, want 64 / 191, ok), sampled stencil n/a (0 / 0, want 90 / 0, ok), GL error ok
+RESULT 12-p0d-glprobe-ref depth-stencil-d24s8 PASS attached to an RGBA8 FBO: depth test ok (left 255,0,0 right 0,255,0), stencil test ok (left 255,255,255 right 0,255,0), sampled depth ok (64 / 191, want 64 / 191, ok), sampled stencil ok (90 / 0, want 90 / 0, ok), GL error ok
+RESULT 12-p0d-glprobe-ref depth-stencil-d32f PASS attached to an RGBA8 FBO: depth test ok (left 255,0,0 right 0,255,0), stencil test n/a (left 0,0,0 right 0,0,0), sampled depth ok (64 / 191, want 64 / 191, ok), sampled stencil n/a (0 / 0, want 90 / 0, ok), GL error ok
+RESULT 12-p0d-glprobe-ref depth-stencil-d32fs8 PASS attached to an RGBA8 FBO: depth test ok (left 255,0,0 right 0,255,0), stencil test ok (left 255,255,255 right 0,255,0), sampled depth ok (64 / 191, want 64 / 191, ok), sampled stencil ok (90 / 0, want 90 / 0, ok), GL error ok
+RESULT 12-p0d-glprobe-ref depth-stencil-s8 PASS attached to an RGBA8 FBO: depth test n/a (left 0,255,0 right 0,255,0), stencil test ok (left 255,255,255 right 0,255,0), sampled depth n/a (0 / 0, want 64 / 191, ok), sampled stencil ok (90 / 0, want 90 / 0, ok), GL error ok
+== srgb
+RESULT 12-p0d-glprobe-ref srgb-framebuffer PASS SRGB8_ALPHA8 target: draw of linear 0.5 stores 188, clear stores 188 (want 188: encoded); sampled back 128 (want 127 or 128: decoded); glBlitFramebuffer to RGBA8 gives 128 (ok; 128 = converted, 188 = raw copy); GL_EXT_sRGB_write_control advertised, GL error ok
+== bgra
+RESULT 12-p0d-glprobe-ref bgra8 PASS glTexStorage2D(GL_BGRA8_EXT) ok; glTexSubImage2D(GL_BGRA_EXT) ok; sampled 30,20,10,255 (want 30,20,10,255); as a render target fbo 0x8cd5, cleared red reads 255,0,0,255 as RGBA; glReadPixels(GL_BGRA_EXT) ok -> 0,0,255,255 (want 0,0,255,255; GL_EXT_read_format_bgra advertised, GL_EXT_texture_storage advertised)
+== msaa
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+RESULT 12-p0d-glprobe-ref msaa-resolve-rgba8 FAIL 4x multisample FBO 0x8cd6 (colour texture + DEPTH24_STENCIL8 texture), resolve target 0x8cd5, GL error INVALID_OPERATION
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+RESULT 12-p0d-glprobe-ref msaa-resolve-rgba16f FAIL 4x multisample FBO 0x8cd6 (colour texture + DEPTH24_STENCIL8 texture), resolve target 0x8cd5, GL error INVALID_OPERATION
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+RESULT 12-p0d-glprobe-ref sample-shading FAIL 4x multisample RGBA8 FBO 0x8cd6
+RESULT 12-p0d-glprobe-ref sample-mask FAIL not reported: the group stopped before this test
+RESULT 12-p0d-glprobe-ref alpha-to-coverage FAIL not reported: the group stopped before this test
+  (GL error left over at the end of the group: INVALID_OPERATION)
+== texbuffer
+RESULT 12-p0d-glprobe-ref texture-buffer PASS glTexBuffer(GL_RGBA8) + texelFetch(samplerBuffer): 255,0,0 0,255,0 0,0,255 255,255,255 (want red green blue white); GL_R32F: red 64 128 191 255 (want 64 128 191 255); GL errors ok, ok
+== compressed
+RESULT 12-p0d-glprobe-ref compressed-bc1 PASS format 0x83f1: one 4x4 block, sampled: 255,0,0,255 (want 255,0,0,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-bc1-srgb PASS format 0x8c4d: one 4x4 block, sampled: 255,0,0,255 (want 255,0,0,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-bc3 PASS format 0x83f3: one 4x4 block, sampled: 255,0,0,255 (want 255,0,0,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-bc4 PASS format 0x8dbb: one 4x4 block, sampled: 255,0,0,255 (want 255,0,0,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-bc5 PASS format 0x8dbd: one 4x4 block, sampled: 255,255,0,255 (want 255,255,0,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-bc7 PASS format 0x8e8c: one 4x4 block, sampled: 255,1,1,255 (want 255,1,1,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-etc2-rgb8 PASS format 0x9274: one 4x4 block, sampled: 255,2,2,255 (want 255,2,2,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-etc2-rgba8 PASS format 0x9278: one 4x4 block, sampled: 255,2,2,255 (want 255,2,2,255), GL error ok
+RESULT 12-p0d-glprobe-ref compressed-astc-4x4 PASS format 0x93b0: one 4x4 block, sampled: 255,0,0,255 (want 255,0,0,255), GL error ok
+== clip
+RESULT 12-p0d-glprobe-ref clip-distance PASS gl_ClipDistance[0] = x with GL_CLIP_DISTANCE0_EXT: left 0,0,255 right 255,0,0 (want blue, red), GL error ok
+== timer
+RESULT 12-p0d-glprobe-ref timer-query PASS GL_TIME_ELAPSED_EXT around 200 draws: available, 15331000 ns (counter bits 64); glQueryCounterEXT(GL_TIMESTAMP_EXT) 481530603594000 ns (bits 64); GL_GPU_DISJOINT_EXT 0, GL error ok
+== timing
+RESULT 12-p0d-glprobe-ref time-compute-dispatch-1000 PASS 1000 x (glDispatchCompute(1,1,1) + glMemoryBarrier(ALL)) of data[0] += 1: 7.38 ms to issue, 0.00 ms more in glFinish, 7.4 us per dispatch; counter 1001 (want 1001: every dispatch ran, in order), GL error ok
+== bgra-msaa
+Mesa: error: GL_INVALID_OPERATION in glTexStorage2DMultisample(samples=4)
+RESULT 12-p0d-glprobe-ref formats-msaa-bgra8 FAIL glTexStorage2DMultisample(4, GL_BGRA8_EXT) as a colour attachment: GL error
+81 PASS, 10 FAIL, 0 SKIP in groups (plus the two ctx-* lines above)

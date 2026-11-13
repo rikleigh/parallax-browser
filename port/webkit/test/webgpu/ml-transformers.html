@@ -1,0 +1,144 @@
+<!doctype html>
+<!-- WebGPU for machine learning (plan P5): transformers.js, which runs models
+     on ONNX Runtime Web, with a small sentence-embedding model
+     (Xenova/all-MiniLM-L6-v2, 90 MB as fp32). Needs the network: the library
+     comes from cdn.jsdelivr.net and the model from huggingface.co, or with
+     ?models=http://host:8765/ from serve-models.py on another machine.
+     Cases: the library loads; the adapter's features that ML libraries ask
+     for are logged (shader-f16 above all); the model runs on WebAssembly
+     (one thread: the reference); the same model runs on WebGPU and its
+     embeddings match the reference (cosine similarity at least 0.999); with
+     shader-f16, the fp16 model runs on WebGPU too (at least 0.99); no
+     uncaptured WebGPU errors. Times are logged: first run (download, shader
+     compilation) and the average of five warm runs.
+     Log lines: RESULT webgpu-ml-transformers <case> PASS|FAIL|SKIP <why>,
+     then the summary. Give the runner time: WAIT=240. Open
+     file:///data/ps5webkit/webgpu/ml-transformers.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU ML: transformers.js</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU ML: transformers.js</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const LIBRARY = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+const MODEL = 'Xenova/all-MiniLM-L6-v2';
+const SENTENCES = [
+  'The console draws a triangle with WebGPU.',
+  'A games console renders a triangle through a new graphics API.',
+  'Bread is baked in an oven for forty minutes.',
+];
+
+function timeout(promise, seconds, what) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(what + ' did not settle in ' + seconds + ' s')), seconds * 1000)),
+  ]);
+}
+
+function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return dot / Math.sqrt(na * nb);
+}
+
+// ?models=http://host:port/ takes the model from serve-models.py on another machine instead of
+// huggingface.co. From this file: page the hub's files could be fetched once in a while only:
+// later fetches failed "due to access control checks" (not looked into; nothing to do with WebGPU).
+const MODELS = new URLSearchParams(location.search).get('models');
+
+T.run('ml-transformers', async () => {
+  const adapter = await T.getAdapter(undefined, 'request-adapter');
+  if (!adapter) return;
+  const wanted = ['shader-f16', 'timestamp-query', 'float32-filterable', 'bgra8unorm-storage', 'depth32float-stencil8', 'subgroups'];
+  T.info('adapter features ML libraries look for: ' + wanted.map(f => f + (adapter.features.has(f) ? ' yes' : ' no')).join(', '));
+  T.info('maxBufferSize ' + adapter.limits.maxBufferSize + ', maxStorageBufferBindingSize ' + adapter.limits.maxStorageBufferBindingSize + ', maxComputeInvocationsPerWorkgroup ' + adapter.limits.maxComputeInvocationsPerWorkgroup);
+
+  let library = null;
+  await T.test('library', async () => {
+    const before = performance.now();
+    library = await timeout(import(LIBRARY), 60, 'import');
+    // No Cache API on file:, and one thread: no SharedArrayBuffer without cross-origin isolation.
+    library.env.useBrowserCache = false;
+    library.env.allowLocalModels = false;
+    if (MODELS)
+      library.env.remoteHost = MODELS;
+    if (library.env.backends && library.env.backends.onnx && library.env.backends.onnx.wasm)
+      library.env.backends.onnx.wasm.numThreads = 1;
+    return 'transformers.js ' + library.env.version + ' in ' + (performance.now() - before).toFixed(0) + ' ms';
+  });
+  if (!library) return;
+
+  async function embed(device, dtype) {
+    const before = performance.now();
+    const extractor = await timeout(library.pipeline('feature-extraction', MODEL, { device, dtype }), 180, 'pipeline(' + device + ', ' + dtype + ')');
+    const loadMs = performance.now() - before;
+    const first = performance.now();
+    let output = await timeout(extractor(SENTENCES, { pooling: 'mean', normalize: true }), 120, 'first run');
+    const firstMs = performance.now() - first;
+    const warm = performance.now();
+    for (let i = 0; i < 5; i++)
+      output = await timeout(extractor(SENTENCES, { pooling: 'mean', normalize: true }), 60, 'warm run');
+    const warmMs = (performance.now() - warm) / 5;
+    const rows = output.tolist();
+    await extractor.dispose();
+    return { rows, timing: 'load ' + loadMs.toFixed(0) + ' ms, first run ' + firstMs.toFixed(0) + ' ms, warm run ' + warmMs.toFixed(1) + ' ms' };
+  }
+
+  function sense(rows) {
+    // The first two sentences say the same thing; the third is about bread.
+    const near = cosine(rows[0], rows[1]), far = cosine(rows[0], rows[2]);
+    T.assert(rows.length === 3 && rows[0].length === 384, 'expected 3 embeddings of 384 values, got ' + rows.length + ' of ' + (rows[0] && rows[0].length));
+    T.assert(near > far + 0.2, 'the embeddings make no sense: similar sentences ' + near.toFixed(3) + ', unrelated ' + far.toFixed(3));
+    return 'similar sentences ' + near.toFixed(3) + ', unrelated ' + far.toFixed(3);
+  }
+
+  let reference = null;
+  await T.test('wasm-fp32', async () => {
+    const result = await embed('wasm', 'fp32');
+    reference = result.rows;
+    return sense(result.rows) + '; ' + result.timing;
+  });
+
+  await T.test('webgpu-fp32', async () => {
+    let result;
+    try {
+      result = await embed('webgpu', 'fp32');
+    } catch (e) {
+      T.info('webgpu-fp32 threw at: ' + String(e && e.stack).split('\n').slice(0, 8).join(' | '));
+      throw e;
+    }
+    const detail = sense(result.rows);
+    if (reference) {
+      const worst = Math.min(...result.rows.map((row, i) => cosine(row, reference[i])));
+      T.assert(worst >= 0.999, 'embeddings differ from WebAssembly: cosine similarity ' + worst.toFixed(5));
+      return detail + '; matches WebAssembly to ' + worst.toFixed(5) + '; ' + result.timing;
+    }
+    return detail + '; no WebAssembly reference; ' + result.timing;
+  });
+
+  if (adapter.features.has('shader-f16')) {
+    await T.test('webgpu-fp16', async () => {
+      const result = await embed('webgpu', 'fp16');
+      const detail = sense(result.rows);
+      if (reference) {
+        const worst = Math.min(...result.rows.map((row, i) => cosine(row, reference[i])));
+        T.assert(worst >= 0.99, 'embeddings differ from WebAssembly: cosine similarity ' + worst.toFixed(5));
+        return detail + '; matches WebAssembly fp32 to ' + worst.toFixed(5) + '; ' + result.timing;
+      }
+      return detail + '; ' + result.timing;
+    });
+  } else
+    T.skip('webgpu-fp16', 'the adapter has no shader-f16');
+});
+</script>
+</body>
+</html>

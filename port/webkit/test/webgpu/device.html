@@ -1,0 +1,163 @@
+<!doctype html>
+<!-- WebGPU devices: making them, what they report and how they end. Nothing
+     is drawn. Cases: requestDevice() with no descriptor; that device's
+     features (nothing beyond core-features-and-limits) and limits (exactly
+     the specification's defaults, whatever the adapter could do); one case
+     per adapter feature, each requested alone on a fresh adapter
+     (feature-<name>); a required limit above the default is granted; an
+     unknown feature name rejects (TypeError) and a limit above the adapter's
+     rejects (OperationError); a second requestDevice() on the same adapter
+     (the specification rejects it; an implementation that hands out a
+     second or an already lost device is logged, PASS if the promise
+     settles); device.destroy() resolves device.lost with reason
+     "destroyed"; labels read back; queue.onSubmittedWorkDone() resolves.
+     Log lines: RESULT webgpu-device <case> PASS|FAIL <why>, then RESULT
+     webgpu-device summary PASS|FAIL <n>/<m>. Upload the directory to
+     /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/device.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU device</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU device</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+// A fresh adapter each time: requestDevice() uses an adapter up.
+async function freshAdapter() {
+  const adapter = await T.step(navigator.gpu.requestAdapter(), 'requestAdapter');
+  T.assert(adapter, 'requestAdapter returned null');
+  return adapter;
+}
+
+async function rejection(promise, name) {
+  try {
+    const value = await T.step(promise, name);
+    return { resolved: true, value };
+  } catch (e) {
+    if (/^timeout after/.test(e.message)) throw e;
+    return { resolved: false, error: e };
+  }
+}
+
+T.run('device', async () => {
+  const g = await T.getDevice(undefined, undefined, 'request-device');
+  if (!g) return;
+  const { adapter, device } = g;
+  T.report('request-device', true);
+
+  await T.test('default-features', async () => {
+    const extra = Array.from(device.features).filter(f => f !== 'core-features-and-limits');
+    T.assert(!extra.length, 'a default device has features ' + extra.join(' '));
+    return device.features.size + ' feature(s): ' + Array.from(device.features).join(' ');
+  });
+
+  await T.test('default-limits', async () => {
+    const different = [];
+    for (const name in T.DEFAULT_LIMITS)
+      if (device.limits[name] !== T.DEFAULT_LIMITS[name])
+        different.push(name + '=' + device.limits[name] + ' (default ' + T.DEFAULT_LIMITS[name] + ')');
+    const others = T.limitNames(device.limits).filter(n => !(n in T.DEFAULT_LIMITS));
+    if (others.length) T.info('limits not in the table: ' + others.map(n => n + '=' + device.limits[n]).join(' '));
+    T.assert(!different.length, different.join(', '));
+    return Object.keys(T.DEFAULT_LIMITS).length + ' limits are the defaults';
+  });
+
+  for (const feature of Array.from(adapter.features).sort()) {
+    await T.test('feature-' + feature, async () => {
+      const a = await freshAdapter();
+      T.assert(a.features.has(feature), 'a second adapter does not list it');
+      const d = await T.step(a.requestDevice({ requiredFeatures: [feature] }), 'requestDevice');
+      const has = d.features.has(feature);
+      d.destroy();
+      T.assert(has, 'device.features does not have it');
+    });
+  }
+
+  await T.test('required-limit-granted', async () => {
+    const a = await freshAdapter();
+    const name = 'maxTextureDimension2D', want = a.limits[name];
+    const d = await T.step(a.requestDevice({ requiredLimits: { [name]: want } }), 'requestDevice');
+    const got = d.limits[name];
+    d.destroy();
+    T.assert(got === want, name + ' is ' + got + ', asked for ' + want);
+    return name + '=' + got + (want === T.DEFAULT_LIMITS[name] ? ' (the adapter offers no more than the default)' : '');
+  });
+
+  await T.test('unsupported-feature-rejects', async () => {
+    const a = await freshAdapter();
+    const r = await rejection(a.requestDevice({ requiredFeatures: ['not-a-webgpu-feature'] }), 'requestDevice');
+    T.assert(!r.resolved, 'requestDevice resolved with ' + r.value);
+    T.assert(r.error instanceof TypeError, 'rejected with ' + T.describe(r.error) + ', expected a TypeError');
+    return T.describe(r.error);
+  });
+
+  await T.test('over-limit-rejects', async () => {
+    const a = await freshAdapter();
+    const name = 'maxBindGroups', want = a.limits[name] + 1;
+    const r = await rejection(a.requestDevice({ requiredLimits: { [name]: want } }), 'requestDevice');
+    T.assert(!r.resolved, 'requestDevice resolved with ' + name + '=' + (r.value && r.value.limits[name]));
+    T.assert(r.error && r.error.name === 'OperationError', 'rejected with ' + T.describe(r.error) + ', expected an OperationError');
+    return name + '=' + want + ': ' + T.describe(r.error);
+  });
+
+  // The adapter has already made `device`.
+  await T.test('second-request-device', async () => {
+    const r = await rejection(adapter.requestDevice(), 'second requestDevice');
+    if (!r.resolved) return 'rejected: ' + T.describe(r.error);
+    const second = r.value;
+    const lost = await Promise.race([second.lost.then(l => l.reason || 'unknown'), new Promise(resolve => setTimeout(() => resolve(null), 500))]);
+    const same = second === device;
+    if (!same) second.destroy();
+    return 'resolved with ' + (same ? 'the same device' : lost ? 'a device that is already lost (' + lost + ')' : 'a second live device');
+  });
+
+  await T.test('label', async () => {
+    device.label = 'device label';
+    T.assert(device.label === 'device label', 'device.label is "' + device.label + '"');
+    const buffer = device.createBuffer({ label: 'buffer label', size: 16, usage: GPUBufferUsage.COPY_DST });
+    T.assert(buffer.label === 'buffer label', 'buffer.label is "' + buffer.label + '"');
+    buffer.label = 'renamed';
+    T.assert(buffer.label === 'renamed', 'buffer.label after assignment is "' + buffer.label + '"');
+    const texture = device.createTexture({ label: 'texture label', size: [4, 4], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING });
+    T.assert(texture.label === 'texture label', 'texture.label is "' + texture.label + '"');
+    const view = texture.createView({ label: 'view label' });
+    T.assert(view.label === 'view label', 'view.label is "' + view.label + '"');
+    T.assert(device.createSampler().label === '', 'an unlabelled sampler has label "' + device.createSampler().label + '"');
+    device.queue.label = 'queue label';
+    T.assert(device.queue.label === 'queue label', 'queue.label is "' + device.queue.label + '"');
+    buffer.destroy();
+    texture.destroy();
+  }, device);
+
+  await T.test('submitted-work-done', async () => {
+    const before = performance.now();
+    await T.step(device.queue.onSubmittedWorkDone(), 'onSubmittedWorkDone (nothing submitted)');
+    device.queue.submit([device.createCommandEncoder().finish()]);
+    await T.step(device.queue.onSubmittedWorkDone(), 'onSubmittedWorkDone (after a submit)');
+    return (performance.now() - before).toFixed(1) + ' ms';
+  }, device);
+
+  await T.test('destroy-lost', async () => {
+    let settled = false;
+    device.lost.then(() => { settled = true; });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    T.assert(!settled, 'device.lost resolved before destroy()');
+    device.destroy();
+    const lost = await T.step(device.lost, 'device.lost after destroy()');
+    T.assert(lost.reason === 'destroyed', 'reason is "' + lost.reason + '", message "' + lost.message + '"');
+    // A destroyed device still takes calls: they make invalid objects, they don't throw.
+    device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST });
+    return 'reason destroyed, message "' + lost.message + '"';
+  });
+});
+</script>
+</body>
+</html>

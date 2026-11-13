@@ -1,0 +1,188 @@
+<!doctype html>
+<!-- WebGPU canvases read by the rest of the web platform: screenshots,
+     thumbnails and 2D compositing all go through these four calls, and each
+     has its own path to the canvas's current texture. A 64x64 canvas (shown
+     at 256 px) gets a pattern of four quadrants: red top left, green top
+     right, blue bottom left, white bottom right. Four readers: toDataURL()
+     (decoded by an Image and drawn to a 2D canvas), toBlob() (the same),
+     createImageBitmap(canvas), and drawImage(canvas) on a 2D context. Cases:
+     same-task-<reader>: the reader is called in the task that drew, before
+     the frame is presented, and must give the pattern; later-frame-<reader>:
+     the reader is called three frames later with nothing drawn since, when
+     the specification has the canvas cleared: transparent or opaque black
+     and the pattern (an implementation that keeps the frame) both pass,
+     logged, and anything else fails; alpha-opaque and alpha-premultiplied:
+     two more canvases cleared to the premultiplied colour 0.5,0.25,0,0.5,
+     which reads as 128,64,0,255 with alphaMode opaque and as 255,128,0,128
+     (un-premultiplied by getImageData and PNG) with alphaMode
+     premultiplied. On screen: the pattern, then an orange-brown square and a
+     see-through orange one. Log lines: RESULT webgpu-todataurl <case>
+     PASS|FAIL <why>, then RESULT webgpu-todataurl summary PASS|FAIL <n>/<m>.
+     Upload the directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/todataurl.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU toDataURL</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 256px; height: 256px; border: 2px solid #555; margin-right: 12px; image-rendering: pixelated; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU toDataURL</h1>
+<canvas id="pattern" width="64" height="64"></canvas><canvas id="opaque" width="64" height="64"></canvas><canvas id="premultiplied" width="64" height="64"></canvas>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const SIZE = 64;
+const WGSL = `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                                vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  return vec4f(corners[i], 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let middle = ${SIZE / 2}.0;
+  if (p.y < middle) {
+    if (p.x < middle) { return vec4f(1.0, 0.0, 0.0, 1.0); }
+    return vec4f(0.0, 1.0, 0.0, 1.0);
+  }
+  if (p.x < middle) { return vec4f(0.0, 0.0, 1.0, 1.0); }
+  return vec4f(1.0, 1.0, 1.0, 1.0);
+}`;
+
+function loadImage(url) {
+  return T.step(new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('the image did not decode (' + url.slice(0, 40) + '...)'));
+    image.src = url;
+  }), 'image load');
+}
+
+// Each reader takes its copy of the canvas when called and returns a promise of ImageData.
+const READERS = {
+  toDataURL(canvas) {
+    const url = canvas.toDataURL();
+    if (!/^data:image\/png;base64,/.test(url)) return Promise.reject(new Error('toDataURL() gave "' + url.slice(0, 40) + '"'));
+    return loadImage(url).then(image => T.snapshot(image, SIZE, SIZE));
+  },
+  toBlob(canvas) {
+    const blob = T.step(new Promise(resolve => canvas.toBlob(resolve)), 'toBlob callback');
+    return blob.then(b => {
+      if (!b) throw new Error('toBlob() gave ' + b);
+      const url = URL.createObjectURL(b);
+      return loadImage(url).then(image => T.snapshot(image, SIZE, SIZE)).finally(() => URL.revokeObjectURL(url));
+    });
+  },
+  createImageBitmap(canvas) {
+    return T.step(createImageBitmap(canvas), 'createImageBitmap').then(bitmap => {
+      if (bitmap.width !== SIZE || bitmap.height !== SIZE) throw new Error('the bitmap is ' + bitmap.width + 'x' + bitmap.height);
+      const image = T.snapshot(bitmap, SIZE, SIZE);
+      bitmap.close();
+      return image;
+    });
+  },
+  drawImage(canvas) {
+    try {
+      return Promise.resolve(T.snapshot(canvas, SIZE, SIZE));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  },
+};
+
+// 'pattern', 'cleared (...)' or 'garbage: ...'.
+function classify(image) {
+  const wrong = T.quadrantsMismatch(image);
+  if (!wrong) return 'pattern';
+  let transparent = true, black = true;
+  for (let i = 0; i < image.data.length; i += 4) {
+    const rgb = image.data[i] | image.data[i + 1] | image.data[i + 2];
+    if (rgb || image.data[i + 3] !== 0) transparent = false;
+    if (rgb || image.data[i + 3] !== 255) black = false;
+  }
+  if (transparent) return 'cleared (transparent black)';
+  if (black) return 'cleared (opaque black)';
+  return 'garbage: ' + wrong;
+}
+
+T.run('todataurl', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device, format } = g;
+  const canvas = document.getElementById('pattern');
+  const context = canvas.getContext('webgpu');
+  if (!context) {
+    T.report('init', false, 'canvas.getContext("webgpu") returned ' + context);
+    return;
+  }
+  context.configure({ device, format });
+  const module = device.createShaderModule({ code: WGSL });
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+  });
+  function drawPattern() {
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: [0.5, 0.5, 0.5, 1], loadOp: 'clear', storeOp: 'store' }],
+    });
+    pass.setPipeline(pipeline);
+    pass.draw(6);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  for (const reader of Object.keys(READERS)) {
+    await T.test('same-task-' + reader, async () => {
+      await T.nextFrame();
+      drawPattern();
+      const image = await READERS[reader](canvas);
+      const what = classify(image);
+      T.assert(what === 'pattern', what);
+      return 'the pattern';
+    }, device);
+  }
+
+  for (const reader of Object.keys(READERS)) {
+    await T.test('later-frame-' + reader, async () => {
+      await T.nextFrame();
+      drawPattern();
+      for (let i = 0; i < 3; i++) await T.nextFrame();
+      const image = await READERS[reader](canvas);
+      const what = classify(image);
+      T.assert(!what.startsWith('garbage'), what);
+      return what === 'pattern' ? 'the pattern (the presented frame is kept)' : what;
+    }, device);
+  }
+
+  // Premultiplied 0.5,0.25,0,0.5 is the straight colour 1,0.5,0 at half alpha.
+  for (const alphaMode of ['opaque', 'premultiplied']) {
+    await T.test('alpha-' + alphaMode, async () => {
+      const target = document.getElementById(alphaMode);
+      const c = target.getContext('webgpu');
+      T.assert(c, 'canvas.getContext("webgpu") returned ' + c);
+      c.configure({ device, format, alphaMode });
+      const want = alphaMode === 'opaque' ? [128, 64, 0, 255] : [255, 128, 0, 128];
+      const tolerance = alphaMode === 'opaque' ? 2 : 4;
+      await T.nextFrame();
+      const encoder = device.createCommandEncoder();
+      encoder.beginRenderPass({
+        colorAttachments: [{ view: c.getCurrentTexture().createView(), clearValue: [0.5, 0.25, 0, 0.5], loadOp: 'clear', storeOp: 'store' }],
+      }).end();
+      device.queue.submit([encoder.finish()]);
+      const [drawn, encoded] = await Promise.all([READERS.drawImage(target), READERS.toDataURL(target)]);
+      T.expectPixel(drawn, SIZE / 2, SIZE / 2, want, 'drawImage', tolerance);
+      T.expectPixel(encoded, SIZE / 2, SIZE / 2, want, 'toDataURL', tolerance);
+      return 'drawImage and toDataURL give ' + T.show(T.pixel(drawn, SIZE / 2, SIZE / 2));
+    }, device);
+  }
+
+  T.report('uncaptured-errors', T.uncaptured.length === 0, T.uncaptured.length ? T.uncaptured.join(' | ') : 'none');
+});
+</script>
+</body>
+</html>

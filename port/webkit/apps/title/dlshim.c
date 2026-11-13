@@ -110,3 +110,13 @@ __attribute__((constructor(101))) static void ps5wkUseSystemMalloc(void)
 {
     setenv("Malloc", "1", 1);
 }
+
+/* WebGPU builds only (package.sh adds --wrap=dlclose): Dawn's DynamicLib is
+ * linked though no PS5 path opens a library, and libc.a's dlclose needs
+ * __dlclose, which a title cannot import (spikes/12-webgpu/p1-dawn-title). */
+int __wrap_dlclose(void* handle);
+int __wrap_dlclose(void* handle)
+{
+    (void)handle;
+    return 0;
+}

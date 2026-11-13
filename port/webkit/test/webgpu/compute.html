@@ -1,0 +1,239 @@
+<!doctype html>
+<!-- WebGPU compute shaders and buffer readback: the path that needs no
+     canvas, so it shows whether shaders compile, pipelines run and mapped
+     buffers return what the GPU wrote. Cases: fill: a pipeline writes
+     i * 3 + 7 into a storage buffer of 4096 u32, which is copied to a
+     MAP_READ buffer, mapped and checked; indirect: two bind groups (a uniform
+     buffer with the multiplier and the addend, and the storage buffer) and
+     dispatchWorkgroupsIndirect; matrix: a 64x64 f32 matrix product checked
+     against the same product in JavaScript (integer-valued entries, so the
+     result is exact); async-pipeline: createComputePipelineAsync, then the
+     fill again with it; timing: the first pipeline (shader module, pipeline,
+     first dispatch, work done) and 100 dispatches with one readback are
+     timed and logged, not judged. Log lines: RESULT webgpu-compute <case>
+     PASS|FAIL <why>, then RESULT webgpu-compute summary PASS|FAIL <n>/<m>.
+     Upload the directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/compute.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU compute</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU compute</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const COUNT = 4096, N = 64;
+
+const FILL = `
+@group(0) @binding(0) var<storage, read_write> data: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&data)) {
+    data[id.x] = id.x * 3u + 7u;
+  }
+}`;
+
+const SCALED = `
+struct Params { mul: u32, add: u32 }
+@group(0) @binding(0) var<uniform> params: Params;
+@group(1) @binding(0) var<storage, read_write> data: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&data)) {
+    data[id.x] = id.x * params.mul + params.add;
+  }
+}`;
+
+const MATRIX = `
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+const N = ${N}u;
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= N || id.y >= N) { return; }
+  var sum = 0.0;
+  for (var k = 0u; k < N; k++) {
+    sum += a[id.y * N + k] * b[k * N + id.x];
+  }
+  c[id.y * N + id.x] = sum;
+}`;
+
+T.run('compute', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device } = g;
+  const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+
+  // Copies a buffer into a MAP_READ buffer and returns its contents.
+  async function read(buffer, ArrayType) {
+    const staging = device.createBuffer({ size: buffer.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, staging, 0, buffer.size);
+    device.queue.submit([encoder.finish()]);
+    await T.step(staging.mapAsync(GPUMapMode.READ), 'mapAsync');
+    const copy = new ArrayType(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return copy;
+  }
+
+  function checkSequence(values, mul, add) {
+    T.assert(values.length === COUNT, values.length + ' values, expected ' + COUNT);
+    for (let i = 0; i < COUNT; i++)
+      if (values[i] !== i * mul + add)
+        throw new Error('data[' + i + '] is ' + values[i] + ', expected ' + (i * mul + add));
+    return COUNT + ' values right (last ' + values[COUNT - 1] + ')';
+  }
+
+  function runFill(pipeline) {
+    const buffer = device.createBuffer({ size: COUNT * 4, usage: STORAGE });
+    const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer } }] });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(COUNT / 64);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    return buffer;
+  }
+
+  let fillPipeline = null, firstMs = 0;
+  await T.test('fill', async () => {
+    const before = performance.now();
+    const module = device.createShaderModule({ code: FILL });
+    fillPipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    const buffer = runFill(fillPipeline);
+    await T.step(device.queue.onSubmittedWorkDone(), 'onSubmittedWorkDone');
+    firstMs = performance.now() - before;
+    const detail = checkSequence(await read(buffer, Uint32Array), 3, 7);
+    buffer.destroy();
+    return detail;
+  }, device);
+
+  await T.test('indirect', async () => {
+    const MUL = 5, ADD = 11;
+    const module = device.createShaderModule({ code: SCALED });
+    const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    const params = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(params, 0, new Uint32Array([MUL, ADD]));
+    const indirect = device.createBuffer({ size: 12, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(indirect, 0, new Uint32Array([COUNT / 64, 1, 1]));
+    const buffer = device.createBuffer({ size: COUNT * 4, usage: STORAGE });
+    const group0 = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: params } }] });
+    const group1 = device.createBindGroup({ layout: pipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: { buffer } }] });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group0);
+    pass.setBindGroup(1, group1);
+    pass.dispatchWorkgroupsIndirect(indirect, 0);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    const detail = checkSequence(await read(buffer, Uint32Array), MUL, ADD);
+    for (const b of [params, indirect, buffer]) b.destroy();
+    return detail;
+  }, device);
+
+  await T.test('matrix', async () => {
+    // Small whole numbers: every product and partial sum is exact in f32,
+    // so the comparison is exact whatever the order or fused multiply-adds.
+    const a = new Float32Array(N * N), b = new Float32Array(N * N), want = new Float32Array(N * N);
+    for (let i = 0; i < N * N; i++) {
+      a[i] = (i * 7) % 13 - 6;
+      b[i] = (i * 5) % 11 - 5;
+    }
+    for (let y = 0; y < N; y++)
+      for (let x = 0; x < N; x++) {
+        let sum = 0;
+        for (let k = 0; k < N; k++) sum += a[y * N + k] * b[k * N + x];
+        want[y * N + x] = sum;
+      }
+    const module = device.createShaderModule({ code: MATRIX });
+    const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    const input = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const bufferA = device.createBuffer({ size: a.byteLength, usage: input });
+    const bufferB = device.createBuffer({ size: b.byteLength, usage: input });
+    const bufferC = device.createBuffer({ size: want.byteLength, usage: STORAGE });
+    device.queue.writeBuffer(bufferA, 0, a);
+    device.queue.writeBuffer(bufferB, 0, b);
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: bufferA } }, { binding: 1, resource: { buffer: bufferB } }, { binding: 2, resource: { buffer: bufferC } }],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(N / 8, N / 8);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    const got = await read(bufferC, Float32Array);
+    let wrong = 0, first = '';
+    for (let i = 0; i < N * N; i++)
+      if (got[i] !== want[i]) {
+        if (!wrong) first = 'c[' + i + '] is ' + got[i] + ', expected ' + want[i];
+        wrong++;
+      }
+    for (const buffer of [bufferA, bufferB, bufferC]) buffer.destroy();
+    T.assert(!wrong, wrong + ' of ' + N * N + ' wrong: ' + first);
+    return N + 'x' + N + ' product matches JavaScript (c[0]=' + got[0] + ', c[last]=' + got[N * N - 1] + ')';
+  }, device);
+
+  await T.test('async-pipeline', async () => {
+    const before = performance.now();
+    const module = device.createShaderModule({ code: FILL });
+    const pipeline = await T.step(device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main' } }), 'createComputePipelineAsync');
+    const ms = performance.now() - before;
+    T.assert(pipeline instanceof GPUComputePipeline, 'resolved with ' + pipeline);
+    const buffer = runFill(pipeline);
+    const detail = checkSequence(await read(buffer, Uint32Array), 3, 7);
+    buffer.destroy();
+    return detail + ', pipeline ready after ' + ms.toFixed(1) + ' ms';
+  }, device);
+
+  // entryPoint left out: the only entry point of the module for the stage (three.js's mipmap
+  // pipelines do this; an empty name was looked up once, and every such pipeline was invalid).
+  await T.test('default-entry-point', async () => {
+    const module = device.createShaderModule({ code: FILL });
+    const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+    const buffer = runFill(pipeline);
+    const detail = checkSequence(await read(buffer, Uint32Array), 3, 7);
+    buffer.destroy();
+    return detail + ', compute stage with no entryPoint';
+  }, device);
+
+  await T.test('timing', async () => {
+    T.assert(fillPipeline, 'the fill case made no pipeline');
+    const buffer = device.createBuffer({ size: COUNT * 4, usage: STORAGE });
+    const bindGroup = device.createBindGroup({ layout: fillPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer } }] });
+    const before = performance.now();
+    for (let i = 0; i < 100; i++) {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(fillPipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(COUNT / 64);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+    const submitted = performance.now() - before;
+    const values = await read(buffer, Uint32Array);
+    const total = performance.now() - before;
+    checkSequence(values, 3, 7);
+    buffer.destroy();
+    return 'first pipeline to work done ' + firstMs.toFixed(1) + ' ms; 100 dispatches submitted in ' + submitted.toFixed(1) +
+      ' ms, read back after ' + total.toFixed(1) + ' ms';
+  }, device);
+});
+</script>
+</body>
+</html>

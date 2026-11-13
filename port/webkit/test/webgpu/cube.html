@@ -1,0 +1,195 @@
+<!doctype html>
+<!-- WebGPU on screen, what a small 3D page does every frame: a turning cube
+     with a vertex and a 16-bit index buffer, back faces culled, a
+     depth24plus depth buffer, a model-view-projection matrix in a uniform
+     buffer rewritten with writeBuffer each frame, and an 8x8 checkerboard
+     texture made with writeTexture (one mip level, nearest sampler) tinted a
+     different colour on each face. On screen: the cube turning on dark grey
+     in a 640x360 canvas with sharp-edged checks, faces never showing through
+     each other, and the frame rate under it. Cases: setup (pipeline, buffers
+     and texture made without a validation error); animation: after 120
+     frames the frame rate and JavaScript time per frame are logged, PASS if
+     the frames came and the device raised no error; centre-pixel: frame 0
+     drawn into a 2D canvas has the cube, not the background, at its centre
+     (fails on its own if canvas readback does). The cube keeps turning
+     afterwards. Log lines: RESULT webgpu-cube <case> PASS|FAIL <why>, then
+     RESULT webgpu-cube summary PASS|FAIL <n>/<m>. Upload the directory to
+     /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/cube.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU cube</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 640px; height: 360px; border: 2px solid #555; display: block; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU cube</h1>
+<canvas id="canvas" width="640" height="360"></canvas>
+<div id="status">starting</div>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const WGSL = `
+struct Uniforms { mvp: mat4x4f }
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var s: sampler;
+@group(0) @binding(2) var t: texture_2d<f32>;
+struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f, @location(1) tint: vec3f }
+@vertex fn vs(@location(0) position: vec3f, @location(1) uv: vec2f, @location(2) tint: vec3f) -> V {
+  return V(u.mvp * vec4f(position, 1.0), uv, tint);
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  return vec4f(textureSample(t, s, v.uv).rgb * v.tint, 1.0);
+}`;
+
+// Column-major 4x4 matrices; clip space depth 0..1.
+function multiply(a, b) {
+  const m = new Float32Array(16);
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++)
+      m[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return m;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, far / (near - far), -1, 0, 0, near * far / (near - far), 0]);
+}
+function translation(x, y, z) {
+  return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+}
+function rotationX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
+}
+function rotationY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+}
+
+// Six faces of four vertices (position, uv, tint), counter-clockwise from outside.
+function cube() {
+  const faces = [   // normal, u, v (u x v = normal), tint
+    [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0.35, 0.35]], [[-1, 0, 0], [0, 0, 1], [0, 1, 0], [0.35, 1, 1]],
+    [[0, 1, 0], [0, 0, 1], [1, 0, 0], [0.35, 1, 0.35]], [[0, -1, 0], [1, 0, 0], [0, 0, 1], [1, 0.35, 1]],
+    [[0, 0, 1], [1, 0, 0], [0, 1, 0], [0.4, 0.5, 1]], [[0, 0, -1], [0, 1, 0], [1, 0, 0], [1, 1, 0.35]],
+  ];
+  const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+  const vertices = [], indices = [];
+  faces.forEach(([n, u, v, tint], face) => {
+    for (const [a, b] of corners) {
+      for (let k = 0; k < 3; k++) vertices.push(n[k] + a * u[k] + b * v[k]);
+      vertices.push((a + 1) / 2, (1 - b) / 2, ...tint);
+    }
+    const first = face * 4;
+    indices.push(first, first + 1, first + 2, first, first + 2, first + 3);
+  });
+  return { vertices: new Float32Array(vertices), indices: new Uint16Array(indices) };
+}
+
+T.run('cube', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device, format } = g;
+  const canvas = document.getElementById('canvas'), status = document.getElementById('status');
+  const CLEAR = [0.1, 0.1, 0.12, 1];
+  let context, pipeline, bindGroup, uniforms, vertexBuffer, indexBuffer, depthView, indexCount;
+
+  if (!await T.test('setup', async () => {
+    context = canvas.getContext('webgpu');
+    T.assert(context, 'canvas.getContext("webgpu") returned ' + context);
+    context.configure({ device, format, alphaMode: 'opaque' });
+    const module = device.createShaderModule({ code: WGSL });
+    pipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: {
+        module, entryPoint: 'vs',
+        buffers: [{
+          arrayStride: 32,
+          attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'float32x2' }, { shaderLocation: 2, offset: 20, format: 'float32x3' }],
+        }],
+      },
+      fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    const mesh = cube();
+    indexCount = mesh.indices.length;
+    vertexBuffer = device.createBuffer({ size: mesh.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(vertexBuffer, 0, mesh.vertices);
+    indexBuffer = device.createBuffer({ size: mesh.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(indexBuffer, 0, mesh.indices);
+    uniforms = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    const checks = new Uint8Array(8 * 8 * 4);
+    for (let y = 0; y < 8; y++)
+      for (let x = 0; x < 8; x++)
+        checks.set((x + y) & 1 ? [255, 255, 255, 255] : [70, 70, 70, 255], (y * 8 + x) * 4);
+    const texture = device.createTexture({ size: [8, 8], format: 'rgba8unorm', mipLevelCount: 1, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture }, checks, { bytesPerRow: 32, rowsPerImage: 8 }, { width: 8, height: 8 });
+    const sampler = device.createSampler({ magFilter: 'nearest', minFilter: 'nearest', mipmapFilter: 'nearest' });
+    bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: uniforms } }, { binding: 1, resource: sampler }, { binding: 2, resource: texture.createView() }],
+    });
+    depthView = device.createTexture({ size: [canvas.width, canvas.height], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT }).createView();
+    await T.step(device.queue.onSubmittedWorkDone(), 'onSubmittedWorkDone');
+    return format + ', ' + indexCount + ' indices';
+  }, device)) return;
+
+  const projection = multiply(perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 100), translation(0, 0, -5.5));
+  let centre = null, centreError = null, shown = 0, shownAt = 0;
+  const animation = T.animate((now, frame) => {
+    const angle = now / 3000 * 2 * Math.PI;
+    device.queue.writeBuffer(uniforms, 0, multiply(projection, multiply(rotationY(angle), rotationX(angle * 0.7))));
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: CLEAR, loadOp: 'clear', storeOp: 'store' }],
+      depthStencilAttachment: { view: depthView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.setVertexBuffer(0, vertexBuffer);
+    pass.setIndexBuffer(indexBuffer, 'uint16');
+    pass.drawIndexed(indexCount);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    if (frame === 0) {
+      try {
+        const image = T.snapshot(canvas, canvas.width, canvas.height);
+        centre = { middle: T.pixel(image, canvas.width / 2, canvas.height / 2), corner: T.pixel(image, 2, 2) };
+      } catch (e) {
+        centreError = e;
+      }
+    }
+    if (now - shownAt >= 1000) {
+      if (shownAt) status.textContent = ((frame - shown) * 1000 / (now - shownAt)).toFixed(1) + ' fps, frame ' + frame;
+      shown = frame;
+      shownAt = now;
+    }
+  }, 120, 30000);
+
+  await T.test('animation', async () => {
+    const before = T.uncaptured.length;
+    const m = await animation.measured;
+    T.assert(T.uncaptured.length === before, 'uncaptured error: ' + T.uncaptured[before]);
+    return '120 frames, ' + m.fps.toFixed(1) + ' fps, ' + m.jsMs.toFixed(2) + ' ms of JavaScript per frame';
+  }, device);
+
+  await T.test('centre-pixel', async () => {
+    if (centreError) throw centreError;
+    T.assert(centre, 'frame 0 was never drawn');
+    const background = CLEAR.map(c => Math.round(c * 255));
+    T.assert(T.near(centre.corner, background), 'corner is ' + T.show(centre.corner) + ', expected the background ' + T.show(background));
+    T.assert(!T.near(centre.middle, background, 8), 'centre is the background ' + T.show(centre.middle) + ': no cube');
+    T.assert(centre.middle[3] === 255, 'centre is not opaque: ' + T.show(centre.middle));
+    return 'centre ' + T.show(centre.middle) + ', corner ' + T.show(centre.corner);
+  });
+});
+</script>
+</body>
+</html>

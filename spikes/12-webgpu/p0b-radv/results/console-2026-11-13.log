@@ -1,0 +1,21 @@
+title 12-webgpu-p0b pid 186: unjailed 1, file log on, tcp log to <mac>:9999 connected (errno 0)
+RESULT 12-webgpu-p0b gl-present PASS 4.6 (Core Profile) Mesa 26.2.0, surface 1920x1080; 60 frames in the first second
+[mem] before vkCreateInstance      direct pool 11712 MB, largest free block 11421.4 MB, flexible free 272.0 MB
+RESULT 12-webgpu-p0b vk-instance PASS instance and physical device in 1 ms; GL presented 0 frames meanwhile
+[mem] after vkCreateInstance       direct pool 11712 MB, largest free block 11404.0 MB, flexible free 272.0 MB
+RESULT 12-webgpu-p0b vk-device PASS "PlayStation 5 GPU (RADV NAVI21)" Vulkan 1.4.354, 219 extensions, heaps: 3904 MB, 7808 MB (device); queue family 0 of 2; device in 0 ms; VK_EXT_external_memory_host yes (alignment 16384)
+[mem] after vkCreateDevice         direct pool 11712 MB, largest free block 11404.0 MB, flexible free 272.0 MB
+RESULT 12-webgpu-p0b vk-triangle PASS 1920x1080 RGBA8: centre 8,250,64 (want 8,250,64) corner 0,0,255; pipeline 2.8 ms, draw + copy to buffer + fence 0.09 ms
+RESULT 12-webgpu-p0b vk-compute PASS 4096 values written by the shader, all right; pipeline 0.3 ms, dispatch + fence 0.03 ms
+[mem] after triangle and compute   direct pool 11712 MB, largest free block 11386.1 MB, flexible free 272.0 MB
+RESULT 12-webgpu-p0b gl-alive PASS GL presented 30 frames in 0.5 s after the Vulkan work (91 since start), no GL errors
+RESULT 12-webgpu-p0b bridge-gl-buffer PASS GL persistent SSBO of 11.9 MB mapped at 2097a8000
+RESULT 12-webgpu-p0b bridge-memcpy PASS 4 frames right in the GL texture; 120 frames: Vulkan draw + copy + fence 0.07 ms, memcpy of 7.9 MB 0.57 ms (max 0.59), GL pass 0.54 ms CPU; 59.9 frames/s end to end, GL presented 120
+bridge: importing 2097a8000 (+0 in the GL mapping), 8306688 bytes, memory types 0x20 (result 0)
+RESULT 12-webgpu-p0b bridge-import PASS GL mapping 2097a8000 imported as Vulkan memory (type 5), 8306688 bytes at +0
+RESULT 12-webgpu-p0b bridge-zero-copy PASS 8 frames right in the GL texture; 300 frames: Vulkan draw + vkCmdCopyImageToBuffer into the GL buffer + fence 0.07 ms (max 0.08), GL SSBO pass 0.54 ms CPU; 59.9 frames/s end to end, GL presented 300, GL errors 0
+[mem] after the bridge             direct pool 11712 MB, largest free block 11376.0 MB, flexible free 272.0 MB
+GL presented 180 frames in the last 3 s; 0 GL errors, 0 failed swaps in all
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

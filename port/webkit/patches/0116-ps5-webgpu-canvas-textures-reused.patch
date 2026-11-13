@@ -1,0 +1,305 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+index 4bfa65e690..7b9a5006a3 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+@@ -5,6 +5,10 @@
+ #include "config.h"
+ #include "PS5WebGLLayers.h"
+ 
++#if USE(DAWN)
++#include "PS5WebGPUCanvas.h"
++#endif
++
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
+ 
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+@@ -15,6 +19,7 @@
+ #include <wtf/Vector.h>
+ 
+ namespace WebKit {
++
+ using namespace WebCore;
+ 
+ namespace {
+@@ -53,15 +58,17 @@ PS5WebGLLayer::~PS5WebGLLayer()
+     retire(WTF::move(m_shown));
+ }
+ 
+-void PS5WebGLLayer::setBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&& buffer)
++void PS5WebGLLayer::setBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&& buffer, Function<void()>&& prepare)
+ {
+     std::unique_ptr<CoordinatedPlatformLayerBuffer> unshown;
+     {
+         Locker locker { m_lock };
+         if (m_detached) {
+             unshown = WTF::move(buffer);
+-        } else
++        } else {
+             unshown = std::exchange(m_pending, WTF::move(buffer));
++            m_pendingPrepare = WTF::move(prepare);
++        }
+     }
+     // A frame the compositor never drew (the page drew faster than it shows).
+     retire(WTF::move(unshown));
+@@ -69,10 +76,21 @@ void PS5WebGLLayer::setBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&&
+         m_arrivals++;
+ }
+ 
++void PS5WebGLLayer::latch()
++{
++    Locker locker { m_lock };
++    if (m_detached || !m_pending)
++        return;
++    retire(std::exchange(m_shown, WTF::move(m_pending)));
++    if (auto prepare = std::exchange(m_pendingPrepare, nullptr))
++        prepare();
++}
++
+ void PS5WebGLLayer::detach()
+ {
+     Locker locker { m_lock };
+     m_detached = true;
++    m_pendingPrepare = nullptr;
+     retire(WTF::move(m_pending));
+     retire(WTF::move(m_shown));
+ }
+@@ -84,7 +102,8 @@ void PS5WebGLLayer::paintToTextureMapper(TextureMapper& textureMapper, const Flo
+     Locker locker { m_lock };
+     if (m_detached)
+         return;
+-    if (m_pending)
++    // A layer that paints on arrival shows what latch() took before this paint.
++    if (m_pending && !m_paintsOnArrival)
+         retire(std::exchange(m_shown, WTF::move(m_pending)));
+     if (m_shown)
+         m_shown->paintToTextureMapper(textureMapper, target, modelViewMatrix, opacity); // waits on the frame's fence (GPU side)
+@@ -134,6 +153,10 @@ void collectGarbage()
+         buffers = std::exchange(garbage(), { });
+     }
+     // Destroyed here, with the compositor's context current (their GL syncs).
++    buffers.clear();
++#if USE(DAWN)
++    PS5WebGPUCanvas::trimSpareTextures();
++#endif
+ }
+ 
+ static std::atomic<CopyVideoFrameFunction> s_copyVideoFrame;
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index ff22b827f7..bc5f1c2dcf 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -25,6 +25,7 @@
+ #include <WebCore/TextureMapperPlatformLayer.h>
+ #include <atomic>
+ #include <memory>
++#include <wtf/Function.h>
+ #include <wtf/Lock.h>
+ #include <wtf/ThreadSafeRefCounted.h>
+ 
+@@ -36,7 +37,10 @@ public:
+     ~PS5WebGLLayer();
+ 
+     // Work queue: the frame just finished (prepareForDisplay).
+-    void setBuffer(std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer>&&);
++    // `prepare` (a layer that paints on arrival only): run once on the render thread, before
++    // the first paint that shows the buffer, with the compositor's context current and no
++    // TextureMapper pass under way (latch()). The buffer outlives it.
++    void setBuffer(std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer>&&, Function<void()>&& prepare = nullptr);
+     // Work queue: the context is going (its textures next): draw nothing more.
+     void detach();
+     // Work queue: about how much GL memory the context's drawing buffers
+@@ -51,6 +55,10 @@ public:
+     void setPaintsOnArrival() { m_paintsOnArrival = true; }
+     // Any thread: the frames set so far on a layer that paints on arrival; else 0.
+     uint64_t arrivals() const { return m_arrivals; }
++    // Render thread, before a scene paint, for a layer that paints on arrival: the newest
++    // buffer becomes the one every pass of that paint draws (the scene, then the backdrop of
++    // a layer above the canvas), and is uploaded now, not in the middle of a pass.
++    void latch();
+ 
+     // Render thread (TextureMapperPlatformLayer): the newest buffer.
+     void paintToTextureMapper(WebCore::TextureMapper&, const WebCore::FloatRect&, const WebCore::TransformationMatrix& modelViewMatrix, float opacity) final;
+@@ -61,6 +69,7 @@ private:
+     Lock m_lock;
+     std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_pending WTF_GUARDED_BY_LOCK(m_lock);
+     std::unique_ptr<WebCore::CoordinatedPlatformLayerBuffer> m_shown WTF_GUARDED_BY_LOCK(m_lock);
++    Function<void()> m_pendingPrepare WTF_GUARDED_BY_LOCK(m_lock);
+     bool m_detached WTF_GUARDED_BY_LOCK(m_lock) { false };
+     std::atomic<uint64_t> m_drawingBufferBytes { 0 };
+     bool m_paintsOnArrival { false };
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+index c81f9f6d0c..49deddad79 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+@@ -13,6 +13,9 @@
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/PixelFormat.h>
+ #include <WebCore/TextureMapper.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/Vector.h>
+ #include <wtf/StdLibExtras.h>
+ 
+ namespace WebKit {
+@@ -20,10 +23,48 @@ using namespace WebCore;
+ 
+ namespace {
+ 
++// Textures of frames that are no longer shown, for the next frames of the same size. Render
++// thread only. A canvas alternates between two: a new 8 MB texture for every frame of a
++// full-screen canvas, and its predecessor deleted in the same frame, made layers above the
++// canvas that draw what is behind them (backdrop-filter) come out black about once a second.
++struct SpareTexture {
++    Ref<BitmapTexture> texture;
++    MonotonicTime since;
++};
++constexpr size_t maximumSpareTextures = 3;
++constexpr Seconds spareTextureLifetime { 1_s };
++
++Vector<SpareTexture>& spareTextures()
++{
++    static NeverDestroyed<Vector<SpareTexture>> textures;
++    return textures;
++}
++
++RefPtr<BitmapTexture> takeSpareTexture(const IntSize& size, OptionSet<BitmapTexture::Flags> flags)
++{
++    auto& spares = spareTextures();
++    for (size_t i = 0; i < spares.size(); ++i) {
++        if (spares[i].texture->size() == size && spares[i].texture->flags() == flags) {
++            Ref texture = spares[i].texture;
++            spares.removeAt(i);
++            return texture;
++        }
++    }
++    return nullptr;
++}
++
++void giveSpareTexture(Ref<BitmapTexture>&& texture)
++{
++    auto& spares = spareTextures();
++    if (spares.size() >= maximumSpareTextures)
++        spares.removeAt(0);
++    spares.append({ WTF::move(texture), MonotonicTime::now() });
++}
++
+ // One frame as the layer's buffer. The texture is made and filled on the
+-// render thread at the first paint (BitmapTexture's PS5 upload path: a
+-// staging ring, no glTexSubImage2D), and dies there with the buffer
+-// (PS5WebGLLayers::collectGarbage).
++// render thread before the first paint that shows it (BitmapTexture's PS5 upload
++// path: a staging ring, no glTexSubImage2D). The buffer dies there too
++// (PS5WebGLLayers::collectGarbage), and leaves its texture to a later frame.
+ class FrameBuffer final : public CoordinatedPlatformLayerBuffer {
+ public:
+     explicit FrameBuffer(Ref<PS5WebGPUCanvas::Frame>&& frame)
+@@ -32,24 +73,40 @@ public:
+     {
+     }
+ 
++    ~FrameBuffer()
++    {
++        if (RefPtr texture = std::exchange(m_texture, nullptr))
++            giveSpareTexture(texture.releaseNonNull());
++    }
++
++    // Render thread, the compositor's context current, outside TextureMapper's passes
++    // (PS5WebGLLayer::latch).
++    void upload()
++    {
++        if (m_texture)
++            return;
++        const bool opaque = m_frame->alphaMode == ::WebGPU::CanvasAlphaMode::Opaque;
++        const bool bgra = m_frame->format == ::WebGPU::TextureFormat::Bgra8unorm || m_frame->format == ::WebGPU::TextureFormat::Bgra8unormSRGB;
++        // BGRA8 or RGBA8 only: the X formats miss BitmapTexture's PS5 upload path and go through
++        // glTexSubImage2D (35 ms at 1920x1080: a full-screen canvas ran at 29 frames/s). An
++        // opaque canvas's alpha channel is whatever the page drew; its texture has no
++        // SupportsAlpha, so it is drawn without blending and the channel is not looked at.
++        const PixelFormat pixelFormat = bgra ? PixelFormat::BGRA8 : PixelFormat::RGBA8;
++        OptionSet<BitmapTexture::Flags> flags;
++        if (!opaque)
++            flags.add(BitmapTexture::Flags::SupportsAlpha);
++        m_texture = takeSpareTexture(size(), flags);
++        if (!m_texture)
++            m_texture = BitmapTexture::create(size(), flags);
++        m_texture->updateContents(m_frame->pixels.span().data(), IntRect(IntPoint(), size()), IntPoint(), size().width() * 4, pixelFormat);
++    }
++
+ private:
+     void paintToTextureMapper(TextureMapper& textureMapper, const FloatRect& targetRect, const TransformationMatrix& modelViewMatrix, float opacity) final
+     {
+-        if (!m_texture) {
+-            const bool opaque = m_frame->alphaMode == ::WebGPU::CanvasAlphaMode::Opaque;
+-            const bool bgra = m_frame->format == ::WebGPU::TextureFormat::Bgra8unorm || m_frame->format == ::WebGPU::TextureFormat::Bgra8unormSRGB;
+-            // BGRA8 or RGBA8 only: the X formats miss BitmapTexture's PS5 upload path and go through
+-            // glTexSubImage2D (35 ms at 1920x1080: a full-screen canvas ran at 29 frames/s). An
+-            // opaque canvas's alpha channel is whatever the page drew; its texture has no
+-            // SupportsAlpha, so it is drawn without blending and the channel is not looked at.
+-            const PixelFormat pixelFormat = bgra ? PixelFormat::BGRA8 : PixelFormat::RGBA8;
+-            OptionSet<BitmapTexture::Flags> flags;
+-            if (!opaque)
+-                flags.add(BitmapTexture::Flags::SupportsAlpha);
+-            m_texture = BitmapTexture::create(size(), flags);
+-            m_texture->updateContents(m_frame->pixels.span().data(), IntRect(IntPoint(), size()), IntPoint(), size().width() * 4, pixelFormat);
+-        }
+-        textureMapper.drawTexture(*m_texture, targetRect, modelViewMatrix, opacity);
++        // Not uploaded here: this runs inside a TextureMapper pass.
++        if (m_texture)
++            textureMapper.drawTexture(*m_texture, targetRect, modelViewMatrix, opacity);
+     }
+ 
+     const Ref<PS5WebGPUCanvas::Frame> m_frame;
+@@ -58,6 +115,14 @@ private:
+ 
+ } // namespace
+ 
++void PS5WebGPUCanvas::trimSpareTextures()
++{
++    auto now = MonotonicTime::now();
++    spareTextures().removeAllMatching([&](auto& spare) {
++        return now - spare.since > spareTextureLifetime;
++    });
++}
++
+ Ref<PS5WebGPUCanvas> PS5WebGPUCanvas::create(ProcessIdentifier webProcess, uint64_t key)
+ {
+     return adoptRef(*new PS5WebGPUCanvas(webProcess, key));
+@@ -109,7 +174,11 @@ void PS5WebGPUCanvas::frameWasPresented(std::span<const uint8_t> pixels, uint32_
+     }
+     // The frame's pixels, and its texture once painted.
+     m_layer->setDrawingBufferBytes(2 * bytes);
+-    m_layer->setBuffer(makeUnique<FrameBuffer>(WTF::move(frame)));
++    auto buffer = makeUnique<FrameBuffer>(WTF::move(frame));
++    auto* bufferPointer = buffer.get();
++    m_layer->setBuffer(WTF::move(buffer), [bufferPointer] {
++        bufferPointer->upload();
++    });
+     if (!std::exchange(m_loggedFirstFrame, true))
+         WTFLogAlways("[webgpu] title: canvas %" PRIx64 ": first frame, %ux%u, format %u, %s", m_key & ~keyTag, width, height, static_cast<unsigned>(format), alphaMode == ::WebGPU::CanvasAlphaMode::Opaque ? "opaque" : "premultiplied");
+ }
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
+index f3ac866f1f..0d4ceb7cdb 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
+@@ -44,6 +44,9 @@ public:
+ 
+     // key: what the WebProcess's GraphicsLayerContentsDisplayDelegate::ps5WebGLLayerKey()
+     // returns for this canvas (layerKey() of its compositor integration's identifier).
++    // Render thread, the compositor's context current (PS5WebGLLayers::collectGarbage): drops
++    // the textures kept for reuse that no frame has taken for a second.
++    static void trimSpareTextures();
+     static Ref<PS5WebGPUCanvas> create(WebCore::ProcessIdentifier, uint64_t key);
+     ~PS5WebGPUCanvas();
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+index 2e0143abdb..93e0e19b17 100644
+--- a/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
++++ b/Source/WebKit/GPUProcess/graphics/wc/WCScene.cpp
+@@ -528,6 +528,7 @@ bool WCScene::webGLLayersNeedPaint()
+         // Once for each arrival, shown or not (a hidden canvas's frames stay pending).
+         if (uint64_t arrivals = layer.webGLLayer->arrivals(); arrivals != layer.webGLArrivalsSeen) {
+             layer.webGLArrivalsSeen = arrivals;
++            layer.webGLLayer->latch();
+             needPaint = true;
+         }
+     }

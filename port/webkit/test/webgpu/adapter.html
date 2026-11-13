@@ -1,0 +1,117 @@
+<!doctype html>
+<!-- WebGPU, the first thing a page asks: is there an adapter and what does it
+     say about itself. Nothing is drawn. Cases: navigator.gpu exists;
+     requestAdapter() with no options, with powerPreference low-power and
+     high-performance (each must give an adapter), and with
+     forceFallbackAdapter (null is allowed: logged); adapter.info has its
+     string fields; adapter.features (the whole list is logged); every
+     adapter.limits value is logged on one line and must be at least as good
+     as the specification's default; isFallbackAdapter (on adapter.info, or
+     on the adapter in older implementations); getPreferredCanvasFormat() is
+     bgra8unorm or rgba8unorm; navigator.gpu.wgslLanguageFeatures (logged).
+     With WebGPU switched off the page logs one FAIL (no navigator.gpu) and
+     the summary. Log lines: RESULT webgpu-adapter <case> PASS|FAIL <why>,
+     then RESULT webgpu-adapter summary PASS|FAIL <n>/<m>. Upload the
+     directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/adapter.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU adapter</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU adapter</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+T.run('adapter', async () => {
+  if (!navigator.gpu) {
+    T.report('navigator-gpu', false, 'no navigator.gpu' + (isSecureContext ? '' : ' (not a secure context)'));
+    return;
+  }
+  T.report('navigator-gpu', true, 'secure context ' + isSecureContext);
+
+  const adapter = await T.getAdapter(undefined, 'request-adapter');
+  if (!adapter) return;
+  T.report('request-adapter', true);
+
+  for (const powerPreference of ['low-power', 'high-performance']) {
+    await T.test('request-adapter-' + powerPreference, async () => {
+      const a = await T.step(navigator.gpu.requestAdapter({ powerPreference }), 'requestAdapter');
+      T.assert(a, 'requestAdapter returned null');
+      const i = a.info;
+      return i ? (i.vendor + ' ' + i.architecture + ' ' + i.device).trim() : '';
+    });
+  }
+
+  // A fallback (software) adapter need not exist: the call must settle.
+  await T.test('request-adapter-fallback', async () => {
+    const a = await T.step(navigator.gpu.requestAdapter({ forceFallbackAdapter: true }), 'requestAdapter');
+    if (!a) return 'no fallback adapter (null)';
+    const i = a.info;
+    return 'fallback adapter: ' + (i ? i.vendor + ' ' + i.architecture + ' ' + i.description : 'no info');
+  });
+
+  await T.test('info', async () => {
+    const i = adapter.info;
+    T.assert(i, 'adapter.info is ' + i);
+    for (const field of ['vendor', 'architecture', 'device', 'description'])
+      T.assert(typeof i[field] === 'string', 'adapter.info.' + field + ' is ' + typeof i[field]);
+    const extra = [];
+    for (const field of ['subgroupMinSize', 'subgroupMaxSize', 'isFallbackAdapter'])
+      if (field in i) extra.push(field + '=' + i[field]);
+    return 'vendor="' + i.vendor + '" architecture="' + i.architecture + '" device="' + i.device +
+      '" description="' + i.description + '" ' + extra.join(' ');
+  });
+
+  await T.test('features', async () => {
+    const f = adapter.features;
+    T.assert(f && typeof f.has === 'function' && typeof f.size === 'number', 'adapter.features is not set-like');
+    return f.size + ': ' + Array.from(f).sort().join(' ');
+  });
+
+  await T.test('limits', async () => {
+    const limits = adapter.limits;
+    T.assert(limits, 'adapter.limits is ' + limits);
+    const names = T.limitNames(limits);
+    T.assert(names.length, 'adapter.limits has no enumerable numeric members');
+    const worse = [], missing = [];
+    for (const name in T.DEFAULT_LIMITS) {
+      if (!(name in limits)) { missing.push(name); continue; }
+      const value = limits[name], base = T.DEFAULT_LIMITS[name];
+      if (T.isMinLimit(name) ? value > base : value < base) worse.push(name + '=' + value + ' (default ' + base + ')');
+    }
+    T.info('limits ' + names.map(n => n + '=' + limits[n]).join(' '));
+    if (missing.length) T.info('limits missing: ' + missing.join(' '));
+    T.assert(!worse.length, 'worse than the default: ' + worse.join(', '));
+    T.assert(!missing.length, 'missing: ' + missing.join(' '));
+    return names.length + ' limits, all at least the default';
+  });
+
+  await T.test('is-fallback-adapter', async () => {
+    const onInfo = adapter.info ? adapter.info.isFallbackAdapter : undefined, onAdapter = adapter.isFallbackAdapter;
+    T.assert(typeof onInfo === 'boolean' || typeof onAdapter === 'boolean',
+      'neither adapter.info.isFallbackAdapter nor adapter.isFallbackAdapter is a boolean');
+    return 'adapter.info.isFallbackAdapter=' + onInfo + ' adapter.isFallbackAdapter=' + onAdapter;
+  });
+
+  await T.test('preferred-canvas-format', async () => {
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    T.assert(format === 'bgra8unorm' || format === 'rgba8unorm', 'getPreferredCanvasFormat() is ' + format);
+    return format;
+  });
+
+  await T.test('wgsl-language-features', async () => {
+    const f = navigator.gpu.wgslLanguageFeatures;
+    T.assert(f && typeof f.has === 'function' && typeof f.size === 'number', 'navigator.gpu.wgslLanguageFeatures is ' + f);
+    return f.size + ': ' + Array.from(f).sort().join(' ');
+  });
+});
+</script>
+</body>
+</html>

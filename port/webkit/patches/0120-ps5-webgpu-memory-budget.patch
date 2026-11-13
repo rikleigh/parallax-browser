@@ -1,0 +1,440 @@
+diff --git a/Source/WebGPU/WebGPUDawn/Buffer.cpp b/Source/WebGPU/WebGPUDawn/Buffer.cpp
+index 187c62bf3b..c39a306ade 100644
+--- a/Source/WebGPU/WebGPUDawn/Buffer.cpp
++++ b/Source/WebGPU/WebGPUDawn/Buffer.cpp
+@@ -44,6 +44,16 @@ RefPtr<Buffer> DeviceImpl::createBuffer(const BufferDescriptor& descriptor)
+     dawnDescriptor.mappedAtCreation = descriptor.mappedAtCreation;
+ 
+     bool mappedAtCreation = descriptor.mappedAtCreation;
++    // Over the title's budget: the driver is not asked (MemoryBudget.h). A size that is not
++    // valid in the first place is Dawn's to refuse, as a validation error, and counts nothing.
++    wgpu::Limits limits;
++    bool sizeIsValid = m_device.GetLimits(&limits) == wgpu::Status::Success && descriptor.size <= limits.maxBufferSize;
++    auto charge = MemoryCharge::tryTake(sizeIsValid ? descriptor.size : 0);
++    if (!charge) {
++        m_device.InjectError(wgpu::ErrorType::OutOfMemory, "GPUDevice.createBuffer: over the browser's memory budget for WebGPU");
++        dawnDescriptor.mappedAtCreation = false;
++        return BufferImpl::create(m_device.CreateErrorBuffer(&dawnDescriptor), descriptor.size, false, *this, { });
++    }
+     wgpu::Buffer buffer = m_device.CreateBuffer(&dawnDescriptor);
+     if (!buffer) {
+         // Dawn returns no buffer at all when it cannot allocate the mapping of a buffer that is
+@@ -54,13 +64,14 @@ RefPtr<Buffer> DeviceImpl::createBuffer(const BufferDescriptor& descriptor)
+         mappedAtCreation = false;
+         buffer = m_device.CreateErrorBuffer(&dawnDescriptor);
+     }
+-    return BufferImpl::create(WTF::move(buffer), descriptor.size, mappedAtCreation, *this);
++    return BufferImpl::create(WTF::move(buffer), descriptor.size, mappedAtCreation, *this, WTF::move(*charge));
+ }
+ 
+-BufferImpl::BufferImpl(wgpu::Buffer&& buffer, uint64_t size, bool mappedAtCreation, DeviceImpl& device)
++BufferImpl::BufferImpl(wgpu::Buffer&& buffer, uint64_t size, bool mappedAtCreation, DeviceImpl& device, MemoryCharge&& charge)
+     : m_buffer(WTF::move(buffer))
+     , m_device(device)
+     , m_size(size)
++    , m_charge(WTF::move(charge))
+ {
+     if (mappedAtCreation && isInBounds<size_t>(size)) {
+         m_state = State::MappedForWriting;
+@@ -213,6 +224,7 @@ void BufferImpl::destroy()
+     m_mappingOffset = 0;
+     m_mappingSize = 0;
+     m_buffer.Destroy();
++    m_charge.release();
+ }
+ 
+ void BufferImpl::generateAValidationError()
+diff --git a/Source/WebGPU/WebGPUDawn/Buffer.h b/Source/WebGPU/WebGPUDawn/Buffer.h
+index 11860c688f..f45ddd74ac 100644
+--- a/Source/WebGPU/WebGPUDawn/Buffer.h
++++ b/Source/WebGPU/WebGPUDawn/Buffer.h
+@@ -26,6 +26,7 @@
+ #pragma once
+ 
+ #include "Device.h"
++#include "MemoryBudget.h"
+ #include <WebGPU/WebGPUCpp.h>
+ #include <webgpu/webgpu_cpp.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -40,9 +41,9 @@ namespace WebGPU::Dawn {
+ class BufferImpl final : public Buffer {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(BufferImpl);
+ public:
+-    static Ref<BufferImpl> create(wgpu::Buffer&& buffer, uint64_t size, bool mappedAtCreation, DeviceImpl& device)
++    static Ref<BufferImpl> create(wgpu::Buffer&& buffer, uint64_t size, bool mappedAtCreation, DeviceImpl& device, MemoryCharge&& charge)
+     {
+-        return adoptRef(*new BufferImpl(WTF::move(buffer), size, mappedAtCreation, device));
++        return adoptRef(*new BufferImpl(WTF::move(buffer), size, mappedAtCreation, device, WTF::move(charge)));
+     }
+ 
+     void mapAsync(OptionSet<MapMode>, uint64_t offset, std::optional<uint64_t> size, CompletionHandler<void(bool)>&&) final;
+@@ -58,7 +59,7 @@ public:
+     const wgpu::Buffer& dawnBuffer() const { return m_buffer; }
+ 
+ private:
+-    BufferImpl(wgpu::Buffer&&, uint64_t size, bool mappedAtCreation, DeviceImpl&);
++    BufferImpl(wgpu::Buffer&&, uint64_t size, bool mappedAtCreation, DeviceImpl&, MemoryCharge&&);
+ 
+     // https://gpuweb.github.io/gpuweb/#buffer-internals-state, as far as the wrapper has to know
+     // it. Dawn validates the rest.
+@@ -84,6 +85,8 @@ private:
+     uint64_t m_mappingGeneration { 0 };
+     // See getBufferContents().
+     Vector<uint8_t> m_shadowContents;
++    // The buffer's size against the title's WebGPU memory budget, until it is destroyed.
++    MemoryCharge m_charge;
+ };
+ 
+ inline BufferImpl& fromAPI(Buffer& buffer)
+diff --git a/Source/WebGPU/WebGPUDawn/CMakeLists.txt b/Source/WebGPU/WebGPUDawn/CMakeLists.txt
+index 08bf5783b1..0cbe040913 100644
+--- a/Source/WebGPU/WebGPUDawn/CMakeLists.txt
++++ b/Source/WebGPU/WebGPUDawn/CMakeLists.txt
+@@ -21,6 +21,7 @@ set(WebGPUDawn_SOURCES
+     Device.cpp
+     ExternalTexture.cpp
+     Instance.cpp
++    MemoryBudget.cpp
+     PipelineLayout.cpp
+     PresentationContext.cpp
+     QuerySet.cpp
+diff --git a/Source/WebGPU/WebGPUDawn/MemoryBudget.cpp b/Source/WebGPU/WebGPUDawn/MemoryBudget.cpp
+new file mode 100644
+index 0000000000..2d361d6a88
+--- /dev/null
++++ b/Source/WebGPU/WebGPUDawn/MemoryBudget.cpp
+@@ -0,0 +1,146 @@
++/*
++ * PS5 (spikes/12-webgpu): see MemoryBudget.h.
++ */
++
++#include "config.h"
++#include "MemoryBudget.h"
++
++#include <atomic>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <wtf/Assertions.h>
++#include <wtf/CheckedArithmetic.h>
++
++namespace WebGPU::Dawn {
++
++namespace {
++
++std::atomic<uint64_t> s_used;
++std::atomic<uint64_t> s_peak;
++std::atomic<unsigned> s_refused;
++
++// 1536 MiB, or the number of MiB in /data/ps5webkit/webgpu-budget-mb (read once; 64 at least).
++uint64_t budgetBytes()
++{
++    static const uint64_t budget = [] {
++        uint64_t megabytes = 1536;
++        int fd = open("/data/ps5webkit/webgpu-budget-mb", O_RDONLY);
++        if (fd >= 0) {
++            char text[16] = { };
++            if (read(fd, text, sizeof(text) - 1) > 0) {
++                unsigned long value = strtoul(text, nullptr, 10);
++                if (value >= 64 && value <= 16384)
++                    megabytes = value;
++            }
++            close(fd);
++        }
++        WTFLogAlways("[webgpu] title: buffers and textures may take %llu MB (webgpu-budget-mb)", static_cast<unsigned long long>(megabytes));
++        return megabytes << 20;
++    }();
++    return budget;
++}
++
++uint64_t bytesPerTexel(TextureFormat format)
++{
++    // Compressed formats: a byte a texel is the most any of them takes.
++    if (format >= TextureFormat::Bc1RgbaUnorm)
++        return 1;
++    switch (format) {
++    case TextureFormat::R8unorm:
++    case TextureFormat::R8snorm:
++    case TextureFormat::R8uint:
++    case TextureFormat::R8sint:
++    case TextureFormat::Stencil8:
++        return 1;
++    case TextureFormat::R16unorm:
++    case TextureFormat::R16snorm:
++    case TextureFormat::R16uint:
++    case TextureFormat::R16sint:
++    case TextureFormat::R16float:
++    case TextureFormat::Rg8unorm:
++    case TextureFormat::Rg8snorm:
++    case TextureFormat::Rg8uint:
++    case TextureFormat::Rg8sint:
++    case TextureFormat::Depth16unorm:
++        return 2;
++    case TextureFormat::Rg32uint:
++    case TextureFormat::Rg32sint:
++    case TextureFormat::Rg32float:
++    case TextureFormat::Rgba16unorm:
++    case TextureFormat::Rgba16snorm:
++    case TextureFormat::Rgba16uint:
++    case TextureFormat::Rgba16sint:
++    case TextureFormat::Rgba16float:
++    case TextureFormat::Depth24plusStencil8:
++    case TextureFormat::Depth32floatStencil8:
++        return 8;
++    case TextureFormat::Rgba32uint:
++    case TextureFormat::Rgba32sint:
++    case TextureFormat::Rgba32float:
++        return 16;
++    default:
++        return 4;
++    }
++}
++
++} // namespace
++
++std::optional<MemoryCharge> MemoryCharge::tryTake(uint64_t bytes)
++{
++    uint64_t budget = budgetBytes();
++    uint64_t used = s_used.load();
++    do {
++        if (bytes > budget || used > budget - bytes) {
++            unsigned refused = ++s_refused;
++            // The first few, then every hundredth: a page can ask in a loop.
++            if (refused <= 5 || !(refused % 100))
++                WTFLogAlways("[webgpu] title: %.1f MB refused, %.1f of %llu MB in use (%u refused so far)", bytes / 1048576.0, used / 1048576.0, static_cast<unsigned long long>(budget >> 20), refused);
++            return std::nullopt;
++        }
++    } while (!s_used.compare_exchange_weak(used, used + bytes));
++    uint64_t now = used + bytes;
++    uint64_t peak = s_peak.load();
++    while (now > peak && !s_peak.compare_exchange_weak(peak, now)) { }
++    return MemoryCharge { bytes };
++}
++
++void MemoryCharge::release()
++{
++    if (uint64_t bytes = std::exchange(m_bytes, 0))
++        s_used -= bytes;
++}
++
++uint64_t estimatedTextureBytes(TextureFormat format, uint64_t width, uint64_t height, uint64_t depthOrArrayLayers, uint32_t mipLevelCount, uint32_t sampleCount)
++{
++    CheckedUint64 bytes = width;
++    bytes *= height;
++    bytes *= std::max<uint64_t>(depthOrArrayLayers, 1);
++    bytes *= bytesPerTexel(format);
++    bytes *= std::max<uint32_t>(sampleCount, 1);
++    if (bytes.hasOverflowed())
++        return UINT64_MAX;
++    uint64_t result = bytes.value();
++    if (mipLevelCount > 1)
++        result += result / 3;
++    return result;
++}
++
++uint64_t estimatedTextureBytes(const TextureDescriptor& descriptor)
++{
++    return estimatedTextureBytes(descriptor.format, descriptor.size.width, descriptor.size.height, descriptor.size.depthOrArrayLayers, descriptor.mipLevelCount, descriptor.sampleCount);
++}
++
++} // namespace WebGPU::Dawn
++
++// The title's [mem] line (port/webkit/apps/title/titlemem.c, weak there).
++extern "C" void ps5wk_webgpu_mem_stats(double* usedMB, double* peakMB, double* budgetMB, unsigned* refused);
++extern "C" void ps5wk_webgpu_mem_stats(double* usedMB, double* peakMB, double* budgetMB, unsigned* refused)
++{
++    using namespace WebGPU::Dawn;
++    *usedMB = s_used.load() / 1048576.0;
++    *peakMB = s_peak.load() / 1048576.0;
++    // Not budgetBytes(): that reads the file and logs, which is for the first WebGPU use.
++    *budgetMB = s_peak.load() ? budgetBytes() / 1048576.0 : 0;
++    *refused = s_refused.load();
++}
+diff --git a/Source/WebGPU/WebGPUDawn/MemoryBudget.h b/Source/WebGPU/WebGPUDawn/MemoryBudget.h
+new file mode 100644
+index 0000000000..de6798a6a1
+--- /dev/null
++++ b/Source/WebGPU/WebGPUDawn/MemoryBudget.h
+@@ -0,0 +1,60 @@
++/*
++ * PS5 (spikes/12-webgpu): how much GPU memory the pages' WebGPU buffers and textures may take.
++ *
++ * The driver allocates them from the title's direct memory, which every tab, the compositor and
++ * video share, and a failed allocation deep in the driver is not something the title survives
++ * reliably. So the sizes are counted here, per title, and a buffer or texture that would go over
++ * the budget is not asked of the driver at all: the page gets an invalid object and a
++ * GPUOutOfMemoryError, as the specification has it for an allocation that fails.
++ *
++ * Texture sizes are estimates (texels x bytes per texel, a third more with mip levels, times the
++ * sample count); what the driver adds for alignment and metadata is not known here.
++ */
++
++#pragma once
++
++#include <WebGPU/WebGPUCpp.h>
++#include <cstdint>
++#include <optional>
++#include <wtf/Noncopyable.h>
++
++namespace WebGPU::Dawn {
++
++// Bytes counted against the budget for as long as this lives.
++class MemoryCharge {
++    WTF_MAKE_NONCOPYABLE(MemoryCharge);
++public:
++    MemoryCharge() = default;
++    MemoryCharge(MemoryCharge&& other)
++        : m_bytes(std::exchange(other.m_bytes, 0))
++    {
++    }
++    MemoryCharge& operator=(MemoryCharge&& other)
++    {
++        if (this != &other) {
++            release();
++            m_bytes = std::exchange(other.m_bytes, 0);
++        }
++        return *this;
++    }
++    ~MemoryCharge() { release(); }
++
++    // Nothing when the budget has no room for `bytes` more. Any thread.
++    static std::optional<MemoryCharge> tryTake(uint64_t bytes);
++    void release();
++    uint64_t bytes() const { return m_bytes; }
++
++private:
++    explicit MemoryCharge(uint64_t bytes)
++        : m_bytes(bytes)
++    {
++    }
++
++    uint64_t m_bytes { 0 };
++};
++
++// What a texture takes, more or less. UINT64_MAX when the product overflows.
++uint64_t estimatedTextureBytes(const TextureDescriptor&);
++uint64_t estimatedTextureBytes(TextureFormat, uint64_t width, uint64_t height, uint64_t depthOrArrayLayers, uint32_t mipLevelCount, uint32_t sampleCount);
++
++} // namespace WebGPU::Dawn
+diff --git a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+index be6f1255b7..abd456d52f 100644
+--- a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
++++ b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+@@ -85,7 +85,7 @@ void PresentationContextImpl::configure(const CanvasConfiguration& configuration
+     invalidDescriptor.usage = wgpu::TextureUsage::RenderAttachment;
+     invalidDescriptor.size = { 1, 1, 1 };
+     invalidDescriptor.format = wgpu::TextureFormat::BGRA8Unorm;
+-    m_invalidTexture = TextureImpl::create(device->dawnDevice().CreateErrorTexture(&invalidDescriptor));
++    m_invalidTexture = TextureImpl::create(device->dawnDevice().CreateErrorTexture(&invalidDescriptor), { });
+ 
+     auto fail = [&](ASCIILiteral message) {
+         if (configuration.reportValidationErrors)
+@@ -180,7 +180,14 @@ RefPtr<Texture> PresentationContextImpl::getCurrentTexture(uint32_t frameIndex)
+         return renderBuffer;
+     }
+ 
+-    renderBuffer = TextureImpl::createCanvasBacking(createRenderBufferTexture(), *this);
++    // Over the title's budget (MemoryBudget.h): no texture, and the frame is not drawn.
++    auto& configuration = *m_configuration;
++    auto charge = MemoryCharge::tryTake(estimatedTextureBytes(configuration.format, configuration.width, configuration.height, 1, 1, 1));
++    if (!charge) {
++        configuration.device->dawnDevice().InjectError(wgpu::ErrorType::OutOfMemory, "GPUCanvasContext.getCurrentTexture: over the browser's memory budget for WebGPU");
++        return m_invalidTexture;
++    }
++    renderBuffer = TextureImpl::createCanvasBacking(createRenderBufferTexture(), *this, WTF::move(*charge));
+     return renderBuffer;
+ }
+ 
+diff --git a/Source/WebGPU/WebGPUDawn/Texture.cpp b/Source/WebGPU/WebGPUDawn/Texture.cpp
+index 11e365783a..74697e2b6c 100644
+--- a/Source/WebGPU/WebGPUDawn/Texture.cpp
++++ b/Source/WebGPU/WebGPUDawn/Texture.cpp
+@@ -51,11 +51,25 @@ RefPtr<Texture> DeviceImpl::createTexture(const TextureDescriptor& descriptor)
+     dawnDescriptor.sampleCount = descriptor.sampleCount;
+     dawnDescriptor.viewFormatCount = viewFormats.size();
+     dawnDescriptor.viewFormats = viewFormats.span().data();
+-    return TextureImpl::create(m_device.CreateTexture(&dawnDescriptor));
++    // Over the title's budget: the driver is not asked (MemoryBudget.h).
++    // A size that is not valid in the first place is Dawn's to refuse, as a validation error,
++    // and counts nothing.
++    wgpu::Limits limits;
++    bool sizeIsValid = m_device.GetLimits(&limits) == wgpu::Status::Success
++        && descriptor.size.width <= limits.maxTextureDimension2D && descriptor.size.height <= limits.maxTextureDimension2D
++        && descriptor.size.depthOrArrayLayers <= std::max(limits.maxTextureArrayLayers, limits.maxTextureDimension3D)
++        && descriptor.sampleCount <= 4;
++    auto charge = MemoryCharge::tryTake(sizeIsValid ? estimatedTextureBytes(descriptor) : 0);
++    if (!charge) {
++        m_device.InjectError(wgpu::ErrorType::OutOfMemory, "GPUDevice.createTexture: over the browser's memory budget for WebGPU");
++        return TextureImpl::create(m_device.CreateErrorTexture(&dawnDescriptor), { });
++    }
++    return TextureImpl::create(m_device.CreateTexture(&dawnDescriptor), WTF::move(*charge));
+ }
+ 
+-TextureImpl::TextureImpl(wgpu::Texture&& texture, PresentationContextImpl* presentationContext)
+-    : m_texture(WTF::move(texture))
++TextureImpl::TextureImpl(wgpu::Texture&& texture, PresentationContextImpl* presentationContext, MemoryCharge&& charge)
++    : m_charge(WTF::move(charge))
++    , m_texture(WTF::move(texture))
+     , m_presentationContext(presentationContext)
+     , m_isCanvasBacking(presentationContext)
+ {
+@@ -105,6 +119,7 @@ void TextureImpl::destroy()
+     if (m_isCanvasBacking)
+         return;
+     m_texture.Destroy();
++    m_charge.release();
+ }
+ 
+ void TextureImpl::undestroy()
+@@ -124,6 +139,7 @@ void TextureImpl::releaseCanvasBacking()
+     m_presentationContext = nullptr;
+     m_isDestroyed = true;
+     m_texture.Destroy();
++    m_charge.release();
+ }
+ 
+ void TextureImpl::setLabel(String&& label)
+diff --git a/Source/WebGPU/WebGPUDawn/Texture.h b/Source/WebGPU/WebGPUDawn/Texture.h
+index 5a877618c2..07eee46374 100644
+--- a/Source/WebGPU/WebGPUDawn/Texture.h
++++ b/Source/WebGPU/WebGPUDawn/Texture.h
+@@ -25,6 +25,7 @@
+ 
+ #pragma once
+ 
++#include "MemoryBudget.h"
+ #include <WebGPU/WebGPUCpp.h>
+ #include <webgpu/webgpu_cpp.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -43,14 +44,14 @@ class PresentationContextImpl;
+ class TextureImpl final : public Texture {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(TextureImpl);
+ public:
+-    static Ref<TextureImpl> create(wgpu::Texture&& texture)
++    static Ref<TextureImpl> create(wgpu::Texture&& texture, MemoryCharge&& charge)
+     {
+-        return adoptRef(*new TextureImpl(WTF::move(texture), nullptr));
++        return adoptRef(*new TextureImpl(WTF::move(texture), nullptr, WTF::move(charge)));
+     }
+ 
+-    static Ref<TextureImpl> createCanvasBacking(wgpu::Texture&& texture, PresentationContextImpl& presentationContext)
++    static Ref<TextureImpl> createCanvasBacking(wgpu::Texture&& texture, PresentationContextImpl& presentationContext, MemoryCharge&& charge)
+     {
+-        return adoptRef(*new TextureImpl(WTF::move(texture), &presentationContext));
++        return adoptRef(*new TextureImpl(WTF::move(texture), &presentationContext, WTF::move(charge)));
+     }
+ 
+     ~TextureImpl();
+@@ -68,7 +69,11 @@ public:
+     void releaseCanvasBacking();
+ 
+ private:
+-    TextureImpl(wgpu::Texture&&, PresentationContextImpl*);
++    TextureImpl(wgpu::Texture&&, PresentationContextImpl*, MemoryCharge&&);
++
++    // The texture's estimated size against the title's WebGPU memory budget, until its memory
++    // is freed (destroy(), or releaseCanvasBacking() for a canvas's).
++    MemoryCharge m_charge;
+ 
+     wgpu::Texture m_texture;
+     ThreadSafeWeakPtr<PresentationContextImpl> m_presentationContext;

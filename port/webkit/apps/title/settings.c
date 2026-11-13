@@ -13,7 +13,7 @@
  *     it whenever a page gets a new WebProcess; no-webgl: applied at once,
  *     ps5browser.c applyWebContentSettings). Opt-in flag files
  *     (perf-overlay, safer-browsing): present = that feature on.
- *     safer-browsing overrides jit, wasm and webgl while present (each
+ *     safer-browsing overrides jit, wasm, webgl and webgpu while present (each
  *     WebProcess reads it at start, ps5wk-child.cpp configureJIT; the title
  *     for WebGL) and leaves their own values alone for when it goes.
  *   home-url.txt: the page the browser opens when it starts, in the PS5
@@ -62,7 +62,7 @@ typedef struct {
 static const Setting settings[] = {
     /* Security (the first four: the page's first section) */
     { "safer", KIND_FLAG_ON, TYPE_BOOL, "safer-browsing", "0", PS5WK_SETTINGS_PAGE, "Safer browsing",
-        "Turns off the JavaScript JIT, WebAssembly and WebGL, where most attacks on browsers start. Pages run slower (scripts several times slower) and some games and 3D sites won't work. The three settings below keep their own values for when it's off. Also the shield button in the browser menu.",
+        "Turns off the JavaScript JIT, WebAssembly, WebGL and WebGPU, where most attacks on browsers start. Pages run slower (scripts several times slower) and some games and 3D sites won't work. The four settings below keep their own values for when it's off. Also the shield button in the browser menu.",
         NULL, 0, 0 },
     { "jit", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
         "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes. Off also removes the most common way in for attacks.",
@@ -72,6 +72,9 @@ static const Setting settings[] = {
         NULL, 0, 0 },
     { "webgl", KIND_FLAG, TYPE_BOOL, "no-webgl", "1", 0, "WebGL",
         "3D graphics for pages and games, on the PS5's GPU. Off: games and maps that need it show an error. Applies to pages loaded from now on.",
+        NULL, 0, 0 },
+    { "webgpu", KIND_FLAG_ON, TYPE_BOOL, "webgpu-on", "0", 0, "WebGPU (experimental)",
+        "The newer 3D and GPU computing interface for pages, on the PS5's GPU. New here and less tested than WebGL: leave it off unless a site needs it. Off: sites fall back to WebGL where they can. Applies to pages loaded from now on.",
         NULL, 0, 0 },
     { "paint_threads", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
         "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",
@@ -292,7 +295,7 @@ static void appendJSONString(GString* out, const char* s)
 /* The page's Security section: Safer browsing and what it turns off. */
 static gboolean isOverriddenBySafer(const Setting* s)
 {
-    return !strcmp(s->id, "jit") || !strcmp(s->id, "wasm") || !strcmp(s->id, "webgl");
+    return !strcmp(s->id, "jit") || !strcmp(s->id, "wasm") || !strcmp(s->id, "webgl") || !strcmp(s->id, "webgpu");
 }
 
 static gboolean isSecurity(const Setting* s)

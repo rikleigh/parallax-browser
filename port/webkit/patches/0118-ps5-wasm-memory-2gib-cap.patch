@@ -1,0 +1,21 @@
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index 07cfa5c8bd..bf3900ed32 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -134,7 +134,16 @@ static bool tryAllocate(VM& vm, NOESCAPE const Func& allocate)
+ 
+ uint64_t maxAllocatableBytes(AddressType addressType)
+ {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: 2 GiB a memory. A shared memory reserves its declared maximum when it is made, and
++    // ONNX Runtime Web's (always shared, whatever the thread count) declares 4 GiB. A payload
++    // can map about 5.4 GiB in all: with 4 of them reserved, the WebProcess could no longer map
++    // a 45 MB tensor for WebGPU, and anything else large failed with it.
++    constexpr uint64_t ps5MaximumBytes = 2 * GB;
++    return std::min<uint64_t>({ maxBufferByteLength(addressType), maxGrowableBufferReservationBytes, ps5MaximumBytes });
++#else
+     return std::min<uint64_t>(maxBufferByteLength(addressType), maxGrowableBufferReservationBytes);
++#endif
+ }
+ 
+ Memory::Memory()

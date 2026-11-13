@@ -1,0 +1,56 @@
+<!doctype html>
+<!-- Index of the WebGPU test pages in this directory. Each page runs by
+     itself when opened, with no input, logs RESULT webgpu-<page> <case>
+     PASS|FAIL|SKIP lines to the console and the page, and ends with a
+     RESULT webgpu-<page> summary line. This page only says whether
+     navigator.gpu exists and links the others. Upload the directory to
+     /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/index.html. See README.md. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU tests</title>
+<style>
+  body { background: #111; color: #eee; font: 24px/1.4 sans-serif; margin: 40px; }
+  a { color: #8cf; }
+  li { margin: 10px 0; }
+  .fail { color: #f66; }
+  .note { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU tests</h1>
+<div id="state">checking</div>
+<ol>
+<li><a href="adapter.html">adapter.html</a>: is there an adapter, and its info, features and limits</li>
+<li><a href="device.html">device.html</a>: making devices, default limits, each feature, destroy and lost</li>
+<li><a href="compute.html">compute.html</a>: compute shaders and buffer readback, with timings</li>
+<li><a href="offscreen-readback.html">offscreen-readback.html</a>: rendering into textures and reading them back (MSAA, depth, float, mips)</li>
+<li><a href="errors.html">errors.html</a>: error scopes, uncaptured errors, shader messages, pipeline errors</li>
+<li><a href="triangle.html">triangle.html</a>: a turning triangle on screen, frame rate after 30 frames</li>
+<li><a href="cube.html">cube.html</a>: a textured, depth-tested cube, frame rate after 120 frames</li>
+<li><a href="resize.html">resize.html</a>: canvas sizes from 16x16 to 1920x1080, unconfigure, rgba16float, a second device</li>
+<li><a href="two-canvases.html">two-canvases.html</a>: three canvases on two devices, one taken out of the page and put back</li>
+<li><a href="todataurl.html">todataurl.html</a>: toDataURL, toBlob, createImageBitmap and drawImage of a WebGPU canvas, alpha modes</li>
+<li><a href="copy-external-image.html">copy-external-image.html</a>: textures from canvases, bitmaps and images, flipY and premultiplied alpha</li>
+<li><a href="video-texture.html">video-texture.html</a>: a playing video as an external texture (needs ../media/sync-1080p30-h264.mp4 or ?src=)</li>
+<li><a href="buffer-map.html">buffer-map.html</a>: buffer mapping as ML libraries use it, up to 64 MiB</li>
+<li><a href="ml-transformers.html">ml-transformers.html</a>: a sentence-embedding model on WebAssembly and on WebGPU (needs the network, or ?models=http://host:8765/)</li>
+</ol>
+<div class="note">Every page runs on load and ends with a "summary" line; failures are red.</div>
+<script>
+(function () {
+  var state = document.getElementById('state');
+  var text;
+  if (!navigator.gpu) {
+    text = 'navigator.gpu is missing: WebGPU is off' + (window.isSecureContext ? '' : ' (this page is not a secure context)') + '. Every page will log one FAIL.';
+    state.className = 'fail';
+  } else {
+    text = 'navigator.gpu is present, preferred canvas format ' + navigator.gpu.getPreferredCanvasFormat() + '.';
+  }
+  state.textContent = text;
+  console.log('[webgpu-index] ' + text);
+})();
+</script>
+</body>
+</html>

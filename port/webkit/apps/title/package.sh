@@ -91,6 +91,22 @@ prospero-clang -std=c11 -O2 "${TF[@]}" -I"$ROOT/spikes" -DLOG_HOST="\"$PS5WK_LOG
     -c "$ROOT/spikes/common/title_exit.c" -o "$W/obj/title_exit.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -I"$ROOT/spikes" -c "$ROOT/spikes/common/psvr2/psvr2.c" -o "$W/obj/psvr2.o"
 
+# WebGPU builds (WEBGPU=1 port/webkit/build.sh: Dawn on RADV, spikes/12-webgpu):
+# RADV as one object with only its ICD entry points global (ps5-opengl has a
+# Mesa of its own), titleradv.c for what it needs from the title, and the payload SDK's
+# AGC driver stub (116 exports, a superset of ps5-opengl's 5: RADV imports
+# sceAgcDriverSetHsOffchipParam). Dawn itself is in ninja's link line.
+AGCDRIVER="$PREFIX/lib/libSceAgcDriver.so"
+webgpu_inputs=()
+rm -f "$W/obj/cpu_model.o" "$W/obj/titleradv.o"
+if grep -q '^USE_DAWN:BOOL=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
+    "$ROOT/spikes/12-webgpu/p0b-radv/radv-object.sh"
+    prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titleradv.c" -o "$W/obj/titleradv.o"
+    webgpu_inputs=("$ROOT/build/radv-ps5/radv-local.o" --wrap=dlclose)
+    AGCDRIVER="$SYS/lib/libSceAgcDriver.so"
+    echo "WebGPU: RADV linked in"
+fi
+
 # 3. ps5browser's objects and libraries, from the link line ninja used.
 cmd="$(ninja -C "$BLD" -t commands ps5browser | tail -1)"
 inputs=()
@@ -126,10 +142,10 @@ title_link() {
         --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close \
         --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
         --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" ${TITLE_LDFLAGS:-} "$@" \
-        "$W"/obj/*.o "${inputs[@]}" "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
+        "$W"/obj/*.o "${inputs[@]}" ${webgpu_inputs[@]+"${webgpu_inputs[@]}"} "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
         --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
         "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
-        "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so" \
+        "$PREFIX/lib/libSceAgc.so" "$AGCDRIVER" \
         "$SYS/lib/libScePad.so" "$SYS/lib/libSceUserService.so" \
         --as-needed "${sdk_stubs[@]}" --start-group "$W/libc-title.a" --end-group \
         2> "$W/link.log" || {
@@ -142,7 +158,7 @@ title_link
 # __cxa_thread_atexit_impl, optional SCE calls) stay undefined dynamic
 # symbols, which the converter rejects: define them as 0 (null) and relink.
 NM=/opt/homebrew/opt/llvm@18/bin/llvm-nm
-for so in "${sdk_stubs[@]}" "$PREFIX/lib/libSceAgc.so" "$PREFIX/lib/libSceAgcDriver.so"; do
+for so in "${sdk_stubs[@]}" "$PREFIX/lib/libSceAgc.so" "$AGCDRIVER"; do
     "$NM" -D --defined-only "$so" 2>/dev/null | awk '{print $NF}'
 done | sort -u > "$W/stub-symbols.txt"
 defsyms=()
@@ -170,7 +186,7 @@ title_link "${defsyms[@]}" "$W/importcheck.o"
 
 # 4. Convert, fake-sign, assemble the folder title.
 "$TOOL" link --in "$W/llvm-pie.elf" --out "$W/eboot.elf" --stub-dir "$SYS/lib" \
-    --stub "$PREFIX/lib/libSceAgc.so" --stub "$PREFIX/lib/libSceAgcDriver.so" \
+    --stub "$PREFIX/lib/libSceAgc.so" --stub "$AGCDRIVER" \
     --module-sdk 0x02000009 --companion-sdk 0x08050001 --file-name eboot.elf
 app="$OUT/$TITLE"; rm -rf -- "$app"; mkdir -p "$app/sce_sys" "$app/sce_module"
 "$TOOL" self --sign --in "$W/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F

@@ -1489,13 +1489,16 @@ static gboolean restartPageOnMain(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
-/* Safer browsing and WebGL (settings.c; README: "Security"). safer-browsing
+/* Safer browsing, WebGL and WebGPU (settings.c; README: "Security"). safer-browsing
  * turns the JavaScript JIT and WebAssembly off in every WebProcess that
- * starts (ps5wk-child.cpp configureJIT) and WebGL off here; no-webgl turns
+ * starts (ps5wk-child.cpp configureJIT) and WebGL and WebGPU off here; no-webgl turns
  * WebGL off alone. WebGL is one WebKitSettings, shared by every tab
  * (private ones too): it applies to pages loaded from then on. */
 #define SAFER_BROWSING_FLAG "/data/ps5webkit/safer-browsing"
 #define NO_WEBGL_FLAG "/data/ps5webkit/no-webgl"
+/* WebGPU (Dawn on RADV, spikes/12-webgpu): off unless this file is there,
+ * and off with Safer browsing whatever it says. */
+#define WEBGPU_ON_FLAG "/data/ps5webkit/webgpu-on"
 static gboolean saferBrowsing;
 
 static gboolean flagFile(const char* path)
@@ -1516,6 +1519,18 @@ static void applyWebContentSettings(void)
         webkit_settings_set_enable_webgl(settings, webgl);
         spike_log("settings: WebGL %s%s", webgl ? "on" : "off", saferBrowsing ? " (Safer browsing)" : "");
     }
+    /* WebGPU has no WebKitSettings property: it is the feature "WebGPU"
+     * (the WebGPUEnabled preference), which a build without WebGPU lacks,
+     * and then there is nothing to turn on. */
+    gboolean webgpu = !saferBrowsing && flagFile(WEBGPU_ON_FLAG);
+    WebKitFeatureList* features = settings ? webkit_settings_get_all_features() : NULL;
+    WebKitFeature* feature = features ? webkit_feature_list_find(features, "WebGPU") : NULL;
+    if (feature && webkit_settings_get_feature_enabled(settings, feature) != webgpu) {
+        webkit_settings_set_feature_enabled(settings, feature, webgpu);
+        spike_log("settings: WebGPU %s%s", webgpu ? "on" : "off", saferBrowsing ? " (Safer browsing)" : "");
+    }
+    if (features)
+        webkit_feature_list_unref(features);
 }
 
 /* From a route thread (Settings): WebKit's settings change on the main loop. */
@@ -1547,7 +1562,7 @@ void ps5wk_safer_browsing_toggle(void)
     }
     applyWebContentSettings();
     wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), on
-        ? "Safer browsing: no JavaScript JIT, WebAssembly or WebGL. Pages run slower."
+        ? "Safer browsing: no JavaScript JIT, WebAssembly, WebGL or WebGPU. Pages run slower."
         : "Safer browsing off: the JIT, WebAssembly and WebGL are back", 4);
     g_idle_add(restartPageOnMain, NULL);
 }

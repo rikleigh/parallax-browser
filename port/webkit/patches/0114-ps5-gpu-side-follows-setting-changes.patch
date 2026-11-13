@@ -1,0 +1,96 @@
+diff --git a/Source/WebKit/GPUProcess/GPUProcess.h b/Source/WebKit/GPUProcess/GPUProcess.h
+index 7a1fc16ee5..9fb229f058 100644
+--- a/Source/WebKit/GPUProcess/GPUProcess.h
++++ b/Source/WebKit/GPUProcess/GPUProcess.h
+@@ -115,6 +115,10 @@ public:
+     {
+         createGPUConnectionToWebProcess(identifier, sessionID, WTF::move(connectionHandle), WTF::move(parameters), [] { });
+     }
++    void ps5SharedPreferencesForWebProcessDidChange(WebCore::ProcessIdentifier identifier, SharedPreferencesForWebProcess&& sharedPreferences)
++    {
++        sharedPreferencesForWebProcessDidChange(identifier, WTF::move(sharedPreferences), [] { });
++    }
+ #endif
+ 
+     void ref() const final { ThreadSafeRefCounted::ref(); }
+diff --git a/Source/WebKit/UIProcess/WebProcessProxy.cpp b/Source/WebKit/UIProcess/WebProcessProxy.cpp
+index afa9d9d9de..a12d8ff1eb 100644
+--- a/Source/WebKit/UIProcess/WebProcessProxy.cpp
++++ b/Source/WebKit/UIProcess/WebProcessProxy.cpp
+@@ -87,6 +87,10 @@
+ #include "WebProcessMessages.h"
+ #include "WebProcessPool.h"
+ #include "WebProcessProxyMessages.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++#include "PS5GPUProcessInTitle.h"
++#endif
+ #include "WebSWContextManagerConnectionMessages.h"
+ #include "WebSharedWorkerContextManagerConnectionMessages.h"
+ #include "WebUserContentControllerProxy.h"
+@@ -3078,6 +3082,13 @@ void WebProcessProxy::sharedPreferencesDidChange()
+                     process->didSyncSharedPreferencesForWebProcessWithGPUProcess(syncedVersion);
+             });
+         }
++#if ENABLE(WEBGL) && defined(PS5_PAYLOAD_SDK)
++        else {
++            // PS5: the GPU process's side lives in this process (PS5GPUProcessInTitle).
++            PS5GPUProcessInTitle::sharedPreferencesForWebProcessDidChange(*this, SharedPreferencesForWebProcess { m_sharedPreferencesForWebProcess });
++            m_sharedPreferencesVersionInGPUProcess = currentVersion;
++        }
++#endif
+     }
+ #endif
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+index b60661b3b9..ac43f019fd 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+@@ -92,11 +92,24 @@ static bool ensureDisplay()
+     return true;
+ }
+ 
++static bool started;
++static bool failed;
++
++// WebProcessProxy::sharedPreferencesDidChange. There is no GPUProcessProxy in the title to carry
++// this, and without it a setting changed while a WebProcess runs (WebGPU switched on in
++// Settings) never reaches that process's GPUConnectionToWebProcess, whose message checks then
++// refuse what the page was just allowed to ask for.
++void sharedPreferencesForWebProcessDidChange(WebProcessProxy& webProcess, SharedPreferencesForWebProcess&& sharedPreferences)
++{
++    RELEASE_ASSERT(RunLoop::isMain());
++    if (!started || failed)
++        return;
++    GPUProcess::singleton().ps5SharedPreferencesForWebProcessDidChange(webProcess.coreProcessIdentifier(), WTF::move(sharedPreferences));
++}
++
+ void createGPUProcessConnection(WebProcessProxy& webProcess, IPC::Connection::Handle&& connectionHandle, GPUProcessConnectionParameters&& parameters)
+ {
+     RELEASE_ASSERT(RunLoop::isMain());
+-    static bool started;
+-    static bool failed;
+     if (!started) {
+         started = true;
+         if (!ensureDisplay()) {
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h
+index 38dfb4b5d9..1b50ca40d3 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.h
+@@ -20,12 +20,16 @@ namespace WebKit {
+ 
+ class WebProcessProxy;
+ struct GPUProcessConnectionParameters;
++struct SharedPreferencesForWebProcess;
+ 
+ namespace PS5GPUProcessInTitle {
+ 
+ // WebProcessPool::createGPUProcessConnection. Main run loop.
+ void createGPUProcessConnection(WebProcessProxy&, IPC::Connection::Handle&&, GPUProcessConnectionParameters&&);
+ 
++// WebProcessProxy::sharedPreferencesDidChange. Main run loop.
++void sharedPreferencesForWebProcessDidChange(WebProcessProxy&, SharedPreferencesForWebProcess&&);
++
+ } // namespace PS5GPUProcessInTitle
+ } // namespace WebKit
+ 

@@ -1,0 +1,182 @@
+<!doctype html>
+<!-- WebGPU with more than one canvas: three 320x180 canvases animated at the
+     same time, the first two on one device and the third on a second device
+     from a second requestAdapter() (a page with an engine and a separate
+     widget does this). On screen: three triangles turning at different
+     speeds, on dark red, dark green and dark blue; the middle canvas
+     disappears for about a second and comes back still turning. Cases:
+     configure (three contexts, two devices); canvas-a, canvas-b,
+     canvas-c-second-device: each canvas cleared to its own colour in one
+     frame and read through drawImage into a 2D canvas, which also shows that
+     no canvas got another's picture; animation: 60 frames of all three, the
+     frame rate logged, no device error; detach-reattach: the middle canvas
+     is taken out of the document for 30 frames (still drawn into) and put
+     back, then drawn with a known colour and read back, and the animation
+     must still be advancing; uncaptured-errors: none on either device. Log
+     lines: RESULT webgpu-two-canvases <case> PASS|FAIL <why>, then RESULT
+     webgpu-two-canvases summary PASS|FAIL <n>/<m>. Upload the directory to
+     /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/two-canvases.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU two canvases</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 320px; height: 180px; border: 2px solid #555; margin-right: 12px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU two canvases</h1>
+<div id="row"><canvas id="a" width="320" height="180"></canvas><canvas id="b" width="320" height="180"></canvas><canvas id="c" width="320" height="180"></canvas></div>
+<div id="status">starting</div>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const WGSL = `
+struct Uniforms { angle: f32, aspect: f32 }
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let a = u.angle + f32(i) * 2.0943951;
+  return vec4f(sin(a) * 0.8 / u.aspect, cos(a) * 0.8, 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f {
+  return vec4f(0.95, 0.95, 0.95, 1.0);
+}`;
+const W = 320, H = 180;
+
+// One canvas: its context, a pipeline on its device, and two ways to draw.
+function scene(device, format, canvas, background, period) {
+  const context = canvas.getContext('webgpu');
+  T.assert(context, 'getContext("webgpu") returned ' + context + ' for canvas ' + canvas.id);
+  context.configure({ device, format, alphaMode: 'opaque' });
+  const module = device.createShaderModule({ code: WGSL });
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+  });
+  const uniforms = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniforms } }] });
+  function pass(clearValue, triangle) {
+    const encoder = device.createCommandEncoder();
+    const p = encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue, loadOp: 'clear', storeOp: 'store' }] });
+    if (triangle) {
+      p.setPipeline(pipeline);
+      p.setBindGroup(0, bindGroup);
+      p.draw(3);
+    }
+    p.end();
+    device.queue.submit([encoder.finish()]);
+  }
+  return {
+    canvas, device,
+    animate(now) {
+      device.queue.writeBuffer(uniforms, 0, new Float32Array([now / period * 2 * Math.PI, W / H]));
+      pass(background, true);
+    },
+    // Clears to a colour and returns what drawImage of the canvas gives, in the same task.
+    solid(colour) {
+      pass(colour.map(c => c / 255), false);
+      return T.snapshot(canvas, W, H);
+    },
+  };
+}
+
+T.run('two-canvases', async () => {
+  const first = await T.getDevice();
+  if (!first) return;
+  const second = await T.getDevice(undefined, undefined, 'second-device');
+  if (!second) return;
+  const status = document.getElementById('status');
+  const scenes = {};
+
+  if (!await T.test('configure', async () => {
+    T.assert(second.device !== first.device, 'the second requestAdapter().requestDevice() gave the same device object');
+    const errors = [];
+    for (const g of [first, second]) g.device.pushErrorScope('validation');
+    scenes.a = scene(first.device, first.format, document.getElementById('a'), [0.25, 0.05, 0.05, 1], 4000);
+    scenes.b = scene(first.device, first.format, document.getElementById('b'), [0.05, 0.25, 0.05, 1], 2500);
+    scenes.c = scene(second.device, second.format, document.getElementById('c'), [0.05, 0.05, 0.3, 1], 1500);
+    for (const g of [first, second]) errors.push(await T.step(g.device.popErrorScope(), 'popErrorScope'));
+    const error = errors.find(Boolean);
+    T.assert(!error, 'validation error: ' + (error && error.message));
+    return 'canvases a and b on one device, c on a second';
+  })) return;
+
+  // All three are drawn in one frame before any is read, so a mix-up shows.
+  const SOLID = { a: [204, 51, 51, 255], b: [51, 204, 51, 255], c: [51, 51, 204, 255] };
+  const images = {}, failures = {};
+  try {
+    await T.nextFrame();
+    for (const name of ['a', 'b', 'c']) {
+      try {
+        images[name] = scenes[name].solid(SOLID[name]);
+      } catch (e) {
+        failures[name] = e;
+      }
+    }
+  } catch (e) {
+    for (const name of ['a', 'b', 'c']) failures[name] = e;
+  }
+  for (const [name, label] of [['a', 'canvas-a'], ['b', 'canvas-b'], ['c', 'canvas-c-second-device']]) {
+    await T.test(label, async () => {
+      if (failures[name]) throw failures[name];
+      for (const [x, y] of [[W / 2, H / 2], [1, 1], [W - 2, H - 2]])
+        T.expectPixel(images[name], x, y, SOLID[name], 'drawImage of canvas ' + name);
+      return T.show(SOLID[name]);
+    });
+  }
+
+  let check = null;   // { name, colour, resolve, reject }: one frame of a known colour, read back
+  let shown = 0, shownAt = 0;
+  const animation = T.animate((now, frame) => {
+    for (const name of ['a', 'b', 'c']) {
+      if (check && check.name === name) {
+        const c = check;
+        check = null;
+        try {
+          c.resolve(scenes[name].solid(c.colour));
+        } catch (e) {
+          c.reject(e);
+        }
+      } else {
+        scenes[name].animate(now);
+      }
+    }
+    if (now - shownAt >= 1000) {
+      if (shownAt) status.textContent = ((frame - shown) * 1000 / (now - shownAt)).toFixed(1) + ' fps, frame ' + frame;
+      shown = frame;
+      shownAt = now;
+    }
+  }, 60, 20000);
+
+  await T.test('animation', async () => {
+    const m = await animation.measured;
+    return '60 frames of three canvases, ' + m.fps.toFixed(1) + ' fps, ' + m.jsMs.toFixed(2) + ' ms of JavaScript per frame';
+  });
+
+  await T.test('detach-reattach', async () => {
+    const canvas = scenes.b.canvas, row = document.getElementById('row'), after = scenes.c.canvas;
+    canvas.remove();
+    T.assert(!canvas.isConnected, 'canvas b is still in the document');
+    const framesBefore = animation.frames;
+    for (let i = 0; i < 30; i++) await T.nextFrame();
+    T.assert(!animation.stopped, 'drawing into the detached canvas threw');
+    row.insertBefore(canvas, after);
+    for (let i = 0; i < 5; i++) await T.nextFrame();
+    const colour = [230, 180, 40, 255];
+    const image = await T.step(new Promise((resolve, reject) => { check = { name: 'b', colour, resolve, reject }; }), 'check frame after re-adding');
+    for (const [x, y] of [[W / 2, H / 2], [1, 1], [W - 2, H - 2]])
+      T.expectPixel(image, x, y, colour, 'drawImage of the re-added canvas');
+    const at = animation.frames;
+    for (let i = 0; i < 10; i++) await T.nextFrame();
+    T.assert(!animation.stopped && animation.frames > at, 'the animation stopped after the canvas was re-added');
+    return 'drawn through ' + (at - framesBefore) + ' frames out of and back in the document, then read back right';
+  });
+
+  T.report('uncaptured-errors', T.uncaptured.length === 0, T.uncaptured.length ? T.uncaptured.join(' | ') : 'none');
+});
+</script>
+</body>
+</html>

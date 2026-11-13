@@ -36,6 +36,33 @@
 #include <time.h>
 #include <unistd.h>
 
+// The title's GPU submission lock (apps/title/titleradv.c; WebGPU builds only):
+// held around this thread's GL work so that RADV's submissions never fall
+// between two of ps5-opengl's, or the other way round.
+extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
+extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
+
+namespace {
+struct GPUSubmitLock {
+    GPUSubmitLock()
+    {
+        if (ps5wk_gpu_submit_lock)
+            ps5wk_gpu_submit_lock();
+    }
+    ~GPUSubmitLock() { release(); }
+    // After a glFlush(): what this thread drew is submitted.
+    void release()
+    {
+        if (m_released || !ps5wk_gpu_submit_unlock)
+            return;
+        m_released = true;
+        glFlush();
+        ps5wk_gpu_submit_unlock();
+    }
+    bool m_released { false };
+};
+}
+
 // GL is reached through libepoxy. In the title its dlopen()/dlsym() resolve
 // to the statically linked ps5-opengl (port/webkit/apps/title/dlshim.c).
 
@@ -665,7 +692,9 @@ void PS5Renderer::threadMain()
                 g_mutex_lock(&m_lock);
                 m_compositorRequested = false;
                 g_mutex_unlock(&m_lock);
+                GPUSubmitLock gpuSubmitLock;
                 m_compositor->applyPending();
+                gpuSubmitLock.release();
                 m_compositor->didPresent();
             }
             continue;
@@ -752,6 +781,8 @@ void PS5Renderer::threadMain()
             m_perfOn = perfWanted;
         }
 
+        // Until the swap: its wait for the vsync is not held against Dawn.
+        GPUSubmitLock gpuSubmitLock;
         setUpCompositorIfWanted();
         serviceBufferRequests();
         int64_t start = nowUS();
@@ -800,6 +831,7 @@ void PS5Renderer::threadMain()
             g_clear_pointer(&capturePath, g_free); // private browsing began meanwhile
         if (capturePath)
             writeCapture(capturePath);
+        gpuSubmitLock.release();
         int64_t swapStart = nowUS();
         eglSwapBuffers(m_eglDisplay, m_eglSurface);
         int64_t swapEnd = nowUS();

@@ -1,0 +1,117 @@
+<!doctype html>
+<!-- WebGPU on screen, the smallest page that draws: a 640x360 canvas,
+     context.configure() with the preferred format and a triangle turning on
+     requestAnimationFrame (its angle in a uniform buffer written every
+     frame). On screen: a triangle with a red, a green and a blue corner
+     turning once every four seconds on dark grey, and the frame rate under
+     it. Cases: configure; first-frame-readback: before the animation one
+     frame is cleared to a known colour (51,102,153) and, in the same task,
+     drawn into a 2D canvas with drawImage and read with getImageData (the
+     path todataurl.html covers in full; it can fail on its own while the
+     canvas still shows on screen); animation: after 30 frames the frame
+     rate and the JavaScript time per frame are logged, PASS if the frames
+     came and the device raised no error. The triangle keeps turning
+     afterwards. Log lines: RESULT webgpu-triangle <case> PASS|FAIL <why>,
+     then RESULT webgpu-triangle summary PASS|FAIL <n>/<m>. Upload the
+     directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/triangle.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU triangle</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 640px; height: 360px; border: 2px solid #555; display: block; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU triangle</h1>
+<canvas id="canvas" width="640" height="360"></canvas>
+<div id="status">starting</div>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const WGSL = `
+struct Uniforms { angle: f32, aspect: f32 }
+@group(0) @binding(0) var<uniform> u: Uniforms;
+struct V { @builtin(position) position: vec4f, @location(0) colour: vec3f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+  var colours = array<vec3f, 3>(vec3f(1.0, 0.1, 0.1), vec3f(0.1, 1.0, 0.1), vec3f(0.2, 0.3, 1.0));
+  let a = u.angle + f32(i) * 2.0943951;
+  return V(vec4f(sin(a) * 0.8 / u.aspect, cos(a) * 0.8, 0.0, 1.0), colours[i]);
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  return vec4f(v.colour, 1.0);
+}`;
+
+T.run('triangle', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device, format } = g;
+  const canvas = document.getElementById('canvas'), status = document.getElementById('status');
+  let context = null;
+
+  if (!await T.test('configure', async () => {
+    context = canvas.getContext('webgpu');
+    T.assert(context, 'canvas.getContext("webgpu") returned ' + context);
+    context.configure({ device, format, alphaMode: 'opaque' });
+    const texture = context.getCurrentTexture();
+    T.assert(texture.width === 640 && texture.height === 360, 'getCurrentTexture() is ' + texture.width + 'x' + texture.height);
+    T.assert(texture.format === format, 'getCurrentTexture().format is ' + texture.format);
+    return format + ' ' + texture.width + 'x' + texture.height;
+  }, device)) return;
+
+  await T.test('first-frame-readback', async () => {
+    await T.nextFrame();
+    const encoder = device.createCommandEncoder();
+    encoder.beginRenderPass({
+      colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: [0.2, 0.4, 0.6, 1], loadOp: 'clear', storeOp: 'store' }],
+    }).end();
+    device.queue.submit([encoder.finish()]);
+    const image = T.snapshot(canvas, 640, 360);
+    for (const [x, y] of [[320, 180], [1, 1], [638, 358]])
+      T.expectPixel(image, x, y, [51, 102, 153, 255], 'drawImage of the canvas');
+    return 'drawImage + getImageData give 51,102,153,255';
+  }, device);
+
+  await T.test('animation', async () => {
+    const module = device.createShaderModule({ code: WGSL });
+    const pipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+    });
+    const uniforms = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniforms } }] });
+    const values = new Float32Array(2);
+    let shown = 0, shownAt = 0;
+    const animation = T.animate((now, frame) => {
+      values[0] = now / 4000 * 2 * Math.PI;
+      values[1] = canvas.width / canvas.height;
+      device.queue.writeBuffer(uniforms, 0, values);
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: [0.1, 0.1, 0.12, 1], loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(3);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+      if (now - shownAt >= 1000) {
+        if (shownAt) status.textContent = ((frame - shown) * 1000 / (now - shownAt)).toFixed(1) + ' fps, frame ' + frame;
+        shown = frame;
+        shownAt = now;
+      }
+    }, 30, 10000);
+    const before = T.uncaptured.length;
+    const m = await animation.measured;
+    T.assert(T.uncaptured.length === before, 'uncaptured error: ' + T.uncaptured[before]);
+    return '30 frames, ' + m.fps.toFixed(1) + ' fps, ' + m.jsMs.toFixed(2) + ' ms of JavaScript per frame';
+  }, device);
+});
+</script>
+</body>
+</html>

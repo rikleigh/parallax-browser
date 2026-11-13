@@ -1,0 +1,43 @@
+PS5 (ps5webkit spike 12 P0a): the OpenGL ES backend takes its EGL and GL entry
+points from the host program instead of dlopen("libEGL.so"):
+    extern "C" void* dawn_ps5_egl_get_proc_address(const char* name);
+(the ANGLE equivalent: spikes/11-webgl/patches/0001-ps5-static-egl-lookup.patch).
+An adapter request that chains RequestAdapterOptionsGetGLProc still wins.
+
+--- a/src/dawn/native/opengl/BackendGL.cpp
++++ b/src/dawn/native/opengl/BackendGL.cpp
+@@ -37,6 +37,14 @@
+ #include "src/dawn/native/opengl/DisplayEGL.h"
+ #include "src/dawn/native/opengl/PhysicalDeviceGL.h"
+ 
++#if DAWN_PLATFORM_IS(PS5)
++// PS5: defined by the host program. There is no libEGL.so to dlopen; the EGL
++// and GL ES implementation is linked into the executable. Must resolve the
++// egl* entry points by name as well as the gl* ones (unlike eglGetProcAddress
++// of some implementations), and return null for names it does not have.
++extern "C" void* dawn_ps5_egl_get_proc_address(const char* name);
++#endif
++
+ namespace dawn::native::opengl {
+ 
+ namespace {
+@@ -131,10 +139,19 @@
+                                                  glGetProcOptions->display),
+             angleVirtualizationGroup));
+     } else {
++#if DAWN_PLATFORM_IS(PS5)
++        // The default EGL display of the host program's EGL.
++        SwallowDiscoveryError(AppendNewDeviceFrom(
++            DisplayEGL::CreateFromProcAndDisplay(
++                GetType(), reinterpret_cast<EGLGetProcProc>(dawn_ps5_egl_get_proc_address),
++                EGL_NO_DISPLAY),
++            angleVirtualizationGroup));
++#else
+         SwallowDiscoveryError(
+             AppendNewDeviceFrom(DisplayEGL::CreateFromDynamicLoading(
+                                     GetType(), kEGLLib, GetInstance()->GetRuntimeSearchPaths()),
+                                 angleVirtualizationGroup));
++#endif
+     }
+ 
+     return devices;

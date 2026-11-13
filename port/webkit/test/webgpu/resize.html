@@ -1,0 +1,196 @@
+<!doctype html>
+<!-- WebGPU canvas sizes and reconfiguration: the swap chain behind a canvas
+     has to follow canvas.width/height, unconfigure()/configure() and a new
+     format or device, which is where a port's presentation path leaks or
+     keeps showing a stale buffer. The canvas is shown at a fixed 640x360
+     whatever its pixel size. Each case draws 30 frames (a white triangle on
+     that case's colour) and then checks, in the task of the last frame, that
+     getCurrentTexture() has the expected size and format and that the canvas
+     drawn into a 2D canvas has the colour in a corner and white in the
+     centre. Cases: initial-320x180; size-640x360, size-1280x720,
+     size-1920x1080, size-16x16, size-320x180: only canvas.width/height
+     change, with no configure() call, as the specification has it (if the
+     texture keeps the old size the page says whether calling configure()
+     again would have fixed it); unconfigure: getCurrentTexture() throws
+     while unconfigured, and configure() brings the canvas back;
+     format-rgba16float: the same canvas configured as rgba16float with
+     toneMapping extended (what getConfiguration() reports is logged), then
+     back to the preferred format; device-change: configured with a second
+     device, then with the first again; uncaptured-errors: none on either
+     device. Afterwards the triangle pulses for
+     as long as the page is open. Log lines: RESULT webgpu-resize <case>
+     PASS|FAIL <why>, then RESULT webgpu-resize summary PASS|FAIL <n>/<m>.
+     Upload the directory to /data/ps5webkit/webgpu/ and open
+     file:///data/ps5webkit/webgpu/resize.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU resize</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  canvas { width: 640px; height: 360px; border: 2px solid #555; display: block; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU resize</h1>
+<canvas id="canvas" width="320" height="180"></canvas>
+<div id="status">starting</div>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const WGSL = `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var corners = array<vec2f, 3>(vec2f(0.0, 0.8), vec2f(-0.8, -0.8), vec2f(0.8, -0.8));
+  return vec4f(corners[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f {
+  return vec4f(1.0, 1.0, 1.0, 1.0);
+}`;
+const FRAMES = 30;
+
+T.run('resize', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device, format } = g;
+  const canvas = document.getElementById('canvas'), status = document.getElementById('status');
+  const context = canvas.getContext('webgpu');
+  if (!context) {
+    T.report('init', false, 'canvas.getContext("webgpu") returned ' + context);
+    return;
+  }
+
+  // draw(colour) for one device and target format.
+  const renderers = new Map();
+  function renderer(forDevice, forFormat) {
+    const key = (forDevice === device ? 'first ' : 'second ') + forFormat;
+    if (!renderers.has(key)) {
+      const module = forDevice.createShaderModule({ code: WGSL });
+      const pipeline = forDevice.createRenderPipeline({
+        layout: 'auto', vertex: { module, entryPoint: 'vs' },
+        fragment: { module, entryPoint: 'fs', targets: [{ format: forFormat }] },
+      });
+      renderers.set(key, colour => {
+        const encoder = forDevice.createCommandEncoder();
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: colour, loadOp: 'clear', storeOp: 'store' }],
+        });
+        pass.setPipeline(pipeline);
+        pass.draw(3);
+        pass.end();
+        forDevice.queue.submit([encoder.finish()]);
+      });
+    }
+    return renderers.get(key);
+  }
+
+  // Draws FRAMES frames and checks the last one: texture size and format, then the pixels.
+  async function drawAndCheck(draw, colour, width, height, wantFormat) {
+    status.textContent = canvas.width + 'x' + canvas.height + ' ' + wantFormat;
+    const before = performance.now();
+    for (let i = 0; i < FRAMES; i++) {
+      await T.nextFrame();
+      draw(colour);
+    }
+    const ms = performance.now() - before;
+    const texture = context.getCurrentTexture();
+    T.assert(texture.width === width && texture.height === height,
+      'getCurrentTexture() is ' + texture.width + 'x' + texture.height + ', expected ' + width + 'x' + height);
+    T.assert(texture.format === wantFormat, 'getCurrentTexture().format is ' + texture.format + ', expected ' + wantFormat);
+    const image = T.snapshot(canvas, width, height);
+    const want = colour.slice(0, 3).map(c => Math.round(c * 255)).concat(255);
+    T.expectPixel(image, 0, 0, want, 'corner');
+    T.expectPixel(image, width - 1, height - 1, want, 'far corner');
+    T.expectPixel(image, width >> 1, height >> 1, [255, 255, 255, 255], 'centre (triangle)');
+    return width + 'x' + height + ' ' + wantFormat + ', ' + (FRAMES * 1000 / ms).toFixed(1) + ' fps';
+  }
+
+  const configuration = { device, format, alphaMode: 'opaque' };
+  await T.test('initial-320x180', async () => {
+    context.configure(configuration);
+    return await drawAndCheck(renderer(device, format), [0.6, 0.2, 0.2, 1], 320, 180, format);
+  }, device);
+
+  const sizes = [[640, 360, [0.2, 0.6, 0.2, 1]], [1280, 720, [0.2, 0.2, 0.6, 1]], [1920, 1080, [0.6, 0.6, 0.2, 1]],
+                 [16, 16, [0.6, 0.2, 0.6, 1]], [320, 180, [0.2, 0.6, 0.6, 1]]];
+  for (const [width, height, colour] of sizes) {
+    await T.test('size-' + width + 'x' + height, async () => {
+      canvas.width = width;
+      canvas.height = height;
+      // No configure(): setting the size replaces the drawing buffer of a configured context.
+      let texture = context.getCurrentTexture();
+      if (texture.width !== width || texture.height !== height) {
+        const got = texture.width + 'x' + texture.height;
+        context.configure(configuration);
+        texture = context.getCurrentTexture();
+        const fixed = texture.width === width && texture.height === height;
+        throw new Error('after setting canvas.width/height getCurrentTexture() is ' + got + '; calling configure() again ' +
+          (fixed ? 'gives ' + width + 'x' + height : 'does not help (' + texture.width + 'x' + texture.height + ')'));
+      }
+      return await drawAndCheck(renderer(device, format), colour, width, height, format);
+    }, device);
+  }
+
+  await T.test('unconfigure', async () => {
+    context.unconfigure();
+    let thrown = null;
+    try {
+      context.getCurrentTexture();
+    } catch (e) {
+      thrown = e;
+    }
+    T.assert(thrown, 'getCurrentTexture() on an unconfigured context did not throw');
+    T.assert(thrown.name === 'InvalidStateError', 'getCurrentTexture() threw ' + T.describe(thrown) + ', expected an InvalidStateError');
+    if (context.getConfiguration)
+      T.assert(context.getConfiguration() === null, 'getConfiguration() while unconfigured is ' + context.getConfiguration());
+    await T.nextFrame();
+    await T.nextFrame();
+    context.configure(configuration);
+    return 'throws ' + thrown.name + ' while unconfigured; ' + await drawAndCheck(renderer(device, format), [0.5, 0.3, 0.1, 1], 320, 180, format);
+  }, device);
+
+  await T.test('format-rgba16float', async () => {
+    context.configure({ device, format: 'rgba16float', alphaMode: 'opaque', colorSpace: 'srgb', toneMapping: { mode: 'extended' } });
+    const reported = context.getConfiguration ? context.getConfiguration() : null;
+    const toneMapping = reported ? 'getConfiguration() reports format ' + reported.format + ', toneMapping ' + (reported.toneMapping ? reported.toneMapping.mode : 'absent')
+                                 : 'no getConfiguration()';
+    const detail = await drawAndCheck(renderer(device, 'rgba16float'), [0.1, 0.3, 0.5, 1], 320, 180, 'rgba16float');
+    context.configure(configuration);
+    await drawAndCheck(renderer(device, format), [0.3, 0.1, 0.5, 1], 320, 180, format);
+    return detail + '; ' + toneMapping + '; back to ' + format;
+  }, device);
+
+  await T.test('device-change', async () => {
+    const second = await T.getDevice(undefined, undefined, 'device-change-second-device');
+    T.assert(second, 'no second device');
+    let detail;
+    const error = await T.errorScope(second.device, 'validation', async () => {
+      context.configure({ device: second.device, format, alphaMode: 'opaque' });
+      detail = await drawAndCheck(renderer(second.device, format), [0.4, 0.4, 0.1, 1], 320, 180, format);
+    });
+    T.assert(!error, 'validation error on the second device: ' + (error && error.message));
+    context.configure(configuration);
+    await drawAndCheck(renderer(device, format), [0.1, 0.4, 0.4, 1], 320, 180, format);
+    second.device.destroy();
+    return 'second device: ' + detail + '; first device again';
+  }, device);
+
+  T.report('uncaptured-errors', T.uncaptured.length === 0, T.uncaptured.length ? T.uncaptured.join(' | ') : 'none');
+
+  // Keeps drawing so the canvas can be watched.
+  const draw = renderer(device, format);
+  status.textContent = 'done: ' + canvas.width + 'x' + canvas.height + ' ' + format;
+  (function tick(now) {
+    try {
+      draw([0.1, 0.1 + 0.1 * Math.sin((now || 0) / 500), 0.15, 1]);
+    } catch (e) {
+      T.info('draw after the checks threw: ' + T.describe(e));
+      return;
+    }
+    requestAnimationFrame(tick);
+  })();
+});
+</script>
+</body>
+</html>

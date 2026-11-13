@@ -1,0 +1,156 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.h b/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.h
+index 2ec8ceac50..883419e021 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.h
++++ b/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.h
+@@ -43,10 +43,14 @@ namespace WebCore {
+ struct GPUImageCopyExternalImage {
+     using SourceType = Variant<
+         Ref<ImageBitmap>,
+-#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
++        // ImageData, <img> and <video> need no WebCodecs (PS5 builds without it); only a
++        // VideoFrame does. The same split is in GPUImageCopyExternalImage.idl.
++#if ENABLE(VIDEO)
+         Ref<ImageData>,
+         Ref<HTMLImageElement>,
+         Ref<HTMLVideoElement>,
++#endif
++#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
+         Ref<WebCodecsVideoFrame>,
+ #endif
+ #if ENABLE(OFFSCREEN_CANVAS)
+diff --git a/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.idl b/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.idl
+index 9b8809d2d1..1761605074 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.idl
++++ b/Source/WebCore/Modules/WebGPU/GPUImageCopyExternalImage.idl
+@@ -35,8 +35,11 @@ typedef (sequence<GPUIntegerCoordinate> or GPUOrigin2DDict) GPUOrigin2D;
+     EnabledBySetting=WebGPUEnabled,
+ ] dictionary GPUImageCopyExternalImage {
+     required (ImageBitmap or
++#if defined(ENABLE_VIDEO) && ENABLE_VIDEO
++        ImageData or HTMLImageElement or HTMLVideoElement or
++#endif
+ #if defined(ENABLE_VIDEO) && ENABLE_VIDEO && defined(ENABLE_WEB_CODECS) && ENABLE_WEB_CODECS
+-        ImageData or HTMLImageElement or HTMLVideoElement or WebCodecsVideoFrame or
++        WebCodecsVideoFrame or
+ #endif
+ #if defined(ENABLE_OFFSCREEN_CANVAS) && ENABLE_OFFSCREEN_CANVAS
+         OffscreenCanvas or
+diff --git a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+index 22c411435f..3828f94826 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
++++ b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+@@ -521,7 +521,7 @@ static void imageBytesForSource(WebGPUIntegration& gpu, WebGPU::Queue& backing,
+         [&](const Ref<ImageBitmap>& imageBitmap) -> ResultType {
+             return getImageBytesFromImageBuffer(imageBitmap->buffer(), needsPremultipliedAlpha, callback);
+         },
+-#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
++#if ENABLE(VIDEO)
+         [&](const Ref<ImageData>& imageData) -> ResultType {
+             callback(imageData->byteArrayPixelBuffer()->bytes(), imageData->width(), imageData->height());
+         },
+@@ -706,16 +706,49 @@ static void imageBytesForSource(WebGPUIntegration& gpu, WebGPU::Queue& backing,
+             }
+             callback(tempBuffer.span(), orientedWidth, orientedHeight);
+ #else
+-            return callback({ }, 0, 0);
++            // PS5 (Dawn): the image drawn into a bitmap, which takes care of its orientation, of
++            // indexed and 16-bit images and of SVG, and read back unpremultiplied. An image is
++            // decoded premultiplied here, so colour under partial alpha has lost precision, and
++            // is gone where alpha is 0.
++            RefPtr cachedImage = imageElement->cachedImage();
++            RefPtr image = cachedImage ? cachedImage->image() : nullptr;
++            if (!image)
++                return callback({ }, 0, 0);
++            FloatSize imageSize = image->size(ImageOrientation::Orientation::FromImage);
++            // An SVG image has no pixels of its own: at the size of the destination, as on Cocoa.
++            if (is<SVGImage>(*image))
++                imageSize = FloatSize(destination.texture->width(), destination.texture->height());
++            IntSize bitmapSize = expandedIntSize(imageSize);
++            if (bitmapSize.isEmpty() || bitmapSize.width() > 16384 || bitmapSize.height() > 16384)
++                return callback({ }, 0, 0);
++            RefPtr imageBuffer = ImageBuffer::create(bitmapSize, RenderingMode::Unaccelerated, RenderingPurpose::Unspecified, 1, ColorSpace::SRGB(), PixelFormat::BGRA8);
++            if (!imageBuffer)
++                return callback({ }, 0, 0);
++            FloatRect destinationRect { { }, FloatSize(bitmapSize) };
++            image->draw(imageBuffer->context(), ConcreteObjectSize::fixed(imageSize), destinationRect, FloatRect { { }, imageSize }, { CompositeOperator::Copy, ImageOrientation::Orientation::FromImage });
++            return getImageBytesFromImageBuffer(imageBuffer, needsPremultipliedAlpha, callback);
+ #endif
+         },
+         [&]([[maybe_unused]] const Ref<HTMLVideoElement>& videoElement) -> ResultType {
+ #if PLATFORM(COCOA)
+             if (RefPtr player = videoElement->player(); player && player->isVideoPlayer())
+                 return getImageBytesFromVideoFrame(gpu, backing, player->videoFrameForCurrentTime(), backingCopySize, callback);
+-#endif
+             return callback({ }, 0, 0);
++#else
++            // PS5 (Dawn): the current frame painted into a bitmap, as drawImage(video) on a 2D
++            // canvas does. A player that cannot paint its frames gives transparent black.
++            IntSize videoSize(videoElement->videoWidth(), videoElement->videoHeight());
++            if (videoSize.isEmpty() || videoSize.width() > 16384 || videoSize.height() > 16384)
++                return callback({ }, 0, 0);
++            RefPtr imageBuffer = ImageBuffer::create(videoSize, RenderingMode::Unaccelerated, RenderingPurpose::Unspecified, 1, ColorSpace::SRGB(), PixelFormat::BGRA8);
++            if (!imageBuffer)
++                return callback({ }, 0, 0);
++            videoElement->paintCurrentFrameInContext(imageBuffer->context(), FloatRect { { }, FloatSize(videoSize) });
++            return getImageBytesFromImageBuffer(imageBuffer, needsPremultipliedAlpha, callback);
++#endif
+         },
++#endif
++#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
+         [&]([[maybe_unused]] const Ref<WebCodecsVideoFrame>& webCodecsFrame) -> ResultType {
+ #if PLATFORM(COCOA)
+             return getImageBytesFromVideoFrame(gpu, backing, webCodecsFrame->internalFrame(), backingCopySize, callback);
+@@ -889,7 +922,7 @@ static GPUResidentSource imageBufferForSource([[maybe_unused]] ScriptExecutionCo
+             // bufferAlphaFormat(), because premultiplyAlpha() is what was asked for, not what is stored.
+             return { imageBitmap->buffer(), imageBitmap->bufferAlphaFormat() == AlphaPremultiplication::Premultiplied };
+         },
+-#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
++#if ENABLE(VIDEO)
+         [&](const Ref<ImageData>& imageData) -> ResultType {
+             return gpuResidentSourceForImageData(context, imageData);
+         },
+@@ -899,6 +932,8 @@ static GPUResidentSource imageBufferForSource([[maybe_unused]] ScriptExecutionCo
+         [&](const Ref<HTMLVideoElement>& videoElement) -> ResultType {
+             return gpuResidentSourceForVideo(videoElement);
+         },
++#endif
++#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
+         [&](const Ref<WebCodecsVideoFrame>& videoFrame) -> ResultType {
+             return gpuResidentSourceForVideo(videoFrame);
+         },
+@@ -952,7 +987,7 @@ static bool isOriginClean(const auto& source, [[maybe_unused]] ScriptExecutionCo
+         [&](const Ref<ImageBitmap>& imageBitmap) -> ResultType {
+             return imageBitmap->originClean();
+         },
+-#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
++#if ENABLE(VIDEO)
+         [&](const Ref<ImageData>&) -> ResultType {
+             return true;
+         },
+@@ -966,6 +1001,8 @@ static bool isOriginClean(const auto& source, [[maybe_unused]] ScriptExecutionCo
+             return true;
+ #endif
+         },
++#endif
++#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
+         [&](const Ref<WebCodecsVideoFrame>&) -> ResultType {
+             return true;
+         },
+@@ -1043,7 +1080,7 @@ static bool isStateValid(const auto& source, const std::optional<GPUOrigin2D>& o
+             }
+             return true;
+         },
+-#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
++#if ENABLE(VIDEO)
+         [&](const Ref<ImageData>& imageData) -> ResultType {
+             auto width = imageData->width();
+             auto height = imageData->height();
+@@ -1072,6 +1109,8 @@ static bool isStateValid(const auto& source, const std::optional<GPUOrigin2D>& o
+         [&](const Ref<HTMLVideoElement>&) -> ResultType {
+             return true;
+         },
++#endif
++#if ENABLE(VIDEO) && ENABLE(WEB_CODECS)
+         [&](const Ref<WebCodecsVideoFrame>&) -> ResultType {
+             return true;
+         },
