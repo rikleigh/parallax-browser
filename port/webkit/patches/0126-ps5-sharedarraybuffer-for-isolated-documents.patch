@@ -1,0 +1,112 @@
+diff --git a/Source/WebCore/bindings/js/ScriptController.cpp b/Source/WebCore/bindings/js/ScriptController.cpp
+index 805e3a530a..1d65f19725 100644
+--- a/Source/WebCore/bindings/js/ScriptController.cpp
++++ b/Source/WebCore/bindings/js/ScriptController.cpp
+@@ -355,9 +355,37 @@ void ScriptController::initScriptForWindowProxy(JSWindowProxy& windowProxy)
+         windowProxy.window()->setProfileGroup(page->group().identifier());
+     }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    ps5ExposeSharedArrayBufferIfCrossOriginIsolated();
++#endif
++
+     protect(m_frame->loader())->dispatchDidClearWindowObjectInWorld(world);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: upstream exposes the SharedArrayBuffer constructor to every global object of a
++// WebProcess launched in CrossOriginMode::Isolated (JSDOMGlobalObject::addBuiltinGlobals), and
++// gets such a process by swapping processes on navigation. This port has one WebProcess
++// (patch 0018), so that never happens: a page served with COOP same-origin and COEP
++// require-corp had crossOriginIsolated == true, could make shared WebAssembly memories and
++// post them to workers, and still had no SharedArrayBuffer global. Emscripten's
++// pthread_create tests exactly that global and fails with EAGAIN. The constructor adds
++// nothing such a page could not already reach (new WebAssembly.Memory({shared: true})
++// .buffer.constructor). Called when the window's global object is made and again when the
++// document's opener policy is known (FrameLoader::didBeginDocument), whichever is later.
++void ScriptController::ps5ExposeSharedArrayBufferIfCrossOriginIsolated()
++{
++    RefPtr document = m_frame->document();
++    if (!document || !document->crossOriginIsolated())
++        return;
++    for (auto& jsWindowProxy : protect(windowProxy())->jsWindowProxiesAsVector()) {
++        JSC::JSLockHolder lock(jsWindowProxy->world().vm());
++        if (auto* window = jsWindowProxy->window())
++            window->exposeSharedArrayBuffer();
++    }
++}
++#endif
++
+ 
+ static Identifier jsValueToModuleKey(JSGlobalObject* lexicalGlobalObject, JSValue value)
+ {
+diff --git a/Source/WebCore/bindings/js/ScriptController.h b/Source/WebCore/bindings/js/ScriptController.h
+index 8953035ef6..ddd2b03ab6 100644
+--- a/Source/WebCore/bindings/js/ScriptController.h
++++ b/Source/WebCore/bindings/js/ScriptController.h
+@@ -175,6 +175,11 @@ public:
+     WEBCORE_EXPORT JSC::JSObject* jsObjectForPluginElement(HTMLPlugInElement*);
+ 
+     void initScriptForWindowProxy(JSWindowProxy&);
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: one WebProcess for every site, so the process is never the "isolated" kind that
++    // gets the SharedArrayBuffer constructor. A document its own headers isolate gets it here.
++    void ps5ExposeSharedArrayBufferIfCrossOriginIsolated();
++#endif
+ 
+     bool willReplaceWithResultOfExecutingJavascriptURL() const { return m_willReplaceWithResultOfExecutingJavascriptURL; }
+ 
+diff --git a/Source/WebCore/loader/FrameLoader.cpp b/Source/WebCore/loader/FrameLoader.cpp
+index 21f70a3555..c2e62d9fc3 100644
+--- a/Source/WebCore/loader/FrameLoader.cpp
++++ b/Source/WebCore/loader/FrameLoader.cpp
+@@ -998,6 +998,10 @@ void FrameLoader::didBeginDocument(bool dispatch, LocalDOMWindow* previousWindow
+             if (auto crossOriginOpenerPolicy = documentLoader->crossOriginOpenerPolicy())
+                 document->setCrossOriginOpenerPolicy(WTF::move(*crossOriginOpenerPolicy));
+         }
++#if defined(PS5_PAYLOAD_SDK)
++        // PS5: now that the opener policy is known (ScriptController.cpp).
++        frame->script().ps5ExposeSharedArrayBufferIfCrossOriginIsolated();
++#endif
+ 
+         if (!m_stateMachine.creatingInitialEmptyDocument() && document->url().protocolIsInHTTPFamily())
+             logCrossOriginIsolationDiagnostics(document, documentLoader->response(), frame->isMainFrame());
+diff --git a/Source/WebCore/workers/WorkerOrWorkletScriptController.cpp b/Source/WebCore/workers/WorkerOrWorkletScriptController.cpp
+index 3c86c40494..7d0171c720 100644
+--- a/Source/WebCore/workers/WorkerOrWorkletScriptController.cpp
++++ b/Source/WebCore/workers/WorkerOrWorkletScriptController.cpp
+@@ -34,6 +34,7 @@
+ #include "JSAudioWorkletGlobalScope.h"
+ #include "JSDOMBinding.h"
+ #include "JSDedicatedWorkerGlobalScope.h"
++#include "WorkerGlobalScope.h"
+ #include "JSEventTarget.h"
+ #include "JSExecState.h"
+ #include "JSPaintWorkletGlobalScope.h"
+@@ -71,6 +72,7 @@
+ #include <JavaScriptCore/VMTrapsInlines.h>
+ #include <JavaScriptCore/WebAssemblyModuleRecord.h>
+ #include <wtf/TZoneMallocInlines.h>
++#include <wtf/Scope.h>
+ 
+ namespace WebCore {
+ 
+@@ -692,6 +694,18 @@ void WorkerOrWorkletScriptController::initScript()
+     ASSERT(m_vm.get());
+     JSC::DeferTermination deferTermination(*m_vm.get());
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: a cross-origin isolated worker gets the SharedArrayBuffer constructor although the
++    // WebProcess is not an isolated one (ScriptController::ps5ExposeSharedArrayBufferIfCrossOriginIsolated).
++    auto exposeSharedArrayBuffer = makeScopeExit([&] {
++        auto* workerGlobalScope = dynamicDowncast<WorkerGlobalScope>(m_globalScope.get());
++        if (!workerGlobalScope || !workerGlobalScope->crossOriginIsolated() || !m_globalScopeWrapper)
++            return;
++        JSC::JSLockHolder lock(*m_vm.get());
++        m_globalScopeWrapper->exposeSharedArrayBuffer();
++    });
++#endif
++
+     if (is<DedicatedWorkerGlobalScope>(m_globalScope)) {
+         initScriptWithSubclass<JSDedicatedWorkerGlobalScopePrototype, JSDedicatedWorkerGlobalScope, DedicatedWorkerGlobalScope>();
+         return;

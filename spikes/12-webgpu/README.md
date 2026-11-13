@@ -103,6 +103,15 @@ Found on the way:
   then not map a 45 MB tensor (`getMappedRange()` came back empty) and
   crashed encoding a 16 MB IPC message. WebAssembly memories are 2 GiB at
   most now (0118; this is in every build, not only WebGPU ones).
+- A page served with COOP `same-origin` and COEP `require-corp` was
+  `crossOriginIsolated` and could share WebAssembly memories with workers,
+  but had no `SharedArrayBuffer` global: WebKit gives that to every page of a
+  WebProcess started as "isolated", which it gets by swapping processes on
+  navigation, and this port has one WebProcess (0018). Emscripten's
+  `pthread_create` tests that global and fails: a PS2 emulator on WebGPU
+  stopped at "cannot start the VU thread" with a
+  black canvas. Such documents and workers get the global now (0126; in
+  every build). The emulator then boots and presents at 1920x1080.
 - From a `file:` page, fetches from huggingface.co failed "due to access
   control checks" most of the time (the server's headers are right). Not
   looked into; the ML page takes its model from `serve-models.py` instead.
