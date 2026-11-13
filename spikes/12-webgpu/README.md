@@ -107,6 +107,12 @@ Found on the way:
   control checks" most of the time (the server's headers are right). Not
   looked into; the ML page takes its model from `serve-models.py` instead.
 
+Since the lock: Dawn carries the M157 branch's six backports that touch code
+built here (`port/deps/patches/dawn/0005` to `0010`); the test pages give the
+same results with them (`results/console-2026-11-13-d.log`). The default
+build (no WebGPU) with patches 0109 to 0122 runs on the console: WebGL
+regression 29/29, a three.js WebGL example at 60 frames/s, no `navigator.gpu`.
+
 ## Costs measured
 
 - Title image (flexible memory): +25 MB for RADV and Dawn together
@@ -133,8 +139,6 @@ Found on the way:
 - A buffer unmapped after writing sends its bytes inline in an IPC message up
   to WebKit's usual threshold; with little address space left that
   allocation is fatal for the WebProcess (seen once, before 0118).
-- Dawn is pinned at the M157 branch point; the branch's later backports
-  (three of them security fixes) are not in yet.
 - RADV is built by `p0b-radv/build-radv.sh`, not yet by `port/deps`.
 - Only one model has run (90 MB). Nothing larger, no image model, no
   ONNX Runtime Web without transformers.js.

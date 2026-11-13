@@ -1,0 +1,212 @@
+Dawn M157 branch (chromium/8103) backport c2e5529ac8b0, as on dawn.googlesource.com:
+
+[M157] Limit 3D textures to 4Gb when rounded to PoT on IMG
+
+Original change's description:
+> Limit 3D textures to 4Gb when rounded to PoT on IMG
+>
+> Adds a toggle to throw a synthetic OOM on when the dimensions of
+> the base level of a 3D texture, rounded to the next power-of-two,
+> cause the texture level to exceed 4Gb storage size. This works
+> around a bug on PowerVR GPUs.
+>
+> Bug: 567735302
+> Change-Id: Iebd98645c60a9c7ae1a35fef8ff0db3046f7c4c1
+> Reviewed-on: https://dawn-review.googlesource.com/c/dawn/+/348055
+> Reviewed-by: Corentin Wallez <cwallez@chromium.org>
+> Commit-Queue: Corentin Wallez <cwallez@chromium.org>
+
+(cherry picked from commit 62fa0852b8dec9966d9621f2dd6e7aea51f1a01d)
+
+Bug: 574326206,567735302
+Change-Id: Iebd98645c60a9c7ae1a35fef8ff0db3046f7c4c1
+Reviewed-on: https://dawn-review.googlesource.com/c/dawn/+/352155
+Commit-Queue: rubber-stamper@appspot.gserviceaccount.com <rubber-stamper@appspot.gserviceaccount.com>
+Auto-Submit: Chrome Cherry Picker <chrome-cherry-picker@chops-service-accounts.iam.gserviceaccount.com>
+Bot-Commit: rubber-stamper@appspot.gserviceaccount.com <rubber-stamper@appspot.gserviceaccount.com>
+
+diff --git a/src/dawn/native/Texture.cpp b/src/dawn/native/Texture.cpp
+index 2113f4f..3091e49 100644
+--- a/src/dawn/native/Texture.cpp
++++ b/src/dawn/native/Texture.cpp
+@@ -28,6 +28,7 @@
+ #include "src/dawn/native/Texture.h"
+ 
+ #include <algorithm>
++#include <limits>
+ #include <utility>
+ 
+ #include "absl/strings/str_format.h"
+@@ -1087,6 +1088,31 @@
+     }
+ }
+ 
++// Used by the Vulkan and GL backends to check for a certain class of driver bug. Must be called
++// from the backend because OOM errors can't be raised via MaybeValError.
++MaybeError VerifyBaseLevelFootprint(const TextureBase* texture) {
++    if (texture->GetDimension() == wgpu::TextureDimension::e3D &&
++        texture->GetDevice()->IsToggleEnabled(Toggle::Limit3DTexturePotFootprintTo4GB)) {
++        const Extent3D& size = texture->GetBaseSize();
++        const TexelBlockInfo& blockInfo =
++            texture->GetFormat().GetAspectInfo(wgpu::TextureAspect::All).block;
++        uint64_t baseWidth = RoundUp(size.width, blockInfo.width);
++        uint64_t baseHeight = RoundUp(size.height, blockInfo.height);
++        uint64_t baseDepth = size.depthOrArrayLayers;
++        uint64_t potWidth = NextPowerOfTwo(baseWidth);
++        uint64_t potHeight = NextPowerOfTwo(baseHeight);
++        uint64_t potDepth = NextPowerOfTwo(baseDepth);
++        uint64_t potByteSize = (potWidth / blockInfo.width) * (potHeight / blockInfo.height) *
++                               potDepth * blockInfo.byteSize;
++        if (potByteSize > std::numeric_limits<uint32_t>::max()) {
++            return DAWN_OUT_OF_MEMORY_ERROR(
++                "3D texture level power-of-two footprint exceeds 32-bit driver limit.");
++        }
++    }
++
++    return {};
++}
++
+ wgpu::TextureComponentSwizzle ComposeSwizzle(wgpu::TextureComponentSwizzle firstSwizzle,
+                                              wgpu::TextureComponentSwizzle secondSwizzle) {
+     return {
+diff --git a/src/dawn/native/Texture.h b/src/dawn/native/Texture.h
+index 2d01e0a..9c5404c 100644
+--- a/src/dawn/native/Texture.h
++++ b/src/dawn/native/Texture.h
+@@ -76,6 +76,8 @@
+ 
+ bool IsValidSampleCount(uint32_t sampleCount);
+ 
++MaybeError VerifyBaseLevelFootprint(const TextureBase* texture);
++
+ // Computes a swizzle which, when applied, is equivalent to applying `firstSwizzle`
+ // then `secondSwizzle`, like the order of WGSL swizzles (`value.rgba.rgba`).
+ wgpu::TextureComponentSwizzle ComposeSwizzle(wgpu::TextureComponentSwizzle firstSwizzle,
+diff --git a/src/dawn/native/Toggles.cpp b/src/dawn/native/Toggles.cpp
+index 26584c5..8ee12d7 100644
+--- a/src/dawn/native/Toggles.cpp
++++ b/src/dawn/native/Toggles.cpp
+@@ -970,6 +970,11 @@
+       "Some ImgTec drivers only report 64, which is below the WebGPU requirement. Enabling this "
+       "toggle accepts the limit of 64 instead of rejecting the adapter entirely.",
+       "https://g-issues.chromium.org/issues/559589664", ToggleStage::Instance}},
++    {Toggle::Limit3DTexturePotFootprintTo4GB,
++     {"limit_3d_texture_pot_footprint_to_4gb",
++      "Synthesize an OutOfMemory error on 3D texture creation if the power-of-two rounded byte "
++      "footprint of the texture is 4 GiB or larger. Works around a PowerVR driver bug.",
++      "https://crbug.com/497202432", ToggleStage::Device}},
+ 
+     // Comment to separate the }} so it is clearer what to copy-paste to add a toggle.
+ }};
+diff --git a/src/dawn/native/Toggles.h b/src/dawn/native/Toggles.h
+index 1f99a70..bf97d6b 100644
+--- a/src/dawn/native/Toggles.h
++++ b/src/dawn/native/Toggles.h
+@@ -233,6 +233,7 @@
+     AutoMapBackendBuffer,
+     PolyfillBoolVecDynamicStore,
+     VulkanRelaxMaxInterStageShaderVariables,
++    Limit3DTexturePotFootprintTo4GB,
+ 
+     EnumCount,
+     InvalidEnum = EnumCount,
+diff --git a/src/dawn/native/opengl/PhysicalDeviceGL.cpp b/src/dawn/native/opengl/PhysicalDeviceGL.cpp
+index 40d5615..111ae9b 100644
+--- a/src/dawn/native/opengl/PhysicalDeviceGL.cpp
++++ b/src/dawn/native/opengl/PhysicalDeviceGL.cpp
+@@ -513,6 +513,10 @@
+         Toggle::GLUseArrayLengthFromImmediate,
+         mVendorId == gpu_info::kVendorID_ImgTec || mVendorId == gpu_info::kVendorID_Nvidia);
+ 
++    // (crbug.com/497202432): Driver bug when POT-rounded 3D texture footprint is >= 4 GiB.
++    deviceToggles->Default(Toggle::Limit3DTexturePotFootprintTo4GB,
++                           mVendorId == gpu_info::kVendorID_ImgTec);
++
+     // Enable the integer range analysis for shader robustness by default if the corresponding
+     // platform feature is enabled.
+     deviceToggles->Default(
+diff --git a/src/dawn/native/opengl/TextureGL.cpp b/src/dawn/native/opengl/TextureGL.cpp
+index d8e00e7..343dc5a 100644
+--- a/src/dawn/native/opengl/TextureGL.cpp
++++ b/src/dawn/native/opengl/TextureGL.cpp
+@@ -296,6 +296,10 @@
+         DAWN_TRY(device->EnqueueGL([texture, clear](const OpenGLFunctions& gl) -> MaybeError {
+             DAWN_GL_TRY(gl, GenTextures(1, &texture->mTextureHandle));
+ 
++            // Ensure that the base level of the texture conforms to device-specific limits.
++            // May generate an OOM.
++            DAWN_TRY(VerifyBaseLevelFootprint(texture.Get()));
++
+             GLenum target = texture->GetGLTarget();
+             uint32_t levels = texture->GetNumMipLevels();
+             const GLFormat& glFormat = texture->GetGLFormat();
+diff --git a/src/dawn/native/vulkan/PhysicalDeviceVk.cpp b/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
+index 9028b78..aa6803a 100644
+--- a/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
++++ b/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
+@@ -1104,6 +1104,10 @@
+         // crbug.com/540087398 - Driver bug miscomputes mip sizes for NPOT depth/stencil textures.
+         // TODO(https://crbug.com/540087398): Limit this to old drivers once there's a driver fix.
+         deviceToggles->Default(Toggle::VulkanDisallowNPOTDepthStencilMipmaps, true);
++
++        // crbug.com/497202432 - Driver bug in when POT-rounded 3D texture footprint is >= 4 GiB.
++        // TODO(https://crbug.com/497202432): Limit this to old drivers once there's a driver fix.
++        deviceToggles->Default(Toggle::Limit3DTexturePotFootprintTo4GB, true);
+     }
+ 
+     // AMD Mesa front end optimizer bug for unary negation and abs.
+diff --git a/src/dawn/native/vulkan/TextureVk.cpp b/src/dawn/native/vulkan/TextureVk.cpp
+index d7f6a7c..5c4b20a 100644
+--- a/src/dawn/native/vulkan/TextureVk.cpp
++++ b/src/dawn/native/vulkan/TextureVk.cpp
+@@ -1456,6 +1456,10 @@
+     DAWN_ASSERT(
+         !(GetFormat().HasDepthOrStencil() && (GetUsage() & wgpu::TextureUsage::StorageBinding)));
+ 
++    // Ensure that the base level of the texture conforms to device-specific limits.
++    // May generate an OOM.
++    DAWN_TRY(VerifyBaseLevelFootprint(this));
++
+     // Create the Vulkan image "container". We don't need to check that the format supports the
+     // combination of sample, usage etc. because validation should have been done in the Dawn
+     // frontend already based on the minimum supported formats in the Vulkan spec
+diff --git a/src/dawn/tests/end2end/Texture3DTests.cpp b/src/dawn/tests/end2end/Texture3DTests.cpp
+index 0d36217..a873377 100644
+--- a/src/dawn/tests/end2end/Texture3DTests.cpp
++++ b/src/dawn/tests/end2end/Texture3DTests.cpp
+@@ -281,5 +281,35 @@
+                       VulkanBackend(),
+                       WebGPUBackend());
+ 
++class Texture3DPotFootprintTests : public DawnTest {};
++
++// Regression test for crbug.com/497202432: verify that a 3D texture whose power-of-two rounded
++// byte footprint reaches 4 GiB (513x513x513 rgba8unorm -> 1024x1024x1024 * 4 = 4 GiB) produces an
++// OutOfMemory error when limit_3d_texture_pot_footprint_to_4gb is enabled.
++TEST_P(Texture3DPotFootprintTests, PotFootprintAt4GBProducesOutOfMemory) {
++    wgpu::TextureDescriptor descriptor;
++    descriptor.dimension = wgpu::TextureDimension::e3D;
++    descriptor.size = {513, 513, 513};
++    descriptor.format = wgpu::TextureFormat::RGBA8Unorm;
++    descriptor.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
++
++    device.PushErrorScope(wgpu::ErrorFilter::OutOfMemory);
++    wgpu::Texture texture = device.CreateTexture(&descriptor);
++
++    wgpu::ErrorType oomResult = wgpu::ErrorType::NoError;
++    device.PopErrorScope(wgpu::CallbackMode::AllowProcessEvents,
++                         [&oomResult](wgpu::PopErrorScopeStatus, wgpu::ErrorType errorType,
++                                      wgpu::StringView) { oomResult = errorType; });
++    FlushWire();
++    instance.ProcessEvents();
++
++    EXPECT_EQ(oomResult, wgpu::ErrorType::OutOfMemory);
++}
++
++DAWN_INSTANTIATE_TEST(Texture3DPotFootprintTests,
++                      OpenGLBackend({"limit_3d_texture_pot_footprint_to_4gb"}),
++                      OpenGLESBackend({"limit_3d_texture_pot_footprint_to_4gb"}),
++                      VulkanBackend({"limit_3d_texture_pot_footprint_to_4gb"}));
++
+ }  // anonymous namespace
+ }  // namespace dawn

@@ -19,8 +19,13 @@ The branch head (`292f8067`, seven `[M157]` backports, three of them marked
 security or use-after-free) is not on GitHub: `github.com/google/dawn` carries
 `main` and date tags only, and a `dawn.googlesource.com` `+archive` tarball is
 generated per request, so it has no stable sha256. The branch point is on
-`main`, hence on GitHub. Before shipping, the seven backports want carrying as
-patches or a later `main` commit wants pinning.
+`main`, hence on GitHub. Six of the seven backports are carried as patches
+(`port/deps/patches/dawn/0005` to `0010`, each with its commit id and message,
+taken from dawn.googlesource.com): the 3D texture limit, the use-after-free in
+the empty copy workarounds, the oversized-row copy toggle, the Vulkan render
+pipeline robustness change, the pipeline event clear marked security, and the
+Vulkan queue's recording context reset. The seventh (`292f8067`) only moves
+the DirectX shader compiler's revision, which is not built here.
 
 Third-party trees, at the revisions in that commit's `DEPS`, as GitHub archive
 tarballs (sha256 in `step_dawn`):
@@ -186,7 +191,7 @@ tried, since the first one built. Not tested: libc++ 18 (the SDK's own).
      `EGL_KHR_fence_sync`/`EGL_KHR_reusable_sync`. The GL backend only answers
      requests for `FeatureLevel::Compatibility`. Whether ps5-opengl meets this
      is P0d's question.
-4. The M157 backports are missing (see "What is pinned").
+4. The M157 backports are carried as patches (see "What is pinned").
 5. `DynamicLib` still compiles to `dlopen`/`dlsym` (the SDK's libc has them);
    with the patches no PS5 code path calls it for a driver.
 6. External image import/export (dma-buf, opaque fd, sync fd) is off, so

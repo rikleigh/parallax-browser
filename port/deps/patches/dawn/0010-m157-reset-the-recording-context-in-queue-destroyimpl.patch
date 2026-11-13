@@ -1,0 +1,50 @@
+Dawn M157 branch (chromium/8103) backport 106245fa2b9e, as on dawn.googlesource.com:
+
+[M157] [vulkan] Reset the recording context in Queue::DestroyImpl.
+
+Original change's description:
+> [vulkan] Reset the recording context in Queue::DestroyImpl.
+>
+> - Prior to this change, Queue::DestroyImpl freed the current recording
+>   context's command pool and buffer, but left the dangling handles in
+>   mRecordingContext. If the recording context was used after the
+>   device was destroyed (e.g. by SharedTextureMemory::EndAccess
+>   performing an export transition submit), commands would be recorded
+>   into a freed VkCommandBuffer, causing a heap use-after-free in the
+>   driver.
+> - This change resets mRecordingContext after freeing its resources so
+>   that no dangling handles survive destruction. Any later use of the
+>   recording context sees null handles instead of freed objects.
+>
+> Bug: 577377985
+> Change-Id: I5440510d199218309d2da4ef9fcdf50529610fe9
+> Reviewed-on: https://dawn-review.googlesource.com/c/dawn/+/354676
+> Commit-Queue: Loko Kung <lokokung@google.com>
+> Reviewed-by: Corentin Wallez <cwallez@chromium.org>
+
+(cherry picked from commit e8595cc5ee53c5105fed064909d42d543660a4eb)
+
+Bug: 582139409,577377985
+Change-Id: I5440510d199218309d2da4ef9fcdf50529610fe9
+Reviewed-on: https://dawn-review.googlesource.com/c/dawn/+/356375
+Commit-Queue: rubber-stamper@appspot.gserviceaccount.com <rubber-stamper@appspot.gserviceaccount.com>
+Auto-Submit: Chrome Cherry Picker <chrome-cherry-picker@chops-service-accounts.iam.gserviceaccount.com>
+Bot-Commit: rubber-stamper@appspot.gserviceaccount.com <rubber-stamper@appspot.gserviceaccount.com>
+
+diff --git a/src/dawn/native/vulkan/QueueVk.cpp b/src/dawn/native/vulkan/QueueVk.cpp
+index e396d87..a69e539 100644
+--- a/src/dawn/native/vulkan/QueueVk.cpp
++++ b/src/dawn/native/vulkan/QueueVk.cpp
+@@ -453,8 +453,10 @@
+     for (VkSemaphore semaphore : mRecordingContext.waitSemaphores) {
+         device->fn.DestroySemaphore(vkDevice, semaphore, nullptr);
+     }
+-    mRecordingContext.waitSemaphores.clear();
+-    mRecordingContext.signalSemaphores.clear();
++    // Reset the recording context so that no dangling handles to the freed command pool/buffer
++    // survive destruction. Any later attempt to use the recording context then sees null handles
++    // instead of using freed objects.
++    mRecordingContext = CommandRecordingContext();
+ 
+     // Free any recycled command pools.
+     mUnusedCommands.Use([&](auto unusedCommands) {
