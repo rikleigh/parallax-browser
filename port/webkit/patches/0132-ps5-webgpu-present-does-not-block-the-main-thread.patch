@@ -1,0 +1,74 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp
+index 6c6102601b..e988ea710b 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.cpp
+@@ -109,6 +109,15 @@ void RemoteCompositorIntegration::prepareForDisplay(uint32_t frameIndex, Complet
+     });
+ }
+ 
++#if USE(DAWN)
++// PS5: PrepareForDisplay with no reply. The frame is presented when this thread reaches the
++// message, after the commands of the frame, and the Web Process does not wait for that.
++void RemoteCompositorIntegration::presentPS5(uint32_t frameIndex)
++{
++    protect(m_backing)->prepareForDisplay(frameIndex, [] { });
++}
++#endif
++
+ void RemoteCompositorIntegration::updateContentsHeadroom(float headroom)
+ {
+     protect(m_backing)->updateContentsHeadroom(headroom);
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h
+index 7d47ce2af3..3017b1d9cc 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.h
+@@ -112,6 +112,9 @@ private:
+ #endif
+ 
+     void prepareForDisplay(uint32_t frameIndex, CompletionHandler<void(Seconds, Seconds)>&&);
++#if USE(DAWN)
++    void presentPS5(uint32_t frameIndex);
++#endif
+     void updateContentsHeadroom(float);
+ 
+     const Ref<WebCore::WebGPUCompositorIntegration> m_backing;
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in
+index c2b3784cd7..cc82f6817d 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteCompositorIntegration.messages.in
+@@ -35,6 +35,7 @@ messages -> RemoteCompositorIntegration Stream {
+     void PrepareForDisplay(uint32_t frameIndex) -> (Seconds gpuFrameCost, Seconds presentStall) Synchronous NotStreamEncodableReply // Because CanvasRenderingContext::prepareForDisplay() requires the layer contents synchronously, this needs to be Synchronous.
+     void PaintCompositedResultsToCanvas(WebCore::RenderingResourceIdentifier imageBuffer, uint32_t bufferIndex) -> () Synchronous
+ #if USE(DAWN)
++    void PresentPS5(uint32_t frameIndex)
+     void ReadPixelsPS5(uint32_t bufferIndex, bool currentFrame) -> (std::optional<WebCore::SharedMemory::Handle> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, ::WebGPU::CanvasAlphaMode alphaMode) Synchronous NotStreamEncodableReply
+ #endif
+     void Destruct()
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp
+index 1697d78c3e..8a139b9f75 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteCompositorIntegrationProxy.cpp
+@@ -126,6 +126,23 @@ bool RemoteCompositorIntegrationProxy::ps5ReadPixels(uint32_t bufferIndex, bool
+ 
+ void RemoteCompositorIntegrationProxy::prepareForDisplay(uint32_t frameIndex, CompletionHandler<void()>&& completionHandler)
+ {
++#if USE(DAWN)
++    // PS5: the frame reaches the compositor from the title (PS5WebGPUCanvas), not through this
++    // process's layer tree, so nothing here needs it to have been presented. The synchronous
++    // message kept the main thread for as long as the title took to run the frame's commands
++    // (4.4 ms a frame for a WebGPU emulator, with its worker's proxied calls waiting behind it).
++    // PS5WK_WEBGPU_SYNC_PRESENT=1 (child.env): the synchronous message, as before.
++    static const bool synchronous = [] {
++        const char* value = getenv("PS5WK_WEBGPU_SYNC_PRESENT");
++        return value && *value && *value != '0';
++    }();
++    if (!synchronous) {
++        auto sendResult = send(Messages::RemoteCompositorIntegration::PresentPS5(frameIndex));
++        UNUSED_VARIABLE(sendResult);
++        completionHandler();
++        return;
++    }
++#endif
+     auto sendResult = sendSync(Messages::RemoteCompositorIntegration::PrepareForDisplay(frameIndex));
+     auto [gpuFrameCost, presentStall] = sendResult.takeReplyOr(Seconds { 0 }, Seconds { 0 });
+     m_lastFrameGPUCost = gpuFrameCost;

@@ -209,6 +209,17 @@ Found on the way:
   thread about 18 ms of WebAssembly a frame and about 14 ms waiting for the
   main thread (its own JavaScript, 4 ms; the synchronous PrepareForDisplay,
   4.4 ms a frame).
+- The canvas present no longer blocks the page's main thread (0132): on
+  Dawn the frame goes with an asynchronous `PresentPS5` message on the same
+  stream instead of the synchronous `PrepareForDisplay`
+  (`PS5WK_WEBGPU_SYNC_PRESENT=1` in `child.env` restores it). It did not
+  change the emulator's frame rate: a fight still presented 27 to 36 frames/s
+  (28 to 34 before), with `Atomics.wait` unchanged at about 120 a second of
+  5.5 ms. Tried with it and not kept: `maximumOMGCandidateCost` 1000000
+  (default 100000), which moved 45 oversized functions from BBQ (25% of the
+  emulator's thread) to OMG (17%) for 18 MB more code and no visible gain.
+  The fight is limited by one core's speed on the emulator's WebAssembly,
+  about 18 ms a frame.
 - From a `file:` page, fetches from huggingface.co failed "due to access
   control checks" most of the time (the server's headers are right). Not
   looked into; the ML page takes its model from `serve-models.py` instead.
