@@ -18,7 +18,7 @@ import argparse, collections, json, os, re, subprocess, sys
 SYMBOLIZER = '/opt/homebrew/opt/llvm@18/bin/llvm-symbolizer'
 NM = '/opt/homebrew/opt/llvm@18/bin/llvm-nm'
 
-TIERS = {'j0': 'JIT: thunks/ICs/regexp', 'j1': 'JIT: Baseline', 'j2': 'JIT: DFG', 'j3': 'JIT: FTL', 'j': 'JIT: unknown tier'}
+TIERS = {'j0': 'JIT: thunks/ICs/regexp', 'j1': 'JIT: Baseline', 'j2': 'JIT: DFG', 'j3': 'JIT: FTL', 'j4': 'JIT: wasm BBQ', 'j5': 'JIT: wasm OMG', 'j6': 'JIT: wasm OMG (OSR entry)', 'j7': 'JIT: wasm BBQ, function over 100 KB', 'j8': 'JIT: wasm OMG, function over 100 KB', 'j': 'JIT: unknown tier'}
 
 # Innermost frame that matches decides the area (checked leaf to root).
 AREAS = [

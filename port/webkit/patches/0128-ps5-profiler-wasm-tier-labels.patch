@@ -1,0 +1,103 @@
+diff --git a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+index b00384922d..0b3817fd35 100644
+--- a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
++++ b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+@@ -1197,7 +1197,7 @@ static void ps5NoteJITAllocation(void* start, void* end)
+         ps5JITRanges = static_cast<PS5JITRange*>(calloc(ps5JITRangeCount, sizeof(PS5JITRange)));
+     });
+     int tier = ps5CurrentJITTier;
+-    ps5JITCounters[tier & 3]++;
++    ps5JITCounters[tier < 4 ? tier : 0]++; // the WebAssembly tiers (4 to 8) count as other
+     if (!ps5JITRanges)
+         return;
+     auto& range = ps5JITRanges[ps5JITRangeNext.fetch_add(1, std::memory_order_relaxed) & (ps5JITRangeCount - 1)];
+diff --git a/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp b/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp
+index 17607c5879..4e3bdc9afa 100644
+--- a/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp
++++ b/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp
+@@ -45,6 +45,15 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/text/MakeString.h>
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <wtf/SetForScope.h>
++namespace JSC {
++// PS5 profiler (ExecutableAllocator.cpp): 4 BBQ, 5 OMG, 6 OMG for OSR entry; 7 and 8: BBQ and
++// OMG code of a function over 100000 bytes (upstream's maximumOMGCandidateCost).
++extern thread_local int ps5CurrentJITTier;
++}
++#endif
++
+ namespace JSC { namespace Wasm {
+ 
+ namespace WasmBBQPlanInternal {
+@@ -101,6 +110,9 @@ void BBQPlan::work()
+ 
+     // The finished code is patched further (wasm call-site linking in installOptimizedCallee) and
+     // flushed once afterward, so skip LinkBuffer's finalize instruction-cache flush.
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    SetForScope ps5TierScope(ps5CurrentJITTier, m_moduleInformation->functions[m_functionIndex].data.size() > 100000 ? 7 : 4);
++#endif
+     LinkBuffer linkBuffer(*context.wasmEntrypointJIT, callee.ptr(), LinkBuffer::Profile::WasmBBQ, JITCompilationCanFail, LinkBuffer::CacheFlushOnFinalize::No);
+     if (linkBuffer.didFailToAllocate()) [[unlikely]] {
+         fail(makeString("Out of executable memory while tiering up function at index "_s, m_functionIndex.rawIndex()), CompilationError::OutOfMemory);
+diff --git a/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp b/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp
+index 396aa3e419..9d2b5cda9d 100644
+--- a/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp
++++ b/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp
+@@ -44,6 +44,15 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/text/MakeString.h>
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <wtf/SetForScope.h>
++namespace JSC {
++// PS5 profiler (ExecutableAllocator.cpp): 4 BBQ, 5 OMG, 6 OMG for OSR entry; 7 and 8: BBQ and
++// OMG code of a function over 100000 bytes (upstream's maximumOMGCandidateCost).
++extern thread_local int ps5CurrentJITTier;
++}
++#endif
++
+ namespace JSC { namespace Wasm {
+ 
+ namespace WasmOMGPlanInternal {
+@@ -148,6 +157,9 @@ void OMGPlan::work()
+     Entrypoint omgEntrypoint;
+     // The finished code is patched further (wasm call-site linking in installOptimizedCallee) and
+     // flushed once afterward, so skip LinkBuffer's finalize instruction-cache flush.
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    SetForScope ps5TierScope(ps5CurrentJITTier, m_moduleInformation->functions[m_functionIndex].data.size() > 100000 ? 8 : 5);
++#endif
+     LinkBuffer linkBuffer(*context.wasmEntrypointJIT, callee.ptr(), LinkBuffer::Profile::WasmOMG, JITCompilationCanFail, LinkBuffer::CacheFlushOnFinalize::No);
+     if (linkBuffer.didFailToAllocate()) [[unlikely]] {
+         Locker locker { m_lock };
+diff --git a/Source/JavaScriptCore/wasm/WasmOSREntryPlan.cpp b/Source/JavaScriptCore/wasm/WasmOSREntryPlan.cpp
+index 652b216abc..3a1d6b09ea 100644
+--- a/Source/JavaScriptCore/wasm/WasmOSREntryPlan.cpp
++++ b/Source/JavaScriptCore/wasm/WasmOSREntryPlan.cpp
+@@ -42,6 +42,15 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/text/MakeString.h>
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <wtf/SetForScope.h>
++namespace JSC {
++// PS5 profiler (ExecutableAllocator.cpp): 4 BBQ, 5 OMG, 6 OMG for OSR entry; 7 and 8: BBQ and
++// OMG code of a function over 100000 bytes (upstream's maximumOMGCandidateCost).
++extern thread_local int ps5CurrentJITTier;
++}
++#endif
++
+ namespace JSC { namespace Wasm {
+ 
+ namespace WasmOSREntryPlanInternal {
+@@ -122,6 +131,9 @@ void OSREntryPlan::work()
+     Entrypoint omgEntrypoint;
+     // The finished code is patched further (wasm call-site linking in installOptimizedCallee) and
+     // flushed once afterward, so skip LinkBuffer's finalize instruction-cache flush.
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    SetForScope ps5TierScope(ps5CurrentJITTier, m_moduleInformation->functions[m_functionIndex].data.size() > 100000 ? 8 : 6);
++#endif
+     LinkBuffer linkBuffer(*context.wasmEntrypointJIT, callee.ptr(), LinkBuffer::Profile::WasmOMG, JITCompilationCanFail, LinkBuffer::CacheFlushOnFinalize::No);
+     if (linkBuffer.didFailToAllocate()) [[unlikely]] {
+         Locker locker { m_lock };
