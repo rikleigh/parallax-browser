@@ -112,6 +112,33 @@ Found on the way:
   stopped at "cannot start the VU thread" with a
   black canvas. Such documents and workers get the global now (0126; in
   every build). The emulator then boots and presents at 1920x1080.
+- The same emulator ran its fights at about 20 frames/s, the GPU side idle:
+  one thread of optimised WebAssembly (OMG) on one core. This port has
+  upstream's fast memory off (0030), so every access was bounds-checked, and
+  it cannot be had the upstream way: an inaccessible reservation costs CPU
+  page tables like any mapping (512 MB of `PROT_NONE`: +256 of the console's
+  8192; `MAP_GUARD` is refused; `test/memprobe/resprobe.c`). But a process's
+  address space ends at 0xFC00000000: mmap refuses every address from there
+  up and an access there is a SIGSEGV with its address
+  (`test/memprobe/topprobe.c`, 13.60). The first shared memory of a
+  WebProcess is now mapped to end there and its code has no bounds checks
+  (0127; in every build; each WebProcess first checks that the kernel refuses
+  the range; `/data/ps5webkit/no-wasm-top-memory` turns it off). One slot per
+  process; other memories keep their checks. Console:
+  `test/wasm/shared-memory-traps.html` 396/396 with the memory in the slot
+  (2 GiB and 64 MB maxima) and out of it, the slot freed and reused over
+  reloads; the emulator's fights at about 25 to 37 frames/s, by the
+  compositor's per-second counts in the title log (one play session each,
+  the owner playing; not the same scenes).
+  Not run: a memory in the slot posted to a worker by a test page (a `file:`
+  page cannot post one; the emulator's own threads do share it).
+  Also tried, not adopted: `JSC_maximumOMGCandidateCost=1000000` in
+  `child.env` (45 of the emulator's functions are over the 100 KB default and
+  stay in BBQ) gave 23 to 25 frames/s with bounds checks, for 18 MB more
+  JIT code.
+- With the emulator running the console was at 8112 to 8124 of 8192 CPU page
+  tables (4613 with no title running); its 2 GiB shared memory alone is 1024.
+  Not addressed.
 - From a `file:` page, fetches from huggingface.co failed "due to access
   control checks" most of the time (the server's headers are right). Not
   looked into; the ML page takes its model from `serve-models.py` instead.

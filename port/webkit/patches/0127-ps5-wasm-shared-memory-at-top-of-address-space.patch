@@ -1,0 +1,186 @@
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index b4da3e7106..fbbbcda681 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -43,7 +43,9 @@
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+ #include <wtf/Condition.h>
+ #include <wtf/Deque.h>
++#include <wtf/PageBlock.h>
+ #include <wtf/Threading.h>
++#include <sys/mman.h>
+ #include <unistd.h>
+ #endif
+ 
+@@ -177,10 +179,98 @@ bool BufferMemoryManager::tryMakeReadableAndWritable(void* address, size_t bytes
+ #endif
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5 (13.60, measured with payloads): a process's address space ends at 0xFC00000000. mmap refuses
++// every address from there up, MAP_FIXED included, and an access there is a SIGSEGV with the address.
++// An inaccessible reservation costs CPU page tables like any mapping (one per 2 MB, of 8192 for the
++// whole console) and MAP_GUARD is not supported, so upstream's fast memory (4 GiB + redzone reserved)
++// cannot be had. A memory that ends at the top needs none of it: memory32 code reaches at most
++// base + 4 GiB + redzone, and everything past the mapping is the kernel's own hole.
++// /data/ps5webkit/no-wasm-top-memory turns this off.
++static constexpr uintptr_t ps5AddressSpaceTop = 0xFC00000000ull;
++
++static bool ps5TopOfAddressSpaceIsUnmappable()
++{
++    static bool result = false;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        if (!access("/data/ps5webkit/no-wasm-top-memory", F_OK)) {
++            dataLogLn("[wasm] no memory at the top of the address space (/data/ps5webkit/no-wasm-top-memory)");
++            return;
++        }
++        if (!Options::useWasmFaultSignalHandler())
++            return;
++        // The whole range that code without bounds checks can reach past a memory ending at the top
++        // must be refused, or this firmware is not laid out as measured. By hint, never MAP_FIXED: where
++        // the kernel does allow a mapping, MAP_FIXED would replace whatever is there.
++        constexpr size_t step = 64 * 1024 * 1024;
++        size_t reach = BufferMemoryHandle::fastMappedBytes() + step;
++        size_t pageSize = WTF::pageSize();
++        for (size_t offset = 0; offset <= reach; offset += step) {
++            for (size_t probe : { offset, offset + step - pageSize }) {
++                void* address = std::bit_cast<void*>(ps5AddressSpaceTop + probe);
++                void* mapped = mmap(address, pageSize, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
++                if (mapped != MAP_FAILED) {
++                    munmap(mapped, pageSize);
++                    dataLogLn("[wasm] no memory at the top of the address space: the kernel mapped ", RawPointer(mapped), " for a hint of ", RawPointer(address));
++                    return;
++                }
++            }
++        }
++        result = true;
++    });
++    return result;
++}
++
++void* BufferMemoryManager::ps5TryAllocateTopSlot(size_t mappedCapacity)
++{
++    size_t pageSize = WTF::pageSize();
++    if (!mappedCapacity || mappedCapacity % pageSize || mappedCapacity > PageCount::maxMemory32Bytes)
++        return nullptr;
++    if (!ps5TopOfAddressSpaceIsUnmappable())
++        return nullptr;
++
++    Locker locker { m_lock };
++    if (m_ps5TopSlotBase)
++        return nullptr;
++    void* wanted = std::bit_cast<void*>(ps5AddressSpaceTop - mappedCapacity);
++    // By hint: if something is mapped in the range already the kernel moves the mapping, and we give it back.
++    void* result = mmap(wanted, mappedCapacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (result == MAP_FAILED)
++        return nullptr;
++    if (result != wanted) {
++        munmap(result, mappedCapacity);
++        dataLogLn("[wasm] the top of the address space is in use (asked ", RawPointer(wanted), ", got ", RawPointer(result), "): bounds checks for this memory");
++        return nullptr;
++    }
++    m_ps5TopSlotBase = std::bit_cast<uintptr_t>(result);
++    m_ps5TopSlotBytes = mappedCapacity;
++    return result;
++}
++
++void BufferMemoryManager::ps5FreeTopSlot(void* basePtr, size_t mappedCapacity)
++{
++    Locker locker { m_lock };
++    RELEASE_ASSERT(std::bit_cast<uintptr_t>(basePtr) == m_ps5TopSlotBase && mappedCapacity == m_ps5TopSlotBytes);
++    munmap(basePtr, mappedCapacity);
++    m_ps5TopSlotBase = 0;
++    m_ps5TopSlotBytes = 0;
++}
++#endif
++
+ bool BufferMemoryManager::isInGrowableOrFastMemory(void* address)
+ {
+     // NOTE: This can be called from a signal handler, but only after we proved that we're in JIT code or IPInt code.
+     Locker locker { m_lock };
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // The top slot: its mapping (no-access past the memory's size) and the hole above it, as far as
++    // code without bounds checks reaches.
++    if (m_ps5TopSlotBase) {
++        uintptr_t value = std::bit_cast<uintptr_t>(address);
++        if (value >= m_ps5TopSlotBase && value - m_ps5TopSlotBase <= BufferMemoryHandle::fastMappedBytes())
++            return true;
++    }
++#endif
+     for (void* memory : m_fastMemories) {
+         char* start = static_cast<char*>(memory);
+         if (start <= address && address <= start + BufferMemoryHandle::fastMappedBytes())
+@@ -378,7 +468,10 @@ BufferMemoryHandle::~BufferMemoryHandle()
+         switch (m_mode) {
+         case MemoryMode::Signaling: {
+             // nullBasePointer's zero-sized memory is not used for MemoryMode::Signaling.
+-#if OS(WINDOWS)
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++            // PS5: the only Signaling memory is the one at the top of the address space.
++            BufferMemoryManager::singleton().ps5FreeTopSlot(memory, m_mappedCapacity);
++#elif OS(WINDOWS)
+             // The region was only reserved; releasing frees it without re-committing.
+             BufferMemoryManager::singleton().freeFastMemory(memory);
+ #else
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.h b/Source/JavaScriptCore/runtime/BufferMemoryHandle.h
+index f451fe17dc..61845213c7 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.h
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.h
+@@ -108,6 +108,14 @@ public:
+ 
+     bool isInGrowableOrFastMemory(void* address);
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the one mapping per process that ends at the top of the address space. Every address from
++    // there up faults, mapped by nobody, so such a memory needs no bounds checks (MemoryMode::Signaling)
++    // and no reservation past its own maximum. Null if the slot is taken or cannot be had.
++    void* ps5TryAllocateTopSlot(size_t mappedCapacity);
++    void ps5FreeTopSlot(void* basePtr, size_t mappedCapacity);
++#endif
++
+     // We allow people to "commit" more wasm memory than there is on the system since most of the time
+     // people don't actually write to most of that memory. There is some chance that this gets us
+     // jettisoned but that's possible anyway.
+@@ -136,6 +144,10 @@ private:
+     Vector<void*> m_fastMemories;
+     StdSet<std::pair<uintptr_t, size_t>> m_growableBoundsCheckingMemories;
+     size_t m_physicalBytes { 0 };
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    uintptr_t m_ps5TopSlotBase { 0 };
++    size_t m_ps5TopSlotBytes { 0 };
++#endif
+ };
+ 
+ class BufferMemoryHandle final : public ThreadSafeRefCounted<BufferMemoryHandle> {
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index bf3900ed32..a034bbac80 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -269,6 +269,26 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+         return nullptr;
+     }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: one shared memory32 per process goes at the top of the address space and needs no bounds
++    // checks (BufferMemoryHandle.cpp). Shared ones because they map their maximum anyway; the first
++    // that asks gets it.
++    if (sharingMode == MemorySharingMode::Shared && !addressType.is64Bit() && desiredMemoryMode.value_or(MemoryMode::Signaling) == MemoryMode::Signaling
++        && reservedMaximumBytes >= initialBytes) {
++        if (char* topMemory = static_cast<char*>(BufferMemoryManager::singleton().ps5TryAllocateTopSlot(reservedMaximumBytes))) {
++            constexpr bool readable = false;
++            constexpr bool writable = false;
++            if (reservedMaximumBytes > initialBytes)
++                OSAllocator::protect(topMemory + initialBytes, reservedMaximumBytes - initialBytes, readable, writable);
++            dataLogLn("[wasm] shared memory of ", initialBytes / (1024 * 1024), " MB (maximum ", reservedMaximumBytes / (1024 * 1024), " MB) at ", RawPointer(topMemory), ", the top of the address space: no bounds checks");
++            Ref handle = adoptRef(*new BufferMemoryHandle(topMemory, initialBytes, reservedMaximumBytes, initial, maximum, MemorySharingMode::Shared, MemoryMode::Signaling));
++            auto span = handle->mutableSpan();
++            auto content = SharedArrayBufferContents::create(span, reservedMaximumBytes, WTF::move(handle), nullptr, SharedArrayBufferContents::Mode::WebAssembly);
++            return Memory::create(WTF::move(content), addressType, WTF::move(growSuccessCallback));
++        }
++    }
++#endif
++
+     if (desiredMemoryMode == MemoryMode::Signaling) {
+         BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
+         return nullptr;

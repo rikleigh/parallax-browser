@@ -1,0 +1,182 @@
+<!doctype html>
+<!-- Shared WebAssembly memories and out-of-bounds accesses. On the PS5 the
+     first shared memory of a WebProcess is mapped so that it ends at the top
+     of the address space and its code has no bounds checks (patch 0127): an
+     access past the end has to fault and come back as a RuntimeError, from
+     every tier, and must never read or write anything. The page makes two
+     shared memories, A (maximum 2 GiB, as an Emscripten pthreads build
+     declares; it gets the top slot when the page is the first to ask) and B
+     (maximum 64 MB; bounds checks, the slot being taken), and runs the same
+     cases on both, three times: cold (IPInt), after 300,000 calls of each
+     function (BBQ) and after long loops and 3,000,000 more calls (OMG).
+     Cases: loads and stores at the last valid address; loads, 8-bit loads,
+     stores and atomic loads at the size, in the reserved part, at the
+     maximum - 4, at the maximum, at 2 GiB, at 4 GiB - 4; a small constant
+     offset (64 KiB) and a large one (256 MB) past the end; a loop that walks
+     off the end; what was stored is still there after the traps; then the
+     memory is grown by 1 MB: the old end is valid, the new end traps. A
+     worker gets memory A and runs the cases on it too (skipped with a note
+     if the memory cannot be posted). The loop's time per load is logged for
+     A and B. ?amax=<MB> and ?bmax=<MB> change the maxima.
+     Log lines: RESULT wasm-shared-traps <case> PASS|FAIL <why>, then
+     RESULT wasm-shared-traps summary PASS|FAIL <n>/<m>. Which memory got the
+     slot is in the WebProcess's "[wasm] shared memory of ... at the top of
+     the address space" line. Upload to /data/ps5webkit/wasm-shared-traps.html
+     and open file:///data/ps5webkit/wasm-shared-traps.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wasm shared memory traps</title>
+<style>
+  body { background: #111; color: #eee; font: 20px/1.3 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>WebAssembly shared memory: out-of-bounds traps</h1>
+<div id="out"></div>
+<script id="common">
+const PAGE = 65536, MB = 1024 * 1024;
+function leb(n) {
+  const b = [];
+  do { let x = n & 0x7f; n = Math.floor(n / 128); if (n) x |= 0x80; b.push(x); } while (n);
+  return b;
+}
+function section(id, body) { return [id, ...leb(body.length), ...body]; }
+function vec(items) { return [...leb(items.length), ...items.flat()]; }
+function func(locals, code) { const body = [...locals, ...code, 0x0b]; return [...leb(body.length), ...body]; }
+function name(s) { return [s.length, ...[...s].map(c => c.charCodeAt(0))]; }
+// One module, the memory imported ("e" "m", shared, initial and maximum in pages).
+function moduleBytes(initialPages, maximumPages) {
+  const I = 0x7f;
+  const types = vec([[0x60, 1, I, 1, I], [0x60, 2, I, I, 0], [0x60, 2, I, I, 1, I]]);
+  const imports = vec([[...name('e'), ...name('m'), 0x02, 0x03, ...leb(initialPages), ...leb(maximumPages)]]);
+  const funcs = vec([[0], [0], [0], [1], [0], [2], [0], [2]]);
+  const names = ['load', 'loadSmall', 'loadBig', 'store', 'load8', 'sum', 'atomicLoad', 'walk'];
+  const exports = vec(names.map((n, i) => [...name(n), 0x00, i]));
+  const noLocals = [0], twoLocals = [1, 2, I];
+  const loopTail = [0x20, 2, 0x41, 1, 0x6a, 0x22, 2, 0x20, 1, 0x49, 0x0d, 0, 0x0b, 0x20, 3];
+  const code = vec([
+    func(noLocals, [0x20, 0, 0x28, 2, 0]),                         // load: i32.load
+    func(noLocals, [0x20, 0, 0x28, 2, ...leb(65536)]),             // loadSmall: offset 64 KiB
+    func(noLocals, [0x20, 0, 0x28, 2, ...leb(256 * MB)]),          // loadBig: offset 256 MB
+    func(noLocals, [0x20, 0, 0x20, 1, 0x36, 2, 0]),                // store: i32.store
+    func(noLocals, [0x20, 0, 0x2d, 0, 0]),                         // load8: i32.load8_u
+    func(twoLocals, [0x03, 0x40, 0x20, 3, 0x20, 0, 0x28, 2, 0, 0x6a, 0x21, 3, ...loopTail]),             // sum(p, n)
+    func(noLocals, [0x20, 0, 0xfe, 0x10, 2, 0]),                   // atomicLoad: i32.atomic.load
+    func(twoLocals, [0x03, 0x40, 0x20, 3, 0x20, 0, 0x20, 2, 0x6a, 0x2d, 0, 0, 0x6a, 0x21, 3, ...loopTail]), // walk(base, n)
+  ]);
+  return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...section(1, types), ...section(2, imports), ...section(3, funcs), ...section(7, exports), ...section(10, code)]);
+}
+// Runs every case on one memory; report(case, ok, why).
+function runCases(tag, memory, maximumBytes, report, stages) {
+  const initialPages = memory.buffer.byteLength / PAGE;
+  const x = new WebAssembly.Instance(new WebAssembly.Module(moduleBytes(initialPages, maximumBytes / PAGE)), { e: { m: memory } }).exports;
+  const traps = (what, f) => {
+    try { const v = f(); report(what, false, 'no trap, returned ' + v); }
+    catch (e) { report(what, e instanceof WebAssembly.RuntimeError, String(e)); }
+  };
+  const equal = (what, got, want) => report(what, got === want, 'got ' + got + ', want ' + want);
+  const cases = (stage) => {
+    const size = memory.buffer.byteLength, t = tag + '-' + stage + '-';
+    x.store(size - 4, 0x5a5a1234 | 0); x.store(0, 77);
+    equal(t + 'last-word', x.load(size - 4), 0x5a5a1234 | 0);
+    equal(t + 'last-byte', x.load8(size - 1), 0x5a);
+    equal(t + 'atomic-last-word', x.atomicLoad(size - 4), 0x5a5a1234 | 0);
+    equal(t + 'small-offset-in-bounds', x.loadSmall(size - 65536 - 4), 0x5a5a1234 | 0);
+    const outside = [['size-3', size - 3], ['size', size], ['size+64K', size + 65536], ['maximum-4', maximumBytes - 4],
+      ['maximum', maximumBytes], ['2G', 0x80000000], ['3G', 0xc0000000], ['4G-4', 0xfffffffc], ['4G-1', 0xffffffff]];
+    for (const [where, p] of outside) {
+      if (p + 4 <= size || p > 0xffffffff) continue;
+      traps(t + 'load-' + where, () => x.load(p | 0));
+      traps(t + 'store-' + where, () => x.store(p | 0, 0x0bad0bad));
+      traps(t + 'atomic-load-' + where, () => x.atomicLoad(p | 0));
+      if (p >= size) traps(t + 'load8-' + where, () => x.load8(p | 0));
+    }
+    traps(t + 'small-offset-size', () => x.loadSmall((size - 65536) | 0));
+    traps(t + 'small-offset-4G-4', () => x.loadSmall(0xfffffffc | 0));
+    traps(t + 'big-offset-0', () => { if (size >= 256 * MB + 4) throw new WebAssembly.RuntimeError('memory is larger than the offset: not a case'); return x.loadBig(0); });
+    traps(t + 'big-offset-2G', () => x.loadBig(0x80000000 | 0));
+    traps(t + 'big-offset-4G-4', () => x.loadBig(0xfffffffc | 0));
+    traps(t + 'walk-off-the-end', () => x.walk(size - 1000, 100000));
+    equal(t + 'walk-to-the-end', x.walk(size - 4, 4), 0x12 + 0x34 + 0x5a + 0x5a);
+    equal(t + 'intact-last-word', x.load(size - 4), 0x5a5a1234 | 0);
+    equal(t + 'intact-first-word', x.load(0), 77);
+  };
+  const warm = (calls, loops) => {
+    const size = memory.buffer.byteLength;
+    for (let i = 0; i < calls; i++) { x.load(i & 0xfffc); x.loadSmall(i & 0xfc); x.store(8 + (i & 0xfc), i); x.load8(i & 0xffff); x.atomicLoad(i & 0xfffc); }
+    for (let i = 0; i < calls / 1000; i++) { try { x.loadBig(0); } catch (e) { } x.walk(0, 100); }
+    let ns = 0;
+    for (let i = 0; i < loops; i++) {
+      const t0 = performance.now();
+      x.sum(size - 4, 20000000); x.walk(0, Math.min(size, 16 * MB));
+      ns = (performance.now() - t0) * 1e6 / (20000000 + Math.min(size, 16 * MB));
+    }
+    return ns;
+  };
+  cases('cold');
+  if (stages < 2) return;
+  warm(300000, 0); cases('warm');
+  const ns = warm(3000000, 6); cases('hot');
+  report(tag + '-loop-time', true, ns.toFixed(3) + ' ns per load in the loops');
+  const before = memory.buffer.byteLength;
+  equal(tag + '-grow', memory.grow(16), before / PAGE);
+  equal(tag + '-grown-size', memory.buffer.byteLength, before + 16 * PAGE);
+  equal(tag + '-grown-old-end', x.load(before), 0);
+  x.store(before + 16 * PAGE - 4, 4242);
+  equal(tag + '-grown-new-last-word', x.load(before + 16 * PAGE - 4), 4242);
+  cases('grown');
+}
+</script>
+<script>
+const out = document.getElementById('out');
+let passed = 0, total = 0;
+function report(what, ok, why) {
+  total++; if (ok) passed++;
+  const line = 'RESULT wasm-shared-traps ' + what + ' ' + (ok ? 'PASS' : 'FAIL') + ' ' + (why || '');
+  if (!ok || /loop-time|worker|memory-/.test(what)) { console.log(line); out.textContent += line + '\n'; }
+}
+function note(text) { console.log('RESULT wasm-shared-traps note ' + text); out.textContent += text + '\n'; }
+const params = new URLSearchParams(location.search);
+const aMax = Number(params.get('amax') || 2048) * MB, bMax = Number(params.get('bmax') || 64) * MB;
+(async () => {
+  try {
+    note('crossOriginIsolated ' + self.crossOriginIsolated + ', SharedArrayBuffer ' + (typeof SharedArrayBuffer));
+    let a, b;
+    try { a = new WebAssembly.Memory({ initial: 256, maximum: aMax / PAGE, shared: true }); report('memory-a', true, '16 MB of ' + aMax / MB + ' MB'); }
+    catch (e) { report('memory-a', false, String(e)); }
+    try { b = new WebAssembly.Memory({ initial: 16, maximum: bMax / PAGE, shared: true }); report('memory-b', true, '1 MB of ' + bMax / MB + ' MB'); }
+    catch (e) { report('memory-b', false, String(e)); }
+    if (a) runCases('a', a, aMax, report, 3);
+    await new Promise(r => setTimeout(r, 0));
+    if (b) runCases('b', b, bMax, report, 3);
+    if (a) {
+      const source = document.getElementById('common').textContent + `
+        onmessage = (e) => {
+          const results = [];
+          try { runCases('worker-a', e.data.memory, e.data.maximum, (what, ok, why) => results.push([what, ok, why]), 3); }
+          catch (error) { results.push(['worker-a-run', false, String(error)]); }
+          postMessage(results);
+        };`;
+      const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+      const results = await new Promise((resolve) => {
+        worker.onmessage = (e) => resolve(e.data);
+        worker.onerror = (e) => resolve([['worker-a-start', false, e.message || 'worker error']]);
+        try { worker.postMessage({ memory: a, maximum: aMax }); }
+        catch (e) { note('worker cases skipped: the memory cannot be posted (' + e + ')'); resolve([]); }
+        setTimeout(() => resolve([['worker-a-timeout', false, 'no answer in 120 s']]), 120000);
+      });
+      for (const [what, ok, why] of results) report(what, ok, why);
+      if (results.length) report('worker-a-cases', true, results.length + ' cases ran in the worker');
+    }
+  } catch (e) {
+    report('exception', false, String(e) + (e.stack ? ' ' + e.stack : ''));
+  }
+  const line = 'RESULT wasm-shared-traps summary ' + (passed === total && total ? 'PASS' : 'FAIL') + ' ' + passed + '/' + total;
+  console.log(line); out.textContent += line + '\n';
+})();
+</script>
+</body>
+</html>
