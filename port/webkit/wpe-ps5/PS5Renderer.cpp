@@ -41,6 +41,9 @@
 // between two of ps5-opengl's, or the other way round.
 extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
 extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
+// ps5-opengl: eglSwapBuffers queues the flip and returns; the first draw into the back buffer of
+// the next frame waits for it. This is that wait, on its own.
+extern "C" int ps5_agc_gate2_wait_present(void) __attribute__((weak));
 
 namespace {
 struct GPUSubmitLock {
@@ -781,6 +784,11 @@ void PS5Renderer::threadMain()
             m_perfOn = perfWanted;
         }
 
+        // The wait for the last frame's flip, before the lock and not inside the first draw under
+        // it: it is most of a frame (13.7 of 16.7 ms), and Dawn waited as long for every
+        // vkQueueSubmit of a page (a WebGPU emulator: 47% of its GPU thread's time, measured).
+        if (ps5wk_gpu_submit_lock && ps5_agc_gate2_wait_present)
+            ps5_agc_gate2_wait_present();
         // Until the swap: its wait for the vsync is not held against Dawn.
         GPUSubmitLock gpuSubmitLock;
         setUpCompositorIfWanted();

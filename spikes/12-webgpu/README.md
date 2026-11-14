@@ -186,6 +186,29 @@ Found on the way:
   the default build also loaded example.com and a Wikipedia article. The
   1536 MB growth took 863 ms on the default build and 118 ms on the WebGPU
   one, not looked into.
+- The emulator was still slow with no thread busy. Wall-time profiles
+  (`PS5WK_PROFILE=threads` in `child.env`, `threads` in
+  `/data/ps5webkit/title-profile`) showed Dawn's thread waiting 47% of the
+  time for the GPU submission lock (`titleradv.c`): the render thread took it
+  for a frame's GL work and its first draw then waited for the last frame's
+  flip inside ps5-opengl, 13.7 of 16.7 ms, with the lock. It now makes that
+  wait first (`ps5_agc_gate2_wait_present`, `PS5Renderer.cpp`; WebGPU builds
+  only) and holds the lock for about 0.5 ms a frame; Dawn's wait is 1%. The
+  WebProcess went from 0.8 to 1.5 cores in a fight, and
+  `video-texture.html` from 39.1 to 60.0 frames/s. Checked: triangle, cube,
+  two-canvases, resize, todataurl, video-texture; the compositor at 59.9
+  frames/s.
+- Two logs for such pages (0131, off unless asked for):
+  `PS5WK_ATOMICS_LOG=1` in `child.env` gives `[atomics]` lines every 5 s
+  (how long `Atomics.wait` blocks; how long a notified `Atomics.waitAsync`
+  takes to run its task), and `/data/ps5webkit/webgpu-latency-log` gives
+  `[webgpu] title: latency` lines (from `mapAsync`, `onSubmittedWorkDone`
+  and a canvas's readback to Dawn's callback). In a fight after the lock
+  fix: about 30 canvas frames/s; `mapAsync` 0.24 ms; about 150 proxied calls
+  a second to the main thread, served in 0.5 ms on average; the emulator's
+  thread about 18 ms of WebAssembly a frame and about 14 ms waiting for the
+  main thread (its own JavaScript, 4 ms; the synchronous PrepareForDisplay,
+  4.4 ms a frame).
 - From a `file:` page, fetches from huggingface.co failed "due to access
   control checks" most of the time (the server's headers are right). Not
   looked into; the ML page takes its model from `serve-models.py` instead.

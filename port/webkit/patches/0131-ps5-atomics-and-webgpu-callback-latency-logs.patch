@@ -1,0 +1,258 @@
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.cpp b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+index 75fbd33871..90222bc88d 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.cpp
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+@@ -40,8 +40,73 @@
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
++#include <wtf/Scope.h>
++#include <wtf/DataLog.h>
++
+ namespace JSC {
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5, PS5WK_ATOMICS_LOG=1 (child.env): how long Atomics.wait blocks and how long a notified
++// Atomics.waitAsync takes to run its task, every 5 s. An Emscripten pthreads page proxies calls
++// to its main thread with this pair, and the round trips are what such a page waits for.
++namespace PS5AtomicsLog {
++static constexpr unsigned bucketCount = 8;
++static constexpr double bucketLimitsUS[bucketCount] = { 50, 100, 200, 500, 1000, 2000, 5000, 1e18 };
++struct Histogram {
++    std::atomic<uint64_t> count { 0 };
++    std::atomic<uint64_t> totalUS { 0 };
++    std::atomic<uint64_t> buckets[bucketCount] { };
++    void add(Seconds duration)
++    {
++        double us = duration.microseconds();
++        count++;
++        totalUS += static_cast<uint64_t>(us);
++        unsigned bucket = 0;
++        while (us >= bucketLimitsUS[bucket])
++            bucket++;
++        buckets[bucket]++;
++    }
++    void dumpAndReset(const char* name, double seconds)
++    {
++        uint64_t n = count.exchange(0), total = totalUS.exchange(0);
++        uint64_t b[bucketCount];
++        for (unsigned i = 0; i < bucketCount; ++i)
++            b[i] = buckets[i].exchange(0);
++        if (!n)
++            return;
++        dataLogLn("[atomics] ", name, ": ", static_cast<uint64_t>(n / seconds), "/s, ", total / n, " us avg, ", static_cast<uint64_t>(total / seconds / 1000), " ms/s; under 50 us ", b[0], ", 100 ", b[1], ", 200 ", b[2], ", 500 ", b[3], ", 1 ms ", b[4], ", 2 ms ", b[5], ", 5 ms ", b[6], ", more ", b[7]);
++    }
++};
++static Histogram syncWaitNotified, syncWaitTimedOut, asyncNotifyToTask;
++static std::atomic<uint64_t> syncNotEqual { 0 };
++static std::atomic<double> lastDump { 0 };
++static bool enabled()
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* value = getenv("PS5WK_ATOMICS_LOG");
++        on = value && *value && *value != '0';
++    }
++    return on;
++}
++static void maybeDump()
++{
++    double now = MonotonicTime::now().secondsSinceEpoch().seconds();
++    double last = lastDump.load();
++    if (now - last < 5 || !lastDump.compare_exchange_strong(last, now))
++        return;
++    if (!last)
++        return;
++    double seconds = now - last;
++    syncWaitNotified.dumpAndReset("wait, notified", seconds);
++    syncWaitTimedOut.dumpAndReset("wait, timed out", seconds);
++    asyncNotifyToTask.dumpAndReset("waitAsync, notify to task", seconds);
++    if (uint64_t n = syncNotEqual.exchange(0))
++        dataLogLn("[atomics] wait, not-equal at once: ", static_cast<uint64_t>(n / seconds), "/s");
++}
++}
++#endif
++
+ namespace WaiterListsManagerInternal {
+ static constexpr bool verbose = false;
+ }
+@@ -91,8 +156,23 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+         VMBlockingScope waitScope(vm, StopTheWorldEvent::AtomicsWaitBlocked);
+ 
+         Locker listLocker { list->lock };
+-        if (WTF::atomicLoad(ptr) != expectedValue)
++        if (WTF::atomicLoad(ptr) != expectedValue) {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++            if (PS5AtomicsLog::enabled())
++                PS5AtomicsLog::syncNotEqual++;
++#endif
+             return WaitSyncResult::NotEqual;
++        }
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        MonotonicTime ps5WaitStart = MonotonicTime::now();
++        bool ps5TimedOut = false;
++        auto ps5Logged = makeScopeExit([&] {
++            if (!PS5AtomicsLog::enabled())
++                return;
++            (ps5TimedOut ? PS5AtomicsLog::syncWaitTimedOut : PS5AtomicsLog::syncWaitNotified).add(MonotonicTime::now() - ps5WaitStart);
++            PS5AtomicsLog::maybeDump();
++        });
++#endif
+ 
+         list->addLast(listLocker, syncWaiter);
+         dataLogLnIf(WaiterListsManagerInternal::verbose, "<WaiterListManager> <Thread:", Thread::currentSingleton(), "> added a new SyncWaiter=", syncWaiter.get(), " to a waiterList for ptr ", RawPointer(ptr));
+@@ -113,6 +193,9 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+         if (didGetDequeued)
+             return WaitSyncResult::OK;
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        ps5TimedOut = true;
++#endif
+         didGetDequeued = list->findAndRemove(listLocker, syncWaiter);
+         ASSERT(didGetDequeued);
+         return WaitSyncResult::TimedOut;
+@@ -220,7 +303,14 @@ void WaiterListManager::notifyWaiterImpl(const AbstractLocker& listLocker, Ref<W
+     ASSERT(!waiter->isOnList());
+ 
+     if (waiter->isAsync()) {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        MonotonicTime ps5Notified = MonotonicTime::now();
++        waiter->scheduleWorkAndClear(listLocker, [resolveResult, ps5Notified](DeferredWorkTimer::Ticket& ticket) {
++            if (PS5AtomicsLog::enabled() && resolveResult == ResolveResult::Ok)
++                PS5AtomicsLog::asyncNotifyToTask.add(MonotonicTime::now() - ps5Notified);
++#else
+         waiter->scheduleWorkAndClear(listLocker, [resolveResult](DeferredWorkTimer::Ticket& ticket) {
++#endif
+             JSPromise* promise = uncheckedDowncast<JSPromise>(ticket.target());
+             JSGlobalObject* globalObject = promise->realm();
+             VM& vm = promise->vm();
+diff --git a/Source/WebGPU/WebGPUDawn/Buffer.cpp b/Source/WebGPU/WebGPUDawn/Buffer.cpp
+index d3979077c5..17876c1553 100644
+--- a/Source/WebGPU/WebGPUDawn/Buffer.cpp
++++ b/Source/WebGPU/WebGPUDawn/Buffer.cpp
+@@ -113,7 +113,8 @@ void BufferImpl::mapAsync(OptionSet<MapMode> mode, uint64_t offset, std::optiona
+ 
+     // A std::nullopt size is passed on as such: Dawn then reports a range that starts after the
+     // end of the buffer.
+-    m_buffer.MapAsync(toDawn(mode), static_cast<size_t>(offset), size ? static_cast<size_t>(rangeSize) : wgpu::kWholeMapSize, wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(callback)), protectedThis = Ref { *this }, canStartMapping, generation, mode, offset, rangeSize](wgpu::MapAsyncStatus status, wgpu::StringView) {
++    m_buffer.MapAsync(toDawn(mode), static_cast<size_t>(offset), size ? static_cast<size_t>(rangeSize) : wgpu::kWholeMapSize, wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(callback)), protectedThis = Ref { *this }, canStartMapping, generation, mode, offset, rangeSize, registered = MonotonicTime::now()](wgpu::MapAsyncStatus status, wgpu::StringView) {
++        noteCallbackLatency(LatencyKind::MapAsync, registered);
+         bool success = status == wgpu::MapAsyncStatus::Success;
+         // The buffer was unmapped or destroyed in the meantime when the generations differ. Dawn
+         // aborts the mapping then, so this is for the order of the callbacks only.
+diff --git a/Source/WebGPU/WebGPUDawn/Instance.cpp b/Source/WebGPU/WebGPUDawn/Instance.cpp
+index 6d98151dfd..7aa4cb6d58 100644
+--- a/Source/WebGPU/WebGPUDawn/Instance.cpp
++++ b/Source/WebGPU/WebGPUDawn/Instance.cpp
+@@ -31,6 +31,8 @@
+ #include "Device.h"
+ #include "PresentationContext.h"
+ #include <dawn/native/DawnNative.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #include <wtf/Seconds.h>
+ #include <wtf/SetForScope.h>
+ 
+@@ -51,6 +53,49 @@ static constexpr auto idlePumpInterval = 100_us;
+ // See ~InstanceImpl(). With the sleep between the rounds this is a tenth of a second.
+ static constexpr unsigned maximumFinalPumpRounds = 1000;
+ 
++void noteCallbackLatency(LatencyKind kind, MonotonicTime registered)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        // open(), as MemoryBudget.cpp: this runs in the title.
++        int fd = open("/data/ps5webkit/webgpu-latency-log", O_RDONLY);
++        enabled = fd >= 0;
++        if (fd >= 0)
++            close(fd);
++        WTFLogAlways("[webgpu] title: latency log %s (/data/ps5webkit/webgpu-latency-log)", enabled ? "on" : "off");
++    }
++    if (!enabled)
++        return;
++    // One thread registers and is called back (the pump's).
++    static constexpr unsigned bucketCount = 8;
++    static constexpr double limitsUS[bucketCount] = { 200, 500, 1000, 2000, 4000, 8000, 16000, 1e18 };
++    struct Histogram { uint64_t count { 0 }; double totalUS { 0 }; uint64_t buckets[bucketCount] { }; };
++    static Histogram histograms[3];
++    static MonotonicTime lastDump = MonotonicTime::now();
++    auto now = MonotonicTime::now();
++    double us = (now - registered).microseconds();
++    auto& histogram = histograms[static_cast<unsigned>(kind)];
++    histogram.count++;
++    histogram.totalUS += us;
++    unsigned bucket = 0;
++    while (us >= limitsUS[bucket])
++        bucket++;
++    histogram.buckets[bucket]++;
++    double seconds = (now - lastDump).seconds();
++    if (seconds < 5)
++        return;
++    lastDump = now;
++    static constexpr const char* names[3] = { "mapAsync", "onSubmittedWorkDone", "canvas readback" };
++    for (unsigned i = 0; i < 3; ++i) {
++        auto& h = histograms[i];
++        if (h.count)
++            WTFLogAlways("[webgpu] title: latency %s: %.0f/s, %.0f us avg; under 200 us %llu, 500 %llu, 1 ms %llu, 2 ms %llu, 4 ms %llu, 8 ms %llu, 16 ms %llu, more %llu", names[i], h.count / seconds, h.totalUS / h.count,
++                static_cast<unsigned long long>(h.buckets[0]), static_cast<unsigned long long>(h.buckets[1]), static_cast<unsigned long long>(h.buckets[2]), static_cast<unsigned long long>(h.buckets[3]),
++                static_cast<unsigned long long>(h.buckets[4]), static_cast<unsigned long long>(h.buckets[5]), static_cast<unsigned long long>(h.buckets[6]), static_cast<unsigned long long>(h.buckets[7]));
++        h = { };
++    }
++}
++
+ RefPtr<InstanceImpl> InstanceImpl::create(InstanceDescriptor&& descriptor)
+ {
+     wgpu::InstanceDescriptor instanceDescriptor;
+diff --git a/Source/WebGPU/WebGPUDawn/Instance.h b/Source/WebGPU/WebGPUDawn/Instance.h
+index 70abcfca47..900736d973 100644
+--- a/Source/WebGPU/WebGPUDawn/Instance.h
++++ b/Source/WebGPU/WebGPUDawn/Instance.h
+@@ -28,6 +28,7 @@
+ #include <WebGPU/WebGPUCpp.h>
+ #include <memory>
+ #include <webgpu/webgpu_cpp.h>
++#include <wtf/MonotonicTime.h>
+ #include <wtf/CompletionHandler.h>
+ #include <wtf/Function.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -50,6 +51,12 @@ struct CallbackCounts : public ThreadSafeRefCounted<CallbackCounts> {
+     uint64_t completed { 0 };
+ };
+ 
++// PS5, /data/ps5webkit/webgpu-latency-log: how long Dawn takes to call back, from the call that
++// registers the callback, every 5 s ("[webgpu] title: latency ..."). What a page that waits for a
++// mapping or for submitted work waits for.
++enum class LatencyKind : uint8_t { MapAsync, SubmittedWorkDone, CanvasReadback };
++void noteCallbackLatency(LatencyKind, MonotonicTime registered);
++
+ // The instance, and the pump for Dawn's callbacks.
+ //
+ // Every call arrives on one thread, and Dawn calls back only from ProcessEvents()
+diff --git a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+index dcf0f71404..c859dc8a8e 100644
+--- a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
++++ b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+@@ -299,7 +299,8 @@ void PresentationContextImpl::startReadback(size_t readbackIndex, uint32_t frame
+         if (RefPtr protectedThis = weakThis.get())
+             protectedThis->readbackCompleted(generation, readbackIndex, frameIndex, presentTime, success);
+     };
+-    m_readbackBuffers[readbackIndex].MapAsync(wgpu::MapMode::Read, 0, static_cast<size_t>(m_configuration->readbackSize), wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(completed))](wgpu::MapAsyncStatus status, wgpu::StringView) {
++    m_readbackBuffers[readbackIndex].MapAsync(wgpu::MapMode::Read, 0, static_cast<size_t>(m_configuration->readbackSize), wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(completed)), registered = MonotonicTime::now()](wgpu::MapAsyncStatus status, wgpu::StringView) {
++        noteCallbackLatency(LatencyKind::CanvasReadback, registered);
+         pending->handler()(status == wgpu::MapAsyncStatus::Success);
+     });
+ }
+diff --git a/Source/WebGPU/WebGPUDawn/Queue.cpp b/Source/WebGPU/WebGPUDawn/Queue.cpp
+index 9d89fa23e8..57668693ce 100644
+--- a/Source/WebGPU/WebGPUDawn/Queue.cpp
++++ b/Source/WebGPU/WebGPUDawn/Queue.cpp
+@@ -56,7 +56,8 @@ void QueueImpl::onSubmittedWorkDone(CompletionHandler<void()>&& callback)
+     }
+ 
+     // The status is not reported: the work is done, or the device is gone and it never will be.
+-    m_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(callback))](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
++    m_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(callback)), registered = MonotonicTime::now()](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
++        noteCallbackLatency(LatencyKind::SubmittedWorkDone, registered);
+         pending->handler()();
+     });
+ }
