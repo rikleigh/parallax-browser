@@ -138,7 +138,18 @@ Found on the way:
   JIT code.
 - With the emulator running the console was at 8112 to 8124 of 8192 CPU page
   tables (4613 with no title running); its 2 GiB shared memory alone is 1024.
-  Not addressed.
+  Not addressed. A payload can read the count:
+  `sceKernelGetPageTableStats(int* cpuTotal, int* cpuAvailable, int* gpuTotal,
+  int* gpuAvailable)` returned 0 with 8192 total, and the available count
+  fell by 256 while 512 MB was mapped and came back after the unmap. Not
+  checked: against the kernel log at the same moment, from the title, the
+  cost of a call.
+- With 0127 and 0128, both builds on the console: the thirteen WebGPU pages
+  as in the table above (the ML page not run), WebGL regression 29/29,
+  `test/wasm/shared-memory-traps.html` 396/396, a memory grown to 1536 MB;
+  the default build also loaded example.com and a Wikipedia article. The
+  1536 MB growth took 863 ms on the default build and 118 ms on the WebGPU
+  one, not looked into.
 - From a `file:` page, fetches from huggingface.co failed "due to access
   control checks" most of the time (the server's headers are right). Not
   looked into; the ML page takes its model from `serve-models.py` instead.
