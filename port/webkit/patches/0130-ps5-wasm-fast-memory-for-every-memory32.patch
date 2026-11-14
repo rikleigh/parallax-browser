@@ -1,0 +1,27 @@
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index 79ab861262..4832d1b0ee 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -126,8 +126,9 @@ static void ps5ReleaseReservation(void* base, size_t bytes)
+ 
+ bool BufferMemoryManager::ps5UseFastMemory(MemorySharingMode sharingMode)
+ {
+-    // Shared memories only: a non-shared one keeps its bounds checks and the mappings of 0099.
+-    // /data/ps5webkit/no-wasm-fast-memory: none. /data/ps5webkit/wasm-fast-memory-all: every memory32.
++    // Every memory32, as upstream. /data/ps5webkit/no-wasm-fast-memory: none, and
++    // /data/ps5webkit/wasm-fast-memory-shared-only: shared ones only; the others then have bounds
++    // checks and the mappings of 0099, as do all past the limit of fast memories a process.
+     static int mode = 0;
+     static std::once_flag once;
+     std::call_once(once, [] {
+@@ -137,7 +138,9 @@ bool BufferMemoryManager::ps5UseFastMemory(MemorySharingMode sharingMode)
+             dataLogLn("[wasm] no fast memories (/data/ps5webkit/no-wasm-fast-memory)");
+             return;
+         }
+-        mode = access("/data/ps5webkit/wasm-fast-memory-all", F_OK) ? 1 : 2;
++        mode = access("/data/ps5webkit/wasm-fast-memory-shared-only", F_OK) ? 2 : 1;
++        if (mode == 1)
++            dataLogLn("[wasm] fast memories for shared memories only (/data/ps5webkit/wasm-fast-memory-shared-only)");
+     });
+     return mode == 2 || (mode == 1 && sharingMode == MemorySharingMode::Shared);
+ }

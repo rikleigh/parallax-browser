@@ -17,7 +17,8 @@
      memory is grown by 1 MB: the old end is valid, the new end traps. A
      worker gets memory A and runs the cases on it too (skipped with a note
      if the memory cannot be posted). The loop's time per load is logged for
-     A and B. ?amax=<MB> and ?bmax=<MB> change the maxima.
+     A and B. ?amax=<MB> and ?bmax=<MB> change the maxima; ?shared=0 makes
+     both memories non-shared (also without bounds checks since 0130).
      Log lines: RESULT wasm-shared-traps <case> PASS|FAIL <why>, then
      RESULT wasm-shared-traps summary PASS|FAIL <n>/<m>. A memory without
      bounds checks has a "[wasm] fast memory of ..." line from the
@@ -38,6 +39,7 @@
 <div id="out"></div>
 <script id="common">
 const PAGE = 65536, MB = 1024 * 1024;
+const sharedMemories = new URLSearchParams(location.search).get("shared") !== "0";
 function leb(n) {
   const b = [];
   do { let x = n & 0x7f; n = Math.floor(n / 128); if (n) x |= 0x80; b.push(x); } while (n);
@@ -51,7 +53,7 @@ function name(s) { return [s.length, ...[...s].map(c => c.charCodeAt(0))]; }
 function moduleBytes(initialPages, maximumPages) {
   const I = 0x7f;
   const types = vec([[0x60, 1, I, 1, I], [0x60, 2, I, I, 0], [0x60, 2, I, I, 1, I]]);
-  const imports = vec([[...name('e'), ...name('m'), 0x02, 0x03, ...leb(initialPages), ...leb(maximumPages)]]);
+  const imports = vec([[...name('e'), ...name('m'), 0x02, sharedMemories ? 0x03 : 0x01, ...leb(initialPages), ...leb(maximumPages)]]);
   const funcs = vec([[0], [0], [0], [1], [0], [2], [0], [2]]);
   const names = ['load', 'loadSmall', 'loadBig', 'store', 'load8', 'sum', 'atomicLoad', 'walk'];
   const exports = vec(names.map((n, i) => [...name(n), 0x00, i]));
@@ -146,9 +148,9 @@ const aMax = Number(params.get('amax') || 2048) * MB, bMax = Number(params.get('
   try {
     note('crossOriginIsolated ' + self.crossOriginIsolated + ', SharedArrayBuffer ' + (typeof SharedArrayBuffer));
     let a, b;
-    try { a = new WebAssembly.Memory({ initial: 256, maximum: aMax / PAGE, shared: true }); report('memory-a', true, '16 MB of ' + aMax / MB + ' MB'); }
+    try { a = new WebAssembly.Memory({ initial: 256, maximum: aMax / PAGE, shared: sharedMemories }); report('memory-a', true, '16 MB of ' + aMax / MB + ' MB'); }
     catch (e) { report('memory-a', false, String(e)); }
-    try { b = new WebAssembly.Memory({ initial: 16, maximum: bMax / PAGE, shared: true }); report('memory-b', true, '1 MB of ' + bMax / MB + ' MB'); }
+    try { b = new WebAssembly.Memory({ initial: 16, maximum: bMax / PAGE, shared: sharedMemories }); report('memory-b', true, '1 MB of ' + bMax / MB + ' MB'); }
     catch (e) { report('memory-b', false, String(e)); }
     if (a) runCases('a', a, aMax, report, 3);
     await new Promise(r => setTimeout(r, 0));

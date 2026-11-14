@@ -159,9 +159,12 @@ Found on the way:
   `rvprobe2.c`). So 0129 replaces 0127's top slot: every shared memory32
   reserves 4 GiB and the redzone, maps what it uses, grows by mapping more,
   and has no bounds checks (up to JSC's eight fast memories a process;
-  `/data/ps5webkit/no-wasm-fast-memory` turns that off,
-  `/data/ps5webkit/wasm-fast-memory-all` tries it for non-shared memories
-  too, not tested). Shared memories with bounds checks and resizable array
+  `/data/ps5webkit/no-wasm-fast-memory` turns that off). 0130 does the same
+  for non-shared memories, so no WebAssembly memory32 has bounds checks, as
+  upstream (`/data/ps5webkit/wasm-fast-memory-shared-only` goes back to
+  0129's shared ones only; the trap page with `?shared=0` 396/396, and the
+  pages listed below again on both builds with 0130). Shared
+  memories with bounds checks and resizable array
   buffers reserve their maximum the same way. It also closes a hole in 0127:
   with the range below 0xFC00000000 taken, a hinted mmap into it is placed
   at 0xFC00000000 and is usable (`rvprobe3.c`), so the area above the top
