@@ -144,6 +144,36 @@ Found on the way:
   fell by 256 while 512 MB was mapped and came back after the unmap. Not
   checked: against the kernel log at the same moment, from the title, the
   cost of a call.
+- Where the tables went (`test/memprobe/ptmap.c`: every process's map and the
+  2 MB slots it covers): the emulator's WebProcess in a fight was 1767, of
+  which 896 the unused 1792 MB of its shared memory, 128 the used 256 MB, 128
+  the JIT pool; the console 7409 (6439 with the test title idle; the 8112
+  above was not seen again).
+- A range reserved with `sceKernelReserveVirtualRange` costs no page tables
+  (512 MB, 4 GiB, 10 GiB: +0, from a payload; the title's direct-memory heap
+  is 16 GiB of it). An access to it is a SIGSEGV with its address, a later
+  mmap is never placed in it, a second reservation inside is refused, and
+  `mmap(MAP_FIXED)` over a part commits that part at the usual cost
+  (`mprotect` returns 0 and commits nothing); `sceKernelMunmap` or `munmap`
+  of the range gives all of it back (`test/memprobe/rvprobe.c`,
+  `rvprobe2.c`). So 0129 replaces 0127's top slot: every shared memory32
+  reserves 4 GiB and the redzone, maps what it uses, grows by mapping more,
+  and has no bounds checks (up to JSC's eight fast memories a process;
+  `/data/ps5webkit/no-wasm-fast-memory` turns that off,
+  `/data/ps5webkit/wasm-fast-memory-all` tries it for non-shared memories
+  too, not tested). Shared memories with bounds checks and resizable array
+  buffers reserve their maximum the same way. It also closes a hole in 0127:
+  with the range below 0xFC00000000 taken, a hinted mmap into it is placed
+  at 0xFC00000000 and is usable (`rvprobe3.c`), so the area above the top
+  was not a guard nothing could map. Console, the emulator in a fight: 6531
+  page tables with its memory fast, 6526 with the switch off (6213 idle);
+  `shared-memory-traps.html` 396/396 three times, both of its memories fast,
+  the ranges released and reused. With 0129, both builds: the thirteen
+  WebGPU pages as in the table above (WebGPU build; the ML page not rerun),
+  WebGL regression 29/29, the trap page 396/396, a memory grown to 1536 MB,
+  `test/wasm/resizable-buffers.html` 16/16 (resizable ArrayBuffers; growable
+  SharedArrayBuffers cannot be made from a `file:` page, so that path ran
+  only as WebAssembly shared memories).
 - With 0127 and 0128, both builds on the console: the thirteen WebGPU pages
   as in the table above, the ML page 4/4 with the same similarities (ONNX
   Runtime's shared memory took the top slot; model loads of 26 to 56 s

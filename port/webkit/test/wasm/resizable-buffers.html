@@ -1,0 +1,59 @@
+<!doctype html>
+<!-- Resizable ArrayBuffers and growable SharedArrayBuffers. On the PS5 their
+     maximum is a reserved range with only the current length mapped (patch
+     0129): growing maps more, and what a growth adds has to read as zero,
+     also after a shrink. Log lines: RESULT resizable-buffers <case>
+     PASS|FAIL <why>, then RESULT resizable-buffers summary PASS|FAIL <n>/<m>.
+     Upload to /data/ps5webkit/resizable-buffers.html and open
+     file:///data/ps5webkit/resizable-buffers.html. -->
+<html><head><meta charset="utf-8"><title>resizable buffers</title></head>
+<body><pre id="out"></pre>
+<script>
+const MB = 1 << 20;
+let pass = 0, total = 0;
+function log(line) { console.log(line); document.getElementById('out').textContent += line + '\n'; }
+function check(name, ok, why) { total++; if (ok) pass++; log(`RESULT resizable-buffers ${name} ${ok ? 'PASS' : 'FAIL'} ${why || ''}`); }
+function allZero(bytes, from, to) { for (let i = from; i < to; i++) if (bytes[i]) return false; return true; }
+function fill(bytes, from, to) { for (let i = from; i < to; i += 4096) bytes[i] = 0xa5; bytes[to - 1] = 0xa5; }
+try {
+    for (const maxMB of [64, 1024]) {
+        const buffer = new ArrayBuffer(1 * MB, { maxByteLength: maxMB * MB });
+        let bytes = new Uint8Array(buffer);
+        check(`ab-${maxMB}-new`, buffer.resizable && buffer.byteLength === MB && allZero(bytes, 0, MB), `${buffer.byteLength} bytes`);
+        fill(bytes, 0, MB);
+        buffer.resize(17 * MB);
+        check(`ab-${maxMB}-grown`, bytes.length === 17 * MB && bytes[0] === 0xa5 && bytes[MB - 1] === 0xa5 && allZero(bytes, MB, 17 * MB), 'old bytes kept, new bytes zero');
+        fill(bytes, MB, 17 * MB);
+        buffer.resize(3 * MB + 100);
+        check(`ab-${maxMB}-shrunk`, bytes.length === 3 * MB + 100 && bytes[3 * MB + 99] !== undefined && bytes[3 * MB + 100] === undefined, `${buffer.byteLength} bytes`);
+        buffer.resize(33 * MB);
+        check(`ab-${maxMB}-regrown`, bytes[0] === 0xa5 && bytes[3 * MB - 1 - 4095] !== undefined && allZero(bytes, 3 * MB + 100, 33 * MB), 'what the shrink dropped reads as zero');
+        bytes[33 * MB - 1] = 7;
+        buffer.resize(maxMB * MB);
+        bytes[maxMB * MB - 1] = 9;
+        check(`ab-${maxMB}-maximum`, bytes[33 * MB - 1] === 7 && bytes[maxMB * MB - 1] === 9 && allZero(bytes, 33 * MB, 34 * MB), `${buffer.byteLength >> 20} MB`);
+        let threw = false;
+        try { buffer.resize(maxMB * MB + 1); } catch (e) { threw = e instanceof RangeError; }
+        check(`ab-${maxMB}-past-maximum`, threw, 'RangeError');
+        buffer.resize(0);
+        buffer.resize(2 * MB);
+        check(`ab-${maxMB}-from-zero`, allZero(bytes, 0, 2 * MB), 'zero after a resize to 0');
+    }
+    const zero = new ArrayBuffer(0, { maxByteLength: 0 });
+    check('ab-zero-maximum', zero.byteLength === 0 && zero.resizable, '');
+    for (let i = 0; i < 40; i++) { const b = new ArrayBuffer(MB, { maxByteLength: 256 * MB }); b.resize(8 * MB); new Uint8Array(b)[8 * MB - 1] = 1; }
+    check('ab-many', true, '40 buffers of maximum 256 MB');
+    if (typeof SharedArrayBuffer === 'function') {
+        const shared = new SharedArrayBuffer(1 * MB, { maxByteLength: 512 * MB });
+        const bytes = new Uint8Array(shared);
+        fill(bytes, 0, MB);
+        shared.grow(40 * MB);
+        check('sab-grown', bytes.length === 40 * MB && bytes[MB - 1] === 0xa5 && allZero(bytes, MB, 40 * MB), 'old bytes kept, new bytes zero');
+        shared.grow(512 * MB);
+        bytes[512 * MB - 1] = 3;
+        check('sab-maximum', bytes[512 * MB - 1] === 3 && allZero(bytes, 500 * MB, 512 * MB - 1), '512 MB');
+    } else
+        log('RESULT resizable-buffers note SharedArrayBuffer undefined (not cross-origin isolated): growable shared buffers not run');
+} catch (e) { check('exception', false, String(e)); }
+log(`RESULT resizable-buffers summary ${pass === total ? 'PASS' : 'FAIL'} ${pass}/${total}`);
+</script></body></html>
