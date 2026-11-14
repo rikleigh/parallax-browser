@@ -145,7 +145,10 @@ Found on the way:
   checked: against the kernel log at the same moment, from the title, the
   cost of a call.
 - With 0127 and 0128, both builds on the console: the thirteen WebGPU pages
-  as in the table above (the ML page not run), WebGL regression 29/29,
+  as in the table above, the ML page 4/4 with the same similarities (ONNX
+  Runtime's shared memory took the top slot; model loads of 26 to 56 s
+  against the page's 60 s limit per case, which an earlier run that day
+  exceeded on all three), WebGL regression 29/29,
   `test/wasm/shared-memory-traps.html` 396/396, a memory grown to 1536 MB;
   the default build also loaded example.com and a Wikipedia article. The
   1536 MB growth took 863 ms on the default build and 118 ms on the WebGPU
