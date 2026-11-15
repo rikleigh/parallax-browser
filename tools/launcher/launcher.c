@@ -6,6 +6,10 @@
  *
  *   status                 the running big app, if any: "OK <appid> <TITLEID>"
  *   launch <TITLEID> [arg] start a registered title (fails if one is running)
+ *   launch-also <TITLEID> [arg]  start it even if a title is running (Spike 14:
+ *                          can two titles run at once?)
+ *   apps                   every app process but system ones (NPXS): "OK pid:appid:TITLEID ..."
+ *   killtitle <TITLEID>    SIGKILL that title's process (PPSA99xxx only)
  *   kill                   SIGKILL the running big app, wait until it is gone
  *   stop                   ask the browser title to wind down by itself (control
  *                          socket, no system calls); launch.sh then polls status
@@ -208,6 +212,56 @@ static pid_t app_pid(int app_id, char title_id[16])
         }
     }
     return -1;
+}
+
+/* Every process sceKernelGetAppInfo knows as an app. */
+static void list_apps(int fd)
+{
+    char out[1024];
+    size_t o = 0;
+    stage = "sceKernelGetAppInfo scan";
+    for (pid_t pid = 1; pid < 8192; pid++) {
+        app_info_t info;
+        memset(&info, 0, sizeof info);
+        if (sceKernelGetAppInfo(pid, &info) != 0 || !info.app_id || !info.title_id[0] || !strncmp(info.title_id, "NPXS", 4))
+            continue;
+        char tid[16];
+        memcpy(tid, info.title_id, 9);
+        tid[9] = 0;
+        o += snprintf(out + o, o < sizeof out ? sizeof out - o : 0, " %d:0x%x:%s", (int)pid, info.app_id, tid);
+    }
+    say(fd, "OK%s", o ? out : " none");
+}
+
+/* SIGKILL the process of one of our homebrew titles (PPSA99xxx). */
+static void kill_title(int fd, const char *want)
+{
+    if (!want || strncmp(want, "PPSA99", 6) || strlen(want) != 9) {
+        say(fd, "ERR killtitle: PPSA99xxx titles only");
+        return;
+    }
+    stage = "sceKernelGetAppInfo scan";
+    for (pid_t pid = 1; pid < 8192; pid++) {
+        app_info_t info;
+        memset(&info, 0, sizeof info);
+        if (sceKernelGetAppInfo(pid, &info) != 0 || strncmp(info.title_id, want, 9))
+            continue;
+        if (kill(pid, SIGKILL) != 0) {
+            say(fd, "ERR killtitle %s: SIGKILL pid %d: %s", want, (int)pid, strerror(errno));
+            return;
+        }
+        for (int t = 0; t < 10000; t += 100) {
+            memset(&info, 0, sizeof info);
+            if (sceKernelGetAppInfo(pid, &info) != 0 || strncmp(info.title_id, want, 9)) {
+                say(fd, "OK killed %s pid %d after %d ms", want, (int)pid, t);
+                return;
+            }
+            usleep(100 * 1000);
+        }
+        say(fd, "ERR %s pid %d still there 10 s after SIGKILL", want, (int)pid);
+        return;
+    }
+    say(fd, "OK %s not running", want);
 }
 
 /* The app takes a moment to go; launching before then fails. */
@@ -434,6 +488,23 @@ static int command(int fd, char *line)
         else
             say(fd, "OK launched %s appid 0x%x (authid 0x%016llx%s)", a1, r,
                 (unsigned long long)used, used == own_authid ? ", own" : "");
+    } else if (!strcmp(cmd, "launch-also")) {
+        if (!a1 || strlen(a1) != 9) {
+            say(fd, "ERR usage: launch-also <TITLEID> [arg]");
+            return 0;
+        }
+        uint64_t used;
+        stage = "sceLncUtilLaunchApp";
+        int r = launch(a1, a2, &used);
+        if (r < 0)
+            say(fd, "ERR launch %s: 0x%08x", a1, (unsigned)r);
+        else
+            say(fd, "OK launched %s appid 0x%x (authid 0x%016llx%s)", a1, r,
+                (unsigned long long)used, used == own_authid ? ", own" : "");
+    } else if (!strcmp(cmd, "apps")) {
+        list_apps(fd);
+    } else if (!strcmp(cmd, "killtitle")) {
+        kill_title(fd, a1);
     } else if (!strcmp(cmd, "stop")) {
         stop_title(fd);
     } else if (!strcmp(cmd, "kill")) {
@@ -452,7 +523,7 @@ static int command(int fd, char *line)
         say(fd, "OK bye");
         return 1;
     } else {
-        say(fd, "ERR unknown command %s (status, launch, stop, kill, register, uninstall, quit)", cmd);
+        say(fd, "ERR unknown command %s (status, launch, launch-also, apps, killtitle, stop, kill, register, uninstall, quit)", cmd);
     }
     return 0;
 }

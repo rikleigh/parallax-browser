@@ -8,6 +8,7 @@
 #   tools/launch.sh --register <ID> [dir on the console, default /data/homebrew/<ID>]
 #   tools/launch.sh --uninstall <ID>   (spike titles only)
 #   tools/launch.sh --status | --stop | --kill [-9] | --quit
+#   tools/launch.sh --apps | --also <ID> | --killtitle <PPSA99xxx>  (Spike 14)
 # --stop (and stopping our browser title before a launch) first asks the
 # title to wind down by itself (launcher "stop": media stopped, audio ports
 # and sockets closed, then the title asks for its SIGKILL) and kills it only
@@ -64,6 +65,9 @@ force=0
 case "${1:-}" in
     -f) force=1; shift ;;
     --status) ensure_launcher; run status; exit ;;
+    --apps) ensure_launcher; run apps; exit ;;
+    --also) ensure_launcher; run launch-also "${2:?title id}" ${3:-}; exit ;;
+    --killtitle) ensure_launcher; run killtitle "${2:?title id}"; exit ;;
     --kill) ensure_launcher; run kill ${2:-}; exit ;;
     --stop) ensure_launcher; stop_title; exit ;;
     --register) ensure_launcher; run register "${2:?title id}" ${3:-}; exit ;;
