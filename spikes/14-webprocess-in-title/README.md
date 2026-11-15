@@ -10,7 +10,9 @@
 **Stage 2 (2026-11-15, [stage2.md](stage2.md)).** With the WebProcess in the
 title, fights run at a median of 48 frames/s against 25 as a payload (mean
 47.6 against 28.2). Same build and matchup, three runs each. Stage 1 (route
-B) works behind `/data/ps5webkit/inprocess-web` ([stage1.md](stage1.md)).
+B) works behind `/data/ps5webkit/inprocess-web` and passes its checks
+([stage1.md](stage1.md)): page loads, tabs, back/forward, 16 minutes of
+fights without a crash, switch off unchanged.
 
 **Stage 1, item 2 measured (2026-11-15, [stage1.md](stage1.md)).** In a
 fight the whole title uses 0.20 of a core and its main thread 1.1%, so

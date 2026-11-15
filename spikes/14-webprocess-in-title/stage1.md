@@ -155,3 +155,28 @@ Open:
   avoid it);
 - a leftover NetworkProcess payload from run 1 (pid 357, 371 MB) is still
   alive on the console.
+
+## Pass checks (2026-11-15, after a console reboot)
+
+PPSA99209 build `20261115-113730-91f31930c3`, switch on. The owner drove
+the controller. Log from line 1464187 of that day's title log.
+
+| Check | Result |
+| --- | --- |
+| A static page and the emulator page load and run in the in-title WebProcess | Pass: `example.com`, three.js WebGPU retargeting, two emulator pages, all in WebProcess 4 (the title). |
+| Closing the tab, back and forward | Pass. Back and forward between the emulator page and other pages reloaded the game. A new tab, then closing it, then closing every tab and opening a new one (B3). At B3, WebKit launched a payload WebProcess (5) for the new tab's start page, closed it 49 s later, and kept using the in-title WebProcess 4. That process was never terminated. |
+| No crash in 10 minutes of fights | Pass: 973 fight seconds (16 min), several scenes and characters. Mean 42.2 frames/s, median 45, p10 30, p90 52 (stage 2's fixed matchup: median 48). No crash, no sync-wait line, no watchdog report. |
+| The switch off gives today's build unchanged | Pass. Review of patch 0133 and the title changes: every change is gated on the in-title connection, `s_ps5WebProcessInTitle`, the process manager's hook, `ps5wk_title_mem_exec` or `ps5wk_title_access_fix`. The always-on parts have no effect: the connection marker flag; `--wrap=access` returns the real call's result unless the fix flag is set. Stage 2's three switch-off runs played normally at the payload's rates. |
+
+**Stage 1 (route B) passes.**
+
+Seen on the way (2026-11-15, a switch-off run, so not this change): the
+console stopped giving the controller to anything. The title logged
+`pad: ... intercepted by the system` once and got no input after it; the PS
+button did nothing either. The title kept running normally for 8 more
+minutes (main thread 0–1%, memory flat). A reboot cleared it, and the
+leftover NetworkProcess payload from run 1 with it.
+In the pass-check session the owner left the emulator paused for a while and
+resumed a fight (when the freeze had shown before): no freeze. The pad went
+to the system and back as normal (`intercepted by the system`, then `not
+intercepted`).
