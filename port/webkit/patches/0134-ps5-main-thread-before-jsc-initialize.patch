@@ -1,0 +1,19 @@
+diff --git a/Source/WebKit/Shared/WebKit2Initialize.cpp b/Source/WebKit/Shared/WebKit2Initialize.cpp
+index 2491bb9042..0f8a3bb117 100644
+--- a/Source/WebKit/Shared/WebKit2Initialize.cpp
++++ b/Source/WebKit/Shared/WebKit2Initialize.cpp
+@@ -39,6 +39,14 @@ namespace WebKit {
+ 
+ void InitializeWebKit2()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // The PS5 browser title runs JSC with the JIT (the in-title WebProcess),
++    // so JSC::initialize() compiles thunks, and with JSC_useJITDump the first
++    // one starts PerfLog's WorkQueue thread. That thread would take WTF thread
++    // uid 1 and initializeMainThread's RELEASE_ASSERT would fail. Making the
++    // main thread's WTF::Thread first avoids that (spikes/14).
++    WTF::initializeMainThread();
++#endif
+     JSC::initialize();
+     WTF::initializeMainThread();
+     WebCore::initializeCommonAtomStrings();

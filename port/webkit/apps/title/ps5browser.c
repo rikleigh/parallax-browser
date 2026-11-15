@@ -2698,6 +2698,11 @@ static void setUpInTitleWeb(void)
     if (!safer)
         setenv("JSC_jitMemoryReservationSize", "268435456", 0);
     setenv("JSC_useWasm", safer ? "false" : "true", 1);
+    /* WebAssembly functions above JSC's OMG cost limit (100000) stay in BBQ
+     * for good: the PS2 emulator's biggest ones were 23.5% of its worker's
+     * time there. With 2000000 they reach OMG too: fights 47-48 -> 49-50
+     * frames/s and steadier (spikes/14-webprocess-in-title/stage2.md). */
+    setenv("JSC_maximumOMGCandidateCost", "2000000", 0);
     if (&ps5wk_title_mem_exec)
         ps5wk_title_mem_exec = !safer;
     /* fontconfig finds its fonts.conf with access() (titlesys.c). */

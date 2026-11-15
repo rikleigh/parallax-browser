@@ -25,3 +25,4 @@ logs/
 /spikes/09-hw-decode/fetch-*.sh
 __pycache__/
 /dist/
+/spikes/14-webprocess-in-title/results/

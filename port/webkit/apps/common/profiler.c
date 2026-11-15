@@ -37,8 +37,9 @@
 //   S <thread> <count> <weight us> <pc> <pc> ...     (innermost first)
 //
 // pcs: hex offsets from the executable's start (llvm-symbolizer on the
-// unstripped ELF), "j<tier>" for JIT code (0 thunks, inline caches and the
-// regexp JIT, 1 Baseline, 2 DFG, 3 FTL; "j" unknown), "x<hex>" for
+// unstripped ELF), "j<tier>:<hex address>" for JIT code (0 thunks, inline
+// caches and the regexp JIT, 1 Baseline, 2 DFG, 3 FTL, 4-8 wasm; "j:" unknown;
+// the address names the function with JSC's JITDump, JSC_useJITDump), "x<hex>" for
 // addresses in other modules (libkernel, libc).
 // port/webkit/test/prof/prof-run.sh runs pages, prof.py summarizes.
 #include "profiler.h"
@@ -537,9 +538,9 @@ static void writeWindow(FILE* f)
             else if (pc >= js && pc < je) {
                 int tier = jitTier(pc);
                 if (tier >= 0)
-                    fprintf(f, " j%d", tier);
+                    fprintf(f, " j%d:%lx", tier, (unsigned long)pc);
                 else
-                    fputs(" j", f);
+                    fprintf(f, " j:%lx", (unsigned long)pc);
             } else
                 fprintf(f, " x%lx", (unsigned long)pc);
         }

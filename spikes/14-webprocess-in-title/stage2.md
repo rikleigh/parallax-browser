@@ -49,3 +49,99 @@ Notes:
 Not measured yet (stage 2's other pass items):
 - main-loop stalls over 100 ms in the title (the UI shares the thread);
 - a CPU profile of the in-title fight and thread placement.
+
+## Toward 60 (2026-11-15)
+
+Profile of an in-title fight (title CPU profiler, stage 2 matchup,
+`logs/prof/title-106.prof`, last 56 s; 49.3 frames/s while profiled):
+
+| Thread | Share of a core |
+| --- | --- |
+| emulator worker (`WebCore: Worker`) | **99.1%**: 74% wasm OMG, 23.5% wasm BBQ in functions over 100 KB |
+| title main thread (UI and the page) | 37% (about half of it page JS) |
+| emulator's second worker | 24% |
+| compositor | 13% |
+| Dawn (`WebGPU_work_queue`) | 9% |
+
+The emulator worker is still the limit, now on a core of its own.
+
+`JSC_maximumOMGCandidateCost=2000000` (default 100000; set with a line in
+`/data/ps5webkit/inprocess-web`) lets JSC optimize the big functions:
+- profiled (`title-112.prof`): BBQ 0%, OMG 78% plus 18% in the over-100 KB
+  functions; the worker at **93.7%** of a core;
+- frame rates, same matchup: 49.5 (median 49, p10 47) unprofiled, 50.7
+  (median 50, **p10 49**) profiled. Stage 2 in-title runs: 46.6–48.2, p10
+  43–45.
+- About +2–5% and steadier; the owner: "almost felt too fast". PS2 game
+  logic runs per frame, so the game now runs close to its real speed. An
+  earlier session saw no gain from this setting in a payload, where the
+  thread shared its core.
+
+Left: the worker has about 6% headroom, so something besides it holds a
+little back (waits on the second worker or frame handoff?). 60 needs about
+1.15–1.2× more from the worker thread.
+
+The worker's waits (profiler `threads` mode, `title-115.prof`): the main
+emulator worker waits about 6% of the time, all in `Atomics.wait` (wasm
+`memoryAtomicWait32`): the emulator's own hand-offs between its two
+workers. The second worker waits about 70% of the time.
+
+Thread placement (`apps/common/affinity.c`, the owner's uncommitted code,
+compiled into the title package when present, `PS5WK_AFFINITY` from the
+switch file): the emulator worker alone on CPU 3, CPU 2 (its sibling)
+empty, every other title thread on 0, 1 and 4-12.
+- First try: the hot slot stayed on a compile thread, so the worker never
+  moved.
+- Second: the worker pinned at 0.99 cores. Median 50, mean 48.7, including
+  7 s at exactly 30 in one round; about 50 without them.
+- No gain over the OMG setting alone (49.5–50.7): the title's scheduler
+  already kept the worker's core free (as stage 0's b5 found).
+
+| Step | Fight median | Emulator worker |
+| --- | --- | --- |
+| payload | 25 | shared core |
+| in the title | 47–48 | 99% of a core |
+| + `JSC_maximumOMGCandidateCost=2000000` | 49–50, p10 47–49 | 94–99% |
+| + worker pinned alone | 50 | 99% |
+
+About 50 is the ceiling from the browser side. The emulator's main thread
+is saturated on its own core, in code that is all at JSC's top wasm tier.
+60 needs about 1.2× from that one thread: from the emulator itself, or from
+JSC's code for its hottest functions (per-function profiling first).
+
+### Where the worker's time goes, by WebAssembly function
+
+`JSC_maximumOMGCandidateCost=2000000` is now the in-title default
+(`apps/title/ps5browser.c` setUpInTitleWeb); the placement hook is gone.
+
+The profiler now writes JIT frames as `j<tier>:<address>`, and
+`prof.py --jitdump jit-*.dump` names them from JSC's JITDump
+(`JSC_useJITDump=true`, `JSC_jitDumpDirectory=/data/ps5webkit/prof` in the
+switch file); `--code-dir` writes the hottest functions' machine code with
+per-instruction sample shares. JITDump in the title needed WTF's main
+thread made before `JSC::initialize()` (`WebKit2Initialize.cpp`, PS5 only):
+the thunks JSC compiles at start-up started PerfLog's WorkQueue thread,
+which took WTF thread uid 1 and failed `initializeMainThread`'s assertion.
+
+Profile `title-106.prof` (two rounds, profiler on), the emulator's main
+worker, inclusive:
+- `ps2::vu::run` (the VU0 interpreter, called per instruction from the
+  recompiled EE code, `gen::unit_*`): 36%, 32% self. Each call sets up a
+  384-byte frame in linear memory and copies vector registers; the hot spots
+  are loads and stores, not arithmetic.
+- `ps2::vu::maddabc` and its lambda: 8.5% self; `lower()` (called from
+  `run` per instruction): 4% self.
+- `gen::unit_*` (recompiled EE blocks): about 10% self.
+- `usleep` and futex waits from `on_vblank`: about 4%.
+
+JSC's code for these is ordinary for interpreter code (fast memory, no
+bounds checks; spills around calls); no single codegen fault stands out.
+
+Inlining larger callees (`wasmInliningMaximumWasmCalleeSize=4000`,
+`LargeFunctionGrowthFactor=2.5`, `Budget=60000`, `MaximumCount=200`):
+median 50, mean 49.8, p10 47 over 94 fight seconds: no change.
+
+So about 50 stays the browser-side ceiling. The largest single item is the
+emulator running VU0 macro instructions one call at a time through its
+interpreter; recompiling them along with the EE blocks (as it already does
+for VU1 microprograms, the `vu1_*` modules) is the emulator author's lever.

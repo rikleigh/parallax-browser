@@ -10,7 +10,10 @@ paint, text, images, network, malloc, locks, kernel...), and for WebKit's
 main thread also by phase (the outermost frame that names one: rendering
 update, JS task, HTML parsing, ...); the hottest functions; and a timeline.
 --folded writes "process;thread;root;...;leaf count" lines (flame graphs,
-speedscope). --from/--to keep only windows in that range (ms since the
+speedscope). --jitdump jit-*.dump (JSC_useJITDump=true,
+JSC_jitDumpDirectory=/data/ps5webkit/prof) names JIT frames by function
+("JIT: wasm OMG | <function>"); --code-dir DIR also writes the machine code
+of the hottest of them there (<n>.bin plus a .s from llvm-objdump). --from/--to keep only windows in that range (ms since the
 profiler started in that process).
 """
 import argparse, collections, json, os, re, subprocess, sys
@@ -104,6 +107,44 @@ def parse(path, lo, hi):
 
 
 INLINES = False
+JIT_MAP = []  # sorted (start, end, name, code bytes) from --jitdump
+JIT_STARTS = []
+
+
+def load_jitdump(paths):
+    """JSC's PerfLog files (perf's jitdump format, version 1): code load records."""
+    import bisect, struct
+    loads = {}
+    for path in paths:
+        data = open(path, 'rb').read()
+        if len(data) < 40 or struct.unpack_from('<I', data, 0)[0] != 0x4a695444:
+            print('!! %s: not a jitdump file' % path)
+            continue
+        off = struct.unpack_from('<I', data, 8)[0]
+        while off + 16 <= len(data):
+            kind, size, ts = struct.unpack_from('<IIQ', data, off)
+            if size < 16 or off + size > len(data):
+                break
+            if kind == 0:  # JITCodeLoad
+                pid, tid, vma, addr, codesize, index = struct.unpack_from('<IIQQQQ', data, off + 16)
+                name_end = data.index(b'\0', off + 56)
+                name = data[off + 56:name_end].decode('utf-8', 'replace')
+                code = data[name_end + 1:name_end + 1 + codesize]
+                prev = loads.get(addr)
+                if not prev or prev[0] <= ts:  # code is freed and reused: the newest load wins
+                    loads[addr] = (ts, addr + codesize, name, code)
+            off += size
+    JIT_MAP[:] = sorted((a, v[1], v[2], v[3]) for a, v in loads.items())
+    JIT_STARTS[:] = [m[0] for m in JIT_MAP]
+    print('jitdump: %d code loads from %d file(s)' % (len(JIT_MAP), len(paths)))
+
+
+def jit_name(address):
+    import bisect
+    i = bisect.bisect_right(JIT_STARTS, address) - 1
+    if i >= 0 and JIT_MAP[i][0] <= address < JIT_MAP[i][1]:
+        return re.sub(r'^JSC-', '', JIT_MAP[i][2])
+    return None
 
 
 def symbolize(elf, offsets):
@@ -147,7 +188,12 @@ def frames_of(stack, sym, adjust, llint=(0, 0)):
     out = []
     for i, pc in enumerate(stack):
         if pc.startswith('j'):
-            out.append(TIERS.get(pc, 'JIT: unknown tier'))
+            tier, _, addr = pc.partition(':')
+            label = TIERS.get(tier, 'JIT: unknown tier')
+            if JIT_MAP and addr:
+                name = jit_name(int(addr, 16) - (1 if i else 0))
+                label += ' | ' + (name or '(not in the jitdump)')
+            out.append(label)
         elif pc.startswith('x'):
             if not out or out[-1] != '(other module)':
                 out.append('(other module)')
@@ -205,9 +251,13 @@ def main():
     ap.add_argument('--to', dest='hi', type=float)
     ap.add_argument('--threads', type=int, default=4, help='detail for this many busiest threads per process')
     ap.add_argument('--inlines', action='store_true', help='expand inlined frames (bare names with -gline-tables-only)')
+    ap.add_argument('--jitdump', nargs='+', default=[], help="JSC's jit-*.dump files: name JIT frames by function")
+    ap.add_argument('--code-dir', help='write the hottest JIT functions\' machine code here (needs --jitdump)')
     args = ap.parse_args()
     global INLINES
     INLINES = args.inlines
+    if args.jitdump:
+        load_jitdump(args.jitdump)
     areas = [(n, re.compile(r)) for n, r in AREAS]
     phases = [(n, re.compile(r)) for n, r in PHASES]
     marker_link = None
@@ -311,10 +361,59 @@ def main():
                     continue
                 a = classify(frames[:1], areas)
                 if a and a.startswith('JS'):
-                    tiers[frames[0] if frames[0].startswith('JIT') else a] += c
+                    tiers[frames[0].split(' | ')[0] if frames[0].startswith('JIT') else a] += c
         if tiers:
             n = sum(tiers.values())
             print('-- JavaScript by leaf (all threads, %.0f ms): %s' % (n, ', '.join('%s %.0f%%' % (k, 100.0 * v / n) for k, v in tiers.most_common())))
+        # JIT functions by self time (all threads), with --jitdump.
+        if JIT_MAP and tiers:
+            funcs = collections.Counter()
+            for idx, fc in per_thread.items():
+                for frames, c in fc.items():
+                    if frames and ' | ' in frames[0]:
+                        funcs[frames[0]] += c
+            leaf_pcs = collections.Counter()  # absolute leaf address -> ms
+            for (idx, stack), c in stacks.items():
+                if stack and stack[0].startswith('j') and ':' in stack[0]:
+                    leaf_pcs[int(stack[0].partition(':')[2], 16)] += c
+            n = sum(tiers.values())
+            print('-- JIT code by function, self time (%% of JavaScript leaf time; %d functions)' % len(funcs))
+            cum = 0.0
+            hottest = funcs.most_common(args.top * 2)
+            for rank, (f, c) in enumerate(hottest, 1):
+                cum += c
+                print('  %2d %5.1f%% (cum %5.1f%%)  %s' % (rank, 100.0 * c / n, 100.0 * cum / n, f[:150]))
+            if args.code_dir:
+                os.makedirs(args.code_dir, exist_ok=True)
+                byname = {m[2]: m for m in JIT_MAP}
+                for rank, (f, c) in enumerate(hottest[:args.top], 1):
+                    m = byname.get('JSC-' + f.split(' | ', 1)[1])
+                    if not m:
+                        continue
+                    base = os.path.join(args.code_dir, '%02d' % rank)
+                    open(base + '.bin', 'wb').write(m[3])
+                    open(base + '.txt', 'w').write('%s\nstart %#x size %d\n' % (m[2], m[0], m[1] - m[0]))
+                    tools = os.path.dirname(SYMBOLIZER)
+                    subprocess.run([os.path.join(tools, 'llvm-objcopy'), '-I', 'binary', '-O', 'elf64-x86-64', '--rename-section=.data=.text,code',
+                                    base + '.bin', base + '.o'], check=False)
+                    listing = subprocess.run([os.path.join(tools, 'llvm-objdump'), '-d', '--no-show-raw-insn', base + '.o'],
+                                             capture_output=True, text=True).stdout
+                    # Per instruction: % of this function's self time (offsets from its start).
+                    hits = collections.Counter({a - m[0]: v for a, v in leaf_pcs.items() if m[0] <= a < m[1]})
+                    total_hits = sum(hits.values()) or 1
+                    with open(base + '.s', 'w') as asm:
+                        asm.write('# %s\n# start %#x, %d bytes; left column: %% of its self time at that instruction\n' % (m[2], m[0], m[1] - m[0]))
+                        for line in listing.splitlines():
+                            mm = re.match(r'\s*([0-9a-f]+):', line)
+                            h = hits.get(int(mm.group(1), 16), 0) if mm else 0
+                            asm.write(('%6.2f ' % (100.0 * h / total_hits) if h else '       ') + line + '\n')
+                    # The hottest 64-byte stretches, for a quick look.
+                    spans = collections.Counter()
+                    for off, v in hits.items():
+                        spans[off // 64 * 64] += v
+                    open(base + '.txt', 'a').write('hottest 64-byte stretches (offset: %% of self time): %s\n' % ', '.join(
+                        '%#x: %.1f%%' % (o, 100.0 * v / total_hits) for o, v in spans.most_common(12)))
+                print('   machine code of the top %d in %s' % (args.top, args.code_dir))
         # Timeline: process cores and the busiest threads per window.
         if len(windows) > 1:
             top = [i for i in rows[:4]]
