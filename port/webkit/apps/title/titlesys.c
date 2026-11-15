@@ -79,6 +79,42 @@ int eaccess(const char* path, int mode)
     return access(path, mode);
 }
 
+/* access() in a title says no for files that exist and open (ps5browser.c
+ * fileExists; 2026-11-15: fontconfig did not find
+ * /data/ps5webkit/etc/fonts/fonts.conf, so the in-title WebProcess painted
+ * pages without text). With ps5wk_title_access_fix set (the WebProcess in
+ * the title, ps5browser.c), a failed access() is checked again with open():
+ * read for F_OK/R_OK/X_OK, write as well for W_OK on files. Unset: as
+ * before. Linked with --wrap=access (package.sh). */
+int ps5wk_title_access_fix;
+int __real_access(const char* path, int mode);
+
+int __wrap_access(const char* path, int mode)
+{
+    if (!__real_access(path, mode))
+        return 0;
+    if (!ps5wk_title_access_fix || !path)
+        return -1;
+    const int saved = errno;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        errno = saved;
+        return -1;
+    }
+    struct stat st;
+    const int isDir = !fstat(fd, &st) && S_ISDIR(st.st_mode);
+    close(fd);
+    if ((mode & W_OK) && !isDir) {
+        fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (fd < 0) {
+            errno = saved;
+            return -1;
+        }
+        close(fd);
+    }
+    return 0;
+}
+
 /* Ownership and mode changes on links: nothing in the browser needs them. */
 int chown(const char* path, uid_t owner, gid_t group)
 {

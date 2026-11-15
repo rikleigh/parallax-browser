@@ -39,6 +39,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <wtf/HashMap.h>
+#include <wtf/Lock.h>
 #include <wtf/Vector.h>
 #include <wtf/glib/GRefPtr.h>
 #include <wtf/glib/WTFGType.h>
@@ -60,6 +61,7 @@ struct PendingLaunch {
     int ipcFD { -1 };
     int pid { 0 };
     gint64 startTime { 0 };
+    bool inTitle { false }; // the WebProcess runs in this process: never killed
 };
 
 struct _WPEProcessManagerPS5Private {
@@ -71,6 +73,16 @@ struct _WPEProcessManagerPS5Private {
     int waitDirTicks { 0 };
     guint64 nextHandle { 1 };
     HashMap<guint64, std::unique_ptr<PendingLaunch>> launches; // by handle
+    WPEProcessManagerPS5InTitleStart inTitleStart { nullptr };
+    bool inTitleUsed { false };
+    // With a WebProcess in the title, the rendezvous (listener, hellos, the
+    // wait for PS5WK_LAUNCH_DIR) runs on a thread of its own with this
+    // context: the title's main loop can be blocked in a sync IPC wait of
+    // that WebProcess, which a NetworkProcess's reply ends only once the
+    // NetworkProcess has its IPC fd (2026-11-15: GetNetworkProcessConnection
+    // waited forever). Null: the main loop's context, as before.
+    GMainContext* rendezvousContext { nullptr };
+    Lock launchesLock; // launches, when the rendezvous has its own thread
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEProcessManagerPS5, wpe_process_manager_ps5, WPE_TYPE_PROCESS_MANAGER, WPEProcessManager)
 
@@ -265,6 +277,7 @@ static gboolean launchFailedOnMain(gpointer data)
 {
     std::unique_ptr<LaunchFailure> failure(static_cast<LaunchFailure*>(data));
     auto* priv = failure->manager->priv;
+    Locker locker { priv->launchesLock };
     auto it = priv->launches.find(failure->handle);
     if (it != priv->launches.end() && it->value->ipcFD >= 0 && !it->value->pid) {
         PS5_LOG("[ps5-launch %s] the launch failed: closing its IPC socket, so WebKit takes the process as ended and starts another",
@@ -377,6 +390,32 @@ static gpointer uploadThread(gpointer data)
 
 // ---------------------------------------------------------- the rendezvous
 
+// Sources on the rendezvous context (the main loop's, or its own thread's).
+static guint rendezvousAddFD(WPEProcessManagerPS5Private* priv, int fd, GIOCondition condition, GUnixFDSourceFunc function, gpointer data)
+{
+    GSource* source = g_unix_fd_source_new(fd, condition);
+    g_source_set_callback(source, reinterpret_cast<GSourceFunc>(function), data, nullptr);
+    guint id = g_source_attach(source, priv->rendezvousContext);
+    g_source_unref(source);
+    return id;
+}
+
+static guint rendezvousAddTimeout(WPEProcessManagerPS5Private* priv, guint ms, GSourceFunc function, gpointer data)
+{
+    GSource* source = g_timeout_source_new(ms);
+    g_source_set_callback(source, function, data, nullptr);
+    guint id = g_source_attach(source, priv->rendezvousContext);
+    g_source_unref(source);
+    return id;
+}
+
+static void rendezvousRemove(WPEProcessManagerPS5Private* priv, guint id)
+{
+    if (GSource* source = g_main_context_find_source_by_id(priv->rendezvousContext, id))
+        g_source_destroy(source);
+}
+
+
 static bool sendFD(int socket, const ps5wk_welcome& welcome, int fd)
 {
     struct iovec iov { const_cast<ps5wk_welcome*>(&welcome), sizeof(welcome) };
@@ -418,9 +457,9 @@ static void handleHello(WPEProcessManagerPS5*, int client, const ps5wk_hello&);
 static void pendingHelloEnd(PendingHello* pending, bool closeFD)
 {
     if (pending->watch)
-        g_source_remove(pending->watch);
+        rendezvousRemove(pending->manager->priv, pending->watch);
     if (pending->timeout)
-        g_source_remove(pending->timeout);
+        rendezvousRemove(pending->manager->priv, pending->timeout);
     if (closeFD)
         close(pending->fd);
     g_object_unref(pending->manager);
@@ -467,8 +506,8 @@ static void handleConnection(WPEProcessManagerPS5* manager, int client)
     }
     fcntl(client, F_SETFD, FD_CLOEXEC);
     auto* pending = new PendingHello { WPE_PROCESS_MANAGER_PS5(g_object_ref(manager)), client, { }, 0, 0, 0 };
-    pending->watch = g_unix_fd_add(client, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR), pendingHelloReadable, pending);
-    pending->timeout = g_timeout_add(2000, pendingHelloTimeout, pending);
+    pending->watch = rendezvousAddFD(manager->priv, client, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR), pendingHelloReadable, pending);
+    pending->timeout = rendezvousAddTimeout(manager->priv, 2000, pendingHelloTimeout, pending);
 }
 
 // Main loop: a whole hello; closes client.
@@ -481,6 +520,7 @@ static void handleHello(WPEProcessManagerPS5* manager, int client, const ps5wk_h
         return;
     }
 
+    Locker locker { priv->launchesLock };
     PendingLaunch* launch = nullptr;
     for (auto& entry : priv->launches.values()) {
         if (entry->processIdentifier == hello.processIdentifier && entry->ipcFD >= 0) {
@@ -611,7 +651,7 @@ static bool bindListener(WPEProcessManagerPS5* manager)
     chmod(address.sun_path, 0777); // payloads run under another uid
     fcntl(fd, F_SETFD, FD_CLOEXEC);
     priv->listenFD = fd;
-    priv->listenWatch = g_unix_fd_add(fd, G_IO_IN, [](int fd, GIOCondition, gpointer userData) -> gboolean {
+    priv->listenWatch = rendezvousAddFD(priv, fd, G_IO_IN, [](int fd, GIOCondition, gpointer userData) -> gboolean {
         int client = accept(fd, nullptr, nullptr);
         if (client >= 0)
             handleConnection(WPE_PROCESS_MANAGER_PS5(userData), client);
@@ -627,11 +667,20 @@ static void ensureListener(WPEProcessManagerPS5* manager)
     auto* priv = manager->priv;
     if (priv->listenFD >= 0 || priv->waitDirTimer)
         return;
+    if (priv->inTitleStart && !priv->rendezvousContext) {
+        priv->rendezvousContext = g_main_context_new();
+        g_thread_unref(g_thread_new("ps5-rendezvous", [](gpointer context) -> gpointer {
+            GMainLoop* loop = g_main_loop_new(static_cast<GMainContext*>(context), FALSE);
+            g_main_loop_run(loop);
+            return nullptr;
+        }, priv->rendezvousContext));
+        PS5_LOG("[ps5-launch] rendezvous on its own thread (a WebProcess runs in the title)");
+    }
     struct stat st;
     if (!stat(PS5WK_LAUNCH_DIR, &st) && bindListener(manager))
         return;
     priv->waitDirTicks = 0;
-    priv->waitDirTimer = g_timeout_add(100, [](gpointer userData) -> gboolean {
+    priv->waitDirTimer = rendezvousAddTimeout(priv, 100, [](gpointer userData) -> gboolean {
         auto* manager = WPE_PROCESS_MANAGER_PS5(userData);
         auto* priv = manager->priv;
         struct stat st;
@@ -649,6 +698,44 @@ static void ensureListener(WPEProcessManagerPS5* manager)
 }
 
 // ------------------------------------------------------- WPEProcessManager
+
+struct InTitleStart {
+    WPEProcessManagerPS5* manager;
+    guint64 handle;
+};
+
+// After launch() has returned (ProcessLauncher then finishes the launch on
+// the main loop): the WebProcess object in the title takes the fd.
+static gboolean startInTitleOnMain(gpointer data)
+{
+    auto* start = static_cast<InTitleStart*>(data);
+    auto* priv = start->manager->priv;
+    int fd = -1;
+    guint64 processIdentifier = 0;
+    {
+        Locker locker { priv->launchesLock };
+        auto it = priv->launches.find(start->handle);
+        if (it != priv->launches.end() && it->value->ipcFD >= 0) {
+            fd = std::exchange(it->value->ipcFD, -1);
+            processIdentifier = it->value->processIdentifier;
+        }
+    }
+    if (fd >= 0) {
+        gint64 t0 = g_get_monotonic_time();
+        if (priv->inTitleStart && !priv->inTitleStart(fd, processIdentifier)) {
+            PS5_LOG("[ps5-launch] web process %" G_GUINT64_FORMAT " runs in the title (pid %d); started in %.1f ms",
+                processIdentifier, static_cast<int>(getpid()), (g_get_monotonic_time() - t0) / 1000.0);
+        } else {
+            g_warning("[ps5-launch] web process %" G_GUINT64_FORMAT ": the in-title start refused it; closing its IPC socket (the next launch is a payload)",
+                processIdentifier);
+            close(fd);
+        }
+    } else
+        PS5_LOG("[ps5-launch] in-title web process: launch %" G_GUINT64_FORMAT " ended before it started", start->handle);
+    g_object_unref(start->manager);
+    delete start;
+    return G_SOURCE_REMOVE;
+}
 
 static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPEProcessLaunchOptions* options, GError** error)
 {
@@ -675,6 +762,19 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
     launch->ipcFD = ipcFD;
     launch->startTime = g_get_monotonic_time();
 
+    if (type == WPE_PROCESS_TYPE_WEB && priv->inTitleStart && !priv->inTitleUsed) {
+        priv->inTitleUsed = true;
+        launch->inTitle = true;
+        guint64 handle = launch->handle;
+        PS5_LOG("[ps5-launch] launching web process %" G_GUINT64_FORMAT " in the title (/data/ps5webkit/inprocess-web)", launch->processIdentifier);
+        {
+            Locker locker { priv->launchesLock };
+            priv->launches.add(handle, WTF::move(launch));
+        }
+        g_idle_add_full(G_PRIORITY_HIGH, startInTitleOnMain, new InTitleStart { WPE_PROCESS_MANAGER_PS5(g_object_ref(manager)), handle }, nullptr);
+        return handle;
+    }
+
     auto* job = new UploadJob;
     job->elfPath = priv->childELF;
     char text[512];
@@ -689,7 +789,10 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
     guint64 handle = launch->handle;
     job->manager = WPE_PROCESS_MANAGER_PS5(g_object_ref(manager));
     job->handle = handle;
-    priv->launches.add(handle, WTF::move(launch));
+    {
+        Locker locker { priv->launchesLock };
+        priv->launches.add(handle, WTF::move(launch));
+    }
     g_thread_unref(g_thread_new("ps5-launch", uploadThread, job));
     return handle;
 }
@@ -697,11 +800,21 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
 static void wpeProcessManagerPS5Terminate(WPEProcessManager* processManager, guint64 handle)
 {
     auto* priv = WPE_PROCESS_MANAGER_PS5(processManager)->priv;
-    auto launch = priv->launches.take(handle);
+    std::unique_ptr<PendingLaunch> launch;
+    {
+        Locker locker { priv->launchesLock };
+        launch = priv->launches.take(handle);
+    }
     if (!launch)
         return;
     if (launch->ipcFD >= 0)
         close(launch->ipcFD);
+    if (launch->inTitle) {
+        // WebKit closed its end: the in-title WebProcess sees its connection
+        // close and stays stopped (AuxiliaryProcess::didClose).
+        PS5_LOG("[ps5-launch] web process %" G_GUINT64_FORMAT " (in the title) terminated by WebKit", launch->processIdentifier);
+        return;
+    }
     // Closing WebKit's end of the IPC socket already makes the child exit;
     // SIGKILL in case it is stuck (may be refused across title/payload).
     if (launch->pid > 0 && kill(launch->pid, SIGKILL))
@@ -712,11 +825,11 @@ static void wpeProcessManagerPS5Dispose(GObject* object)
 {
     auto* priv = WPE_PROCESS_MANAGER_PS5(object)->priv;
     if (priv->listenWatch) {
-        g_source_remove(priv->listenWatch);
+        rendezvousRemove(priv, priv->listenWatch);
         priv->listenWatch = 0;
     }
     if (priv->waitDirTimer) {
-        g_source_remove(priv->waitDirTimer);
+        rendezvousRemove(priv, priv->waitDirTimer);
         priv->waitDirTimer = 0;
     }
     if (priv->listenFD >= 0) {
@@ -788,6 +901,12 @@ gboolean wpe_process_manager_ps5_quiesce(guint timeoutMS)
     PS5_LOG("[ps5-launch] quiesced: no new payloads; %d send(s) in flight at the call, %s after %.0f ms", sending,
         done ? "none left" : "STILL SENDING", (g_get_monotonic_time() - t0) / 1000.0);
     return done;
+}
+
+void wpe_process_manager_ps5_set_web_in_title(WPEProcessManager* manager, WPEProcessManagerPS5InTitleStart start)
+{
+    g_return_if_fail(WPE_IS_PROCESS_MANAGER_PS5(manager));
+    WPE_PROCESS_MANAGER_PS5(manager)->priv->inTitleStart = start;
 }
 
 void wpe_process_manager_ps5_set_child_elf(WPEProcessManager* manager, const char* path)

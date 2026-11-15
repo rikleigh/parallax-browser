@@ -2675,6 +2675,75 @@ static void startTitleProfiler(void)
     spike_log("[prof] title profiler started, mode %s (/data/ps5webkit/title-profile)", mode[0] ? mode : "1");
 }
 
+/* The WebProcess in the title (spikes/14-webprocess-in-title, stage 1):
+ * while /data/ps5webkit/inprocess-web exists, the first WebProcess runs in
+ * this process (WebKit's PS5WebProcessInTitle.cpp, through the PS5 process
+ * manager) instead of as an elfldr payload; later ones are payloads. Its JSC
+ * runs with ps5wk-child.cpp's configureJIT settings, which then hold for the
+ * whole title (one set of JSC options per process). */
+int ps5wk_web_process_in_title_start(int fd, uint64_t processIdentifier);
+extern int ps5wk_title_mem_exec __attribute__((weak)); /* titlemem.c (the title package; not the payload-style ELF) */
+extern int ps5wk_title_access_fix __attribute__((weak)); /* titlesys.c (the title package) */
+static int inTitleWeb;
+
+/* ps5wk-child.cpp configureJIT() and setupEnvironment()'s WebProcess parts,
+ * for the title's environment. Before WebKit initializes JSC. */
+static void setUpInTitleWeb(void)
+{
+    const int safer = fileExists("/data/ps5webkit/safer-browsing");
+    setenv("JSC_useJIT", safer ? "false" : "true", 1);
+    setenv("JSC_numberOfBaselineCompilerThreads", "1", 0);
+    setenv("JSC_numberOfDFGCompilerThreads", "1", 0);
+    setenv("JSC_numberOfFTLCompilerThreads", "1", 0);
+    if (!safer)
+        setenv("JSC_jitMemoryReservationSize", "268435456", 0);
+    setenv("JSC_useWasm", safer ? "false" : "true", 1);
+    if (&ps5wk_title_mem_exec)
+        ps5wk_title_mem_exec = !safer;
+    /* fontconfig finds its fonts.conf with access() (titlesys.c). */
+    if (&ps5wk_title_access_fix)
+        ps5wk_title_access_fix = 1;
+    char path[96];
+    snprintf(path, sizeof path, "/system_tmp/ps5wk/audio-%d.sock", (int)getpid());
+    setenv("PS5WK_AUDIO_SOCKET", path, 0);
+    snprintf(path, sizeof path, "/system_tmp/ps5wk/video-%d.sock", (int)getpid());
+    setenv("PS5WK_VIDEO_SOCKET", path, 0);
+    setenv("WEBKIT_GST_ENABLE_HLS_SUPPORT", "1", 0);
+    setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", "1920x1080@60", 0);
+    mkdir("/data/ps5webkit/home/cache", 0777);
+    mkdir("/data/ps5webkit/home/cache/media", 0777);
+    setenv("WPE_SHELL_MEDIA_DISK_CACHE_PATH", "/data/ps5webkit/home/cache/media", 0);
+    /* stdout to the log as well (titlelog.c takes stderr only): the page's
+     * console messages (enable-write-console-messages-to-stdout) and
+     * libraries' debug output, as a payload's stdout is relayed. */
+    fflush(stdout);
+    /* dup2 onto fd 1 fails here (EBUSY), so stdout's FILE gets fd 2. */
+    FILE* out = fdopen(STDERR_FILENO, "w");
+    if (out) {
+        setvbuf(out, NULL, _IOLBF, 0);
+        stdout = out;
+    }
+    spike_log("[web-in-title] stdout to the log: %s", out ? "yes (a FILE on fd 2)" : "no");
+    /* KEY=VALUE lines in the switch file: the in-title WebProcess's child.env
+     * (debugging, e.g. FC_DEBUG). */
+    FILE* env = fopen("/data/ps5webkit/inprocess-web", "r");
+    char line[512];
+    while (env && fgets(line, sizeof line, env)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char* eq = strchr(line, '=');
+        if (line[0] == '#' || !eq || strchr(line, ' ') > line && strchr(line, ' ') < eq)
+            continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+        spike_log("[web-in-title] env %s=%s (/data/ps5webkit/inprocess-web)", line, eq + 1);
+    }
+    if (env)
+        fclose(env);
+    spike_log("[web-in-title] on (/data/ps5webkit/inprocess-web): the first WebProcess runs in the title; JIT %s, "
+              "WebAssembly %s, executable pool %s",
+        getenv("JSC_useJIT"), getenv("JSC_useWasm"), safer ? "none" : "256 MB in direct memory");
+}
+
 int main(int argc, char** argv)
 {
     /* Before the unjail in spike_title_init (PS5VR: libSceVideodec2 does
@@ -2742,7 +2811,11 @@ int main(int argc, char** argv)
      * (adblock.c) and nothing else: no JIT in a title. Read when WebKit
      * initializes JSC (the web context below); the WebProcesses do not see
      * this environment. */
-    setenv("JSC_useJIT", "false", 0);
+    inTitleWeb = fileExists("/data/ps5webkit/inprocess-web");
+    if (inTitleWeb)
+        setUpInTitleWeb();
+    else
+        setenv("JSC_useJIT", "false", 0);
     /* Whose data: before anything reads it (README: "Users and storage"). */
     ps5wk_profile_init();
     /* The values in use until something restarts (the settings page). */
@@ -2783,6 +2856,8 @@ int main(int argc, char** argv)
     }
     wpe_display_set_primary(display);
     SPIKE_PASS("display", "PS5 display connected");
+    if (inTitleWeb && wpe_process_manager_get_default())
+        wpe_process_manager_ps5_set_web_in_title(wpe_process_manager_get_default(), ps5wk_web_process_in_title_start);
     memLog("display connected");
     /* The WebProcesses' audio (ps5audiosink) is played here with sceAudioOut
      * (apps/common/ps5audioserver.c). /data/ps5webkit/audio-null (a file):

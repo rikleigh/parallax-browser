@@ -47,6 +47,16 @@ WPE_API gboolean wpe_process_manager_ps5_run_task (WPEProcessManager            
                                                    WPEProcessManagerPS5TaskEnded  ended,
                                                    gpointer                       user_data);
 
+/* The first WebProcess in the title instead of a payload
+ * (spikes/14-webprocess-in-title): @start gets WebKit's end of the IPC
+ * socket and the process identifier on the main loop, returns 0 when it
+ * took the fd (the WebProcess runs in this process from then on) or -1 (the
+ * fd is closed, WebKit takes the process as crashed and launches another,
+ * as a payload). Later WebProcesses are payloads. NULL turns it off. */
+typedef int (*WPEProcessManagerPS5InTitleStart) (int fd, guint64 process_identifier);
+WPE_API void wpe_process_manager_ps5_set_web_in_title (WPEProcessManager               *manager,
+                                                       WPEProcessManagerPS5InTitleStart start);
+
 /* Before the title ends (it is SIGKILLed): no payload upload starts after
  * this call, and it waits up to @timeout_ms for the one being sent to
  * elfldr. A title killed in the middle of an upload leaves elfldr a cut-off

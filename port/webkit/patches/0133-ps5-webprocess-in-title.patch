@@ -1,0 +1,512 @@
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index 4832d1b0ee..8324d7d866 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -98,6 +98,12 @@ void BufferMemoryResult::dump(PrintStream& out) const
+ // guard. A hinted mmap that finds the range below taken is placed above that address after all.)
+ extern "C" int sceKernelReserveVirtualRange(void** address, size_t length, int flags, size_t alignment);
+ extern "C" int sceKernelMunmap(void* address, size_t length);
++// The browser title (spikes/14-webprocess-in-title, item 5): mmap(MAP_FIXED) there commits flexible
++// memory (about 220 MB free; the emulator's memory alone is 256 MB). With a WebProcess in the title,
++// apps/title/titlemem.c commits in direct memory mapped at the address instead, and releases it with
++// the reservation. Payloads don't define these.
++extern "C" int ps5wk_title_commit_direct(void* address, size_t bytes) __attribute__((weak)); // 1 done, 0 not here, -1 failed
++extern "C" void ps5wk_title_release_direct(void* address, size_t bytes) __attribute__((weak));
+ 
+ static size_t ps5ReservationBytes(size_t bytes)
+ {
+@@ -120,6 +126,8 @@ static void* ps5TryReserve(size_t bytes)
+ static void ps5ReleaseReservation(void* base, size_t bytes)
+ {
+     // The reservation and whatever was mapped over it.
++    if (ps5wk_title_release_direct)
++        ps5wk_title_release_direct(base, ps5ReservationBytes(bytes));
+     int result = sceKernelMunmap(base, ps5ReservationBytes(bytes));
+     RELEASE_ASSERT(!result);
+ }
+@@ -243,8 +251,13 @@ bool BufferMemoryManager::tryMakeReadableAndWritable(void* address, size_t bytes
+     // memory, or what a growth adds. Mapping over it is the commit, and it reads as zero.
+     if (!bytes)
+         return true;
+-    if (singleton().isInGrowableOrFastMemory(address) && singleton().isInGrowableOrFastMemory(static_cast<char*>(address) + bytes - 1))
++    if (singleton().isInGrowableOrFastMemory(address) && singleton().isInGrowableOrFastMemory(static_cast<char*>(address) + bytes - 1)) {
++        if (ps5wk_title_commit_direct) {
++            if (int done = ps5wk_title_commit_direct(address, bytes))
++                return done > 0;
++        }
+         return mmap(address, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == address;
++    }
+     OSAllocator::protect(address, bytes, readable, writable);
+     return true;
+ #elif OS(WINDOWS)
+diff --git a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp
+index bb37e8c476..67ecb622b1 100644
+--- a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp
++++ b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.cpp
+@@ -360,6 +360,12 @@ GPUConnectionToWebProcess::GPUConnectionToWebProcess(GPUProcess& gpuProcess, Web
+     // reply from the GPU process, which would be unsafe.
+     Ref connection = m_connection;
+     connection->setOnlySendMessagesAsDispatchWhenWaitingForSyncReplyWhenProcessingSuchAMessage(true);
++#if defined(PS5_PAYLOAD_SDK)
++    // The GPU process side runs in the title's main thread (PS5GPUProcessInTitle.cpp): like the UI
++    // side's connections (IPC::Connection::ps5MarkUIProcessSide), its messages must be dispatched
++    // while an in-title WebProcess waits for them (RemoteGPUProxy's WasCreated needs CreateGPU).
++    connection->ps5MarkUIProcessSide();
++#endif
+     connection->open(*this);
+ 
+     auto capabilities = parameters.mediaCodecCapabilities.value_or(GPUProcessMediaCodecCapabilities {
+diff --git a/Source/WebKit/Platform/IPC/Connection.cpp b/Source/WebKit/Platform/IPC/Connection.cpp
+index 22c6079f03..05435e16b4 100644
+--- a/Source/WebKit/Platform/IPC/Connection.cpp
++++ b/Source/WebKit/Platform/IPC/Connection.cpp
+@@ -84,6 +84,11 @@ static UnfairLock s_connectionMapLock;
+ static Lock s_connectionMapLock;
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Connection::ps5MarkInTitleWebProcessConnection (Spike 14).
++static std::atomic<const Connection*> s_ps5InTitleWebProcessConnection;
++#endif
++
+ class Connection::SyncMessageState final : public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<SyncMessageState> {
+ public:
+     static Ref<SyncMessageState> getOrCreate(SerialFunctionDispatcher&);
+@@ -122,8 +127,14 @@ public:
+ private:
+     explicit SyncMessageState(SerialFunctionDispatcher& dispatcher)
+         : m_dispatcher(dispatcher)
++#if defined(PS5_PAYLOAD_SDK)
++        , m_ps5IsMainRunLoop(&dispatcher == static_cast<SerialFunctionDispatcher*>(&RunLoop::mainSingleton()))
++#endif
+     {
+     }
++#if defined(PS5_PAYLOAD_SDK)
++    const bool m_ps5IsMainRunLoop;
++#endif
+     static Lock syncMessageStateMapLock;
+     static HashMap<Ref<SerialFunctionDispatcher>, ThreadSafeWeakPtr<SyncMessageState>>& LEGACY_NODELETE syncMessageStateMap() WTF_REQUIRES_LOCK(syncMessageStateMapLock)
+     {
+@@ -201,6 +212,16 @@ bool Connection::SyncMessageState::processIncomingMessage(Connection& connection
+     {
+         Locker locker { m_lock };
+         if (!m_allMessagesShouldBeDispatchedWhileWaitingForSyncReplySet.contains(&connection)) {
++#if defined(PS5_PAYLOAD_SDK)
++            // Connection::ps5MarkUIProcessSide. The connection's queued
++            // messages go first, to keep its order.
++            const Connection* inTitleWeb = s_ps5InTitleWebProcessConnection.load();
++            if (m_ps5IsMainRunLoop && inTitleWeb && connection.m_ps5UIProcessSide) {
++                m_allMessagesShouldBeDispatchedWhileWaitingForSyncReplySet.add(connection);
++                while (!connection.m_incomingMessages.isEmpty())
++                    m_messagesToDispatchWhileWaitingForSyncReply.append(ConnectionAndIncomingMessage { connection, connection.m_incomingMessages.takeFirst() });
++            } else
++#endif
+             switch (message->shouldDispatchMessageWhenWaitingForSyncReply()) {
+             case ShouldDispatchWhenWaitingForSyncReply::No:
+                 return false;
+@@ -878,11 +899,32 @@ auto Connection::waitForMessage(MessageName messageName, uint64_t destinationID,
+             return makeUnexpected(Error::InvalidConnection);
+         }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        // The in-title WebProcess (Spike 14) waiting on the title's main thread: what it waits for can
++        // need that thread on the UI or GPU side (RemoteGPUProxy::waitUntilInitialized waits for
++        // WasCreated, which the GPU side sends from its CreateGPU handler). Wait in 2 ms slices and
++        // dispatch the main run loop's queued UI and GPU side messages between them.
++        if (s_ps5InTitleWebProcessConnection.load() && !m_ps5UIProcessSide && RunLoop::isMain()) {
++            auto slice = std::min(timeout.deadline(), ApproximateTime::now() + 2_ms);
++            if (!m_waitForMessageCondition.waitUntil(m_waitForMessageLock, slice)) {
++                if (timeout.didTimeOut()) {
++                    m_waitingForMessage = nullptr;
++                    return makeUnexpected(Error::Timeout);
++                }
++                locker.unlockEarly();
++                static NeverDestroyed<RefPtr<SyncMessageState>> mainState = SyncMessageState::getOrCreate(RunLoop::mainSingleton()).ptr();
++                RefPtr { mainState.get() }->dispatchMessages();
++                continue;
++            }
++        } else
++#endif
++        {
+         bool didTimeout = !m_waitForMessageCondition.waitUntil(m_waitForMessageLock, timeout.deadline());
+         if (didTimeout) {
+             m_waitingForMessage = nullptr;
+             return makeUnexpected(Error::Timeout);
+         }
++        }
+         if (m_waitingForMessage->messageWaitingInterrupted) {
+             m_waitingForMessage = nullptr;
+             if (m_shouldWaitForMessages)
+@@ -1022,6 +1064,21 @@ auto Connection::waitForSyncReply(SyncRequestID syncRequestID, MessageName messa
+         // We didn't find a sync reply yet, keep waiting.
+         // This allows the WebProcess to still serve clients while waiting for the message to return.
+         // Notably, it can continue to process accessibility requests, which are on the main thread.
++#if defined(PS5_PAYLOAD_SDK)
++        // The in-title WebProcess (Spike 14) blocks the whole browser while it
++        // waits: say which reply it waits for, every 2 s.
++        if (s_ps5InTitleWebProcessConnection.load() == this) {
++            Timeout slice { std::min(timeout.secondsUntilDeadline(), 2_s) };
++            if (protect(m_syncState)->wait(slice))
++                continue;
++            timedOut = timeout.didTimeOut();
++            if (!timedOut) {
++                WTFLogAlways("[web-in-title] the title's main thread still waits for the reply to %s (sync request %" PRIu64 ")",
++                    description(messageName).characters(), syncRequestID.toUInt64());
++            }
++            continue;
++        }
++#endif
+         timedOut = !protect(m_syncState)->wait(timeout);
+     }
+ 
+@@ -1248,6 +1305,16 @@ void Connection::dispatchIncomingMessageForTesting(UniqueRef<Decoder>&& decoder)
+ #if defined(PS5_PAYLOAD_SDK)
+ static std::atomic<const Connection*> s_ps5ExitProcessOnClose;
+ 
++void Connection::ps5MarkInTitleWebProcessConnection()
++{
++    s_ps5InTitleWebProcessConnection = this;
++}
++
++bool Connection::ps5HasInTitleWebProcess()
++{
++    return !!s_ps5InTitleWebProcessConnection.load();
++}
++
+ void Connection::ps5ExitProcessWhenClosed()
+ {
+     s_ps5ExitProcessOnClose = this;
+diff --git a/Source/WebKit/Platform/IPC/Connection.h b/Source/WebKit/Platform/IPC/Connection.h
+index c461f4f9de..28c59af999 100644
+--- a/Source/WebKit/Platform/IPC/Connection.h
++++ b/Source/WebKit/Platform/IPC/Connection.h
+@@ -474,6 +474,20 @@ public:
+     // PS5 payloads: _exit(0) as soon as this connection (to the UI process)
+     // closes, on the IPC thread, before anything can wait on it and abort.
+     void ps5ExitProcessWhenClosed();
++    // PS5 (spikes/14-webprocess-in-title): this is the in-title WebProcess's
++    // connection to the UI process, whose main thread it shares.
++    void ps5MarkInTitleWebProcessConnection();
++    static bool ps5HasInTitleWebProcess();
++    // A UI process connection to an auxiliary process (AuxiliaryProcessProxy).
++    // With a WebProcess in the title, these have all their messages
++    // dispatched inside sync waits on the main thread (not only sync ones),
++    // so a UI handler that finishes with another process's reply (the
++    // NetworkProcess's, for GetNetworkProcessConnection) can finish while the
++    // in-title WebProcess waits for it. The WebProcess side's own
++    // connections keep WebKit's rules: dispatching their async messages
++    // inside a sync wait ended a page load in the middle of its HTML
++    // (2026-11-15).
++    void ps5MarkUIProcessSide() { m_ps5UIProcessSide = true; }
+ #endif
+     void invalidate();
+ 
+@@ -768,6 +782,9 @@ private:
+     UniqueID m_uniqueID;
+     bool m_isServer;
+     std::atomic<bool> m_isValid { true };
++#if defined(PS5_PAYLOAD_SDK)
++    std::atomic<bool> m_ps5UIProcessSide { false };
++#endif
+ 
+     bool m_onlySendMessagesAsDispatchWhenWaitingForSyncReplyWhenProcessingSuchAMessage { false };
+     bool m_shouldExitOnSyncMessageSendFailure { false };
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index 880d4a46e6..c537ba2aba 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -93,6 +93,11 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+     list(APPEND WebKit_SOURCES
+         UIProcess/wpe/ps5/PS5WCHost.cpp
+     )
++
++    # The WebProcess in the title (spikes/14-webprocess-in-title).
++    list(APPEND WebKit_SOURCES
++        WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
++    )
+ endif ()
+ 
+ # DrawingAreaProxyWC paints UpdateInfo bitmaps into a BackingStore, which the
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.cpp b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+index fc03294dd7..ce916939ee 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.cpp
++++ b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+@@ -75,6 +75,12 @@ AuxiliaryProcess::~AuxiliaryProcess()
+ 
+ void AuxiliaryProcess::didClose(IPC::Connection&)
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    if (s_ps5WebProcessInTitle) {
++        WTFLogAlways("[web-in-title] the UI process closed the in-title WebProcess's connection: it stays stopped (one per title)");
++        return;
++    }
++#endif
+ // Stop the run loop for GTK and WPE to ensure a normal exit, since stopRunLoop()
+ // releases resources like EGL displays before the process exits.
+ // PS5 payloads have no EGL, and their teardown after the run loop stops
+@@ -155,6 +161,38 @@ private:
+ };
+ }
+ 
++bool AuxiliaryProcess::s_ps5WebProcessInTitle;
++
++void AuxiliaryProcess::ps5InitializeWebProcessInTitle(AuxiliaryProcessInitializationParameters&& parameters)
++{
++    RELEASE_ASSERT(RunLoop::isMain());
++    RELEASE_ASSERT(!m_connection);
++    RELEASE_ASSERT(parameters.processIdentifier);
++    s_ps5WebProcessInTitle = true;
++
++    // As initialize(), with these differences:
++    // - the process type and identifier are the title's from now on: the UI
++    //   side checks neither outside asserts, and the WebProcess side needs
++    //   both (isInWebProcess(), identifiers qualified by Process::identifier());
++    // - no platformInitialize(): the title ignores SIGPIPE already;
++    // - no generation protection (SessionID, WebPageProxyIdentifier): the UI
++    //   process makes them for every new page;
++    // - no ps5ExitProcessWhenClosed().
++    setAuxiliaryProcessType(parameters.processType);
++    Process::setIdentifier(*parameters.processIdentifier);
++
++    SandboxInitializationParameters sandboxParameters;
++    initializeSandbox(parameters, sandboxParameters);
++    initializeProcess(parameters);
++    initializeProcessName(parameters);
++
++    Ref connection = IPC::Connection::createClientConnection(WTF::move(parameters.connectionIdentifier), connectionReceiveQueueQOS());
++    lazyInitialize(m_connection, connection.copyRef());
++    initializeConnection(connection.ptr());
++    connection->ps5MarkInTitleWebProcessConnection();
++    connection->open(*this);
++}
++
+ void AuxiliaryProcess::ps5InitializeInTitle()
+ {
+     RELEASE_ASSERT(RunLoop::isMain());
+@@ -278,6 +316,13 @@ uint64_t AuxiliaryProcess::messageSenderDestinationID() const
+ 
+ void AuxiliaryProcess::stopRunLoop()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // The main run loop is the title's (PS5WebProcessInTitle.cpp).
++    if (s_ps5WebProcessInTitle) {
++        WTFLogAlways("[web-in-title] stopRunLoop ignored: the main run loop is the title's");
++        return;
++    }
++#endif
+     platformStopRunLoop();
+ }
+ 
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.h b/Source/WebKit/Shared/AuxiliaryProcess.h
+index 843a58bd40..d011a51f59 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.h
++++ b/Source/WebKit/Shared/AuxiliaryProcess.h
+@@ -115,6 +115,17 @@ public:
+     // initialize()'s process-wide set-up, which belongs to the UI process.
+     // Main run loop.
+     void ps5InitializeInTitle();
++
++    // PS5 (spikes/14-webprocess-in-title): the WebProcess in the title,
++    // beside the UI process (WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp).
++    // initialize() without what belongs to a whole process: the UI process
++    // still generates session and page identifiers, and a closed connection
++    // must not end the title. Sets the process type to WebContent for the
++    // whole title. Main run loop.
++    void ps5InitializeWebProcessInTitle(AuxiliaryProcessInitializationParameters&&);
++    // The title hosts a WebProcess: no auxiliary process in it stops the
++    // main run loop or ends the process.
++    static bool ps5WebProcessIsInTitle() { return s_ps5WebProcessInTitle; }
+ #endif
+ 
+     IPC::MessageReceiverMap& messageReceiverMap() LIFETIME_BOUND { return m_messageReceiverMap; }
+@@ -231,6 +242,9 @@ private:
+ 
+     bool m_isInShutDown { false };
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    static bool s_ps5WebProcessInTitle;
++#endif
+     const RefPtr<IPC::Connection> m_connection;
+     IPC::MessageReceiverMap m_messageReceiverMap;
+ 
+diff --git a/Source/WebKit/UIProcess/AuxiliaryProcessProxy.cpp b/Source/WebKit/UIProcess/AuxiliaryProcessProxy.cpp
+index 1c0a468db5..c924c98593 100644
+--- a/Source/WebKit/UIProcess/AuxiliaryProcessProxy.cpp
++++ b/Source/WebKit/UIProcess/AuxiliaryProcessProxy.cpp
+@@ -453,6 +453,9 @@ void AuxiliaryProcessProxy::didFinishLaunching(ProcessLauncher* launcher, IPC::C
+     auto addResult = connectionToProcessMap().add(m_connection->uniqueID(), *this);
+     ASSERT_UNUSED(addResult, addResult.isNewEntry);
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    connection->ps5MarkUIProcessSide(); // IPC::Connection::ps5MarkUIProcessSide (Spike 14)
++#endif
+     connectionWillOpen(*connection);
+     connection->open(*this);
+     connection->setOutgoingMessageQueueIsGrowingLargeCallback([weakThis = WeakPtr { *this }] {
+diff --git a/Source/WebKit/WebProcess/WebProcess.cpp b/Source/WebKit/WebProcess/WebProcess.cpp
+index e5c075670d..ce006abc44 100644
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -470,6 +470,11 @@ void WebProcess::initializeConnection(IPC::Connection* connection)
+ // Unless the main thread doesn't exit after 10 senconds to avoid leaking the process.
+ #if PLATFORM(GTK) || PLATFORM(WPE)
+     IPC::Connection::DidCloseOnConnectionWorkQueueCallback callExitCallback = crashAfter10Seconds;
++#if defined(PS5_PAYLOAD_SDK)
++    // In the title (PS5WebProcessInTitle.cpp) the process is the browser.
++    if (ps5WebProcessIsInTitle())
++        callExitCallback = nullptr;
++#endif
+ #else
+     // We call _exit() directly from the background queue in case the main thread is unresponsive
+     // and AuxiliaryProcess::didClose() does not get called.
+diff --git a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+index 917397644b..d9b69ea78a 100644
+--- a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
++++ b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+@@ -106,6 +106,14 @@ using namespace WebCore;
+ 
+ void WebProcess::stopRunLoop()
+ {
++#if defined(PS5_PAYLOAD_SDK)
++    // In the title the shared display is the GPU process side's, and the
++    // run loop the title's (PS5WebProcessInTitle.cpp).
++    if (ps5WebProcessIsInTitle()) {
++        WTFLogAlways("[web-in-title] WebProcess::stopRunLoop ignored (in the title)");
++        return;
++    }
++#endif
+     // Closing the last page terminates the process, which calls back here.
+     if (m_isStoppingRunLoop)
+         return;
+diff --git a/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp b/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
+new file mode 100644
+index 0000000000..f71c9bfaa0
+--- /dev/null
++++ b/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
+@@ -0,0 +1,126 @@
++/*
++ * PS5: one WebProcess in the browser title (spikes/14-webprocess-in-title,
++ * stage 1, behind /data/ps5webkit/inprocess-web).
++ *
++ * As an elfldr payload the WebProcess gets CPUs 9, 11, 13, 14 and 15, of
++ * which only one physical core (14/15) runs while a title does; the title
++ * has CPUs 0-12. Stage 0 measured an emulator-shaped WebAssembly kernel 1.41x
++ * faster in the title.
++ *
++ * The UI process side is unchanged: ProcessLauncher makes the socket pair
++ * and gives the client end to the PS5 process manager
++ * (wpe-ps5/WPEProcessManagerPS5.cpp), which, for the first WebProcess when
++ * the switch is on, calls ps5wk_web_process_in_title_start() on the main
++ * run loop instead of sending ps5wk-child.elf to elfldr. That makes
++ * WebKit's WebProcess object in the title, the way
++ * UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp makes the GPU process's.
++ *
++ * What a payload's WebProcessMain does and this does not: WTF, JSC and
++ * GLib are started by the UI process already, and RunLoop::run() is the
++ * title's main loop. WebKit has one main thread per process, so the page's
++ * main-thread work runs on the title's (1.1% of a core in a fight, stage 1).
++ * AuxiliaryProcess::ps5InitializeWebProcessInTitle lists the other
++ * differences. The JSC options (JIT, WebAssembly) and the executable pool
++ * come from the title (apps/title/ps5browser.c, titlemem.c).
++ */
++
++#include "config.h"
++
++#if defined(PS5_PAYLOAD_SDK)
++
++#include "AuxiliaryProcess.h"
++#include "WebProcess.h"
++#include <skia/core/SkGraphics.h>
++#include <wtf/RunLoop.h>
++#include <wtf/RuntimeApplicationChecks.h>
++#include <wtf/unix/UnixFileDescriptor.h>
++#include <fontconfig/fontconfig.h>
++#include <stdio.h>
++#include <string.h>
++#include <wtf/MonotonicTime.h>
++
++#if USE(GCRYPT)
++#include <pal/crypto/gcrypt/Initialization.h>
++#endif
++
++#if USE(SKIA_OPENTYPE_SVG)
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/modules/svg/SkSVGOpenTypeSVGDecoder.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#endif
++
++// A title can't list directories (opendir of /data/ps5webkit/fonts: EPERM,
++// 2026-11-15), so fontconfig's scan of its font folder finds nothing and
++// pages paint without text. stat, open and FreeType work: add the fonts
++// one by one, from the title's runtime file list (runtime.c installs them
++// in /data/ps5webkit/fonts). They are application fonts of the current
++// configuration, which WebCore's Skia font manager uses.
++static void addFontsWithoutScanning()
++{
++    auto start = MonotonicTime::now();
++    FcConfig* config = FcConfigGetCurrent();
++    FcFontSet* system = config ? FcConfigGetFonts(config, FcSetSystem) : nullptr;
++    if (!config || (system && system->nfont)) {
++        WTFLogAlways("[web-in-title] fonts: fontconfig has %d system fonts already", system ? system->nfont : -1);
++        return;
++    }
++    FILE* list = fopen("/app0/runtime/runtime-files.txt", "r");
++    if (!list) {
++        WTFLogAlways("[web-in-title] fonts: no /app0/runtime/runtime-files.txt (errno %d): pages will have no text", errno);
++        return;
++    }
++    unsigned added = 0, failed = 0;
++    char line[512];
++    while (fgets(line, sizeof line, list)) {
++        line[strcspn(line, "\r\n")] = 0;
++        if (strncmp(line, "fonts/", 6))
++            continue;
++        char path[600];
++        snprintf(path, sizeof path, "/data/ps5webkit/%s", line);
++        if (FcConfigAppFontAddFile(config, reinterpret_cast<const FcChar8*>(path)))
++            added++;
++        else
++            failed++;
++    }
++    fclose(list);
++    FcFontSet* application = FcConfigGetFonts(config, FcSetApplication);
++    WTFLogAlways("[web-in-title] fonts: %u files added one by one (%u failed), %d faces, in %.0f ms (a title can't list /data/ps5webkit/fonts)",
++        added, failed, application ? application->nfont : 0, (MonotonicTime::now() - start).milliseconds());
++}
++
++// 0: started, and the WebProcess owns fd. -1: not started (already one, or
++// bad arguments); fd is still the caller's. Main run loop.
++extern "C" int ps5wk_web_process_in_title_start(int fd, uint64_t processIdentifier)
++{
++    using namespace WebKit;
++    RELEASE_ASSERT(RunLoop::isMain());
++    static bool started;
++    if (started || fd < 0 || !ObjectIdentifier<WebCore::ProcessIdentifierType>::isValidIdentifier(processIdentifier)) {
++        WTFLogAlways("[web-in-title] not starting WebProcess %" PRIu64 " in the title (%s)", processIdentifier, started ? "one runs already" : "bad arguments");
++        return -1;
++    }
++    started = true;
++
++    // WebProcessMainWPE::platformInitialize, minus g_set_prgname (the
++    // title's name stays).
++#if USE(GCRYPT)
++    PAL::GCrypt::initialize();
++#endif
++    SkGraphics::Init();
++#if USE(SKIA_OPENTYPE_SVG)
++    SkGraphics::SetOpenTypeSVGDecoderFactory(SkSVGOpenTypeSVGDecoder::Make);
++#endif
++
++    addFontsWithoutScanning();
++
++    AuxiliaryProcessInitializationParameters parameters;
++    parameters.processType = WTF::AuxiliaryProcessType::WebContent;
++    parameters.processIdentifier = ObjectIdentifier<WebCore::ProcessIdentifierType>(processIdentifier);
++    parameters.connectionIdentifier = IPC::Connection::Identifier { { fd, UnixFileDescriptor::Adopt } };
++    WTFLogAlways("[web-in-title] starting WebProcess %" PRIu64 " in the title (IPC fd %d)", processIdentifier, fd);
++    WebProcess::singleton().ps5InitializeWebProcessInTitle(WTF::move(parameters));
++    WTFLogAlways("[web-in-title] WebProcess %" PRIu64 " initialized; its messages run on the title's main loop", processIdentifier);
++    return 0;
++}
++
++#endif // defined(PS5_PAYLOAD_SDK)

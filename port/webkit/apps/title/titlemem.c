@@ -22,6 +22,14 @@
  *   inaccessible 16 KiB guard below it; it is freed at pthread_join, or
  *   2 s after a detached thread's function returned.
  *
+ * - executable anonymous mappings, only when ps5wk_title_mem_exec is set
+ *   (the WebProcess in the title, spikes/14-webprocess-in-title: JSC's JIT
+ *   pool is one anonymous RWX mmap): a title can't run code from a mapping
+ *   made executable at map time, but can once it is made so with
+ *   sceKernelMprotect (Spike 13). Mapped read-write in direct memory as
+ *   above, then sceKernelMprotect'ed to the protection asked for. Unset,
+ *   they go to the real mmap as before.
+ *
  * ps5wk_title_mem_log() reports flexible memory and what each part holds.
  */
 #define SPIKE_NAME "ps5browser"
@@ -175,9 +183,100 @@ static void dmap_release_range(uintptr_t a, size_t len)
     }
 }
 
+int ps5wk_title_mem_exec;
+int __wrap_munmap(void* addr, size_t len);
+
+/* WebAssembly memories of the WebProcess in the title (JSC's
+ * BufferMemoryHandle.cpp, spikes/14-webprocess-in-title item 5). JSC
+ * reserves each memory's range with sceKernelReserveVirtualRange and commits
+ * what it uses with mmap(MAP_FIXED), which in a title takes flexible memory
+ * (about 220 MB free). Here: direct memory mapped at the address, zeroed,
+ * and in the table so munmap, madvise and MAP_FIXED re-zeroing work as for
+ * the other mappings. Only with ps5wk_title_mem_exec (the switch); 0 tells
+ * JSC to mmap as before. Address and length in 64 KiB units (wasm pages). */
+static unsigned long long commit_count, commit_failures;
+int ps5wk_title_commit_direct(void* address, size_t bytes)
+{
+    const uintptr_t a = (uintptr_t)address;
+    if (!ps5wk_title_mem_exec || !bytes)
+        return 0;
+    if ((a & (UNIT - 1)) || (bytes & (UNIT - 1))) {
+        spike_log("[mem] wasm commit of %zu bytes at %p: not in 64 KiB units, mmap instead (flexible memory)", bytes, address);
+        return 0;
+    }
+    int64_t phys = 0;
+    int rc = sceKernelAllocateMainDirectMemory(bytes, UNIT, DMEM_TYPE_WB, &phys);
+    if (rc) {
+        __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
+        spike_log("[mem] wasm commit of %.1f MB at %p: no direct memory (rc 0x%08x)", bytes / 1048576.0, address, (unsigned)rc);
+        return -1;
+    }
+    void* mapped = address;
+    rc = sceKernelMapDirectMemory(&mapped, bytes, DMEM_PROT_CPU_RW, DMEM_MAP_FIXED, phys, 0);
+    if (rc || mapped != address) {
+        if (!rc && mapped)
+            sceKernelMunmap(mapped, bytes);
+        sceKernelReleaseDirectMemory(phys, bytes);
+        __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
+        spike_log("[mem] wasm commit of %.1f MB at %p: sceKernelMapDirectMemory(MAP_FIXED) rc 0x%08x -> %p", bytes / 1048576.0,
+            address, (unsigned)rc, mapped);
+        return -1;
+    }
+    memset(address, 0, bytes); /* direct memory is not zero when recommitted (Spike 10) */
+    pthread_mutex_lock(&dmap_lock);
+    if (ndmaps == MAX_DMAPS) {
+        pthread_mutex_unlock(&dmap_lock);
+        sceKernelMunmap(address, bytes);
+        sceKernelReleaseDirectMemory(phys, bytes);
+        return -1;
+    }
+    dmap_insert((dmap_t) { a, bytes, phys });
+    dmap_bytes += bytes;
+    if (dmap_bytes > dmap_peak)
+        dmap_peak = dmap_bytes;
+    dmap_count++;
+    pthread_mutex_unlock(&dmap_lock);
+    unsigned long long n = __atomic_add_fetch(&commit_count, 1, __ATOMIC_RELAXED);
+    if (n <= 8 || bytes >= ((size_t)32 << 20))
+        spike_log("[mem] wasm commit %llu: %.1f MB of direct memory at %p (in a reserved range)", n, bytes / 1048576.0, address);
+    return 1;
+}
+
+/* Before JSC unmaps a memory's reservation: its direct memory goes back. */
+void ps5wk_title_release_direct(void* address, size_t bytes)
+{
+    const uintptr_t a = (uintptr_t)address & ~(PAGE - 1);
+    const size_t l = round_up((uintptr_t)address + bytes, PAGE) - a;
+    pthread_mutex_lock(&dmap_lock);
+    if (dmap_overlaps(a, l))
+        dmap_release_range(a, l);
+    pthread_mutex_unlock(&dmap_lock);
+}
+static unsigned long exec_maps;
+
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off)
 {
     const int anon = (flags & MAP_ANON) && fd == -1 && !(flags & MAP_SHARED);
+    if (ps5wk_title_mem_exec && anon && len && (prot & PROT_EXEC) && !(flags & MAP_FIXED)) {
+        void* p = __wrap_mmap(addr, len, (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE, flags, fd, off);
+        if (p == MAP_FAILED)
+            return p;
+        const size_t size = round_up(len, PAGE);
+        const int kprot = ((prot & PROT_READ) ? 1 : 0) | ((prot & PROT_WRITE) ? 2 : 0) | 4;
+        int rc = sceKernelMprotect(p, size, kprot);
+        if (rc) {
+            spike_log("[mem] executable mmap of %.1f MB at %p: sceKernelMprotect(0x%x) rc 0x%08x", size / 1048576.0, p, kprot,
+                (unsigned)rc);
+            __wrap_munmap(p, len);
+            errno = ENOMEM;
+            return MAP_FAILED;
+        }
+        unsigned long n = __atomic_add_fetch(&exec_maps, 1, __ATOMIC_RELAXED);
+        if (n <= 8 || size >= ((size_t)8 << 20))
+            spike_log("[mem] executable mmap %lu of %.1f MB (prot %d) -> direct memory at %p, made 0x%x with sceKernelMprotect", n,
+                size / 1048576.0, prot, p, kprot);
+        return p;
+    }
     if (!anon || !len || !(prot & (PROT_READ | PROT_WRITE)) || (prot & PROT_EXEC)) {
         __atomic_fetch_add(&dmap_passthrough, 1, __ATOMIC_RELAXED);
         return __real_mmap(addr, len, prot, flags, fd, off);
@@ -354,6 +453,13 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
             size = s;
         pthread_attr_getdetachstate(attr, &detach);
     }
+    /* With a WebProcess in the title, as ps5wk-child's crash guard does for
+     * payloads (MIN_THREAD_STACK): WebKit asks for no size for JavaScript
+     * threads (workers) on PS5, and the 64 KiB default is less than JSC's
+     * reserved zone, so every worker's first script was "Maximum call stack
+     * size exceeded" (2026-11-15). */
+    if (ps5wk_title_mem_exec && size < (2u << 20))
+        size = 2u << 20;
     size = round_up(size < (64u << 10) ? (64u << 10) : size, UNIT);
     const size_t memLen = size + UNIT; /* the lowest 16 KiB of the extra unit is the guard */
 
