@@ -496,8 +496,8 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
         PX_A(s->privateMode ? PX_PRIVATE_BAR_2 : PX_SURFACE, 0xee), TRUE);
     wpe_display_ps5_canvas_fill(c, 0, BAR_H - 1, screenW, 1, 0, PX_A(s->privateMode ? PX_MAGENTA : PX_LINE, 0xff));
 
-    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "", "", "", "", "+", "⚙" };
-    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
+    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, NULL, "", "", "", "", "+", "⚙" };
+    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
     int x = EDGE;
     for (int i = TB_BACK; i <= TB_HOME; i++) {
         drawButton(c, x, BTN_Y, BTN_W, BTN_H, labels[i], enabled[i] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == i, interactive ? i : -1);
@@ -524,6 +524,11 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
     drawButton(c, starX, BTN_Y, BTN_W, BTN_H, s->starred ? "★" : "☆", s->starred ? PX_PINK : PX_TEXT, toolbar && s->toolbarFocus == TB_STAR,
         interactive ? TB_STAR : -1);
     {
+        /* the tab count: a button (the Tabs list) */
+        if (toolbar && s->toolbarFocus == TB_TABS)
+            focusBox(c, countX, BTN_Y, 64, BTN_H, PX_RADIUS);
+        if (interactive)
+            addHot(countX, BTN_Y, 64, BTN_H, HOT_TOOLBAR, TB_TABS);
         const int box = 34, bx = countX + (64 - box) / 2, by = BTN_Y + (BTN_H - box) / 2;
         char count[16];
         snprintf(count, sizeof count, "%u", s->tabCount);
@@ -654,6 +659,8 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         x += hint(c, x, cy, "✕", "Home") + 32;
         if (s->homeSquare)
             x += hint(c, x, cy, "□", s->homeSquare) + 32;
+    } else if (!list && s->toolbarFocus == TB_TABS) {
+        x += hint(c, x, cy, "✕", "Tabs") + 32;
     } else if (!list && s->toolbarFocus == TB_FULLSCREEN) {
         x += hint(c, x, cy, "✕", s->fullScreen ? "Show the address bar" : "Full screen") + 32;
         if (s->fullScreenWhy) {

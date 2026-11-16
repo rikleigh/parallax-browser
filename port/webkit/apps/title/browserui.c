@@ -28,7 +28,7 @@
  *     top with its title, address and progress, gone 1.5 s after the load
  *     ends
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
- *     Stop, Home, the address, Bookmark, Full screen, Gamepad mode, Private
+ *     Stop, Home, the address, the tab count (the Tabs list), Bookmark, Full screen, Gamepad mode, Private
  *     browsing, Safer browsing, New tab, Settings) over a panel with four
  *     lists: Tabs, Bookmarks, History, Downloads (downloads.c: X pauses,
  *     resumes or retries, Square cancels or deletes, R2 shows the details). The pad is in UI mode while it is
@@ -1613,6 +1613,8 @@ static void editAddress(void)
         spike_log("browser: address: no system keyboard");
 }
 
+static void setSection(int s);
+
 static void toolbarActivate(int index)
 {
     switch (index) {
@@ -1659,6 +1661,15 @@ static void toolbarActivate(int index)
     case TB_NEWTAB:
         if (openInNewTab(NULL))
             setMenu(FALSE);
+        break;
+    case TB_TABS:
+        /* the Tabs list, on the tab shown (the menu opens for it) */
+        if (!menuOpen)
+            setMenu(TRUE);
+        setSection(SEC_TABS);
+        zone = ZONE_LIST;
+        keepFocusVisible();
+        redraw();
         break;
     case TB_FULLSCREEN:
         setMenu(FALSE);

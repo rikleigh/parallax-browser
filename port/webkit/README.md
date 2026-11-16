@@ -489,7 +489,7 @@ The bar: Back, Forward, Reload (Stop while loading), Home (□ on it: *Make
 this the home page* for an http(s) page, *Use the start page* on the home
 page or the start page while another home page is set; the footer says
 which, the TV confirms it, and in private browsing it does nothing), the address
-field (the page's title and address), the tab count, Bookmark (☆ adds the
+field (the page's title and address), the tab count (X: the Tabs list), Bookmark (☆ adds the
 page shown, ★ removes it), Full screen (the four corners; see below),
 Gamepad mode (the controller; □ on it opens the
 button mapping, see *Gamepad mode*), Private browsing (the hat and glasses,

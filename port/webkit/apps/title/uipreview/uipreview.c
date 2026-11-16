@@ -463,6 +463,8 @@ int main(int argc, char** argv)
     barAboveShot("bar-above-page-pointer-fullscreen", &s);
     s.toolbarFocus = TB_ADDRESS;
     barAboveShot("bar-above-page-pointer-address", &s);
+    s.toolbarFocus = TB_TABS;
+    barAboveShot("bar-above-page-pointer-tabs", &s);
 
     /* the loading bar, alone over the page */
     s = baseState();
