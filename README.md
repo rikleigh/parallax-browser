@@ -24,7 +24,7 @@ play the video on a page in the PS VR2 headset.
   Audio API.
 - Gamepad mode for browser games. The page gets the controller through the
   Gamepad API, with rumble, or you map keys and a mouse to the buttons for
-  each site. Hold Options to leave it.
+  each site. Hold △ to turn it on, Options to leave it.
 - Tabs, bookmarks, history and a start page. Recent tabs stay loaded.
 - Private browsing keeps no history, and drops cookies and site data when
   you leave it.

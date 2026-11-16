@@ -1547,7 +1547,7 @@ static void toolbarActivate(int index)
     }
 }
 
-/* The gamepad button's □ (and the offer's): the mapping page for the site
+/* The gamepad button's □: the mapping page for the site
  * shown, in a browser page tab (the game keeps its tab). */
 /* □ on the Home button: this page as the home page, or the start page
  * again (ps5wk_home_square). The menu stays open; its hint changes. */
@@ -1849,8 +1849,14 @@ static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
 {
     (void)d;
     (void)data;
-    /* Options held in gamepad mode: out of it (off for the site); the menu
-     * if it was already off. */
+    /* △ held on the page: gamepad mode on (never by itself). */
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD) {
+        if (!menuOpen)
+            ps5wk_gamepad_enter();
+        return TRUE;
+    }
+    /* Options held in gamepad mode: out of it; the menu if it was already
+     * off. */
     if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD) {
         if (ps5wk_gamepad_active())
             ps5wk_gamepad_leave();
@@ -2423,15 +2429,13 @@ static char* apiRun(ApiCall* call, int* status)
     }
     if (!strcmp(path, "/browser/gamepad")) {
         char* site = param(call->query, call->body, "site");
-        char* gamepad = param(call->query, call->body, "gamepad");
         char* preset = param(call->query, call->body, "preset");
         char* keys = param(call->query, call->body, "keys");
         char* left = param(call->query, call->body, "left");
         char* right = param(call->query, call->body, "right");
         char* remove = param(call->query, call->body, "remove");
-        char* reply = ps5wk_gamepad_api(post, site, gamepad, preset, keys, left, right, remove && !strcmp(remove, "1"), status);
+        char* reply = ps5wk_gamepad_api(post, site, preset, keys, left, right, remove && !strcmp(remove, "1"), status);
         g_free(site);
-        g_free(gamepad);
         g_free(preset);
         g_free(keys);
         g_free(left);

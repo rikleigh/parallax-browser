@@ -843,7 +843,7 @@ const char ps5wk_settings_page[] =
     "<div class=\"card\"><div class=\"row\"><span class=\"name\">Lists</span></div><p class=\"help\" id=\"abList\"></p><p class=\"help\" id=\"abStatus\"></p><div class=\"seg\"><button id=\"abUpdate\">Update lists now</button></div></div>\n"
     "<h2>Gamepad mode</h2>\n"
     "<div class=\"card\"><div class=\"row\"><span class=\"name\">Controls per site</span></div>"
-    "<p class=\"help\">Gamepad mode gives a game the whole controller (hold Options to leave it), with keys on its buttons for keyboard games.</p>"
+    "<p class=\"help\">Gamepad mode gives a game the whole controller (hold △ on the page to turn it on, Options to leave it), with keys on its buttons for keyboard games.</p>"
     "<div class=\"seg\"><button id=\"gpOpen\" onclick=\"location.href=(location.protocol=='parallax:'?'parallax://gamepad':'/gamepad')+(pin?'?pin='+encodeURIComponent(pin):'')\">Button mapping</button></div></div>\n"
     "<h2>Downloads</h2>\n"
     "<div class=\"card\" id=\"dlCard\"><div class=\"row\"><span class=\"name\">Downloads folder</span><span class=\"badge\" id=\"dlFree\"></span></div>"

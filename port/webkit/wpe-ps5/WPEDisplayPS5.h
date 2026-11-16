@@ -90,6 +90,9 @@ typedef enum {
     /* Not a button: Options held for 1 s in gamepad mode (the press itself
      * went to the page). Only the button handler sees it. */
     WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD = 0x01000000,
+    /* Not a button: Triangle held for 1 s on a page outside gamepad mode
+     * (the press itself went to the page). Only the button handler sees it. */
+    WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD = 0x02000000,
 } WPEDisplayPS5Button;
 
 /* Called on the main thread with the buttons that went down, before the
@@ -136,7 +139,9 @@ WPE_API void        wpe_display_ps5_set_pointer_over_editable (WPEDisplayPS5 *di
  * meaning anything to the browser: no pointer, scrolling, Back, zoom or
  * focus moves; each button sends only its key below (if any) and the
  * sticks do what they are set to. The button handler sees nothing but
- * WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD. */
+ * WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD. Outside it, Triangle held on the
+ * page is WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD (the application turns it
+ * on with that). */
 typedef enum {
     WPE_DISPLAY_PS5_STICK_GAMEPAD = 0, /* the Gamepad API only */
     WPE_DISPLAY_PS5_STICK_ARROWS,      /* the arrow keys (pushed past half way) */

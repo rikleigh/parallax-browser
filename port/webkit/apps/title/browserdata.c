@@ -414,8 +414,6 @@ static void saveNow(void)
             PS5WKSite* site = g_ptr_array_index(sites, i);
             g_string_append(out, i ? ",\n{\"host\":" : "\n{\"host\":");
             ps5wk_json_string(out, site->host);
-            g_string_append(out, ",\"gamepad\":");
-            ps5wk_json_string(out, ps5wk_site_gamepad_name(site->gamepad));
             g_string_append(out, ",\"keys\":");
             ps5wk_json_string(out, site->keys ? site->keys : "");
             g_string_append(out, ",\"left\":");
@@ -519,23 +517,12 @@ static PS5WKSite* siteCopy(const PS5WKSite* from, const char* host)
     PS5WKSite* site = g_new0(PS5WKSite, 1);
     site->host = g_strdup(host);
     if (from) {
-        site->gamepad = from->gamepad;
         site->keys = g_strdup(from->keys);
         site->left = g_strdup(from->left);
         site->right = g_strdup(from->right);
         site->changed = from->changed;
     }
     return site;
-}
-
-const char* ps5wk_site_gamepad_name(int gamepad)
-{
-    return gamepad == PS5WK_GAMEPAD_ON ? "on" : gamepad == PS5WK_GAMEPAD_OFF ? "off" : "ask";
-}
-
-static int gamepadFromName(const char* name)
-{
-    return !g_strcmp0(name, "on") ? PS5WK_GAMEPAD_ON : !g_strcmp0(name, "off") ? PS5WK_GAMEPAD_OFF : PS5WK_GAMEPAD_ASK;
 }
 
 static void loadSites(void)
@@ -548,7 +535,8 @@ static void loadSites(void)
         if (!host || !*host || ps5wk_site_find(host))
             continue;
         PS5WKSite* site = siteCopy(NULL, host);
-        site->gamepad = gamepadFromName(jstr(item, "gamepad"));
+        /* "gamepad" (on/off/ask) from before 2026-11-16: gamepad mode is
+         * no longer kept, only the mapping. */
         site->keys = g_strdup(jstr(item, "keys"));
         site->left = g_strdup(jstr(item, "left"));
         site->right = g_strdup(jstr(item, "right"));

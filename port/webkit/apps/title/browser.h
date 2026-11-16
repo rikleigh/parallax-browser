@@ -60,16 +60,10 @@ GPtrArray* ps5wk_session_load(int* active);
 void ps5wk_session_save(GPtrArray* tabs, int active);
 void ps5wk_session_tab_free(gpointer tab);
 
-/* Per-site settings (sites.json): gamepad mode and its button mapping
- * (gamepad.c; README: "Gamepad mode"). */
-enum {
-    PS5WK_GAMEPAD_ASK, /* not decided: offered when the page reads the gamepad */
-    PS5WK_GAMEPAD_ON,
-    PS5WK_GAMEPAD_OFF, /* declined or switched off: not offered again */
-};
+/* Per-site settings (sites.json): gamepad mode's button mapping (gamepad.c;
+ * README: "Gamepad mode"). Whether it is on is never kept. */
 typedef struct {
     char* host;   /* lowercase, as in the page's address */
-    int gamepad;  /* PS5WK_GAMEPAD_* */
     char* keys;   /* "cross=Space circle=Escape ...", NULL/"": none (gamepad.c) */
     char* left;   /* the sticks: "gamepad", "arrows", "wasd", "pointer", "scroll" */
     char* right;
@@ -84,7 +78,6 @@ PS5WKSite* ps5wk_site_find(const char* host);
 PS5WKSite* ps5wk_site_get(const char* host);
 void ps5wk_site_changed(PS5WKSite* site);
 gboolean ps5wk_site_remove(const char* host);
-const char* ps5wk_site_gamepad_name(int gamepad);
 /* Private mode: from now on site settings live in a copy that is dropped
  * when it ends (FALSE). */
 void ps5wk_sites_set_private(gboolean enabled);
@@ -174,19 +167,22 @@ char* ps5wk_browser_api(const char* method, const char* path, const char* query,
 /* ---- gamepad.c (README: "Gamepad mode") ---- */
 
 void ps5wk_gamepad_init(WPEDisplayPS5* display);
-/* The page shown (a committed load, a tab switch): applies its site's mode. */
+/* The page shown (a committed load, a tab switch): gamepad mode goes off on
+ * another site or tab. */
 void ps5wk_gamepad_page(WebKitWebView* view, const char* uri);
-/* The offer's △ and ○ while it shows (before the browser's own); TRUE: taken. */
+/* A press on the page (before the browser's own): the hint. TRUE: taken. */
 gboolean ps5wk_gamepad_buttons(guint32 pressed);
-/* The menu's gamepad button: on/off for the site shown. */
+/* △ held on the page: gamepad mode on for this visit. */
+void ps5wk_gamepad_enter(void);
+/* The menu's gamepad button: on or off. */
 void ps5wk_gamepad_toggle(void);
-/* Options held in gamepad mode: off for the site shown. */
+/* Options held in gamepad mode: off. */
 void ps5wk_gamepad_leave(void);
 gboolean ps5wk_gamepad_active(void);
 /* The site shown ("file:" for local files), NULL for none. */
 const char* ps5wk_gamepad_site(void);
-/* /browser/gamepad: GET the state, POST site=&gamepad=&preset=&keys=&left=&right=&remove=1. */
-char* ps5wk_gamepad_api(gboolean post, const char* site, const char* gamepad, const char* preset, const char* keys,
+/* /browser/gamepad: GET the state, POST site=&preset=&keys=&left=&right=&remove=1. */
+char* ps5wk_gamepad_api(gboolean post, const char* site, const char* preset, const char* keys,
     const char* left, const char* right, gboolean remove, int* status);
 /* The mapping page (GET /gamepad on the link server). */
 extern const char ps5wk_gamepad_page_html[];

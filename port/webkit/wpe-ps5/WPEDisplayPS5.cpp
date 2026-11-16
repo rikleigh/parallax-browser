@@ -80,6 +80,7 @@ static constexpr double repeatInterval = 0.06;
 static constexpr double pointerShownFor = 8.0; // seconds after the last stick move
 static constexpr int stickDeadZone = 14; // of 127
 static constexpr double optionsHoldFor = 1.0; // gamepad mode: Options held this long is the browser's
+static constexpr double triangleHoldFor = 1.0; // a page outside gamepad mode: Triangle held this long is the browser's
 // The touchpad: a press or release shifts the finger a little; no pointer
 // moves for this long after one, so a click lands where the pointer was.
 static constexpr double touchClickStill = 0.10; // seconds
@@ -212,6 +213,9 @@ struct _WPEDisplayPS5Private {
     uint8_t stickKeysDown[2] { 0, 0 }; // per stick: up, down, left, right
     double optionsDownAt { -1 };
     bool optionsHoldSent { false };
+    // Outside gamepad mode: Triangle held on the page (it turns gamepad mode on).
+    double triangleDownAt { -1 };
+    bool triangleHoldSent { false };
 
     GRefPtr<WPEProcessManager> processManager;
     std::string childELF;
@@ -1162,6 +1166,7 @@ static void padTick(WPEDisplayPS5* display)
         priv->stickChord = false;
         priv->ignoredButtons = data.buttons;
         priv->repeatingKey = 0;
+        priv->triangleDownAt = -1;
         return;
     }
 
@@ -1205,6 +1210,9 @@ static void padTick(WPEDisplayPS5* display)
     if (!pageHasPad && (priv->gamepadKeysDown || priv->stickKeysDown[0] || priv->stickKeysDown[1]))
         releaseGamepadInput(display, view);
 
+    if (!pageHasPad || priv->gamepadMode)
+        priv->triangleDownAt = -1;
+
     if (priv->padCaptured) {
         priv->repeatingKey = 0;
         if (priv->capturedPadCallback)
@@ -1218,6 +1226,23 @@ static void padTick(WPEDisplayPS5* display)
     if (priv->gamepadMode) {
         gamepadModeTick(display, view, data, now, pressed, released, t);
         return;
+    }
+
+    // Triangle held on the page: the application's (gamepad mode on). Its
+    // press still went to the page (the keyboard for a focused field).
+    if (pressed & PS5_PAD_TRIANGLE) {
+        priv->triangleDownAt = t;
+        priv->triangleHoldSent = false;
+    }
+    if (!(now & PS5_PAD_TRIANGLE))
+        priv->triangleDownAt = -1;
+    else if (priv->triangleDownAt >= 0 && !priv->triangleHoldSent && t - priv->triangleDownAt >= triangleHoldFor && priv->buttonHandler) {
+        priv->triangleHoldSent = true;
+        PS5_LOG("pad: Triangle held on the page");
+        bool wasUI = priv->uiMode, wasCaptured = priv->padCaptured, wasGamepadMode = priv->gamepadMode;
+        priv->buttonHandler(display, WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD, priv->buttonHandlerData);
+        if (priv->uiMode != wasUI || priv->padCaptured != wasCaptured || priv->activeView != view || priv->gamepadMode != wasGamepadMode)
+            return;
     }
 
     // Left stick and the touchpad: pointer. Right stick and two fingers on

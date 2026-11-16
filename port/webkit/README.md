@@ -761,7 +761,9 @@ above; with it, each switch showed the right page.
 ## Gamepad mode
 
 Built and checked on the TV 2026-11-09 (the Gamepad API, all buttons and
-axes, analog triggers, rumble, the keys, Options held, the offer). Browser games get the
+axes, analog triggers, rumble, the keys, Options held). Since 2026-11-16 it
+is never switched on by itself: △ held turns it on, and a hint replaced
+the offer (checked on the TV 2026-11-16). Browser games get the
 controller in two ways:
 
 - **The Gamepad API**, always (WebKit is now built with `ENABLE_GAMEPAD`).
@@ -779,39 +781,45 @@ controller in two ways:
   VR has it. `wpe-ps5/WPEGamepadPS5.cpp` is the device; WebKit's
   `GamepadProviderWPE` makes it (`wpe_display_create_gamepad_manager`) when a
   page first asks for gamepads.
-- **Gamepad mode**, per site: the pad stops meaning anything to the
+- **Gamepad mode**, when you turn it on: the pad stops meaning anything to the
   browser (no pointer, scrolling, Back, zoom, reload or focus moves; spatial
   navigation off), so the whole controller is the game's. Each button can
   also press a key, and each stick can be the arrow keys, W A S D, the
   pointer or scrolling, for games that only read the keyboard or mouse.
-  **Hold Options for a second** to leave gamepad mode: it goes off for the
-  site (*"Gamepad mode off · turn it back on from the menu's controller
-  button"*) and the pad is the browser's again. A short press still goes to
-  the game, which often uses it for pause.
+  **Hold △ on the page for a second** to turn it on (*"Gamepad mode on ·
+  hold Options to leave it"*); the press itself still reaches the page.
+  **Hold Options for a second** to leave it (*"Gamepad mode off · hold △ to
+  turn it on again"*): the pad is the browser's again. A short Options
+  press still goes to the game, which often uses it for pause. It stays on
+  while the tab shows the same site and goes off by itself on another site
+  or another tab. Whether it is on is never kept: each visit starts with
+  it off. The button mapping is kept per site.
 
 | | |
 | --- | --- |
-| switching it on | the menu's gamepad button (✕: on or off for the site); or the offer *"Gamepad mode available △ Turn on □ Set up buttons ○ Not now"*: on a page that reads the controller, on a site with no answer yet, the first press brings it up, and it stays until answered (remembered for the site) or the page changes; an unanswered offer comes back on the site's next page. Checked on the TV 2026-11-09 |
-| the mapping | □ on the menu's gamepad button (*Set up buttons*), or □ on the offer, opens `parallax://gamepad?site=<host>` in a browser page tab (see *Tabs, bookmarks, history*: the game keeps its tab, and it opens with 12 tabs open); *Back to the page* or O closes it and shows the game again. Also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
+| switching it on and off | △ held 1 s on the page (on), Options held 1 s (off); or the menu's gamepad button (✕: on or off). Not while the menu, the keyboard or View in VR has the pad |
+| the hint | *"This page supports controllers · hold △ for gamepad mode"*, 4 s, once per visit to a site whose page reads the controller (when it starts reading it, or at the first press); it takes no buttons |
+| the mapping | □ on the menu's gamepad button (*Set up buttons*) opens `parallax://gamepad?site=<host>` in a browser page tab (see *Tabs, bookmarks, history*: the game keeps its tab, and it opens with 12 tabs open); *Back to the page* or O closes it and shows the game again. Also *Settings → Gamepad mode → Button mapping*, and from a phone at the PS5's address with the PIN |
 | presets | *Controller only* (no keys: games that read the controller); *Arrows + Space* (D-pad and left stick arrows, ✕ Space, ○ Esc, □ Z, △ X, L1 Shift, R1 Ctrl, Options Enter); *WASD + mouse* (left stick WASD, right stick pointer, R2 click, ✕ Space, ○ C, □ R, △ E, L1 Q, R1 F, L2 Shift, Options Esc, touchpad Tab); *Point and click* (left stick pointer, ✕ and R2 click, right stick scrolls, ○ and Options Esc) |
 | a key per button | any of A-Z, 0-9, Space, Enter, Esc, Tab, Backspace, Shift, Ctrl, Alt, the arrows, or a mouse click at the pointer; sent as real key events with `KeyboardEvent.code` (hardware key codes) |
-| where it is kept | `users/<id>/sites.json` (browserdata.c), per host; local files (`file:`) count as one site |
+| where it is kept | the mapping only: `users/<id>/sites.json` (browserdata.c), per host; local files (`file:`) count as one site. The `"gamepad"` (on/off/ask) of older files is ignored |
 
-The offer's default is *Controller only* (the page reads the controller);
-switching gamepad mode on from the menu on a page that does not read it
-starts with *Arrows + Space*. A page gets both the Gamepad API and the
+A site without a mapping gets one the first time gamepad mode is turned on
+there: *Controller only* if the page reads the controller, else *Arrows +
+Space*. A page gets both the Gamepad API and the
 keys, so a game that reads both may see a press twice: *Controller only*
 avoids that.
 
 Code: `wpe-ps5/WPEDisplayPS5.cpp` (`wpe_display_ps5_set_gamepad_mode`, the
 keys and sticks in the pad loop, Options held as
-`WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD`), `apps/title/gamepad.c` (the site's
-mode, the offer, the presets, `/browser/gamepad` and the mapping page),
-`apps/title/browserui.c` (the menu button, Options held, the browser page tab). Log lines: `[wpe-ps5] gamepad
+`WPE_DISPLAY_PS5_BUTTON_OPTIONS_HOLD`, △ held as
+`WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD`), `apps/title/gamepad.c` (on and
+off, the hint, the presets, `/browser/gamepad` and the mapping page),
+`apps/title/browserui.c` (the menu button, the holds, the browser page tab). Log lines: `[wpe-ps5] gamepad
 mode on: 12 key(s), left stick arrows, right stick gamepad`, `[wpe-ps5]
-gamepad: the page reads the gamepad`, `gamepad: offered gamepad mode on
-<host>`, `[wpe-ps5] pad: Options held in gamepad mode`, `gamepad: left with
-Options held on <host>`. Test page:
+gamepad: the page reads the gamepad`, `gamepad: hint shown on <host>`,
+`[wpe-ps5] pad: Triangle held on the page`, `gamepad: mode on for <host>`,
+`[wpe-ps5] pad: Options held in gamepad mode`, `gamepad: left on <host>`. Test page:
 `test/input/gamepad.html` (what the page gets, rumble on □ held 2 s).
 
 ## Private browsing
@@ -856,7 +864,7 @@ Leaving (the same button) closes the private tabs, their WebProcess and the
 session with its data, and brings the normal tabs back where they were.
 Bookmarks work as usual (a bookmark added in private browsing is kept).
 Downloads are kept, as in Safari: the file and its line in the Downloads
-list stay. Gamepad-mode settings changed while private last only until it
+list stay. Button mappings changed while private last only until it
 ends. `POST /browser/private on=1|0` (link server, PIN) does the same as
 the button; `GET` says whether it is on.
 
@@ -3378,7 +3386,7 @@ the left stick moves), otherwise Enter; O = Back; left stick = pointer;
 right stick = scroll under the pointer; Options = the browser menu (address
 bar, tabs, bookmarks, history; see *Tabs, bookmarks, history*);
 Triangle = keyboard for the focused field (it also opens by itself when X
-focuses a field); Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
+focuses a field), held 1 s = gamepad mode on; Square = reload; L1/R1 = previous/next field; L2/R2 = zoom;
 R3 = View in VR (XF86Tools, sent at R3's release so the chord below still
 works; Settings is in the menu); L3 = home page; L3 + R3 =
 performance overlay; touchpad = a laptop's touchpad: one finger moves the
@@ -3388,7 +3396,8 @@ at the pointer and drags while held (no moves for 0.1 s after a press or
 release, so a click lands where the pointer was). In the menu it moves the
 menu's pointer and scrolls the list. In gamepad mode none of these:
 the page gets the pad (and the keys set for the site), and Options held 1 s
-leaves gamepad mode (see *Gamepad mode*).
+leaves gamepad mode; outside it, △ held 1 s on a page turns it on (see
+*Gamepad mode*).
 
 GL goes through libepoxy; in the title, `--wrap=dlopen/dlsym` and
 `apps/title/dlshim.c` resolve epoxy's lookups to the statically linked
