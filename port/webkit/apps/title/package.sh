@@ -139,7 +139,7 @@ title_link() {
         --wrap=mmap --wrap=munmap --wrap=madvise --wrap=abort \
         --wrap=pthread_create --wrap=pthread_join --wrap=pthread_exit \
         --wrap=dlopen --wrap=dlsym --wrap=access --wrap=fcntl --wrap=pipe2 --wrap=dup --wrap=dup2 \
-        --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close \
+        --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close --wrap=socket \
         --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
         --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" ${TITLE_LDFLAGS:-} "$@" \
         "$W"/obj/*.o "${inputs[@]}" ${webgpu_inputs[@]+"${webgpu_inputs[@]}"} "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \

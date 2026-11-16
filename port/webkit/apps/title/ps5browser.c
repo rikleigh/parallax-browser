@@ -2747,6 +2747,7 @@ static int fileExists(const char* path)
 /* titlevdec.c: hardware video decoding (Videodec2) for the WebProcesses. */
 void ps5wk_title_vdec_preload(void) __attribute__((weak));
 void ps5wk_title_vdec_install(void) __attribute__((weak));
+int ps5wk_title_vdec_max_size(int* width, int* height) __attribute__((weak));
 /* titlelog.c: the log queue no thread waits on (CONSOLE-HEALTH.md, "Logging"). */
 void ps5wk_titlelog_install(const char* dir);
 
@@ -2865,7 +2866,18 @@ static void setUpInTitleWeb(void)
     snprintf(path, sizeof path, "/system_tmp/ps5wk/video-%d.sock", (int)getpid());
     setenv("PS5WK_VIDEO_SOCKET", path, 0);
     setenv("WEBKIT_GST_ENABLE_HLS_SUPPORT", "1", 0);
-    setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", "1920x1080@60", 0);
+    /* What MSE/canPlayType accept, as ps5wk-child.cpp sets it from the
+     * title's answer: up to 8K with hardware decoding, else 1080p60 (the
+     * software decoders' limit). A fixed 1080p here kept video players on
+     * their low streams. */
+    int vdecWidth = 0, vdecHeight = 0;
+    const char* hwdec = getenv("PS5WK_HWDEC");
+    if (ps5wk_title_vdec_max_size && ps5wk_title_vdec_max_size(&vdecWidth, &vdecHeight) && !(hwdec && !strcmp(hwdec, "0")) && vdecWidth >= 3840)
+        setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", vdecWidth >= 7680 && vdecHeight >= 4320 ? "7680x4320@60" : "3840x2160@60", 0);
+    else
+        setenv("WEBKIT_GST_VIDEO_DECODING_LIMIT", "1920x1080@60", 0);
+    spike_log("[web-in-title] video decoding: %s (up to %dx%d); MSE/canPlayType limit %s", vdecWidth ? "hardware in the title" : "software",
+        vdecWidth, vdecHeight, getenv("WEBKIT_GST_VIDEO_DECODING_LIMIT"));
     mkdir("/data/ps5webkit/home/cache", 0777);
     mkdir("/data/ps5webkit/home/cache/media", 0777);
     setenv("WPE_SHELL_MEDIA_DISK_CACHE_PATH", "/data/ps5webkit/home/cache/media", 0);

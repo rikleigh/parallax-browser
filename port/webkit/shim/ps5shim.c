@@ -239,10 +239,20 @@ int __wrap_close(int fd)
     return r;
 }
 
+static int ps5TitleSocketNbio(int fd, int on);
 int __real_socket(int, int, int) __attribute__((weak));
 int __wrap_socket(int domain, int type, int protocol)
 {
     int fd = __real_socket(domain, type, protocol);
+    /* Title: SOCK_NONBLOCK (GLib's g_socket_new asks for it) leaves the
+     * socket blocking; SO_NBIO switches it. */
+    if (fd >= 0 && (type & SOCK_NONBLOCK) && __real_recvmsg) {
+        int saved = errno;
+        int nbio = ps5TitleSocketNbio(fd, 1);
+        if (nbio == -1 && fd < NB_FDS)
+            atomic_store(&nonBlocking[fd], 1);
+        errno = saved;
+    }
     if (fd >= 0 && (domain == AF_INET || domain == AF_INET6) && fdTraceEnabled()) {
         int saved = errno;
         fdTraceReport("socket inet", fd, domain);
@@ -251,6 +261,23 @@ int __wrap_socket(int domain, int type, int protocol)
     return fd;
 }
 
+/* Title only (where the send/recv wraps are linked): Sony's SO_NBIO, the
+ * one way that makes a title's inet socket non-blocking (F_SETFL and
+ * SOCK_NONBLOCK are taken but do nothing; FIONBIO is EACCES). 0: set; -1:
+ * a socket that refused it; -2: not a socket. The first outcome of each
+ * kind is logged. */
+#define PS5_SO_NBIO 0x1200
+static atomic_int nbioReported[3];
+static int ps5TitleSocketNbio(int fd, int on)
+{
+    int r = setsockopt(fd, SOL_SOCKET, PS5_SO_NBIO, &on, sizeof on);
+    int e = errno;
+    int kind = !r ? 0 : e == ENOTSOCK ? 2 : 1;
+    if (!atomic_exchange(&nbioReported[kind], 1))
+        fprintf(stderr, "[ps5shim] SO_NBIO %d on fd %d: %s (errno %d)%s\n", on, fd, !r ? "set" : "refused", r ? e : 0,
+            kind == 1 ? "; emulating with MSG_DONTWAIT" : "");
+    return !r ? 0 : kind == 2 ? -2 : -1;
+}
 int __real_fcntl(int fd, int cmd, ...);
 static int dupFallback(int fd, intptr_t minFD)
 {
@@ -331,6 +358,26 @@ int __wrap_fcntl(int fd, int cmd, ...)
                     fprintf(stderr, "[ps5shim] fcntl(F_SETFL, O_NONBLOCK) on fd %d: errno %d; emulating with MSG_DONTWAIT\n", fd, saved);
                 errno = 0;
                 return 0;
+            }
+            errno = saved;
+        }
+        /* Title, inet sockets: F_SETFL(O_NONBLOCK) succeeds and F_GETFL shows
+         * it, but the socket stays blocking (a read with no data waits;
+         * FIONBIO, which FreeBSD's F_SETFL uses for sockets, is EACCES).
+         * GLib's sockets then sat in recv() until the server closed the
+         * connection: hlsdemux2 in the in-title WebProcess took ~15 s a
+         * segment, a libsoup request on a quiet thread never finished
+         * (2026-11-16, ps5browser's wakeup test). Sony's SO_NBIO socket option
+         * does switch it; where that fails, MSG_DONTWAIT as above. */
+        if (r >= 0 && fd >= 0 && __real_recvmsg) {
+            int saved = errno;
+            int on = (arg & O_NONBLOCK) != 0;
+            int nbio = ps5TitleSocketNbio(fd, on);
+            if (nbio != -2) { /* a socket */
+                if (fd < NB_FDS)
+                    atomic_store(&nonBlocking[fd], (char)(nbio ? on : 0));
+                errno = saved;
+                return r;
             }
             errno = saved;
         }

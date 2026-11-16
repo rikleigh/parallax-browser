@@ -25,6 +25,7 @@
 int sceKernelAvailableFlexibleMemorySize(size_t *size);
 
 static int s_load_rc = -1;
+static int s_installed;
 double ps5wk_title_direct_mb(void); /* titlemem.c */
 
 static void log_line(const char *line)
@@ -221,4 +222,16 @@ void ps5wk_title_vdec_install(void)
         probe_sizes();
     }
     ps5wk_video_set_decoder_backend(&title_backend);
+    s_installed = 1;
+}
+
+/* For the in-title WebProcess's media limit (ps5browser.c setUpInTitleWeb):
+ * what the title's video server tells a payload WebProcess
+ * (PS5VideoServer.cpp HELLO_ACK, ps5wk-child.cpp queryTitleDecoder). */
+int ps5wk_title_vdec_max_size(int *width, int *height);
+int ps5wk_title_vdec_max_size(int *width, int *height)
+{
+    *width = s_installed ? title_backend.max_width : 0;
+    *height = s_installed ? title_backend.max_height : 0;
+    return s_installed;
 }
