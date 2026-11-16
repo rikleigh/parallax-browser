@@ -39,6 +39,10 @@ play the video on a page in the PS VR2 headset.
 - A link server. Open `http://<ps5-ip>:9040/` on a phone or computer, or
   scan the QR code on the start page or in Settings, to send links to the
   PS5, change settings and fetch downloads. See [Security](#security).
+- Pages run inside the browser's own process, which gets more of the
+  PS5's CPU than a separate one: games and heavy pages run up to twice as
+  fast. "Pages in the browser process" in Settings switches back to a
+  separate process, where a page that crashes closes only itself.
 - Settings, at `parallax://settings`, for Safer browsing, the home page,
   the search engine, video, memory, ad blocking, the link server and
   clearing data. Google is the default search engine. Pressing □ on the
@@ -137,9 +141,10 @@ that title with your homebrew tool. Your data in `/data/ps5webkit` stays.
   is on, the link server doesn't say which pages are open. It still keeps
   and lists downloads, as in normal browsing.
 - **The browser has no sandbox, and a malicious page could take over the
-  console.** The browser starts the process that runs web pages like any
-  other payload. That process runs as root, outside the system's jail,
-  with the jailbreak's kernel access, and it can reach elfldr. A web page
+  console.** Web pages run inside the browser itself, or, with "Pages in
+  the browser process" off or Safer browsing on, in a process the browser
+  starts like any other payload. Either way they run as root, outside the
+  system's jail, with the jailbreak's kernel access, and can reach elfldr. A web page
   that exploits a bug in WebKit, most often in the JavaScript JIT, would
   get all of it. That means every user's cookies and logged-in sessions,
   the console's files and account data, and the kernel until the next
@@ -153,7 +158,8 @@ that title with your homebrew tool. Your data in `/data/ps5webkit` stays.
   Browse sites you trust and keep ad blocking on. For any other site, turn
   on Safer browsing with the shield button in the menu, or in Settings. It
   turns off the JavaScript JIT, WebAssembly and WebGL, where most exploits
-  start. Scripts then run several times slower, and some games and 3D
+  start, and runs pages in a separate process (the browser restarts to
+  switch). Scripts then run several times slower, and some games and 3D
   sites won't work. Don't sign in to accounts that matter on the PS5, and
   don't import cookies from another browser.
 

@@ -871,11 +871,19 @@ WPEProcessManager* wpe_process_manager_ps5_new(const char* childELF)
 gboolean wpe_process_manager_ps5_run_task(WPEProcessManager* processManager, const char* task, const char* argument,
     WPEProcessManagerPS5TaskOutput output, WPEProcessManagerPS5TaskEnded ended, gpointer userData)
 {
+    return wpe_process_manager_ps5_run_task_elf(processManager, nullptr, task, argument, output, ended, userData);
+}
+
+gboolean wpe_process_manager_ps5_run_task_elf(WPEProcessManager* processManager, const char* elf, const char* task, const char* argument,
+    WPEProcessManagerPS5TaskOutput output, WPEProcessManagerPS5TaskEnded ended, gpointer userData)
+{
     g_return_val_if_fail(WPE_IS_PROCESS_MANAGER_PS5(processManager), FALSE);
     g_return_val_if_fail(task && *task && !strchr(task, ' ') && argument && *argument && !strchr(argument, ' '), FALSE);
     auto* manager = WPE_PROCESS_MANAGER_PS5(processManager);
+    if (s_quiescing)
+        return FALSE;
     auto* job = new UploadJob;
-    job->elfPath = manager->priv->childELF;
+    job->elfPath = elf && *elf ? elf : manager->priv->childELF.c_str();
     char text[512];
     snprintf(text, sizeof(text), PS5WK_LAUNCH_HEADER " %d %s 0 %s\n", PS5WK_LAUNCH_VERSION, task, argument);
     job->header = text;

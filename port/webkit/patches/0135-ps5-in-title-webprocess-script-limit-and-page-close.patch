@@ -1,0 +1,159 @@
+diff --git a/Source/WebKit/Shared/AuxiliaryProcess.cpp b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+index ce916939ee..199f199f6b 100644
+--- a/Source/WebKit/Shared/AuxiliaryProcess.cpp
++++ b/Source/WebKit/Shared/AuxiliaryProcess.cpp
+@@ -73,11 +73,19 @@ AuxiliaryProcess::~AuxiliaryProcess()
+         connection->invalidate();
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp.
++void ps5InTitleWebProcessConnectionClosed();
++#endif
++
+ void AuxiliaryProcess::didClose(IPC::Connection&)
+ {
+ #if defined(PS5_PAYLOAD_SDK)
+     if (s_ps5WebProcessInTitle) {
+-        WTFLogAlways("[web-in-title] the UI process closed the in-title WebProcess's connection: it stays stopped (one per title)");
++        WTFLogAlways("[web-in-title] the UI process closed the in-title WebProcess's connection: closing its pages; it stays stopped (one per title)");
++        RunLoop::mainSingleton().dispatch([] {
++            ps5InTitleWebProcessConnectionClosed();
++        });
+         return;
+     }
+ #endif
+diff --git a/Source/WebKit/WebProcess/WebProcess.cpp b/Source/WebKit/WebProcess/WebProcess.cpp
+index ce006abc44..ac7ce20a56 100644
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -1098,6 +1098,13 @@ WebPage* WebProcess::webPage(PageIdentifier pageID) const
+     return m_pageMap.get(pageID);
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp: the in-title WebProcess's pages
++// (closed when the UI process lets go of it) and its script time limit.
++void ps5InTitlePageCreated(WebCore::PageIdentifier);
++void ps5InTitlePageRemoved(WebCore::PageIdentifier);
++#endif
++
+ void WebProcess::createWebPage(PageIdentifier pageID, WebPageCreationParameters&& parameters)
+ {
+     m_hasEverHadAnyWebPages = true;
+@@ -1122,6 +1129,10 @@ void WebProcess::createWebPage(PageIdentifier pageID, WebPageCreationParameters&
+ 
+         // Balanced by an enableTermination in removeWebPage.
+         disableTermination();
++#if defined(PS5_PAYLOAD_SDK)
++        if (ps5WebProcessIsInTitle())
++            ps5InTitlePageCreated(pageID);
++#endif
+         updateCPULimit();
+         updateIsBroadcastChannelEnabled();
+ 
+@@ -1153,6 +1164,10 @@ void WebProcess::removeWebPage(PageIdentifier pageID)
+ 
+     pageWillLeaveWindow(pageID);
+     m_pageMap.remove(pageID);
++#if defined(PS5_PAYLOAD_SDK)
++    if (ps5WebProcessIsInTitle())
++        ps5InTitlePageRemoved(pageID);
++#endif
+ 
+     enableTermination();
+     updateCPULimit();
+diff --git a/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp b/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
+index f71c9bfaa0..9f19544234 100644
+--- a/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
++++ b/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
+@@ -29,7 +29,13 @@
+ #if defined(PS5_PAYLOAD_SDK)
+ 
+ #include "AuxiliaryProcess.h"
++#include "WebPage.h"
+ #include "WebProcess.h"
++#include <JavaScriptCore/JSLock.h>
++#include <JavaScriptCore/Watchdog.h>
++#include <WebCore/CommonVM.h>
++#include <wtf/HashSet.h>
++#include <wtf/NeverDestroyed.h>
+ #include <skia/core/SkGraphics.h>
+ #include <wtf/RunLoop.h>
+ #include <wtf/RuntimeApplicationChecks.h>
+@@ -88,6 +94,75 @@ static void addFontsWithoutScanning()
+         added, failed, application ? application->nfont : 0, (MonotonicTime::now() - start).milliseconds());
+ }
+ 
++namespace WebKit {
++
++// The in-title WebProcess's pages, for closing them when the UI process lets
++// go of it: "Restart page", Safer browsing, a crash test. A payload exits
++// then; this one stays (one per title) and would keep its pages, their
++// scripts and workers (a game's emulator, its sound) running unseen.
++static HashSet<WebCore::PageIdentifier>& inTitlePages()
++{
++    static NeverDestroyed<HashSet<WebCore::PageIdentifier>> pages;
++    return pages;
++}
++
++// The page's scripts run on the title's main thread, beside the browser's
++// own UI. A script that doesn't return (a loop, a hung page) would freeze
++// the menu, the address bar and the controller: JSC's watchdog stops a
++// script after PS5WK_SCRIPT_LIMIT_S seconds of CPU time per entry (default
++// 10, 0 for none), as JSContextGroupSetExecutionTimeLimit does. The script
++// ends with an uncatchable termination; the page and its later scripts go on.
++static bool scriptTimeLimitReached(JSC::JSGlobalObject*, void*, void*)
++{
++    WTFLogAlways("[web-in-title] a page script ran on the title's main thread past its time limit (PS5WK_SCRIPT_LIMIT_S): stopped it");
++    return true;
++}
++
++static void installScriptTimeLimit()
++{
++    static bool installed;
++    if (installed)
++        return;
++    installed = true;
++    const char* value = getenv("PS5WK_SCRIPT_LIMIT_S");
++    double seconds = value && *value ? atof(value) : 10;
++    if (seconds <= 0) {
++        WTFLogAlways("[web-in-title] no script time limit (PS5WK_SCRIPT_LIMIT_S=%s)", value);
++        return;
++    }
++    auto& vm = WebCore::commonVM();
++    JSC::JSLockHolder lock(vm);
++    vm.ensureWatchdog().setTimeLimit(Seconds(seconds), scriptTimeLimitReached);
++    WTFLogAlways("[web-in-title] page scripts on the main thread stop after %.0f s of CPU time (PS5WK_SCRIPT_LIMIT_S)", seconds);
++}
++
++void ps5InTitlePageCreated(WebCore::PageIdentifier identifier)
++{
++    inTitlePages().add(identifier);
++    installScriptTimeLimit();
++}
++
++void ps5InTitlePageRemoved(WebCore::PageIdentifier identifier)
++{
++    inTitlePages().remove(identifier);
++}
++
++void ps5InTitleWebProcessConnectionClosed()
++{
++    auto pages = copyToVector(inTitlePages());
++    unsigned closed = 0;
++    for (auto identifier : pages) {
++        if (RefPtr page = WebProcess::singleton().webPage(identifier)) {
++            page->close([] { });
++            closed++;
++        }
++    }
++    inTitlePages().clear();
++    WTFLogAlways("[web-in-title] closed %u page(s) of the in-title WebProcess; new pages run in payload WebProcesses until the browser restarts", closed);
++}
++
++} // namespace WebKit
++
+ // 0: started, and the WebProcess owns fd. -1: not started (already one, or
+ // bad arguments); fd is still the caller's. Main run loop.
+ extern "C" int ps5wk_web_process_in_title_start(int fd, uint64_t processIdentifier)

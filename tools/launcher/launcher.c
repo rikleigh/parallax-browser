@@ -386,11 +386,13 @@ static void register_title(int fd, const char *tid, const char *src_arg)
         say(fd, "OK registered %s from %s (%s)", tid, src, how);
 }
 
-/* Only our spike titles can be uninstalled: never the owner's titles, and
- * not the browser (PPSA99207) either. */
+/* Only our spike and test titles can be uninstalled: never the owner's
+ * titles, and not the browser (PPSA99207) either. PPSA99208 and PPSA99209
+ * are the WebGPU and web-in-title test builds of the browser (Spike 14). */
 static const char *const uninstallable[] = {
     "PPSA99006", "PPSA99007", "PPSA99009", "PPSA99010", "PPSA99011",
-    "PPSA99012", "PPSA99013", "PPSA99014", "PPSA99015",
+    "PPSA99012", "PPSA99013", "PPSA99014", "PPSA99015", "PPSA99208",
+    "PPSA99209",
 };
 
 static void uninstall_title(int fd, const char *tid)

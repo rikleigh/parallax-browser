@@ -8,12 +8,12 @@
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
  *   flag files (no-hwdec, audio-silent, push-off, adblock-off,
- *     no-compositing, no-webgl): present = that feature off; the title
+ *     no-compositing, no-webgl, no-inprocess-web): present = that feature off; the title
  *     reads them when it starts (no-compositing: WebKit in the title reads
  *     it whenever a page gets a new WebProcess; no-webgl: applied at once,
  *     ps5browser.c applyWebContentSettings). Opt-in flag files
  *     (perf-overlay, safer-browsing): present = that feature on.
- *     safer-browsing overrides jit, wasm, webgl and webgpu while present (each
+ *     safer-browsing overrides jit, wasm, webgl, webgpu and web_in_title while present (each
  *     WebProcess reads it at start, ps5wk-child.cpp configureJIT; the title
  *     for WebGL) and leaves their own values alone for when it goes.
  *   home-url.txt: the page the browser opens when it starts, in the PS5
@@ -75,6 +75,9 @@ static const Setting settings[] = {
         NULL, 0, 0 },
     { "webgpu", KIND_FLAG_ON, TYPE_BOOL, "webgpu-on", "0", 0, "WebGPU (experimental)",
         "The newer 3D and GPU computing interface for pages, on the PS5's GPU. New here and less tested than WebGL: leave it off unless a site needs it. Off: sites fall back to WebGL where they can. Applies to pages loaded from now on.",
+        NULL, 0, 0 },
+    { "web_in_title", KIND_FLAG, TYPE_BOOL, "no-inprocess-web", "1", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
+        "Runs pages inside the browser itself, which has more of the PS5's CPU: games and heavy pages run up to twice as fast. Off runs each page in a separate process, as before: a page that crashes then closes only itself, not the browser, and pages are kept apart from the browser. Safer browsing always keeps them apart. While it's on, the settings under Pages apply when the browser restarts.",
         NULL, 0, 0 },
     { "paint_threads", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
         "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",
@@ -258,6 +261,23 @@ void ps5wk_settings_init(const char* dir, const char* user, PS5WKSettingsNormali
     g_mutex_unlock(&lock);
 }
 
+/* Pages in the browser process (ps5browser.c): its WebProcess reads the
+ * page settings when the browser starts, so they wait for a browser restart
+ * and the page has no Restart page. */
+static gboolean pagesInBrowser;
+
+void ps5wk_settings_set_pages_in_browser(gboolean on)
+{
+    g_mutex_lock(&lock);
+    pagesInBrowser = on;
+    g_mutex_unlock(&lock);
+}
+
+static int effectiveScope(const Setting* s)
+{
+    return pagesInBrowser && s->scope == PS5WK_SETTINGS_PAGE ? PS5WK_SETTINGS_BROWSER : s->scope;
+}
+
 void ps5wk_settings_applied(int scopes)
 {
     g_mutex_lock(&lock);
@@ -295,7 +315,8 @@ static void appendJSONString(GString* out, const char* s)
 /* The page's Security section: Safer browsing and what it turns off. */
 static gboolean isOverriddenBySafer(const Setting* s)
 {
-    return !strcmp(s->id, "jit") || !strcmp(s->id, "wasm") || !strcmp(s->id, "webgl") || !strcmp(s->id, "webgpu");
+    return !strcmp(s->id, "jit") || !strcmp(s->id, "wasm") || !strcmp(s->id, "webgl") || !strcmp(s->id, "webgpu")
+        || !strcmp(s->id, "web_in_title");
 }
 
 static gboolean isSecurity(const Setting* s)
@@ -329,16 +350,17 @@ char* ps5wk_settings_json(const char* extra)
     for (size_t i = 0; i < SETTING_COUNT; i++) {
         const Setting* s = &settings[i];
         char* value = currentValue(s, env);
-        gboolean waiting = s->scope && applied[i] && strcmp(value, applied[i]);
+        int scope = effectiveScope(s);
+        gboolean waiting = scope && applied[i] && strcmp(value, applied[i]);
         if (waiting)
-            pending[s->scope] = TRUE;
+            pending[scope] = TRUE;
         g_string_append_printf(out, "%s{\"id\":\"%s\",\"type\":\"%s\",\"value\":", i ? "," : "", s->id, typeNames[s->type]);
         appendJSONString(out, value);
         g_string_append(out, ",\"default\":");
         appendJSONString(out, s->fallback);
         g_string_append(out, ",\"inUse\":");
         appendJSONString(out, s->scope && applied[i] ? applied[i] : value);
-        g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\"", scopeName(s->scope),
+        g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\"", scopeName(scope),
             waiting ? "true" : "false", isSecurity(s) ? "security" : s->kind == KIND_ENV || s->scope == PS5WK_SETTINGS_PAGE ? "page" : "browser");
         /* Safer browsing on (on disk): these say they are off whatever
          * their own value is. */
@@ -370,8 +392,8 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append_c(out, '}');
         g_free(value);
     }
-    g_string_append_printf(out, "],\"pending\":{\"page\":%s,\"browser\":%s},\"groups\":{\"security\":\"Security\",\"page\":\"Pages\",\"browser\":\"Browser\"},"
-        "\"statusSerial\":%u,\"status\":", pending[PS5WK_SETTINGS_PAGE] ? "true" : "false",
+    g_string_append_printf(out, "],\"pagesInBrowser\":%s,\"pending\":{\"page\":%s,\"browser\":%s},\"groups\":{\"security\":\"Security\",\"page\":\"Pages\",\"browser\":\"Browser\"},"
+        "\"statusSerial\":%u,\"status\":", pagesInBrowser ? "true" : "false", pending[PS5WK_SETTINGS_PAGE] ? "true" : "false",
         pending[PS5WK_SETTINGS_BROWSER] ? "true" : "false", statusSerial);
     appendJSONString(out, status ? status : "");
     g_string_append(out, "}\n");
@@ -834,7 +856,7 @@ const char ps5wk_settings_page[] =
     "<p class=\"help\">Clearing the cache only makes pages load more slowly the next time. Clearing cookies logs you out of every site. Clearing all website data also removes the cache, local storage and site databases. Your history, bookmarks and downloads stay.</p>\n"
     "<div class=\"seg\"><button id=\"clearCache\">Clear cache</button><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
     "<h2>Restart</h2>\n"
-    "<div class=\"card\"><p class=\"help\">Restart page: the page's process starts again with the settings above (Pages). Restart browser: the browser closes and opens again on the page you were on (Browser settings).</p>\n"
+    "<div class=\"card\"><p class=\"help\" id=\"restartHelp\">Restart page: the page's process starts again with the settings above (Pages). Restart browser: the browser closes and opens again on the page you were on (Browser settings).</p>\n"
     "<div class=\"seg\"><button id=\"restartPage\">Restart page</button><button id=\"restartBrowser\">Restart browser</button></div></div>\n"
     "<p class=\"note\" id=\"where\"></p>\n"
     "<p class=\"note\">On the PS5: Options, then Settings (⚙) in the browser menu opens this page; O goes back. Ad blocking for the page you came from: the first card under Ad blocking.</p>\n"
@@ -899,6 +921,7 @@ const char ps5wk_settings_page[] =
     "  });\n"
     "  var p=S.pending.page,w=S.pending.browser;\n"
     "  $('banner').hidden=!p&&!w;$('bannerPage').hidden=!p;$('bannerBrowser').hidden=!w;\n"
+    "  $('restartPage').hidden=!!S.pagesInBrowser;if(S.pagesInBrowser)$('restartHelp').textContent='Pages run in the browser process, so every setting above applies when the browser restarts. Restart browser: the browser closes and opens again on the page you were on.';\n"
     "  $('bannerText').textContent=p&&w?'Some changes wait for a page restart, others for a browser restart.':p?'Changes wait for a page restart.':'Changes wait for a browser restart.';\n"
     "  $('actions').hidden=false;$('back').hidden=!onPS5;renderAdblock();renderPhone();renderDownloads();renderStorage();\n"
     "  $('where').textContent=S.uri?'The PS5 is showing '+S.uri:'';\n"

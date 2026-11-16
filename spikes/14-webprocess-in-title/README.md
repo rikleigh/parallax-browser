@@ -1,5 +1,10 @@
 # Spike 14: the WebProcess inside the title (fights 1.7–1.9× faster in the title)
 
+**Stage 3 (2026-11-16, [stage3.md](stage3.md)): the default.** Pages run
+in the browser title unless Settings turns it off or Safer browsing is on.
+A runaway script is stopped after 10 s, page settings apply at a browser
+restart, and the browser restarts itself through a small helper payload.
+
 **Stage 0 (2026-11-15, [stage0.md](stage0.md)).**
 - **Gain:** with the fight's shape, `wasm-big` runs at 5.19–5.25 Msteps/s in
   the title and 3.69–3.72 in the payload, **1.41×**. About 1.23× comes from

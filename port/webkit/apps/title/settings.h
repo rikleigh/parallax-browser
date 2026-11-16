@@ -23,6 +23,8 @@ void ps5wk_settings_init(const char* dir, const char* user, PS5WKSettingsNormali
 /* The values now on disk are in use for these scopes (a new WebProcess
  * started: PS5WK_SETTINGS_PAGE). */
 void ps5wk_settings_applied(int scopes);
+/* Pages in the browser process: page settings wait for a browser restart. */
+void ps5wk_settings_set_pages_in_browser(gboolean on);
 
 /* The settings as JSON: {"ok":true,<extra>"settings":[...],...}. extra:
  * more members, each followed by a comma, or NULL. */

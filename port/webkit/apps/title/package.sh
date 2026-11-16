@@ -207,6 +207,10 @@ mkdir -p "$app/ui"
 python3 "$HERE/brand-assets.py" mark 48 "$app/ui/parallax-mark.bgra"
 cp "$PORT/runtime/parallax-logo.png" "$app/ui/parallax-logo.png"
 prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
+# The restart helper (apps/relaunch/ps5wk-relaunch.c): the title sends it to
+# elfldr to be closed and started again (Restart browser).
+make -s -C "$HERE/../relaunch" >/dev/null
+prospero-strip -o "$app/ps5wk-relaunch.elf" "$HERE/../relaunch/ps5wk-relaunch.elf"
 # The ad blocker (port/webkit/ADBLOCK.md): uBO Lite's rules converted for
 # WebKit (tools/ubol-convert.js, pinned release; generated, never committed)
 # and the converter the title runs for on-console updates (/app0/adblock).

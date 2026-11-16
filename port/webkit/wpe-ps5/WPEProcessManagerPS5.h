@@ -47,6 +47,17 @@ WPE_API gboolean wpe_process_manager_ps5_run_task (WPEProcessManager            
                                                    WPEProcessManagerPS5TaskEnded  ended,
                                                    gpointer                       user_data);
 
+/* As wpe_process_manager_ps5_run_task, from another payload ELF (@elf; NULL:
+ * the child ELF). FALSE once wpe_process_manager_ps5_quiesce was called. Used
+ * by the title's browser restart (apps/relaunch/ps5wk-relaunch.c). */
+WPE_API gboolean wpe_process_manager_ps5_run_task_elf (WPEProcessManager             *manager,
+                                                       const char                    *elf,
+                                                       const char                    *task,
+                                                       const char                    *argument,
+                                                       WPEProcessManagerPS5TaskOutput output,
+                                                       WPEProcessManagerPS5TaskEnded  ended,
+                                                       gpointer                       user_data);
+
 /* The first WebProcess in the title instead of a payload
  * (spikes/14-webprocess-in-title): @start gets WebKit's end of the IPC
  * socket and the process identifier on the main loop, returns 0 when it

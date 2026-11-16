@@ -102,6 +102,9 @@ static gint64 startedAt; /* Unix seconds: the settings page sees a restart */
  * media test run left the console wedged.) */
 #define PS5WK_CONTROL_SOCKET "/system_tmp/ps5wk/ps5browser-control.sock"
 static gint64 windDownStart;
+/* Pages in the browser process (main, setUpInTitleWeb): the first WebProcess
+ * runs in the title. */
+static int inTitleWeb;
 
 static gboolean windDownStep(gpointer data)
 {
@@ -1477,11 +1480,22 @@ static gboolean settingsRequestAllowed(const char* host, const char* origin)
     return !g_ascii_strcasecmp(origin, expected);
 }
 
+static const char* restartBrowser(const char* from);
+
 static gboolean restartPageOnMain(gpointer data)
 {
     (void)data;
     if (!webView || windDownStart || memRestartURI || memRestarting)
         return G_SOURCE_REMOVE;
+    /* Pages in the browser process: there is one in-title WebProcess per
+     * browser run, and its settings are read when the browser starts, so a
+     * page restart is a browser restart back to this page. */
+    if (inTitleWeb) {
+        const char* error = restartBrowser("a page restart");
+        if (error)
+            spike_log("settings: page restart: %s", error);
+        return G_SOURCE_REMOVE;
+    }
     const char* uri = webkit_web_view_get_uri(webView);
     memRestartURI = uri && *uri && strcmp(uri, "about:blank") ? g_strdup(uri) : homeURL();
     settingsRestart = TRUE;
@@ -1561,10 +1575,19 @@ void ps5wk_safer_browsing_toggle(void)
         return;
     }
     applyWebContentSettings();
-    wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), on
-        ? "Safer browsing: no JavaScript JIT, WebAssembly, WebGL or WebGPU. Pages run slower."
-        : "Safer browsing off: the JIT, WebAssembly and WebGL are back", 4);
-    g_idle_add(restartPageOnMain, NULL);
+    /* Safer browsing also decides where pages run (main): with pages in the
+     * browser process (or about to be), the browser restarts. */
+    const gboolean browserRestart = inTitleWeb || !flagFile("/data/ps5webkit/no-inprocess-web");
+    const char* error = browserRestart ? restartBrowser("Safer browsing (the menu)") : NULL;
+    if (error)
+        spike_log("settings: Safer browsing: no browser restart: %s", error);
+    wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), error
+        ? "Safer browsing changes when the browser restarts"
+        : on ? (browserRestart ? "Safer browsing: no JavaScript JIT, WebAssembly, WebGL or WebGPU. Restarting the browser…"
+                               : "Safer browsing: no JavaScript JIT, WebAssembly, WebGL or WebGPU. Pages run slower.")
+             : (browserRestart ? "Safer browsing off: restarting the browser…" : "Safer browsing off: the JIT, WebAssembly and WebGL are back"), 4);
+    if (!browserRestart)
+        g_idle_add(restartPageOnMain, NULL);
 }
 
 static void dataCleared(GObject* manager, GAsyncResult* result, gpointer data)
@@ -1638,18 +1661,74 @@ static gboolean launcherAsk(const char* command, char* reply, size_t size)
  * connection (it reads the second line once the kill is done). NULL, or
  * why not. Never on another title: the launcher kills the running app,
  * which is this one. */
+/* The restart helper (apps/relaunch/ps5wk-relaunch.c), sent to elfldr by
+ * restartBrowser: 0 none; 1 sent, not ready yet; 2 ready, the wind-down
+ * runs and spike_title_exit_helper tells it to go. */
+#define PS5WK_RELAUNCH_ELF "/app0/ps5wk-relaunch.elf"
+static gint relaunchState;
+static char relaunchGoFile[96];
+
+static gboolean relaunchFailedOnMain(gpointer data)
+{
+    (void)data;
+    unlink(PS5WK_PENDING_URL);
+    ps5wk_settings_set_status("The browser couldn't restart itself. Close it and start it again from the home screen.");
+    wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), "The browser couldn't restart itself: close it and start it again", 5);
+    return G_SOURCE_REMOVE;
+}
+
+/* The helper's lines (a thread of the process manager's). */
+static void relaunchOutput(const char* line, gpointer data)
+{
+    (void)data;
+    if (strstr(line, "[relaunch] ready") && g_atomic_int_compare_and_exchange(&relaunchState, 1, 2)) {
+        spike_log("settings: the restart helper is ready; the browser winds down");
+        g_main_context_invoke(NULL, beginWindDown, NULL);
+    }
+}
+
+static void relaunchEnded(gboolean launched, gpointer data)
+{
+    (void)data;
+    if (g_atomic_int_compare_and_exchange(&relaunchState, 1, 0)) {
+        spike_log("settings: the restart helper %s before it was ready: no restart", launched ? "ended" : "never started");
+        g_idle_add(relaunchFailedOnMain, NULL);
+    }
+}
+
+/* title_exit.c, once main has returned (the wind-down is done): the helper
+ * SIGKILLs the title and starts it again. 0: it was told to. */
+int spike_title_exit_helper(void);
+int spike_title_exit_helper(void)
+{
+    if (g_atomic_int_get(&relaunchState) != 2)
+        return -1;
+    int fd = open(relaunchGoFile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        spike_log("restart helper: can't create %s (errno %d)", relaunchGoFile, errno);
+        return -1;
+    }
+    close(fd);
+    spike_log("closing the title through the restart helper (SIGKILL, then it starts the title again)");
+    return 0;
+}
+
 static const char* restartBrowser(const char* from)
 {
     if (!spike_title_relaunch)
         return "only the PS5 title can restart itself";
-    if (windDownStart)
+    if (windDownStart || g_atomic_int_get(&relaunchState))
         return "the browser is already closing";
-    char reply[160];
-    if (!launcherAsk("status\n", reply, sizeof reply))
-        return "the launcher payload isn't running (tools/launch.sh sends it): close the browser and start it again from the home screen";
-    if (strncmp(reply, "OK ", 3) || !strstr(reply, PS5WK_TITLE_ID)) {
-        spike_log("settings: restart refused, launcher status \"%s\"", reply);
-        return "the launcher doesn't see the browser running";
+    /* The helper, or else the launcher payload (tools/launcher, developers). */
+    const gboolean helper = fileExists(PS5WK_RELAUNCH_ELF) && wpe_process_manager_get_default();
+    char reply[160] = "";
+    if (!helper) {
+        if (!launcherAsk("status\n", reply, sizeof reply))
+            return "the restart helper is missing and the launcher payload isn't running: close the browser and start it again from the home screen";
+        if (strncmp(reply, "OK ", 3) || !strstr(reply, PS5WK_TITLE_ID)) {
+            spike_log("settings: restart refused, launcher status \"%s\"", reply);
+            return "the launcher doesn't see the browser running";
+        }
     }
     g_mutex_lock(&shownLock);
     const char* back = shownURI && !isSettingsURI(shownURI) && !g_str_has_prefix(shownURI, PS5WK_GAMEPAD_URL) ? shownURI : settingsReturnURI;
@@ -1664,6 +1743,22 @@ static const char* restartBrowser(const char* from)
             (void)!write(fd, uri, strlen(uri));
             close(fd);
         }
+    }
+    if (helper) {
+        snprintf(relaunchGoFile, sizeof relaunchGoFile, "/data/ps5webkit/home/tmp/relaunch-go-%d", (int)getpid());
+        char argument[160];
+        snprintf(argument, sizeof argument, "%s:%d:%s", PS5WK_TITLE_ID, (int)getpid(), relaunchGoFile);
+        g_atomic_int_set(&relaunchState, 1);
+        if (!wpe_process_manager_ps5_run_task_elf(wpe_process_manager_get_default(), PS5WK_RELAUNCH_ELF, "relaunch", argument,
+                relaunchOutput, relaunchEnded, NULL)) {
+            g_atomic_int_set(&relaunchState, 0);
+            unlink(PS5WK_PENDING_URL);
+            g_free(uri);
+            return "the restart helper couldn't be started";
+        }
+        spike_log("settings: browser restart asked by %s, through the restart helper; coming back to %s", from, uri ? uri : "the home page");
+        g_free(uri);
+        return NULL; /* the wind-down starts when the helper is ready */
     }
     spike_log("settings: browser restart asked by %s; launcher says \"%s\"; coming back to %s", from, reply, uri ? uri : "the home page");
     g_free(uri);
@@ -1813,7 +1908,13 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
         char* scope = query ? formValue(query, !strcmp(path, "/restart") ? "scope" : "what") : NULL;
         if (!scope)
             scope = formValue(body, !strcmp(path, "/restart") ? "scope" : "what");
-        if (!strcmp(path, "/restart") && scope && (!strcmp(scope, "page") || !strcmp(scope, "web"))) {
+        if (!strcmp(path, "/restart") && scope && (!strcmp(scope, "page") || !strcmp(scope, "web")) && inTitleWeb) {
+            /* Pages in the browser process: a page restart is a browser restart (restartPageOnMain). */
+            const char* error = restartBrowser(from);
+            if (!error)
+                ps5wk_settings_set_status("Restarting the browser…");
+            settingsReplyJSON(client, error ? 503 : 200, !error, error ? error : "Restarting the browser (pages run in the browser process).");
+        } else if (!strcmp(path, "/restart") && scope && (!strcmp(scope, "page") || !strcmp(scope, "web"))) {
             spike_log("settings: page restart asked by %s", from);
             ps5wk_settings_set_status("Restarting the page…");
             g_idle_add(restartPageOnMain, NULL);
@@ -2684,27 +2785,77 @@ static void startTitleProfiler(void)
 int ps5wk_web_process_in_title_start(int fd, uint64_t processIdentifier);
 extern int ps5wk_title_mem_exec __attribute__((weak)); /* titlemem.c (the title package; not the payload-style ELF) */
 extern int ps5wk_title_access_fix __attribute__((weak)); /* titlesys.c (the title package) */
-static int inTitleWeb;
 
-/* ps5wk-child.cpp configureJIT() and setupEnvironment()'s WebProcess parts,
- * for the title's environment. Before WebKit initializes JSC. */
+/* KEY=VALUE lines of an env file, as ps5wk-child.cpp's readEnvFile reads
+ * them (comments and lines without "=" skipped; a line wins over what is
+ * set already). */
+static void readTitleEnvFile(const char* file)
+{
+    FILE* env = fopen(file, "r");
+    char line[512];
+    while (env && fgets(line, sizeof line, env)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char* eq = strchr(line, '=');
+        if (line[0] == '#' || !eq || (strchr(line, ' ') && strchr(line, ' ') < eq))
+            continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+        spike_log("[web-in-title] env %s=%s (%s)", line, eq + 1, file);
+    }
+    if (env)
+        fclose(env);
+}
+
+/* ps5wk-child.cpp setupEnvironment() and configureJIT(), for the title's
+ * environment: the in-title WebProcess gets what a payload would. Before
+ * WebKit initializes JSC. Not with Safer browsing (main: pages are then
+ * payloads). */
 static void setUpInTitleWeb(void)
 {
-    const int safer = fileExists("/data/ps5webkit/safer-browsing");
-    setenv("JSC_useJIT", safer ? "false" : "true", 1);
+    /* stdout to the log as well (titlelog.c takes stderr only): the page's
+     * console messages (enable-write-console-messages-to-stdout) and
+     * libraries' debug output, as a payload's stdout is relayed. */
+    fflush(stdout);
+    /* dup2 onto fd 1 fails here (EBUSY), so stdout's FILE gets fd 2. */
+    FILE* out = fdopen(STDERR_FILENO, "w");
+    if (out) {
+        setvbuf(out, NULL, _IOLBF, 0);
+        stdout = out;
+    }
+    spike_log("[web-in-title] stdout to the log: %s", out ? "yes (a FILE on fd 2)" : "no");
+    /* The page settings (Settings writes child.env: PS5WK_JIT, PS5WK_WASM,
+     * PS5WK_PAINT_THREADS...) and debugging lines, as every payload reads
+     * them; then /data/ps5webkit/inprocess-web, if there is one, for this
+     * WebProcess only (e.g. JSC_useJITDump, PS5WK_SCRIPT_LIMIT_S). Read when
+     * the browser starts: Settings says they apply at a browser restart. */
+    readTitleEnvFile("/data/ps5webkit/child.env");
+    readTitleEnvFile("/data/ps5webkit/inprocess-web");
+
+    /* configureJIT: PS5WK_JIT=1 (all tiers), dfg, baseline or 0 (off). */
+    const char* knob = getenv("PS5WK_JIT");
+    const char* mode = knob && *knob ? knob : "1";
+    const int off = !strcmp(mode, "0") || !strcmp(mode, "off");
+    setenv("JSC_useJIT", off ? "false" : "true", 0);
+    if (!strcmp(mode, "baseline"))
+        setenv("JSC_useDFGJIT", "false", 0);
+    if (!strcmp(mode, "baseline") || !strcmp(mode, "dfg"))
+        setenv("JSC_useFTLJIT", "false", 0);
     setenv("JSC_numberOfBaselineCompilerThreads", "1", 0);
     setenv("JSC_numberOfDFGCompilerThreads", "1", 0);
     setenv("JSC_numberOfFTLCompilerThreads", "1", 0);
-    if (!safer)
+    const int jit = !strcmp(getenv("JSC_useJIT"), "true");
+    if (jit)
         setenv("JSC_jitMemoryReservationSize", "268435456", 0);
-    setenv("JSC_useWasm", safer ? "false" : "true", 1);
+    /* PS5WK_WASM=0 turns WebAssembly off; it needs the JIT. */
+    const char* wasmKnob = getenv("PS5WK_WASM");
+    setenv("JSC_useWasm", jit && !(wasmKnob && !strcmp(wasmKnob, "0")) ? "true" : "false", 0);
     /* WebAssembly functions above JSC's OMG cost limit (100000) stay in BBQ
      * for good: the PS2 emulator's biggest ones were 23.5% of its worker's
      * time there. With 2000000 they reach OMG too: fights 47-48 -> 49-50
      * frames/s and steadier (spikes/14-webprocess-in-title/stage2.md). */
     setenv("JSC_maximumOMGCandidateCost", "2000000", 0);
     if (&ps5wk_title_mem_exec)
-        ps5wk_title_mem_exec = !safer;
+        ps5wk_title_mem_exec = jit;
     /* fontconfig finds its fonts.conf with access() (titlesys.c). */
     if (&ps5wk_title_access_fix)
         ps5wk_title_access_fix = 1;
@@ -2718,35 +2869,51 @@ static void setUpInTitleWeb(void)
     mkdir("/data/ps5webkit/home/cache", 0777);
     mkdir("/data/ps5webkit/home/cache/media", 0777);
     setenv("WPE_SHELL_MEDIA_DISK_CACHE_PATH", "/data/ps5webkit/home/cache/media", 0);
-    /* stdout to the log as well (titlelog.c takes stderr only): the page's
-     * console messages (enable-write-console-messages-to-stdout) and
-     * libraries' debug output, as a payload's stdout is relayed. */
-    fflush(stdout);
-    /* dup2 onto fd 1 fails here (EBUSY), so stdout's FILE gets fd 2. */
-    FILE* out = fdopen(STDERR_FILENO, "w");
-    if (out) {
-        setvbuf(out, NULL, _IOLBF, 0);
-        stdout = out;
+    const char* dfg = getenv("JSC_useDFGJIT");
+    const char* ftl = getenv("JSC_useFTLJIT");
+    spike_log("[web-in-title] on (Settings: Pages in the browser process): the first WebProcess runs in the title; "
+              "JIT %s (PS5WK_JIT=%s; JSC_useJIT=%s%s%s%s%s), WebAssembly %s, executable pool %s",
+        jit ? "on" : "off, LLInt only", mode, getenv("JSC_useJIT"), dfg ? ", JSC_useDFGJIT=" : "", dfg ? dfg : "",
+        ftl ? ", JSC_useFTLJIT=" : "", ftl ? ftl : "", getenv("JSC_useWasm"), jit ? "256 MB in direct memory" : "none");
+}
+
+/* Main-loop stalls: with pages in the title, the page's scripts and
+ * layout share this thread with the browser's UI and the controller. A
+ * 50 ms timer measures how late it runs: over 100 ms counts as a stall,
+ * over 250 ms is logged at once, and every 60 s one line sums it up
+ * ("[stall] 60 s: N over 100 ms, ..."). */
+#define STALL_TICK_MS 50
+static gint64 stallLast, stallWindowStart;
+static unsigned stallCount, stallOver250;
+static double stallTotalMS, stallMaxMS;
+
+static gboolean stallTick(gpointer data)
+{
+    (void)data;
+    gint64 now = g_get_monotonic_time();
+    if (stallLast) {
+        double late = (now - stallLast) / 1000.0 - STALL_TICK_MS;
+        if (late > 100) {
+            stallCount++;
+            stallTotalMS += late;
+            if (late > stallMaxMS)
+                stallMaxMS = late;
+            if (late > 250) {
+                stallOver250++;
+                spike_log("[stall] the main loop was blocked for %.0f ms", late);
+            }
+        }
+    } else
+        stallWindowStart = now;
+    stallLast = now;
+    if (now - stallWindowStart >= 60 * G_USEC_PER_SEC) {
+        spike_log("[stall] 60 s: %u over 100 ms (%u over 250 ms), %.0f ms in all, longest %.0f ms; pages %s",
+            stallCount, stallOver250, stallTotalMS, stallMaxMS, inTitleWeb ? "in the title" : "in payloads");
+        stallCount = stallOver250 = 0;
+        stallTotalMS = stallMaxMS = 0;
+        stallWindowStart = now;
     }
-    spike_log("[web-in-title] stdout to the log: %s", out ? "yes (a FILE on fd 2)" : "no");
-    /* KEY=VALUE lines in the switch file: the in-title WebProcess's child.env
-     * (debugging, e.g. FC_DEBUG). */
-    FILE* env = fopen("/data/ps5webkit/inprocess-web", "r");
-    char line[512];
-    while (env && fgets(line, sizeof line, env)) {
-        line[strcspn(line, "\r\n")] = 0;
-        char* eq = strchr(line, '=');
-        if (line[0] == '#' || !eq || strchr(line, ' ') > line && strchr(line, ' ') < eq)
-            continue;
-        *eq = 0;
-        setenv(line, eq + 1, 1);
-        spike_log("[web-in-title] env %s=%s (/data/ps5webkit/inprocess-web)", line, eq + 1);
-    }
-    if (env)
-        fclose(env);
-    spike_log("[web-in-title] on (/data/ps5webkit/inprocess-web): the first WebProcess runs in the title; JIT %s, "
-              "WebAssembly %s, executable pool %s",
-        getenv("JSC_useJIT"), getenv("JSC_useWasm"), safer ? "none" : "256 MB in direct memory");
+    return G_SOURCE_CONTINUE;
 }
 
 int main(int argc, char** argv)
@@ -2816,7 +2983,10 @@ int main(int argc, char** argv)
      * (adblock.c) and nothing else: no JIT in a title. Read when WebKit
      * initializes JSC (the web context below); the WebProcesses do not see
      * this environment. */
-    inTitleWeb = fileExists("/data/ps5webkit/inprocess-web");
+    /* Pages in the browser process (spikes/14-webprocess-in-title): on
+     * unless Settings turned it off (no-inprocess-web) or Safer browsing is
+     * on, which keeps pages apart from the browser. */
+    inTitleWeb = !fileExists("/data/ps5webkit/no-inprocess-web") && !fileExists("/data/ps5webkit/safer-browsing");
     if (inTitleWeb)
         setUpInTitleWeb();
     else
@@ -2825,6 +2995,7 @@ int main(int argc, char** argv)
     ps5wk_profile_init();
     /* The values in use until something restarts (the settings page). */
     ps5wk_settings_init("/data/ps5webkit", ps5wk_profile_dir(), pushNormalize);
+    ps5wk_settings_set_pages_in_browser(inTitleWeb);
 
     /* open(), not access(): access() said no for an existing file here. */
     int flag = open("/data/ps5webkit/debug-screenshot", O_RDONLY);
@@ -2969,6 +3140,7 @@ int main(int argc, char** argv)
     pushStart();
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     mainLoop = loop;
+    g_timeout_add(STALL_TICK_MS, stallTick, NULL);
     g_main_loop_run(loop);
     /* No child upload may be cut off by the SIGKILL that follows main. */
     wpe_process_manager_ps5_quiesce(5000);

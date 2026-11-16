@@ -57,10 +57,22 @@ static void ask_launcher_to_kill_us(void)
     close(fd);
 }
 
+/* A title with a restart helper of its own (ps5browser's
+ * apps/relaunch/ps5wk-relaunch.c, waiting to SIGKILL it and start it again)
+ * defines this: 0 when the helper was told to go, so the title just waits. */
+int spike_title_exit_helper(void) __attribute__((weak));
+
 void catchReturnFromMain(int status);
 void catchReturnFromMain(int status)
 {
     spike_log("main returned %d", status);
+    if (spike_title_exit_helper && spike_title_exit_helper() == 0) {
+        fflush(stderr);
+        spike_log_flush(500);
+        for (int i = 0; i < 100; i++)
+            usleep(100 * 1000); /* the helper's SIGKILL comes in this time */
+        spike_log("the restart helper did not close the title in 10 s");
+    }
     ask_launcher_to_kill_us();
     spike_log("no launcher; closing the title through sceShellCoreUtilExitApp");
     if (psvr2_exit_app() == 0)
