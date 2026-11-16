@@ -8,11 +8,11 @@
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
  *   flag files (no-hwdec, audio-silent, push-off, adblock-off,
- *     no-compositing, no-webgl, no-inprocess-web): present = that feature off; the title
+ *     no-compositing, no-webgl): present = that feature off; the title
  *     reads them when it starts (no-compositing: WebKit in the title reads
  *     it whenever a page gets a new WebProcess; no-webgl: applied at once,
  *     ps5browser.c applyWebContentSettings). Opt-in flag files
- *     (perf-overlay, safer-browsing): present = that feature on.
+ *     (perf-overlay, safer-browsing, webgpu-on, pages-in-browser): present = that feature on.
  *     safer-browsing overrides jit, wasm, webgl, webgpu and web_in_title while present (each
  *     WebProcess reads it at start, ps5wk-child.cpp configureJIT; the title
  *     for WebGL) and leaves their own values alone for when it goes.
@@ -76,8 +76,8 @@ static const Setting settings[] = {
     { "webgpu", KIND_FLAG_ON, TYPE_BOOL, "webgpu-on", "0", 0, "WebGPU (experimental)",
         "The newer 3D and GPU computing interface for pages, on the PS5's GPU. New here and less tested than WebGL: leave it off unless a site needs it. Off: sites fall back to WebGL where they can. Applies to pages loaded from now on.",
         NULL, 0, 0 },
-    { "web_in_title", KIND_FLAG, TYPE_BOOL, "no-inprocess-web", "1", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
-        "Runs pages inside the browser itself, which has more of the PS5's CPU: games and heavy pages run up to twice as fast. Off runs each page in a separate process, as before: a page that crashes then closes only itself, not the browser, and pages are kept apart from the browser. Safer browsing always keeps them apart. While it's on, the settings under Pages apply when the browser restarts.",
+    { "web_in_title", KIND_FLAG_ON, TYPE_BOOL, "pages-in-browser", "0", PS5WK_SETTINGS_BROWSER, "Pages in the browser process (experimental)",
+        "Runs pages inside the browser itself instead of in a separate process. Faster: pages get more of the PS5's CPU, and games and heavy pages run up to twice as fast. But a page's work shares the browser's own thread, so on busy pages (feeds that keep adding posts) the menu, the pointer and clicks pause for up to a second now and then. Also, a page that crashes closes the whole browser, and pages are not kept apart from the browser. The settings under Pages then apply when the browser restarts. Safer browsing always keeps pages in their own process.",
         NULL, 0, 0 },
     { "paint_threads", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
         "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",

@@ -39,10 +39,15 @@ play the video on a page in the PS VR2 headset.
 - A link server. Open `http://<ps5-ip>:9040/` on a phone or computer, or
   scan the QR code on the start page or in Settings, to send links to the
   PS5, change settings and fetch downloads. See [Security](#security).
-- Pages run inside the browser's own process, which gets more of the
-  PS5's CPU than a separate one: games and heavy pages run up to twice as
-  fast. "Pages in the browser process" in Settings switches back to a
-  separate process, where a page that crashes closes only itself.
+- Each page runs in its own process, so a page that crashes closes only
+  itself. "Pages in the browser process (experimental)" in Settings runs
+  pages inside the browser instead:
+  - Pro: pages get more of the PS5's CPU, and games and heavy pages run up
+    to twice as fast.
+  - Con: busy pages make the menu, the pointer and clicks pause now and
+    then. Scrolling carries on through the pauses.
+  - Con: a page that crashes closes the whole browser.
+  - Con: pages are not kept apart from the browser.
 - Settings, at `parallax://settings`, for Safer browsing, the home page,
   the search engine, video, memory, ad blocking, the link server and
   clearing data. Google is the default search engine. Pressing □ on the
@@ -147,9 +152,9 @@ that title with your homebrew tool. Your data in `/data/ps5webkit` stays.
   is on, the link server doesn't say which pages are open. It still keeps
   and lists downloads, as in normal browsing.
 - **The browser has no sandbox, and a malicious page could take over the
-  console.** Web pages run inside the browser itself, or, with "Pages in
-  the browser process" off or Safer browsing on, in a process the browser
-  starts like any other payload. Either way they run as root, outside the
+  console.** Web pages run in a process the browser starts like any other
+  payload, or, with the experimental "Pages in the browser process" on,
+  inside the browser itself. Either way they run as root, outside the
   system's jail, with the jailbreak's kernel access, and can reach elfldr. A web page
   that exploits a bug in WebKit, most often in the JavaScript JIT, would
   get all of it. That means every user's cookies and logged-in sessions,

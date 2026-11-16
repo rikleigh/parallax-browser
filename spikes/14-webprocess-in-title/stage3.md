@@ -1,11 +1,23 @@
 # Spike 14, stage 3: pages in the browser process by default (2026-11-16)
 
-Pages run in the browser title (PPSA99207, Parallax Browser) unless
-Settings' "Pages in the browser process" is off
-(`/data/ps5webkit/no-inprocess-web`) or Safer browsing is on. Both of those
-use payload WebProcesses as before. `/data/ps5webkit/inprocess-web` is no
-longer the switch; its KEY=VALUE lines still go to the in-title WebProcess
-(debugging).
+**Later the same day: experimental, off by default.** Pages run in payload
+WebProcesses unless Settings' "Pages in the browser process (experimental)"
+is on (`/data/ps5webkit/pages-in-browser`). Safer browsing always uses
+payloads. `/data/ps5webkit/no-inprocess-web` is gone.
+
+- Pro: pages get more CPU, so games and heavy pages run up to twice as fast
+  (48 against 25 frames/s in a fighting game).
+- Con: a busy page's scripts, style and layout run on the title's main
+  thread. A feed that adds posts as it scrolls blocks it for 0.3-1.2 s
+  about 25 times a minute, and the menu, the pointer and clicks wait.
+  Patch 0137 keeps the stick scrolling meanwhile.
+- Con: a page that crashes ends the browser.
+- Con: pages are not kept apart from the browser.
+
+`/data/ps5webkit/inprocess-web` is not the switch; its KEY=VALUE lines go to
+the in-title WebProcess (debugging).
+
+The rest of this page is how it was made the default, before that.
 
 ## What changed for it to be the default
 
