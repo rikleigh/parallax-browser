@@ -195,20 +195,23 @@ int __wrap_munmap(void* addr, size_t len);
  * the other mappings. Only with ps5wk_title_mem_exec (the switch); 0 tells
  * JSC to mmap as before. Address and length in 64 KiB units (wasm pages). */
 static unsigned long long commit_count, commit_failures;
-int ps5wk_title_commit_direct(void* address, size_t bytes)
+static int commit_direct_at(void* address, size_t bytes, const char* what)
 {
     const uintptr_t a = (uintptr_t)address;
     if (!ps5wk_title_mem_exec || !bytes)
         return 0;
-    if ((a & (UNIT - 1)) || (bytes & (UNIT - 1))) {
-        spike_log("[mem] wasm commit of %zu bytes at %p: not in 64 KiB units, mmap instead (flexible memory)", bytes, address);
+    if ((a & (PAGE - 1)) || (bytes & (PAGE - 1))) {
+        spike_log("[mem] %s commit of %zu bytes at %p: not in 16 KiB pages, mmap instead (flexible memory)", what, bytes, address);
         return 0;
     }
+    /* 16 KiB pages work too (Spike 10: commits and partial releases in
+     * 16 KiB multiples); 64 KiB where the range allows it. */
+    const size_t align = ((a | bytes) & (UNIT - 1)) ? PAGE : UNIT;
     int64_t phys = 0;
-    int rc = sceKernelAllocateMainDirectMemory(bytes, UNIT, DMEM_TYPE_WB, &phys);
+    int rc = sceKernelAllocateMainDirectMemory(bytes, align, DMEM_TYPE_WB, &phys);
     if (rc) {
         __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
-        spike_log("[mem] wasm commit of %.1f MB at %p: no direct memory (rc 0x%08x)", bytes / 1048576.0, address, (unsigned)rc);
+        spike_log("[mem] %s commit of %.1f MB at %p: no direct memory (rc 0x%08x)", what, bytes / 1048576.0, address, (unsigned)rc);
         return -1;
     }
     void* mapped = address;
@@ -218,7 +221,7 @@ int ps5wk_title_commit_direct(void* address, size_t bytes)
             sceKernelMunmap(mapped, bytes);
         sceKernelReleaseDirectMemory(phys, bytes);
         __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
-        spike_log("[mem] wasm commit of %.1f MB at %p: sceKernelMapDirectMemory(MAP_FIXED) rc 0x%08x -> %p", bytes / 1048576.0,
+        spike_log("[mem] %s commit of %.1f MB at %p: sceKernelMapDirectMemory(MAP_FIXED) rc 0x%08x -> %p", what, bytes / 1048576.0,
             address, (unsigned)rc, mapped);
         return -1;
     }
@@ -238,8 +241,13 @@ int ps5wk_title_commit_direct(void* address, size_t bytes)
     pthread_mutex_unlock(&dmap_lock);
     unsigned long long n = __atomic_add_fetch(&commit_count, 1, __ATOMIC_RELAXED);
     if (n <= 8 || bytes >= ((size_t)32 << 20))
-        spike_log("[mem] wasm commit %llu: %.1f MB of direct memory at %p (in a reserved range)", n, bytes / 1048576.0, address);
+        spike_log("[mem] %s commit %llu: %.1f MB of direct memory at %p (in a reserved range)", what, n, bytes / 1048576.0, address);
     return 1;
+}
+
+int ps5wk_title_commit_direct(void* address, size_t bytes)
+{
+    return commit_direct_at(address, bytes, "wasm");
 }
 
 /* Before JSC unmaps a memory's reservation: its direct memory goes back. */
@@ -253,6 +261,7 @@ void ps5wk_title_release_direct(void* address, size_t bytes)
     pthread_mutex_unlock(&dmap_lock);
 }
 static unsigned long exec_maps;
+static unsigned long long fixed_direct, fixed_passthrough, fixed_passthrough_bytes;
 
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off)
 {
@@ -278,6 +287,17 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
         return p;
     }
     if (!anon || !len || !(prot & (PROT_READ | PROT_WRITE)) || (prot & PROT_EXEC)) {
+        /* A fixed mapping over ours (a PROT_NONE guard or decommit): that
+         * part leaves the table first, so it is released and never cleared
+         * by a later MAP_FIXED as if it were still ours. */
+        if ((flags & MAP_FIXED) && len) {
+            const uintptr_t a = (uintptr_t)addr & ~(PAGE - 1);
+            const size_t l = round_up((uintptr_t)addr + len, PAGE) - a;
+            pthread_mutex_lock(&dmap_lock);
+            if (dmap_overlaps(a, l))
+                dmap_release_range(a, l);
+            pthread_mutex_unlock(&dmap_lock);
+        }
         __atomic_fetch_add(&dmap_passthrough, 1, __ATOMIC_RELAXED);
         return __real_mmap(addr, len, prot, flags, fd, off);
     }
@@ -291,6 +311,36 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
             memset(addr, 0, len);
             __atomic_fetch_add(&dmap_zero_fills, 1, __ATOMIC_RELAXED);
             return addr;
+        }
+        /* Outside the table (a range reserved some other way, or mapped by
+         * the real mmap before): with pages in the title, a fresh mapping
+         * there took flexible memory every time libpas zero-filled or
+         * decommitted its pages, until none was left and libpas's
+         * PAS_ASSERT ended the browser (2026-11-16, pas_page_malloc_zero_fill;
+         * 0 zero fills inside the table, ~200 passed through in a few
+         * minutes of video). Whole 16 KiB pages up to 64 MB get direct
+         * memory at the address instead, like WebAssembly's commits (the
+         * ranges seen were 16 KiB aligned: 1 MB and 64 MB less 16 KiB). */
+        const uintptr_t a = (uintptr_t)addr;
+        if (ps5wk_title_mem_exec && !(a & (PAGE - 1)) && !(len & (PAGE - 1)) && len <= ((size_t)64 << 20)) {
+            pthread_mutex_lock(&dmap_lock);
+            if (dmap_overlaps(a, len))
+                dmap_release_range(a, len);
+            pthread_mutex_unlock(&dmap_lock);
+            if (commit_direct_at(addr, len, "fixed mmap") > 0) {
+                __atomic_fetch_add(&fixed_direct, 1, __ATOMIC_RELAXED);
+                return addr;
+            }
+        }
+        unsigned long long n = __atomic_add_fetch(&fixed_passthrough, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&fixed_passthrough_bytes, len, __ATOMIC_RELAXED);
+        if (n <= 24 || !(n & (n - 1))) {
+            pthread_mutex_lock(&dmap_lock);
+            int overlaps = dmap_overlaps(a, len);
+            pthread_mutex_unlock(&dmap_lock);
+            spike_log("[mem] fixed mmap %llu to flexible memory: %zu bytes at %p (prot %d, flags 0x%x)%s%s; %.1f MB so far",
+                n, len, addr, prot, flags, (a | len) & (PAGE - 1) ? ", not in 16 KiB pages" : "", overlaps ? ", overlapping ours" : "",
+                fixed_passthrough_bytes / 1048576.0);
         }
         __atomic_fetch_add(&dmap_passthrough, 1, __ATOMIC_RELAXED);
         return __real_mmap(addr, len, prot, flags, fd, off);
@@ -607,9 +657,10 @@ void ps5wk_title_mem_log(const char* milestone)
             snprintf(webgpu, sizeof webgpu, "; WebGPU buffers and textures %.1f MB (peak %.1f, budget %.0f, %u refused)", used, peak, budget, refused);
     }
     spike_log("[mem] %s: flexible %.1f MB free; direct memory %.1f MB in use; direct heap %.1f MB mapped (peak %.1f, %llu libc fallbacks, init %s); "
-              "anon mmaps %.1f MB in %u (peak %.1f MB, %llu made, %llu failed, %llu zero fills, %llu passed through); "
+              "anon mmaps %.1f MB in %u (peak %.1f MB, %llu made, %llu failed, %llu zero fills, %llu passed through; fixed mmaps outside them: %llu to direct memory, %llu to flexible, %.1f MB); "
               "thread stacks %u live, %.1f MB (%u created, %u libc)%s%s",
         milestone, dmem_flexible_free() / 1048576.0, ps5wk_title_direct_mb(), h.mapped / 1048576.0, h.peak / 1048576.0, h.libc_fallbacks,
         h.init_step, (mapped - sb) / 1048576.0, n, peak / 1048576.0, dmap_count, dmap_failures, dmap_zero_fills,
-        dmap_passthrough, live, sb / 1048576.0, created, threads_libc, webgl, webgpu);
+        dmap_passthrough, fixed_direct, fixed_passthrough, fixed_passthrough_bytes / 1048576.0, live, sb / 1048576.0, created, threads_libc,
+        webgl, webgpu);
 }

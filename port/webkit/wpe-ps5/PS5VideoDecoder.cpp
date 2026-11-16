@@ -1069,6 +1069,7 @@ struct BudgetLimits {
     int waitMS { 500 };
     int vp9Headroom { 1 }; // 0: never 4K headroom, 1: streams above 1080p, 2: every VP9 stream
     int h264Small { 1 }; // 1: H.264 streams up to 640x480 get a decoder of their own size; 0: 1920x1088
+    int h264Headroom { 1 }; // 1: H.264 streams above 1080p get a 3840x2160 decoder when it fits; 0: their own size
 };
 
 struct Cost {
@@ -1110,6 +1111,8 @@ static BudgetLimits readBudgetLimits()
             limits.vp9Headroom = i;
         else if (sscanf(word, "h264small=%d", &i) == 1)
             limits.h264Small = i;
+        else if (sscanf(word, "h264headroom=%d", &i) == 1)
+            limits.h264Headroom = i;
     }
     fclose(f);
     return limits;
@@ -1171,6 +1174,16 @@ static Cost estimateCost(unsigned codec, unsigned depth, int width, int height)
     double scale = area / refArea;
     cost.directMB *= std::max(0.25, scale);
     cost.flexibleMB *= std::max(0.35, scale);
+    // H.264 above 1080p: from Spike 9's 4K figure (71 MB at depth 4), not
+    // 1080p's scaled up (95 MB at 4K).
+    if (codec == PS5WK_VCODEC_H264 && area > 1920.0 * 1088)
+        cost.flexibleMB = 71 * area / (3840.0 * 2160);
+    // Above 1080p the title opens H.264 and HEVC at pipeline depth 2
+    // (titlevdec.c): Spike 9's 8K HEVC took 139 MB there against 223 MB at
+    // depth 4, so 0.62 of the depth-4 figures (H.264 4K: 71 MB measured at
+    // depth 4). A measured cost replaces this after the first open.
+    if (codec != PS5WK_VCODEC_VP9 && area > 1920.0 * 1088)
+        cost.flexibleMB *= 0.62;
     return cost;
 }
 
@@ -1400,6 +1413,24 @@ static uint32_t openHardware(const std::shared_ptr<Decoder>& d, const ps5wk_vide
         } else if (openWidth * openHeight <= 1920 * 1088) {
             openWidth = std::max(openWidth, 1920);
             openHeight = std::max(openHeight, 1088);
+        }
+    } else if (codec == PS5WK_VCODEC_H264 && openWidth * openHeight > 1920 * 1088 && openWidth <= 3840 && openHeight <= 2160
+        && limits.h264Headroom) {
+        // Adaptive streams (HLS) start low and switch up a few seconds in
+        // (2160x1080, then 3840x1920): each switch closed the decoder and
+        // opened a bigger one, which the budget often refused with pages in
+        // the title (the old one's memory comes back only after the drain),
+        // and playback stopped. A 4K decoder from the start, when it fits
+        // now with room to spare, keeps every later switch.
+        Cost big = estimateCost(codec, depth, 3840, 2160);
+        double flexible = flexibleFreeMB();
+        g_mutex_lock(&budgetLock);
+        bool roomy = flexible - budgetPendingFlexibleMB - big.flexibleMB >= limits.reserveMB + 8
+            && budgetDirectMB + big.directMB <= limits.directMB / 2;
+        g_mutex_unlock(&budgetLock);
+        if (roomy) {
+            openWidth = 3840;
+            openHeight = 2160;
         }
     } else if (codec == PS5WK_VCODEC_H264 && openWidth * openHeight < 1920 * 1088) {
         if (limits.h264Small && openWidth * openHeight <= 640 * 480) {

@@ -1733,8 +1733,11 @@ planned below, with these details:
   with several videos* below).
   Decoders are opened at 3840x2160 for VP9 (13 MB of flexible memory) and
   at least 1920x1088 for H.264, so YouTube's resolution switches within
-  that keep the decoder; pipeline depth 4 up to 4K, 2 above (8K: 139 MB of
-  flexible memory instead of 223).
+  that keep the decoder; H.264 above 1080p gets 3840x2160 when that fits
+  with 8 MB to spare over the reserve (`h264headroom=0` in `vdec-budget`:
+  its own size), so an HLS stream's switch up to 4K keeps it too. Pipeline
+  depth 4 up to 1080p, 2 above (8K: 139 MB of flexible memory instead of
+  223; since 2026-11-16 also 4K, for pages in the title).
 - **Renderer**: a REMOTE frame converts straight from the decoder's GL
   buffer (no memcpy), NV12 or the 10-bit LSB-aligned variant (`format_ 4`).
 - **Backend**: the decoding itself is a function table the executable

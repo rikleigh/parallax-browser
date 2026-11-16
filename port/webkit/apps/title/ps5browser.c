@@ -53,6 +53,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <wpe/ps5/wpe-ps5.h>
+#include "../common/crashguard.h"
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 
@@ -2917,7 +2918,7 @@ static gboolean stallTick(gpointer data)
         }
     } else
         stallWindowStart = now;
-    stallLast = now;
+    __atomic_store_n(&stallLast, now, __ATOMIC_RELAXED);
     if (now - stallWindowStart >= 60 * G_USEC_PER_SEC) {
         spike_log("[stall] 60 s: %u over 100 ms (%u over 250 ms), %.0f ms in all, longest %.0f ms; pages %s",
             stallCount, stallOver250, stallTotalMS, stallMaxMS, inTitleWeb ? "in the title" : "in payloads");
@@ -2928,6 +2929,45 @@ static gboolean stallTick(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* While the main loop is stuck (the 50 ms timer above can only measure a
+ * stall afterwards): another thread says, at 3 s and every 5 s after, what
+ * the main thread waits in and what WebGL's and WebGPU's threads are doing
+ * (WebKit, Spike 14 stage 3: the in-title WebProcess's 15 s GetErrors
+ * waits). */
+size_t ps5wk_main_thread_stream_wait(char* out, size_t size) __attribute__((weak));
+size_t ps5wk_stream_threads_report(char* out, size_t size) __attribute__((weak));
+
+static void* stallWatch(void* data)
+{
+    (void)data;
+    gint64 reportedFor = 0;
+    int reports = 0;
+    for (;;) {
+        g_usleep(500 * 1000);
+        gint64 last = __atomic_load_n(&stallLast, __ATOMIC_RELAXED);
+        if (!last)
+            continue;
+        double stuck = (g_get_monotonic_time() - last) / 1e6;
+        if (stuck < 3) {
+            reports = 0;
+            continue;
+        }
+        if (reportedFor == last && stuck < 3 + 5.0 * reports)
+            continue;
+        if (reportedFor != last)
+            reports = 0;
+        reportedFor = last;
+        reports++;
+        char waits[256] = "", threads[768] = "";
+        if (ps5wk_main_thread_stream_wait)
+            ps5wk_main_thread_stream_wait(waits, sizeof waits);
+        if (ps5wk_stream_threads_report)
+            ps5wk_stream_threads_report(threads, sizeof threads);
+        spike_log("[stall] the main loop has not turned for %.1f s: %s; %s", stuck, waits[0] ? waits : "?", threads[0] ? threads : "?");
+    }
+    return NULL;
+}
+
 int main(int argc, char** argv)
 {
     /* Before the unjail in spike_title_init (PS5VR: libSceVideodec2 does
@@ -2936,6 +2976,10 @@ int main(int argc, char** argv)
         ps5wk_title_vdec_preload();
     ps5wk_titlelog_install("/data/ps5webkit");
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
+    /* Before WebKit (WTF chains its handlers to these). A crash used to end
+     * the title without a word; the report also goes straight to a file. */
+    ps5wk_crash_guard_report_file("/data/ps5webkit/crash-title.txt");
+    ps5wk_crash_guard_install("title");
     loadStart = g_get_monotonic_time();
     startedAt = g_get_real_time() / G_USEC_PER_SEC;
     signal(SIGPIPE, SIG_IGN);
@@ -3153,6 +3197,11 @@ int main(int argc, char** argv)
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     mainLoop = loop;
     g_timeout_add(STALL_TICK_MS, stallTick, NULL);
+    {
+        pthread_t watcher;
+        if (!pthread_create(&watcher, NULL, stallWatch, NULL))
+            pthread_detach(watcher);
+    }
     g_main_loop_run(loop);
     /* No child upload may be cut off by the SIGKILL that follows main. */
     wpe_process_manager_ps5_quiesce(5000);

@@ -123,6 +123,9 @@ add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/tit
 target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/title/adblock-scripting.c)
 target_include_directories(ps5browser PRIVATE ${PS5_API_INCLUDE_DIRECTORIES} ${PS5_PORT_DIR}/../../spikes)
 target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_PORT=${PS5WK_LOG_PORT})
+# The crash guard (fatal signals reported to the log and crash-title.txt),
+# without its pthread_create wrapper (titlecrash.c).
+target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/title/titlecrash.c)
 target_link_options(ps5browser PRIVATE ${PS5_LOCK_WRAPS})
 target_link_libraries(ps5browser PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)
 add_dependencies(ps5browser ps5wk-objects)

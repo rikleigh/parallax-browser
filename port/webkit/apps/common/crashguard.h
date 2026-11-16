@@ -17,12 +17,19 @@ extern "C" {
  * chains to handlers installed earlier). */
 void ps5wk_crash_guard_install(const char* tag);
 
+/* The report also goes to this file (appended), written from the handler:
+ * the browser title's stderr is a pipe drained by a log thread that dies
+ * with it. Call before ps5wk_crash_guard_install. */
+void ps5wk_crash_guard_report_file(const char* path);
+
 /* An alternate signal stack for the calling thread (sigaltstack is
  * per-thread), so a stack overflow can still be reported. Every thread made
  * through pthread_create gets one when the executable links with
  * -Wl,--wrap=pthread_create (CMakeLists.txt). That wrapper also raises
  * threads below 2 MiB of stack (the payload libc's default is 64 KiB) to
- * 2 MiB. */
+ * 2 MiB. Built with PS5WK_CRASHGUARD_NO_THREAD_WRAP (the browser title,
+ * whose titlemem.c wraps pthread_create) there is no wrapper: only the
+ * thread that installed the guard has an alternate stack. */
 void ps5wk_crash_guard_thread(void);
 
 #ifdef __cplusplus

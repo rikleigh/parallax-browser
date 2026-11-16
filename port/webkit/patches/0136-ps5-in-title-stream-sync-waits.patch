@@ -1,0 +1,251 @@
+diff --git a/Source/WebKit/Platform/IPC/Connection.cpp b/Source/WebKit/Platform/IPC/Connection.cpp
+index 05435e16b4..5095df8798 100644
+--- a/Source/WebKit/Platform/IPC/Connection.cpp
++++ b/Source/WebKit/Platform/IPC/Connection.cpp
+@@ -1310,11 +1310,66 @@ void Connection::ps5MarkInTitleWebProcessConnection()
+     s_ps5InTitleWebProcessConnection = this;
+ }
+ 
++// StreamClientConnectionBuffer::tryAcquireAll: WebGL's and WebGPU's sync calls wait for their
++// reply there, on a semaphore, not in waitForSyncReply. From the in-title WebProcess on the title's
++// main thread that wait must still dispatch the main run loop's queued UI and GPU side messages (as
++// waitForMessage does above), or a reply that needs one of them only comes with the 15 s timeout,
++// with the whole browser frozen (2026-11-16: GetErrors, twice).
++bool ps5InTitleMainThreadWaits()
++{
++    return s_ps5InTitleWebProcessConnection.load() && RunLoop::isMain();
++}
++
++unsigned ps5DispatchMainRunLoopMessagesWhileWaiting(MessageName* first)
++{
++    return Connection::ps5DispatchMainRunLoopMessages(first);
++}
++
++unsigned Connection::ps5DispatchMainRunLoopMessages(MessageName* first)
++{
++    static NeverDestroyed<RefPtr<SyncMessageState>> mainState = SyncMessageState::getOrCreate(RunLoop::mainSingleton()).ptr();
++    unsigned count = 0;
++    RefPtr { mainState.get() }->dispatchMessages([&](MessageName name, uint64_t) {
++        if (!count++ && first)
++            *first = name;
++    });
++    return count;
++}
++
++// What the title's main thread waits for in a stream sync call (the stall report).
++static std::atomic<uint16_t> s_ps5MainThreadStreamWait;
++static std::atomic<double> s_ps5MainThreadStreamWaitSince;
++
++void ps5NoteMainThreadStreamWait(MessageName name, bool waiting)
++{
++    if (!ps5InTitleMainThreadWaits())
++        return;
++    s_ps5MainThreadStreamWaitSince = waiting ? MonotonicTime::now().secondsSinceEpoch().value() : 0;
++    s_ps5MainThreadStreamWait = waiting ? static_cast<uint16_t>(name) : 0;
++}
++
+ bool Connection::ps5HasInTitleWebProcess()
+ {
+     return !!s_ps5InTitleWebProcessConnection.load();
+ }
+ 
++} // namespace IPC
++
++// apps/title/ps5browser.c's stall report: the stream sync call the title's main thread waits in.
++extern "C" size_t ps5wk_main_thread_stream_wait(char* out, size_t size)
++{
++    double since = IPC::s_ps5MainThreadStreamWaitSince.load();
++    uint16_t name = IPC::s_ps5MainThreadStreamWait.load();
++    if (!size)
++        return 0;
++    int n = since > 0 && name
++        ? snprintf(out, size, "the main thread waits for the reply to %s (%.1f s)", IPC::description(static_cast<IPC::MessageName>(name)).characters(), MonotonicTime::now().secondsSinceEpoch().value() - since)
++        : snprintf(out, size, "the main thread is not in a WebGL/WebGPU sync call");
++    return n < 0 ? 0 : std::min<size_t>(static_cast<size_t>(n), size - 1);
++}
++
++namespace IPC {
++
+ void Connection::ps5ExitProcessWhenClosed()
+ {
+     s_ps5ExitProcessOnClose = this;
+diff --git a/Source/WebKit/Platform/IPC/Connection.h b/Source/WebKit/Platform/IPC/Connection.h
+index 28c59af999..61aa386973 100644
+--- a/Source/WebKit/Platform/IPC/Connection.h
++++ b/Source/WebKit/Platform/IPC/Connection.h
+@@ -478,6 +478,8 @@ public:
+     // connection to the UI process, whose main thread it shares.
+     void ps5MarkInTitleWebProcessConnection();
+     static bool ps5HasInTitleWebProcess();
++    // The main run loop's queued UI and GPU side messages, dispatched now (ps5InTitleMainThreadWaits).
++    static unsigned ps5DispatchMainRunLoopMessages(MessageName* first);
+     // A UI process connection to an auxiliary process (AuxiliaryProcessProxy).
+     // With a WebProcess in the title, these have all their messages
+     // dispatched inside sync waits on the main thread (not only sync ones),
+diff --git a/Source/WebKit/Platform/IPC/StreamClientConnection.h b/Source/WebKit/Platform/IPC/StreamClientConnection.h
+index 93875ce789..f8373965bb 100644
+--- a/Source/WebKit/Platform/IPC/StreamClientConnection.h
++++ b/Source/WebKit/Platform/IPC/StreamClientConnection.h
+@@ -437,7 +437,13 @@ std::optional<StreamClientConnection::SendSyncResult<T>> StreamClientConnection:
+         auto wakeUpResult = m_buffer.release(messageEncoder.size());
+         wakeUpServer(wakeUpResult);
+         if constexpr (T::isReplyStreamEncodable) {
++#if defined(PS5_PAYLOAD_SDK)
++            ps5NoteMainThreadStreamWait(T::name(), true);
+             auto replySpan = m_buffer.tryAcquireAll(timeout);
++            ps5NoteMainThreadStreamWait(T::name(), false);
++#else
++            auto replySpan = m_buffer.tryAcquireAll(timeout);
++#endif
+             if (!replySpan)
+                 return makeUnexpected(Error::FailedToAcquireReplyBufferSpan);
+ 
+diff --git a/Source/WebKit/Platform/IPC/StreamClientConnectionBuffer.h b/Source/WebKit/Platform/IPC/StreamClientConnectionBuffer.h
+index 933410cdb8..85e5909681 100644
+--- a/Source/WebKit/Platform/IPC/StreamClientConnectionBuffer.h
++++ b/Source/WebKit/Platform/IPC/StreamClientConnectionBuffer.h
+@@ -33,6 +33,13 @@
+ 
+ namespace IPC {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// Connection.cpp: the in-title WebProcess waiting on the title's main thread.
++bool ps5InTitleMainThreadWaits();
++unsigned ps5DispatchMainRunLoopMessagesWhileWaiting(MessageName* first);
++void ps5NoteMainThreadStreamWait(MessageName, bool waiting);
++#endif
++
+ class StreamClientConnectionBuffer : public StreamConnectionBuffer {
+ public:
+     static std::optional<StreamClientConnectionBuffer> create(unsigned dataSizeLog2, Event&& clientWait);
+@@ -193,6 +200,29 @@ inline std::optional<std::span<uint8_t>> StreamClientConnectionBuffer::tryAcquir
+         if (!clientLimit && (clientOffset == ClientOffset::serverIsSleepingTag || !clientOffset))
+             break;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++        // The in-title WebProcess on the title's main thread: wait in 2 ms slices and dispatch the
++        // main run loop's queued UI and GPU side messages between them (Connection.cpp,
++        // ps5InTitleMainThreadWaits). Setting the waiting tag again each pass is harmless: the server
++        // clears it when it finishes and signals.
++        if (ps5InTitleMainThreadWaits()) {
++            Timeout slice { std::min(timeout.secondsUntilDeadline(), 2_ms) };
++            if (!m_clientWait.waitFor(slice)) {
++                if (timeout.didTimeOut())
++                    return std::nullopt;
++                MessageName first { };
++                if (unsigned dispatched = ps5DispatchMainRunLoopMessagesWhileWaiting(&first)) {
++                    static unsigned reported;
++                    if (reported++ < 20)
++                        WTFLogAlways("[web-in-title] a WebGL/WebGPU sync call waited for %u message(s) of the title's main thread (first %s): dispatched them", dispatched, description(first).characters());
++                }
++                continue;
++            }
++            if (timeout.didTimeOut())
++                return std::nullopt;
++            continue;
++        }
++#endif
+         if (!m_clientWait.waitFor(timeout))
+             return std::nullopt;
+         if (timeout.didTimeOut())
+diff --git a/Source/WebKit/Platform/IPC/StreamServerConnection.cpp b/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
+index 53f88a7f2e..6fd8a938a3 100644
+--- a/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
++++ b/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
+@@ -34,8 +34,42 @@
+ #include <mutex>
+ #include <wtf/NeverDestroyed.h>
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include <pthread.h>
++#include <wtf/MonotonicTime.h>
++#endif
++
+ namespace IPC {
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// The browser title's stall report (apps/title/ps5browser.c, ps5wk_stream_threads_report): which
++// stream message each work queue thread (WebGL's, WebGPU's) is in, and since when.
++namespace {
++struct PS5StreamThread {
++    std::atomic<uintptr_t> thread { 0 };
++    std::atomic<uint16_t> message { 0 };
++    std::atomic<double> since { 0 };
++    std::atomic<uint16_t> lastMessage { 0 };
++    std::atomic<double> lastEnd { 0 };
++};
++PS5StreamThread s_ps5StreamThreads[4];
++std::atomic<unsigned> s_ps5StreamThreadCount;
++
++PS5StreamThread* ps5StreamThread()
++{
++    static thread_local int slot = -1;
++    if (slot < 0) {
++        unsigned index = s_ps5StreamThreadCount.fetch_add(1);
++        if (index >= std::size(s_ps5StreamThreads))
++            return nullptr;
++        slot = static_cast<int>(index);
++        s_ps5StreamThreads[slot].thread = reinterpret_cast<uintptr_t>(pthread_self());
++    }
++    return &s_ps5StreamThreads[slot];
++}
++}
++#endif
++
+ RefPtr<StreamServerConnection> StreamServerConnection::tryCreate(Handle&& handle, const StreamServerConnectionParameters& params)
+ {
+     auto buffer = StreamServerConnectionBuffer::map(WTF::move(handle.buffer));
+@@ -303,7 +337,21 @@ bool StreamServerConnection::dispatchStreamMessage(Decoder& message, StreamMessa
+     m_isDispatchingMessage = true;
+ #endif
+     IPC::messageLog().add(message.messageName());
++#if defined(PS5_PAYLOAD_SDK)
++    PS5StreamThread* ps5Thread = ps5StreamThread();
++    if (ps5Thread) {
++        ps5Thread->since = MonotonicTime::now().secondsSinceEpoch().value();
++        ps5Thread->message = static_cast<uint16_t>(message.messageName());
++    }
++#endif
+     receiver.didReceiveStreamMessage(*this, message);
++#if defined(PS5_PAYLOAD_SDK)
++    if (ps5Thread) {
++        ps5Thread->lastMessage = ps5Thread->message.load();
++        ps5Thread->lastEnd = MonotonicTime::now().secondsSinceEpoch().value();
++        ps5Thread->message = 0;
++    }
++#endif
+ #if ASSERT_ENABLED
+     m_isDispatchingMessage = false;
+ #endif
+@@ -348,3 +396,31 @@ void StreamServerConnection::markCurrentlyDispatchedMessageAsInvalid(const Strin
+ }
+ 
+ }
++
++#if defined(PS5_PAYLOAD_SDK)
++extern "C" size_t ps5wk_stream_threads_report(char* out, size_t size)
++{
++    if (!size)
++        return 0;
++    size_t used = 0;
++    out[0] = 0;
++    double now = MonotonicTime::now().secondsSinceEpoch().value();
++    unsigned count = std::min<unsigned>(IPC::s_ps5StreamThreadCount.load(), std::size(IPC::s_ps5StreamThreads));
++    for (unsigned i = 0; i < count && used + 1 < size; i++) {
++        auto& t = IPC::s_ps5StreamThreads[i];
++        uint16_t message = t.message.load();
++        uint16_t last = t.lastMessage.load();
++        int n = message
++            ? snprintf(out + used, size - used, "%sstream thread %#lx: in %s for %.1f s", used ? "; " : "", static_cast<unsigned long>(t.thread.load()),
++                IPC::description(static_cast<IPC::MessageName>(message)).characters(), now - t.since.load())
++            : snprintf(out + used, size - used, "%sstream thread %#lx: idle for %.1f s (last %s)", used ? "; " : "", static_cast<unsigned long>(t.thread.load()),
++                t.lastEnd.load() > 0 ? now - t.lastEnd.load() : 0.0, last ? IPC::description(static_cast<IPC::MessageName>(last)).characters() : "none");
++        if (n < 0)
++            break;
++        used = std::min(size - 1, used + static_cast<size_t>(n));
++    }
++    if (!count)
++        used = static_cast<size_t>(std::max(0, snprintf(out, size, "no stream threads yet")));
++    return std::min(used, size - 1);
++}
++#endif

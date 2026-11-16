@@ -55,8 +55,11 @@ static void *tv_open(unsigned codec, unsigned profile, unsigned depth, int width
     c.height = height;
     c.caller_frames = 1;
     /* Spike 9: depth 4 nearly doubles 8K throughput but needs 223 MB of
-     * flexible memory there (139 MB at depth 2); 4K and below are cheap. */
-    c.pipeline_depth = (long)width * height > 3840L * 2176 ? 2 : 4;
+     * flexible memory there (139 MB at depth 2, still 79 fps). Since pages
+     * run in the title they share its flexible memory, and a 4K H.264
+     * decoder at depth 4 (71 MB) often didn't fit (2026-11-16): depth 2
+     * above 1080p, depth 4 (cheap) up to it. */
+    c.pipeline_depth = (long)width * height > 1920L * 1088 ? 2 : 4;
     switch (codec) {
     case PS5WK_VCODEC_H264:
         c.codec = VDEC2_CODEC_AVC;

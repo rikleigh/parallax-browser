@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -42,6 +43,7 @@ void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* commi
 #define MAX_CANDIDATES 24
 
 static char guardTag[32] = "?";
+static int reportFd = -1; /* ps5wk_crash_guard_report_file */
 static volatile sig_atomic_t inHandler;
 
 typedef struct {
@@ -107,6 +109,8 @@ static void flush(line_t* line)
 {
     put(line, "\n");
     ssize_t ignored = write(2, line->text, line->length);
+    if (reportFd >= 0)
+        ignored = write(reportFd, line->text, line->length);
     (void)ignored;
 }
 
@@ -245,6 +249,12 @@ void ps5wk_crash_guard_thread(void)
         munmap(memory, ALT_STACK_SIZE);
 }
 
+void ps5wk_crash_guard_report_file(const char* path)
+{
+    if (reportFd < 0 && path)
+        reportFd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+}
+
 void ps5wk_crash_guard_install(const char* tag)
 {
     if (tag) {
@@ -268,6 +278,7 @@ void ps5wk_crash_guard_install(const char* tag)
     }
 }
 
+#ifndef PS5WK_CRASHGUARD_NO_THREAD_WRAP
 // -Wl,--wrap=pthread_create: every new thread gets its alternate signal stack
 // first. The stack is freed when the thread function returns (not on
 // pthread_exit, which leaks 128 KiB).
@@ -366,3 +377,4 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attributes, v
         pthread_attr_destroy(&widened);
     return rc;
 }
+#endif /* PS5WK_CRASHGUARD_NO_THREAD_WRAP */

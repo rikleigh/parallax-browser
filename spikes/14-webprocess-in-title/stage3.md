@@ -19,6 +19,10 @@ longer the switch; its KEY=VALUE lines still go to the in-title WebProcess
 | Main-loop stalls were not measured. | A 50 ms timer in the title: stalls over 250 ms logged at once, `[stall] 60 s: ...` every minute. |
 | HLS video (`<video src=...m3u8>`, GStreamer's hlsdemux2, which downloads by itself in the WebProcess) took ~15 s per segment in the title: long loads, playback stopping every few seconds. In a title, inet sockets stay blocking: `fcntl(F_SETFL, O_NONBLOCK)` and `SOCK_NONBLOCK` are taken (F_GETFL shows the flag) but a read with no data waits, and `ioctl(FIONBIO)` is EACCES. GLib's reads then waited until the server closed the connection. | `shim/ps5shim.c` (title only): `fcntl(F_SETFL)` and `socket(SOCK_NONBLOCK)` on a socket also set Sony's `SO_NBIO` (0x1200), which does switch it; where that is refused, the existing `MSG_DONTWAIT` emulation. `package.sh` wraps `socket` for the title. Found with a start-up self-test in the title (wake-up latency of pipes, sockets and GLib contexts; libsoup requests; each way of asking for non-blocking), since removed. |
 | The in-title WebProcess capped video at 1080p (`WEBKIT_GST_VIDEO_DECODING_LIMIT`); payloads ask the title's decoder and allow up to 8K. | `setUpInTitleWeb` sets the limit from the hardware decoder (`ps5wk_title_vdec_max_size`, titlevdec.c), as `ps5wk-child.cpp` does. |
+| The browser froze for 15 s at a time (twice in a few hours of video pages): a page's WebGL sync call (`GetErrors`) waited for the WebGL thread until IPC's timeout. Stream sync calls wait on the stream's semaphore, where patch 0133's dispatch of the main run loop's UI and GPU side messages didn't reach. | Patch 0136: that wait goes in 2 ms slices on the title's main thread and dispatches those messages between them (logged: `a WebGL/WebGPU sync call waited for N message(s) of the title's main thread`). A thread logs `[stall] the main loop has not turned for N s` with the stream call the main thread is in and what each WebGL/WebGPU stream thread is doing (`ps5wk_stream_threads_report`). |
+| A crash ended the title without a word. | `apps/title/titlecrash.c`: the payloads' crash guard in the title (without its pthread_create wrapper, titlemem.c has one); the report also goes to `/data/ps5webkit/crash-title.txt`, written from the handler. |
+| libpas zero-fills and decommits by mapping fresh pages over its own (`mmap(MAP_FIXED)`). Ranges outside titlemem.c's table went to the real mmap, flexible memory: ~530 MB of such mappings in a few minutes of video pages, flexible memory down to 56 MB (15 MB after hours), video decoders refused for memory (slow software decoding), and the title ended by libpas's `PAS_ASSERT` in `pas_page_malloc_zero_fill` once none was left. | titlemem.c: anonymous read-write `MAP_FIXED` mappings outside the table, in 16 KiB pages up to 64 MB, get direct memory at the address (like WebAssembly's commits); a `MAP_FIXED` mapping of another kind over the table's ranges (a `PROT_NONE` guard) takes them out of the table first. The `[mem]` line counts both kinds. |
+| Adaptive (HLS) streams start below 4K and switch up a few seconds in; each switch closed the decoder and asked for a bigger one, which the budget refused with pages in the title (the old decoder's memory came back only after the drain): playback stopped and started again. | PS5VideoDecoder.cpp: H.264 above 1080p gets a 3840x2160 decoder from the start when it fits (`h264headroom=0` in `vdec-budget`: its own size), so the switch keeps it; the H.264 estimate above 1080p comes from Spike 9's 4K figure. titlevdec.c: pipeline depth 2 above 1080p (it was above 4K). |
 
 ## Checks (owner, PPSA99207, no launcher payload running)
 
@@ -40,6 +44,14 @@ longer the switch; its KEY=VALUE lines still go to the in-title WebProcess
   after the kill, and the system showed "Cannot start the game or app"
   each time (the browser still started). Waiting until no app is in front
   plus 1 s (`/data/ps5webkit/relaunch-delay-ms`) removed it.
+
+- **Video pages after the fixes above** (2026-11-16): four VR videos (HLS,
+  2160x1080 then 3840x1920) and the start page in between, WebGPU on and
+  off: no crash, every decoder in hardware (none refused), every
+  `MAP_FIXED` outside the table in direct memory (none in flexible), the
+  title's flexible memory at least 185 MB free (56 MB before), the longest
+  stall 0.9 s. Direct memory in use went from about 1 GB to 1.9 GB:
+  not watched over a long session yet.
 
 ## Left as it is
 
