@@ -39,6 +39,7 @@
 #include "viewinvr.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -2929,25 +2930,184 @@ static gboolean stallTick(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* Stall samples: while the main loop has not turned for 120 ms, this
+ * thread samples the main thread's stack every 20 ms (SIGVTALRM, the
+ * profiler's unwinder: apps/common/profiler.c, in the title package), at
+ * most 160 samples a stall. A stall that ends up over 250 ms writes its
+ * samples, identical stacks folded, to
+ * /data/ps5webkit/prof/stalls-title-<pid>.txt and names its entry in the
+ * log ("[stall] sampled #N"); test/prof/stall-sym.py symbolizes and sums
+ * them up by function. /data/ps5webkit/no-stall-samples (a file) turns it
+ * off. The sampling path takes no lock of the C library (the main thread
+ * may hold one); the report is written once the main loop turned again.
+ *
+ *   # stall <n> <ms> ms, <samples> samples every 20 ms, main thread CPU <ms> ms (<busy|waiting>), at <s> s
+ *   S <count> <frames>     (the profiler's notation, innermost first)
+ */
+#define STALL_SAMPLE_AFTER_MS 120
+#define STALL_SAMPLE_MS 20
+#define STALL_SAMPLES 160
+#define STALL_FRAMES 64
+#define STALL_SAMPLES_OFF "/data/ps5webkit/no-stall-samples"
+int ps5wk_backtrace_init(void) __attribute__((weak));
+unsigned ps5wk_backtrace_context(const void* ucontext, uintptr_t* out) __attribute__((weak));
+size_t ps5wk_backtrace_format(char* buffer, size_t size, const uintptr_t* pcs, unsigned n) __attribute__((weak));
+void ps5wk_backtrace_refresh_jit(void) __attribute__((weak));
+void ps5wk_profiler_register_self(void) __attribute__((weak));
+void ps5wk_profiler_own_thread(void) __attribute__((weak));
+
+static pthread_t stallMainThread;
+static gboolean stallSampling;
+static uintptr_t sampleFrames[128]; /* PS5WK_BACKTRACE_MAX */
+static unsigned sampleCount;
+static gint64 sampleCPU; /* the main thread's own CPU clock, us */
+static int sampleDone;
+
+typedef struct {
+    unsigned count, n;
+    uintptr_t pcs[STALL_FRAMES];
+} StallStack;
+static StallStack stallStacks[STALL_SAMPLES];
+static unsigned stallStackCount, stallSampleTotal, stallReports;
+static gint64 stallCPUFirst, stallCPULast;
+static int stallFile = -1;
+
+static void onStallSample(int sig, siginfo_t* info, void* context)
+{
+    (void)sig;
+    (void)info;
+    int saved = errno;
+    if (pthread_equal(pthread_self(), stallMainThread)) {
+        sampleCount = ps5wk_backtrace_context(context, sampleFrames);
+        struct timespec ts;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        sampleCPU = (gint64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    }
+    __atomic_store_n(&sampleDone, 1, __ATOMIC_RELEASE);
+    errno = saved;
+}
+
+/* The main thread (call on it): its stack can be sampled. */
+static void stallSamplesSetUp(void)
+{
+    stallMainThread = pthread_self();
+    struct stat st;
+    if (!stat(STALL_SAMPLES_OFF, &st)) {
+        spike_log("[stall] no stack samples (" STALL_SAMPLES_OFF ")");
+        return;
+    }
+    if (!ps5wk_backtrace_init || !ps5wk_backtrace_context || !ps5wk_backtrace_format || ps5wk_backtrace_init()) {
+        spike_log("[stall] no stack samples: no unwinder in this build");
+        return;
+    }
+    if (ps5wk_profiler_register_self)
+        ps5wk_profiler_register_self();
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_sigaction = onStallSample;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGVTALRM, &action, NULL)) {
+        spike_log("[stall] no stack samples: sigaction failed");
+        return;
+    }
+    stallSampling = TRUE;
+}
+
+/* One sample of the main thread's stack, folded in. */
+static void stallSampleOne(void)
+{
+    __atomic_store_n(&sampleDone, 0, __ATOMIC_RELEASE);
+    if (pthread_kill(stallMainThread, SIGVTALRM))
+        return;
+    for (int i = 0; i < 50 && !__atomic_load_n(&sampleDone, __ATOMIC_ACQUIRE); i++)
+        g_usleep(1000);
+    if (!__atomic_load_n(&sampleDone, __ATOMIC_ACQUIRE))
+        return;
+    unsigned n = sampleCount < STALL_FRAMES ? sampleCount : STALL_FRAMES;
+    if (!stallSampleTotal++)
+        stallCPUFirst = sampleCPU;
+    stallCPULast = sampleCPU;
+    for (unsigned i = 0; i < stallStackCount; i++) {
+        StallStack* st = &stallStacks[i];
+        if (st->n == n && !memcmp(st->pcs, sampleFrames, n * sizeof(uintptr_t))) {
+            st->count++;
+            return;
+        }
+    }
+    StallStack* st = &stallStacks[stallStackCount++];
+    st->count = 1;
+    st->n = n;
+    memcpy(st->pcs, sampleFrames, n * sizeof(uintptr_t));
+}
+
+/* The stall is over (the main loop turned): its samples to the file. */
+static void stallSamplesEnd(double stallMS)
+{
+    if (stallMS < 250 || !stallSampleTotal)
+        return;
+    if (stallFile < 0) {
+        mkdir("/data/ps5webkit/prof", 0777);
+        char path[96];
+        snprintf(path, sizeof path, "/data/ps5webkit/prof/stalls-title-%d.txt", (int)getpid());
+        stallFile = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (stallFile < 0)
+            return;
+    }
+    double cpuMS = (stallCPULast - stallCPUFirst) / 1000.0;
+    double sampledMS = (stallSampleTotal - 1) * (double)STALL_SAMPLE_MS;
+    const char* kind = sampledMS > 0 && cpuMS > sampledMS / 2 ? "busy" : "waiting";
+    stallReports++;
+    GString* out = g_string_new(NULL);
+    g_string_append_printf(out, "# stall %u %.0f ms, %u samples every %d ms, main thread CPU %.0f ms (%s), at %.1f s\n", stallReports, stallMS,
+        stallSampleTotal, STALL_SAMPLE_MS, cpuMS, kind, g_get_monotonic_time() / 1e6);
+    char frames[STALL_FRAMES * 20];
+    for (unsigned i = 0; i < stallStackCount; i++) {
+        ps5wk_backtrace_format(frames, sizeof frames, stallStacks[i].pcs, stallStacks[i].n);
+        g_string_append_printf(out, "S %u%s\n", stallStacks[i].count, frames);
+    }
+    ssize_t written = write(stallFile, out->str, out->len);
+    (void)written;
+    g_string_free(out, TRUE);
+    spike_log("[stall] sampled #%u: %.0f ms, %u samples (%u stacks), main thread %s (CPU %.0f ms of %.0f): /data/ps5webkit/prof/stalls-title-%d.txt",
+        stallReports, stallMS, stallSampleTotal, stallStackCount, kind, cpuMS, sampledMS, (int)getpid());
+}
+
 /* While the main loop is stuck (the 50 ms timer above can only measure a
- * stall afterwards): another thread says, at 3 s and every 5 s after, what
- * the main thread waits in and what WebGL's and WebGPU's threads are doing
- * (WebKit, Spike 14 stage 3: the in-title WebProcess's 15 s GetErrors
- * waits). */
+ * stall afterwards): this thread samples the main thread's stack (above)
+ * and says, at 3 s and every 5 s after, what the main thread waits in and
+ * what WebGL's and WebGPU's threads are doing (WebKit, Spike 14 stage 3:
+ * the in-title WebProcess's 15 s GetErrors waits). */
 size_t ps5wk_main_thread_stream_wait(char* out, size_t size) __attribute__((weak));
 size_t ps5wk_stream_threads_report(char* out, size_t size) __attribute__((weak));
 
 static void* stallWatch(void* data)
 {
     (void)data;
-    gint64 reportedFor = 0;
+    if (ps5wk_profiler_own_thread)
+        ps5wk_profiler_own_thread();
+    gint64 reportedFor = 0, sampledFor = 0;
     int reports = 0;
     for (;;) {
-        g_usleep(500 * 1000);
+        g_usleep(sampledFor ? STALL_SAMPLE_MS * 1000 : 50 * 1000);
         gint64 last = __atomic_load_n(&stallLast, __ATOMIC_RELAXED);
         if (!last)
             continue;
+        if (sampledFor && last != sampledFor) {
+            stallSamplesEnd((last - sampledFor) / 1000.0 - STALL_TICK_MS);
+            sampledFor = 0;
+        }
         double stuck = (g_get_monotonic_time() - last) / 1e6;
+        if (stallSampling && stuck * 1000 >= STALL_SAMPLE_AFTER_MS) {
+            if (!sampledFor) {
+                sampledFor = last;
+                stallStackCount = stallSampleTotal = 0;
+                if (ps5wk_backtrace_refresh_jit)
+                    ps5wk_backtrace_refresh_jit();
+            }
+            if (stallSampleTotal < STALL_SAMPLES)
+                stallSampleOne();
+        }
         if (stuck < 3) {
             reports = 0;
             continue;
@@ -3197,6 +3357,7 @@ int main(int argc, char** argv)
     GMainLoop* loop = g_main_loop_new(NULL, FALSE);
     mainLoop = loop;
     g_timeout_add(STALL_TICK_MS, stallTick, NULL);
+    stallSamplesSetUp();
     {
         pthread_t watcher;
         if (!pthread_create(&watcher, NULL, stallWatch, NULL))

@@ -330,6 +330,21 @@ static void gamepadIcon(WPEDisplayPS5Canvas* c, int cx, int cy, guint32 color)
     wpe_display_ps5_canvas_fill(c, cx + 13, cy - 3, 5, 5, 2, hole);
 }
 
+/* The full screen button's icon: the four corners of a screen. */
+static void fullScreenIcon(WPEDisplayPS5Canvas* c, int cx, int cy, guint32 color)
+{
+    const int w = 36, h = 26, arm = 11, t = 4;
+    const int l = cx - w / 2, r = cx + w / 2, top = cy - h / 2, bottom = cy + h / 2;
+    wpe_display_ps5_canvas_fill(c, l, top, arm, t, 1, color);
+    wpe_display_ps5_canvas_fill(c, l, top, t, arm, 1, color);
+    wpe_display_ps5_canvas_fill(c, r - arm, top, arm, t, 1, color);
+    wpe_display_ps5_canvas_fill(c, r - t, top, t, arm, 1, color);
+    wpe_display_ps5_canvas_fill(c, l, bottom - t, arm, t, 1, color);
+    wpe_display_ps5_canvas_fill(c, l, bottom - arm, t, arm, 1, color);
+    wpe_display_ps5_canvas_fill(c, r - arm, bottom - t, arm, t, 1, color);
+    wpe_display_ps5_canvas_fill(c, r - t, bottom - arm, t, arm, 1, color);
+}
+
 /* The private browsing button's icon: a hat and dark glasses. */
 static void privateIcon(WPEDisplayPS5Canvas* c, int cx, int cy, guint32 color)
 {
@@ -395,13 +410,13 @@ static void shieldIcon(WPEDisplayPS5Canvas* c, int cx, int cy, gboolean on, guin
     wpe_display_ps5_canvas_image(c, cx - SHIELD_W / 2, cy - SHIELD_H / 2, SHIELD_W, SHIELD_H, px, 255);
 }
 
-static void drawProgress(WPEDisplayPS5Canvas* c, int screenW, double progress)
+static void drawProgress(WPEDisplayPS5Canvas* c, int screenW, int barHeight, double progress)
 {
     if (progress < 0.05)
         progress = 0.05;
     if (progress > 1)
         progress = 1;
-    const int w = (int)(screenW * progress), y = BAR_H - 4;
+    const int w = (int)(screenW * progress), y = barHeight - 4;
     /* the brand's gradient over the whole width, shown up to the progress */
     guint32 head = PX_FOCUS_FROM;
     {
@@ -474,21 +489,27 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
 {
     const int screenW = s->screenW;
     const gboolean toolbar = interactive && s->zone == ZONE_TOOLBAR;
+    if (interactive)
+        hotCount = 0; /* the bar first (bui_draw_menu adds the rest) */
     /* Private browsing: a plum bar, so a private page never looks like the others. */
     wpe_display_ps5_canvas_fill_gradient(c, 0, 0, screenW, BAR_H, 0, PX_A(s->privateMode ? PX_PRIVATE_BAR : PX_BASE, 0xf6),
         PX_A(s->privateMode ? PX_PRIVATE_BAR_2 : PX_SURFACE, 0xee), TRUE);
     wpe_display_ps5_canvas_fill(c, 0, BAR_H - 1, screenW, 1, 0, PX_A(s->privateMode ? PX_MAGENTA : PX_LINE, 0xff));
 
-    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "", "", "", "+", "⚙" };
-    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
+    const char* labels[TB_COUNT] = { "←", "→", s->loading ? "✕" : "↻", "⌂", NULL, NULL, "", "", "", "", "+", "⚙" };
+    const gboolean enabled[TB_COUNT] = { s->canBack, s->canForward, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, s->canNewTab, TRUE };
     int x = EDGE;
     for (int i = TB_BACK; i <= TB_HOME; i++) {
         drawButton(c, x, BTN_Y, BTN_W, BTN_H, labels[i], enabled[i] ? PX_TEXT : PX_TEXT_OFF, toolbar && s->toolbarFocus == i, interactive ? i : -1);
         x += BTN_W + GAP;
     }
-    /* the right: settings, new tab, safer browsing, private, gamepad, bookmark, the tab count */
+    /* the right: settings, new tab, safer browsing, private, gamepad, full screen, bookmark, the tab count */
     const int settingsX = screenW - EDGE - BTN_W, newTabX = settingsX - GAP - BTN_W, saferX = newTabX - GAP - BTN_W, privateX = saferX - GAP - BTN_W;
-    const int gamepadX = privateX - GAP - BTN_W, starX = gamepadX - GAP - BTN_W, countX = starX - GAP - 64;
+    const int gamepadX = privateX - GAP - BTN_W, fullX = gamepadX - GAP - BTN_W, starX = fullX - GAP - BTN_W, countX = starX - GAP - 64;
+    drawButton(c, fullX, BTN_Y, BTN_W, BTN_H, labels[TB_FULLSCREEN], PX_TEXT, toolbar && s->toolbarFocus == TB_FULLSCREEN, interactive ? TB_FULLSCREEN : -1);
+    fullScreenIcon(c, fullX + BTN_W / 2, BTN_Y + BTN_H / 2, s->fullScreen ? PX_CYAN_TEXT : PX_TEXT);
+    if (s->fullScreen)
+        wpe_display_ps5_canvas_fill_gradient(c, fullX + 18, BTN_Y + BTN_H - 8, BTN_W - 36, 4, 2, PX_CYAN, PX_BLUE, FALSE);
     drawButton(c, privateX, BTN_Y, BTN_W, BTN_H, labels[TB_PRIVATE], PX_TEXT, toolbar && s->toolbarFocus == TB_PRIVATE, interactive ? TB_PRIVATE : -1);
     privateIcon(c, privateX + BTN_W / 2, BTN_Y + BTN_H / 2, s->privateMode ? PX_PINK : PX_TEXT);
     drawButton(c, saferX, BTN_Y, BTN_W, BTN_H, labels[TB_SAFER], PX_TEXT, toolbar && s->toolbarFocus == TB_SAFER, interactive ? TB_SAFER : -1);
@@ -559,7 +580,7 @@ void bui_draw_bar(WPEDisplayPS5Canvas* c, const BUIState* s, gboolean interactiv
         wpe_display_ps5_canvas_text(c, ax + 24, ay + 41, textW, 23, FALSE, PX_TEXT_3, "Address or search");
 
     if (s->loading)
-        drawProgress(c, screenW, s->progress);
+        drawProgress(c, screenW, BAR_H, s->progress);
 }
 
 /* ---------------------------------------------------------------- the menu */
@@ -633,6 +654,13 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         x += hint(c, x, cy, "✕", "Home") + 32;
         if (s->homeSquare)
             x += hint(c, x, cy, "□", s->homeSquare) + 32;
+    } else if (!list && s->toolbarFocus == TB_FULLSCREEN) {
+        x += hint(c, x, cy, "✕", s->fullScreen ? "Show the address bar" : "Full screen") + 32;
+        if (s->fullScreenWhy) {
+            char why[96];
+            snprintf(why, sizeof why, "Full screen now for %s", s->fullScreenWhy);
+            x += wpe_display_ps5_canvas_text(c, x, cy + T_HINT * 36 / 100, 0, T_HINT, FALSE, PX_TEXT_3, why) + 32;
+        }
     } else if (!list && s->toolbarFocus == TB_PRIVATE)
         x += hint(c, x, cy, "✕", s->privateMode ? "Leave private browsing" : "Private browsing") + 32;
     else if (!list && s->toolbarFocus == TB_SAFER)

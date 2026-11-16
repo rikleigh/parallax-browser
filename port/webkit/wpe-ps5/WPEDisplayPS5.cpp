@@ -23,6 +23,7 @@
 
 #include "PS5PerfOverlay.h"
 #include "PS5Renderer.h"
+#include <atomic>
 #include <pthread.h>
 #include <sys/resource.h>
 #include <time.h>
@@ -108,6 +109,11 @@ struct _WPEDisplayPS5Private {
 
     int32_t userID { -1 };
     int32_t pad { -1 };
+    // The pad's stall thread (padStallThread): when padTick last ran, and
+    // whether it was on a page with the right stick scrolling it.
+    std::atomic<double> padTickAt { 0 };
+    std::atomic<bool> padTickScrolls { false };
+    GMutex padReadLock { }; // scePadReadState: padTick or the stall thread
     uint32_t buttons { 0 };
     uint32_t ignoredButtons { 0 };
     uint32_t repeatingKey { 0 };
@@ -250,7 +256,9 @@ static void redraw(WPEDisplayPS5* display)
     auto* priv = display->priv;
     bool visible = nowSeconds() - priv->pointerMovedAt < pointerShownFor;
     priv->pointerWasVisible = visible;
-    PS5Renderer::singleton().present(visible, priv->pointerX, priv->pointerY);
+    // The page's pointer is in view coordinates, the UI's in the screen's.
+    double top = priv->uiMode ? 0 : PS5Renderer::singleton().pageTop();
+    PS5Renderer::singleton().present(visible, priv->pointerX, priv->pointerY + top);
 }
 
 void wpeDisplayPS5ScheduleRedraw(WPEDisplayPS5* display)
@@ -406,10 +414,11 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
 
 // How far to draw the page higher so the field being typed into (its
 // caret line, in view coordinates) sits above the open keyboard. The view
-// fills the screen at scale 1. Only a field wholly on screen lifts the page
+// fills the screen below the application's bar (PS5Renderer::pageTop) at
+// scale 1. Only a field wholly on screen lifts the page
 // (the page image holds what is on screen and nothing below it), never by
 // more than the keyboard's height and the field's, and never so far that the field's top
-// leaves the screen; anything else (a caret position before a scroll that
+// goes under the bar; anything else (a caret position before a scroll that
 // reveals the field: patch 0095 sends it again after) leaves the page put.
 static int keyboardLiftFor(WPEDisplayPS5* display, int fieldY, int fieldHeight, const char** why)
 {
@@ -419,11 +428,12 @@ static int keyboardLiftFor(WPEDisplayPS5* display, int fieldY, int fieldHeight, 
     int viewHeight = priv->activeView ? wpe_view_get_height(priv->activeView) : 0;
     if (fieldHeight <= 0 || viewHeight <= 0 || priv->keyboardTop <= 0)
         return 0;
-    float viewToScreen = screenHeight / viewHeight;
+    const float top = PS5Renderer::singleton().pageTop();
+    float viewToScreen = (screenHeight - top) / viewHeight;
     // The caret's line, with room for the field's border and padding.
-    float fieldTop = (fieldY - fieldHeight * 0.5f) * viewToScreen;
-    float fieldBottom = (fieldY + fieldHeight * 1.5f) * viewToScreen;
-    if (fieldY < 0 || (fieldY + fieldHeight) * viewToScreen > screenHeight) {
+    float fieldTop = top + (fieldY - fieldHeight * 0.5f) * viewToScreen;
+    float fieldBottom = top + (fieldY + fieldHeight * 1.5f) * viewToScreen;
+    if (fieldY < 0 || top + (fieldY + fieldHeight) * viewToScreen > screenHeight) {
         if (why)
             *why = " (caret off screen: no lift)";
         return 0;
@@ -431,7 +441,7 @@ static int keyboardLiftFor(WPEDisplayPS5* display, int fieldY, int fieldHeight, 
     if (fieldBottom <= priv->keyboardTop - margin)
         return 0;
     float wanted = fieldBottom - (priv->keyboardTop - margin);
-    float keepTopVisible = std::max(fieldTop - margin, 0.0f);
+    float keepTopVisible = std::max(fieldTop - margin - top, 0.0f);
     // At most the keyboard's height and room for the field: enough for a
     // field at the very bottom of the screen to clear it.
     float most = screenHeight - priv->keyboardTop + margin + (fieldBottom - fieldTop);
@@ -479,8 +489,8 @@ bool wpeDisplayPS5RequestText(WPEDisplayPS5* display, const char* title, const c
     // it would cover the field being typed into, the page is drawn higher
     // (PS5Renderer::setKeyboardLift) until it closes: no scrolling, so a
     // field at the end of a page or in a fixed box rises too, and the page
-    // never sees it. The view fills the screen at scale 1; its coordinates
-    // scale to the screen's. The keyboard's size comes from the system
+    // never sees it. The view fills the screen below the application's bar
+    // at scale 1. The keyboard's size comes from the system
     // (1920x1080 coordinates), else a guess of 45% of the screen.
     const float screenHeight = PS5Renderer::singleton().height();
     const float toScreen = screenHeight / 1080.0f;
@@ -593,23 +603,35 @@ static double stickValue(uint8_t raw)
     return (v < 0 ? -1 : 1) * x * x; // quadratic: fine control near the centre
 }
 
-// Moves the page's pointer by (dx, dy) view pixels and shows it.
+// Moves the page's pointer by (dx, dy) view pixels and shows it. It also
+// goes up over the application's bar above the page (y < 0, down to
+// -PS5Renderer::pageTop()): the page then sees it leave (one move above
+// its top), and the application's UI pointer callback hears where it is,
+// in screen coordinates, while it is there and once as it comes back.
 static void movePointer(WPEDisplayPS5* display, WPEView* view, double dx, double dy, double t)
 {
     auto* priv = display->priv;
     int width = wpe_view_get_width(view), height = wpe_view_get_height(view);
+    const int top = PS5Renderer::singleton().pageTop();
     bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
     if (!pointerVisible && priv->pointerX == 0 && priv->pointerY == 0) {
         priv->pointerX = width / 2.0;
         priv->pointerY = height / 2.0;
     }
+    const bool wasOverBar = priv->pointerY < 0;
     priv->pointerX = std::fmin(std::fmax(priv->pointerX + dx, 0), width - 1);
-    priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, 0), height - 1);
+    // Not over the bar while a click holds the page's button (a drag).
+    priv->pointerY = std::fmin(std::fmax(priv->pointerY + dy, priv->pointerDown ? 0 : -top), height - 1);
     priv->pointerMovedAt = t;
-    auto modifiers = priv->pointerDown ? WPE_MODIFIER_POINTER_BUTTON1 : static_cast<WPEModifiers>(0);
-    GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
-        eventTime(), modifiers, priv->pointerX, priv->pointerY, dx, dy));
-    wpe_view_event(view, event.get());
+    const bool overBar = priv->pointerY < 0;
+    if (!overBar || !wasOverBar) {
+        auto modifiers = priv->pointerDown ? WPE_MODIFIER_POINTER_BUTTON1 : static_cast<WPEModifiers>(0);
+        GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
+            eventTime(), modifiers, priv->pointerX, overBar ? -1 : priv->pointerY, dx, dy));
+        wpe_view_event(view, event.get());
+    }
+    if ((overBar || wasOverBar) && priv->uiPointerCallback)
+        priv->uiPointerCallback(display, priv->pointerX, priv->pointerY + top, 0, priv->uiPointerCallbackData);
     wpeDisplayPS5ScheduleRedraw(display);
 }
 
@@ -694,7 +716,7 @@ static bool touchPointer(WPEDisplayPS5* display, WPEView* view, const TouchMove&
     auto* priv = display->priv;
     bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
     double px = pointerVisible ? priv->pointerX : width / 2.0;
-    double py = pointerVisible ? priv->pointerY : wpe_view_get_height(view) / 2.0;
+    double py = pointerVisible ? std::fmax(priv->pointerY, 0) : wpe_view_get_height(view) / 2.0;
     const double k = 0.5 * width / touchpadWidth; // WebKit multiplies precise deltas by 2.5
     GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
         static_cast<WPEModifiers>(0), move.dx * k, move.dy * k, TRUE, FALSE, px, py));
@@ -739,7 +761,7 @@ static void stickScroll(WPEDisplayPS5* display, WPEView* view, double rx, double
     auto* priv = display->priv;
     const double speed = 14.0; // WebKit multiplies precise deltas by 2.5
     double px = pointerVisible ? priv->pointerX : wpe_view_get_width(view) / 2.0;
-    double py = pointerVisible ? priv->pointerY : wpe_view_get_height(view) / 2.0;
+    double py = pointerVisible ? std::fmax(priv->pointerY, 0) : wpe_view_get_height(view) / 2.0;
     GRefPtr<WPEEvent> event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
         static_cast<WPEModifiers>(0), -rx * speed, -ry * speed, TRUE, FALSE, px, py));
     wpe_view_event(view, event.get());
@@ -957,6 +979,26 @@ static void padScrollTestInit()
         test.delay, test.secs, test.rx, test.ry, test.upry >= 0 ? test.upry : test.ry, test.px, test.py, test.hold, test.pause, test.shots, test.rest);
 }
 
+// The test's stick at time t (the values after padTick's curve); false
+// while it is still. Also read by the pad's stall thread (padStallThread).
+static bool padScrollTestStick(double t, double* rx, double* ry)
+{
+    auto& test = s_padScrollTest;
+    double cycle = 2 * test.secs + test.hold + test.pause;
+    double at = t - test.start;
+    if (!test.on || !test.start || at < 0 || cycle <= 0)
+        return false;
+    double phase = std::fmod(at, cycle);
+    if ((phase >= test.secs && phase < test.secs + test.hold) || phase >= 2 * test.secs + test.hold)
+        return false;
+    bool down = phase < test.secs;
+    double base = test.ry > 0 ? test.ry : test.rx; // upry scales the up half of either axis
+    double upScale = test.upry >= 0 && base > 0 ? test.upry / base : 1;
+    *ry = down ? test.ry : -test.ry * upScale;
+    *rx = down ? test.rx : -test.rx * upScale;
+    return *rx || *ry;
+}
+
 static void padScrollTestTick(WPEDisplayPS5* display)
 {
     auto& test = s_padScrollTest;
@@ -986,11 +1028,8 @@ static void padScrollTestTick(WPEDisplayPS5* display)
         return;
     }
     bool down = phase < test.secs;
-    double base = test.ry > 0 ? test.ry : test.rx; // upry scales the up half of either axis
-    double upScale = test.upry >= 0 && base > 0 ? test.upry / base : 1;
-    double ry = down ? test.ry : -test.ry * upScale;
-    double rx = down ? test.rx : -test.rx * upScale;
-    if (!down && !ry && !rx)
+    double rx, ry;
+    if (!padScrollTestStick(t, &rx, &ry))
         return; // still in the up half (upry=0)
     const double speed = 14.0; // as padTick
     double x = wpe_view_get_width(view) * test.px, y = wpe_view_get_height(view) * test.py;
@@ -1007,6 +1046,83 @@ static void padScrollTestTick(WPEDisplayPS5* display)
             snprintf(path, sizeof path, "/data/ps5webkit/shots/pad-%03u-%s.ppm", ++test.shotCount, down ? "down" : "up");
             wpe_display_ps5_capture_screen(display, path);
         }
+    }
+}
+
+// The right stick while the main thread is stuck. Pages in the title run
+// their scripts, style and layout on the title's main thread, which also
+// runs padTick: while a page keeps it busy (a feed adding posts, 0.3-1.2 s
+// at a time) no stick event reached the scrolling tree and the page stopped
+// dead, where a page in a payload kept scrolling into what was already
+// painted. This thread wakes every pad interval; once padTick has not run
+// for 50 ms and its last run was on a page with the stick scrolling it, it
+// reads the pad itself and hands the stick's delta, as padTick's stickScroll
+// would send it, to the page's scrolling tree on the render thread
+// (ps5wk_title_stall_scroll, WebKit: only while the stick was scrolling that
+// page frame-locked within the last second; clamped at the painted edge
+// there). Nothing else of the pad is read here; padTick goes on as before
+// when the main thread is back. One log line per stall it scrolled in.
+extern "C" bool ps5wk_title_stall_scroll(double wpeDeltaX, double wpeDeltaY) __attribute__((weak));
+
+static void* padStallThread(void* data)
+{
+    auto* display = static_cast<WPEDisplayPS5*>(data);
+    auto* priv = display->priv;
+    double lastSent = 0, stallFrom = 0;
+    unsigned events = 0;
+    double pixels = 0;
+    for (;;) {
+        g_usleep(padIntervalMS * 1000);
+        double t = nowSeconds();
+        double tickAt = priv->padTickAt.load(std::memory_order_relaxed);
+        if (t - tickAt < 0.05 || !priv->padTickScrolls.load(std::memory_order_relaxed)) {
+            if (events)
+                PS5_LOG("pad: the main thread was stuck %.0f ms; the stick scrolled the page from the pad's thread meanwhile (%u steps, %.0f px)",
+                    (tickAt - stallFrom) * 1000, events, pixels);
+            events = 0;
+            pixels = 0;
+            lastSent = 0;
+            continue;
+        }
+        if (!events && !lastSent)
+            stallFrom = tickAt;
+        double rx = 0, ry = 0;
+        if (s_padScrollTest.on) {
+            if (!padScrollTestStick(t, &rx, &ry))
+                rx = ry = 0;
+        } else {
+            PS5PadData pad { };
+            g_mutex_lock(&priv->padReadLock);
+            int readResult = priv->pad >= 0 ? scePadReadState(priv->pad, &pad) : -1;
+            g_mutex_unlock(&priv->padReadLock);
+            if (readResult || (pad.buttons & PS5_PAD_INTERCEPTED))
+                continue;
+            rx = stickValue(pad.sticks[2]);
+            ry = stickValue(pad.sticks[3]);
+        }
+        double since = lastSent ? t - lastSent : t - tickAt - 0.05 + padIntervalMS / 1000.0;
+        lastSent = t;
+        if (!rx && !ry)
+            continue;
+        // padTick sends 14 px per pad interval at full deflection.
+        double scale = std::clamp(since / (padIntervalMS / 1000.0), 0.0, 6.0);
+        double dx = -rx * 14.0 * scale, dy = -ry * 14.0 * scale;
+        if (ps5wk_title_stall_scroll(dx, dy)) {
+            events++;
+            pixels += std::hypot(dx, dy) * 2.5;
+        }
+    }
+    return nullptr;
+}
+
+static void startPadStallThread(WPEDisplayPS5* display)
+{
+    if (!ps5wk_title_stall_scroll || display->priv->pad < 0)
+        return;
+    pthread_t thread;
+    if (!pthread_create(&thread, nullptr, padStallThread, display)) {
+        pthread_detach(thread);
+        PS5_LOG("pad: the stick also scrolls from the pad's own thread while the main thread is stuck");
     }
 }
 
@@ -1032,7 +1148,7 @@ static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, const TouchMo
     }
 
     int width = PS5Renderer::singleton().width(), height = PS5Renderer::singleton().height();
-    if (priv->activeView) {
+    if (priv->activeView && !priv->uiMode) { // the UI's pointer: the whole screen
         width = wpe_view_get_width(priv->activeView);
         height = wpe_view_get_height(priv->activeView);
     }
@@ -1113,6 +1229,8 @@ static void padSystemState(WPEDisplayPS5* display, int readResult, const PS5PadD
 static void padTick(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
+    priv->padTickAt.store(nowSeconds(), std::memory_order_relaxed);
+    priv->padTickScrolls.store(false, std::memory_order_relaxed);
     pollTextDialog(display);
     padScrollTestTick(display);
 
@@ -1121,7 +1239,9 @@ static void padTick(WPEDisplayPS5* display)
         return;
 
     PS5PadData data { };
+    g_mutex_lock(&priv->padReadLock);
     int readResult = scePadReadState(priv->pad, &data);
+    g_mutex_unlock(&priv->padReadLock);
     padSystemState(display, readResult, data);
     if (readResult)
         return;
@@ -1251,6 +1371,7 @@ static void padTick(WPEDisplayPS5* display)
     if (touchPointer(display, view, touch, t))
         pointerVisible = true;
     stickScroll(display, view, stickValue(data.sticks[2]), stickValue(data.sticks[3]), pointerVisible);
+    priv->padTickScrolls.store(!priv->pendingText, std::memory_order_relaxed);
 
     // Cross: click when the pointer is shown, otherwise Return. The
     // touchpad's press: always a click at the pointer. Whichever went down
@@ -1261,6 +1382,10 @@ static void padTick(WPEDisplayPS5* display)
         priv->buttons &= ~extra;
         pressed &= ~extra;
     }
+    // Over the application's bar the button handler had the click; whatever
+    // it left is not the page's.
+    if (priv->pointerY < 0 && pointerVisible)
+        pressed &= ~clickButtons;
     if (pressed & PS5_PAD_TOUCHPAD)
         pointerClickDown(display, view, PS5_PAD_TOUCHPAD, t);
     else if (pressed & PS5_PAD_CROSS) {
@@ -1389,6 +1514,7 @@ static gboolean wpeDisplayPS5Connect(WPEDisplay* display, GError** error)
 
     openPad(displayPS5);
     padScrollTestInit();
+    startPadStallThread(displayPS5);
     // The system keyboard: loaded at run time by the title (PS5Sce.h).
     if (ps5wk_title_load_ime && !ps5wk_title_load_ime(&priv->ime)) {
         int rc = priv->ime.commonDialogInitialize ? priv->ime.commonDialogInitialize() : -1;
@@ -1592,6 +1718,13 @@ void wpe_display_ps5_set_ui_mode(WPEDisplayPS5* display, gboolean enabled)
     if (priv->uiMode == !!enabled)
         return;
     priv->uiMode = enabled;
+    // The pointer stays where it is on the screen: the UI's coordinates are
+    // the screen's, the page's start below the application's bar.
+    if (int top = PS5Renderer::singleton().pageTop(); top && (priv->pointerX || priv->pointerY)) {
+        priv->pointerY += enabled ? top : -top;
+        if (!enabled && priv->activeView)
+            priv->pointerY = std::fmin(std::fmax(priv->pointerY, -top), wpe_view_get_height(priv->activeView) - 1);
+    }
     priv->ignoredButtons |= priv->buttons;
     priv->buttons = 0;
     priv->swallowedButtons = 0;
@@ -1742,6 +1875,28 @@ bool wpeDisplayPS5Rumble(WPEDisplayPS5* display, double strong, double weak)
         PS5_LOG("gamepad: rumble %u/%u -> 0x%x", motors[0], motors[1], static_cast<unsigned>(rc));
     }
     return !rc;
+}
+
+void wpe_display_ps5_set_page_top(WPEDisplayPS5* display, int pixels)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    auto* priv = display->priv;
+    auto& renderer = PS5Renderer::singleton();
+    int before = renderer.pageTop();
+    renderer.setPageTop(pixels);
+    if (renderer.pageTop() == before)
+        return;
+    PS5_LOG("page area: %d px below the top (was %d)", renderer.pageTop(), before);
+    wpeViewPS5ResizeAll();
+    if (!priv->uiMode && priv->activeView && (priv->pointerX || priv->pointerY))
+        priv->pointerY = std::fmin(std::fmax(priv->pointerY, -renderer.pageTop()), wpe_view_get_height(priv->activeView) - 1);
+    wpeDisplayPS5ScheduleRedraw(display);
+}
+
+int wpe_display_ps5_get_page_top(WPEDisplayPS5* display)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), 0);
+    return PS5Renderer::singleton().pageTop();
 }
 
 gboolean wpe_display_ps5_get_ui_mode(WPEDisplayPS5* display)

@@ -19,10 +19,17 @@
  * The UI is drawn by the title (browserdraw.c, wpe_display_ps5_set_ui_layer, a CPU canvas
  * shown over the page by PS5Renderer, the same with GPU compositing on or
  * off, not in the headset):
- *   - while a page loads, a bar at the top with its title, address and
- *     progress, gone 1.5 s after the load ends
+ *   - the bar above the page (the page is laid out below it,
+ *     wpe_display_ps5_set_page_top): the menu's bar, its buttons picked
+ *     with the pointer (it goes up over the bar) and X or the touchpad
+ *   - full screen (the menu's full screen button, kept; also by itself in
+ *     gamepad mode and while a page's element is in full screen, e.g. a
+ *     video): the page fills the screen; while a page loads, a bar at the
+ *     top with its title, address and progress, gone 1.5 s after the load
+ *     ends
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
- *     Stop, Home, the address, Bookmark, New tab, Settings) over a panel with four
+ *     Stop, Home, the address, Bookmark, Full screen, Gamepad mode, Private
+ *     browsing, Safer browsing, New tab, Settings) over a panel with four
  *     lists: Tabs, Bookmarks, History, Downloads (downloads.c: X pauses,
  *     resumes or retries, Square cancels or deletes, R2 shows the details). The pad is in UI mode while it is
  *     open (wpe_display_ps5_set_ui_mode): D-pad moves the focus, X
@@ -58,6 +65,7 @@
 #define DATA_DIR "/data/ps5webkit"
 #define NO_RESTORE_FLAG DATA_DIR "/no-session-restore"
 #define NO_LOAD_BAR_FLAG DATA_DIR "/no-load-bar"
+#define FULL_SCREEN_FLAG DATA_DIR "/full-screen" /* full screen chosen in the menu (kept) */
 #define SCROLL_WORLD "ps5wk"
 
 /* ps5browser.c */
@@ -441,8 +449,15 @@ static void logLiveTabs(const char* why)
  * the ad blocker) and the UI follow the active tab's view. */
 void ps5wk_set_active_web_view(WebKitWebView* view);
 
+static void updateLayout(void);
+static gboolean videoFullScreen; /* the shown page's element is in full screen */
+
 static void showView(WebKitWebView* view)
 {
+    if (videoFullScreen && view != webView) {
+        videoFullScreen = FALSE;
+        updateLayout();
+    }
     webView = view;
     wpe_display_ps5_set_active_view(display, webkit_web_view_get_wpe_view(view));
     ps5wk_set_active_web_view(view);
@@ -1090,6 +1105,9 @@ static guint downloadsRedrawTimer;
 static gint64 lastDownloadsRedraw;
 static int screenW = 1920, screenH = 1080;
 static gint64 lastBarDraw;
+static int fullScreenChosen = -1; /* FULL_SCREEN_FLAG; -1: not read yet */
+static int barHover = -1;   /* the bar's button under the pointer (menu closed), -1: none */
+static guint barHoverTimer; /* clears it once the pointer hides or leaves */
 /* What drawing the menu costs (main thread), logged when it closes. */
 static unsigned drawCount;
 static gint64 drawTotalUS, drawMaxUS;
@@ -1190,6 +1208,44 @@ static void listRow(int row, BUIRow* r, void* data)
     }
 }
 
+static gboolean fullScreenChoice(void)
+{
+    if (fullScreenChosen < 0) {
+        int fd = open(FULL_SCREEN_FLAG, O_RDONLY);
+        fullScreenChosen = fd >= 0;
+        if (fd >= 0)
+            close(fd);
+    }
+    return fullScreenChosen;
+}
+
+/* Full screen without the choice: why, else NULL. */
+static const char* fullScreenWhy(void)
+{
+    if (videoFullScreen)
+        return "the page";
+    if (ps5wk_gamepad_active())
+        return "gamepad mode";
+    return NULL;
+}
+
+static gboolean fullScreenNow(void)
+{
+    return fullScreenChoice() || fullScreenWhy();
+}
+
+/* The bar above the page (VR: the TV shows a card). */
+static gboolean stripShown(void)
+{
+    return !fullScreenNow() && !ps5wk_vr_active();
+}
+
+/* Something of the UI on screen that shows the page's state. */
+static gboolean uiShown(void)
+{
+    return menuOpen || barShown || stripShown();
+}
+
 static void fillState(BUIState* s)
 {
     memset(s, 0, sizeof *s);
@@ -1204,6 +1260,8 @@ static void fillState(BUIState* s)
     s->gamepadOn = ps5wk_gamepad_active();
     s->privateMode = privateMode;
     s->saferOn = ps5wk_safer_browsing();
+    s->fullScreen = fullScreenChoice();
+    s->fullScreenWhy = s->fullScreen ? NULL : fullScreenWhy();
     s->title = shownTitle();
     s->uri = shownURI();
     s->tabCount = userTabCount();
@@ -1281,9 +1339,27 @@ static void redrawNow(void)
         wpe_display_ps5_canvas_free(menuCanvas);
         menuCanvas = NULL;
     }
+    /* the bar above the page (its buttons under the pointer), or (full
+     * screen) the bar while loading */
+    const int barHeight = bui_bar_height();
+    if (stripShown()) {
+        if (!barCanvas)
+            barCanvas = wpe_display_ps5_canvas_new(screenW, barHeight);
+        if (!barCanvas)
+            return;
+        BUIState state;
+        fillState(&state);
+        state.zone = ZONE_TOOLBAR;
+        state.toolbarFocus = barHover;
+        wpe_display_ps5_canvas_clear(barCanvas, 0);
+        bui_draw_bar(barCanvas, &state, TRUE);
+        wpe_display_ps5_set_ui_layer(display, barCanvas, 0, 0);
+        lastBarDraw = g_get_monotonic_time();
+        return;
+    }
     if (barShown && !ps5wk_vr_active()) {
         if (!barCanvas)
-            barCanvas = wpe_display_ps5_canvas_new(screenW, bui_bar_height());
+            barCanvas = wpe_display_ps5_canvas_new(screenW, barHeight);
         if (!barCanvas)
             return;
         BUIState state;
@@ -1326,7 +1402,7 @@ static gboolean barRedrawDue(gpointer data)
 
 static void progressRedraw(void)
 {
-    if (redrawSource || (!menuOpen && !barShown))
+    if (redrawSource || !uiShown())
         return;
     gint64 since = (g_get_monotonic_time() - lastBarDraw) / 1000;
     if (menuOpen || since >= 80)
@@ -1376,6 +1452,61 @@ static void hideBarSoon(void)
         barHideTimer = g_timeout_add(BAR_HIDE_MS, barHide, NULL);
 }
 
+/* The page below the address bar, or (full screen) the whole screen. */
+static void updateLayout(void)
+{
+    if (!display)
+        return;
+    const int top = fullScreenNow() ? 0 : bui_bar_height();
+    if (top != wpe_display_ps5_get_page_top(display)) {
+        const char* why = fullScreenWhy();
+        spike_log("browser: %s", top ? "the bar above the page" : fullScreenChoice() ? "full screen" : why && !strcmp(why, "gamepad mode") ? "full screen for gamepad mode" : "full screen for the page");
+        wpe_display_ps5_set_page_top(display, top);
+    }
+    redraw();
+}
+
+void ps5wk_browser_layout_changed(void)
+{
+    updateLayout();
+}
+
+static void setFullScreen(gboolean on)
+{
+    fullScreenChosen = on;
+    if (on) {
+        int fd = open(FULL_SCREEN_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0)
+            close(fd);
+    } else
+        unlink(FULL_SCREEN_FLAG);
+    updateLayout();
+    wpe_display_ps5_show_message(display, on ? "Full screen · press Options for the menu" : "The bar is back above the page", on ? 3 : 1.5);
+}
+
+/* A page's element (a video, a game's canvas) asks for full screen: the
+ * address bar goes while it is (WebKit then does the rest: the toplevel is
+ * always full screen). */
+static gboolean onEnterFullScreen(WebKitWebView* view, gpointer data)
+{
+    (void)data;
+    if (view == webView && !videoFullScreen) {
+        videoFullScreen = TRUE;
+        updateLayout();
+    }
+    return FALSE;
+}
+
+static gboolean onLeaveFullScreen(WebKitWebView* view, gpointer data)
+{
+    (void)data;
+    if (view == webView && videoFullScreen) {
+        videoFullScreen = FALSE;
+        updateLayout();
+    }
+    return FALSE;
+}
+
 /* downloads.c: progress or a state changed. The menu (and the bar's ring)
  * redraw at most 4 times a second for progress. */
 static gboolean downloadsRedrawDue(gpointer data)
@@ -1389,7 +1520,7 @@ static gboolean downloadsRedrawDue(gpointer data)
 
 void ps5wk_browser_downloads_changed(void)
 {
-    if (!tabs || (!menuOpen && !barShown) || downloadsRedrawTimer)
+    if (!tabs || !uiShown() || downloadsRedrawTimer)
         return;
     gint64 since = (g_get_monotonic_time() - lastDownloadsRedraw) / 1000;
     if (since >= 250)
@@ -1410,6 +1541,7 @@ static void setMenu(gboolean open)
     if (menuOpen == open)
         return;
     menuOpen = open;
+    barHover = -1;
     wpe_display_ps5_set_ui_mode(display, open);
     if (open) {
         zone = ZONE_TOOLBAR;
@@ -1527,6 +1659,10 @@ static void toolbarActivate(int index)
     case TB_NEWTAB:
         if (openInNewTab(NULL))
             setMenu(FALSE);
+        break;
+    case TB_FULLSCREEN:
+        setMenu(FALSE);
+        setFullScreen(!fullScreenChoice());
         break;
     case TB_GAMEPAD:
         setMenu(FALSE);
@@ -1710,12 +1846,68 @@ static gboolean focusHot(const BUIHot* hot)
     return TRUE;
 }
 
+/* The bar's button under the page's pointer (screen coordinates), -1: none. */
+static int barButtonAt(double x, double y)
+{
+    const BUIHot* hot = y < bui_bar_height() ? hotAt(x, y) : NULL;
+    return hot && hot->kind == HOT_TOOLBAR ? hot->index : -1;
+}
+
+static gboolean barHoverCheck(gpointer data)
+{
+    (void)data;
+    double x, y;
+    gboolean shown = wpe_display_ps5_get_pointer(display, &x, &y);
+    if (!menuOpen && stripShown() && shown && y < 0)
+        return G_SOURCE_CONTINUE;
+    barHoverTimer = 0;
+    if (barHover >= 0) {
+        barHover = -1;
+        redraw();
+    }
+    return G_SOURCE_REMOVE;
+}
+
+/* The page's pointer over the bar above the page (menu closed). */
+static void barPointer(double x, double y)
+{
+    int hover = stripShown() ? barButtonAt(x, y) : -1;
+    if (hover != barHover) {
+        barHover = hover;
+        redraw();
+    }
+    if (barHover >= 0 && !barHoverTimer)
+        barHoverTimer = g_timeout_add(250, barHoverCheck, NULL);
+}
+
+/* X or the touchpad's press with the page's pointer over the bar: its
+ * button. TRUE: taken (the page never sees it). */
+static gboolean barClick(guint32 pressed)
+{
+    if (!(pressed & (WPE_DISPLAY_PS5_BUTTON_CROSS | WPE_DISPLAY_PS5_BUTTON_TOUCHPAD)) || !stripShown())
+        return FALSE;
+    double x, y;
+    if (!wpe_display_ps5_get_pointer(display, &x, &y) || y >= 0)
+        return FALSE;
+    int button = barButtonAt(x, y + wpe_display_ps5_get_page_top(display));
+    if (button >= 0) {
+        spike_log("browser: bar button %d picked with the pointer", button);
+        barHover = -1;
+        toolbarActivate(button);
+        redraw();
+    }
+    return TRUE;
+}
+
 static void onUIPointer(WPEDisplayPS5* d, double x, double y, double scrollY, gpointer data)
 {
     (void)d;
     (void)data;
-    if (!menuOpen)
+    if (!menuOpen) {
+        if (!scrollY)
+            barPointer(x, y);
         return;
+    }
     if (scrollY) {
         scrollAccumulator += scrollY;
         int steps = (int)(scrollAccumulator / ROW_H * 2);
@@ -1872,6 +2064,8 @@ static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
         menuButtons(pressed);
         return TRUE;
     }
+    if (barClick(pressed))
+        return TRUE;
     if (ps5wk_gamepad_buttons(pressed))
         return TRUE;
     if (ps5wk_vr_buttons(pressed))
@@ -2031,7 +2225,7 @@ static void onTitleChanged(GObject* object, GParamSpec* pspec, gpointer data)
         return;
     if (!privateMode)
         ps5wk_history_set_title(webkit_web_view_get_uri(view), title);
-    if (menuOpen || barShown)
+    if (uiShown())
         redraw();
 }
 
@@ -2052,7 +2246,7 @@ static void onURIChanged(GObject* object, GParamSpec* pspec, gpointer data)
     if (!privateMode)
         ps5wk_history_visit(uri, webkit_web_view_get_title(view), TRUE);
     scheduleSessionSave();
-    if (menuOpen || barShown)
+    if (uiShown())
         redraw();
 }
 
@@ -2224,6 +2418,8 @@ static void connectView(WebKitWebView* view)
     g_signal_connect(view, "notify::is-loading", G_CALLBACK(onProgress), &tabs);
     g_signal_connect(view, "create", G_CALLBACK(onCreate), &tabs);
     g_signal_connect(view, "decide-policy", G_CALLBACK(onDecidePolicy), &tabs);
+    g_signal_connect(view, "enter-fullscreen", G_CALLBACK(onEnterFullScreen), &tabs);
+    g_signal_connect(view, "leave-fullscreen", G_CALLBACK(onLeaveFullScreen), &tabs);
     if (view != webView)
         ps5wk_connect_web_view(view);
 }
@@ -2255,11 +2451,12 @@ void ps5wk_browser_init(WPEDisplay* d, WebKitWebView* view)
     WPEView* wpeView = webkit_web_view_get_wpe_view(view);
     if (wpeView && wpe_view_get_width(wpeView) > 0) {
         screenW = wpe_view_get_width(wpeView);
-        screenH = wpe_view_get_height(wpeView);
+        screenH = wpe_view_get_height(wpeView) + wpe_display_ps5_get_page_top(display);
     }
     wpe_display_ps5_set_button_handler(display, onButtons, NULL);
     wpe_display_ps5_set_ui_pointer_callback(display, onUIPointer, NULL);
     connectView(view);
+    updateLayout();
     normalSession = webkit_web_view_get_network_session(view);
 }
 
@@ -2353,10 +2550,11 @@ static char* stateJSON(void)
             tab->scrollX, tab->scrollY, tab->state ? g_bytes_get_size(tab->state) : (size_t)0);
     }
     WebKitBackForwardList* list = webkit_web_view_get_back_forward_list(webView);
-    g_string_append_printf(out, "],\"private\":%s,\"active\":%d,\"maxTabs\":%d,\"menu\":%s,\"bar\":%s,\"section\":%d,\"zone\":%d,\"toolbarFocus\":%d,"
+    g_string_append_printf(out, "],\"private\":%s,\"active\":%d,\"maxTabs\":%d,\"menu\":%s,\"bar\":%s,\"fullScreen\":%s,\"pageTop\":%d,\"section\":%d,\"zone\":%d,\"toolbarFocus\":%d,"
         "\"listFocus\":%d,\"canGoBack\":%s,\"canGoForward\":%s,\"backForwardLength\":%u,\"loading\":%s,\"progress\":%.2f,"
         "\"liveLimit\":%u,\"liveAllowed\":%u,\"liveCount\":%u,\"memoryTight\":%s,\"bookmarks\":",
-        privateMode ? "true" : "false", active, MAX_TABS, menuOpen ? "true" : "false", barShown ? "true" : "false", section, zone, toolbarFocus, listFocus,
+        privateMode ? "true" : "false", active, MAX_TABS, menuOpen ? "true" : "false", barShown ? "true" : "false",
+        fullScreenNow() ? "true" : "false", wpe_display_ps5_get_page_top(display), section, zone, toolbarFocus, listFocus,
         canGoBack() ? "true" : "false", webkit_web_view_can_go_forward(webView) ? "true" : "false",
         webkit_back_forward_list_get_length(list), webkit_web_view_is_loading(webView) ? "true" : "false",
         webkit_web_view_get_estimated_load_progress(webView), liveLimit, liveAllowed(), liveCount(), memoryTight ? "true" : "false");
@@ -2441,7 +2639,7 @@ static char* apiRun(ApiCall* call, int* status)
         g_free(left);
         g_free(right);
         g_free(remove);
-        if (menuOpen || barShown)
+        if (uiShown())
             redraw();
         return reply;
     }

@@ -46,6 +46,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "viewinvr.h"
+#include "browser.h"
 #include "browserdraw.h"
 #include "vrlayout.h"
 
@@ -911,6 +912,7 @@ static void onVRState(WPEDisplayPS5* display, gboolean active, const char* messa
     }
     vrStarting = FALSE;
     vrOn = active;
+    ps5wk_browser_layout_changed(); /* the address bar: not while the TV shows the card */
     if (active) {
         SPIKE_PASS("vr", "headset shows the video (%s)", message && *message ? message : "up");
         setMessage(vrShown, 6);

@@ -1,6 +1,7 @@
 /*
- * Drawing the browser's own UI (browserui.c): the address bar (also the
- * loading bar) and the Options menu, into a WPEDisplayPS5Canvas. Only
+ * Drawing the browser's own UI (browserui.c): the bar (above the page, also
+ * the loading bar in full screen) and the Options menu, into a
+ * WPEDisplayPS5Canvas. Only
  * drawing: browserui.c fills a BUIState from the tabs, bookmarks, history
  * and the menu's focus, and keeps the pad and the menu's logic. Kept apart
  * so the same code renders on the Mac (apps/title/uipreview) for design
@@ -11,7 +12,7 @@
 #include <glib.h>
 #include <wpe/ps5/wpe-ps5.h>
 
-enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_STAR, TB_GAMEPAD, TB_PRIVATE, TB_SAFER, TB_NEWTAB, TB_SETTINGS, TB_COUNT };
+enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_STAR, TB_FULLSCREEN, TB_GAMEPAD, TB_PRIVATE, TB_SAFER, TB_NEWTAB, TB_SETTINGS, TB_COUNT };
 enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_DOWNLOADS, SEC_COUNT };
 enum { ZONE_TOOLBAR, ZONE_LIST };
 enum { HOT_TOOLBAR, HOT_SECTION, HOT_ROW };
@@ -60,6 +61,10 @@ typedef struct {
     gboolean gamepadOn, privateMode;
     /* Safer browsing on (no JIT, WebAssembly or WebGL): the shield filled */
     gboolean saferOn;
+    /* full screen chosen (the address bar hidden); fullScreenWhy: why the
+     * page is in full screen without it ("gamepad mode", "a video"), or NULL */
+    gboolean fullScreen;
+    const char* fullScreenWhy;
     const char* title;
     const char* uri;
     unsigned tabCount, maxTabs;
@@ -89,7 +94,8 @@ int bui_row_height(void);
 /* How many rows the menu's list shows. */
 int bui_visible_rows(int screenH);
 
-/* The bar, @interactive: in the menu (focus, pointer targets), else the
+/* The bar, @interactive: in the menu or above the page (focus: zone
+ * ZONE_TOOLBAR and toolbarFocus, -1 none; pointer targets), else the
  * loading bar. The canvas is bui_bar_height() high (or the menu's). */
 void bui_draw_bar(WPEDisplayPS5Canvas* canvas, const BUIState* state, gboolean interactive);
 /* The whole menu on a screen-sized canvas: dimmed page, bar, lists. */

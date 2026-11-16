@@ -275,6 +275,19 @@ WPE_API void                 wpe_display_ps5_set_ui_layer      (WPEDisplayPS5   
 WPE_API void                 wpe_display_ps5_set_ui_mode       (WPEDisplayPS5       *display,
                                                                 gboolean             enabled);
 WPE_API gboolean             wpe_display_ps5_get_ui_mode       (WPEDisplayPS5       *display);
+
+/* The page area: the page starts @pixels below the top of the screen (the
+ * application's bar above it, drawn in the UI layer), and its views are
+ * that much shorter (WebKit lays the page out again). 0: the page fills the
+ * screen. The page's pointer, hole-punch videos and the on-screen keyboard's
+ * lift follow. The page's pointer also goes up over the bar: there its y
+ * (wpe_display_ps5_get_pointer, view coordinates) is negative, the UI
+ * pointer callback hears its moves (screen coordinates), and a click (X,
+ * the touchpad's press) goes to the button handler only, never the page.
+ * Main thread. */
+WPE_API void                 wpe_display_ps5_set_page_top      (WPEDisplayPS5       *display,
+                                                                int                  pixels);
+WPE_API int                  wpe_display_ps5_get_page_top      (WPEDisplayPS5       *display);
 /* Several views (the browser's live tabs): only the active view is mapped
  * (page visible: WebKit paints it, runs its timers and rAF at full rate),
  * has the keyboard focus, is shown and gets the pad; the others are

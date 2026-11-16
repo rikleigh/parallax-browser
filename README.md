@@ -66,12 +66,18 @@ play the video on a page in the PS VR2 headset.
 | R2 | Zoom in |
 | Triangle | Keyboard |
 | Square | Reload |
-| Options | The menu, with the address bar, tabs, bookmarks, history and downloads |
+| Options | The menu, with the address field, tabs, bookmarks, history and downloads |
 | R3 | View in VR |
 | L3 | Home page |
 | L3 and R3 together | Performance overlay |
 
 To open Settings, press Options, then choose ⚙.
+
+The bar (Back, Forward, the address, Bookmark, Settings and the rest) stays
+above the page. Move the pointer up onto a button and press X to use it
+without opening the menu. To hide the bar, choose the full screen button (the
+four corners). The browser remembers that choice. It also hides the bar by
+itself in gamepad mode and while a video is in full screen.
 
 | Button | In VR |
 | --- | --- |

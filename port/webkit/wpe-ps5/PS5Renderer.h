@@ -109,6 +109,11 @@ public:
     // Draw the page this many pixels higher (the on-screen keyboard is up
     // and would cover the field being typed into); 0 puts it back. Any thread.
     void setKeyboardLift(int pixels);
+    // The page starts this many pixels down (the application's address bar
+    // above it, drawn in the UI layer); its views are that much shorter
+    // (WPEViewPS5). 0: the page fills the screen. Any thread.
+    void setPageTop(int pixels);
+    int pageTop() const { return m_pageTop.load(std::memory_order_relaxed); }
 
     // Hardware decoding (PS5VideoDecoder's output buffers): a persistent,
     // coherent GL buffer made on the render thread (blocks until it is);
@@ -206,6 +211,7 @@ private:
     int m_width { 0 };
     int m_height { 0 };
     std::atomic<int> m_keyboardLift { 0 }; // see setKeyboardLift
+    std::atomic<int> m_pageTop { 0 }; // see setPageTop
 
     pthread_t m_thread { };
     GMutex m_lock;

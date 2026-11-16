@@ -597,6 +597,13 @@ void PS5Renderer::setKeyboardLift(int pixels)
         requestCompositorFrame();
 }
 
+void PS5Renderer::setPageTop(int pixels)
+{
+    pixels = std::clamp(pixels, 0, m_height / 2);
+    if (m_pageTop.exchange(pixels) != pixels)
+        requestCompositorFrame();
+}
+
 void PS5Renderer::requestCompositorFrame()
 {
     g_mutex_lock(&m_lock);
@@ -1309,17 +1316,23 @@ void PS5Renderer::drawScene()
         out[3] = static_cast<float>(1.0 - y / m_height * 2.0);
     };
 
-    // Where the page goes: scaled to fit, centred (normally 1:1). With a
+    // Where the page goes: below the application's bar (setPageTop), scaled
+    // to fit, centred (normally 1:1). A page as wide as the screen is drawn
+    // 1:1 from the top of its area: just after the bar comes or goes, the
+    // last frame at the old height stays until WebKit paints one at the new
+    // (cut at the bottom, or black there, for a frame or two). With a
     // composited scene, the scene texture is the page.
     const int contentWidth = m_sceneTexture ? m_sceneWidth : m_pageWidth;
     const int contentHeight = m_sceneTexture ? m_sceneHeight : m_pageHeight;
+    const int top = m_pageTop.load(std::memory_order_relaxed), areaHeight = m_height - top;
     double scale = 1, pageX = 0, pageY = 0, pageW = 0, pageH = 0;
     if (contentWidth > 0) {
-        scale = std::min(static_cast<double>(m_width) / contentWidth, static_cast<double>(m_height) / contentHeight);
+        if (contentWidth != m_width)
+            scale = std::min(static_cast<double>(m_width) / contentWidth, static_cast<double>(areaHeight) / contentHeight);
         pageW = contentWidth * scale;
         pageH = contentHeight * scale;
         pageX = (m_width - pageW) / 2;
-        pageY = (m_height - pageH) / 2;
+        pageY = top + (contentWidth != m_width ? (areaHeight - pageH) / 2 : 0);
         // Lifted above the on-screen keyboard (videos and the page together).
         pageY -= m_keyboardLift.load(std::memory_order_relaxed);
     }

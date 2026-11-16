@@ -35,6 +35,12 @@ bool wpeDisplayPS5ChoosesActiveView(WPEDisplayPS5*);
 // WPEViewPS5: the view became the active one (map, focus, next frame whole)
 // or stopped being it (focus out, unmap).
 void wpeViewPS5SetActive(WPEView*, bool active);
+// The size every page view has: the screen's width, its height less
+// PS5Renderer::pageTop() (the application's bar above the page).
+void wpeViewPS5PageSize(int* width, int* height);
+// Main thread: the page area changed size; every view (and its toplevel)
+// is resized to it.
+void wpeViewPS5ResizeAll(void);
 
 // Coalesced redraw (pointer moved, page updated).
 void wpeDisplayPS5ScheduleRedraw(WPEDisplayPS5*);

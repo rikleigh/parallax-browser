@@ -158,6 +158,9 @@ void ps5wk_browser_toggle_menu(void);
 gboolean ps5wk_browser_menu_open(void);
 /* Closes the menu (e.g. View in VR started, the browser winds down). */
 void ps5wk_browser_close_menu(void);
+/* Gamepad mode or View in VR changed: the address bar above the page, or
+ * full screen (browserui.c). */
+void ps5wk_browser_layout_changed(void);
 /* The session file now (wind-down). */
 void ps5wk_browser_save(void);
 /* The /browser API (link server thread); NULL path = not ours. Returns a

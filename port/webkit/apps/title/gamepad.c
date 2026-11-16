@@ -259,7 +259,10 @@ static void apply(gboolean announce)
         wpe_display_ps5_show_message(display, on ? "Gamepad mode on · hold Options to leave it" : "Gamepad mode off", on ? 4 : 2);
     if (on != modeOn)
         spike_log("gamepad: mode %s for %s", on ? "on" : "off", host ? host : "(no site)");
+    gboolean changed = on != modeOn;
     modeOn = on;
+    if (changed) /* full screen while it is on */
+        ps5wk_browser_layout_changed();
 }
 
 void ps5wk_gamepad_page(WebKitWebView* shown, const char* uri)

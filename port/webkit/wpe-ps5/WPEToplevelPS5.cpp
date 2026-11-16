@@ -27,7 +27,8 @@
  * WPEToplevelPS5:
  *
  * The PS5 [class@WPEPlatform.Toplevel]: always fullscreen on the TV, the size
- * of the EGL window surface. Resize requests are ignored.
+ * of the EGL window surface less the application's bar above the page
+ * (wpe_display_ps5_set_page_top). Resize requests are ignored.
  */
 struct _WPEToplevelPS5Private {
 };
@@ -38,9 +39,10 @@ static void wpeToplevelPS5Constructed(GObject* object)
     G_OBJECT_CLASS(wpe_toplevel_ps5_parent_class)->constructed(object);
 
     auto* toplevel = WPE_TOPLEVEL(object);
-    int width = PS5Renderer::singleton().width();
-    int height = PS5Renderer::singleton().height();
-    wpe_toplevel_resized(toplevel, width ? width : 1920, height ? height : 1080);
+    int width = 0;
+    int height = 0;
+    wpeViewPS5PageSize(&width, &height);
+    wpe_toplevel_resized(toplevel, width, height);
     wpe_toplevel_state_changed(toplevel, static_cast<WPEToplevelState>(WPE_TOPLEVEL_STATE_ACTIVE | WPE_TOPLEVEL_STATE_FULLSCREEN));
 }
 

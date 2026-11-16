@@ -216,6 +216,28 @@ static void shot(const char* name, WPEDisplayPS5Canvas* canvas)
     shotAt(name, canvas, 0, 0);
 }
 
+/* The bar above the page (menu closed): the page starts below it; the
+ * focus is the button under the pointer (toolbarFocus, -1: none). */
+static void barAboveShot(const char* name, BUIState* s)
+{
+    const int sh = bui_bar_height();
+    WPEDisplayPS5Canvas* canvas = wpe_display_ps5_canvas_new(W, sh);
+    wpe_display_ps5_canvas_clear(canvas, 0);
+    s->zone = ZONE_TOOLBAR;
+    bui_draw_bar(canvas, s, TRUE);
+    uint32_t* frame = malloc((size_t)W * H * 4);
+    memset(frame, 0, (size_t)W * sh * 4);
+    memcpy(frame + (size_t)W * sh, background, (size_t)W * (H - sh) * 4);
+    wpe_display_ps5_set_ui_layer((WPEDisplayPS5*)1, canvas, 0, 0);
+    over(frame, W, H, uipreview_layer, uipreview_layer_rect[0], uipreview_layer_rect[1], uipreview_layer_rect[2], uipreview_layer_rect[3], 0);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s.png", outDir, name);
+    savePNG(path, frame, W, H);
+    free(frame);
+    printf("  %s\n", path);
+    wpe_display_ps5_canvas_free(canvas);
+}
+
 static void menuShot(const char* name, BUIState* s)
 {
     WPEDisplayPS5Canvas* canvas = wpe_display_ps5_canvas_new(W, H);
@@ -321,6 +343,21 @@ int main(int argc, char** argv)
     menuShot("menu-toolbar-private", &s);
 
     s = baseState();
+    s.toolbarFocus = TB_FULLSCREEN;
+    menuShot("menu-toolbar-fullscreen-off", &s);
+
+    s = baseState();
+    s.toolbarFocus = TB_FULLSCREEN;
+    s.fullScreen = TRUE;
+    menuShot("menu-toolbar-fullscreen-on", &s);
+
+    s = baseState();
+    s.toolbarFocus = TB_FULLSCREEN;
+    s.gamepadOn = TRUE;
+    s.fullScreenWhy = "gamepad mode";
+    menuShot("menu-toolbar-fullscreen-gamepad", &s);
+
+    s = baseState();
     s.toolbarFocus = TB_SAFER;
     menuShot("menu-toolbar-safer-off", &s);
 
@@ -411,6 +448,21 @@ int main(int argc, char** argv)
     s.downloadsActive = 1;
     s.downloadsProgress = 0.37;
     menuShot("menu-tabs-downloading", &s);
+
+    /* the bar above the page, menu closed */
+    s = baseState();
+    s.loading = FALSE;
+    s.toolbarFocus = -1;
+    barAboveShot("bar-above-page", &s);
+    s.loading = TRUE;
+    s.progress = 0.45;
+    barAboveShot("bar-above-page-loading", &s);
+    s = baseState();
+    s.loading = FALSE;
+    s.toolbarFocus = TB_FULLSCREEN;
+    barAboveShot("bar-above-page-pointer-fullscreen", &s);
+    s.toolbarFocus = TB_ADDRESS;
+    barAboveShot("bar-above-page-pointer-address", &s);
 
     /* the loading bar, alone over the page */
     s = baseState();

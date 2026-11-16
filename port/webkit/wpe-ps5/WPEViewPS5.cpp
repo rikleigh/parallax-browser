@@ -46,11 +46,40 @@ struct _WPEViewPS5Private {
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEViewPS5, wpe_view_ps5, WPE_TYPE_VIEW, WPEView)
 
+// Every PS5 view (main thread), for wpeViewPS5ResizeAll.
+static GPtrArray* allViews;
+
+void wpeViewPS5PageSize(int* width, int* height)
+{
+    auto& renderer = PS5Renderer::singleton();
+    int screenWidth = renderer.width() ? renderer.width() : 1920;
+    int screenHeight = renderer.height() ? renderer.height() : 1080;
+    *width = screenWidth;
+    *height = screenHeight - renderer.pageTop();
+}
+
+void wpeViewPS5ResizeAll(void)
+{
+    int width = 0;
+    int height = 0;
+    wpeViewPS5PageSize(&width, &height);
+    for (guint i = 0; allViews && i < allViews->len; i++) {
+        auto* view = WPE_VIEW(g_ptr_array_index(allViews, i));
+        if (auto* toplevel = wpe_view_get_toplevel(view))
+            wpe_toplevel_resized(toplevel, width, height);
+        if (wpe_view_get_width(view) != width || wpe_view_get_height(view) != height)
+            wpe_view_resized(view, width, height);
+    }
+}
+
 static void wpeViewPS5Constructed(GObject* object)
 {
     G_OBJECT_CLASS(wpe_view_ps5_parent_class)->constructed(object);
 
     auto* view = WPE_VIEW(object);
+    if (!allViews)
+        allViews = g_ptr_array_new();
+    g_ptr_array_add(allViews, view);
     WPE_VIEW_PS5(view)->priv->mainContext = adoptGRef(g_main_context_ref_thread_default());
     g_signal_connect(view, "notify::toplevel", G_CALLBACK(+[](WPEView* view, GParamSpec*, gpointer) {
         auto* priv = WPE_VIEW_PS5(view)->priv;
@@ -116,6 +145,8 @@ void wpeViewPS5SetActive(WPEView* view, bool active)
 
 static void wpeViewPS5Dispose(GObject* object)
 {
+    if (allViews)
+        g_ptr_array_remove_fast(allViews, object);
     auto* priv = WPE_VIEW_PS5(object)->priv;
     if (priv->focusSource) {
         g_source_destroy(priv->focusSource.get());

@@ -490,13 +490,33 @@ this the home page* for an http(s) page, *Use the start page* on the home
 page or the start page while another home page is set; the footer says
 which, the TV confirms it, and in private browsing it does nothing), the address
 field (the page's title and address), the tab count, Bookmark (☆ adds the
-page shown, ★ removes it), Gamepad mode (the controller; □ on it opens the
+page shown, ★ removes it), Full screen (the four corners; see below),
+Gamepad mode (the controller; □ on it opens the
 button mapping, see *Gamepad mode*), Private browsing (the hat and glasses,
 see *Private browsing*), New tab (the home page) and Settings (⚙). History has *Clear
-all history* at the top (X twice). While a page loads (menu closed), the bar
-shows at the top with the page's title, address and a progress line, and
-goes 1.5 s after the load ends; the pad still drives the page.
-`/data/ps5webkit/no-load-bar` (a file) turns that off.
+all history* at the top (X twice).
+
+**The bar above the page and full screen.** With the menu closed, the menu's
+bar (104 px) stays above the page, with the load's progress line. The page is
+laid out below the bar rather than under it (`wpe_display_ps5_set_page_top`).
+The views are 1920x976, and hole-punch videos and the keyboard's lift follow.
+
+The page's pointer goes up over the bar. There:
+- the button under it is focused, as in the menu;
+- X or the touchpad's press uses that button without opening the menu;
+- the page sees the pointer leave and never gets the click.
+
+The menu's **Full screen** button hides the bar. The choice is kept in
+`/data/ps5webkit/full-screen` (a file). The browser also goes full screen by
+itself, and back when it ends:
+- in gamepad mode;
+- while a page's element is in full screen (a video's full screen button;
+  WebKit's `enter-fullscreen`).
+
+In full screen, while a page loads, the bar shows at the top with the page's
+title, address and a progress line, and goes 1.5 s after the load ends; the
+pad still drives the page. `/data/ps5webkit/no-load-bar` (a file) turns that
+off.
 
 **Tabs and memory.** The tab shown and the most recently used other tab
 are **live**: each has its own WebKitWebView, all in the one WebProcess
@@ -653,7 +673,7 @@ with GPU compositing on or off, and not shown in the headset (View in VR
 hands its panel and TV card over with `wpe_display_ps5_vr_set_panel()`
 instead). A menu frame is a 1920x1080 canvas (8 MB,
 freed when the menu closes; the renderer keeps one 8 MB GL buffer after
-the first use); the loading bar 1920x104 (0.8 MB). The drawing itself is
+the first use); the loading bar 1920x104 (0.8 MB), the same size for the bar above the page. The drawing itself is
 `apps/title/browserdraw.c`, from a plain state that `browserui.c` fills
 (no WebKit calls), on the canvas's rounded rectangles, gradients, outlines,
 glows, images and text; over a uniform area a translucent fill reuses the

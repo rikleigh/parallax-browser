@@ -1,0 +1,108 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+index 33831b6f89..751789e4c3 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/DrawingAreaProxyWCPS5.cpp
+@@ -79,6 +79,35 @@ static HashMap<uint64_t, Ref<PS5WCScrollingTree>>& scrollingTrees()
+     return map;
+ }
+ 
++// The scene whose tree the stick scrolled last (frame-locked), for
++// ps5wk_title_stall_scroll; 0: none (it went away or was hidden).
++static std::atomic<uint64_t> s_stallStickScene { 0 };
++
++// Pages in the title run their scripts, style and layout on the title's
++// main thread, which also reads the pad: while a page keeps it busy (a feed
++// adding posts: 0.3-1.2 s), no stick event reaches the tree and the page
++// stopped dead, where a page in a payload kept scrolling into what was
++// already painted. The pad's helper thread (wpe-ps5 WPEDisplayPS5.cpp)
++// calls this instead while the main thread is stuck: the stick's delta as
++// the WPE scroll event would carry it (precise, mouse: x 2.5 in
++// WebEventFactory), queued for the render thread like a main-thread one
++// (clamped at the painted edge there). Any thread. False if nothing took it.
++extern "C" __attribute__((visibility("default"))) bool ps5wk_title_stall_scroll(double wpeDeltaX, double wpeDeltaY)
++{
++    uint64_t sceneID = s_stallStickScene.load();
++    if (!sceneID)
++        return false;
++    RefPtr<PS5WCScrollingTree> tree;
++    {
++        Locker locker { scrollingTreesLock() };
++        auto it = scrollingTrees().find(sceneID);
++        if (it == scrollingTrees().end())
++            return false;
++        tree = it->value.ptr();
++    }
++    return tree->queueStallStickScroll(WebCore::FloatSize(wpeDeltaX * 2.5, wpeDeltaY * 2.5));
++}
++
+ // The flag file's content, or false when there is none.
+ static bool readAsyncScrollingFile(char (&buffer)[256])
+ {
+@@ -302,6 +331,7 @@ bool DrawingAreaProxyWCPS5::handleWheelEvent(Ref<WebWheelEvent>&& wheelEvent)
+     // the render thread at the frames' display times instead.
+     if (m_scrollingTree->frameLockedStick()) {
+         m_scrollingTree->queueFrameLockedScroll(platformWheelEvent);
++        s_stallStickScene = identifier().toUInt64();
+         PS5WCHost::noteWheelEventRouting(true);
+         if (PS5WCHost::sceneHasWheelEventListeners(identifier().toUInt64()))
+             dispatchWheelEventToDOM(wheelEvent.copyRef());
+@@ -568,6 +598,8 @@ void DrawingAreaProxyWCPS5::glMemoryAction(uint64_t sceneID, GLMemoryAction acti
+ DrawingAreaProxyWCPS5::~DrawingAreaProxyWCPS5()
+ {
+     liveDrawingAreas().remove(identifier().toUInt64());
++    uint64_t mine = identifier().toUInt64();
++    s_stallStickScene.compare_exchange_strong(mine, 0);
+ #if ENABLE(ASYNC_SCROLLING)
+     if (m_scrollingTree) {
+         Locker locker { scrollingTreesLock() };
+@@ -593,6 +625,8 @@ void DrawingAreaProxyWCPS5::viewIsBecomingVisible()
+ 
+ void DrawingAreaProxyWCPS5::viewIsBecomingInvisible()
+ {
++    uint64_t mine = identifier().toUInt64();
++    s_stallStickScene.compare_exchange_strong(mine, 0);
+     if (!PS5WCNullHost::isInstalled())
+         PS5WCHost::singleton().setPageVisible(identifier().toUInt64(), false);
+ }
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+index 7aca3bec83..0f26ac48b2 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.cpp
+@@ -611,6 +611,19 @@ void PS5WCScrollingTree::queueFrameLockedScroll(const PlatformWheelEvent& wheelE
+     PS5WCHost::requestFrame();
+ }
+ 
++bool PS5WCScrollingTree::queueStallStickScroll(FloatSize delta)
++{
++    std::optional<PlatformWheelEvent> event;
++    {
++        Locker locker { m_stickLock };
++        if (!m_frameLockedStick || !m_stickEvent || (MonotonicTime::now() - m_stickLastEvent).seconds() > 1)
++            return false;
++        event = m_stickEvent->copyWithDeltaAndVelocity(delta, m_stickVelocity);
++    }
++    queueFrameLockedScroll(*event);
++    return true;
++}
++
+ // Render thread, at the start of a frame: move by velocity x frame interval,
+ // within what is queued (and all of it once the stick has stopped), catching
+ // up if more than ~3 frames' worth is waiting.
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+index 4e39236412..5c9f33d6e9 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCScrollingTree.h
+@@ -148,6 +148,13 @@ public:
+     void setFrameLockedStick(bool on) { m_frameLockedStick = on; }
+     bool frameLockedStick() const { return m_frameLockedStick; }
+     void queueFrameLockedScroll(const WebCore::PlatformWheelEvent&);
++    // Any thread, while the title's main thread is stalled (pages in the
++    // title: their scripts, style and layout run on it, and it also reads
++    // the pad): the stick's delta from the pad's own thread
++    // (ps5wk_title_stall_scroll), queued as the newest stick event of the
++    // gesture with this delta. False unless the stick was scrolling this
++    // tree frame-locked within the last second.
++    bool queueStallStickScroll(WebCore::FloatSize delta);
+     // Per-frame scroll steps (px) of the root, for the [ascroll] line.
+     struct StepStats { unsigned frames { 0 }; double sum { 0 }, sumSquares { 0 }; };
+ 
