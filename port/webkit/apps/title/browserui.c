@@ -144,7 +144,8 @@ static Tab* activeTab(void)
 /* The browser's own pages, which open in a browser page tab. */
 static gboolean isBrowserPageURI(const char* uri)
 {
-    return uri && (g_str_has_prefix(uri, PS5WK_SETTINGS_URL_PREFIX) || g_str_has_prefix(uri, PS5WK_GAMEPAD_URL));
+    return uri && (g_str_has_prefix(uri, PS5WK_SETTINGS_URL_PREFIX) || g_str_has_prefix(uri, PS5WK_GAMEPAD_URL)
+        || g_str_has_prefix(uri, PS5WK_UPDATE_URL));
 }
 
 /* The tabs MAX_TABS counts: all but a browser page tab. */

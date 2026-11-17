@@ -125,8 +125,26 @@ On its first start, the browser copies its runtime files from the title
 into `/data/ps5webkit`. These are the fonts, certificates, Unicode data
 and the start page.
 
-To update, replace the `PPSA99207` folder with the new one, or update from
-the store. The next start brings the runtime files up to date. Each PS5
+### Updates
+
+From 0.2.0 the browser looks for a newer release each time it opens. If
+there is one, it opens a page with the release notes and three choices:
+**Update**, **What's new** and **Later**. Nothing is downloaded until you
+choose Update. The download and unpacking run in the background, and then
+the browser asks whether to restart now or next time. It installs the new
+version, opens again and brings your tabs back. Settings, Updates shows
+the version and has **Check for updates**.
+
+If you installed the browser from ProsperoStore, the store keeps it up to
+date. The browser then only says that a new version is out, so the store
+stays in charge of that install.
+
+The browser needs its folder on the console, as above. If it is installed
+as an image, or in more than one place, it can't update itself and says
+so.
+
+You can also update by hand: replace the `PPSA99207` folder with the new
+one. The next start brings the runtime files up to date. Each PS5
 user's bookmarks, history, settings and downloads live in
 `/data/ps5webkit/users`. Updates never touch that folder, so your data
 stays.

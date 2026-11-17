@@ -1718,7 +1718,26 @@ int spike_title_exit_helper(void)
     return 0;
 }
 
+static const char* restartBrowserWith(const char* from, const char* staging);
+
 static const char* restartBrowser(const char* from)
+{
+    return restartBrowserWith(from, NULL);
+}
+
+/* An update (updates.c): the helper installs the release in staging once
+ * the title is gone. Only through the helper: the launcher payload can't
+ * install. */
+const char* ps5wk_restart_for_update(const char* staging, const char* from)
+{
+    if (!staging || strlen(staging) > 120 || strchr(staging, ':') || strchr(staging, ' '))
+        return "the update's folder can't be passed to the restart helper";
+    if (!fileExists(PS5WK_RELAUNCH_ELF) || !wpe_process_manager_get_default())
+        return "the restart helper is missing";
+    return restartBrowserWith(from, staging);
+}
+
+static const char* restartBrowserWith(const char* from, const char* staging)
 {
     if (!spike_title_relaunch)
         return "only the PS5 title can restart itself";
@@ -1727,6 +1746,8 @@ static const char* restartBrowser(const char* from)
     /* The helper, or else the launcher payload (tools/launcher, developers). */
     const gboolean helper = fileExists(PS5WK_RELAUNCH_ELF) && wpe_process_manager_get_default();
     char reply[160] = "";
+    if (!helper && staging)
+        return "the restart helper is missing";
     if (!helper) {
         if (!launcherAsk("status\n", reply, sizeof reply))
             return "the restart helper is missing and the launcher payload isn't running: close the browser and start it again from the home screen";
@@ -1739,8 +1760,9 @@ static const char* restartBrowser(const char* from)
     const char* back = shownURI && !isSettingsURI(shownURI) && !g_str_has_prefix(shownURI, PS5WK_GAMEPAD_URL) ? shownURI : settingsReturnURI;
     const char* error = NULL;
     /* Not a private page: open-url.txt outlives the restart, which comes
-     * back in normal browsing. */
-    char* uri = back && *back && !ps5wk_browser_private() ? pushNormalize(back, &error) : NULL;
+     * back in normal browsing. An update comes back to the saved tabs as
+     * they are. */
+    char* uri = !staging && back && *back && !ps5wk_browser_private() ? pushNormalize(back, &error) : NULL;
     g_mutex_unlock(&shownLock);
     if (uri) {
         int fd = open(PS5WK_PENDING_URL, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -1751,10 +1773,13 @@ static const char* restartBrowser(const char* from)
     }
     if (helper) {
         snprintf(relaunchGoFile, sizeof relaunchGoFile, "/data/ps5webkit/home/tmp/relaunch-go-%d", (int)getpid());
-        char argument[160];
-        snprintf(argument, sizeof argument, "%s:%d:%s", PS5WK_TITLE_ID, (int)getpid(), relaunchGoFile);
+        char argument[300];
+        if (staging)
+            snprintf(argument, sizeof argument, "%s:%d:%s:%s", PS5WK_TITLE_ID, (int)getpid(), relaunchGoFile, staging);
+        else
+            snprintf(argument, sizeof argument, "%s:%d:%s", PS5WK_TITLE_ID, (int)getpid(), relaunchGoFile);
         g_atomic_int_set(&relaunchState, 1);
-        if (!wpe_process_manager_ps5_run_task_elf(wpe_process_manager_get_default(), PS5WK_RELAUNCH_ELF, "relaunch", argument,
+        if (!wpe_process_manager_ps5_run_task_elf(wpe_process_manager_get_default(), PS5WK_RELAUNCH_ELF, staging ? "update" : "relaunch", argument,
                 relaunchOutput, relaunchEnded, NULL)) {
             g_atomic_int_set(&relaunchState, 0);
             unlink(PS5WK_PENDING_URL);
@@ -1812,10 +1837,12 @@ static char* settingsState(const char* message, gboolean trusted)
     char* link = linkJSON();
     char* downloads = ps5wk_downloads_summary_json();
     char* storage = ps5wk_profile_storage_json();
+    char* update = ps5wk_updates_json();
     char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,\"downloads\":%s,"
-        "\"storage\":%s,%s%s%s%s",
-        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link, downloads, storage,
+        "\"storage\":%s,\"update\":%s,%s%s%s%s",
+        (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link, downloads, storage, update,
         message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock);
+    g_free(update);
     g_free(storage);
     g_free(downloads);
     g_free(link);
@@ -1845,11 +1872,17 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
         pushReply(client, 200, "text/html; charset=utf-8", ps5wk_gamepad_page_html);
         return;
     }
-    gboolean known = (!strcmp(path, "/settings.json") && get)
-        || (post && (!strcmp(path, "/settings") || !strcmp(path, "/restart") || !strcmp(path, "/clear") || !strcmp(path, "/adblock")));
+    if (!strcmp(path, "/update") && get) { /* its script uses /update.json and POST /update */
+        pushReply(client, 200, "text/html; charset=utf-8", ps5wk_update_page_html);
+        return;
+    }
+    gboolean known = ((!strcmp(path, "/settings.json") || !strcmp(path, "/update.json")) && get)
+        || (post && (!strcmp(path, "/settings") || !strcmp(path, "/restart") || !strcmp(path, "/clear") || !strcmp(path, "/adblock")
+            || !strcmp(path, "/update")));
     if (!known) {
         settingsReplyJSON(client, !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
-            || !strcmp(path, "/settings") || !strcmp(path, "/adblock") ? 405 : 404, FALSE, "method not allowed or no such page");
+            || !strcmp(path, "/settings") || !strcmp(path, "/adblock") || !strcmp(path, "/update") || !strcmp(path, "/update.json") ? 405 : 404,
+            FALSE, "method not allowed or no such page");
         return;
     }
     if (!pinOK && !trusted) {
@@ -1864,6 +1897,18 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
         char* state = settingsState(NULL, trusted);
         pushReply(client, 200, "application/json", state);
         g_free(state);
+    } else if (!strcmp(path, "/update.json")) {
+        char* state = ps5wk_updates_json();
+        pushReply(client, 200, "application/json", state);
+        g_free(state);
+    } else if (!strcmp(path, "/update")) {
+        char* action = query ? formValue(query, "do") : NULL;
+        if (!action)
+            action = formValue(body, "do");
+        const char* error = ps5wk_updates_action(action, from);
+        spike_log("settings: update %s from %s: %s", action ? action : "?", from, error ? error : "ok");
+        settingsReplyJSON(client, error ? 409 : 200, !error, error ? error : "ok");
+        g_free(action);
     } else if (!strcmp(path, "/settings")) {
         gboolean json = strstr(type, "json") || *body == '{';
         char* message = NULL;
@@ -2217,7 +2262,7 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
         *query++ = 0;
     const char* path = target;
     gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
-        || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad");
+        || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad") || !strcmp(path, "/update") || !strcmp(path, "/update.json");
     gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
 
     /* Every request from the network: the Host must be this PS5 by address
@@ -2492,6 +2537,7 @@ static void pushStart(void)
  * link server:
  *   parallax://settings           Settings (the link server's /settings page)
  *   parallax://gamepad?site=<host> the button mapping (/gamepad)
+ *   parallax://update             the update page (/update; updates.c)
  *   parallax://start              the start page: /data/ps5webkit/start.html,
  *       with the start-data.js and parallax-logo.png next to it
  * Their scripts call the link server's routes on their own origin
@@ -2609,7 +2655,7 @@ static void onParallaxRequest(WebKitURISchemeRequest* request, gpointer data)
     const char* path = uri ? g_uri_get_path(uri) : "";
     const char* query = uri ? g_uri_get_query(uri) : NULL;
     gboolean root = !*path || !strcmp(path, "/");
-    if (!host || (strcmp(host, "settings") && strcmp(host, "gamepad") && strcmp(host, "start"))) {
+    if (!host || (strcmp(host, "settings") && strcmp(host, "gamepad") && strcmp(host, "start") && strcmp(host, "update"))) {
         schemeFinishText(request, 404, "no such page\n");
         if (uri)
             g_uri_unref(uri);
@@ -2620,7 +2666,8 @@ static void onParallaxRequest(WebKitURISchemeRequest* request, gpointer data)
         return;
     }
     /* Each page at its root is the link server's page of that name. */
-    const char* route = !root ? path : !strcmp(host, "settings") ? "/settings" : !strcmp(host, "gamepad") ? "/gamepad" : NULL;
+    const char* route = !root ? path : !strcmp(host, "settings") ? "/settings" : !strcmp(host, "gamepad") ? "/gamepad"
+        : !strcmp(host, "update") ? "/update" : NULL;
     if (route && !strcmp(route, "/parallax-logo.png"))
         route = "/logo.png";
     if (!route || strlen(route) + (query ? strlen(query) : 0) > 2000) {
@@ -3398,6 +3445,7 @@ int main(int argc, char** argv)
     ps5wk_browser_init(display, webView);
     ps5wk_downloads_init(WPE_DISPLAY_PS5(display), session);
     ps5wk_adblock_init(webView);
+    ps5wk_updates_init(WPE_DISPLAY_PS5(display));
     debugDialogsInit(webView);
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 

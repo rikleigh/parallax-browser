@@ -148,9 +148,10 @@ default it asks for no password.
 
 ### The browser's own pages (parallax://)
 
-Settings, the button mapping and the start page are served by the title
-itself, not by the link server: `parallax://settings`,
-`parallax://gamepad?site=<host>` and `parallax://start`
+Settings, the button mapping, the update page and the start page are
+served by the title itself, not by the link server: `parallax://settings`,
+`parallax://gamepad?site=<host>`, `parallax://update` (UPDATES.md) and
+`parallax://start`
 (`/data/ps5webkit/start.html`, with `start-data.js` and `parallax-logo.png`
 next to it). `apps/title/ps5browser.c` registers the scheme on WebKit's web
 context (`webkit_web_context_register_uri_scheme`). Their scripts call the
@@ -362,6 +363,8 @@ curl http://192.168.1.50:9040/settings.json        # every setting: value, defau
 curl -d '{"jit":"dfg","paint_threads":2}' http://192.168.1.50:9040/settings   # or form fields: -d jit=dfg -d sound=0
 curl -X POST 'http://192.168.1.50:9040/restart?scope=page'     # or scope=browser
 curl -X POST 'http://192.168.1.50:9040/clear?what=cookies'     # or what=all
+curl http://192.168.1.50:9040/update.json          # the browser's own updates (UPDATES.md): version, state, latest, progress
+curl -X POST 'http://192.168.1.50:9040/update?do=check'      # or do=download, do=install, do=later
 ```
 
 Settings are named by their id (`jit`, `paint_threads`, `scroll_copy`,

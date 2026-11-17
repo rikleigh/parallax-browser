@@ -25,6 +25,16 @@ if [[ -z ${ALLOW_DIRTY:-} ]] && [[ -n "$(git -C "$ROOT" status --porcelain --unt
     git -C "$ROOT" status --short --untracked-files=no >&2
     exit 1
 fi
+# A release version (A.B.C, the tag vA.B.C) must match param.json's
+# contentVersion, 0(A+1).BBB.CCC: the browser's own updates (UPDATES.md)
+# check the unpacked release against its tag, and ProsperoStore compares
+# contentVersion.
+if [[ $version =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    version="${version#v}"
+    want="$(printf '%02d.%03d.%03d' $((BASH_REMATCH[1] + 1)) "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")"
+    have="$(sed -n 's/.*"contentVersion": *"\([^"]*\)".*/\1/p' "$ROOT/port/webkit/apps/title/sce_sys/param.json")"
+    [[ $have == "$want" ]] || { echo "version $version needs contentVersion $want in sce_sys/param.json (it has $have)" >&2; exit 1; }
+fi
 name="parallax-browser-$version"
 out="$ROOT/dist/$name"
 stage="$ROOT/dist/$name-debug"

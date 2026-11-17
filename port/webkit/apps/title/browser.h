@@ -196,6 +196,20 @@ extern const char ps5wk_gamepad_page_html[];
  * and home-url.txt may still have it; it opens parallax://start instead. */
 #define PS5WK_LEGACY_START_URL "file:///data/ps5webkit/start.html"
 
+/* ---- updates.c (port/webkit/UPDATES.md) ---- */
+void ps5wk_updates_init(WPEDisplayPS5* display);
+/* GET /update.json: the state, a JSON object (any thread). */
+char* ps5wk_updates_json(void);
+/* POST /update do=check|download|install|later (any thread; the work runs
+ * on the main loop): NULL, or why not. */
+const char* ps5wk_updates_action(const char* action, const char* from);
+/* The update page (GET /update on the link server). */
+extern const char ps5wk_update_page_html[];
+#define PS5WK_UPDATE_URL "parallax://update"
+/* ps5browser.c: the browser closes, and the restart helper installs the
+ * release unpacked in staging and starts it. NULL, or why not. */
+const char* ps5wk_restart_for_update(const char* staging, const char* from);
+
 /* titlelog.c: while on, the log takes no lines (private browsing). */
 void ps5wk_log_private(int on);
 /* ps5browser.c: Settings forgets the page it was opened from (R3 there),
