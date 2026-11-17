@@ -14,14 +14,26 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
-# The WebKit build with WebGL and every patch (port/webkit/build.sh default).
-BLD="${BLD:-$ROOT/toolchain/wpe-webkit/build-webgl}"
+# The WebKit build with WebGL, WebGPU and every patch (WEBGPU=1 port/webkit/build.sh).
+BLD="${BLD:-$ROOT/toolchain/wpe-webkit/build-webgpu}"
 version="${1:-$(git -C "$ROOT" describe --tags --always --dirty)}"
+
+# The zip names a commit (INSTALL.txt): what is built must be that commit.
+# Untracked files are fine (notes); a changed tracked file is not.
+if [[ -z ${ALLOW_DIRTY:-} ]] && [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]]; then
+    echo "the working tree has uncommitted changes (ALLOW_DIRTY=1 to build anyway, not for a release):" >&2
+    git -C "$ROOT" status --short --untracked-files=no >&2
+    exit 1
+fi
 name="parallax-browser-$version"
 out="$ROOT/dist/$name"
 stage="$ROOT/dist/$name-debug"
 
-[[ -f $BLD/build.ninja ]] || { echo "missing $BLD: run port/webkit/build.sh" >&2; exit 1; }
+[[ -f $BLD/build.ninja ]] || { echo "missing $BLD: run WEBGPU=1 port/webkit/build.sh" >&2; exit 1; }
+grep -q '^ENABLE_WEBGPU:BOOL=ON' "$BLD/CMakeCache.txt" || { echo "$BLD is not a WebGPU build" >&2; exit 1; }
+# package.sh links every object in title-work/obj: start from an empty one, so
+# nothing left from another build or an experiment gets in.
+rm -rf "$ROOT/toolchain/wpe-webkit/title-work/obj"
 
 # 1. The title with no log host.
 devhost="$(sed -n 's/^PS5WK_LOG_HOST:STRING=//p' "$BLD/CMakeCache.txt")"

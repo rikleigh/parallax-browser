@@ -35,7 +35,7 @@ The rest of this page is how it was made the default, before that.
 | A crash ended the title without a word. | `apps/title/titlecrash.c`: the payloads' crash guard in the title (without its pthread_create wrapper, titlemem.c has one); the report also goes to `/data/ps5webkit/crash-title.txt`, written from the handler. |
 | libpas zero-fills and decommits by mapping fresh pages over its own (`mmap(MAP_FIXED)`). Ranges outside titlemem.c's table went to the real mmap, flexible memory: ~530 MB of such mappings in a few minutes of video pages, flexible memory down to 56 MB (15 MB after hours), video decoders refused for memory (slow software decoding), and the title ended by libpas's `PAS_ASSERT` in `pas_page_malloc_zero_fill` once none was left. | titlemem.c: anonymous read-write `MAP_FIXED` mappings outside the table, in 16 KiB pages up to 64 MB, get direct memory at the address (like WebAssembly's commits); a `MAP_FIXED` mapping of another kind over the table's ranges (a `PROT_NONE` guard) takes them out of the table first. The `[mem]` line counts both kinds. |
 | Adaptive (HLS) streams start below 4K and switch up a few seconds in; each switch closed the decoder and asked for a bigger one, which the budget refused with pages in the title (the old decoder's memory came back only after the drain): playback stopped and started again. | PS5VideoDecoder.cpp: H.264 above 1080p gets a 3840x2160 decoder from the start when it fits (`h264headroom=0` in `vdec-budget`: its own size), so the switch keeps it; the H.264 estimate above 1080p comes from Spike 9's 4K figure. titlevdec.c: pipeline depth 2 above 1080p (it was above 4K). |
-| Scrolling a feed that adds posts as it goes felt sluggish: the page's scripts, style and layout (0.3-1.2 s at a time, about 25 times a minute) run on the title's main thread, which also reads the pad, so the page stopped dead while they ran. | Stall samples: while the main loop has not turned for 120 ms, the stall thread samples the main thread's stack every 20 ms (the profiler's unwinder); stalls over 250 ms go to `/data/ps5webkit/prof/stalls-title-<pid>.txt` (`test/prof/stall-sym.py` sums them up by function; `/data/ps5webkit/no-stall-samples` turns it off). 43 of 44 were the page's own work (scripts building posts, style, layout). Patch 0137 + WPEDisplayPS5.cpp: while padTick has not run for 50 ms, a pad thread reads the right stick and queues its delta for the render thread's frame-locked scrolling (up to the painted edge, as a payload page does). Same 150 s scroll test: 100k px before, 112k px with it, 118k px with pages in a payload. The other stalls remain (menu, pointer, clicks wait). |
+| Scrolling a feed that adds posts as it goes felt sluggish: the page's scripts, style and layout (0.3-1.2 s at a time, about 25 times a minute) run on the title's main thread, which also reads the pad, so the page stopped dead while they ran. | Stall samples: while the main loop has not turned for 120 ms, the stall thread samples the main thread's stack every 20 ms (the profiler's unwinder); stalls over 250 ms go to `/data/ps5webkit/prof/stalls-title-<pid>.txt` (`test/prof/stall-sym.py` sums them up by function). On only with pages in the browser process or `/data/ps5webkit/stall-samples`; `no-stall-samples` turns it off; the newest 4 files stay. 43 of 44 were the page's own work (scripts building posts, style, layout). Patch 0137 + WPEDisplayPS5.cpp: while padTick has not run for 50 ms, a pad thread reads the right stick and queues its delta for the render thread's frame-locked scrolling (up to the painted edge, as a payload page does). Same 150 s scroll test: 100k px before, 112k px with it, 118k px with pages in a payload. The other stalls remain (menu, pointer, clicks wait). |
 
 ## Checks (owner, PPSA99207, no launcher payload running)
 
@@ -66,11 +66,30 @@ The rest of this page is how it was made the default, before that.
   stall 0.9 s. Direct memory in use went from about 1 GB to 1.9 GB:
   not watched over a long session yet.
 
+## Release review fixes (0.2.0, 2026-11-17)
+
+- Safer browsing turned on from Settings or the link server restarts the
+  browser, as the menu's shield does (pages left the browser process only
+  at the next start before).
+- `titlemem.c`: a WebAssembly commit zeroes its memory through a scratch
+  mapping before mapping it at the address (a shared memory's threads saw
+  the old contents for a moment), checks the table has room before it
+  touches the range (a full table unmapped part of the reservation), drops
+  the old physical memory when it maps over one of its own ranges, and
+  ends the browser if the fixed mapping itself fails (the reservation may
+  be gone, and the code has no bounds checks).
+- The stream threads' timing for the stall report (patch 0136): two clock
+  reads per WebGL call, now only in this mode
+  (`ps5wk_stream_threads_watch`).
+
 ## Left as it is
 
 - A page that crashes the in-title WebProcess ends the browser (no
-  "page crashed, reload" page): start it again from the home screen. Not
-  tested yet.
+  "page crashed, reload" page): start it again from the home screen. That
+  start shows the start page in a new tab and leaves the saved tabs
+  unloaded (a crash report newer than the last start,
+  `/data/ps5webkit/title-started`), so a page that crashes on load can't
+  crash every start. Not tested yet.
 - The page memory limit (`PS5WK_MEM_RESTART_MB`) only acts on payload
   WebProcesses; in the title, the title's own memory is the limit.
 - Security: payload WebProcesses already run as root outside the jail with

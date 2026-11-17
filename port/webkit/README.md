@@ -1084,7 +1084,9 @@ with the title folder at the top and installs or updates only that folder in
   package.sh` leaves `runtime/` out for faster development uploads.
 - `tools/make-release.sh` zips `PPSA99207/` (with `LICENSE`, the notices and
   `INSTALL.txt` inside), the start page without its test links in its
-  `runtime/`.
+  `runtime/`. It packages the WebGPU build (`build-webgpu`), starts from an
+  empty `title-work/obj`, and refuses uncommitted changes to tracked files
+  (`ALLOW_DIRTY=1` for a test zip).
 
 Checked on the console (2026-11-10): with the runtime folders moved aside to
 `/data/ps5webkit-runtime-before`, the first start installed 330 files,

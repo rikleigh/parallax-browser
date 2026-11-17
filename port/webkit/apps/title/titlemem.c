@@ -41,6 +41,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -157,8 +158,9 @@ static void* dmap_new(size_t len, size_t align)
 }
 
 /* Unmap and release [a, a+len) wherever it overlaps mappings (lock held).
- * a and len are PAGE multiples. */
-static void dmap_release_range(uintptr_t a, size_t len)
+ * a and len are PAGE multiples. With unmap 0, the caller has just mapped
+ * over that range: only the old physical memory goes back. */
+static void dmap_drop_range(uintptr_t a, size_t len, int unmap)
 {
     const uintptr_t end = a + len;
     unsigned i = dmap_find(a);
@@ -166,7 +168,8 @@ static void dmap_release_range(uintptr_t a, size_t len)
         dmap_t m = dmaps[i];
         uintptr_t lo = a > m.base ? a : m.base;
         uintptr_t hi = end < m.base + m.len ? end : m.base + m.len;
-        sceKernelMunmap((void*)lo, hi - lo);
+        if (unmap)
+            sceKernelMunmap((void*)lo, hi - lo);
         sceKernelReleaseDirectMemory(m.phys + (int64_t)(lo - m.base), hi - lo);
         dmap_bytes -= hi - lo;
         dmap_t left = { m.base, lo - m.base, m.phys };
@@ -183,6 +186,11 @@ static void dmap_release_range(uintptr_t a, size_t len)
     }
 }
 
+static void dmap_release_range(uintptr_t a, size_t len)
+{
+    dmap_drop_range(a, len, 1);
+}
+
 int ps5wk_title_mem_exec;
 int __wrap_munmap(void* addr, size_t len);
 
@@ -195,7 +203,14 @@ int __wrap_munmap(void* addr, size_t len);
  * the other mappings. Only with ps5wk_title_mem_exec (the switch); 0 tells
  * JSC to mmap as before. Address and length in 64 KiB units (wasm pages). */
 static unsigned long long commit_count, commit_failures;
-static int commit_direct_at(void* address, size_t bytes, const char* what)
+
+/* -1: not committed, and the range is as it was (still reserved), so the
+ * caller may report out of memory. A failure after the range may have been
+ * touched ends the browser when the range is a WebAssembly reservation
+ * (reserved): its compiled code has no bounds checks, so a hole there that
+ * something else later mapped into would be readable and writable from the
+ * page (release review D1, T3). */
+static int commit_direct_at(void* address, size_t bytes, const char* what, int reserved)
 {
     const uintptr_t a = (uintptr_t)address;
     if (!ps5wk_title_mem_exec || !bytes)
@@ -214,25 +229,50 @@ static int commit_direct_at(void* address, size_t bytes, const char* what)
         spike_log("[mem] %s commit of %.1f MB at %p: no direct memory (rc 0x%08x)", what, bytes / 1048576.0, address, (unsigned)rc);
         return -1;
     }
+    /* Zeroed before it appears at the address: direct memory is not zero
+     * when recommitted (Spike 10), and a shared WebAssembly memory's other
+     * threads can read the new pages as soon as they are mapped there. */
+    void* scratch = NULL;
+    rc = sceKernelMapDirectMemory(&scratch, bytes, DMEM_PROT_CPU_RW, 0, phys, align);
+    if (rc || !scratch) {
+        sceKernelReleaseDirectMemory(phys, bytes);
+        __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
+        spike_log("[mem] %s commit of %.1f MB at %p: no room to zero it (rc 0x%08x)", what, bytes / 1048576.0, address, (unsigned)rc);
+        return -1;
+    }
+    memset(scratch, 0, bytes);
+    sceKernelMunmap(scratch, bytes);
+    /* The table must have room before the range is touched: with none, the
+     * mapping would have to be undone, which hands a reservation back. */
+    pthread_mutex_lock(&dmap_lock);
+    if (ndmaps >= MAX_DMAPS - 2) { /* dmap_drop_range may split one in two */
+        pthread_mutex_unlock(&dmap_lock);
+        sceKernelReleaseDirectMemory(phys, bytes);
+        __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
+        spike_log("[mem] %s commit of %.1f MB at %p: the table is full (%d mappings)", what, bytes / 1048576.0, address, MAX_DMAPS);
+        return -1;
+    }
     void* mapped = address;
     rc = sceKernelMapDirectMemory(&mapped, bytes, DMEM_PROT_CPU_RW, DMEM_MAP_FIXED, phys, 0);
     if (rc || mapped != address) {
+        pthread_mutex_unlock(&dmap_lock);
         if (!rc && mapped)
             sceKernelMunmap(mapped, bytes);
         sceKernelReleaseDirectMemory(phys, bytes);
         __atomic_fetch_add(&commit_failures, 1, __ATOMIC_RELAXED);
         spike_log("[mem] %s commit of %.1f MB at %p: sceKernelMapDirectMemory(MAP_FIXED) rc 0x%08x -> %p", what, bytes / 1048576.0,
             address, (unsigned)rc, mapped);
+        if (reserved) {
+            spike_log("[mem] the WebAssembly memory's reserved range may now have a hole: ending the browser");
+            spike_log_flush(500);
+            abort();
+        }
         return -1;
     }
-    memset(address, 0, bytes); /* direct memory is not zero when recommitted (Spike 10) */
-    pthread_mutex_lock(&dmap_lock);
-    if (ndmaps == MAX_DMAPS) {
-        pthread_mutex_unlock(&dmap_lock);
-        sceKernelMunmap(address, bytes);
-        sceKernelReleaseDirectMemory(phys, bytes);
-        return -1;
-    }
+    /* Mapped over one of ours (a resizable buffer grown back after a
+     * shrink): the old physical memory goes back, the new mapping stays. */
+    if (dmap_overlaps(a, bytes))
+        dmap_drop_range(a, bytes, 0);
     dmap_insert((dmap_t) { a, bytes, phys });
     dmap_bytes += bytes;
     if (dmap_bytes > dmap_peak)
@@ -247,7 +287,7 @@ static int commit_direct_at(void* address, size_t bytes, const char* what)
 
 int ps5wk_title_commit_direct(void* address, size_t bytes)
 {
-    return commit_direct_at(address, bytes, "wasm");
+    return commit_direct_at(address, bytes, "wasm", 1);
 }
 
 /* Before JSC unmaps a memory's reservation: its direct memory goes back. */
@@ -327,7 +367,7 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
             if (dmap_overlaps(a, len))
                 dmap_release_range(a, len);
             pthread_mutex_unlock(&dmap_lock);
-            if (commit_direct_at(addr, len, "fixed mmap") > 0) {
+            if (commit_direct_at(addr, len, "fixed mmap", 0) > 0) {
                 __atomic_fetch_add(&fixed_direct, 1, __ATOMIC_RELAXED);
                 return addr;
             }

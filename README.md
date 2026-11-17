@@ -235,9 +235,11 @@ Mac with Apple silicon. The steps are:
 
 `tools/logserver.sh` collects the browser's log on the Mac.
 
-`tools/make-release.sh <version>` builds the release zip. The zip has the
-`PPSA99207` folder at the top, as the homebrew catalog requires, and the
-build inside has no log address. For every release, raise
+`tools/make-release.sh <version>` builds the release zip from the WebGPU
+build (`WEBGPU=1 port/webkit/build.sh`, in `build-webgpu`). It refuses a
+working tree with uncommitted changes, since the zip names the commit. The
+zip has the `PPSA99207` folder at the top, as the homebrew catalog
+requires, and the build inside has no log address. For every release, raise
 `contentVersion` in `port/webkit/apps/title/sce_sys/param.json` so that
 consoles see the new build as an update. The format is
 `01.<minor>.<patch>`, so 0.1.0 is `01.001.000`.

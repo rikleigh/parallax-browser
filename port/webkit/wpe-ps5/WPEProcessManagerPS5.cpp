@@ -766,7 +766,7 @@ static guint64 wpeProcessManagerPS5Launch(WPEProcessManager* processManager, WPE
         priv->inTitleUsed = true;
         launch->inTitle = true;
         guint64 handle = launch->handle;
-        PS5_LOG("[ps5-launch] launching web process %" G_GUINT64_FORMAT " in the title (/data/ps5webkit/inprocess-web)", launch->processIdentifier);
+        PS5_LOG("[ps5-launch] launching web process %" G_GUINT64_FORMAT " in the title (pages in the browser process: /data/ps5webkit/pages-in-browser)", launch->processIdentifier);
         {
             Locker locker { priv->launchesLock };
             priv->launches.add(handle, WTF::move(launch));

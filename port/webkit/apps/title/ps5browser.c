@@ -1515,6 +1515,7 @@ static gboolean restartPageOnMain(gpointer data)
 /* WebGPU (Dawn on RADV, spikes/12-webgpu): off unless this file is there,
  * and off with Safer browsing whatever it says. */
 #define WEBGPU_ON_FLAG "/data/ps5webkit/webgpu-on"
+void ps5wk_gpu_submit_lock(void) __attribute__((weak));
 static gboolean saferBrowsing;
 
 static gboolean flagFile(const char* path)
@@ -1536,9 +1537,11 @@ static void applyWebContentSettings(void)
         spike_log("settings: WebGL %s%s", webgl ? "on" : "off", saferBrowsing ? " (Safer browsing)" : "");
     }
     /* WebGPU has no WebKitSettings property: it is the feature "WebGPU"
-     * (the WebGPUEnabled preference), which a build without WebGPU lacks,
-     * and then there is nothing to turn on. */
-    gboolean webgpu = !saferBrowsing && flagFile(WEBGPU_ON_FLAG);
+     * (the WebGPUEnabled preference). Every build has the feature, so in a
+     * build without Dawn (no titleradv.c, which defines
+     * ps5wk_gpu_submit_lock) it stays off: on, pages would find a
+     * navigator.gpu with nothing behind it and not fall back to WebGL. */
+    gboolean webgpu = !saferBrowsing && flagFile(WEBGPU_ON_FLAG) && ps5wk_gpu_submit_lock;
     WebKitFeatureList* features = settings ? webkit_settings_get_all_features() : NULL;
     WebKitFeature* feature = features ? webkit_feature_list_find(features, "WebGPU") : NULL;
     if (feature && webkit_settings_get_feature_enabled(settings, feature) != webgpu) {
@@ -1870,6 +1873,15 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
         ps5wk_adblock_setting_changed(); /* applies at once (no restart) */
         applyPerfOverlaySetting();
         g_idle_add(applyWebContentSettingsOnMain, NULL); /* WebGL at once; the JIT with the next WebProcess */
+        /* Safer browsing on with pages in the browser process: they would
+         * keep running here, with the JIT and WebAssembly, until a restart.
+         * Restart now, as the menu's shield does. */
+        if (inTitleWeb && flagFile(SAFER_BROWSING_FLAG)) {
+            const char* error = restartBrowser(from);
+            spike_log("settings: Safer browsing on with pages in the browser process: %s", error ? error : "restarting the browser");
+            if (!error)
+                ps5wk_settings_set_status("Safer browsing: restarting the browser…");
+        }
         if (ok || changed) {
             char* state = settingsState(message, trusted);
             pushReply(client, ok ? 200 : 503, "application/json", state);
@@ -2937,8 +2949,10 @@ static gboolean stallTick(gpointer data)
  * samples, identical stacks folded, to
  * /data/ps5webkit/prof/stalls-title-<pid>.txt and names its entry in the
  * log ("[stall] sampled #N"); test/prof/stall-sym.py symbolizes and sums
- * them up by function. /data/ps5webkit/no-stall-samples (a file) turns it
- * off. The sampling path takes no lock of the C library (the main thread
+ * them up by function. On with pages in the browser process (their work
+ * is what stalls the main loop there) or with /data/ps5webkit/stall-samples
+ * (a file); /data/ps5webkit/no-stall-samples turns it off. Only the newest
+ * STALL_FILES_KEPT files stay. The sampling path takes no lock of the C library (the main thread
  * may hold one); the report is written once the main loop turned again.
  *
  *   # stall <n> <ms> ms, <samples> samples every 20 ms, main thread CPU <ms> ms (<busy|waiting>), at <s> s
@@ -2949,6 +2963,8 @@ static gboolean stallTick(gpointer data)
 #define STALL_SAMPLES 160
 #define STALL_FRAMES 64
 #define STALL_SAMPLES_OFF "/data/ps5webkit/no-stall-samples"
+#define STALL_SAMPLES_ON "/data/ps5webkit/stall-samples"
+#define STALL_FILES_KEPT 4
 int ps5wk_backtrace_init(void) __attribute__((weak));
 unsigned ps5wk_backtrace_context(const void* ucontext, uintptr_t* out) __attribute__((weak));
 size_t ps5wk_backtrace_format(char* buffer, size_t size, const uintptr_t* pcs, unsigned n) __attribute__((weak));
@@ -2988,6 +3004,33 @@ static void onStallSample(int sig, siginfo_t* info, void* context)
 }
 
 /* The main thread (call on it): its stack can be sampled. */
+static gint compareMTimeNewestFirst(gconstpointer a, gconstpointer b)
+{
+    struct stat sa, sb;
+    time_t ta = stat(*(char* const*)a, &sa) ? 0 : sa.st_mtime;
+    time_t tb = stat(*(char* const*)b, &sb) ? 0 : sb.st_mtime;
+    return ta < tb ? 1 : ta > tb ? -1 : 0;
+}
+
+/* Older runs' stall files: the newest STALL_FILES_KEPT - 1 stay (this run
+ * may add one). */
+static void stallFilesPrune(void)
+{
+    GDir* dir = g_dir_open("/data/ps5webkit/prof", 0, NULL);
+    if (!dir)
+        return;
+    GPtrArray* files = g_ptr_array_new_with_free_func(g_free);
+    for (const char* name; (name = g_dir_read_name(dir));) {
+        if (g_str_has_prefix(name, "stalls-title-") && g_str_has_suffix(name, ".txt"))
+            g_ptr_array_add(files, g_build_filename("/data/ps5webkit/prof", name, NULL));
+    }
+    g_dir_close(dir);
+    g_ptr_array_sort(files, compareMTimeNewestFirst);
+    for (guint i = STALL_FILES_KEPT - 1; i < files->len; i++)
+        unlink(g_ptr_array_index(files, i));
+    g_ptr_array_free(files, TRUE);
+}
+
 static void stallSamplesSetUp(void)
 {
     stallMainThread = pthread_self();
@@ -2996,6 +3039,9 @@ static void stallSamplesSetUp(void)
         spike_log("[stall] no stack samples (" STALL_SAMPLES_OFF ")");
         return;
     }
+    if (!inTitleWeb && stat(STALL_SAMPLES_ON, &st))
+        return; /* pages in their own processes: no samples unless asked */
+    stallFilesPrune();
     if (!ps5wk_backtrace_init || !ps5wk_backtrace_context || !ps5wk_backtrace_format || ps5wk_backtrace_init()) {
         spike_log("[stall] no stack samples: no unwinder in this build");
         return;
@@ -3080,6 +3126,7 @@ static void stallSamplesEnd(double stallMS)
  * the in-title WebProcess's 15 s GetErrors waits). */
 size_t ps5wk_main_thread_stream_wait(char* out, size_t size) __attribute__((weak));
 size_t ps5wk_stream_threads_report(char* out, size_t size) __attribute__((weak));
+void ps5wk_stream_threads_watch(void) __attribute__((weak));
 
 static void* stallWatch(void* data)
 {
@@ -3123,9 +3170,26 @@ static void* stallWatch(void* data)
             ps5wk_main_thread_stream_wait(waits, sizeof waits);
         if (ps5wk_stream_threads_report)
             ps5wk_stream_threads_report(threads, sizeof threads);
-        spike_log("[stall] the main loop has not turned for %.1f s: %s; %s", stuck, waits[0] ? waits : "?", threads[0] ? threads : "?");
+        spike_log("[stall] the main loop has not turned for %.1f s: %s; %s", stuck, waits[0] ? waits : "?",
+            threads[0] ? threads : "stream threads not watched (pages in their own processes)");
     }
     return NULL;
+}
+
+/* Did the last run end in a crash? The crash handler appends to
+ * crash-title.txt; each start touches title-started. A report written after
+ * the last start is that run's crash. */
+static gboolean titleCrashedLastRun(void)
+{
+    struct stat crash, started;
+    gboolean crashed = !stat("/data/ps5webkit/crash-title.txt", &crash) && !stat("/data/ps5webkit/title-started", &started)
+        && crash.st_mtime >= started.st_mtime;
+    int fd = open("/data/ps5webkit/title-started", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        (void)!write(fd, "1\n", 2);
+        close(fd);
+    }
+    return crashed;
 }
 
 int main(int argc, char** argv)
@@ -3138,6 +3202,7 @@ int main(int argc, char** argv)
     spike_title_init("ps5browser", LOG_HOST, LOG_PORT);
     /* Before WebKit (WTF chains its handlers to these). A crash used to end
      * the title without a word; the report also goes straight to a file. */
+    const gboolean lastRunCrashed = titleCrashedLastRun();
     ps5wk_crash_guard_report_file("/data/ps5webkit/crash-title.txt");
     ps5wk_crash_guard_install("title");
     loadStart = g_get_monotonic_time();
@@ -3203,9 +3268,13 @@ int main(int argc, char** argv)
      * experimental, off unless Settings turned it on (pages-in-browser), and
      * never with Safer browsing, which keeps pages apart from the browser. */
     inTitleWeb = fileExists("/data/ps5webkit/pages-in-browser") && !fileExists("/data/ps5webkit/safer-browsing");
-    if (inTitleWeb)
+    if (inTitleWeb) {
         setUpInTitleWeb();
-    else
+        /* Which stream message each WebGL/WebGPU thread is in, for the
+         * stall report: two clock reads a message, so only in this mode. */
+        if (ps5wk_stream_threads_watch)
+            ps5wk_stream_threads_watch();
+    } else
         setenv("JSC_useJIT", "false", 0);
     /* Whose data: before anything reads it (README: "Users and storage"). */
     ps5wk_profile_init();
@@ -3343,7 +3412,14 @@ int main(int argc, char** argv)
         ps5wk_browser_start(NULL, home, TRUE);
         loadNextTestURL();
     } else {
-        /* The saved tabs come back; a start link opens in a new tab. */
+        /* The saved tabs come back; a start link opens in a new tab. After
+         * a crash, the start page does (in a new tab): the shown page may
+         * be what crashed the browser (pages in the browser process), and
+         * loading it again would crash it at every start. */
+        if (lastRunCrashed && !start) {
+            spike_log("browser: the last run crashed; the start page in a new tab, the saved tabs kept unloaded");
+            start = g_strdup(home);
+        }
         loadStart = g_get_monotonic_time();
         ps5wk_browser_start(start, home, FALSE);
     }

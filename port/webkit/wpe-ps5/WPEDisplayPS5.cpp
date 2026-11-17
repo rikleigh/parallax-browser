@@ -1132,6 +1132,14 @@ static void uiTick(WPEDisplayPS5* display, const PS5PadData& data, const TouchMo
 {
     auto* priv = display->priv;
     constexpr uint32_t repeatable = PS5_PAD_UP | PS5_PAD_DOWN | PS5_PAD_LEFT | PS5_PAD_RIGHT | PS5_PAD_L1 | PS5_PAD_R1 | PS5_PAD_L2 | PS5_PAD_R2;
+    // The D-pad moves the UI's focus: the pointer goes, so that X then acts
+    // on the focus and not on what the pointer was left over (until the
+    // stick or the touchpad moves it again).
+    constexpr uint32_t dpad = PS5_PAD_UP | PS5_PAD_DOWN | PS5_PAD_LEFT | PS5_PAD_RIGHT;
+    if ((pressed & dpad) && t - priv->pointerMovedAt < pointerShownFor) {
+        priv->pointerMovedAt = -1000;
+        wpeDisplayPS5ScheduleRedraw(display);
+    }
     if (pressed & repeatable) {
         uint32_t bits = pressed & repeatable;
         priv->uiRepeatButton = bits & (~bits + 1); // the lowest one
@@ -1383,9 +1391,10 @@ static void padTick(WPEDisplayPS5* display)
         pressed &= ~extra;
     }
     // Over the application's bar the button handler had the click; whatever
-    // it left is not the page's.
-    if (priv->pointerY < 0 && pointerVisible)
-        pressed &= ~clickButtons;
+    // it left is not the page's. The touchpad's press clicks at the pointer
+    // even when it has timed out, so over the bar it is never the page's.
+    if (priv->pointerY < 0)
+        pressed &= pointerVisible ? ~clickButtons : ~static_cast<uint32_t>(PS5_PAD_TOUCHPAD);
     if (pressed & PS5_PAD_TOUCHPAD)
         pointerClickDown(display, view, PS5_PAD_TOUCHPAD, t);
     else if (pressed & PS5_PAD_CROSS) {

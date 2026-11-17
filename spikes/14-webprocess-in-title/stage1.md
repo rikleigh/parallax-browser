@@ -131,7 +131,7 @@ Also for debugging:
 - `KEY=VALUE` lines in `/data/ps5webkit/inprocess-web` are set in the
   title's environment, as `child.env` is for payloads.
 
-| 6 | The emulator page (wall profiler on): black screen, but the main thread was idle (1% of a core), not stuck. A JS probe (`test-onload.js`) found WebGPU's adapter, IndexedDB, CacheStorage and fetch all working, and `crossOriginIsolated` true. But the document held 3 of the page's 4 inline scripts and no the emulator's main script: **25,192 of 46,436 characters**, cut in the middle of the third script, while a `fetch` of the same URL got all of it. | See below. |
+| 6 | The emulator page (wall profiler on): black screen, but the main thread was idle (1% of a core), not stuck. A JS probe (`test-onload.js`) found WebGPU's adapter, IndexedDB, CacheStorage and fetch all working, and `crossOriginIsolated` true. But the document held 3 of the page's 4 inline scripts and not the emulator's main script: **25,192 of 46,436 characters**, cut in the middle of the third script, while a `fetch` of the same URL got all of it. | See below. |
 
 **Run 6's cause, from the code (not yet confirmed by a run).** The first IPC
 fix dispatched every message of every main-loop connection except the

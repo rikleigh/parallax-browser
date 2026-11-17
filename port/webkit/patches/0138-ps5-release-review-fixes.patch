@@ -1,0 +1,298 @@
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index 8324d7d866..c34a18ebe1 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -29,6 +29,7 @@
+ #include "JSWebAssemblyInstance.h"
+ #include "Options.h"
+ #include "WasmFaultSignalHandler.h"
++#include <cerrno>
+ #include <cstring>
+ #include <mutex>
+ #include <wtf/DataLog.h>
+@@ -252,11 +253,18 @@ bool BufferMemoryManager::tryMakeReadableAndWritable(void* address, size_t bytes
+     if (!bytes)
+         return true;
+     if (singleton().isInGrowableOrFastMemory(address) && singleton().isInGrowableOrFastMemory(static_cast<char*>(address) + bytes - 1)) {
++        // The title's commit fails only with the range still reserved (titlemem.c).
+         if (ps5wk_title_commit_direct) {
+             if (int done = ps5wk_title_commit_direct(address, bytes))
+                 return done > 0;
+         }
+-        return mmap(address, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == address;
++        // A failed MAP_FIXED may have taken the reservation with it (FreeBSD removes the old
++        // entries first). The memory's compiled code has no bounds checks, so a hole that a
++        // later mapping lands in would be open to the page: end the process instead of
++        // reporting out of memory.
++        void* mapped = mmap(address, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
++        RELEASE_ASSERT_WITH_MESSAGE(mapped == address, "WebAssembly memory commit of %zu bytes at %p failed (errno %d): its reserved range may have a hole", bytes, address, errno);
++        return true;
+     }
+     OSAllocator::protect(address, bytes, readable, writable);
+     return true;
+diff --git a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+index ab73a1784f..96df0ccd57 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
++++ b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+@@ -1026,7 +1026,9 @@ static bool isOriginClean(const auto& source, [[maybe_unused]] ScriptExecutionCo
+             return imageElement->originClean(*protect(context.securityOrigin()));
+         },
+         [&]([[maybe_unused]] const Ref<HTMLVideoElement>& videoElement) -> ResultType {
+-#if PLATFORM(COCOA)
++#if PLATFORM(COCOA) || defined(PS5_PAYLOAD_SDK)
++            // PS5: copyExternalImageToTexture returns the video's real pixels (patches 0117, 0123),
++            // so a cross-origin video must not be copied.
+             return !videoElement->taintsOrigin(*protect(context.securityOrigin()));
+ #else
+             return true;
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
+index 2748c42e53..7ebbf101bb 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
+@@ -88,11 +88,17 @@ RemoteDevice::RemoteDevice(GPUConnectionToWebProcess& gpuConnectionToWebProcess,
+     , m_gpuConnectionToWebProcess(gpuConnectionToWebProcess)
+     , m_gpu(gpu)
+ {
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
++    PS5WebGLLayers::webGPUDeviceAdded();
++#endif
+     m_streamConnection->startReceivingMessages(*this, Messages::RemoteDevice::messageReceiverName(), m_identifier.toUInt64());
+ }
+ 
+ RemoteDevice::~RemoteDevice()
+ {
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
++    PS5WebGLLayers::webGPUDeviceRemoved();
++#endif
+     // The device can outlive this receiver, so complete the callbacks that reply to the Web Process.
+     m_backing->resolveDeviceLostPromise({ });
+     m_backing->resolveUncapturedErrorEvent({ });
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index 950bb42181..a6154bc57f 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -110,6 +110,14 @@ bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY);
+ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);
+ // eglBindAPI(EGL_OPENGL_ES_API) on this thread (ps5-opengl's EGL).
+ void bindESAPI();
++// glFlush of the native context current on this thread, if any (ps5-opengl): what ANGLE drew is
++// submitted (PS5WebGLVideoCopy.cpp).
++void flushNative();
++// WebGPU devices alive in the GPU side (RemoteDevice). While there is one, RADV submits between
++// WebGL's work, so WebGL's work queue takes the GPU submission lock around each batch and
++// flushes before letting it go (RemoteGraphicsContextGLPS5.cpp; release review G2).
++void webGPUDeviceAdded();
++void webGPUDeviceRemoved();
+ 
+ } // namespace PS5WebGLLayers
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+index 5dd8911739..10690d7f95 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+@@ -23,6 +23,12 @@ void bindESAPI()
+     eglBindAPI(EGL_OPENGL_ES_API);
+ }
+ 
++void flushNative()
++{
++    if (eglGetCurrentContext() != EGL_NO_CONTEXT)
++        glFlush();
++}
++
+ // A native ES context of the compositor's share group, current only for a
+ // copy (PS5Renderer::copyVideoFrame binds its own framebuffers), so ANGLE's
+ // native context keeps the state ANGLE thinks it has. WebGL's work queue only.
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+index ba04ac6c3c..8bb60f96cb 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -18,6 +18,8 @@
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/GraphicsContextGLCoordinated.h>
+ #include <WebCore/GraphicsLayerContentsDisplayDelegate.h>
++#include <atomic>
++#include <mutex>
+ #include <time.h>
+ #include <wtf/HashSet.h>
+ #include <wtf/Lock.h>
+@@ -29,11 +31,53 @@
+ // PS5 ANGLE (Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/ps5/PS5ExternalTexture.cpp).
+ extern "C" unsigned ANGLE_PS5PrepareExternalTexture2D(unsigned name, int width, int height, unsigned internalFormat, unsigned format, unsigned type);
+ 
++// The title's GPU submission lock (apps/title/titleradv.c, WebGPU builds only).
++extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
++extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
++
+ namespace WebKit {
+ 
+ // Each live context's line (RemoteGraphicsContextGLPS5::logStats), after the frame line.
+ void logContextStats(double seconds);
+ 
++namespace PS5WebGLLayers {
++
++// ps5-opengl (WebGL, the compositor) and RADV (WebGPU) both set GPU state in one submission and
++// rely on it in the next. A RADV submission between two of WebGL's lost WebGL's blending in
++// about 2% of frames (test/webgpu/webgl-and-webgpu.html, 2026-11-17). The compositor holds the
++// lock around a frame's GL work (PS5Renderer.cpp); WebGL's queue holds it around each batch and
++// flushes before letting go, so RADV only ever runs between whole batches. Only while a WebGPU
++// device exists: with none, nothing of RADV's runs and a WebGL-only page pays nothing.
++static std::atomic<unsigned> s_webGPUDevices;
++
++void webGPUDeviceAdded()
++{
++    if (!s_webGPUDevices++)
++        WTFLogAlways("[webgl] a WebGPU device exists: WebGL's work takes the GPU submission lock");
++}
++
++void webGPUDeviceRemoved()
++{
++    if (!--s_webGPUDevices)
++        WTFLogAlways("[webgl] no WebGPU device left: WebGL's work without the GPU submission lock");
++}
++
++static bool batchBegin()
++{
++    if (!ps5wk_gpu_submit_lock || !s_webGPUDevices.load(std::memory_order_relaxed))
++        return false;
++    ps5wk_gpu_submit_lock();
++    return true;
++}
++
++static void batchEnd()
++{
++    flushNative();
++    ps5wk_gpu_submit_unlock();
++}
++
++} // namespace PS5WebGLLayers
++
+ namespace {
+ 
+ // Hands each frame's buffer (GraphicsContextGLCoordinated::prepareForDisplay)
+@@ -351,6 +395,10 @@ GCGLsync RemoteGraphicsContextGL::ps5Sync(uint64_t handle)
+ 
+ Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& connection, WebCore::GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
+ {
++    static std::once_flag hooks;
++    std::call_once(hooks, [] {
++        remoteGraphicsContextGLStreamWorkQueueSingleton().ps5SetBatchHooks(PS5WebGLLayers::batchBegin, PS5WebGLLayers::batchEnd);
++    });
+     auto instance = adoptRef(*new RemoteGraphicsContextGLPS5(connection, identifier, renderingBackend, WTF::move(streamConnection)));
+     instance->initialize(WTF::move(attributes));
+     return instance;
+diff --git a/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp b/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp
+index 3292f49754..abb35449fd 100644
+--- a/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp
++++ b/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.cpp
+@@ -157,8 +157,23 @@ void StreamConnectionWorkQueue::processStreams()
+             functions.swap(m_functions);
+             connections = m_connections;
+         }
+-        for (auto& function : functions)
+-            WTF::move(function)();
++#if defined(PS5_PAYLOAD_SDK)
++        auto ps5Batch = [this](auto&& work) {
++            PS5BatchBegin begin = m_ps5BatchBegin.load(std::memory_order_acquire);
++            bool held = begin && begin();
++            work();
++            if (held)
++                m_ps5BatchEnd.load(std::memory_order_acquire)();
++        };
++#else
++        auto ps5Batch = [](auto&& work) { work(); };
++#endif
++        if (!functions.isEmpty()) {
++            ps5Batch([&] {
++                for (auto& function : functions)
++                    WTF::move(function)();
++            });
++        }
+ 
+         hasMoreToProcess = false;
+         for (auto& connection : borrow(connections)) {
+@@ -171,7 +186,9 @@ void StreamConnectionWorkQueue::processStreams()
+             };
+             double start = threadCPU();
+ #endif
+-            hasMoreToProcess |= connection->dispatchStreamMessages(defaultMessageLimit) == StreamServerConnection::HasMoreMessages;
++            ps5Batch([&] {
++                hasMoreToProcess |= connection->dispatchStreamMessages(defaultMessageLimit) == StreamServerConnection::HasMoreMessages;
++            });
+ #if defined(PS5_PAYLOAD_SDK)
+             connection->ps5NoteBatchCPU(threadCPU() - start);
+ #endif
+diff --git a/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.h b/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.h
+index 33482c60da..8d22b971b8 100644
+--- a/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.h
++++ b/Source/WebKit/Platform/IPC/StreamConnectionWorkQueue.h
+@@ -57,6 +57,19 @@ public:
+     void dispatch(WTF::Function<void()>&&) final;
+     bool isCurrent() const final;
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: called around each batch the processing thread runs (queued functions, then each
++    // connection's messages). begin returns whether end must run after the batch. WebGL's queue:
++    // the GPU submission lock while a WebGPU device exists (RemoteGraphicsContextGLPS5.cpp).
++    using PS5BatchBegin = bool (*)();
++    using PS5BatchEnd = void (*)();
++    void ps5SetBatchHooks(PS5BatchBegin begin, PS5BatchEnd end)
++    {
++        m_ps5BatchEnd = end;
++        m_ps5BatchBegin = begin;
++    }
++#endif
++
+ private:
+     void startProcessingThread() WTF_REQUIRES_LOCK(m_lock);
+     void processStreams();
+@@ -72,6 +85,10 @@ private:
+     Deque<Function<void()>> m_functions WTF_GUARDED_BY_LOCK(m_lock);
+     WTF::Function<void()> m_cleanupFunction WTF_GUARDED_BY_LOCK(m_lock);
+     Vector<Ref<StreamServerConnection>> m_connections WTF_GUARDED_BY_LOCK(m_lock);
++#if defined(PS5_PAYLOAD_SDK)
++    std::atomic<PS5BatchBegin> m_ps5BatchBegin { nullptr };
++    std::atomic<PS5BatchEnd> m_ps5BatchEnd { nullptr };
++#endif
+ };
+ 
+ }
+diff --git a/Source/WebKit/Platform/IPC/StreamServerConnection.cpp b/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
+index 6fd8a938a3..0f4233d791 100644
+--- a/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
++++ b/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
+@@ -54,9 +54,14 @@ struct PS5StreamThread {
+ };
+ PS5StreamThread s_ps5StreamThreads[4];
+ std::atomic<unsigned> s_ps5StreamThreadCount;
++// Two clock reads per stream message (each WebGL call is one; the title has no
++// fast clock): only when the title asks, with pages in the browser process.
++std::atomic<bool> s_ps5StreamThreadsOn;
+ 
+ PS5StreamThread* ps5StreamThread()
+ {
++    if (!s_ps5StreamThreadsOn.load(std::memory_order_relaxed))
++        return nullptr;
+     static thread_local int slot = -1;
+     if (slot < 0) {
+         unsigned index = s_ps5StreamThreadCount.fetch_add(1);
+@@ -398,10 +403,19 @@ void StreamServerConnection::markCurrentlyDispatchedMessageAsInvalid(const Strin
+ }
+ 
+ #if defined(PS5_PAYLOAD_SDK)
++extern "C" void ps5wk_stream_threads_watch(void)
++{
++    IPC::s_ps5StreamThreadsOn = true;
++}
++
+ extern "C" size_t ps5wk_stream_threads_report(char* out, size_t size)
+ {
+     if (!size)
+         return 0;
++    if (!IPC::s_ps5StreamThreadsOn) {
++        out[0] = 0;
++        return 0;
++    }
+     size_t used = 0;
+     out[0] = 0;
+     double now = MonotonicTime::now().secondsSinceEpoch().value();

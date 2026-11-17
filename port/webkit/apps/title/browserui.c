@@ -2216,6 +2216,13 @@ static gboolean discardEndedViews(gpointer data)
 /* TRUE: a hidden live tab's view (ps5browser.c then leaves it alone). */
 gboolean ps5wk_browser_view_terminated(WebKitWebView* view)
 {
+    /* The page's process ended with an element in full screen: no
+     * leave-fullscreen comes (WPE has no closeFullScreenManager), and the
+     * same view shows the reload, so the bar would stay hidden. */
+    if (view == webView && videoFullScreen) {
+        videoFullScreen = FALSE;
+        updateLayout();
+    }
     if (view == webView || !tabForView(view))
         return FALSE;
     if (!discardEndedSource)

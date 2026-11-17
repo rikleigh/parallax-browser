@@ -30,6 +30,7 @@ shared helper; `index.html` links the pages.
 | `todataurl.html` | `toDataURL`, `toBlob`, `createImageBitmap` and `drawImage` of a WebGPU canvas, in the task that drew and three frames later; alphaMode opaque and premultiplied |
 | `copy-external-image.html` | `copyExternalImageToTexture` from a 2D canvas, ImageBitmap, OffscreenCanvas, HTMLImageElement and ImageData, with `flipY` and `premultipliedAlpha` both ways |
 | `video-texture.html` | A playing video through `importExternalTexture` (120 frames), `copyExternalImageToTexture` and `requestVideoFrameCallback` |
+| `webgl-and-webgpu.html` | A WebGL and a WebGPU canvas drawn every frame and read back: blending and geometry stay right while both drivers (ps5-opengl, RADV) submit; `?webgpu=0` is WebGL alone |
 | `ml-transformers.html` | transformers.js (ONNX Runtime Web) with a 90 MB sentence-embedding model: WebAssembly as the reference, then WebGPU fp32 and fp16 compared with it; times logged. Needs the network, see below |
 
 The comment at the top of each page lists its cases and what should be on

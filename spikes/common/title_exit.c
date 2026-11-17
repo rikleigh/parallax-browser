@@ -18,9 +18,19 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <errno.h>
+#include <time.h>
 
 #include "title.h"
 #include "psvr2/psvr2.h"
+
+/* 100 ms, all of it: a signal (ps5browser's stall samples) cuts usleep short. */
+static void sleep100ms(void)
+{
+    struct timespec left = { 0, 100 * 1000 * 1000 };
+    while (nanosleep(&left, &left) && errno == EINTR)
+        ;
+}
 
 #define LAUNCHER_PORT 9031
 
@@ -52,7 +62,7 @@ static void ask_launcher_to_kill_us(void)
         spike_log_flush(500);
         if (write(fd, cmd, strlen(cmd)) == (ssize_t)strlen(cmd))
             for (int i = 0; i < 30; i++)
-                usleep(100 * 1000);
+                sleep100ms();
     }
     close(fd);
 }
@@ -70,13 +80,13 @@ void catchReturnFromMain(int status)
         fflush(stderr);
         spike_log_flush(500);
         for (int i = 0; i < 100; i++)
-            usleep(100 * 1000); /* the helper's SIGKILL comes in this time */
+            sleep100ms(); /* the helper's SIGKILL comes in this time */
         spike_log("the restart helper did not close the title in 10 s");
     }
     ask_launcher_to_kill_us();
     spike_log("no launcher; closing the title through sceShellCoreUtilExitApp");
     if (psvr2_exit_app() == 0)
         for (int i = 0; i < 20; i++)
-            usleep(100 * 1000); /* ShellUI ends a GPU-free title in this time */
+            sleep100ms(); /* ShellUI ends a GPU-free title in this time */
     spike_log("ShellUI did not close the title; leaving through exit()");
 }
