@@ -261,7 +261,7 @@ static void apply(gboolean announce)
         spike_log("gamepad: mode %s for %s", on ? "on" : "off", host ? host : "(no site)");
     gboolean changed = on != modeOn;
     modeOn = on;
-    if (changed) /* full screen while it is on */
+    if (changed) /* the bar's Gamepad mode button */
         ps5wk_browser_layout_changed();
 }
 

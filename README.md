@@ -82,7 +82,7 @@ The bar (Back, Forward, the address, Bookmark, Settings and the rest) stays
 above the page. Move the pointer up onto a button and press X to use it
 without opening the menu. To hide the bar, choose the full screen button (the
 four corners). The browser remembers that choice. It also hides the bar by
-itself in gamepad mode and while a video is in full screen.
+itself while a video is in full screen. Gamepad mode leaves the bar as it is.
 
 | Button | In VR |
 | --- | --- |

@@ -62,7 +62,7 @@ typedef struct {
     /* Safer browsing on (no JIT, WebAssembly or WebGL): the shield filled */
     gboolean saferOn;
     /* full screen chosen (the address bar hidden); fullScreenWhy: why the
-     * page is in full screen without it ("gamepad mode", "a video"), or NULL */
+     * page is in full screen without it ("the page": a video), or NULL */
     gboolean fullScreen;
     const char* fullScreenWhy;
     const char* title;

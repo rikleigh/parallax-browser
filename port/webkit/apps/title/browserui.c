@@ -22,9 +22,9 @@
  *   - the bar above the page (the page is laid out below it,
  *     wpe_display_ps5_set_page_top): the menu's bar, its buttons picked
  *     with the pointer (it goes up over the bar) and X or the touchpad
- *   - full screen (the menu's full screen button, kept; also by itself in
- *     gamepad mode and while a page's element is in full screen, e.g. a
- *     video): the page fills the screen; while a page loads, a bar at the
+ *   - full screen (the menu's full screen button, kept; also by itself
+ *     while a page's element is in full screen, e.g. a video; gamepad mode
+ *     leaves the bar as it is): the page fills the screen; while a page loads, a bar at the
  *     top with its title, address and progress, gone 1.5 s after the load
  *     ends
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
@@ -1224,8 +1224,6 @@ static const char* fullScreenWhy(void)
 {
     if (videoFullScreen)
         return "the page";
-    if (ps5wk_gamepad_active())
-        return "gamepad mode";
     return NULL;
 }
 
@@ -1459,8 +1457,7 @@ static void updateLayout(void)
         return;
     const int top = fullScreenNow() ? 0 : bui_bar_height();
     if (top != wpe_display_ps5_get_page_top(display)) {
-        const char* why = fullScreenWhy();
-        spike_log("browser: %s", top ? "the bar above the page" : fullScreenChoice() ? "full screen" : why && !strcmp(why, "gamepad mode") ? "full screen for gamepad mode" : "full screen for the page");
+        spike_log("browser: %s", top ? "the bar above the page" : fullScreenChoice() ? "full screen" : "full screen for the page");
         wpe_display_ps5_set_page_top(display, top);
     }
     redraw();
