@@ -34,8 +34,9 @@ build dir links RADV in. WebKit side, patches 0109 to 0125:
   pixels (`CopyTextureToBuffer` + `MapAsync`) and becomes a texture in the
   title's WC scene through the WebGL layer registry (`PS5WebGPUCanvas`).
   Readback (`toDataURL`, `drawImage`) is a sync message with shared memory.
-- Setting: "WebGPU (experimental)", off by default, off with Safer browsing
-  (`/data/ps5webkit/webgpu-on`). Switching it on takes effect in pages that
+- Setting: "WebGPU", on by default from 0.2.0 (before: "WebGPU
+  (experimental)", off unless `/data/ps5webkit/webgpu-on`), off with Safer
+  browsing or `/data/ps5webkit/no-webgpu`. Switching it on takes effect in pages that
   are already open (0114).
 - Memory budget (0120): buffers and textures are counted, 1536 MB for the
   title (`/data/ps5webkit/webgpu-budget-mb` to change it); over it the page

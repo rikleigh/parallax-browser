@@ -3,7 +3,7 @@
 # RESULT lines.
 #   [TITLE=PPSA99208] port/webkit/test/webgpu/run-console.sh [page ...]     (default: the five headless pages)
 # Needs: the pages uploaded to /data/ps5webkit/webgpu/ (README.md), the
-# browser running with WebGPU on (Settings, or /data/ps5webkit/webgpu-on),
+# browser running with WebGPU on (the default; not with /data/ps5webkit/no-webgpu or Safer browsing),
 # and tools/logserver.sh listening (page console lines reach it through the
 # title's log). Each page gets WAIT seconds (default 60) to print its summary.
 # QUERY is added to each page's URL (ml-transformers: QUERY="models=http://<mac>:8765/").

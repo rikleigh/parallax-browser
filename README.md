@@ -18,6 +18,9 @@ play the video on a page in the PS VR2 headset.
 - WPE WebKit with GPU compositing and async scrolling. JavaScriptCore and
   WebAssembly run with the JIT.
 - WebGL 1 and 2 on the PS5's GPU, including video drawn into WebGL.
+- WebGPU on the PS5's GPU, with WGSL shaders, compute and video as a
+  texture. It's on by default; Settings can turn it off, and sites then fall
+  back to WebGL where they can.
 - Hardware video decoding on the console's decoder, for H.264, HEVC and
   VP9 up to 8K, including HLS streams.
 - Audio in AAC, MP3, Opus, Vorbis in Ogg and WebM, and FLAC, with the Web
@@ -80,9 +83,10 @@ To open Settings, press Options, then choose ⚙.
 
 The bar (Back, Forward, the address, Bookmark, Settings and the rest) stays
 above the page. Move the pointer up onto a button and press X to use it
-without opening the menu. To hide the bar, choose the full screen button (the
-four corners). The browser remembers that choice. It also hides the bar by
-itself while a video is in full screen. Gamepad mode leaves the bar as it is.
+without opening the menu. The tab count opens the list of tabs. To hide
+the bar, choose the full screen button (the four corners). The browser
+remembers that choice. It also hides the bar by itself while a video is in
+full screen. Gamepad mode leaves the bar as it is.
 
 | Button | In VR |
 | --- | --- |
@@ -186,11 +190,11 @@ that title with your homebrew tool. Your data in `/data/ps5webkit` stays.
 
   Browse sites you trust and keep ad blocking on. For any other site, turn
   on Safer browsing with the shield button in the menu, or in Settings. It
-  turns off the JavaScript JIT, WebAssembly and WebGL, where most exploits
-  start, and runs pages in a separate process (the browser restarts to
-  switch). Scripts then run several times slower, and some games and 3D
-  sites won't work. Don't sign in to accounts that matter on the PS5, and
-  don't import cookies from another browser.
+  turns off the JavaScript JIT, WebAssembly, WebGL and WebGPU, where most
+  exploits start, and runs pages in a separate process (the browser
+  restarts to switch). Scripts then run several times slower, and some
+  games and 3D sites won't work. Don't sign in to accounts that matter on
+  the PS5, and don't import cookies from another browser.
 
   If the console behaves oddly after you visit a site, reboot it before
   you run the jailbreak again. Then check `/data/homebrew` and etaHEN's

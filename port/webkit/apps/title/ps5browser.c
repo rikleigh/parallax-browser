@@ -1512,14 +1512,15 @@ static gboolean restartPageOnMain(gpointer data)
 
 /* Safer browsing, WebGL and WebGPU (settings.c; README: "Security"). safer-browsing
  * turns the JavaScript JIT and WebAssembly off in every WebProcess that
- * starts (ps5wk-child.cpp configureJIT) and WebGL and WebGPU off here; no-webgl turns
- * WebGL off alone. WebGL is one WebKitSettings, shared by every tab
+ * starts (ps5wk-child.cpp configureJIT) and WebGL and WebGPU off here; no-webgl
+ * and no-webgpu turn WebGL or WebGPU off alone. WebGL is one WebKitSettings, shared by every tab
  * (private ones too): it applies to pages loaded from then on. */
 #define SAFER_BROWSING_FLAG "/data/ps5webkit/safer-browsing"
 #define NO_WEBGL_FLAG "/data/ps5webkit/no-webgl"
-/* WebGPU (Dawn on RADV, spikes/12-webgpu): off unless this file is there,
- * and off with Safer browsing whatever it says. */
-#define WEBGPU_ON_FLAG "/data/ps5webkit/webgpu-on"
+/* WebGPU (Dawn on RADV, spikes/12-webgpu): on unless this file is there
+ * (on by default from 0.2.0; before, a webgpu-on file turned it on), and
+ * off with Safer browsing whatever it says. */
+#define NO_WEBGPU_FLAG "/data/ps5webkit/no-webgpu"
 void ps5wk_gpu_submit_lock(void) __attribute__((weak));
 static gboolean saferBrowsing;
 
@@ -1546,7 +1547,7 @@ static void applyWebContentSettings(void)
      * build without Dawn (no titleradv.c, which defines
      * ps5wk_gpu_submit_lock) it stays off: on, pages would find a
      * navigator.gpu with nothing behind it and not fall back to WebGL. */
-    gboolean webgpu = !saferBrowsing && flagFile(WEBGPU_ON_FLAG) && ps5wk_gpu_submit_lock;
+    gboolean webgpu = !saferBrowsing && !flagFile(NO_WEBGPU_FLAG) && ps5wk_gpu_submit_lock;
     WebKitFeatureList* features = settings ? webkit_settings_get_all_features() : NULL;
     WebKitFeature* feature = features ? webkit_feature_list_find(features, "WebGPU") : NULL;
     if (feature && webkit_settings_get_feature_enabled(settings, feature) != webgpu) {
