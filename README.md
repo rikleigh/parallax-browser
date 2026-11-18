@@ -1,7 +1,16 @@
 # Parallax Browser
 
-A homebrew web browser for a jailbroken PS5, built on WPE WebKit. It can
-play the video on a page in the PS VR2 headset.
+A homebrew web browser for a jailbroken PS5 that aims to make the console a
+first-class place for the modern web. It's built on WPE WebKit.
+
+- **Fast:** JavaScriptCore and WebAssembly run with the JIT, and pages are
+  composited and scrolled on the GPU.
+- **Standards first:** WebGL 2, WebGPU, Web Audio, the Gamepad API and
+  multi-threaded WebAssembly, on the PS5's own hardware.
+- **Made for media:** H.264, HEVC and VP9 are decoded in hardware up to 8K,
+  including HLS streams.
+- **VR:** press R3 on a page's video to watch it in the PS VR2, in 180°,
+  360° or 3D.
 
 <p align="center"><img src="port/webkit/runtime/parallax-logo.png" width="160" alt="Parallax Browser logo"></p>
 
