@@ -19,6 +19,12 @@
  * other files in /data/ps5webkit are never touched, and files an older
  * runtime had are left where they are.
  *
+ * Every folder and file is open to all (0777, 0666), like the rest of
+ * /data/ps5webkit: the title runs as its own uid, and FTP on the console,
+ * which runs as another and gets no root override, couldn't delete what
+ * was in a 0755 folder the title made (GitHub issue 2). Folders an older
+ * title made 0755 are opened at every start, up to date or not.
+ *
  * Main thread, right after the unjail, before anything reads the files.
  */
 #define SPIKE_NAME "ps5browser"
@@ -62,13 +68,14 @@ static void copyFile(const char* from, const char* to, CopyState* state)
         return;
     }
     char* tmp = g_strconcat(to, ".tmp", NULL);
-    int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out < 0) {
         fail(state, "create", tmp);
         close(in);
         g_free(tmp);
         return;
     }
+    fchmod(out, 0666);
     gboolean ok = TRUE;
     for (;;) {
         ssize_t n = read(in, buffer, sizeof buffer);
@@ -112,41 +119,96 @@ static void copyFile(const char* from, const char* to, CopyState* state)
     g_free(tmp);
 }
 
-/* Every file runtime-files.txt names, from RUNTIME_FROM to RUNTIME_TO. */
-static void copyListed(CopyState* state)
+/* runtime-files.txt as lines, stripped, or NULL. */
+static char** readList(void)
 {
     char* listPath = g_build_filename(RUNTIME_FROM, RUNTIME_LIST, NULL);
     char* list = NULL;
-    if (!g_file_get_contents(listPath, &list, NULL, NULL)) {
-        fail(state, "read", listPath);
-        g_free(listPath);
-        return;
-    }
+    gboolean read = g_file_get_contents(listPath, &list, NULL, NULL);
     g_free(listPath);
+    if (!read)
+        return NULL;
     char** lines = g_strsplit(list, "\n", -1);
     g_free(list);
+    for (char** line = lines; *line; line++)
+        g_strstrip(*line);
+    return lines;
+}
+
+/* Relative paths inside the runtime only. */
+static gboolean listedPathOK(const char* name)
+{
+    return name[0] != '/' && !strstr(name, "..");
+}
+
+/* The folders of relative (a path under RUNTIME_TO), each made if missing
+ * and opened to all; done holds the ones already seen. */
+static int openFolders(const char* relative, GHashTable* done)
+{
+    char* path = g_build_filename(RUNTIME_TO, relative, NULL);
+    size_t base = strlen(RUNTIME_TO) + 1;
+    int result = 0;
+    for (char* cut = path + base;; cut++) {
+        if (*cut && *cut != '/')
+            continue;
+        char saved = *cut;
+        *cut = 0;
+        if (!g_hash_table_contains(done, path)) {
+            if (mkdir(path, 0777) && errno != EEXIST) {
+                result = errno;
+                *cut = saved;
+                break;
+            }
+            chmod(path, 0777);
+            g_hash_table_add(done, g_strdup(path));
+        }
+        *cut = saved;
+        if (!saved)
+            break;
+    }
+    g_free(path);
+    errno = result;
+    return result ? -1 : 0;
+}
+
+/* Every listed file's folders, and the fontconfig cache's, made and opened
+ * to all. Fontconfig writes its cache there; FTP copies and zips drop empty
+ * folders. */
+static void openAllFolders(char** lines, CopyState* state)
+{
+    GHashTable* done = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     for (char** line = lines; *line && !state->error; line++) {
-        const char* name = g_strstrip(*line);
+        const char* name = *line;
+        if (!*name || !listedPathOK(name))
+            continue;
+        char* parent = g_path_get_dirname(name);
+        if (strcmp(parent, ".") && openFolders(parent, done))
+            fail(state, "mkdir", parent);
+        g_free(parent);
+    }
+    if (!state->error && openFolders("cache/fontconfig", done))
+        fail(state, "mkdir", RUNTIME_TO "/cache/fontconfig");
+    g_hash_table_destroy(done);
+}
+
+/* Every file runtime-files.txt names, from RUNTIME_FROM to RUNTIME_TO. */
+static void copyListed(char** lines, CopyState* state)
+{
+    for (char** line = lines; *line && !state->error; line++) {
+        const char* name = *line;
         if (!*name)
             continue;
-        /* Relative paths inside the runtime only. */
-        if (name[0] == '/' || strstr(name, "..")) {
+        if (!listedPathOK(name)) {
             errno = EINVAL;
             fail(state, "refused", name);
             break;
         }
         char* source = g_build_filename(RUNTIME_FROM, name, NULL);
         char* target = g_build_filename(RUNTIME_TO, name, NULL);
-        char* parent = g_path_get_dirname(target);
-        if (g_mkdir_with_parents(parent, 0755))
-            fail(state, "mkdir", parent);
-        else
-            copyFile(source, target, state);
-        g_free(parent);
+        copyFile(source, target, state);
         g_free(source);
         g_free(target);
     }
-    g_strfreev(lines);
 }
 
 static char* readStamp(const char* dir)
@@ -171,8 +233,15 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
         return 0;
     }
     char* installed = readStamp(RUNTIME_TO);
+    char** lines = readList();
     if (installed && !strcmp(installed, bundled)) {
-        spike_log("runtime: %s is up to date (%s)", RUNTIME_TO, bundled);
+        /* Folders an older title made 0755 (issue 2). */
+        CopyState opened = { 0 };
+        if (lines)
+            openAllFolders(lines, &opened);
+        spike_log("runtime: %s is up to date (%s)%s%s", RUNTIME_TO, bundled, opened.error ? "; couldn't open " : "",
+            opened.error ? opened.failed : "");
+        g_strfreev(lines);
         g_free(installed);
         g_free(bundled);
         return 0;
@@ -181,13 +250,14 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
         installed ? installed : "none");
     gint64 start = g_get_monotonic_time();
     CopyState state = { 0 };
-    if (g_mkdir_with_parents(RUNTIME_TO, 0755))
+    if (!lines)
+        fail(&state, "read", RUNTIME_FROM "/" RUNTIME_LIST);
+    else if (g_mkdir_with_parents(RUNTIME_TO, 0777))
         fail(&state, "mkdir", RUNTIME_TO);
-    else
-        copyListed(&state);
-    /* Fontconfig writes its cache here; FTP copies and zips drop empty folders. */
-    if (!state.error && g_mkdir_with_parents(RUNTIME_TO "/cache/fontconfig", 0755))
-        fail(&state, "mkdir", RUNTIME_TO "/cache/fontconfig");
+    else {
+        openAllFolders(lines, &state);
+        copyListed(lines, &state);
+    }
     if (!state.error) {
         char* from = g_build_filename(RUNTIME_FROM, RUNTIME_STAMP, NULL);
         char* to = g_build_filename(RUNTIME_TO, RUNTIME_STAMP, NULL);
@@ -206,6 +276,7 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
         spike_log("runtime: installed %u files, %.1f MB, in %.0f ms", state.files, state.bytes / 1048576.0, ms);
         result = (int)state.files;
     }
+    g_strfreev(lines);
     g_free(installed);
     g_free(bundled);
     return result;
