@@ -1,7 +1,6 @@
 /* ps5zip.c: unpacking a release zip; see ps5zip.h. */
 #include "ps5zip.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -26,6 +25,10 @@ typedef struct {
     int directory;
 } Entry;
 
+/* Set by a failure that isn't the archive's (memory, reading it, writing
+ * the files): ps5zip_extract returns -2 for those. One unpack at a time. */
+static int localFailure;
+
 static void fail(char* error, size_t size, const char* format, ...)
 {
     if (!error || !size)
@@ -35,6 +38,8 @@ static void fail(char* error, size_t size, const char* format, ...)
     vsnprintf(error, size, format, args);
     va_end(args);
 }
+
+#define failLocal(...) (localFailure = 1, fail(__VA_ARGS__))
 
 static unsigned u16(const unsigned char* p)
 {
@@ -158,14 +163,14 @@ static int extractOne(int fd, const Entry* e, uint64_t dataEnd, const char* dest
         return -1;
     }
     if (makeFolders(dest, relative, 0)) {
-        fail(error, errorSize, "%s: its folder couldn't be made (errno %d)", relative, errno);
+        failLocal(error, errorSize, "%s: its folder couldn't be made (errno %d)", relative, errno);
         return -1;
     }
     char path[2048];
     snprintf(path, sizeof path, "%s/%s", dest, relative);
     int outFd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0777);
     if (outFd < 0) {
-        fail(error, errorSize, "%s couldn't be created (errno %d)", relative, errno);
+        failLocal(error, errorSize, "%s couldn't be created (errno %d)", relative, errno);
         return -1;
     }
     fchmod(outFd, 0777);
@@ -176,7 +181,7 @@ static int extractOne(int fd, const Entry* e, uint64_t dataEnd, const char* dest
     memset(&z, 0, sizeof z);
     if (e->method == 8 && inflateInit2(&z, -MAX_WBITS) != Z_OK) {
         close(outFd);
-        fail(error, errorSize, "%s: inflate couldn't start", relative);
+        failLocal(error, errorSize, "%s: inflate couldn't start", relative);
         return -1;
     }
     int ended = 0;
@@ -184,14 +189,14 @@ static int extractOne(int fd, const Entry* e, uint64_t dataEnd, const char* dest
         size_t want = e->compressed - read > CHUNK ? CHUNK : (size_t)(e->compressed - read);
         if (want && readAt(fd, in, want, start + read)) {
             ok = 0;
-            fail(error, errorSize, "%s: read failed", relative);
+            failLocal(error, errorSize, "%s: read failed", relative);
             break;
         }
         read += want;
         if (e->method == 0) {
             if (writeAll(outFd, in, want)) {
                 ok = 0;
-                fail(error, errorSize, "%s: write failed (errno %d)", relative, errno);
+                failLocal(error, errorSize, "%s: write failed (errno %d)", relative, errno);
                 break;
             }
             crc = crc32(crc, in, (uInt)want);
@@ -219,7 +224,7 @@ static int extractOne(int fd, const Entry* e, uint64_t dataEnd, const char* dest
                 }
                 if (got && writeAll(outFd, out, got)) {
                     ok = 0;
-                    fail(error, errorSize, "%s: write failed (errno %d)", relative, errno);
+                    failLocal(error, errorSize, "%s: write failed (errno %d)", relative, errno);
                     break;
                 }
                 crc = crc32(crc, out, (uInt)got);
@@ -242,7 +247,7 @@ static int extractOne(int fd, const Entry* e, uint64_t dataEnd, const char* dest
         inflateEnd(&z);
     if (close(outFd) && ok) {
         ok = 0;
-        fail(error, errorSize, "%s: close failed (errno %d)", relative, errno);
+        failLocal(error, errorSize, "%s: close failed (errno %d)", relative, errno);
     }
     if (ok && (written != e->size || crc != e->crc)) {
         ok = 0;
@@ -255,10 +260,11 @@ static int extractOne(int fd, const Entry* e, uint64_t dataEnd, const char* dest
 int ps5zip_extract(const char* archive, const char* prefix, const char* dest, unsigned maxEntries, uint64_t maxBytes,
     ps5zip_progress_fn progress, void* data, char* error, size_t errorSize)
 {
+    localFailure = 0;
     int fd = open(archive, O_RDONLY);
     if (fd < 0) {
-        fail(error, errorSize, "the archive couldn't be opened (errno %d)", errno);
-        return -1;
+        failLocal(error, errorSize, "the archive couldn't be opened (errno %d)", errno);
+        return -2;
     }
     struct stat st;
     unsigned char* cd = NULL;
@@ -276,7 +282,7 @@ int ps5zip_extract(const char* archive, const char* prefix, const char* dest, un
     unsigned char* tail = malloc(tailLength);
     if (!tail || readAt(fd, tail, tailLength, size - tailLength)) {
         free(tail);
-        fail(error, errorSize, "the archive couldn't be read");
+        failLocal(error, errorSize, "the archive couldn't be read");
         goto done;
     }
     long eocd = -1;
@@ -310,7 +316,7 @@ int ps5zip_extract(const char* archive, const char* prefix, const char* dest, un
     cd = malloc(cdSize ? cdSize : 1);
     entries = calloc(count, sizeof *entries);
     if (!cd || !entries || readAt(fd, cd, cdSize, cdOffset)) {
-        fail(error, errorSize, "the archive's directory couldn't be read");
+        failLocal(error, errorSize, "the archive's directory couldn't be read");
         goto done;
     }
     size_t prefixLength = strlen(prefix);
@@ -394,7 +400,7 @@ int ps5zip_extract(const char* archive, const char* prefix, const char* dest, un
     /* Duplicates (a folder and its trailing-slash twin count once each). */
     Entry* sorted = malloc(count * sizeof *sorted);
     if (!sorted) {
-        fail(error, errorSize, "out of memory");
+        failLocal(error, errorSize, "out of memory");
         goto done;
     }
     memcpy(sorted, entries, count * sizeof *sorted);
@@ -411,7 +417,7 @@ int ps5zip_extract(const char* archive, const char* prefix, const char* dest, un
     in = malloc(CHUNK);
     out = malloc(CHUNK);
     if (!in || !out) {
-        fail(error, errorSize, "out of memory");
+        failLocal(error, errorSize, "out of memory");
         goto done;
     }
     uint64_t written = 0;
@@ -426,7 +432,7 @@ int ps5zip_extract(const char* archive, const char* prefix, const char* dest, un
             continue; /* the prefix folder itself */
         if (e->directory) {
             if (makeFolders(dest, relative, 1)) {
-                fail(error, errorSize, "%s: the folder couldn't be made (errno %d)", relative, errno);
+                failLocal(error, errorSize, "%s: the folder couldn't be made (errno %d)", relative, errno);
                 goto done;
             }
             continue;
@@ -441,31 +447,5 @@ done:
     free(entries);
     free(cd);
     close(fd);
-    return result;
-}
-
-int ps5zip_remove_tree(const char* path)
-{
-    struct stat st;
-    if (lstat(path, &st))
-        return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode))
-        return unlink(path);
-    DIR* dir = opendir(path);
-    if (!dir)
-        return -1;
-    int result = 0;
-    struct dirent* d;
-    while ((d = readdir(dir))) {
-        if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
-            continue;
-        char child[2048];
-        int n = snprintf(child, sizeof child, "%s/%s", path, d->d_name);
-        if (n < 0 || (size_t)n >= sizeof child || ps5zip_remove_tree(child))
-            result = -1;
-    }
-    closedir(dir);
-    if (rmdir(path))
-        result = -1;
-    return result;
+    return result && localFailure ? -2 : result;
 }

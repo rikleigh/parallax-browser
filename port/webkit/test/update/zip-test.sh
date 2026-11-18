@@ -8,12 +8,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../../.." && pwd)"
 title="${1:-$root/toolchain/wpe-webkit/titles/PPSA99207}"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
 cc -O2 -Wall -Wextra -o "$work/zip-test" "$here/zip-test.c" "$root/port/webkit/apps/common/ps5zip.c" -lz
 fails=0
-check() { # expect name archive [prefix]
+check() { # expect name archive [prefix] [readonly]
     local expect="$1" name="$2" archive="$3" prefix="${4:-PPSA99207/}"
+    chmod -R u+w "$work/out" 2>/dev/null || true
     rm -rf "$work/out" && mkdir "$work/out"
+    [[ -z ${5:-} ]] || chmod 0555 "$work/out"
     local got
     got="$("$work/zip-test" "$archive" "$prefix" "$work/out" || true)"
     if [[ "$got" == "$expect"* ]]; then echo "PASS $name: $got"; else echo "FAIL $name: $got (expected $expect)"; fails=$((fails + 1)); fi
@@ -82,4 +84,5 @@ check REFUSED "an entry twice" "$work/dup.zip"
 check REFUSED "a CRC that doesn't match" "$work/crc.zip"
 check REFUSED "not a zip" "$work/notzip.zip"
 check REFUSED "another title's prefix" "$work/good.zip" "PPSA00001/"
+check FAILED "a folder that can't be written to (not the archive's fault)" "$work/good.zip" PPSA99207/ readonly
 [ "$fails" = 0 ] && echo "zip-test: all passed" || { echo "zip-test: $fails failed"; exit 1; }

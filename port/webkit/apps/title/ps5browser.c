@@ -104,6 +104,11 @@ static gint64 startedAt; /* Unix seconds: the settings page sees a restart */
  * media test run left the console wedged.) */
 #define PS5WK_CONTROL_SOCKET "/system_tmp/ps5wk/ps5browser-control.sock"
 static gint64 windDownStart;
+
+gboolean ps5wk_browser_winding_down(void)
+{
+    return windDownStart != 0;
+}
 /* Pages in the browser process (main, setUpInTitleWeb): the first WebProcess
  * runs in the title. */
 static int inTitleWeb;
@@ -1677,6 +1682,7 @@ static gboolean relaunchFailedOnMain(gpointer data)
 {
     (void)data;
     unlink(PS5WK_PENDING_URL);
+    ps5wk_updates_restart_failed();
     ps5wk_settings_set_status("The browser couldn't restart itself. Close it and start it again from the home screen.");
     wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), "The browser couldn't restart itself: close it and start it again", 5);
     return G_SOURCE_REMOVE;

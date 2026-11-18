@@ -48,6 +48,8 @@
 
 #include <ps5/kernel.h>
 
+#include "../common/ps5update.h"
+
 #define LOG_PATH "/data/ps5webkit/relaunch.log"
 
 typedef struct {
@@ -73,10 +75,12 @@ typedef struct {
 } app_info_t;
 int sceKernelGetAppInfo(pid_t pid, app_info_t* info);
 
-#define UPDATE_DIR "/data/ps5webkit/update"
-#define UPDATE_RESULT UPDATE_DIR "/last-install.txt"
-#define STORE_ROOT "/data/prosperostore"
+#define UPDATE_RESULT PS5UPDATE_WORK "/last-install.txt"
+#ifdef PS5WK_UPDATE_TESTING
+/* A development build only: a folder in place of ProsperoStore's
+ * (UPDATES.md, "Testing"). */
 #define STORE_ROOT_TEST "/data/ps5webkit/update-store-root"
+#endif
 
 static FILE* logFile;
 static int titleConnected = 1;
@@ -135,96 +139,6 @@ static int launch(const char* title)
 }
 
 /* ---- updates ---- */
-
-static int readSmall(const char* path, char* buffer, size_t size)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return -1;
-    ssize_t n = read(fd, buffer, size - 1);
-    close(fd);
-    if (n < 0 || (size_t)n >= size - 1)
-        return -1;
-    buffer[n] = 0;
-    return 0;
-}
-
-/* key=value lines (ready.txt). */
-static int lineValue(const char* text, const char* key, char* out, size_t size)
-{
-    size_t length = strlen(key);
-    for (const char* line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
-        if (!strncmp(line, key, length) && line[length] == '=') {
-            const char* value = line + length + 1;
-            size_t n = strcspn(value, "\r\n");
-            if (n >= size)
-                return -1;
-            memcpy(out, value, n);
-            out[n] = 0;
-            return 0;
-        }
-    }
-    return -1;
-}
-
-/* "key": "value" in a small JSON object with plain string values (param.json,
- * ProsperoStore's receipt and journal): enough for the fields compared. */
-static int jsonValue(const char* text, const char* key, char* out, size_t size)
-{
-    char quoted[64];
-    snprintf(quoted, sizeof quoted, "\"%s\"", key);
-    const char* p = strstr(text, quoted);
-    if (!p)
-        return -1;
-    p += strlen(quoted);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-        p++;
-    if (*p++ != ':')
-        return -1;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-        p++;
-    if (*p++ != '"')
-        return -1;
-    size_t n = 0;
-    while (p[n] && p[n] != '"' && p[n] != '\\')
-        n++;
-    if (p[n] != '"' || n >= size)
-        return -1;
-    memcpy(out, p, n);
-    out[n] = 0;
-    return 0;
-}
-
-static int paramOf(const char* folder, char* title, size_t titleSize, char* version, size_t versionSize)
-{
-    char path[512], text[16384];
-    snprintf(path, sizeof path, "%s/sce_sys/param.json", folder);
-    return readSmall(path, text, sizeof text) || jsonValue(text, "titleId", title, titleSize) || jsonValue(text, "contentVersion", version, versionSize) ? -1 : 0;
-}
-
-static int removeTree(const char* path)
-{
-    struct stat st;
-    if (lstat(path, &st))
-        return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode))
-        return unlink(path);
-    DIR* dir = opendir(path);
-    if (!dir)
-        return -1;
-    int result = 0;
-    struct dirent* d;
-    while ((d = readdir(dir))) {
-        if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
-            continue;
-        char child[1024];
-        snprintf(child, sizeof child, "%s/%s", path, d->d_name);
-        if (removeTree(child))
-            result = -1;
-    }
-    closedir(dir);
-    return rmdir(path) ? -1 : result;
-}
 
 static int copyFile(const char* from, const char* to)
 {
@@ -303,80 +217,75 @@ static void installResult(const char* text)
     }
 }
 
-/* NULL, or why the update must not be installed now. */
+/* NULL, or why the update must not be installed now: the job's checks
+ * again (ps5update.c, the same code), now that the title is gone. */
 static const char* updateRefusal(const char* title, const char* install, const char* running)
 {
     static char why[256];
-    char storeRoot[256] = STORE_ROOT, text[16384], value[1024];
-    if (!readSmall(STORE_ROOT_TEST, storeRoot, sizeof storeRoot))
-        storeRoot[strcspn(storeRoot, "\r\n")] = 0;
+    char storeRoot[256] = PS5UPDATE_STORE_ROOT;
+#ifdef STORE_ROOT_TEST
+    char* test = ps5update_read(STORE_ROOT_TEST, sizeof storeRoot - 1);
+    if (test) {
+        test[strcspn(test, "\r\n")] = 0;
+        if (*test)
+            snprintf(storeRoot, sizeof storeRoot, "%s", test);
+        free(test);
+    }
+#endif
     char id[16], version[16];
-    if (paramOf(install, id, sizeof id, version, sizeof version) || strcmp(id, title))
+    if (ps5update_param(install, id, sizeof id, version, sizeof version) || strcmp(id, title))
         return "the installed folder no longer holds the browser";
     if (strcmp(version, running)) {
         snprintf(why, sizeof why, "the installed version changed (%s, not %s)", version, running);
         return why;
     }
-    char path[512];
-    snprintf(path, sizeof path, "%s/journal.json", storeRoot);
-    if (!readSmall(path, text, sizeof text) && !jsonValue(text, "titleId", value, sizeof value) && !strcmp(value, title))
+    ps5update_store store;
+    ps5update_store_check(storeRoot, title, install, &store);
+    say("update: ProsperoStore (%s): %s", storeRoot, store.note);
+    if (store.busy)
         return "ProsperoStore has an operation on the browser in progress";
-    snprintf(path, sizeof path, "%s/receipts/%s.json", storeRoot, title);
-    char location[1024], receiptVersion[16];
-    if (!readSmall(path, text, sizeof text) && !jsonValue(text, "titleId", value, sizeof value) && !strcmp(value, title)
-        && !jsonValue(text, "location", location, sizeof location) && !jsonValue(text, "contentVersion", receiptVersion, sizeof receiptVersion)) {
-        char target[1100];
-        snprintf(target, sizeof target, "%s/%s", location, title);
-        if (!strcmp(target, install) && !strcmp(receiptVersion, version))
-            return "ProsperoStore manages this install";
-    }
+    if (store.managed)
+        return "ProsperoStore manages this install";
     return NULL;
 }
 
 #define MAX_ENTRIES 256
 
 /* Once the title is gone: the release's top-level entries in place of the
- * install's. 0, or -1 (nothing changed, or every move undone). */
-static int installUpdate(const char* title, const char* staging)
+ * install's. NULL (installed), or why not (nothing changed, or every move
+ * undone). version gets the release's version. */
+static const char* installSteps(const char* title, const char* staging, char* version, size_t versionSize)
 {
-    char readyPath[512], ready[4096];
-    char version[32], contentVersion[16], running[16], install[512];
+    static char why[320];
+    char readyPath[512], contentVersion[16], running[16], install[512];
     snprintf(readyPath, sizeof readyPath, "%s/ready.txt", staging);
-    if (readSmall(readyPath, ready, sizeof ready) || lineValue(ready, "version", version, sizeof version)
-        || lineValue(ready, "content-version", contentVersion, sizeof contentVersion) || lineValue(ready, "running", running, sizeof running)
-        || lineValue(ready, "install", install, sizeof install)) {
-        say("update: %s is missing or incomplete: not installed", readyPath);
-        installResult("failed the update's files are incomplete\n");
-        return -1;
+    char* ready = ps5update_read(readyPath, 4096);
+    int complete = ready && !ps5update_line_value(ready, "version", version, versionSize)
+        && !ps5update_line_value(ready, "content-version", contentVersion, sizeof contentVersion)
+        && !ps5update_line_value(ready, "running", running, sizeof running) && !ps5update_line_value(ready, "install", install, sizeof install);
+    free(ready);
+    if (!complete) {
+        say("update: %s is missing or incomplete", readyPath);
+        return "the update's files are incomplete";
     }
     char app[600], id[16], stagedVersion[16];
     snprintf(app, sizeof app, "%s/%s", staging, title);
     const char* refusal = updateRefusal(title, install, running);
-    if (!refusal && (paramOf(app, id, sizeof id, stagedVersion, sizeof stagedVersion) || strcmp(id, title) || strcmp(stagedVersion, contentVersion)))
-        refusal = "the unpacked release isn't the expected version";
-    if (refusal) {
-        say("update to %s not installed: %s", version, refusal);
-        char text[320];
-        snprintf(text, sizeof text, "failed %s\n", refusal);
-        installResult(text);
-        removeTree(staging);
-        unlink(UPDATE_DIR "/staged.txt");
-        return -1;
-    }
+    if (refusal)
+        return refusal;
+    if (ps5update_param(app, id, sizeof id, stagedVersion, sizeof stagedVersion) || strcmp(id, title) || strcmp(stagedVersion, contentVersion))
+        return "the unpacked release isn't the expected version";
     /* <staging>/../previous: the old files, kept until the next update. */
     char previous[600];
     snprintf(previous, sizeof previous, "%s", staging);
     char* slash = strrchr(previous, '/');
-    if (!slash) {
-        installResult("failed the staging folder is odd\n");
-        return -1;
-    }
+    if (!slash || slash == previous)
+        return "the staging folder is odd";
     snprintf(slash, sizeof previous - (size_t)(slash - previous), "/previous");
-    removeTree(previous);
+    ps5update_remove_tree(previous);
     if (mkdir(previous, 0777) && errno != EEXIST) {
-        say("update: %s couldn't be made (errno %d)", previous, errno);
-        installResult("failed the folder for the old version couldn't be made\n");
-        return -1;
+        snprintf(why, sizeof why, "the folder for the old version couldn't be made (errno %d)", errno);
+        return why;
     }
     static char names[MAX_ENTRIES][256];
     int count = 0;
@@ -387,18 +296,14 @@ static int installUpdate(const char* title, const char* staging)
             continue;
         if (count == MAX_ENTRIES || strlen(d->d_name) >= sizeof names[0]) {
             closedir(dir);
-            say("update: too many or too long entries in %s", app);
-            installResult("failed the release has too many top-level entries\n");
-            return -1;
+            return "the release has too many top-level entries";
         }
         snprintf(names[count++], sizeof names[0], "%s", d->d_name);
     }
     if (dir)
         closedir(dir);
-    if (!count) {
-        installResult("failed the release is empty\n");
-        return -1;
-    }
+    if (!count)
+        return "the release is empty";
     static char movedOut[MAX_ENTRIES], movedIn[MAX_ENTRIES];
     memset(movedOut, 0, sizeof movedOut);
     memset(movedIn, 0, sizeof movedIn);
@@ -436,22 +341,33 @@ static int installUpdate(const char* title, const char* staging)
             if (movedOut[i] && rename(old, to))
                 say("update: undo: %s couldn't come back (errno %d)", old, errno);
         }
-        char text[256];
-        snprintf(text, sizeof text, "failed a file couldn't be moved (errno %d)\n", failure);
-        installResult(text);
-        removeTree(staging);
-        unlink(UPDATE_DIR "/staged.txt");
-        return -1;
+        snprintf(why, sizeof why, "a file couldn't be moved (errno %d)", failure);
+        return why;
     }
     chmod(install, 0777);
     say("update: %s installed in %s (%d entries; the old ones in %s)", version, install, count, previous);
     refreshRegistered(title, install);
-    char text[96];
-    snprintf(text, sizeof text, "ok %s\n", version);
+    return NULL;
+}
+
+/* Every outcome, installed or not, ends here: the result for the title's
+ * next start, and the staged release gone (staging and staged.txt), so a
+ * failure is never tried again at each start. */
+static int installUpdate(const char* title, const char* staging)
+{
+    char version[32] = "?";
+    const char* why = installSteps(title, staging, version, sizeof version);
+    char text[400];
+    if (why) {
+        say("update to %s not installed: %s", version, why);
+        snprintf(text, sizeof text, "failed %s\n", why);
+    } else
+        snprintf(text, sizeof text, "ok %s\n", version);
     installResult(text);
-    removeTree(staging);
-    unlink(UPDATE_DIR "/staged.txt");
-    return 0;
+    unlink(PS5UPDATE_WORK "/staged.txt");
+    if (ps5update_remove_tree(staging))
+        say("update: %s couldn't be removed (errno %d)", staging, errno);
+    return why ? -1 : 0;
 }
 
 int main(void)

@@ -151,6 +151,8 @@ gboolean ps5wk_browser_open_page(const char* url);
 /* Closes the browser page tab shown, back to the tab it was opened over
  * (also POST /browser/page action=close). FALSE: the tab shown isn't one. */
 gboolean ps5wk_browser_close_page(void);
+/* TRUE while a browser page tab is the one shown. */
+gboolean ps5wk_browser_page_shown(void);
 /* The mapping page for the site shown (the menu's gamepad button's □). */
 void ps5wk_browser_open_gamepad_page(void);
 /* Options: the menu (with the address field focused). */
@@ -209,6 +211,11 @@ extern const char ps5wk_update_page_html[];
 /* ps5browser.c: the browser closes, and the restart helper installs the
  * release unpacked in staging and starts it. NULL, or why not. */
 const char* ps5wk_restart_for_update(const char* staging, const char* from);
+/* ps5browser.c: the restart helper ended before it was ready, so the browser
+ * stays (updates.c: an update being installed is ready again). */
+void ps5wk_updates_restart_failed(void);
+/* ps5browser.c: TRUE once the browser has begun to close. */
+gboolean ps5wk_browser_winding_down(void);
 
 /* titlelog.c: while on, the log takes no lines (private browsing). */
 void ps5wk_log_private(int on);

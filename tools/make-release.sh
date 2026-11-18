@@ -49,7 +49,7 @@ rm -rf "$ROOT/toolchain/wpe-webkit/title-work/obj"
 devhost="$(sed -n 's/^PS5WK_LOG_HOST:STRING=//p' "$BLD/CMakeCache.txt")"
 restore() {
     echo "==> putting the build's log host back ($devhost)"
-    cmake -DPS5WK_LOG_HOST="$devhost" "$BLD" >/dev/null && ninja -C "$BLD" ps5browser >/dev/null
+    cmake -DPS5WK_LOG_HOST="$devhost" "$BLD" >/dev/null && ninja -C "$BLD" ps5wk-child ps5browser >/dev/null
 }
 trap restore EXIT
 echo "==> building with no log host"
@@ -66,6 +66,13 @@ for host in "$devhost" "${PS5WK_LOG_HOST:-}" "${PS5_HOST:-}"; do
     [[ $host =~ ^[0-9]+(\.[0-9]+){3}$ ]] || continue
     if grep -rlaF "$host" "$TITLE" >/dev/null; then
         echo "$host is still in the title: $(grep -rlaF "$host" "$TITLE" | tr '\n' ' ')" >&2; exit 1
+    fi
+done
+
+# No update test hook (UPDATES.md, "Testing"): a development build's only.
+for hook in update-test-yes update-source update-store-root PS5WK_UPDATE_TESTING; do
+    if grep -rlaF "$hook" "$TITLE" --include='*.bin' --include='*.elf' >/dev/null; then
+        echo "the update test hook $hook is in the title: $(grep -rlaF "$hook" "$TITLE" --include='*.bin' --include='*.elf' | tr '\n' ' ')" >&2; exit 1
     fi
 done
 

@@ -92,7 +92,7 @@ set(PS5_MALLOC_WRAPS -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,
 
 add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUARD} ${PS5_APPS_DIR}/common/profiler.c ${PS5_APPS_DIR}/common/ps5unwind.c
     ${PS5_APPS_DIR}/common/watchdog.c ${PS5_LOCKS} ${PS5_APPS_DIR}/common/ps5malloc.c ${PS5_APPS_DIR}/common/ps5clock.c ${PS5_APPS_DIR}/child/adblock-job.c
-    ${PS5_APPS_DIR}/child/update-job.c ${PS5_APPS_DIR}/common/ps5zip.c)
+    ${PS5_APPS_DIR}/child/update-job.c ${PS5_APPS_DIR}/common/ps5zip.c ${PS5_APPS_DIR}/common/ps5update.c)
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
 # adblock-job.c uses WebKit's public API (WebKitUserContentFilterStore, JSC).
 set_source_files_properties(${PS5_APPS_DIR}/child/adblock-job.c ${PS5_APPS_DIR}/child/update-job.c PROPERTIES INCLUDE_DIRECTORIES "${PS5_API_INCLUDE_DIRECTORIES}")
@@ -118,12 +118,20 @@ set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
 # The title gets ps5locks too: package.sh relinks these objects and copies
 # the --wrap options from this link line (its heap, Spike 10's dlmalloc
 # arenas, locks with pthread mutexes).
-add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/adblock.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/title/vrlayout.c ${PS5_APPS_DIR}/title/browserui.c ${PS5_APPS_DIR}/title/browserdraw.c ${PS5_APPS_DIR}/title/browserdata.c ${PS5_APPS_DIR}/title/gamepad.c ${PS5_APPS_DIR}/title/profile.c ${PS5_APPS_DIR}/title/runtime.c ${PS5_APPS_DIR}/title/downloads.c ${PS5_APPS_DIR}/title/qrcode.c ${PS5_APPS_DIR}/title/updates.c ${PS5_APPS_DIR}/common/ps5zip.c ${PS5_APPS_DIR}/common/ps5audioserver.c
+add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/adblock.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/title/vrlayout.c ${PS5_APPS_DIR}/title/browserui.c ${PS5_APPS_DIR}/title/browserdraw.c ${PS5_APPS_DIR}/title/browserdata.c ${PS5_APPS_DIR}/title/gamepad.c ${PS5_APPS_DIR}/title/profile.c ${PS5_APPS_DIR}/title/runtime.c ${PS5_APPS_DIR}/title/downloads.c ${PS5_APPS_DIR}/title/qrcode.c ${PS5_APPS_DIR}/title/updates.c ${PS5_APPS_DIR}/common/ps5update.c ${PS5_APPS_DIR}/common/ps5audioserver.c
     ${PS5_APPS_DIR}/title/ps5locks-title.c ${PS5_APPS_DIR}/title/titlelog.c)
 # The ad blocker's per-site cosmetic filters and scriptlets (ADBLOCK.md, phase 2).
 target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/title/adblock-scripting.c)
 target_include_directories(ps5browser PRIVATE ${PS5_API_INCLUDE_DIRECTORIES} ${PS5_PORT_DIR}/../../spikes)
 target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_PORT=${PS5WK_LOG_PORT})
+# The update test hooks (UPDATES.md, "Testing": a test source, a test
+# ProsperoStore folder, the test's yes) only in development builds, the ones
+# that log to a Mac; never in a release (make-release.sh builds with no log
+# host, and checks).
+if (PS5WK_LOG_HOST)
+    target_compile_definitions(ps5browser PRIVATE PS5WK_UPDATE_TESTING=1)
+    set_property(SOURCE ${PS5_APPS_DIR}/child/update-job.c APPEND PROPERTY COMPILE_DEFINITIONS PS5WK_UPDATE_TESTING=1)
+endif ()
 # The crash guard (fatal signals reported to the log and crash-title.txt),
 # without its pthread_create wrapper (titlecrash.c).
 target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/title/titlecrash.c)

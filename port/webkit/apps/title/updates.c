@@ -13,14 +13,19 @@
  *
  * Files (UPDATE_WORK): job.ini and result.ini (the job's), staged.txt (the
  * staging folder of a release that is ready; the job writes it last),
- * last-install.txt (the helper's outcome, read once at the next start).
+ * last-install.txt (the helper's outcome, read once at the next start),
+ * install-attempt.txt (an install began: if the next start finds it with no
+ * outcome, the helper never finished, and the staged release isn't
+ * installed by itself again), refused.txt (the job's: a release refused
+ * for what it holds, not offered again).
  * Logs: [update] lines, and the job's [update-job] lines.
  */
 #define SPIKE_NAME "ps5browser"
 
 #include "common/spike.h"
 #include "browser.h"
-#include "../common/ps5zip.h"
+#include "viewinvr.h"
+#include "../common/ps5update.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -34,16 +39,19 @@
 #include "WPEDisplayPS5.h"
 #include "WPEProcessManagerPS5.h"
 
-#define UPDATE_WORK "/data/ps5webkit/update"
-#define UPDATE_SOURCE "https://api.github.com/repos/rikleigh/parallax-browser/releases?per_page=10"
-/* Test use only: a URL in place of GitHub's API, and a folder in place of
- * ProsperoStore's (UPDATES.md, "Testing"). */
+#define UPDATE_WORK PS5UPDATE_WORK
+#define UPDATE_ATTEMPT UPDATE_WORK "/install-attempt.txt"
+#ifdef PS5WK_UPDATE_TESTING
+/* A development build only (CMakeLists.txt: a build with a log host): a URL
+ * in place of GitHub's API, a folder in place of ProsperoStore's, and the
+ * user's yes to Update and Restart now (UPDATES.md, "Testing"). A release
+ * has none of them. */
 #define UPDATE_SOURCE_TEST "/data/ps5webkit/update-source"
-#define UPDATE_STORE_ROOT "/data/prosperostore"
 #define UPDATE_STORE_ROOT_TEST "/data/ps5webkit/update-store-root"
-/* Test use only: the user's yes to Update and Restart now. */
 #define UPDATE_TEST_YES "/data/ps5webkit/update-test-yes"
+#endif
 #define UPDATE_CHECK_DELAY_S 10
+#define UPDATE_PAGE_TRIES 30 /* 2 s apart: the update page waits a minute at most */
 #define UPDATE_TITLE "PPSA99207"
 
 typedef enum {
@@ -70,6 +78,7 @@ static char* page;
 static char* notes;
 static char* failure;        /* why the last step failed */
 static char* installProblem; /* why this install can't update itself */
+static char* refused;        /* why the newest release was refused (it isn't offered) */
 static char* status;         /* the job's last status line */
 static char* staging;        /* the release that is ready */
 static char* lastInstall;    /* the helper's outcome at this start, once */
@@ -85,6 +94,9 @@ static gboolean jobRunning;
 static gboolean openWhenFound; /* the start's check, or Check for updates */
 static gboolean offered;       /* the page opened by itself this run */
 static gboolean manualCheck;   /* Check for updates: the page opens whatever it finds */
+static guint pageSource;       /* the update page waiting to open */
+static gboolean pageAsked;     /* the user asked for it (Check for updates) */
+static int pageTries;
 
 static void setString(char** field, const char* value)
 {
@@ -129,17 +141,25 @@ static char* fileLine(const char* path)
     return text;
 }
 
-/* key=value from ready.txt. */
+/* key=value from ready.txt (ps5update.c: the helper reads it the same way). */
 static char* readyValue(const char* text, const char* key)
 {
-    size_t length = strlen(key);
-    for (const char* line = text; line && *line;) {
-        if (!strncmp(line, key, length) && line[length] == '=')
-            return g_strndup(line + length + 1, strcspn(line + length + 1, "\r\n"));
-        const char* next = strchr(line, '\n');
-        line = next ? next + 1 : NULL;
-    }
-    return NULL;
+    char value[1024];
+    return ps5update_line_value(text, key, value, sizeof value) ? NULL : g_strdup(value);
+}
+
+/* The test's yes (a development build). */
+static gboolean testYes(void)
+{
+#ifdef UPDATE_TEST_YES
+    int fd = open(UPDATE_TEST_YES, O_RDONLY); /* not access(): a title's says no (titlesys.c) */
+    if (fd < 0)
+        return FALSE;
+    close(fd);
+    return TRUE;
+#else
+    return FALSE;
+#endif
 }
 
 /* ---- the job ---- */
@@ -184,12 +204,39 @@ static void jobEnded(gboolean launched, gpointer data)
     g_idle_add(jobFinishedOnMain, job);
 }
 
+/* Main loop: the update page over the tab shown, when nothing is in the
+ * way: never while the browser closes or View in VR is on (it would end VR),
+ * and for the start's own offer not over a browser page (Settings mid-edit)
+ * either. It waits for those (and a tab switch) a minute at most, then says
+ * so in a message instead. */
 static gboolean openPageOnMain(gpointer data)
 {
     (void)data;
-    if (!ps5wk_browser_open_page(PS5WK_UPDATE_URL))
-        g_timeout_add_seconds(2, openPageOnMain, NULL); /* a tab switch: try again */
+    pageSource = 0;
+    if (ps5wk_browser_winding_down())
+        return G_SOURCE_REMOVE;
+    const char* wait = ps5wk_vr_active() ? "View in VR is on" : !pageAsked && ps5wk_browser_page_shown() ? "a browser page is open" : NULL;
+    if (!wait && ps5wk_browser_open_page(PS5WK_UPDATE_URL))
+        return G_SOURCE_REMOVE;
+    if (++pageTries < UPDATE_PAGE_TRIES) {
+        pageSource = g_timeout_add_seconds(2, openPageOnMain, NULL);
+        return G_SOURCE_REMOVE;
+    }
+    g_mutex_lock(&lock);
+    char* text = g_strdup_printf("Parallax Browser %s is available: see Settings, Updates", latest ? latest : "");
+    g_mutex_unlock(&lock);
+    spike_log("[update] the update page didn't open (%s): a message instead", wait ? wait : "a tab switch");
+    message(text, 6);
+    g_free(text);
     return G_SOURCE_REMOVE;
+}
+
+static void openPage(gboolean asked)
+{
+    pageAsked = asked || (pageSource && pageAsked);
+    pageTries = 0;
+    if (!pageSource)
+        pageSource = g_idle_add(openPageOnMain, NULL);
 }
 
 static gboolean jobFinishedOnMain(gpointer data)
@@ -215,6 +262,9 @@ static gboolean jobFinishedOnMain(gpointer data)
         if (value || !download)
             setString(&installProblem, value);
         g_free(value);
+        value = g_key_file_get_string(result, "result", "refused", NULL);
+        setString(&refused, value);
+        g_free(value);
         managed = g_key_file_get_boolean(result, "result", "managed", NULL);
         busy = g_key_file_get_boolean(result, "result", "busy", NULL);
         size = g_key_file_get_uint64(result, "result", "size", NULL);
@@ -233,7 +283,9 @@ static gboolean jobFinishedOnMain(gpointer data)
         state = available ? U_AVAILABLE : U_UP_TO_DATE;
     else {
         state = U_FAILED;
-        failedDownload = download;
+        /* Try again: a download again, unless the release was refused for
+         * what it holds (a check then says so). */
+        failedDownload = download && !refused;
         setString(&failure, error ? error : !job->launched ? "the update job couldn't start" : "the update job ended without a result");
     }
     UpdateState now = state;
@@ -241,23 +293,20 @@ static gboolean jobFinishedOnMain(gpointer data)
     gboolean canInstall = !managed && !installProblem;
     g_mutex_unlock(&lock);
     spike_log("[update] %s %s: %s%s%s", job->mode, ok ? "done" : "failed", stateNames[now], error ? ": " : "", error ? error : "");
-    int testFd = open(UPDATE_TEST_YES, O_RDONLY); /* not access(): a title's says no (titlesys.c) */
-    gboolean testYes = testFd >= 0;
-    if (testFd >= 0)
-        close(testFd);
+    gboolean yes = testYes();
     if (now == U_READY) {
         char* text = g_strdup_printf("Parallax Browser %s is ready: restart to install it, or it installs the next time the browser opens", shownVersion);
         message(text, 6);
         g_free(text);
-        if (testYes) {
-            spike_log("[update] %s: Restart now", UPDATE_TEST_YES);
+        if (yes) {
+            spike_log("[update] the test's yes: Restart now");
             const char* error = install("the test's yes");
             if (error)
                 spike_log("[update] install: %s", error);
         }
-    } else if (now == U_AVAILABLE && canInstall && testYes) {
-        spike_log("[update] %s: Update", UPDATE_TEST_YES);
-        g_idle_add(openPageOnMain, NULL);
+    } else if (now == U_AVAILABLE && canInstall && yes) {
+        spike_log("[update] the test's yes: Update");
+        openPage(TRUE);
         const char* error = startJob("download");
         if (error)
             spike_log("[update] download: %s", error);
@@ -267,14 +316,16 @@ static gboolean jobFinishedOnMain(gpointer data)
          * gets a message (the store may list the release a day later). */
         if (canInstall || manualCheck) {
             spike_log("[update] %s is available: the update page opens", shownVersion);
-            g_idle_add(openPageOnMain, NULL);
+            openPage(manualCheck);
         } else {
             spike_log("[update] %s is available; %s", shownVersion, managed ? "ProsperoStore manages this install" : "this install can't update itself");
             char* text = g_strdup_printf(managed ? "Parallax Browser %s is out: update it in ProsperoStore" : "Parallax Browser %s is out: see Settings, Updates", shownVersion);
             message(text, 6);
             g_free(text);
         }
-    } else if (now == U_FAILED && download)
+    } else if (now == U_UP_TO_DATE && manualCheck && refused)
+        openPage(TRUE); /* it says why the newest isn't offered */
+    else if (now == U_FAILED && download)
         message("The update couldn't be downloaded: see the update page", 5);
     openWhenFound = FALSE;
     manualCheck = FALSE;
@@ -299,16 +350,20 @@ static const char* startJob(const char* mode)
     g_mkdir_with_parents(UPDATE_WORK, 0777);
     chmod(UPDATE_WORK, 0777); /* the job runs under another uid */
     unlink(UPDATE_WORK "/result.ini");
+#ifdef PS5WK_UPDATE_TESTING
     char* source = fileLine(UPDATE_SOURCE_TEST);
     char* storeRoot = fileLine(UPDATE_STORE_ROOT_TEST);
+#else
+    char *source = NULL, *storeRoot = NULL;
+#endif
     GKeyFile* file = g_key_file_new();
     g_key_file_set_string(file, "job", "mode", mode);
     g_key_file_set_string(file, "job", "title", UPDATE_TITLE);
     g_key_file_set_string(file, "job", "running", running);
-    g_key_file_set_string(file, "job", "source", source ? source : UPDATE_SOURCE);
+    g_key_file_set_string(file, "job", "source", source ? source : PS5UPDATE_SOURCE);
     g_key_file_set_boolean(file, "job", "test-source", source != NULL);
     g_key_file_set_string(file, "job", "work", UPDATE_WORK);
-    g_key_file_set_string(file, "job", "store-root", storeRoot ? storeRoot : UPDATE_STORE_ROOT);
+    g_key_file_set_string(file, "job", "store-root", storeRoot ? storeRoot : PS5UPDATE_STORE_ROOT);
     g_key_file_set_string(file, "job", "result", UPDATE_WORK "/result.ini");
     gsize length = 0;
     char* text = g_key_file_to_data(file, &length, NULL);
@@ -317,7 +372,7 @@ static const char* startJob(const char* mode)
     g_free(text);
     g_key_file_unref(file);
     if (source || storeRoot)
-        spike_log("[update] test settings: source %s, ProsperoStore folder %s", source ? source : "GitHub", storeRoot ? storeRoot : UPDATE_STORE_ROOT);
+        spike_log("[update] test settings: source %s, ProsperoStore folder %s", source ? source : "GitHub", storeRoot ? storeRoot : PS5UPDATE_STORE_ROOT);
     g_free(source);
     g_free(storeRoot);
     if (!written)
@@ -345,23 +400,31 @@ static const char* startJob(const char* mode)
     return NULL;
 }
 
-/* Main loop: the staged release goes in through the restart helper. */
+/* Main loop: the staged release goes in through the restart helper. The
+ * state is U_INSTALLING after (ps5wk_updates_action sets it first, for the
+ * page), or U_READY again with why not. */
 static const char* install(const char* from)
 {
     g_mutex_lock(&lock);
-    char* where = state == U_READY && staging ? g_strdup(staging) : NULL;
+    char* where = (state == U_READY || state == U_INSTALLING) && staging ? g_strdup(staging) : NULL;
     char* version = g_strdup(latest);
     g_mutex_unlock(&lock);
     if (!where) {
         g_free(version);
         return "no update is ready";
     }
+    /* Written before the helper starts, gone at the next start: found
+     * there with no outcome, the helper never finished. */
+    g_file_set_contents(UPDATE_ATTEMPT, where, -1, NULL);
     const char* error = ps5wk_restart_for_update(where, from);
     spike_log("[update] installing %s from %s (%s): %s", version ? version : "?", where, from, error ? error : "the browser closes");
-    if (!error) {
-        g_mutex_lock(&lock);
-        state = U_INSTALLING;
-        g_mutex_unlock(&lock);
+    g_mutex_lock(&lock);
+    state = error ? U_READY : U_INSTALLING;
+    setString(&failure, error);
+    g_mutex_unlock(&lock);
+    if (error)
+        unlink(UPDATE_ATTEMPT);
+    else {
         char* text = g_strdup_printf("Updating to %s…", version ? version : "the new version");
         message(text, 10);
         g_free(text);
@@ -371,9 +434,31 @@ static const char* install(const char* from)
     return error;
 }
 
+void ps5wk_updates_restart_failed(void)
+{
+    g_mutex_lock(&lock);
+    gboolean installing = state == U_INSTALLING;
+    if (installing) {
+        state = U_READY;
+        setString(&failure, "the browser couldn't restart itself");
+    }
+    g_mutex_unlock(&lock);
+    if (installing) {
+        unlink(UPDATE_ATTEMPT);
+        spike_log("[update] the restart helper didn't get ready: the update is ready again");
+    }
+}
+
 static gboolean checkOnMain(gpointer data)
 {
     (void)data;
+    g_mutex_lock(&lock);
+    UpdateState now = state;
+    g_mutex_unlock(&lock);
+    if (now == U_READY || now == U_INSTALLING) {
+        spike_log("[update] the start's check: not needed, an update is ready");
+        return G_SOURCE_REMOVE;
+    }
     openWhenFound = TRUE;
     const char* error = startJob("check");
     if (error) {
@@ -388,10 +473,10 @@ static gboolean installAtStartOnMain(gpointer data)
     (void)data;
     const char* error = install("the start (an update the user said yes to)");
     if (error) {
-        g_mutex_lock(&lock);
-        state = U_READY; /* Restart now on the update page can try again */
-        g_mutex_unlock(&lock);
-        g_timeout_add_seconds(UPDATE_CHECK_DELAY_S, checkOnMain, NULL);
+        /* Ready again: Restart now on the update page can try again. */
+        char* text = g_strdup_printf("The update couldn't be installed now (%s): see Settings, Updates", error);
+        message(text, 6);
+        g_free(text);
     }
     return G_SOURCE_REMOVE;
 }
@@ -399,7 +484,7 @@ static gboolean installAtStartOnMain(gpointer data)
 static gpointer removeTreeThread(gpointer data)
 {
     char* path = data;
-    if (ps5zip_remove_tree(path))
+    if (ps5update_remove_tree(path))
         spike_log("[update] %s couldn't be removed (errno %d)", path, errno);
     g_free(path);
     return NULL;
@@ -412,23 +497,31 @@ typedef struct {
     char* from;
 } Action;
 
+/* The state was set for the action already (ps5wk_updates_action); a
+ * failure here sets why. */
 static gboolean actionOnMain(gpointer data)
 {
     Action* a = data;
     const char* error = NULL;
+    gboolean download = !strcmp(a->action, "download");
     if (!strcmp(a->action, "check")) {
         openWhenFound = TRUE;
         manualCheck = TRUE;
         offered = FALSE;
         error = startJob("check");
-    } else if (!strcmp(a->action, "download"))
+    } else if (download)
         error = startJob("download");
     else if (!strcmp(a->action, "install"))
-        error = install(a->from);
+        error = install(a->from); /* sets the state either way */
     if (error) {
         spike_log("[update] %s from %s: %s", a->action, a->from, error);
-        if (!strcmp(a->action, "install")) {
+        if (strcmp(a->action, "install")) {
+            manualCheck = openWhenFound = FALSE;
             g_mutex_lock(&lock);
+            if (state == U_CHECKING || state == U_DOWNLOADING) {
+                state = U_FAILED;
+                failedDownload = download;
+            }
             setString(&failure, error);
             g_mutex_unlock(&lock);
         }
@@ -443,23 +536,37 @@ const char* ps5wk_updates_action(const char* action, const char* from)
 {
     if (!action || (strcmp(action, "check") && strcmp(action, "download") && strcmp(action, "install") && strcmp(action, "later")))
         return "do=check, do=download, do=install or do=later";
-    g_mutex_lock(&lock);
-    UpdateState now = state;
-    gboolean storeManaged = managed;
-    gboolean problem = installProblem != NULL;
-    g_mutex_unlock(&lock);
     if (!strcmp(action, "later")) {
         spike_log("[update] later, from %s", from);
         return NULL;
     }
-    if (!strcmp(action, "download") && (storeManaged || problem))
-        return storeManaged ? "ProsperoStore manages this install: update it in ProsperoStore" : "this install can't update itself";
-    if (!strcmp(action, "download") && now != U_AVAILABLE && !(now == U_FAILED && failedDownload))
-        return "no update to download";
-    if (!strcmp(action, "install") && now != U_READY)
-        return "no update is ready";
+    /* Checked and set under one lock: the page reads the new state as soon
+     * as this returns (before the main loop has run the action), and a
+     * second press is refused. */
+    const char* refusal = NULL;
+    g_mutex_lock(&lock);
+    UpdateState now = state;
     if (now == U_CHECKING || now == U_DOWNLOADING || now == U_INSTALLING)
-        return "busy: wait a moment";
+        refusal = "busy: wait a moment";
+    else if (!strcmp(action, "check") && now == U_READY)
+        refusal = "an update is ready: restart to install it";
+    else if (!strcmp(action, "download") && (managed || installProblem))
+        refusal = managed ? "ProsperoStore manages this install: update it in ProsperoStore" : "this install can't update itself";
+    else if (!strcmp(action, "download") && now != U_AVAILABLE && !(now == U_FAILED && failedDownload))
+        refusal = "no update to download";
+    else if (!strcmp(action, "install") && (now != U_READY || !staging))
+        refusal = "no update is ready";
+    if (!refusal) {
+        state = !strcmp(action, "check") ? U_CHECKING : !strcmp(action, "download") ? U_DOWNLOADING : U_INSTALLING;
+        if (state != U_INSTALLING) {
+            setString(&failure, NULL);
+            progressDone = progressTotal = 0;
+            progressPhase[0] = 0;
+        }
+    }
+    g_mutex_unlock(&lock);
+    if (refusal)
+        return refusal;
     Action* a = g_new0(Action, 1);
     a->action = g_strdup(action);
     a->from = g_strdup(from);
@@ -481,6 +588,7 @@ char* ps5wk_updates_json(void)
     FIELD("notes", notes);
     FIELD("error", failure);
     FIELD("installProblem", installProblem);
+    FIELD("refused", refused);
     FIELD("status", status);
     FIELD("lastInstall", lastInstall);
 #undef FIELD
@@ -502,6 +610,11 @@ void ps5wk_updates_init(WPEDisplayPS5* displayIn)
     /* The helper's outcome, from the restart that installed (or didn't). */
     char* outcome = fileLine(UPDATE_WORK "/last-install.txt");
     unlink(UPDATE_WORK "/last-install.txt");
+    char* attempt = fileLine(UPDATE_ATTEMPT);
+    unlink(UPDATE_ATTEMPT);
+    gboolean failedBefore = outcome && strncmp(outcome, "ok ", 3);
+    gboolean unfinished = attempt && !outcome; /* the helper never wrote one */
+    g_free(attempt);
     if (outcome) {
         spike_log("[update] the last install: %s (running %s)", outcome, runningShown);
         char* text = !strncmp(outcome, "ok ", 3) ? g_strdup_printf("Updated to %s", runningShown)
@@ -513,6 +626,8 @@ void ps5wk_updates_init(WPEDisplayPS5* displayIn)
         g_free(text);
         g_free(outcome);
     }
+    if (unfinished)
+        spike_log("[update] an install began and never finished (no outcome from the restart helper)");
     /* A release the user said yes to, ready: it installs now. */
     char* where = fileLine(UPDATE_WORK "/staged.txt");
     if (where) {
@@ -526,9 +641,11 @@ void ps5wk_updates_init(WPEDisplayPS5* displayIn)
             readyPage = readyValue(ready, "page");
             readyTag = readyValue(ready, "tag");
         }
-        gboolean usable = version && contentVersion && from && !strcmp(from, running) && strcmp(contentVersion, running) > 0;
+        /* Not after a failed install: the helper removes the release then,
+         * and one left behind isn't tried at every start. */
+        gboolean usable = version && contentVersion && from && !strcmp(from, running) && strcmp(contentVersion, running) > 0 && !failedBefore;
         spike_log("[update] staged in %s: %s (%s, from %s): %s", where, version ? version : "?", contentVersion ? contentVersion : "?",
-            from ? from : "?", usable ? "installing it now" : "not usable: removed");
+            from ? from : "?", !usable ? "not usable: removed" : unfinished ? "ready; not installed by itself again" : "installing it now");
         if (usable) {
             g_mutex_lock(&lock);
             state = U_READY;
@@ -536,8 +653,16 @@ void ps5wk_updates_init(WPEDisplayPS5* displayIn)
             setString(&latest, version);
             setString(&tag, readyTag);
             setString(&page, readyPage);
+            if (unfinished)
+                setString(&failure, "the last try to install it didn't finish");
             g_mutex_unlock(&lock);
-            g_timeout_add(1500, installAtStartOnMain, NULL);
+            if (!unfinished)
+                g_timeout_add(1500, installAtStartOnMain, NULL);
+            else {
+                char* text = g_strdup_printf("Parallax Browser %s is ready, but installing it didn't finish last time: see Settings, Updates", version);
+                message(text, 6);
+                g_free(text);
+            }
         } else {
             unlink(UPDATE_WORK "/staged.txt");
             g_thread_unref(g_thread_new("update-clean", removeTreeThread, g_strdup(where)));
@@ -595,14 +720,14 @@ const char ps5wk_update_page_html[] =
     "<div class=\"seg\" id=\"buttons\"></div><div id=\"notes\" hidden></div></div>\n"
     "<p class=\"help\" id=\"version\"></p>\n"
     "</main><script>\n"
-    "var U=null,pin='',tv=document.documentElement.className=='tv',focusId=null;\n"
+    "var U=null,pin='',tv=document.documentElement.className=='tv',focusId=null,notice='',noticeState='';\n"
     "try{pin=sessionStorage.getItem('ps5pin')||''}catch(e){}\n"
     "var query=new URLSearchParams(location.search);if(query.get('pin'))pin=query.get('pin');\n"
     "function $(id){return document.getElementById(id)}\n"
     "function headers(form){var h={'Accept':'application/json'};if(pin)h['X-PS5-PIN']=pin;if(form)h['Content-Type']='application/x-www-form-urlencoded';return h}\n"
     "function post(path,body){return fetch(path,{method:'POST',headers:headers(true),body:body,cache:'no-store'}).then(function(r){return r.json().catch(function(){return{ok:r.ok}})})}\n"
     "function closePage(){if(!tv){history.back();return}post('/browser/page','action=close').then(function(j){if(j.ok===false)history.back()},function(){history.back()})}\n"
-    "function act(what){return post('/update','do='+what).then(function(j){if(j.ok===false&&j.error){$('text').textContent=j.error}load()})}\n"
+    "function act(what){notice='';return post('/update','do='+what).then(function(j){if(j.ok===false&&j.error){notice=j.error;noticeState=U?U.state:''}load()},function(){notice='The PS5 did not answer.';noticeState=U?U.state:'';load()})}\n"
     "function openTab(url){if(!tv){window.open(url,'_blank');return}post('/browser/tab','action=new&url='+encodeURIComponent(url))}\n"
     "function mb(n){return Math.round(n/1048576)+' MB'}\n"
     "function button(text,primary,run){var b=document.createElement('button');b.textContent=text;if(primary)b.className='primary';b.onclick=run;$('buttons').appendChild(b);return b}\n"
@@ -612,6 +737,7 @@ const char ps5wk_update_page_html[] =
     "  var notes=(u.state=='available'||u.state=='failed')&&u.notes;$('notes').hidden=!notes;$('notes').textContent=notes||'';\n"
     "  var whatsNew=function(){if(u.page)button('What\\u2019s new',false,function(){openTab(u.page)})};\n"
     "  if(u.state=='checking'||u.state=='idle'){head='Looking for a newer version…';busy=true}\n"
+    "  else if(u.state=='up-to-date'&&u.refused){head='Version '+u.latest+' can\\u2019t be installed.';text='Its download was refused: '+u.refused+'. The browser offers the next version when there is one.';button('Check again',false,function(){act('check')});whatsNew();button('Close',false,closePage)}\n"
     "  else if(u.state=='up-to-date'){head='Parallax Browser is up to date.';text=u.lastInstall||'';button('Check again',false,function(){act('check')});button('Close',false,closePage)}\n"
     "  else if(u.state=='available'&&u.managed){head='Version '+u.latest+' is available.';text='ProsperoStore installed the browser and keeps it up to date: update it in ProsperoStore. It can list a new version a day or so after its release.';whatsNew();button('Close',true,closePage)}\n"
     "  else if(u.state=='available'&&u.installProblem){head='Version '+u.latest+' is available.';text='The browser can\\u2019t update itself here: '+u.installProblem+'.';whatsNew();button('Close',true,closePage)}\n"
@@ -620,9 +746,10 @@ const char ps5wk_update_page_html[] =
     "    text=(unpack?'':(u.total?mb(u.done)+' of '+mb(u.total)+'. ':''))+'You can go back to the page: the browser says when it\\u2019s ready.';$('fill').style.width=pc+'%';busy=true;button('Back to the page',false,closePage)}\n"
     "  else if(u.state=='ready'){head=u.latest+' is ready.';text='Restart now to install it, or it installs the next time the browser opens. Your tabs come back.'+(u.error?' ('+u.error+')':'');button('Restart now',true,function(){act('install')});button('Next time',false,function(){post('/update','do=later');closePage()})}\n"
     "  else if(u.state=='installing'){head='Updating to '+u.latest+'…';text='The browser closes and opens again on this page\\u2019s tab.';busy=true}\n"
-    "  else{head=u.retryDownload?'The update couldn\\u2019t be downloaded.':'The browser couldn\\u2019t check for updates.';text=u.error||'';$('text').className='help warn';\n"
-    "    button('Try again',true,function(){act(u.retryDownload?'download':'check')});button('Close',false,closePage)}\n"
+    "  else{head=u.refused?'Version '+u.latest+' can\\u2019t be installed.':u.retryDownload?'The update couldn\\u2019t be downloaded.':'The browser couldn\\u2019t check for updates.';text=u.error||'';$('text').className='help warn';\n"
+    "    button(u.refused?'Check again':'Try again',true,function(){act(u.retryDownload?'download':'check')});button('Close',false,closePage)}\n"
     "  if(u.state!='failed')$('text').className='help';\n"
+    "  if(notice&&u.state!=noticeState)notice='';if(notice){text=notice;$('text').className='help warn'}\n"
     "  $('head').textContent=head;$('text').textContent=text;$('bar').hidden=u.state!='downloading';\n"
     "  var first=$('buttons').querySelector('button');if(tv&&first&&focusId!=u.state){focusId=u.state;first.focus()}\n"
     "  return busy;\n"

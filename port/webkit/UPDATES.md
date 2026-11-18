@@ -17,7 +17,11 @@ per start, and nothing else happens unless the user says yes.
    browser page like Settings, `parallax://update`): **"Parallax Browser
    0.3.0 is available"**, the release notes, and three buttons: **Update**,
    **What's new** (the release's page on GitHub, in a new tab) and **Later**.
-   Later or O closes it; the next start asks again.
+   Later or O closes it; the next start asks again. It never opens over
+   View in VR or while the browser closes, and the start's own offer never
+   replaces a browser page that is open (Settings mid-edit): it waits for
+   those a minute at most, then says so in a message instead ("see
+   Settings, Updates").
 3. Update: it downloads and unpacks in the background, with progress on the
    update page (and in Settings). The user can go back to browsing; a
    message says when it's done.
@@ -70,6 +74,7 @@ compares `contentVersion` as text, and this scheme keeps that order too.
 | `apps/title/updates.c` (new) | the title | Schedule, state, Settings rows, the link server's `/update`, messages; starts the job; at start, installs a staged update through the restart helper |
 | `apps/child/update-job.c` (new) | a ps5wk-child task payload (like `adblock-job.c`) | Finds the install, asks GitHub, downloads, checks, unpacks into a staging folder |
 | `apps/relaunch/ps5wk-relaunch.c` | the restart helper payload | With an update: after the title is gone, swaps the staged files in, refreshes the system's copies of `sce_sys`, then starts the title |
+| `apps/common/ps5update.c` (new) | all three | The one reading of ProsperoStore's receipt and journal, `param.json` and `ready.txt` (plain C: the helper has no glib), so the job and the helper can't disagree. Its test: `test/update/store-test.sh` |
 
 Why payloads: the console slows a title's own file writes to about 2 MB/s
 after a few hundred megabytes, and the unpacked browser is about 470 MB.
@@ -91,19 +96,27 @@ hand").
 
 ### 2. Check that ProsperoStore doesn't manage it
 
-ProsperoStore treats an app as its own when
-`/data/prosperostore/receipts/PPSA99207.json` exists, its `location` is the
-folder that holds the app (e.g. `/data/homebrew`), and its `contentVersion`
-is the one installed (its `managed()` check). When all three hold, the
-browser **does not update itself**. It still checks GitHub, to say that an
-update is out.
+ProsperoStore writes `/data/prosperostore/receipts/PPSA99207.json` when it
+installs the browser: its `location` is the folder that holds the app (e.g.
+`/data/homebrew`), with the `contentVersion` it installed. When the receipt
+names **this** folder (`location` + `/PPSA99207`, in any spelling: extra or
+trailing slashes, through a link, the same folder by device and inode), the
+browser **does not update itself**, whatever version the receipt records.
+It still checks GitHub, to say that an update is out.
 
-Also, `/data/prosperostore/journal.json` naming `PPSA99207` means that the
-store has an operation on the browser in progress, or interrupted. Then the
-browser does nothing at all.
+Also, `/data/prosperostore/journal.json` naming `PPSA99207` anywhere means
+that the store has an operation on the browser in progress, or interrupted.
+Then the browser does nothing at all.
 
-Both are read only. The browser never writes anything under
-`/data/prosperostore`.
+The check **fails closed**. A receipt that is there but can't be read,
+isn't valid JSON, is over 1 MB, has no `titleId` or `location`, or names
+another title, counts as the store's. A journal that can't be read or isn't
+valid JSON counts as an operation in progress. Only a missing receipt, or a
+valid one that names another folder, lets the browser update itself.
+
+The job and the helper make this check with the same code
+(`apps/common/ps5update.c`, `ps5update_store_check`). Both files are read
+only: the browser never writes anything under `/data/prosperostore`.
 
 Why this is enough to avoid conflicts:
 
@@ -116,9 +129,11 @@ Why this is enough to avoid conflicts:
 - **An install the browser updated** was not the store's to begin with (no
   matching receipt). If the user later picks "Manage with ProsperoStore",
   the store writes a receipt and the browser steps back from then on.
-- **If a receipt exists but doesn't match** (someone copied a newer version
-  over a store install by hand), the store already shows "Installed outside
-  ProsperoStore", so the browser may update it.
+- **If a receipt names this folder at another version** (someone copied a
+  newer version over a store install by hand), the browser still steps
+  back: the store shows "Installed outside ProsperoStore", and "Manage with
+  ProsperoStore" adopts it at its version. A receipt naming another folder
+  is another copy's, and this one may update itself.
 - **Folders.** The store keeps its work in `/data/prosperostore` and
   `<drive>/prosperostore`; ours are `/data/ps5webkit/update` and
   `<drive>/ps5webkit-update`. Neither is inside a folder ShadowMountPlus
@@ -143,7 +158,12 @@ Why this is enough to avoid conflicts:
     no duplicates;
   - limits on the number of files and on the total size.
 - `sce_sys/param.json` must say `PPSA99207` and the `contentVersion` that
-  belongs to the tag.
+  belongs to the tag, and there must be an `eboot.bin`.
+- A release refused for what it holds (any of the above; not a failure of
+  this console's, such as a full disk) is recorded in
+  `/data/ps5webkit/update/refused.txt` with its tag and digest. That release
+  isn't offered again: the update page and Settings say it was refused and
+  why. Another zip under the same tag (a new digest) is offered.
 - Every file and folder gets mode `0777`: the console won't start an app
   with less.
 - When it's done, the job writes `staging/ready.txt`: the version, the
@@ -163,6 +183,13 @@ still holds, it installs the update:
   browser;
 - the user said Update for this version (`ready.txt` is only written
   after a yes).
+
+Not after an install that failed or never finished: if the last restart's
+outcome says it failed, the staged release is deleted; if the title finds
+`/data/ps5webkit/update/install-attempt.txt` (written before each install,
+deleted at the next start) with no outcome, the helper never finished, so
+the release stays ready but waits for Restart now. Either way the browser
+can't keep restarting itself into the same failure.
 
 Restart now does the same at once. The title shows "Updating to
 0.3.0…" and starts the restart helper with the header
@@ -184,7 +211,11 @@ Once the title is gone, the helper:
    this, the home screen keeps the old name and pictures.
 4. Starts the title, which shows "Updated to 0.3.0".
 
-It deletes the staging folder (the job already deleted the zip). `previous/` is kept
+Whatever the outcome, installed or refused or failed part way, it then
+writes the outcome to `/data/ps5webkit/update/last-install.txt` and deletes
+the staging folder and `staged.txt` (the job already deleted the zip). If
+the helper never gets ready, the title stays and the release is ready again
+(Restart now). `previous/` is kept
 until the next update, as with ProsperoStore's
 `/data/prosperostore/previous`: to go back, copy it over the folder by FTP.
 
@@ -197,25 +228,44 @@ stays valid.
 | --- | --- |
 | No network, GitHub down, rate limit | Settings: "Couldn't check: <why>". Tried again at the next start, or with Check for updates |
 | Download fails, wrong size or digest, cancelled | Zip deleted; the update page says so and offers Update again |
-| Zip refused (paths, links, the wrong title or version) | Staging deleted; "The 0.3.0 download was refused: <why>"; the same release isn't tried again |
+| Zip refused (paths, links, the wrong title or version, no eboot.bin) | Staging deleted; recorded in `refused.txt`; the update page says why; that release (tag and digest) isn't offered again |
+| Unpacking fails here (a full disk, a write error) | Staging deleted; Try again downloads it again |
 | ProsperoStore manages the install | Nothing downloaded; Settings says so |
 | The install isn't a folder, or there's more than one | Settings says why; no download |
 | The title doesn't wind down within 60 s | The helper does nothing (as for Restart browser now) |
-| A rename fails | The moves are undone; the old version starts; message "The update couldn't be installed" |
+| A rename fails, or any other install failure | The moves are undone; the old version starts; message "The update couldn't be installed: <why>"; the staged release is deleted, never tried again at each start |
+| The helper ends before it's ready | The browser stays; the update is ready again (Restart now) |
+| The helper dies after closing the browser | The next start finds the install attempt with no outcome: the update is ready but isn't installed by itself again |
 | Power lost during the renames | The one unprotected moment, a fraction of a second, as with the store. `previous/` holds the old files |
 | Power lost at any other time | A leftover staging folder, deleted by the next job |
 | The new version fails to start | Not handled automatically in 0.2.0. `previous/` is there for a copy back by FTP |
 
 ## The link server
 
-- `GET /update`: the state as JSON (version, state, available, progress,
-  managedBy, error, lastCheck).
-- `POST /update?action=check`, `?action=install`.
+- `GET /update`: the update page (HTML); `parallax://update` shows it.
+- `GET /update.json`: the state as JSON (`running`, `state`, `latest`, `tag`,
+  `page`, `notes`, `error`, `installProblem`, `refused`, `status`,
+  `lastInstall`, `managed`, `busy`, `size`, `phase`, `done`, `total`,
+  `checkedAt`, `retryDownload`). `/settings.json` has it as `update`.
+- `POST /update?do=check`, `do=download`, `do=install`, `do=later`. The
+  state changes before the reply (`checking`, `downloading`,
+  `installing`), so the page that asked sees it straight away; a refusal
+  comes back as `{"ok":false,"error":…}` with HTTP 409, and the page keeps
+  it on screen until the state changes or the next press. Check for updates
+  is refused while an update is ready (it would replace it).
 
 The update page and Settings use these, as Settings does for the ad
 blocker.
 
 ## Testing
+
+The three hooks below are compiled only into **development builds** (the
+ones with a log host, `PS5WK_LOG_HOST`: CMake defines
+`PS5WK_UPDATE_TESTING` for the title and the job, and `package.sh` builds
+the helper with `UPDATE_TESTING=1`). A release has none of them: the title,
+the job and the helper use GitHub and `/data/prosperostore` whatever any
+file says, and `make-release.sh` refuses a title whose binaries mention a
+hook.
 
 `/data/ps5webkit/update-test-yes` (a file; test use only) answers yes for
 the user: Update when a release is offered, Restart now when it's ready.
@@ -268,7 +318,24 @@ marker file added), through `update-source` and `update-test-yes`:
 | The real GitHub API | v0.1.0 (a pre-release) and its digest read; "up to date" |
 | Unpacker on the Mac (`test/update/zip-test.sh`) | The title as make-release.sh zips it, byte for byte, every file 0777; `../`, absolute, backslash, `./`, a link, a fifo, a duplicate, a bad CRC, not a zip, another title's prefix: all refused |
 
-Not tested on the console: a receipt that doesn't match, ProsperoStore's
-journal, the helper's own refusal (a receipt appearing between the download
-and the restart), a folder on an external or USB drive, and a rename that
-fails part way.
+## Review fixes, console test (2026-11-18)
+
+After the review (store check failing closed, test hooks in development
+builds only, the helper's cleanup on every failure, the job ending with its
+title, refused releases recorded, the page's state and guards), a
+development build on the console, releases served from the Mac:
+
+| Step | Result |
+| --- | --- |
+| Shared code on the Mac (`test/update/store-test.sh`, `zip-test.sh`) | 35 JSON and store checks, every refusal and the new local-failure case: all pass |
+| A 0.2.3 zip whose `param.json` says 01.002.000 | Downloaded, refused ("the release says version 01.002.000, its tag 01.002.003"), staging removed, `refused.txt` written. Next start: "v0.2.3 was refused before …: not offered again", state up to date |
+| A 0.2.2 zip with 300 top-level entries, installed at start | The helper: "not installed: the release has too many top-level entries" (an exit that used to leave `staged.txt`). Staging and `staged.txt` removed; the browser came back on 0.2.0, said so, and didn't install again; its check offered 0.2.2 on the update page. The install folder untouched |
+| A truncated receipt in the test store folder | "the receipt … isn't understood: taken as the store's"; a message only, nothing downloaded |
+| The browser closed 18 MB into a 194 MB download | The job ended with it: `release.zip` stayed at 19.5 MB, the server saw the connection drop. The next start's job removed the leftover and downloaded again |
+| A full update to 0.2.1 through the rewritten helper | Downloaded in 57 s, unpacked in 15.6 s, the helper's checks again ("no receipt"), 9 entries swapped, 10 `sce_sys` copies refreshed, "the last install: ok 0.2.1", `contentVersion` 01.002.001 |
+| Release-mode compile (no `PS5WK_UPDATE_TESTING`) | The title's and the job's update code build clean with none of the hook strings; the helper likewise |
+
+Not tested on the console: ProsperoStore's journal (the Mac test covers
+it), a folder on an external or USB drive, a rename that fails part way,
+the update page waiting out View in VR, and a release built by
+`make-release.sh` (its hook check runs at the next release build).

@@ -2115,6 +2115,12 @@ gboolean ps5wk_browser_open_page(const char* url)
     return openTab(url, TRUE);
 }
 
+gboolean ps5wk_browser_page_shown(void)
+{
+    Tab* tab = activeTab();
+    return tab && tab->browserPage;
+}
+
 gboolean ps5wk_browser_close_page(void)
 {
     Tab* tab = activeTab();

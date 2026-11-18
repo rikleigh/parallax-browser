@@ -208,8 +208,10 @@ python3 "$HERE/brand-assets.py" mark 48 "$app/ui/parallax-mark.bgra"
 cp "$PORT/runtime/parallax-logo.png" "$app/ui/parallax-logo.png"
 prospero-strip -o "$app/ps5wk-child.elf" "$CHILD"
 # The restart helper (apps/relaunch/ps5wk-relaunch.c): the title sends it to
-# elfldr to be closed and started again (Restart browser).
-make -s -C "$HERE/../relaunch" >/dev/null
+# elfldr to be closed and started again (Restart browser), and to install an
+# update. Always rebuilt (-B): with the update test hooks for a development
+# build (a log host), without for a release.
+make -s -B -C "$HERE/../relaunch" UPDATE_TESTING="$([[ -n ${PS5WK_LOG_HOST:-} ]] && echo 1 || echo 0)" >/dev/null
 prospero-strip -o "$app/ps5wk-relaunch.elf" "$HERE/../relaunch/ps5wk-relaunch.elf"
 # The ad blocker (port/webkit/ADBLOCK.md): uBO Lite's rules converted for
 # WebKit (tools/ubol-convert.js, pinned release; generated, never committed)

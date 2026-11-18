@@ -15,6 +15,15 @@
  * output closes; no result means failure. The swap itself is the restart
  * helper's (apps/relaunch/ps5wk-relaunch.c), once the title is gone.
  *
+ * A release's zip that is refused for what it holds (the unpacker's checks,
+ * the wrong title or version, no eboot.bin) is recorded in
+ * <work>/refused.txt with its digest: that release isn't offered again
+ * (another zip under the same tag is).
+ *
+ * The process ends when the title closes the connection (stdin), as the ad
+ * blocker's job does: a job left by a title that closed must not run on
+ * under the next one's.
+ *
  * A payload, not the title: the console slows a title's own file writes to
  * about 2 MB/s after a few hundred megabytes, and the browser unpacks to
  * about 470 MB. Output: "[update-job] ..." lines, relayed to the title's
@@ -23,6 +32,8 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +47,7 @@
 #include <libsoup/soup.h>
 #include <wpe/webkit.h>
 
+#include "../common/ps5update.h"
 #include "../common/ps5zip.h"
 
 #define UPDATE_JOB_LIMIT_S (60 * 60)
@@ -156,35 +168,18 @@ static gboolean jsonBool(JSCValue* object, const char* key)
     return b;
 }
 
-static char* readSmall(const char* path, gsize limit)
-{
-    gchar* text = NULL;
-    gsize length = 0;
-    if (!g_file_get_contents(path, &text, &length, NULL))
-        return NULL;
-    if (length > limit) {
-        g_free(text);
-        return NULL;
-    }
-    return text;
-}
-
-/* The title ID and contentVersion folder's param.json declares. */
+/* The title ID and contentVersion folder's param.json declares
+ * (ps5update.c: the helper reads it the same way). */
 static gboolean readParam(const char* folder, char** title, char** version)
 {
-    char* path = g_build_filename(folder, "sce_sys", "param.json", NULL);
-    char* text = readSmall(path, 64 * 1024);
-    g_free(path);
-    JSCValue* param = text ? parseJSON(text) : NULL;
-    g_free(text);
-    *title = jsonString(param, "titleId");
-    *version = jsonString(param, "contentVersion");
-    g_clear_object(&param);
-    if (*title && *version)
-        return TRUE;
-    g_clear_pointer(title, g_free);
-    g_clear_pointer(version, g_free);
-    return FALSE;
+    char id[64], v[64];
+    if (ps5update_param(folder, id, sizeof id, v, sizeof v)) {
+        *title = *version = NULL;
+        return FALSE;
+    }
+    *title = g_strdup(id);
+    *version = g_strdup(v);
+    return TRUE;
 }
 
 /* ---- the installed folder ----
@@ -274,44 +269,16 @@ static gboolean findInstall(const char* title, const char* version, Install* out
 }
 
 /* ---- ProsperoStore (read only) ----
- * It manages an app when <root>/receipts/<title>.json names the folder that
- * holds it and the version that is there (its managed() check); a journal
- * naming the app means an operation on it is in progress or interrupted. */
+ * ps5update_store_check: the restart helper checks again with the same code
+ * once the title is gone. It fails closed: a receipt or journal that can't
+ * be read counts as the store's. */
 static void storeState(const char* storeRoot, const char* title, const Install* install, gboolean* managed, gboolean* busy)
 {
-    *managed = *busy = FALSE;
-    char* path = g_strdup_printf("%s/receipts/%s.json", storeRoot, title);
-    char* text = readSmall(path, 16 * 1024);
-    JSCValue* receipt = text ? parseJSON(text) : NULL;
-    char* id = jsonString(receipt, "titleId");
-    char* location = jsonString(receipt, "location");
-    char* version = jsonString(receipt, "contentVersion");
-    if (receipt) {
-        char* target = location ? g_strdup_printf("%s/%s", location, title) : NULL;
-        *managed = id && !strcmp(id, title) && target && !strcmp(target, install->folder) && version
-            && !strcmp(version, install->version);
-        JOBLOG("ProsperoStore receipt %s: %s, %s, %s: %s", path, id ? id : "?", location ? location : "?", version ? version : "?",
-            *managed ? "it manages this install" : "not this install (the store sees it as installed outside it)");
-        g_free(target);
-    }
-    g_free(id);
-    g_free(location);
-    g_free(version);
-    g_clear_object(&receipt);
-    g_free(text);
-    g_free(path);
-
-    path = g_strdup_printf("%s/journal.json", storeRoot);
-    text = readSmall(path, 64 * 1024);
-    JSCValue* journal = text ? parseJSON(text) : NULL;
-    id = jsonString(journal, "titleId");
-    *busy = id && !strcmp(id, title);
-    if (text)
-        JOBLOG("ProsperoStore journal: %s%s", id ? id : "?", *busy ? " (this app: an operation in progress)" : "");
-    g_free(id);
-    g_clear_object(&journal);
-    g_free(text);
-    g_free(path);
+    ps5update_store store;
+    ps5update_store_check(storeRoot, title, install->folder, &store);
+    *managed = store.managed != 0;
+    *busy = store.busy != 0;
+    JOBLOG("ProsperoStore (%s): %s", storeRoot, store.note);
 }
 
 /* ---- GitHub ---- */
@@ -343,6 +310,41 @@ static void releaseClear(Release* r)
     g_free(r->page);
     g_free(r->notes);
     memset(r, 0, sizeof *r);
+}
+
+/* ---- releases refused before ----
+ * <work>/refused.txt: tag=, sha256=, why= of the last release whose zip was
+ * refused for what it holds. */
+static char* refusedBefore(const char* work, const Release* release)
+{
+    char* path = g_build_filename(work, "refused.txt", NULL);
+    char* text = ps5update_read(path, 4096);
+    g_free(path);
+    char tag[128], sha[80], why[600];
+    char* result = NULL;
+    if (text && !ps5update_line_value(text, "tag", tag, sizeof tag) && !ps5update_line_value(text, "sha256", sha, sizeof sha)
+        && !strcmp(tag, release->tag) && !strcmp(sha, release->sha256))
+        result = g_strdup(ps5update_line_value(text, "why", why, sizeof why) ? "its files were refused" : why);
+    free(text);
+    return result;
+}
+
+static gboolean writeText(const char* path, const char* text);
+
+static void recordRefused(const char* work, const Release* release, const char* why)
+{
+    char* path = g_build_filename(work, "refused.txt", NULL);
+    char* oneLine = g_strdup(why);
+    for (char* c = oneLine; *c; c++) {
+        if (*c == '\n' || *c == '\r')
+            *c = ' ';
+    }
+    char* text = g_strdup_printf("tag=%s\nsha256=%s\nwhy=%s\n", release->tag, release->sha256, oneLine);
+    if (!writeText(path, text))
+        JOBLOG("%s couldn't be written", path);
+    g_free(text);
+    g_free(oneLine);
+    g_free(path);
 }
 
 /* The newest published release with its zip (drafts skipped, pre-releases
@@ -599,8 +601,30 @@ static gboolean writeText(const char* path, const char* text)
 
 /* ---- the job ---- */
 
+/* The title closed the connection (it ended, or gave up on us): stop. A
+ * partial staging folder is removed by the next job. */
+static void* stdinWatcher(void* data)
+{
+    (void)data;
+    for (;;) {
+        struct pollfd p = { 0, POLLIN, 0 };
+        int n = poll(&p, 1, -1);
+        if (n < 0 && errno == EINTR)
+            continue;
+        char c;
+        if (n < 0 || (p.revents & (POLLHUP | POLLERR | POLLNVAL)) || read(0, &c, 1) <= 0)
+            break;
+    }
+    JOBLOG("the title closed the connection: ending");
+    _exit(3);
+    return NULL;
+}
+
 int ps5wk_update_job(const char* jobPath)
 {
+    pthread_t watcher;
+    if (!pthread_create(&watcher, NULL, stdinWatcher, NULL))
+        pthread_detach(watcher);
     alarm(UPDATE_JOB_LIMIT_S);
     GKeyFile* job = g_key_file_new();
     if (!g_key_file_load_from_file(job, jobPath, G_KEY_FILE_NONE, NULL)) {
@@ -616,6 +640,17 @@ int ps5wk_update_job(const char* jobPath)
     char* resultPath = g_key_file_get_string(job, "job", "result", NULL);
     gboolean test = g_key_file_get_boolean(job, "job", "test-source", NULL);
     g_key_file_unref(job);
+#ifdef PS5WK_UPDATE_TESTING
+    JOBLOG("a development build (PS5WK_UPDATE_TESTING): the job file's source and ProsperoStore folder count");
+#else
+    /* A release build: GitHub and ProsperoStore's own folder, whatever the
+     * job file says (the test hooks are a development build's). */
+    g_free(source);
+    source = g_strdup(PS5UPDATE_SOURCE);
+    g_free(storeRoot);
+    storeRoot = g_strdup(PS5UPDATE_STORE_ROOT);
+    test = FALSE;
+#endif
     if (!mode || !title || !running || !source || !work || !storeRoot || !resultPath) {
         JOBLOG("incomplete job file %s", jobPath);
         return 1;
@@ -628,7 +663,7 @@ int ps5wk_update_job(const char* jobPath)
     Install install = { 0 };
     Release release = { 0 };
     Version runningVersion;
-    gboolean managed = FALSE, busy = FALSE, available = FALSE;
+    gboolean managed = FALSE, busy = FALSE, available = FALSE, refused = FALSE;
     gboolean downloading = !strcmp(mode, "download");
 
     if (!parseContentVersion(running, &runningVersion))
@@ -656,6 +691,13 @@ int ps5wk_update_job(const char* jobPath)
             char* version = g_strdup_printf("%d.%d.%d", release.version.major, release.version.minor, release.version.patch);
             JOBLOG("newest release %s (%s, %llu bytes, sha256 %s): %s", release.tag, version, (unsigned long long)release.size,
                 release.sha256, available ? "newer" : "not newer");
+            char* before = available ? refusedBefore(work, &release) : NULL;
+            if (before) {
+                JOBLOG("%s was refused before (%s): not offered again", release.tag, before);
+                g_key_file_set_string(result, "result", "refused", before);
+                available = FALSE;
+                g_free(before);
+            }
             g_key_file_set_string(result, "result", "tag", release.tag);
             g_key_file_set_string(result, "result", "version", version);
             g_key_file_set_uint64(result, "result", "size", release.size);
@@ -681,7 +723,7 @@ int ps5wk_update_job(const char* jobPath)
         struct statvfs fs;
         if (!staging)
             why = g_strdup_printf("no work folder for %s", install.folder);
-        else if (ps5zip_remove_tree(staging)) /* an earlier attempt's leftovers */
+        else if (ps5update_remove_tree(staging)) /* an earlier attempt's leftovers */
             why = g_strdup_printf("the old staging folder %s couldn't be removed (errno %d)", staging, errno);
         else if (g_mkdir_with_parents(staging, 0777) || chmod(stagingWork, 0777) || chmod(staging, 0777))
             why = g_strdup_printf("the staging folder %s couldn't be made (errno %d)", staging, errno);
@@ -701,11 +743,13 @@ int ps5wk_update_job(const char* jobPath)
             snprintf(prefix, sizeof prefix, "%s/", title);
             char error[512] = "";
             gint64 shown = 0, start = g_get_monotonic_time();
+            int unpacked = -2;
             if (g_mkdir(app, 0777) || chmod(app, 0777))
                 why = g_strdup_printf("the unpack folder couldn't be made (errno %d)", errno);
-            else if (ps5zip_extract(zip, prefix, app, UPDATE_ZIP_ENTRIES, UPDATE_UNPACKED_LIMIT, unpackProgress, &shown, error, sizeof error))
-                why = g_strdup_printf("the release's zip was refused: %s", error);
-            else
+            else if ((unpacked = ps5zip_extract(zip, prefix, app, UPDATE_ZIP_ENTRIES, UPDATE_UNPACKED_LIMIT, unpackProgress, &shown, error, sizeof error))) {
+                refused = unpacked == -1; /* the archive's fault, not this console's */
+                why = g_strdup_printf(refused ? "the release's zip was refused: %s" : "the release couldn't be unpacked: %s", error);
+            } else
                 JOBLOG("unpacked in %.1f s", (g_get_monotonic_time() - start) / 1e6);
         }
         if (!why) {
@@ -719,6 +763,7 @@ int ps5wk_update_job(const char* jobPath)
                 why = g_strdup_printf("the release says version %s, its tag %s", version, expected);
             else if (!g_file_test(eboot, G_FILE_TEST_IS_REGULAR))
                 why = g_strdup("the release has no eboot.bin");
+            refused = why != NULL; /* what the release holds */
             g_free(eboot);
             g_free(id);
             g_free(version);
@@ -743,8 +788,12 @@ int ps5wk_update_job(const char* jobPath)
             g_free(ready);
             g_free(readyPath);
         }
+        if (why && refused) {
+            recordRefused(work, &release, why);
+            g_key_file_set_string(result, "result", "refused", why);
+        }
         if (why && staging)
-            ps5zip_remove_tree(staging);
+            ps5update_remove_tree(staging);
         g_free(expected);
         g_free(app);
         g_free(zip);
