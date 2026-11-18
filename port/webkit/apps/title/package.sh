@@ -68,8 +68,12 @@ D10="$ROOT/spikes/10-title-dmem"
 # was a SIGBUS (code 3, pc = addr) in the title's first JavaScript (adblock.c).
 prospero-clang -std=gnu11 -O2 "${TF[@]}" -DMALLOC_ALIGNMENT=32 -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
-# The system keyboard: libSceImeDialog loaded and bound at run time.
+# The system keyboard: libSceImeDialog's imports, bound once titleime.c
+# loads the module, and a link-only libSceCommonDialog stub for
+# sceCommonDialogInitialize, which the SDK's stubs lack (commondialog-stub.c).
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$HERE" -c "$HERE/titleime.c" -o "$W/obj/titleime.o"
+prospero-clang -std=gnu11 -O2 -fPIC -c "$HERE/commondialog-stub.c" -o "$W/tool/commondialog-stub.o"
+"$LLD" --shared -soname libSceCommonDialog.sprx -o "$W/tool/libSceCommonDialog.so" "$W/tool/commondialog-stub.o"
 # Hardware video decoding (step 2b): Spike 9's vdec2 + the backend for wpe-ps5's PS5VideoDecoder.
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes/09-hw-decode" -c "$ROOT/spikes/09-hw-decode/vdec2.c" -o "$W/obj/vdec2.o"
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$PORT/wpe-ps5" -c "$HERE/titlevdec.c" -o "$W/obj/titlevdec.o"
@@ -146,7 +150,7 @@ title_link() {
         --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
         "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
         "$PREFIX/lib/libSceAgc.so" "$AGCDRIVER" \
-        "$SYS/lib/libScePad.so" "$SYS/lib/libSceUserService.so" \
+        "$SYS/lib/libScePad.so" "$SYS/lib/libSceUserService.so" "$SYS/lib/libSceImeDialog.so" "$W/tool/libSceCommonDialog.so" \
         --as-needed "${sdk_stubs[@]}" --start-group "$W/libc-title.a" --end-group \
         2> "$W/link.log" || {
             { grep -oE 'undefined symbol: .*' "$W/link.log" | sort -u | head -60; } || true
@@ -186,7 +190,7 @@ title_link "${defsyms[@]}" "$W/importcheck.o"
 
 # 4. Convert, fake-sign, assemble the folder title.
 "$TOOL" link --in "$W/llvm-pie.elf" --out "$W/eboot.elf" --stub-dir "$SYS/lib" \
-    --stub "$PREFIX/lib/libSceAgc.so" --stub "$AGCDRIVER" \
+    --stub "$PREFIX/lib/libSceAgc.so" --stub "$AGCDRIVER" --stub "$W/tool/libSceCommonDialog.so" \
     --module-sdk 0x02000009 --companion-sdk 0x08050001 --file-name eboot.elf
 app="$OUT/$TITLE"; rm -rf -- "$app"; mkdir -p "$app/sce_sys" "$app/sce_module"
 "$TOOL" self --sign --in "$W/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F

@@ -2,22 +2,26 @@
  * titleime.c - load the system keyboard (libSceImeDialog) into the browser
  * title and bind its functions.
  *
- * The title imports pad and user service from libraries the system loads
- * for every title, but libSceImeDialog.sprx is not one of them: its imports
- * stay NULL even though eboot.bin lists it as needed. So it is loaded at
- * run time, as Spike 9 and the PSVR2 code load theirs:
+ * The keyboard is an ordinary import, as in ProsperoStore: eboot.bin imports
+ * sceImeDialog* (the SDK's stub) and sceCommonDialogInitialize (a link-only
+ * stub, commondialog-stub.c). The system doesn't load libSceImeDialog when
+ * the title starts, so those imports are NULL until
+ * sceSysmoduleLoadModule(0x96) loads it; then the loader binds them by NID,
+ * on any firmware (13.60, 2026-11-18: Init went from 0 to base + 0xc00, the
+ * keyboard opened, typed, and did passwords and the address bar).
+ * libSceCommonDialog is bound at start.
  *
- *  1. sceSysmoduleLoadModule(0x96) (the ImeDialog id in 13.60's
- *     libSceSysmodule table, the same as on the PS4);
- *  2. sceKernelLoadStartModule(<sandbox word>/common/lib/libSceImeDialog.sprx)
+ * 0.1.0 to 0.2.1 didn't import them (the reference in dlshim.c is dropped by
+ * --gc-sections) and bound 13.60 export offsets instead, which other firmware
+ * refuses: no keyboard there (GitHub issue 1, 12.20). That path is kept as a
+ * fallback for an import the loader leaves NULL:
+ *
+ *  1. sceKernelLoadStartModule(<sandbox word>/common/lib/libSceImeDialog.sprx)
  *     for a handle (returns the loaded module's handle);
- *  3. sceKernelDlsym by name, and where that is refused (it is for every
+ *  2. sceKernelDlsym by name, and where that is refused (it is for every
  *     system library tried so far), 13.60 export offsets from the module
  *     base, used only when an anchor string in the module's read-only data
  *     matches (ime_exports_1360.h), so other firmware fails safely.
- *
- * libSceCommonDialog (sceCommonDialogInitialize) is bound the same way; it is
- * optional.
  *
  * Title only (package.sh); WPEDisplayPS5 calls ps5wk_title_load_ime() when
  * it is linked in (a weak reference, NULL in payloads).
@@ -145,9 +149,46 @@ static int bind_exports(int h, const char* file, const char* const* names, void*
     return bound;
 }
 
+extern int sceImeDialogInit(const void*, const void*);
+extern int sceImeDialogGetStatus(void);
+extern int sceImeDialogGetResult(void*);
+extern int sceImeDialogTerm(void);
+extern int sceImeDialogAbort(void);
+extern int sceImeDialogGetPanelSize(const void*, uint32_t*, uint32_t*);
+extern int sceCommonDialogInitialize(void);
+
+/* The imports' addresses as they are now. Not inlined: the compiler takes
+ * import addresses (GOT loads) as constant and could read them before the
+ * module is loaded. */
+__attribute__((noinline)) static void read_imports(struct ps5wk_ime_functions* out)
+{
+    out->init = sceImeDialogInit;
+    out->get_status = sceImeDialogGetStatus;
+    out->get_result = sceImeDialogGetResult;
+    out->term = sceImeDialogTerm;
+    out->abort = sceImeDialogAbort;
+    out->get_panel_size = sceImeDialogGetPanelSize;
+    out->common_dialog_initialize = sceCommonDialogInitialize;
+}
+
+/* The imports, once the module is loaded. Returns 0 when init, get_status,
+ * get_result and term are bound. */
+static int bind_imports(struct ps5wk_ime_functions* out)
+{
+    int rc = sceSysmoduleLoadModule(SYSMODULE_IME_DIALOG);
+    read_imports(out);
+    const int ok = out->init && out->get_status && out->get_result && out->term;
+    spike_log("ime: sysmodule 0x96 -> 0x%08x; imports %s (Init %p, CommonDialogInitialize %p)", (unsigned)rc,
+        ok ? "bound" : "not bound", (void*)out->init, (void*)out->common_dialog_initialize);
+    return ok ? 0 : -1;
+}
+
 /* Returns 0 when init, get_status, get_result and term are all bound. */
 int ps5wk_title_load_ime(struct ps5wk_ime_functions* out)
 {
+    memset(out, 0, sizeof *out);
+    if (!bind_imports(out))
+        return 0;
     memset(out, 0, sizeof *out);
     int h = load_module(SYSMODULE_IME_DIALOG, "libSceImeDialog");
     if (h >= 0) {
