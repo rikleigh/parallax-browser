@@ -1009,6 +1009,11 @@ static void probePlatformCosts()
 int main(int, char**)
 {
     signal(SIGPIPE, SIG_IGN);
+    // The title (uid 1) writes in what this (uid 0) makes in /data/ps5webkit:
+    // at the default umask a folder made here was 0755 root's, and the title
+    // couldn't install its fonts or save its ad blocker lists in it (GitHub
+    // issue 3). Modes WebKit asks for explicitly (0600 databases) still hold.
+    umask(0);
     ps5wk_crash_guard_install("child");
     setvbuf(stdout, nullptr, _IOLBF, 0);
     setvbuf(stderr, nullptr, _IOLBF, 0);

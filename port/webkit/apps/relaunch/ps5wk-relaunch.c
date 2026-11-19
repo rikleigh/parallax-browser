@@ -32,6 +32,16 @@
  * release has into <staging>/../previous and the release's in (renames;
  * undone if one fails), and refreshes the system's copies of sce_sys. The
  * outcome goes to /data/ps5webkit/update/last-install.txt for the title.
+ *
+ * A repair (GitHub issue 3): the header's type is "repair" and its argument
+ * /data/ps5webkit (nothing else is accepted). The title runs as uid 1 and
+ * the payloads as uid 0; a folder a payload made at the default umask is
+ * 0755 root's, and the title can't write in it (the runtime's fonts, the ad
+ * blocker's lists). This opens every folder under it to all (|0777) and
+ * every file (|0666), without following links, and ends with
+ *   [relaunch] repair done <changed> <failed>
+ * The title runs it at start when it finds a folder it can't write in
+ * (runtime.c, ps5wk_data_repair), then copies its files again.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -370,10 +380,95 @@ static int installUpdate(const char* title, const char* staging)
     return why ? -1 : 0;
 }
 
+#define REPAIR_ROOT "/data/ps5webkit"
+#define REPAIR_DEPTH 32
+
+typedef struct {
+    unsigned changed, failed, seen;
+    char firstFailure[200];
+} RepairState;
+
+/* path's mode with want added (lstat: a link is left alone). */
+static void openUp(const char* path, const struct stat* st, mode_t want, RepairState* state)
+{
+    state->seen++;
+    if ((st->st_mode & want) == want)
+        return;
+    if (chmod(path, (st->st_mode & 07777) | want)) {
+        if (!state->failed++)
+            snprintf(state->firstFailure, sizeof state->firstFailure, "%s (errno %d)", path, errno);
+        return;
+    }
+    state->changed++;
+}
+
+static void repairTree(char* path, size_t size, int depth, RepairState* state)
+{
+    struct stat st;
+    if (lstat(path, &st))
+        return;
+    if (S_ISREG(st.st_mode)) {
+        openUp(path, &st, 0666, state);
+        return;
+    }
+    if (!S_ISDIR(st.st_mode))
+        return; /* links, sockets: as they are */
+    openUp(path, &st, 0777, state);
+    if (depth >= REPAIR_DEPTH)
+        return;
+    DIR* dir = opendir(path);
+    if (!dir) {
+        if (!state->failed++)
+            snprintf(state->firstFailure, sizeof state->firstFailure, "opendir %s (errno %d)", path, errno);
+        return;
+    }
+    size_t length = strlen(path);
+    struct dirent* d;
+    while ((d = readdir(dir))) {
+        if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
+            continue;
+        if (length + 1 + strlen(d->d_name) + 1 > size) {
+            state->failed++;
+            continue;
+        }
+        path[length] = '/';
+        strcpy(path + length + 1, d->d_name);
+        repairTree(path, size, depth + 1, state);
+        path[length] = 0;
+    }
+    closedir(dir);
+}
+
+static int repair(const char* root)
+{
+    if (strcmp(root, REPAIR_ROOT)) {
+        say("repair refused: only %s", REPAIR_ROOT);
+        return 1;
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    static char path[1024];
+    snprintf(path, sizeof path, "%s", root);
+    RepairState state;
+    memset(&state, 0, sizeof state);
+    repairTree(path, sizeof path, 0, &state);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    say("repair: %u entries in %s, %u opened to all, %u failed%s%s, in %ld ms", state.seen, root, state.changed, state.failed,
+        state.failed ? ", first " : "", state.firstFailure,
+        (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+    say("repair done %u %u", state.changed, state.failed);
+    return state.failed ? 1 : 0;
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+    /* What this makes in /data/ps5webkit stays open to the title (uid 1;
+     * GitHub issue 3). */
+    umask(0);
     logFile = fopen(LOG_PATH, "a");
+    if (logFile)
+        chmod(LOG_PATH, 0666);
     char line[512];
     if (!fgets(line, sizeof line, stdin)) {
         say("no launch header on stdin: the browser title starts this payload");
@@ -386,6 +481,9 @@ int main(void)
     int pid = 0;
     char go[256] = "", staging[256] = "";
     int update = 0;
+    if (sscanf(line, "%31s %d %15s %llu %299s", magic, &version, type, &processIdentifier, argument) == 5
+        && !strcmp(magic, "PS5WK-LAUNCH") && !strcmp(type, "repair"))
+        return repair(argument);
     if (sscanf(line, "%31s %d %15s %llu %299s", magic, &version, type, &processIdentifier, argument) != 5
         || strcmp(magic, "PS5WK-LAUNCH") || (strcmp(type, "relaunch") && strcmp(type, "update"))
         || ((update = !strcmp(type, "update"))
