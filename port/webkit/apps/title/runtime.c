@@ -49,15 +49,34 @@ typedef struct {
     unsigned files;
     guint64 bytes;
     int error; /* errno of the first failure */
+    gboolean inData; /* it was in /data/ps5webkit (not reading /app0) */
     char failed[256];
 } CopyState;
 
-static void fail(CopyState* state, const char* what, const char* path)
+static void failWhere(CopyState* state, const char* what, const char* path, gboolean inData)
 {
     if (state->error)
         return;
     state->error = errno ? errno : EIO;
+    state->inData = inData;
     snprintf(state->failed, sizeof state->failed, "%s %s", what, path);
+}
+
+/* A failure writing in /data/ps5webkit. */
+static void fail(CopyState* state, const char* what, const char* path)
+{
+    failWhere(state, what, path, TRUE);
+}
+
+/* A failure reading the title's own files: no repair of /data helps. */
+static void failSource(CopyState* state, const char* what, const char* path)
+{
+    failWhere(state, what, path, FALSE);
+}
+
+static gboolean refusedInData(const CopyState* state)
+{
+    return state->inData && (state->error == EACCES || state->error == EPERM);
 }
 
 static void copyFile(const char* from, const char* to, CopyState* state)
@@ -65,7 +84,7 @@ static void copyFile(const char* from, const char* to, CopyState* state)
     static char buffer[1 << 20];
     int in = open(from, O_RDONLY);
     if (in < 0) {
-        fail(state, "open", from);
+        failSource(state, "open", from);
         return;
     }
     char* tmp = g_strconcat(to, ".tmp", NULL);
@@ -83,7 +102,7 @@ static void copyFile(const char* from, const char* to, CopyState* state)
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0) {
-            fail(state, "read", from);
+            failSource(state, "read", from);
             ok = FALSE;
             break;
         }
@@ -201,7 +220,7 @@ static void copyListed(char** lines, CopyState* state)
             continue;
         if (!listedPathOK(name)) {
             errno = EINVAL;
-            fail(state, "refused", name);
+            failSource(state, "refused", name);
             break;
         }
         char* source = g_build_filename(RUNTIME_FROM, name, NULL);
@@ -222,10 +241,12 @@ static char* readStamp(const char* dir)
     return contents;
 }
 
-int ps5wk_runtime_install(char* error, size_t errorSize)
+int ps5wk_runtime_install(char* error, size_t errorSize, gboolean* dataRefused)
 {
     if (error && errorSize)
         *error = 0;
+    if (dataRefused)
+        *dataRefused = FALSE;
     char* bundled = readStamp(RUNTIME_FROM);
     if (!bundled) {
         /* A development title packaged with NO_RUNTIME=1: the files were
@@ -242,6 +263,8 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
             openAllFolders(lines, &opened);
         spike_log("runtime: %s is up to date (%s)%s%s", RUNTIME_TO, bundled, opened.error ? "; couldn't open " : "",
             opened.error ? opened.failed : "");
+        if (dataRefused)
+            *dataRefused = refusedInData(&opened);
         g_strfreev(lines);
         g_free(installed);
         g_free(bundled);
@@ -252,7 +275,7 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
     gint64 start = g_get_monotonic_time();
     CopyState state = { 0 };
     if (!lines)
-        fail(&state, "read", RUNTIME_FROM "/" RUNTIME_LIST);
+        failSource(&state, "read", RUNTIME_FROM "/" RUNTIME_LIST);
     else if (g_mkdir_with_parents(RUNTIME_TO, 0777))
         fail(&state, "mkdir", RUNTIME_TO);
     else {
@@ -280,7 +303,8 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
     g_strfreev(lines);
     g_free(installed);
     g_free(bundled);
-    errno = result < 0 ? state.error : 0;
+    if (dataRefused)
+        *dataRefused = result < 0 && refusedInData(&state);
     return result;
 }
 
@@ -294,7 +318,8 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
  * one is refused, the restart helper (a payload, root) opens the tree. */
 
 static const char* const writtenFolders[] = {
-    "", "home", "home/cache", "home/tmp", "cache/fontconfig", "fonts", "adblock", "browser", "browser/contentfilters", "users",
+    "", "home", "home/cache", "home/tmp", "cache", "cache/fontconfig", "fonts", "adblock", "adblock/work", "browser",
+    "browser/contentfilters", "update", "users",
 };
 
 gboolean ps5wk_data_locked(char* which, size_t whichSize)
@@ -344,6 +369,7 @@ static void repairOutput(const char* line, gpointer data)
     repairWait.done = TRUE;
     repairWait.changed = changed;
     repairWait.failed = failed;
+    g_cond_broadcast(&repairWait.cond); /* the result is in: no need to wait for the connection to close */
     g_mutex_unlock(&repairWait.lock);
 }
 
@@ -379,7 +405,7 @@ int ps5wk_data_repair(char* error, size_t errorSize)
     }
     gint64 end = start + REPAIR_TIMEOUT_S * G_USEC_PER_SEC;
     g_mutex_lock(&repairWait.lock);
-    while (!repairWait.ended && g_cond_wait_until(&repairWait.cond, &repairWait.lock, end))
+    while (!repairWait.done && !repairWait.ended && g_cond_wait_until(&repairWait.cond, &repairWait.lock, end))
         ;
     gboolean ended = repairWait.ended, done = repairWait.done;
     unsigned changed = repairWait.changed, failed = repairWait.failed;

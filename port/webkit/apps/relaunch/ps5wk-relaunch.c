@@ -38,8 +38,11 @@
  * the payloads as uid 0; a folder a payload made at the default umask is
  * 0755 root's, and the title can't write in it (the runtime's fonts, the ad
  * blocker's lists). This opens every folder under it to all (|0777) and
- * every file (|0666), without following links, and ends with
+ * every file (|0666), and ends with
  *   [relaunch] repair done <changed> <failed>
+ * Each entry is opened with O_NOFOLLOW and changed through its descriptor
+ * (fchmod, fdopendir, openat): links, and files with other hard links, are
+ * left as they are, and nothing outside the folder is changed.
  * The title runs it at start when it finds a folder it can't write in
  * (runtime.c, ps5wk_data_repair), then copies its files again.
  */
@@ -384,42 +387,73 @@ static int installUpdate(const char* title, const char* staging)
 #define REPAIR_DEPTH 32
 
 typedef struct {
-    unsigned changed, failed, seen;
+    unsigned changed, failed, seen, skipped;
     char firstFailure[200];
 } RepairState;
 
-/* path's mode with want added (lstat: a link is left alone). */
-static void openUp(const char* path, const struct stat* st, mode_t want, RepairState* state)
+static void repairFailed(RepairState* state, const char* what, const char* path)
 {
-    state->seen++;
+    if (!state->failed++)
+        snprintf(state->firstFailure, sizeof state->firstFailure, "%s %s (errno %d)", what, path, errno);
+}
+
+/* fd's mode with want added. Through the open file, never the path: a link
+ * swapped in after the check can't send this anywhere else. */
+static void openUp(int fd, const struct stat* st, mode_t want, const char* path, RepairState* state)
+{
     if ((st->st_mode & want) == want)
         return;
-    if (chmod(path, (st->st_mode & 07777) | want)) {
-        if (!state->failed++)
-            snprintf(state->firstFailure, sizeof state->firstFailure, "%s (errno %d)", path, errno);
+    if (fchmod(fd, (st->st_mode & 07777) | want)) {
+        repairFailed(state, "fchmod", path);
         return;
     }
     state->changed++;
 }
 
-static void repairTree(char* path, size_t size, int depth, RepairState* state)
+/* name in the folder parent (path: for the log only). O_NOFOLLOW: a link
+ * fails to open (ELOOP) and is left as it is, with what it points to.
+ * O_NONBLOCK: a FIFO doesn't wait for a writer. */
+static void repairEntry(int parent, const char* name, char* path, size_t size, int depth, RepairState* state)
 {
-    struct stat st;
-    if (lstat(path, &st))
-        return;
-    if (S_ISREG(st.st_mode)) {
-        openUp(path, &st, 0666, state);
+    int fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ELOOP || errno == EMLINK || errno == EOPNOTSUPP || errno == ENXIO)
+            state->skipped++; /* a link, a socket */
+        else
+            repairFailed(state, "open", path);
         return;
     }
-    if (!S_ISDIR(st.st_mode))
-        return; /* links, sockets: as they are */
-    openUp(path, &st, 0777, state);
-    if (depth >= REPAIR_DEPTH)
+    struct stat st;
+    if (fstat(fd, &st)) {
+        repairFailed(state, "fstat", path);
+        close(fd);
         return;
-    DIR* dir = opendir(path);
+    }
+    state->seen++;
+    if (S_ISREG(st.st_mode)) {
+        /* A file also linked from outside the tree keeps its mode. */
+        if (st.st_nlink > 1)
+            state->skipped++;
+        else
+            openUp(fd, &st, 0666, path, state);
+        close(fd);
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        state->skipped++;
+        close(fd);
+        return;
+    }
+    openUp(fd, &st, 0777, path, state);
+    if (depth >= REPAIR_DEPTH) {
+        repairFailed(state, "too deep:", path);
+        close(fd);
+        return;
+    }
+    DIR* dir = fdopendir(fd); /* owns fd from here */
     if (!dir) {
-        if (!state->failed++)
-            snprintf(state->firstFailure, sizeof state->firstFailure, "opendir %s (errno %d)", path, errno);
+        repairFailed(state, "fdopendir", path);
+        close(fd);
         return;
     }
     size_t length = strlen(path);
@@ -428,12 +462,13 @@ static void repairTree(char* path, size_t size, int depth, RepairState* state)
         if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
             continue;
         if (length + 1 + strlen(d->d_name) + 1 > size) {
-            state->failed++;
+            errno = ENAMETOOLONG;
+            repairFailed(state, "path", path);
             continue;
         }
         path[length] = '/';
         strcpy(path + length + 1, d->d_name);
-        repairTree(path, size, depth + 1, state);
+        repairEntry(dirfd(dir), d->d_name, path, size, depth + 1, state);
         path[length] = 0;
     }
     closedir(dir);
@@ -451,10 +486,11 @@ static int repair(const char* root)
     snprintf(path, sizeof path, "%s", root);
     RepairState state;
     memset(&state, 0, sizeof state);
-    repairTree(path, sizeof path, 0, &state);
+    /* The root itself: absolute, and not a link either. */
+    repairEntry(AT_FDCWD, root, path, sizeof path, 0, &state);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    say("repair: %u entries in %s, %u opened to all, %u failed%s%s, in %ld ms", state.seen, root, state.changed, state.failed,
-        state.failed ? ", first " : "", state.firstFailure,
+    say("repair: %u entries in %s, %u opened to all, %u left as they are (links, hard links, sockets), %u failed%s%s, in %ld ms",
+        state.seen, root, state.changed, state.skipped, state.failed, state.failed ? ", first: " : "", state.firstFailure,
         (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
     say("repair done %u %u", state.changed, state.failed);
     return state.failed ? 1 : 0;
@@ -468,7 +504,7 @@ int main(void)
     umask(0);
     logFile = fopen(LOG_PATH, "a");
     if (logFile)
-        chmod(LOG_PATH, 0666);
+        fchmod(fileno(logFile), 0666);
     char line[512];
     if (!fgets(line, sizeof line, stdin)) {
         say("no launch header on stdin: the browser title starts this payload");

@@ -3283,13 +3283,15 @@ int main(int argc, char** argv)
      * the title folder into /data/ps5webkit, before anything reads them. */
     {
         char why[200];
-        int installed = ps5wk_runtime_install(why, sizeof why);
-        const int installError = installed < 0 ? errno : 0;
+        gboolean refused = FALSE;
+        int installed = ps5wk_runtime_install(why, sizeof why, &refused);
         /* Folders a payload (root) made that the title can't write in
-         * (GitHub issue 3): the restart helper opens them, then again. */
+         * (GitHub issue 3): the restart helper opens them, then again. Only
+         * a refusal in /data/ps5webkit: a repair can't help with /app0. */
         char locked[200] = "";
-        if ((installError == EACCES || installError == EPERM) || ps5wk_data_locked(locked, sizeof locked)) {
-            spike_log("runtime: /data/ps5webkit refuses the title (%s): repairing", installed < 0 ? why : locked);
+        if (refused || ps5wk_data_locked(locked, sizeof locked)) {
+            spike_log("runtime: /data/ps5webkit refuses the title (%s): repairing", refused ? why : locked);
+            spike_notify("Parallax Browser is repairing its files...");
             char repairWhy[120];
             if (ps5wk_data_repair(repairWhy, sizeof repairWhy) < 0) {
                 spike_log("runtime: repair failed: %s", repairWhy);
@@ -3298,7 +3300,7 @@ int main(int argc, char** argv)
                     g_strlcat(why, repairWhy, sizeof why);
                 }
             } else if (installed < 0)
-                installed = ps5wk_runtime_install(why, sizeof why);
+                installed = ps5wk_runtime_install(why, sizeof why, NULL);
         }
         if (installed < 0) {
             char message[300];

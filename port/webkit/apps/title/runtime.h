@@ -8,8 +8,10 @@
 
 /* Copies /app0/runtime into /data/ps5webkit when its stamp differs from the
  * installed one. Returns the number of files copied (0: nothing to do, or no
- * runtime in the title), or -1 with a short reason in error. */
-int ps5wk_runtime_install(char* error, size_t errorSize);
+ * runtime in the title), or -1 with a short reason in error. dataRefused:
+ * TRUE when /data/ps5webkit refused the title (EACCES/EPERM there, not in
+ * /app0), which ps5wk_data_repair can fix. */
+int ps5wk_runtime_install(char* error, size_t errorSize, gboolean* dataRefused);
 
 /* TRUE when a folder in /data/ps5webkit that the title writes in refuses
  * it (EACCES/EPERM; GitHub issue 3), with the folder in which. */
