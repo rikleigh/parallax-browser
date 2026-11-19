@@ -18,6 +18,7 @@
 
 #include "config.h"
 #include "PS5PerfOverlay.h"
+#include "PS5GLES.h"
 
 #include "PS5Compositor.h"
 #include "PS5VideoDecoder.h"
@@ -555,7 +556,7 @@ void main()
 static GLuint compileShader(GLenum type, const char* source)
 {
     GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
+    ps5ShaderSourceGL(shader, source);
     glCompileShader(shader);
     GLint ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);

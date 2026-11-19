@@ -90,7 +90,16 @@ cp "$SYS/lib/libc.a" "$W/libc-title.a"
 /opt/homebrew/opt/llvm@18/bin/llvm-ar d "$W/libc-title.a" syscalls.o
 /opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |
     awk '$2 == "T" && $3 ~ /^egl[A-Z]/ { print "EGL_SYMBOL(" $3 ")" }' | sort -u > "$W/obj/egl_symbols.inc"
-prospero-clang -std=c11 -O2 "${TF[@]}" -I"$W/obj" -c "$HERE/dlshim.c" -o "$W/obj/dlshim.o"
+# GPU=radv builds (port/webkit/build.sh; HANDOVER-radv.md Phase 2): the
+# title renders on WebKit's ANGLE with its Vulkan backend over RADV, and
+# epoxy's GL is ANGLE (dlshim.c). Package them as a test title, e.g.
+# TITLE=PPSA99208 NAME="Parallax RADV test" BLD=.../build-radv.
+RADV_FLAGS=()
+if grep -q '^PS5WK_GPU_RADV:[A-Z]*=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
+    RADV_FLAGS=(-DPS5WK_GPU_RADV=1)
+    echo "GPU=radv: the title renders on ANGLE (Vulkan, RADV)"
+fi
+prospero-clang -std=c11 -O2 "${TF[@]}" ${RADV_FLAGS[@]+"${RADV_FLAGS[@]}"} -I"$W/obj" -c "$HERE/dlshim.c" -o "$W/obj/dlshim.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -I"$ROOT/spikes" -DLOG_HOST="\"$PS5WK_LOG_HOST\"" -DLOG_PORT="$PS5WK_LOG_PORT" \
     -c "$ROOT/spikes/common/title_exit.c" -o "$W/obj/title_exit.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -I"$ROOT/spikes" -c "$ROOT/spikes/common/psvr2/psvr2.c" -o "$W/obj/psvr2.o"
@@ -105,7 +114,7 @@ webgpu_inputs=()
 rm -f "$W/obj/cpu_model.o" "$W/obj/titleradv.o"
 if grep -q '^USE_DAWN:BOOL=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
     "$ROOT/port/deps/radv/radv-object.sh"
-    prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titleradv.c" -o "$W/obj/titleradv.o"
+    prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" ${RADV_FLAGS[@]+"${RADV_FLAGS[@]}"} -c "$HERE/titleradv.c" -o "$W/obj/titleradv.o"
     webgpu_inputs=("$ROOT/build/radv-ps5/radv-local.o" --wrap=dlclose)
     AGCDRIVER="$SYS/lib/libSceAgcDriver.so"
     echo "WebGPU: RADV linked in"

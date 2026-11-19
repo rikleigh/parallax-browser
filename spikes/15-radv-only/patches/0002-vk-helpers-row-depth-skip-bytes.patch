@@ -1,0 +1,19 @@
+ps5webkit spike 15a: WebKit's ANGLE (changes.diff) gives this one caller of
+InternalFormat::computeRowDepthSkipBytes a gl::Extents, but the declaration
+in formatutils.h takes width and height, as upstream's does. WebKit never
+builds the Vulkan backend, so nothing caught it. Back to upstream's call.
+
+--- a/src/libANGLE/renderer/vulkan/vk_helpers.cpp
++++ b/src/libANGLE/renderer/vulkan/vk_helpers.cpp
+@@ -9495,8 +9495,9 @@
+     }
+ 
+     ANGLE_VK_CHECK_MATH(
+-        contextVk, formatInfo.computeRowDepthSkipBytes(type, glExtents, unpack, is3D, inputRowPitch,
+-                                                       inputDepthPitch, inputSkipBytes));
++        contextVk, formatInfo.computeRowDepthSkipBytes(type, glExtents.width, glExtents.height, unpack,
++                                                       is3D, inputRowPitch, inputDepthPitch,
++                                                       inputSkipBytes));
+     return angle::Result::Continue;
+ }
+ 

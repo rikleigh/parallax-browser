@@ -26,6 +26,10 @@
        &inline            the overflow scroller and the wheel region span the
                           column (the pad scrolls at the screen centre: it then
                           lands on them); by default they are 440 px wide on the left
+       &auto=<px>         scroll by itself, <px> per frame, down to the
+                          cluster (or the end) and back up, from the main
+                          thread (window.scrollBy): a repeatable load for A/B
+                          runs with no one at the pad
      Logs (console.log, the title log):
        SJ <t> s: scroll events n, rAF n, scrollY a..b, long tasks n, lazy loaded n, prevented n
        once a second while anything happens.
@@ -159,9 +163,16 @@ body.inline #scroller, body.inline #wheel { width: auto; }
     }, { rootMargin: "200px" });
     document.querySelectorAll(".lazy").forEach(function (el) { io.observe(el); });
 
+    var auto = +q.get("auto") || 0, autoDir = 1;
     function frame() {
         stats.raf++;
         barinfo.textContent = "scrollY " + Math.round(window.scrollY);
+        if (auto) {
+            var limit = Math.min(+q.get("cluster") || Infinity, document.documentElement.scrollHeight) - innerHeight;
+            if (window.scrollY + auto * autoDir > limit) autoDir = -1;
+            else if (window.scrollY + auto * autoDir < 0) autoDir = 1;
+            window.scrollBy(0, auto * autoDir);
+        }
         if (busy) {
             var end = performance.now() + busy;
             while (performance.now() < end) { }
@@ -187,7 +198,7 @@ body.inline #scroller, body.inline #wheel { width: auto; }
         stats.yMax = -Infinity;
     }, 1000);
     console.log("SJ start: busy " + busy + " ms, spike " + spike + "/" + every + " ms, layers " + layers + ", posts " + posts
-        + (parallax ? ", parallax" : "") + (prevent ? ", prevent" : "") + (heavy ? ", heavy " + heavy : "") + "; height " + document.documentElement.scrollHeight);
+        + (parallax ? ", parallax" : "") + (prevent ? ", prevent" : "") + (heavy ? ", heavy " + heavy : "") + (auto ? ", auto " + auto + " px" : "") + "; height " + document.documentElement.scrollHeight);
 })();
 </script>
 </body></html>

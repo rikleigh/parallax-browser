@@ -1,0 +1,31 @@
+ps5webkit spike 15a: ANGLE on Vulkan on RADV, no ps5-opengl (pid 137, unjailed 1)
+  ANGLE client extensions: EGL_EXT_client_extensions EGL_EXT_device_query EGL_EXT_platform_base EGL_MESA_platform_surfaceless EGL_ANGLE_platform_angle EGL_ANGLE_platform_angle_device_type_egl_angle EGL_ANGLE_platform_angle_vulkan EGL_ANGLE_platform_angle_vulkan_device_uuid EGL_ANGLE_platform_angle_device_id EGL_ANGLE_platform_angle_display_key EGL_KHR_client_get_all_proc_addresses EGL_KHR_debug EGL_ANGLE_feature_control EGL_ANGLE_no_error 
+RESULT 15a-angle-vk angle-display PASS EGL 1.5 vendor "Google Inc. (AMD)" version "1.5 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" apis "OpenGL_ES" (7 ms)
+  ANGLE display extensions: EGL_EXT_create_context_robustness EGL_ANGLE_surface_orientation EGL_KHR_create_context EGL_KHR_image EGL_KHR_image_base EGL_EXT_image_gl_colorspace EGL_KHR_gl_colorspace EGL_KHR_gl_texture_2D_image EGL_KHR_gl_texture_cubemap_image EGL_KHR_gl_renderbuffer_image EGL_KHR_get_all_proc_addresses EGL_KHR_fence_sync EGL_KHR_wait_sync EGL_ANGLE_create_context_webgl_compatibility EGL_CHROMIUM_create_context_bind_generates_resource EGL_KHR_swap_buffers_with_damage EGL_EXT_pixel_format_float EGL_KHR_surfaceless_context EGL_ANGLE_display_texture_share_group EGL_ANGLE_display_semaphore_share_group EGL_ANGLE_create_context_client_arrays EGL_ANGLE_program_cache_control EGL_ANGLE_robust_resource_initialization EGL_ANGLE_create_context_extensions_enabled EGL_ANDROID_blob_cache EGL_ANDROID_recordable EGL_ANGLE_create_context_backwards_compatible EGL_KHR_no_config_context EGL_IMG_context_priority EGL_KHR_create_context_no_error EGL_KHR_reusable_sync EGL_EXT_buffer_age EGL_ANGLE_create_surface_swap_
+RESULT 15a-angle-vk angle-config PASS config id 1 renderable 0x45, surfaceless 1
+RESULT 15a-angle-vk angle-context-es3 PASS GL "OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" renderer "ANGLE (AMD, Vulkan 1.4.354 (PlayStation 5 GPU (RADV NAVI21) (0x00000000)), radv-26.2.0)" GLSL "OpenGL ES GLSL ES 3.10 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)", 175 extensions, surfaceless (1 ms)
+  WebGL-relevant: +OES_texture_float +OES_texture_float_linear +OES_texture_half_float +EXT_color_buffer_float +OES_element_index_uint +OES_standard_derivatives +EXT_texture_filter_anisotropic +OES_vertex_array_object +ANGLE_instanced_arrays +EXT_sRGB +OES_EGL_image +OES_EGL_image_external +KHR_debug +ANGLE_framebuffer_blit +ANGLE_framebuffer_multisample +EXT_disjoint_timer_query +OES_texture_npot +OES_rgb8_rgba8 +EXT_texture_compression_s3tc
+  limits: max texture 16384, renderbuffer 16384, vertex texture units 32, vertex attribs 16
+RESULT 15a-angle-vk angle-shader PASS ESSL 300 es compiled + linked in 5.4 ms; uniforms xform 0 color 1
+  step: fbo
+RESULT 15a-angle-vk angle-fbo PASS RGBA8 256x256 texture FBO status 0x8cd5
+  step: clear + draw
+  step: finish
+  step: readPixels
+RESULT 15a-angle-vk angle-triangle PASS centre 255,0,0 (want red) corner 0,0,255 apex+ 0,0,255 (want blue), GL error 0x0
+RESULT 15a-angle-vk angle-texture PASS 64x64 checker sampled: bl 0,255,0 (want green) br 255,0,0 (want red), GL error 0x0
+RESULT 15a-angle-vk angle-fence PASS ClientWaitSync 0x911a in 0.00 ms, status 0x9119
+RESULT 15a-angle-vk angle-draw-bench PASS 2000 draws: frame 0.94 ms = issue 0.49 (cpu 0.49) + finish 0.45; per draw 0.2 us (cpu 0.2); first frame 0.8 ms
+RESULT 15a-angle-vk angle-tex-upload-1080p PASS 0.62 ms per 1920x1080 RGBA texSubImage2D+finish
+RESULT 15a-angle-vk angle-readpixels-256 PASS 0.06 ms per 256x256 readPixels
+RESULT 15a-angle-vk angle-context-es2 PASS GL "OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" GLSL "OpenGL ES GLSL ES 3.10 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)": #version 100 triangle centre 0,255,0 (want green) corner 0,0,0 (want black)
+RESULT 15a-angle-vk angle-context-es31 PASS GL "OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)" GLSL "OpenGL ES GLSL ES 3.10 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)", SSBO bindings 64, compute invocations 1024
+  window surface on config id 17 (2 8888 window configs tried)
+  window surface 3840x2160, surface + context 15.3 ms
+RESULT 15a-angle-vk angle-present PASS 600 frames, 0 draws each: 60.1 frames/s, worst interval 16.9 ms, 0 over 20 ms; issue 16.56 ms (cpu 0.04), swap 0.04 ms a frame (first swap included)
+RESULT 15a-angle-vk angle-present-draws PASS 600 frames, 2000 draws each: 59.9 frames/s, worst interval 16.9 ms, 0 over 20 ms; issue 16.28 ms (cpu 0.54), swap 0.40 ms a frame
+  per draw while presenting: 8.1 us (cpu 0.3)
+angle tests done
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

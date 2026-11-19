@@ -1,0 +1,31 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795052291
+push: loading file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795052291
+load started: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795052291
+load committed: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795052291
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[webgpu] title: canvas 2768 of WebProcess 4
+load finished: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795052291
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795052291 "" (0.0 s after start)
+[mem] load finished: flexible 242.0 MB free; direct memory 4092.0 MB in use; direct heap 76.0 MB mapped (peak 254.1, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 42 (peak 345.9 MB, 54 made, 0 failed, 0 zero fills, 88 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 38 live, 81.8 MB (50 created, 0 libc); WebGL 7 contexts (7 made), drawing buffers ~5.3 MB; WebGPU buffers and textures 5.3 MB (peak 1536.0, budget 1536, 2 refused)
+[webgpu] title: canvas 2768: first frame, 64x64, format 26, opaque
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-toDataURL PASS the pattern
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-toBlob PASS the pattern
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-createImageBitmap PASS the pattern
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-drawImage PASS the pattern
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-toDataURL PASS the pattern (the presented frame is kept)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-toBlob PASS the pattern (the presented frame is kept)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-createImageBitmap PASS the pattern (the presented frame is kept)
+[webgpu] title: canvas 27d0 of WebProcess 4
+[webgpu] title: canvas 27d0: first frame, 64x64, format 26, opaque
+[webgpu] title: canvas 27e5 of WebProcess 4
+[webgpu] title: canvas 27e5: first frame, 64x64, format 26, premultiplied
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-drawImage PASS the pattern (the presented frame is kept)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl alpha-opaque PASS drawImage and toDataURL give 128,64,0,255
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl alpha-premultiplied PASS drawImage and toDataURL give 255,128,0,128
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-todataurl summary PASS 11/11
+[wc] 2.1 s: 57 updates (apply 0.19 ms avg, 2.8 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 183 (183 draws, 40.0 MB, 23.80 ms, 0.130 ms per upload, 0 fence waits, 0 finishes); 57 paints (0.24 ms avg, 0.4 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 17.8 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 18.3 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.4 max
+[wc] 2.1 s: 57 updates answered when applied (async scrolling)
+[wc] 2.1 s: WebGL 9 contexts (9 made), 3 layers shown, drawing buffers ~5.4 MB (in the GL texture cap)
+[ascroll] 2.1 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 57 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00

@@ -49,26 +49,46 @@ void* __wrap_dlopen(const char* name, int mode)
     return __real_dlopen(name, mode);
 }
 
-void* __wrap_dlsym(void* handle, const char* symbol)
+/* ps5-opengl's egl* and GL entry points. */
+static void* ps5OpenGLSymbol(const char* symbol)
 {
-    if (handle != &eglHandle && handle != &glHandle)
-        return __real_dlsym(handle, symbol);
     if (!symbol)
         return NULL;
     for (size_t i = 0; i < sizeof(eglSymbols) / sizeof(eglSymbols[0]); i++) {
         if (!strcmp(eglSymbols[i].name, symbol))
             return (void*)eglSymbols[i].address;
     }
-    if (!strncmp(symbol, "egl", 3) && symbol[3] >= 'A' && symbol[3] <= 'Z')
-        return (void*)lookupProc(symbol); /* extensions, or NULL */
-    return (void*)lookupProc(symbol);
+    return (void*)lookupProc(symbol); /* GL, extensions, or NULL */
+}
+
+#if PS5WK_GPU_RADV
+/* GPU=radv (HANDOVER-radv.md Phase 2): epoxy's EGL and GL are ANGLE (WebKit's,
+ * linked in, with its Vulkan backend on RADV). ANGLE exports only EGL_* and
+ * GL_* names, and its eglGetProcAddress answers for every egl* and gl* name
+ * (EGL_KHR_get_all_proc_addresses). ps5-opengl stays linked for ANGLE's GL
+ * backend (WebGL, until Phase 3), which reaches it through
+ * angle_ps5_egl_get_proc_address below. */
+typedef void (*angle_proc_t)(void);
+extern angle_proc_t EGL_GetProcAddress(const char* procname);
+#endif
+
+void* __wrap_dlsym(void* handle, const char* symbol)
+{
+    if (handle != &eglHandle && handle != &glHandle)
+        return __real_dlsym(handle, symbol);
+#if PS5WK_GPU_RADV
+    return symbol ? (void*)EGL_GetProcAddress(symbol) : NULL;
+#else
+    return ps5OpenGLSymbol(symbol);
+#endif
 }
 
 /* ANGLE's EGL backend (WebGL builds; spikes/11-webgl/patches/0001) asks for
- * the native egl* and GL entry points here instead of dlsym()ing libEGL. */
+ * the native egl* and GL entry points here instead of dlsym()ing libEGL:
+ * ps5-opengl's, in every build. */
 void* angle_ps5_egl_get_proc_address(const char* name)
 {
-    return __wrap_dlsym(&eglHandle, name);
+    return ps5OpenGLSymbol(name);
 }
 
 /* Strong references to the SCE functions the PS5 platform declares weak

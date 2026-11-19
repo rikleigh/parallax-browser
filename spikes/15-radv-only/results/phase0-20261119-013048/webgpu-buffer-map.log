@@ -1,0 +1,26 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795052259
+push: loading file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795052259
+load started: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795052259
+[web4] [render] compositing: 3 updates in 5.4 s, 0.1 ms avg, 0.1 max (2 with a requirements traversal, 3 with a backing/hierarchy update)
+load committed: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795052259
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+load finished: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795052259
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795052259 "" (0.0 s after start)
+[mem] load finished: flexible 242.0 MB free; direct memory 3778.3 MB in use; direct heap 62.0 MB mapped (peak 62.0, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 32 (peak 315.2 MB, 44 made, 0 failed, 0 zero fills, 47 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 28 live, 40.9 MB (40 created, 0 libc); WebGPU buffers and textures 0.0 MB (peak 1536.0, budget 1536, 2 refused)
+[web4] [render] compositing requirements per traversal: 2 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfP RenderView 1, selfS RenderView 1
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map mapped-at-creation PASS 48 bytes round trip, mapAsync after 2.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map odd-multiple-of-4 PASS 1028 bytes round trip, mapAsync after 1.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map mapped-at-creation-no-map-usage PASS 256 bytes written through a STORAGE buffer mapped at creation
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map partial-ranges PASS two disjoint ranges written, a partial mapping read
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map typed-views PASS Float32Array and Int32Array views over one range
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map map-write PASS 128 bytes written through mapAsync(WRITE)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map remap PASS three rounds
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map round-trip-1MiB PASS 1048576 bytes round trip, mapAsync after 6.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map round-trip-16MiB PASS 16777216 bytes round trip, mapAsync after 48.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map round-trip-64MiB PASS 67108864 bytes round trip, mapAsync after 150.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map adapter-again PASS 19 features, the same as before the device
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-buffer-map summary PASS 11/11
+[wc] 1.5 s: 7 updates (apply 0.70 ms avg, 2.6 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 28 (28 draws, 11.1 MB, 3.61 ms, 0.129 ms per upload, 0 fence waits, 0 finishes); 7 paints (0.21 ms avg, 0.4 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 12.7 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.5 s: 7 updates answered when applied (async scrolling)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 7 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00

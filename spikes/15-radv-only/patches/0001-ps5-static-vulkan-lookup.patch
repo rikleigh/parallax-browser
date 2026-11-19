@@ -1,0 +1,42 @@
+PS5 (ps5webkit spike 15a): no Vulkan loader to dlopen. The driver (RADV, an
+ICD) is linked into the title, and the host program hands ANGLE its
+vkGetInstanceProcAddr (for a Mesa ICD, vk_icdGetInstanceProcAddr):
+    extern "C" void *angle_ps5_vk_get_instance_proc_addr(void);
+Null means no Vulkan driver. Same as Dawn's port/deps/patches/dawn/0002.
+
+--- a/src/libANGLE/renderer/vulkan/vk_renderer.cpp
++++ b/src/libANGLE/renderer/vulkan/vk_renderer.cpp
+@@ -43,6 +43,13 @@
+ #include "libANGLE/trace.h"
+ #include "platform/PlatformMethods.h"
+ #include "vulkan/vulkan_core.h"
++
++#if defined(ANGLE_PLATFORM_PS5)
++// PS5 (ps5webkit spike 15a): RADV is linked into the title as an ICD and
++// there is no libvulkan to dlopen. The host program returns the driver's
++// vkGetInstanceProcAddr (vk_icdGetInstanceProcAddr), or null for no Vulkan.
++extern "C" void *angle_ps5_vk_get_instance_proc_addr(void);
++#endif
+ 
+ // Consts
+ namespace
+@@ -2504,12 +2511,19 @@
+ #if defined(ANGLE_SHARED_LIBVULKAN)
+     {
+         ANGLE_SCOPED_DISABLE_MSAN();
++#    if defined(ANGLE_PLATFORM_PS5)
++        PFN_vkGetInstanceProcAddr vulkanLoaderGetInstanceProcAddr =
++            reinterpret_cast<PFN_vkGetInstanceProcAddr>(angle_ps5_vk_get_instance_proc_addr());
++        ANGLE_VK_CHECK(context, vulkanLoaderGetInstanceProcAddr != nullptr,
++                       VK_ERROR_INITIALIZATION_FAILED);
++#    else
+         mLibVulkanLibrary = angle::vk::OpenLibVulkan();
+         ANGLE_VK_CHECK(context, mLibVulkanLibrary, VK_ERROR_INITIALIZATION_FAILED);
+ 
+         PFN_vkGetInstanceProcAddr vulkanLoaderGetInstanceProcAddr =
+             reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+                 angle::GetLibrarySymbol(mLibVulkanLibrary, "vkGetInstanceProcAddr"));
++#    endif
+ 
+         // Set all vk* function ptrs
+         VK_CALL(volkInitializeCustom, vulkanLoaderGetInstanceProcAddr);

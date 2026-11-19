@@ -35,3 +35,12 @@ add_dependencies(WPEPlatformPS5 WPEPlatformGeneratedEnumTypesHeader)
 if (USE_GRAPHICS_LAYER_WC)
     target_compile_definitions(WPEPlatformPS5 PRIVATE PS5WK_WC=1)
 endif ()
+# GPU=radv (port/webkit/build.sh): render on ANGLE's Vulkan backend over RADV
+# instead of ps5-opengl (PS5GLES.h; HANDOVER-radv.md Phase 2).
+if (PS5WK_GPU_RADV)
+    target_compile_definitions(WPEPlatformPS5 PRIVATE PS5WK_GPU_RADV=1)
+endif ()
+if (PS5WK_GPU_RADV)
+    # PS5RendererVR's eye buffers are RADV images (vulkan/vulkan.h).
+    target_include_directories(WPEPlatformPS5 SYSTEM PRIVATE ${PS5WK_VULKAN_INCLUDE})
+endif ()

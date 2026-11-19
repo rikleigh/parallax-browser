@@ -1,0 +1,13 @@
+ps5webkit spike 15e: images shared between ANGLE's VkDevice and a second one (pid 145, unjailed 1)
+RESULT 15e-vk-share share-caps PASS second VkInstance + VkDevice on the same RADV (0); 219 device extensions: VK_KHR_external_memory_fd 0, VK_KHR_external_semaphore_fd 0, VK_KHR_external_fence_fd 0, VK_EXT_external_memory_host 1 (alignment 16384); opaque-fd buffer export features 0x0
+RESULT 15e-vk-share share-a-to-b-same PASS ANGLE drew a 1920x1080 pattern (released in GL layout 0x958e); the second device read its alias (ANGLE's image 8847360 bytes, B's 8847360): 0 of 2073600 texels wrong (all right); B's copy + wait 0.08 ms
+RESULT 15e-vk-share share-b-to-a-same PASS the second device wrote a 1920x1080 pattern into its alias (copy + wait 0.14 ms); ANGLE read its image: 0 of 2073600 texels wrong (all right), GL error 0x0
+RESULT 15e-vk-share share-a-to-b-control INFO ANGLE drew a 1920x1080 pattern (released in GL layout 0x958e); the second device read its alias (ANGLE's image 8896512 bytes, B's 8847360): 518400 of 2073600 texels wrong; B's copy + wait 0.07 ms [control: ANGLE's image made without the external struct]
+  first wrong texel (0,0)
+RESULT 15e-vk-share share-b-to-a-control INFO the second device wrote a 1920x1080 pattern into its alias (copy + wait 0.23 ms); ANGLE read its image: 2073600 of 2073600 texels wrong, GL error 0x0 [control]
+  first wrong texel (0,0)
+RESULT 15e-vk-share share-buffer PASS 1920x1080, 30 frames: the second device's image copied into its import of an ANGLE GL buffer (4000400000, +0) 0.05 ms, then ANGLE's upload from that buffer (PIXEL_UNPACK) 0.10 ms, a frame (each to completion); 0 of 2073600 texels wrong; GL error 0x0
+share tests done
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

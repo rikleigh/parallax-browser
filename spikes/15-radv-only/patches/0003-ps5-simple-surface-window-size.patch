@@ -1,0 +1,39 @@
+--- a/src/libANGLE/renderer/vulkan/SurfaceVk.cpp
++++ b/src/libANGLE/renderer/vulkan/SurfaceVk.cpp
+@@ -1343,6 +1343,12 @@
+ 
+         mIsSurfaceSizedBySwapchain = true;
+     }
++#if defined(ANGLE_PLATFORM_PS5) && defined(ANGLE_VULKAN_DISPLAY_MODE_SIMPLE)
++    // PS5: VideoOut's VK_KHR_display surface reports the display mode's size
++    // (3840x2160 on a 4K TV) as currentExtent, and takes any size up to it;
++    // the swapchain is the native window's size (WindowSurfaceVkSimple).
++    mIsSurfaceSizedBySwapchain = true;
++#endif
+ 
+     // Introduction to Android rotation and pre-rotation:
+     //
+--- a/src/libANGLE/renderer/vulkan/linux/display/WindowSurfaceVkSimple.cpp
++++ b/src/libANGLE/renderer/vulkan/linux/display/WindowSurfaceVkSimple.cpp
+@@ -78,6 +78,21 @@
+     ANGLE_VK_TRY(context, VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR, physicalDevice,
+                                   mSurface, &surfaceCaps));
+ 
++#if defined(ANGLE_PLATFORM_PS5)
++    // The size the native window asks for, within what the surface takes.
++    const angle::vk::SimpleDisplayWindow *displayWindow =
++        reinterpret_cast<const angle::vk::SimpleDisplayWindow *>(mNativeWindowType);
++    if (displayWindow != nullptr && displayWindow->width != 0 && displayWindow->height != 0)
++    {
++        *extentsOut = gl::Extents(
++            gl::clamp<int>(displayWindow->width, surfaceCaps.minImageExtent.width,
++                           surfaceCaps.maxImageExtent.width),
++            gl::clamp<int>(displayWindow->height, surfaceCaps.minImageExtent.height,
++                           surfaceCaps.maxImageExtent.height),
++            1);
++        return angle::Result::Continue;
++    }
++#endif
+     *extentsOut = gl::Extents(surfaceCaps.currentExtent.width, surfaceCaps.currentExtent.height, 1);
+     return angle::Result::Continue;
+ }

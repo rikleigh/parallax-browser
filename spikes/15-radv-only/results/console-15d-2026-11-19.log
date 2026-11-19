@@ -1,0 +1,19 @@
+ps5webkit spike 15d: hardware-decoded video into RADV memory, converted on ANGLE (pid 143, unjailed 1)
+vdec2: sysmodule 0xcf -> 0x00000000; load /FOt4QoonAC/common/lib/libSceVideodec2.sprx -> 0xd2; 0 bound by name, 10 by 13.60 offsets (anchor matched), 0 missing
+RESULT 15d-video video-gl PASS window 1920x1080, GL "OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)"; EXT_buffer_storage 1, EXT_disjoint_timer_query 1; max SSBO 1023 MB, fragment SSBO blocks 64, offset alignment 4; programs linked
+  h264_1080p.mp4: decoder frame 3268 KB (alignment 0x100); 8 ANGLE GL buffers of 3344 KB, the first mapped at 4000400000 (+0 to align)
+  picture 35: slot 2, pitch 2048, coded height 1088; vs CPU: fragment 1, compute 0 (max channel difference); luma 22..221
+  picture 305: slot 0, pitch 2048, coded height 1088; vs CPU: fragment 1, compute 0 (max channel difference); luma 25..212
+RESULT 15d-video video-h264_1080p.mp4 PASS 1920x1080 h264: 600 pictures in 10.0 s (59.9/s, on the TV at vsync), 607 AUs, 0 rc errors (first 0x0), 0 outside the GL slots; vs CPU at 64 points on 2 pictures: fragment 1, compute 0; fragment: issue 0.027 ms (cpu 0.027), GPU 0.089 ms, to glFinish 0.17 ms; compute: GPU 0.037 ms, to glFinish 0.11 ms (60 timed); present 16.32 ms; GL error 0x0
+  hevc_4k.mp4: decoder frame 12244 KB (alignment 0x100); 8 ANGLE GL buffers of 12320 KB, the first mapped at 4004000000 (+0 to align)
+  picture 35: slot 0, pitch 3840, coded height 2160; vs CPU: fragment 1, compute 0 (max channel difference); luma 21..214
+  picture 305: slot 6, pitch 3840, coded height 2160; vs CPU: fragment 0, compute 0 (max channel difference); luma 29..220
+RESULT 15d-video video-hevc_4k.mp4 PASS 3840x2160 hevc: 598 pictures in 10.0 s (59.8/s, on the TV at vsync), 603 AUs, 0 rc errors (first 0x0), 0 outside the GL slots; vs CPU at 64 points on 2 pictures: fragment 1, compute 0; fragment: issue 0.039 ms (cpu 0.039), GPU 0.139 ms, to glFinish 0.24 ms; compute: GPU 0.141 ms, to glFinish 0.21 ms (60 timed); present 16.03 ms; GL error 0x0
+  vp9p2_4k.ivf: decoder frame 24488 KB (alignment 0x100); 8 ANGLE GL buffers of 24560 KB, the first mapped at 4000400000 (+0 to align)
+  picture 35: slot 1, pitch 7680, coded height 2160; vs CPU: fragment 1, compute 0 (max channel difference); luma 25..212
+  picture 305: slot 4, pitch 7680, coded height 2160; vs CPU: fragment 1, compute 0 (max channel difference); luma 26..211
+RESULT 15d-video video-vp9p2_4k.ivf PASS 3840x2160 vp9 10-bit: 571 pictures in 10.0 s (57.0/s, on the TV at vsync), 619 AUs, 0 rc errors (first 0x0), 0 outside the GL slots; vs CPU at 64 points on 2 pictures: fragment 1, compute 0; fragment: issue 0.054 ms (cpu 0.054), GPU 0.245 ms, to glFinish 0.42 ms; compute: GPU 0.482 ms, to glFinish 0.56 ms (57 timed); present 7.04 ms; GL error 0x0
+video tests done
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

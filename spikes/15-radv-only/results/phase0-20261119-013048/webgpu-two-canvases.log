@@ -1,0 +1,41 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/two-canvases.html?run=1795052286
+push: loading file:///data/ps5webkit/phase0/webgpu/two-canvases.html?run=1795052286
+load started: file:///data/ps5webkit/phase0/webgpu/two-canvases.html?run=1795052286
+load committed: file:///data/ps5webkit/phase0/webgpu/two-canvases.html?run=1795052286
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[webgpu] title: canvas 1a56 of WebProcess 4
+load finished: file:///data/ps5webkit/phase0/webgpu/two-canvases.html?run=1795052286
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/two-canvases.html?run=1795052286 "" (0.0 s after start)
+[mem] load finished: flexible 242.0 MB free; direct memory 4054.4 MB in use; direct heap 74.0 MB mapped (peak 254.1, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 40 (peak 337.7 MB, 52 made, 0 failed, 0 zero fills, 81 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 36 live, 73.6 MB (48 created, 0 libc); WebGL 4 contexts (4 made), drawing buffers ~4.0 MB; WebGPU buffers and textures 4.0 MB (peak 1536.0, budget 1536, 2 refused)
+[webgpu] title: canvas 1a5d of WebProcess 4
+[webgpu] title: canvas 1a64 of WebProcess 4
+[webgpu] title: canvas 1a64: first frame, 320x180, format 26, opaque
+[webgpu] title: canvas 1a56: first frame, 320x180, format 26, opaque
+[webgpu] title: canvas 1a5d: first frame, 320x180, format 26, opaque
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases configure PASS canvases a and b on one device, c on a second
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases canvas-a PASS 204,51,51,255
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases canvas-b PASS 51,204,51,255
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases canvas-c-second-device PASS 51,51,204,255
+[wc] 1.0 s: 60 updates (apply 0.07 ms avg, 3.1 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 182 (182 draws, 45.7 MB, 33.86 ms, 0.186 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.26 ms avg, 0.4 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 18.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 17.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates answered when applied (async scrolling)
+[wc] 1.0 s: WebGL 6 contexts (6 made), 3 layers shown, drawing buffers ~5.3 MB (in the GL texture cap)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases animation PASS 60 frames of three canvases, 59.9 fps, 0.27 ms of JavaScript per frame
+[web4] [render] compositing: 5 updates in 5.8 s, 0.1 ms avg, 0.1 max (5 with a requirements traversal, 5 with a backing/hierarchy update)
+[web4] [render] compositing requirements per traversal: 4 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfD RenderView 3, selfP RenderView 1, selfDS RenderView 1
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases detach-reattach PASS drawn through 36 frames out of and back in the document, then read back right
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-two-canvases uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-two-canvases summary PASS 7/7
+[wc] 1.0 s: 60 updates (apply 0.05 ms avg, 1.0 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 171 (171 draws, 38.4 MB, 28.14 ms, 0.165 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.24 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 18.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 17.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 184 (184 draws, 39.8 MB, 32.40 ms, 0.176 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.25 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 18.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 17.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 1.31 ms avg 4.1 max, swap 0.0 ms avg 0.0 max, vsync interval 16.69 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.04 ms avg, video 0.00, scene 0.75, draw 0.50 avg 0.6 max (incl. the wait for the previous flip)
+[web4] [render] wc: 300 updates in 5.0 s (59.9/s), 0.4 ms average, p50 0.4, p95 0.8, 6.8 ms max; update 0.3 avg; paint 0.0 avg 0.0 p95 (0.01 Mpx, 0.1 tiles avg); frame done 16.2 ms avg; rAF clock 59.9/s (0 idle); reply to next update 0.0 ms avg 0.3 max (300 of 300 waiting at the reply, 0 started by the idle timer); tile wait 0.1 ms avg
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 184 (184 draws, 39.8 MB, 41.16 ms, 0.224 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.25 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 18.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 17.2 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.3, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.0
+[web4] [render] wc flush: 300 layer tree flushes, 0.03 ms avg; layers per flush: 8 walked, 0 skipped (culled), 2.5 changed
+[web4] [render] paint cull (per update): 0 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 0 not eligible
+[web4] [render] wc tiles: record 0.4 ms/s (0.73 Mpx/s), raster 0.8 ms/s wall (0.73 Mpx/s, 136 items, 7 async), shm allocations 0.0/s, old way 0
+[app msg] [wpe-ps5] [cpu] title: main thread busy 1 % (outside poll), process CPU 0.13 cores, render thread CPU 1 %
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.4 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 184 (184 draws, 39.8 MB, 30.79 ms, 0.167 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.25 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 18.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 17.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max

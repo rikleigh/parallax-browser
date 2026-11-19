@@ -1,0 +1,327 @@
+diff --git a/Source/WebCore/platform/graphics/PlatformDisplay.h b/Source/WebCore/platform/graphics/PlatformDisplay.h
+index 2d3d65197d..c68f6f2e55 100644
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.h
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.h
+@@ -95,6 +95,11 @@ public:
+     // share group, so WebGL's textures are the compositor's (WebKit's
+     // PS5GPUProcessInTitle.cpp). Before anything asks for one.
+     WEBCORE_EXPORT void setSharingGLContext(std::unique_ptr<GLContext>&&);
++    // GPU=radv (ps5webkit HANDOVER-radv.md, Phase 3): the compositor renders
++    // on ANGLE (Vulkan), so this display is ANGLE's own. WebGL's contexts are
++    // made on it and share with the sharing context directly, as on Windows,
++    // instead of wrapping a native context (EGL_EXTERNAL_CONTEXT_ANGLE).
++    void setDisplayIsANGLE() { m_displayIsANGLE = true; }
+ #endif
+     void clearGLContexts();
+     EGLDisplay eglDisplay() const;
+@@ -153,6 +158,9 @@ private:
+ 
+ #if ENABLE(WEBGL) && !PLATFORM(WIN)
+     mutable EGLDisplay m_angleEGLDisplay { nullptr };
++#if defined(PS5_PAYLOAD_SDK)
++    bool m_displayIsANGLE { false };
++#endif
+ #endif
+ 
+ #if ENABLE(VIDEO) && USE(GSTREAMER_GL)
+diff --git a/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp b/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp
+index 1b2ee24bf0..be37773284 100644
+--- a/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp
++++ b/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp
+@@ -213,11 +213,20 @@ bool GraphicsContextGLANGLE::initialize()
+     // Enable the extensions needed for antialias and preserveDrawingBuffer, to avoid IPC.
+     (void) enableExtensionsImpl({ "GL_ANGLE_framebuffer_multisample"_s, "GL_ANGLE_framebuffer_blit"_s, "GL_OES_rgb8_rgba8"_s });
+ 
+-    if (m_isForWebGL2 && !enableExtensionsImpl({ "GL_EXT_occlusion_query_boolean"_s, "GL_ANGLE_framebuffer_multisample"_s }))
++    if (m_isForWebGL2 && !enableExtensionsImpl({ "GL_EXT_occlusion_query_boolean"_s, "GL_ANGLE_framebuffer_multisample"_s })) {
++#if defined(PS5_PAYLOAD_SDK)
++        WTFLogAlways("[webgl] title: context set-up: WebGL 2 needs GL_EXT_occlusion_query_boolean and GL_ANGLE_framebuffer_multisample (occlusion %d, multisample %d requestable)",
++            m_allRequestableExtensions.contains("GL_EXT_occlusion_query_boolean"_s), m_allRequestableExtensions.contains("GL_ANGLE_framebuffer_multisample"_s));
++#endif
+         return false;
++    }
+ 
+-    if (!platformInitializeExtensions())
++    if (!platformInitializeExtensions()) {
++#if defined(PS5_PAYLOAD_SDK)
++        WTFLogAlways("[webgl] title: context set-up: platformInitializeExtensions failed");
++#endif
+         return false;
++    }
+ 
+     if (m_isForWebGL2)
+         GL_Enable(GraphicsContextGL::PRIMITIVE_RESTART_FIXED_INDEX);
+diff --git a/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp b/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp
+index 9678a2a85c..0aa67dd8dd 100644
+--- a/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp
++++ b/Source/WebCore/platform/graphics/angle/PlatformDisplayANGLE.cpp
+@@ -32,6 +32,10 @@ EGLDisplay PlatformDisplay::angleEGLDisplay() const
+ #if PLATFORM(WIN)
+     return eglDisplay();
+ #else
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_displayIsANGLE)
++        return eglDisplay();
++#endif
+     if (m_angleEGLDisplay != EGL_NO_DISPLAY)
+         return m_angleEGLDisplay;
+ 
+@@ -77,10 +81,28 @@ EGLContext PlatformDisplay::angleSharingGLContext()
+ #if PLATFORM(WIN)
+     return sharingGLContext()->platformContext();
+ #else
+-    ASSERT(m_angleEGLDisplay != EGL_NO_DISPLAY);
+     auto sharingContext = sharingGLContext();
+     if (!sharingContext)
+         return EGL_NO_CONTEXT;
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_displayIsANGLE) {
++        // A plain ES context in the sharing context's share group: each WebGL
++        // context destroys the one it was given (GraphicsContextGLEGL).
++        EGLint configAttributes[] = {
++            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
++            EGL_NONE
++        };
++        EGLConfig config;
++        EGLint numberConfigsReturned = 0;
++        EGL_ChooseConfig(eglDisplay(), configAttributes, &config, 1, &numberConfigsReturned);
++        if (numberConfigsReturned != 1)
++            return EGL_NO_CONTEXT;
++        EGLint contextAttributes[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
++        return EGL_CreateContext(eglDisplay(), config, sharingContext->platformContext(), contextAttributes);
++    }
++#endif
++    ASSERT(m_angleEGLDisplay != EGL_NO_DISPLAY);
+ 
+     EGLint configAttributes[] = {
+         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+diff --git a/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp b/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp
+index a7996ba6e2..2376ed547e 100644
+--- a/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp
++++ b/Source/WebCore/platform/graphics/egl/GraphicsContextGLEGL.cpp
+@@ -247,6 +247,13 @@ RefPtr<VideoFrame> GraphicsContextGLEGL::surfaceBufferToVideoFrame(SurfaceBuffer
+ }
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5: which step of a WebGL context's set-up failed, in the title's log.
++#define PS5_WEBGL_SETUP_FAILED(message) WTFLogAlways("[webgl] title: context set-up: %s (EGL 0x%04x)", message, EGL_GetError())
++#else
++#define PS5_WEBGL_SETUP_FAILED(message) LOG(WebGL, message)
++#endif
++
+ bool GraphicsContextGLEGL::platformInitializeContext()
+ {
+     m_isForWebGL2 = contextAttributes().isWebGL2;
+@@ -277,7 +284,7 @@ bool GraphicsContextGLEGL::platformInitializeContext()
+     EGLint numberConfigsReturned = 0;
+     EGL_ChooseConfig(m_displayObj, configAttributes, &m_configObj, 1, &numberConfigsReturned);
+     if (numberConfigsReturned != 1) {
+-        LOG(WebGL, "EGLConfig Initialization failed.");
++        PS5_WEBGL_SETUP_FAILED("EGLConfig Initialization failed.");
+         return false;
+     }
+     LOG(WebGL, "Got EGLConfig");
+@@ -286,14 +293,14 @@ bool GraphicsContextGLEGL::platformInitializeContext()
+         static const int pbufferAttributes[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+         m_surfaceObj = EGL_CreatePbufferSurface(m_displayObj, m_configObj, pbufferAttributes);
+         if (m_surfaceObj == EGL_NO_SURFACE) {
+-            LOG(WebGL, "Surfaceless context is not supported and we failed to create a pbuffer surface");
++            PS5_WEBGL_SETUP_FAILED("Surfaceless context is not supported and we failed to create a pbuffer surface");
+             return false;
+         }
+     }
+ 
+     EGL_BindAPI(EGL_OPENGL_ES_API);
+     if (EGL_GetError() != EGL_SUCCESS) {
+-        LOG(WebGL, "Unable to bind to OPENGL_ES_API");
++        PS5_WEBGL_SETUP_FAILED("Unable to bind to OPENGL_ES_API");
+         return false;
+     }
+ 
+@@ -320,8 +327,13 @@ bool GraphicsContextGLEGL::platformInitializeContext()
+     eglContextAttributes.append(EGL_CONTEXT_BIND_GENERATES_RESOURCE_CHROMIUM);
+     eglContextAttributes.append(EGL_FALSE);
+ #if USE(COORDINATED_GRAPHICS)
+-    eglContextAttributes.append(EGL_CONTEXT_VIRTUALIZATION_GROUP_ANGLE);
+-    eglContextAttributes.append(0);
++    // Only where the display has it (ANGLE's GL backend): asking for it on
++    // a display without it fails the context (EGL_BAD_ATTRIBUTE; the PS5's
++    // GPU=radv build, ANGLE on Vulkan).
++    if (GLContext::isExtensionSupported(displayExtensions, "EGL_ANGLE_context_virtualization")) {
++        eglContextAttributes.append(EGL_CONTEXT_VIRTUALIZATION_GROUP_ANGLE);
++        eglContextAttributes.append(0);
++    }
+ #endif
+ 
+     if (WTF::contains(unsafeSpan(displayExtensions), "EGL_ANGLE_power_preference"_span)) {
+@@ -337,18 +349,18 @@ bool GraphicsContextGLEGL::platformInitializeContext()
+ #else
+     m_angleSharingContextObj = sharedDisplay.angleSharingGLContext();
+     if (m_angleSharingContextObj == EGL_NO_CONTEXT) {
+-        LOG(WebGL, "ANGLE sharing EGLContext Initialization failed.");
++        PS5_WEBGL_SETUP_FAILED("ANGLE sharing EGLContext Initialization failed.");
+         return false;
+     }
+ 
+     m_contextObj = EGL_CreateContext(m_displayObj, m_configObj, m_angleSharingContextObj, eglContextAttributes.span().data());
+ #endif
+     if (m_contextObj == EGL_NO_CONTEXT) {
+-        LOG(WebGL, "EGLContext Initialization failed.");
++        PS5_WEBGL_SETUP_FAILED("EGLContext Initialization failed.");
+         return false;
+     }
+     if (!makeContextCurrent()) {
+-        LOG(WebGL, "ANGLE makeContextCurrent failed.");
++        PS5_WEBGL_SETUP_FAILED("ANGLE makeContextCurrent failed.");
+         return false;
+     }
+     LOG(WebGL, "Got EGLContext");
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+index 0fae3f40c0..dd50c48f26 100644
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+@@ -59,6 +59,15 @@ std::unique_ptr<PlatformDisplaySurfaceless> PlatformDisplaySurfaceless::create()
+     return std::unique_ptr<PlatformDisplaySurfaceless>(new PlatformDisplaySurfaceless(glDisplay.releaseNonNull()));
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++std::unique_ptr<PlatformDisplaySurfaceless> PlatformDisplaySurfaceless::create(Ref<GLDisplay>&& glDisplay)
++{
++    auto display = std::unique_ptr<PlatformDisplaySurfaceless>(new PlatformDisplaySurfaceless(WTF::move(glDisplay)));
++    display->setDisplayIsANGLE();
++    return display;
++}
++#endif
++
+ PlatformDisplaySurfaceless::PlatformDisplaySurfaceless(Ref<GLDisplay>&& glDisplay)
+     : PlatformDisplay(WTF::move(glDisplay))
+ {
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
+index cca6166f72..1fc4559bfb 100644
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
+@@ -32,6 +32,10 @@ namespace WebCore {
+ class PlatformDisplaySurfaceless final : public PlatformDisplay {
+ public:
+     static std::unique_ptr<PlatformDisplaySurfaceless> create();
++#if defined(PS5_PAYLOAD_SDK)
++    // GPU=radv: on the compositor's display (ANGLE's), PlatformDisplay::setDisplayIsANGLE.
++    WEBCORE_EXPORT static std::unique_ptr<PlatformDisplaySurfaceless> create(Ref<GLDisplay>&&);
++#endif
+ 
+     virtual ~PlatformDisplaySurfaceless();
+ private:
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+index 10690d7f95..69974ab9ca 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
+@@ -13,6 +13,7 @@
+ #include <WebCore/PlatformDisplay.h>
+ #include <epoxy/egl.h>
+ #include <epoxy/gl.h>
++#include <string.h>
+ #include <wtf/NeverDestroyed.h>
+ 
+ namespace WebKit {
+@@ -45,9 +46,44 @@ static EGLContext copyContext()
+     return context.get() ? static_cast<EGLContext>(context.get()->platformContext()) : EGL_NO_CONTEXT;
+ }
+ 
++// GPU=radv: WebGL's contexts are on the compositor's ANGLE display (the
++// title's PS5GPUProcessInTitle.cpp), whose EGL version names ANGLE.
++static bool currentDisplayIsANGLE()
++{
++    static int angle = -1;
++    if (angle < 0) {
++        const char* version = eglQueryString(eglGetCurrentDisplay(), EGL_VERSION);
++        angle = version && strstr(version, "ANGLE");
++    }
++    return angle;
++}
++
+ bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY)
+ {
+     auto copy = copyVideoFrameFunction();
++    if (copy && eglGetCurrentContext() != EGL_NO_CONTEXT && currentDisplayIsANGLE()) {
++        // GPU=radv: WebGL's own context is in the compositor's share group, so
++        // the copy runs in it. Making another ANGLE context current in the
++        // middle of WebGL's frame and back crashed ANGLE's Vulkan backend (its
++        // render pass commands lost their allocator; 2026-11-19). The copy
++        // binds framebuffers of its own; WebGL's bindings and scissor test are
++        // put back.
++        GLint readFramebuffer = 0, drawFramebuffer = 0;
++        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
++        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
++        const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
++        if (scissor)
++            glDisable(GL_SCISSOR_TEST);
++        void* done = copy(key, nativeTexture, flipY);
++        if (scissor)
++            glEnable(GL_SCISSOR_TEST);
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebuffer);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
++        if (!done)
++            return false;
++        glDeleteSync(static_cast<GLsync>(done)); // same context: already in order
++        return true;
++    }
+     EGLContext helper = copy ? copyContext() : EGL_NO_CONTEXT;
+     if (helper == EGL_NO_CONTEXT)
+         return false;
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+index dca31e6827..b2948ce6d8 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+@@ -156,7 +156,9 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+     if (!state.context)
+         return false;
+ 
+-    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    // The context's own display: ps5-opengl's default display, or (GPU=radv)
++    // the compositor's ANGLE display, which isn't ANGLE's default one.
++    EGLDisplay display = WebCore::PlatformDisplay::sharedDisplay().eglDisplay();
+     if (ps5wk_gpu_submit_lock)
+         ps5wk_gpu_submit_lock();
+     bool ok = false;
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+index 3ccb6f2598..1aacc28e18 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5GPUProcessInTitle.cpp
+@@ -13,7 +13,10 @@
+ #include "ProcessTerminationReason.h"
+ #include "WebProcessProxy.h"
+ #include <WebCore/GLContext.h>
++#include <WebCore/GLDisplay.h>
+ #include <WebCore/PlatformDisplaySurfaceless.h>
++#include <epoxy/egl.h>
++#include <string.h>
+ #if USE(DAWN)
+ #include <pthread.h>
+ #include <pthread_np.h>
+@@ -78,6 +81,24 @@ static bool ensureDisplay()
+ {
+     if (WebCore::PlatformDisplay::sharedDisplayIfExists())
+         return true;
++    // GPU=radv (HANDOVER-radv.md, Phase 3): the compositor is on ANGLE
++    // (Vulkan). WebGL's display is then that same ANGLE display, and its
++    // contexts share with an ES context of the compositor's share group
++    // directly.
++    if (auto* compositor = PS5WCHost::compositorContext()) {
++        RefPtr compositorDisplay = compositor->display();
++        const char* version = compositorDisplay ? eglQueryString(compositorDisplay->eglDisplay(), EGL_VERSION) : nullptr;
++        if (version && strstr(version, "ANGLE")) {
++            auto display = WebCore::PlatformDisplaySurfaceless::create(compositorDisplay.releaseNonNull());
++            if (auto sharing = WebCore::GLContext::create(display->glDisplay(), WebCore::GLContext::Target::Surfaceless, compositor)) {
++                display->setSharingGLContext(WTF::move(sharing));
++                WTFLogAlways("[webgl] title: WebGL on the compositor's ANGLE display (%s), sharing its GL names", version);
++            } else
++                WTFLogAlways("[webgl] title: no ES context in the compositor's ANGLE share group: WebGL canvases stay blank");
++            WebCore::PlatformDisplay::setSharedDisplay(WTF::move(display));
++            return true;
++        }
++    }
+     auto display = WebCore::PlatformDisplaySurfaceless::create();
+     if (!display)
+         return false;

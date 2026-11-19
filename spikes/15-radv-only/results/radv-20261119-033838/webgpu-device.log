@@ -1,0 +1,57 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/device.html?run=1795059921
+push: loading file:///data/ps5webkit/phase0/webgpu/device.html?run=1795059921
+load started: file:///data/ps5webkit/phase0/webgpu/device.html?run=1795059921
+[web4] [render] compositing: 3 updates in 5.4 s, 0.1 ms avg, 0.1 max (2 with a requirements traversal, 2 with a backing/hierarchy update)
+load committed: file:///data/ps5webkit/phase0/webgpu/device.html?run=1795059921
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[webgl] a WebGPU device exists: WebGL's work takes the GPU submission lock
+[webgpu] title: buffers and textures may take 1536 MB (webgpu-budget-mb)
+load finished: file:///data/ps5webkit/phase0/webgpu/device.html?run=1795059921
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/device.html?run=1795059921 "" (0.0 s after start)
+[mem] load finished: flexible 239.0 MB free; direct memory 502.7 MB in use; direct heap 28.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 48 (peak 332.1 MB, 51 made, 0 failed, 0 zero fills, 35 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 45 live, 75.9 MB (48 created, 0 libc); WebGPU buffers and textures 0.0 MB (peak 0.0, budget 1536, 0 refused)
+[webgpu] title: latency log off (/data/ps5webkit/webgpu-latency-log)
+[web4] [render] compositing requirements per traversal: 2 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfP RenderView 1, selfS RenderView 1
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device request-device PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device default-features PASS 1 feature(s): core-features-and-limits
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:55:16: CONSOLE LOG [webgpu-device] limits not in the table: maxStorageBuffersInFragmentStage=8 maxStorageTexturesInFragmentStage=4 maxStorageBuffersInVertexStage=8 maxStorageTexturesInVertexStage=4
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device default-limits PASS 31 limits are the defaults
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-bgra8unorm-storage PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-clip-distances PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-core-features-and-limits PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-depth-clip-control PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-depth32float-stencil8 PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-dual-source-blending PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-float32-blendable PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-float32-filterable PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-indirect-first-instance PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-primitive-index PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-rg11b10ufloat-renderable PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-shader-f16 PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-subgroups PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-texture-component-swizzle PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-texture-compression-bc PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-texture-compression-bc-sliced-3d PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-texture-formats-tier1 PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-texture-formats-tier2 PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device feature-timestamp-query PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device required-limit-granted PASS maxTextureDimension2D=16384
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device unsupported-feature-rejects PASS TypeError: Type error
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device over-limit-rejects PASS maxBindGroups=5: OperationError: The operation failed for an operation-specific reason.
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device second-request-device PASS rejected: OperationError: The operation failed for an operation-specific reason.
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device label PASS
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device submitted-work-done PASS 7.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-device destroy-lost PASS reason destroyed, message ""
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-device summary PASS 29/29
+[wc] 1.5 s: 6 updates (apply 0.35 ms avg, 1.3 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 34 (34 draws, 9.0 MB, 1.51 ms, 0.045 ms per upload, 0 fence waits, 0 finishes); 6 paints (0.11 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 1.4 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 1.5 s: 6 updates answered when applied (async scrolling)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 6 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[wc] 1.0 s: 30 updates (apply 0.07 ms avg, 0.1 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 60 (60 draws, 2.3 MB, 1.64 ms, 0.027 ms per upload, 0 fence waits, 0 finishes); 30 paints (0.10 ms avg, 0.1 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 0.2 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 1.0 s: 30 updates answered when applied (async scrolling)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 30 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[wc] 1.0 s: 58 updates (apply 0.06 ms avg, 0.1 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 116 (116 draws, 4.5 MB, 2.96 ms, 0.026 ms per upload, 0 fence waits, 0 finishes); 58 paints (0.10 ms avg, 0.1 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 0.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 1.0 s: 58 updates answered when applied (async scrolling)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 58 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[wc] 1.0 s: 58 updates (apply 0.06 ms avg, 0.1 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 116 (116 draws, 4.5 MB, 2.90 ms, 0.025 ms per upload, 0 fence waits, 0 finishes); 58 paints (0.10 ms avg, 0.1 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 0.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[app msg] [wpe-ps5] [present] 181 frames (36.1/s), render 0.43 ms avg 16.6 max, swap 0.1 ms avg 0.5 max, vsync interval 17.43 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.08 ms avg, video 0.00, scene 0.11, draw 0.23 avg 16.5 max (incl. the wait for the previous flip)

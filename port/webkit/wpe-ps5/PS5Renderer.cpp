@@ -18,6 +18,7 @@
 
 #include "config.h"
 #include "PS5Renderer.h"
+#include "PS5GLES.h"
 
 #include "PS5Compositor.h"
 #include "PS5GLBench.h"
@@ -198,7 +199,7 @@ void main()
 static GLuint compile(GLenum type, const char* source, char* error, unsigned errorSize)
 {
     GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
+    ps5ShaderSourceGL(shader, source);
     glCompileShader(shader);
     GLint ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
@@ -423,6 +424,96 @@ void* PS5Renderer::threadEntry(void* data)
     return nullptr;
 }
 
+#if PS5WK_GPU_RADV
+// GPU=radv: ANGLE's Vulkan backend on RADV, on ANGLE's "simple" display
+// (VK_KHR_display, which PS5_Mesa's RADV puts on VideoOut), an ES 3.1
+// context (spikes/15-radv-only 15a). epoxy reaches ANGLE's entry points
+// (apps/title/dlshim.c).
+#ifndef EGL_PLATFORM_ANGLE_ANGLE
+#define EGL_PLATFORM_ANGLE_ANGLE 0x3202
+#define EGL_PLATFORM_ANGLE_TYPE_ANGLE 0x3203
+#endif
+#ifndef EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE
+#define EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE 0x3450
+#endif
+#ifndef EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE
+#define EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE 0x348F
+#endif
+#ifndef EGL_PLATFORM_VULKAN_DISPLAY_MODE_SIMPLE_ANGLE
+#define EGL_PLATFORM_VULKAN_DISPLAY_MODE_SIMPLE_ANGLE 0x34A4
+#endif
+// ps5-opengl hides the system's splash screen when its window surface is
+// made (ps5_egl.c); with ANGLE nothing else does, and the splash stays over
+// the title's picture.
+extern "C" int sceSystemServiceHideSplashScreen(void) __attribute__((weak));
+bool PS5Renderer::initializeANGLE(void*& display, void*& config, void*& surface, void*& context, char* error, unsigned errorSize)
+{
+    typedef EGLDisplay (*GetPlatformDisplayEXT)(EGLenum, void*, const EGLint*);
+    auto getPlatformDisplay = reinterpret_cast<GetPlatformDisplayEXT>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
+    static const EGLint displayAttributes[] = {
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
+        EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE, EGL_PLATFORM_VULKAN_DISPLAY_MODE_SIMPLE_ANGLE,
+        EGL_NONE
+    };
+    int64_t start = nowUS();
+    display = getPlatformDisplay ? getPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE, reinterpret_cast<void*>(static_cast<intptr_t>(EGL_DEFAULT_DISPLAY)), displayAttributes) : EGL_NO_DISPLAY;
+    EGLint major = 0, minor = 0;
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor)) {
+        snprintf(error, errorSize, "ANGLE Vulkan display: %s (0x%04x)", getPlatformDisplay ? "eglInitialize failed" : "no eglGetPlatformDisplayEXT", eglGetError());
+        return false;
+    }
+    int64_t initialized = nowUS();
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+        snprintf(error, errorSize, "eglBindAPI(EGL_OPENGL_ES_API) failed (0x%04x)", eglGetError());
+        return false;
+    }
+    // ANGLE sizes the swapchain by this (ANGLE patch 0003); VideoOut has
+    // 1920x1080 and 3840x2160 buffers and blits other sizes into one.
+    static struct { uint16_t width, height; } window = { 1920, 1080 };
+    // RADV's VideoOut surface offers B8G8R8A8 only, and ANGLE refuses a window
+    // surface whose config's format the surface lacks: try the 8888 window
+    // configs until one takes.
+    EGLConfig configs[64];
+    EGLint count = 0, tried = 0, lastError = 0;
+    eglGetConfigs(display, configs, 64, &count);
+    for (EGLint i = 0; i < count && surface == EGL_NO_SURFACE; i++) {
+        EGLint type = 0, renderable = 0, r = 0, g = 0, b = 0, a = 0, samples = 0;
+        eglGetConfigAttrib(display, configs[i], EGL_SURFACE_TYPE, &type);
+        eglGetConfigAttrib(display, configs[i], EGL_RENDERABLE_TYPE, &renderable);
+        eglGetConfigAttrib(display, configs[i], EGL_RED_SIZE, &r);
+        eglGetConfigAttrib(display, configs[i], EGL_GREEN_SIZE, &g);
+        eglGetConfigAttrib(display, configs[i], EGL_BLUE_SIZE, &b);
+        eglGetConfigAttrib(display, configs[i], EGL_ALPHA_SIZE, &a);
+        eglGetConfigAttrib(display, configs[i], EGL_SAMPLES, &samples);
+        if (!(type & EGL_WINDOW_BIT) || !(renderable & EGL_OPENGL_ES3_BIT) || r != 8 || g != 8 || b != 8 || a != 8 || samples > 1)
+            continue;
+        tried++;
+        surface = eglCreateWindowSurface(display, configs[i], (EGLNativeWindowType)(uintptr_t)&window, nullptr);
+        if (surface != EGL_NO_SURFACE)
+            config = configs[i];
+        else
+            lastError = eglGetError();
+    }
+    if (surface == EGL_NO_SURFACE) {
+        snprintf(error, errorSize, "ANGLE window surface: 0x%04x on all %d 8888 window configs (of %d)", lastError, tried, count);
+        return false;
+    }
+    int splash = sceSystemServiceHideSplashScreen ? sceSystemServiceHideSplashScreen() : -1;
+    if (splash)
+        g_message("[wpe-ps5] PS5Renderer: hiding the splash screen failed (0x%08x)", static_cast<unsigned>(splash));
+    static const EGLint contextAttributes[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE };
+    context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttributes);
+    if (context == EGL_NO_CONTEXT || !eglMakeCurrent(display, surface, surface, context)) {
+        snprintf(error, errorSize, "ANGLE ES 3.1 context failed (0x%04x)", eglGetError());
+        return false;
+    }
+    g_message("[wpe-ps5] PS5Renderer: ANGLE on Vulkan, EGL %d.%d, display up in %.1f ms, surface and context in %.1f ms (%d 8888 window configs tried); %s; %s",
+        major, minor, (initialized - start) / 1000.0, (nowUS() - initialized) / 1000.0, tried,
+        reinterpret_cast<const char*>(glGetString(GL_RENDERER)), reinterpret_cast<const char*>(glGetString(GL_VERSION)));
+    return true;
+}
+#endif
+
 bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
 {
     // Mesa's glthread for every context of the title (the compositor's and
@@ -433,6 +524,14 @@ bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
         setenv("PS5_GLTHREAD", "1", 1);
         g_message("[wpe-ps5] glthread on for the title's GL contexts (/data/ps5webkit/gl-thread)");
     }
+#if PS5WK_GPU_RADV
+    EGLDisplay display;
+    EGLConfig config = nullptr;
+    EGLSurface surface = EGL_NO_SURFACE;
+    EGLContext context = EGL_NO_CONTEXT;
+    if (!initializeANGLE(display, config, surface, context, error, errorSize))
+        return false;
+#else
     EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (display == EGL_NO_DISPLAY || !eglInitialize(display, nullptr, nullptr)) {
         snprintf(error, errorSize, "eglInitialize failed (0x%04x)", eglGetError());
@@ -462,6 +561,7 @@ bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
         snprintf(error, errorSize, "EGL window surface/context failed (0x%04x)", eglGetError());
         return false;
     }
+#endif
     eglQuerySurface(display, surface, EGL_WIDTH, &m_width);
     eglQuerySurface(display, surface, EGL_HEIGHT, &m_height);
     if (m_width <= 0 || m_height <= 0) {
@@ -794,8 +894,10 @@ void PS5Renderer::threadMain()
         // The wait for the last frame's flip, before the lock and not inside the first draw under
         // it: it is most of a frame (13.7 of 16.7 ms), and Dawn waited as long for every
         // vkQueueSubmit of a page (a WebGPU emulator: 47% of its GPU thread's time, measured).
+#if !PS5WK_GPU_RADV // ANGLE waits in its swapchain acquire instead
         if (ps5wk_gpu_submit_lock && ps5_agc_gate2_wait_present)
             ps5_agc_gate2_wait_present();
+#endif
         // Until the swap: its wait for the vsync is not held against Dawn.
         GPUSubmitLock gpuSubmitLock;
         setUpCompositorIfWanted();
@@ -968,7 +1070,7 @@ void PS5Renderer::copyPage()
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(job.stride / 4));
         if (resized) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, job.data);
+            glTexImage2D(GL_TEXTURE_2D, 0, kPS5BGRAInternalFormat, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, job.data);
             bytes = 4.0 * width * height;
         } else if (!job.damageCount) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, job.data);
@@ -1121,6 +1223,12 @@ void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
         // An sRGB texture gets the frame's bytes as they are, as texImage2D
         // stores them: no linear-to-sRGB encoding on the write (on by
         // default in ES contexts; EXT_sRGB_write_control turns it off).
+#if PS5WK_GPU_RADV
+        // GPU=radv: this runs in WebGL's own ANGLE context (WebKit's
+        // PS5WebGLVideoCopy.cpp), whose errors the page sees, and ANGLE has
+        // no EXT_sRGB_write_control here: no sRGB toggle.
+        // TODO: sRGB WebGL textures get the frame encoded twice.
+#else
         static bool checkedSRGB;
         if (!checkedSRGB) {
             while (glGetError() != GL_NO_ERROR) { }
@@ -1131,10 +1239,13 @@ void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
             if (GLenum error = glGetError())
                 g_message("[wpe-ps5] video frame copy: sRGB writes can't be turned off (GL error 0x%x): sRGB WebGL textures get encoded twice", error);
         }
+#endif
         // The stream's row 0 is the picture's top, as texImage2D's without
         // UNPACK_FLIP_Y.
         glBlitFramebuffer(0, 0, w, h, 0, flipY ? h : 0, w, flipY ? 0 : h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#if !PS5WK_GPU_RADV
         glEnable(GL_FRAMEBUFFER_SRGB);
+#endif
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDeleteFramebuffers(2, fbos);
@@ -1535,7 +1646,7 @@ void PS5Renderer::applyUILayer()
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, m_uiStaging.data());
+        glTexImage2D(GL_TEXTURE_2D, 0, kPS5BGRAInternalFormat, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, m_uiStaging.data());
     }
     // The copy is in GL now: no second 8 MB kept on the CPU side.
     m_uiStaging.clear();

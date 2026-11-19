@@ -51,6 +51,23 @@ static void gpu_submit_init(void)
     pthread_mutexattr_destroy(&attr);
 }
 
+#if PS5WK_GPU_RADV
+/* GPU=radv: ANGLE (the compositor, WebGL) and Dawn are both RADV, and RADV's
+ * PS5 winsys has one queue for the process, its submissions in order under
+ * its own lock: there is no other driver to keep apart. Held here, the lock
+ * was held through ANGLE's swapchain acquire (in the frame's first draw,
+ * about 13 of 16.7 ms), and Dawn's canvas readbacks waited about a second
+ * each (a WebGPU cube shown at 1 frame/s; 2026-11-19). The functions stay:
+ * ps5browser.c turns WebGPU on when they exist. */
+void ps5wk_gpu_submit_lock(void)
+{
+}
+
+int ps5wk_gpu_submit_unlock(void)
+{
+    return 0;
+}
+#else
 void ps5wk_gpu_submit_lock(void)
 {
     pthread_once(&gpu_submit_once, gpu_submit_init);
@@ -66,3 +83,15 @@ int ps5wk_gpu_submit_unlock(void)
     pthread_mutex_unlock(&gpu_submit_mutex);
     return 1;
 }
+#endif
+
+#if PS5WK_GPU_RADV
+/* ANGLE's Vulkan loader hook (ANGLE patch "ps5-static-vulkan-lookup", from
+ * spikes/15-radv-only): RADV is linked in, so ANGLE takes the driver's
+ * vkGetInstanceProcAddr instead of dlopen()ing a loader. */
+void* vk_icdGetInstanceProcAddr(void* instance, const char* name);
+void* angle_ps5_vk_get_instance_proc_addr(void)
+{
+    return (void*)&vk_icdGetInstanceProcAddr;
+}
+#endif

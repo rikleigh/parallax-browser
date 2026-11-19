@@ -7,7 +7,7 @@
      WebGL 2 canvas. On the TV: the test pattern, the right way up, its clock
      running, on a tilted quad; the text under it gives the frame rate and
      the centre pixel. Upload to /data/ps5webkit/webgl-video.html and open
-     file:///data/ps5webkit/webgl-video.html[?clip=sync-2160p30-hevc.mp4][&attach=1]. -->
+     file:///data/ps5webkit/webgl-video.html[?clip=sync-2160p30-hevc.mp4 or an absolute path][&attach=1]. -->
 <html>
 <head>
 <meta charset="utf-8">
@@ -28,7 +28,7 @@ function log(text) { console.log('[webgl-video] ' + text); }
 
 const clip = new URLSearchParams(location.search).get('clip') || 'sync-1080p30-h264.mp4';
 const video = document.createElement('video');
-video.src = '/data/ps5webkit/media/' + clip;
+video.src = clip.startsWith('/') ? clip : '/data/ps5webkit/media/' + clip;
 video.muted = true;
 video.loop = true;
 video.playsInline = true;

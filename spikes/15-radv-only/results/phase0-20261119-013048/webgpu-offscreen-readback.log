@@ -1,0 +1,27 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795052248
+push: loading file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795052248
+load started: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795052248
+[web4] [render] compositing: 4 updates in 5.6 s, 0.1 ms avg, 0.1 max (2 with a requirements traversal, 4 with a backing/hierarchy update)
+load committed: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795052248
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+load finished: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795052248
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795052248 "" (0.0 s after start)
+[mem] load finished: flexible 242.0 MB free; direct memory 708.3 MB in use; direct heap 60.0 MB mapped (peak 60.0, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 32 (peak 313.1 MB, 39 made, 0 failed, 0 zero fills, 41 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 28 live, 40.9 MB (35 created, 0 libc); WebGPU buffers and textures 0.3 MB (peak 0.3, budget 1536, 0 refused)
+[web4] [render] compositing requirements per traversal: 2 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfP RenderView 1, selfS RenderView 1
+[web4] [render] wc: 5 updates in 6.0 s (0.8/s), 0.4 ms average, p50 0.3, p95 0.6, 0.6 ms max; update 0.1 avg; paint 0.2 avg 0.5 p95 (0.87 Mpx, 4.8 tiles avg); frame done 11.3 ms avg; rAF clock 2.2/s (4 idle); reply to next update 1188.7 ms avg 5496.5 max (3 of 5 waiting at the reply, 2 started by the idle timer); tile wait 0.6 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.0, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.1
+[web4] [render] wc flush: 5 layer tree flushes, 0.22 ms avg; layers per flush: 6 walked, 0 skipped (culled), 2.8 changed
+[web4] [render] paint cull (per update): 1 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 1 not eligible
+[web4] [render] wc tiles: record 0.2 ms/s (0.73 Mpx/s), raster 0.4 ms/s wall (0.73 Mpx/s, 152 items, 4 async), shm allocations 0.0/s, old way 0
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback triangle PASS centre red, corners blue, upright
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback msaa-resolve PASS centre red, corner blue, 409 blended edge pixels
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback depth PASS the near quad stays in front of the later far one
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback write-texture-sample PASS four quadrants right, first texel row at the top
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback write-buffer-copy PASS 256 bytes right (two copies, untouched bytes zero)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback rgba16float PASS centre 1.5,0.25,-1,1 and corner 0.25,0.5,2,1 kept
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback mip-levels PASS levels 64, 32, 16 hold red, green, blue; a view of level 2 samples blue
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-offscreen-readback summary PASS 7/7
+[wc] 1.5 s: 6 updates (apply 0.73 ms avg, 2.7 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 24 (24 draws, 10.3 MB, 3.13 ms, 0.130 ms per upload, 0 fence waits, 0 finishes); 6 paints (0.21 ms avg, 0.4 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.3 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 15.8 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.5 s: 6 updates answered when applied (async scrolling)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 6 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00

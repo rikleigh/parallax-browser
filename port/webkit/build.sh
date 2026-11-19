@@ -51,6 +51,20 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 WK="$ROOT/toolchain/wpe-webkit"
 WC="${WC:-1}"
 WEBGL="${WEBGL:-1}"
+# GPU=radv (HANDOVER-radv.md, Phase 2): the title's compositor, UI, video
+# and overlay on ANGLE's Vulkan backend over RADV instead of ps5-opengl
+# (spikes/15-radv-only). WEBGPU=1's options, in its own worktree and build
+# dir until parity: src-radv (branch ps5-radv, made from ps5-webgl; its
+# commits are exported to patches-radv/) and build-radv. GPU=gl (default):
+# ps5-opengl, as before.
+GPU="${GPU:-gl}"
+if [ "$GPU" = radv ]; then
+    WEBGL=1
+    WEBGPU=1
+    SRC="${SRC:-$WK/src-radv}"
+    BLD="${BLD:-$WK/build-radv}"
+    LOGDIR="${LOGDIR:-$BLD}"
+fi
 # WEBGPU=1: WebGPU on Dawn + RADV (spikes/12-webgpu), on top of WEBGL=1's
 # tree. Its own build dir, build-webgpu, until it ships.
 WEBGPU="${WEBGPU:-0}"
@@ -87,6 +101,17 @@ log() { printf '\n=== %s\n' "$*"; }
 # build reads. Patches are applied as commits on branch "ps5" so they can be
 # edited in place and exported again (export-patches).
 step_src() {
+    if [ "$GPU" = radv ] && [ ! -e "$SRC/.git" ]; then
+        log "worktree $SRC (branch ps5-radv from ps5-webgl)"
+        git -C "$WK/src-webgl" worktree add -q "$SRC" -b ps5-radv ps5-webgl
+        for p in "$HERE"/patches-radv/*.patch; do
+            [ -e "$p" ] || continue
+            echo "  $(basename "$p")"
+            git -C "$SRC" apply --whitespace=nowarn "$p"
+            git -C "$SRC" add -A Source CMakeLists.txt
+            git -C "$SRC" commit -qm "$(basename "$p" .patch)"
+        done
+    fi
     if [ ! -e "$SRC/.git" ]; then
         log "cloning $WEBKIT_REF -> $SRC (shared objects, sparse)"
         mkdir -p "$WK"
@@ -124,11 +149,14 @@ step_src() {
 }
 
 step_export_patches() {
-    log "exporting $WEBKIT_COMMIT..HEAD ($(git -C "$SRC" branch --show-current)) to patches/"
-    rm -f "$HERE"/patches/*.patch
-    for c in $(git -C "$SRC" rev-list --reverse "$WEBKIT_COMMIT..HEAD"); do
+    # GPU=radv: only its own commits on top of ps5-webgl, to patches-radv/.
+    local base="$WEBKIT_COMMIT" dir="$HERE/patches"
+    [ "$GPU" = radv ] && { base=ps5-webgl; dir="$HERE/patches-radv"; mkdir -p "$dir"; }
+    log "exporting $base..HEAD ($(git -C "$SRC" branch --show-current)) to $(basename "$dir")/"
+    rm -f "$dir"/*.patch
+    for c in $(git -C "$SRC" rev-list --reverse "$base..HEAD"); do
         name="$(git -C "$SRC" log -1 --format=%s "$c")"
-        git -C "$SRC" diff --no-color "$c^" "$c" > "$HERE/patches/$name.patch"
+        git -C "$SRC" diff --no-color "$c^" "$c" > "$dir/$name.patch"
         echo "  $name.patch ($(git -C "$SRC" diff --shortstat "$c^" "$c"))"
     done
 }
@@ -215,6 +243,30 @@ if [ "$WEBGPU" = 1 ]; then
     # Later -D wins over the -DENABLE_WEBGPU=OFF above.
     WEBKIT_OPTIONS+=(-DENABLE_WEBGPU=ON -DUSE_DAWN=ON)
 fi
+if [ "$GPU" = radv ]; then
+    # ANGLE gets its Vulkan backend (PlatformWPE.cmake), wpe-ps5 renders on it.
+    # Headers: RADV's install (port/deps/build.sh radv), SPIR-V from Dawn's
+    # source (port/deps/build.sh dawn), VulkanMemoryAllocator at ANGLE's DEPS
+    # pin (fetched once by step_vma).
+    WEBKIT_OPTIONS+=(-DPS5WK_GPU_RADV=ON
+        -DPS5WK_VULKAN_INCLUDE="$ROOT/build/radv-ps5/install/include"
+        -DPS5WK_SPIRV_HEADERS_INCLUDE="$ROOT/toolchain/wpe-deps/src/dawn/third_party/spirv-headers/src/include"
+        -DPS5WK_SPIRV_TOOLS_INCLUDE="$ROOT/toolchain/wpe-deps/src/dawn/third_party/spirv-tools/src/include"
+        -DPS5WK_VMA_DIR="$ROOT/toolchain/wpe-deps/src/vma")
+fi
+# VulkanMemoryAllocator for ANGLE's Vulkan backend (GPU=radv), at the
+# revision ANGLE's DEPS pins.
+VMA_REV=7e55b011e16182fc349149abbd3aaf3b1db46421
+step_vma() {
+    local vma="$ROOT/toolchain/wpe-deps/src/vma"
+    [ -f "$vma/include/vk_mem_alloc.h" ] && return 0
+    log "fetching VulkanMemoryAllocator $VMA_REV"
+    rm -rf "$vma"; mkdir -p "$vma"
+    git -C "$vma" init -q
+    git -C "$vma" fetch -q --depth 1 \
+        https://chromium.googlesource.com/external/github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator "$VMA_REV"
+    git -C "$vma" checkout -q FETCH_HEAD
+}
 if [ "$WC" = 1 ]; then
     WEBKIT_OPTIONS+=(-DUSE_TEXTURE_MAPPER=ON -DUSE_GRAPHICS_LAYER_WC=ON)
 else
@@ -222,6 +274,7 @@ else
 fi
 
 step_configure() {
+    [ "$GPU" = radv ] && step_vma
     log "configure $BLD"
     mkdir -p "$BLD"
     local cflags="-isystem $SHIM/include -include ps5shim.h -ffunction-sections -fdata-sections ${DEBUG_FLAGS:--gline-tables-only}"

@@ -1,0 +1,28 @@
+ps5webkit spike 15c: an Hmd2 eye buffer from a RADV VkImage (pid 142, unjailed 1)
+RESULT 15c-vr-tsharp vr-device PASS ANGLE's VkInstance 20003fd80, VkPhysicalDevice 200042200, VkDevice 2000610e0; GL "OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)"
+RESULT 15c-vr-tsharp vr-image PASS buffer 0: 4096x2048 RGBA8 scanout image, 33554432 bytes (a 64 KiB tile grid is 33554432), alignment 65536, memory type 3 flags 0x7 heap 1, address 4000400000
+RESULT 15c-vr-tsharp vr-egl-image PASS buffer 0: EGL image -> texture 1, FBO status 0x8cd5, GL error 0x0000
+RESULT 15c-vr-tsharp vr-layout PASS 4096x2048 coordinate pattern drawn by GL, read raw through the measured SW_64KB_R_X map: 0 of 8388608 texels wrong (all where the map puts them); flipped rows: 131072 of 131072 sampled wrong; linear: 131056 of 131072 wrong. GL readPixels (5,3) = 5,3,0 (want 5,3,0); draw+wait 4.4 ms, CPU check 72 ms
+  memory row 0 is GL row 0 (gl_FragCoord.y = 0.5): a frame for Hmd2 has its top at GL y = 0, as Spike 3b's flip_y did on ps5-opengl
+  buffer 0 at 4000400000: T# 40004000 c3800000 01ffc3ff 91b00fac 00000000 00700000 00000000 00000000
+  buffer 1 at 4002400000: T# 40024000 c3800000 01ffc3ff 91b00fac 00000000 00700000 00000000 00000000
+  buffer 2 at 4004400000: T# 40044000 c3800000 01ffc3ff 91b00fac 00000000 00700000 00000000 00000000
+RESULT 15c-vr-tsharp vr-tsharp PASS 3 T#s, 4096x2048 RGBA8 SW_64KB_R_X over RADV memory
+  psvr2: psvr2: sceHmd2Initialize -> 0x00000000
+  psvr2: psvr2: FOV rc 0x00000000 out 1.8418 in 0.9472 up 1.3290 down 1.3290
+  psvr2: psvr2: sceHmd2Open(user 0x11028d21) -> 0x0e040000
+  psvr2: psvr2: sceHmd2Open -> 0x0e040000; status 0 worn 1 lens 60 mm
+  psvr2: psvr2: tracker wants 32768 KB direct memory (align 0x10000)
+  psvr2: psvr2: tracker init 0x00000000 register 0x00000000
+  psvr2: psvr2: reprojection wants 1026 KB work + 98304 KB display buffer
+  psvr2: psvr2: sceHmd2ReprojectionInitialize -> 0x00000000
+  psvr2: psvr2: EnableVrMode -> 0x00000000, VR port 0x4e710201
+  psvr2: psvr2: RegisterBuffers2 -> 0x00000000
+  psvr2: psvr2: 120 Hz output 0x00000000, half-rate render config 0x00000000
+  psvr2: psvr2: stopped after 3601 frames (unregister 0x80290009 close 0x00000000 disable 0x00000000)
+  psvr2: psvr2: closed (tracker 0x00000000 0x00000000, reprojection 0x00000000, hmd 0x00000000 0x00000000; 129 MB direct memory released)
+RESULT 15c-vr-tsharp vr-headset PASS 3601 frames in 60.0 s (60.0 frames/s), 3601 tracked, 0 submit/begin errors; draw+finish 0.22 ms average, worst 1.33, 0 over 16 ms. Owner: see the README for what the headset should show
+vr tests done
+done
+main returned 0
+closing the title through the launcher (SIGKILL)

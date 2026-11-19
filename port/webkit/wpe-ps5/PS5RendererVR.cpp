@@ -39,6 +39,7 @@
 
 #include "config.h"
 #include "PS5Renderer.h"
+#include "PS5GLES.h"
 
 #include "PS5Sce.h"
 #include "PS5Text.h"
@@ -67,7 +68,199 @@ void psvr2_close(void) __attribute__((weak));
 int psvr2_worn(void) __attribute__((weak));
 void psvr2_require_headset(int on) __attribute__((weak));
 int psvr2_device_status(uint32_t* status, int* worn, int* lens_mm) __attribute__((weak));
+int psvr2_build_tsharp_rgba8(uint32_t out[8], uint64_t gpu_address, uint32_t width, uint32_t height, uint32_t pitch_bytes, uint32_t sw_mode) __attribute__((weak));
 }
+
+#if PS5WK_GPU_RADV
+#include <vulkan/vulkan.h>
+// GPU=radv: the eye buffers are RADV images on ANGLE's VkDevice, laid out as
+// scanout images (SW_64KB_R_X, what Hmd2 takes; spikes/15-radv-only 15c),
+// wrapped as GL textures (EGL_VULKAN_IMAGE_ANGLE). On the PS5 a RADV
+// buffer's GPU address is its CPU mapping.
+// RADV's, in the title only (weak: the payloads link this file without RADV).
+extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance, const char*) __attribute__((weak));
+namespace {
+// Mesa's private image create info (src/vulkan/util/vk_internal_exts.h).
+constexpr VkStructureType kWsiImageCreateInfoMesa = static_cast<VkStructureType>(1000001002);
+struct WsiImageCreateInfo {
+    VkStructureType sType;
+    const void* pNext;
+    bool scanout;
+    bool blitSrc;
+};
+constexpr uint32_t kSwizzle64KbRX = 27;
+constexpr EGLint kEGLDeviceEXT = 0x322C, kEGLVulkanInstanceANGLE = 0x34A9, kEGLVulkanPhysicalDeviceANGLE = 0x34AB,
+    kEGLVulkanDeviceANGLE = 0x34AC, kEGLVulkanImageANGLE = 0x34D3, kEGLVulkanImageCreateInfoHiANGLE = 0x34D4,
+    kEGLVulkanImageCreateInfoLoANGLE = 0x34D5;
+struct RadvEyeBuffer {
+    VkImage image { VK_NULL_HANDLE };
+    VkDeviceMemory memory { VK_NULL_HANDLE };
+    VkImageCreateInfo info { };
+    void* address { nullptr };
+    EGLImageKHR eglImage { EGL_NO_IMAGE_KHR };
+};
+struct RadvVk {
+    bool ready { false };
+    VkDevice device { VK_NULL_HANDLE };
+    VkPhysicalDevice physical { VK_NULL_HANDLE };
+    PFN_vkGetPhysicalDeviceMemoryProperties memoryProperties { };
+    PFN_vkCreateImage createImage { };
+    PFN_vkDestroyImage destroyImage { };
+    PFN_vkGetImageMemoryRequirements imageRequirements { };
+    PFN_vkAllocateMemory allocate { };
+    PFN_vkFreeMemory freeMemory { };
+    PFN_vkBindImageMemory bind { };
+    PFN_vkMapMemory map { };
+    EGLImageKHR (*createEGLImage)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*) { };
+    EGLBoolean (*destroyEGLImage)(EGLDisplay, EGLImageKHR) { };
+    void (*acquireTextures)(GLuint, const GLuint*, const GLenum*) { };
+    void (*releaseTextures)(GLuint, const GLuint*, GLenum*) { };
+};
+RadvVk s_radv;
+
+bool radvSetUp(EGLDisplay display, char* why, size_t whySize)
+{
+    if (s_radv.ready)
+        return true;
+    typedef EGLBoolean (*QueryDisplayAttrib)(EGLDisplay, EGLint, EGLAttrib*);
+    typedef EGLBoolean (*QueryDeviceAttrib)(void*, EGLint, EGLAttrib*);
+    auto queryDisplay = reinterpret_cast<QueryDisplayAttrib>(eglGetProcAddress("eglQueryDisplayAttribEXT"));
+    auto queryDevice = reinterpret_cast<QueryDeviceAttrib>(eglGetProcAddress("eglQueryDeviceAttribEXT"));
+    EGLAttrib device = 0, instance = 0, physical = 0, vkDevice = 0;
+    if (!queryDisplay || !queryDevice || !queryDisplay(display, kEGLDeviceEXT, &device)
+        || !queryDevice(reinterpret_cast<void*>(device), kEGLVulkanInstanceANGLE, &instance)
+        || !queryDevice(reinterpret_cast<void*>(device), kEGLVulkanPhysicalDeviceANGLE, &physical)
+        || !queryDevice(reinterpret_cast<void*>(device), kEGLVulkanDeviceANGLE, &vkDevice)) {
+        snprintf(why, whySize, "ANGLE's Vulkan device query failed (EGL 0x%04x)", eglGetError());
+        return false;
+    }
+    if (!vk_icdGetInstanceProcAddr) {
+        snprintf(why, whySize, "RADV is not linked into this program");
+        return false;
+    }
+    auto inst = reinterpret_cast<VkInstance>(instance);
+    s_radv.device = reinterpret_cast<VkDevice>(vkDevice);
+    s_radv.physical = reinterpret_cast<VkPhysicalDevice>(physical);
+    auto getDeviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(vk_icdGetInstanceProcAddr(inst, "vkGetDeviceProcAddr"));
+    s_radv.memoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(vk_icdGetInstanceProcAddr(inst, "vkGetPhysicalDeviceMemoryProperties"));
+    if (!getDeviceProc || !s_radv.memoryProperties) {
+        snprintf(why, whySize, "no vkGetDeviceProcAddr");
+        return false;
+    }
+#define DEVICE_PROC(field, name) s_radv.field = reinterpret_cast<PFN_##name>(getDeviceProc(s_radv.device, #name))
+    DEVICE_PROC(createImage, vkCreateImage);
+    DEVICE_PROC(destroyImage, vkDestroyImage);
+    DEVICE_PROC(imageRequirements, vkGetImageMemoryRequirements);
+    DEVICE_PROC(allocate, vkAllocateMemory);
+    DEVICE_PROC(freeMemory, vkFreeMemory);
+    DEVICE_PROC(bind, vkBindImageMemory);
+    DEVICE_PROC(map, vkMapMemory);
+#undef DEVICE_PROC
+    s_radv.createEGLImage = reinterpret_cast<decltype(s_radv.createEGLImage)>(eglGetProcAddress("eglCreateImageKHR"));
+    s_radv.destroyEGLImage = reinterpret_cast<decltype(s_radv.destroyEGLImage)>(eglGetProcAddress("eglDestroyImageKHR"));
+    s_radv.acquireTextures = reinterpret_cast<void (*)(GLuint, const GLuint*, const GLenum*)>(eglGetProcAddress("glAcquireTexturesANGLE"));
+    s_radv.releaseTextures = reinterpret_cast<void (*)(GLuint, const GLuint*, GLenum*)>(eglGetProcAddress("glReleaseTexturesANGLE"));
+    s_radv.ready = s_radv.createImage && s_radv.destroyImage && s_radv.imageRequirements && s_radv.allocate && s_radv.freeMemory
+        && s_radv.bind && s_radv.map && s_radv.createEGLImage && s_radv.destroyEGLImage && s_radv.acquireTextures && s_radv.releaseTextures;
+    if (!s_radv.ready)
+        snprintf(why, whySize, "missing Vulkan, EGL image or ANGLE texture entry points");
+    return s_radv.ready;
+}
+
+// One eye buffer: the scanout image, mapped (its address is the T#'s), as GL texture `texture`.
+bool radvMakeEyeBuffer(EGLDisplay display, RadvEyeBuffer& b, GLuint texture, uint32_t width, uint32_t height, char* why, size_t whySize)
+{
+    static const WsiImageCreateInfo scanout = { kWsiImageCreateInfoMesa, nullptr, true, false };
+    b.info = { };
+    b.info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    b.info.pNext = &scanout;
+    b.info.imageType = VK_IMAGE_TYPE_2D;
+    b.info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    b.info.extent = { width, height, 1 };
+    b.info.mipLevels = 1;
+    b.info.arrayLayers = 1;
+    b.info.samples = VK_SAMPLE_COUNT_1_BIT;
+    b.info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    b.info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    b.info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    b.info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkResult r = s_radv.createImage(s_radv.device, &b.info, nullptr, &b.image);
+    if (r != VK_SUCCESS) {
+        snprintf(why, whySize, "vkCreateImage %d", static_cast<int>(r));
+        return false;
+    }
+    VkMemoryRequirements requirements;
+    s_radv.imageRequirements(s_radv.device, b.image, &requirements);
+    VkPhysicalDeviceMemoryProperties properties;
+    s_radv.memoryProperties(s_radv.physical, &properties);
+    // Host-visible and coherent (the address must be mapped), device-local if there is such a type.
+    int type = -1;
+    const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (int pass = 0; pass < 2 && type < 0; pass++) {
+        for (uint32_t i = 0; i < properties.memoryTypeCount && type < 0; i++) {
+            VkMemoryPropertyFlags f = properties.memoryTypes[i].propertyFlags;
+            if ((requirements.memoryTypeBits & (1u << i)) && (f & need) == need && (pass || (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+                type = static_cast<int>(i);
+        }
+    }
+    if (type < 0) {
+        snprintf(why, whySize, "no host-visible memory type in 0x%x", requirements.memoryTypeBits);
+        return false;
+    }
+    VkMemoryDedicatedAllocateInfo dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    dedicated.image = b.image;
+    VkMemoryAllocateInfo allocation = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated };
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = static_cast<uint32_t>(type);
+    r = s_radv.allocate(s_radv.device, &allocation, nullptr, &b.memory);
+    if (r == VK_SUCCESS)
+        r = s_radv.bind(s_radv.device, b.image, b.memory, 0);
+    if (r == VK_SUCCESS)
+        r = s_radv.map(s_radv.device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.address);
+    const uint64_t tiled = static_cast<uint64_t>((width + 127) / 128) * ((height + 127) / 128) * 0x10000;
+    if (r != VK_SUCCESS || requirements.size != tiled || (reinterpret_cast<uintptr_t>(b.address) & 0xffff)) {
+        snprintf(why, whySize, "image memory: result %d, %llu bytes (a 64 KiB tile grid is %llu), address %p", static_cast<int>(r),
+            static_cast<unsigned long long>(requirements.size), static_cast<unsigned long long>(tiled), b.address);
+        return false;
+    }
+    const uint64_t info = reinterpret_cast<uintptr_t>(&b.info);
+    const EGLint attributes[] = {
+        kEGLVulkanImageCreateInfoHiANGLE, static_cast<EGLint>(info >> 32),
+        kEGLVulkanImageCreateInfoLoANGLE, static_cast<EGLint>(info & 0xffffffffu),
+        EGL_NONE
+    };
+    b.eglImage = s_radv.createEGLImage(display, EGL_NO_CONTEXT, kEGLVulkanImageANGLE, reinterpret_cast<EGLClientBuffer>(&b.image), attributes);
+    if (b.eglImage == EGL_NO_IMAGE_KHR) {
+        snprintf(why, whySize, "eglCreateImageKHR(EGL_VULKAN_IMAGE_ANGLE) 0x%04x", eglGetError());
+        return false;
+    }
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, b.eglImage);
+    // ANGLE holds the image for the whole VR session (the TV path samples it
+    // too); Hmd2 reads it after the frame's glFinish.
+    const GLenum undefined = GL_NONE;
+    s_radv.acquireTextures(1, &texture, &undefined);
+    return glGetError() == GL_NO_ERROR;
+}
+
+void radvFreeEyeBuffer(EGLDisplay display, RadvEyeBuffer& b, GLuint texture)
+{
+    if (b.eglImage != EGL_NO_IMAGE_KHR) {
+        GLenum layout = GL_NONE;
+        s_radv.releaseTextures(1, &texture, &layout);
+    }
+    glDeleteTextures(1, &texture); // before the image goes
+    glFinish();
+    if (b.eglImage != EGL_NO_IMAGE_KHR)
+        s_radv.destroyEGLImage(display, b.eglImage);
+    if (b.image)
+        s_radv.destroyImage(s_radv.device, b.image, nullptr);
+    if (b.memory)
+        s_radv.freeMemory(s_radv.device, b.memory, nullptr);
+    b = RadvEyeBuffer { };
+}
+} // namespace
+#endif
 
 void ps5RendererUploadPanel(unsigned& texture, const PS5TextImage&);
 
@@ -99,6 +292,9 @@ struct PS5VRState {
     int eye { kEyeSize };
     GLuint eyeTexture[PSVR2_MAX_BUFFERS] { };
     GLuint eyeFBO[PSVR2_MAX_BUFFERS] { };
+#if PS5WK_GPU_RADV
+    RadvEyeBuffer radvEye[PSVR2_MAX_BUFFERS];
+#endif
     float tan[2][4] { };
     int projection { 0 };
     float fisheyeHalf { static_cast<float>(M_PI / 2) };
@@ -235,7 +431,7 @@ static GLint s_uVideo, s_uHint, s_uHaveVideo, s_uTan, s_uRot, s_uProj, s_uEye, s
 static GLuint compileShader(GLenum type, const char* source, char* log, size_t logSize)
 {
     GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
+    ps5ShaderSourceGL(shader, source);
     glCompileShader(shader);
     GLint ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
@@ -671,6 +867,52 @@ bool PS5Renderer::vrStart(int projection, float fisheyeDegrees, char* message, s
         }
     }
 
+#if PS5WK_GPU_RADV
+    // Three side-by-side eye buffers: RADV scanout images (SW_64KB_R_X, what
+    // Hmd2 takes) on ANGLE's device, with T#s built for their addresses.
+    char radvWhy[200] = "";
+    uint32_t tsharp[PSVR2_MAX_BUFFERS][8] = { };
+    bool ok = psvr2_build_tsharp_rgba8 && radvSetUp(m_eglDisplay, radvWhy, sizeof radvWhy);
+    glGenTextures(PSVR2_MAX_BUFFERS, vr->eyeTexture);
+    glGenFramebuffers(PSVR2_MAX_BUFFERS, vr->eyeFBO);
+    for (int b = 0; ok && b < PSVR2_MAX_BUFFERS; b++) {
+        const uint32_t w = 2 * vr->eye, h = vr->eye;
+        ok = radvMakeEyeBuffer(m_eglDisplay, vr->radvEye[b], vr->eyeTexture[b], w, h, radvWhy, sizeof radvWhy);
+        if (ok) {
+            glBindFramebuffer(GL_FRAMEBUFFER, vr->eyeFBO[b]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, vr->eyeTexture[b], 0);
+            ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+            if (!ok)
+                snprintf(radvWhy, sizeof radvWhy, "eye buffer FBO incomplete");
+        }
+        // The builder wants a pitch of at least a row even when the swizzle implies it.
+        if (ok)
+            ok = !psvr2_build_tsharp_rgba8(tsharp[b], reinterpret_cast<uintptr_t>(vr->radvEye[b].address), w, h, w * 4, kSwizzle64KbRX);
+        if (ok && !b)
+            VRLOG("eye buffers %ux%u: RADV scanout images on ANGLE's device, address %p, sw_mode %u", w, h, vr->radvEye[b].address, kSwizzle64KbRX);
+        if (ok) {
+            glViewport(0, 0, w, h);
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFinish();
+    auto freeEyeBuffers = [&] {
+        glDeleteFramebuffers(PSVR2_MAX_BUFFERS, vr->eyeFBO);
+        for (int b = 0; b < PSVR2_MAX_BUFFERS; b++)
+            radvFreeEyeBuffer(m_eglDisplay, vr->radvEye[b], vr->eyeTexture[b]);
+    };
+    if (!ok) {
+        VRLOG("eye buffer setup failed: %s (GL 0x%x)", radvWhy[0] ? radvWhy : "no T# builder", glGetError());
+        snprintf(message, messageSize, "The headset could not be set up (eye buffers).");
+        if (!vr->sim)
+            psvr2_close();
+        freeEyeBuffers();
+        delete vr;
+        return false;
+    }
+#else
     // Three side-by-side eye buffers, exported as T#s (ps5-opengl lays
     // immutable RGBA8 textures out as SW_64KB_R_X, what Hmd2 takes).
     typedef EGLBoolean (*ExportFunction)(EGLDisplay, EGLContext, GLuint, uint32_t[8], uint64_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*);
@@ -711,13 +953,17 @@ bool PS5Renderer::vrStart(int projection, float fisheyeDegrees, char* message, s
         delete vr;
         return false;
     }
+    auto freeEyeBuffers = [&] {
+        glDeleteFramebuffers(PSVR2_MAX_BUFFERS, vr->eyeFBO);
+        glDeleteTextures(PSVR2_MAX_BUFFERS, vr->eyeTexture);
+    };
+#endif
 
     if (!vr->sim) {
         if (psvr2_start(tsharp, PSVR2_MAX_BUFFERS, vr->eye, vr->eye) != 0) {
             snprintf(message, messageSize, "The PS VR2 headset could not start VR mode. Is it connected and turned on?");
             psvr2_close();
-            glDeleteFramebuffers(PSVR2_MAX_BUFFERS, vr->eyeFBO);
-            glDeleteTextures(PSVR2_MAX_BUFFERS, vr->eyeTexture);
+            freeEyeBuffers();
             delete vr;
             return false;
         }
@@ -751,7 +997,12 @@ void PS5Renderer::vrStop(const char* why)
         psvr2_close(); // leaves VR mode first, so the compositor stops reading the eye buffers
     glFinish();
     glDeleteFramebuffers(PSVR2_MAX_BUFFERS, vr->eyeFBO);
+#if PS5WK_GPU_RADV
+    for (int b = 0; b < PSVR2_MAX_BUFFERS; b++)
+        radvFreeEyeBuffer(m_eglDisplay, vr->radvEye[b], vr->eyeTexture[b]);
+#else
     glDeleteTextures(PSVR2_MAX_BUFFERS, vr->eyeTexture);
+#endif
     if (vr->hintTexture)
         glDeleteTextures(1, &vr->hintTexture);
     if (vr->tvTexture)

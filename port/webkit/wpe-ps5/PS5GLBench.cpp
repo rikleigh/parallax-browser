@@ -18,6 +18,7 @@
 
 #include "config.h"
 #include "PS5GLBench.h"
+#include "PS5GLES.h"
 
 #include <algorithm>
 #include <emmintrin.h>
@@ -128,7 +129,7 @@ void main()
 GLuint compileShader(GLenum type, const char* source)
 {
     GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
+    ps5ShaderSourceGL(shader, source);
     glCompileShader(shader);
     GLint ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);

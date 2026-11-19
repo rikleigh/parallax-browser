@@ -178,6 +178,9 @@ private:
     static void* threadEntry(void*);
     void threadMain();
     bool initializeGL(char* error, unsigned errorSize);
+#if PS5WK_GPU_RADV
+    bool initializeANGLE(void*& display, void*& config, void*& surface, void*& context, char* error, unsigned errorSize); // EGL handles
+#endif
     bool createPrograms(char* error, unsigned errorSize);
     void renderFrame();
     void copyPage();

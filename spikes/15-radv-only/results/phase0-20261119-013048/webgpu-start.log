@@ -1,0 +1,134 @@
+[dl] wind-down: 0 downloads saved as paused
+wind-down: quit requested; 1 audio stream(s) open; loading about:blank
+load started: about:blank
+[web4] [WPEWebKit:Media:-] MediaElementSession::clientWillBeDOMSuspended(534E1D916C84A2E6) 
+[app msg] [video] stream 3 from pid 249 closed
+[app msg] [vdec] decoder 1 from pid 249 closed: 898 AUs (21.9 MB), 890 pictures, 0 hidden, 0 errors (first rc 0x00000000), 0 skipped before a keyframe, 0 refused, 0 format changes, 0 resets after errors; 12 PRELEASEs, 0 waits of 10 s for a slot, 0 pictures lost without a release
+IPC: socket 75 in process 246 reported condition 0x11 (HUP/ERR/NVAL)
+[webgl] title: context 15 (WebGL 2) gone after 29.6 s: 1773 frames, 495 ms of the WebGL thread
+load committed: about:blank
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+load finished: about:blank
+RESULT ps5browser load PASS about:blank "" (31.7 s after start)
+[mem] load finished: flexible 218.0 MB free; direct memory 710.2 MB in use; direct heap 66.3 MB mapped (peak 66.3, 0 libc fallbacks, init ready); anon mmaps 267.6 MB in 34 (peak 292.3 MB, 37 made, 0 failed, 0 zero fills, 31 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 29 live, 23.8 MB (32 created, 0 libc); WebGL 0 contexts (1 made), drawing buffers ~0.0 MB
+[vdec] decoder closed: flexible free 241 MB, direct memory in use 706 MB (its output buffers go back with the next frame)
+[app msg] [vdec] decoder 1 released: budget 0 decoders, 0 MB (peak 1, 136 MB; 0 refused, 0 waited, 0 VP9 sized to the stream)
+[ps5audio] port 0x20000000 (pid 249) closing: GetPortState 0x00000000: output 0x81, 2 ch, volume -1, reroutes 10, flag 0x0
+[app msg] [video] stream 3 removed: 874 frames received, 825 shown, 49 dropped
+[ps5audio] stream from pid 249 closed: 29.4 s of audio in 29.4 s (peak 0, rms 0 of 32767; 0 output errors, first 0x00000000; 0 dropouts, 0.0 ms)
+wind-down: 0 audio stream(s) left after 64 ms; ending the WebProcess and the audio server
+wind-down: the WebProcess ended (reason 2); no reload
+[ps5audio] stopped: 0 stream(s) woken, 0 thread(s) still running after 0 ms, 0 port(s) closed here
+wind-down: done after 64 ms; leaving the main loop
+[app msg] [wpe-ps5] [ps5-launch] quiesced: no new payloads; 0 send(s) in flight at the call, none left after 0 ms
+main returned 0
+closing the title through the launcher (SIGKILL)
+[wc] scene 21 removed: 9 layers, 0 video layers; GL textures 14.3 -> 7.1 MB, 0 scenes left
+[log] connected to <mac>:9999
+[log] non-blocking log: TCP <mac>:9999 (buffer 512 KB, dropped lines noted), file /data/ps5webkit/ps5browser.log, stderr: the stderr stream writes into a pipe (/data/ps5webkit/log-sink: TCP <mac>:9999, queue 512 KB, stall 30 s)
+title ps5browser pid 251: unjailed 1, file log on, tcp log to :9999 queued (non-blocking sender) (errno 0)
+ps5browser: WPE WebKit 2.55.0, pid 251, build 20261118-093659-91f31930c3
+runtime: /data/ps5webkit is up to date (2943b42e559f5f18)
+[mem] main: flexible 243.0 MB free; direct memory 4.4 MB in use; direct heap 2.0 MB mapped (peak 2.0, 0 libc fallbacks, init ready); anon mmaps 0.1 MB in 3 (peak 0.4 MB, 3 made, 0 failed, 0 zero fills, 0 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 2 live, 0.3 MB (2 created, 0 libc)
+imports: 0 of 481 NULL
+probe: [recv MSG_DONTWAIT on empty: -1/35] [stream: F_GETFL 2/0 F_SETFL -1/13 FIONBIO -1] socketpair stream rc 0 errno 0 (F_SETFD 0); [recv MSG_DONTWAIT on empty: -1/35] [seqpacket: F_GETFL 2/0 F_SETFL -1/13 FIONBIO -1] socketpair seqpacket rc 0 errno 0 (F_SETFD 0); [recv MSG_DONTWAIT on empty: -1/35] [dgram: F_GETFL 2/0 F_SETFL -1/13 FIONBIO -1] socketpair dgram rc 0 errno 0 (F_SETFD 0); pipe rc 0 errno 0
+probe: fcntl(p[0], F_GETFD) = 0 (errno 0); fcntl(p[0], F_SETFD, FD_CLOEXEC) = 0 (errno 0); fcntl(p[0], F_GETFL) = 2 (errno 0); fcntl(p[0], F_SETFL, O_NONBLOCK) = 0 (errno 0); fcntl(p[0], F_GETFL) = 6 (errno 0); ioctl(p[1], FIONBIO, &one) = 0 (errno 0); F_DUPFD -> 30; d = dup(q[0] = 0) = 28 (errno 1); pipe2(q, O_CLOEXEC) = 0 (errno 0); 
+[app msg] [vdec] backend Videodec2: codecs 0x107, up to 8192x4352; sysmodule 0xcf -> 0x00000000; load /XBVfi5zNuC/common/lib/libSceVideodec2.sprx -> 0xd1; 0 bound by name, 10 by 13.60 offsets (anchor matched), 0 missing
+[user] User1 (user 0x11028d21, rc 0x00000000; name rc 0x00000000): data in /data/ps5webkit/users/11028d21
+[app msg] [wpe-ps5] PS5Renderer: EGL 1.4 PS5 experimental, GL 4.6 (Core Profile) Mesa 26.2.0, 1920x1080, render thread; page in a persistent GL buffer
+[app msg] [video] listening on /system_tmp/ps5wk/video-251.sock
+[app msg] [wpe-ps5] pad: init 0x0, user 285379873, open -> 60753664
+[app msg] [wpe-ps5] pad: the stick also scrolls from the pad's own thread while the main thread is stuck
+ime: sysmodule 0x96 -> 0x00000000; imports bound (Init 800f78c00, CommonDialogInitialize 800e48d40)
+[app msg] [wpe-ps5] ime: libSceImeDialog bound; sceCommonDialogInitialize -> 0x0
+[app msg] [wpe-ps5] display connected: 1920x1080, pad 60753664
+RESULT ps5browser display PASS PS5 display connected
+[mem] display connected: flexible 242.0 MB free; direct memory 320.0 MB in use; direct heap 16.8 MB mapped (peak 16.8, 0 libc fallbacks, init ready); anon mmaps 0.1 MB in 6 (peak 12.6 MB, 6 made, 0 failed, 0 zero fills, 0 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 5 live, 12.4 MB (5 created, 0 libc)
+audio: server started (sceAudioOut); self-test file: absent
+[ps5audio] listening on /system_tmp/ps5wk/audio-251.sock (sceAudioOut)
+[mem] anonymous mmap of 128.0 MB (align 0x8000000, prot 3) -> direct memory at 218000000
+[mem] anonymous mmap of 128.0 MB (align 0x10000, prot 3) -> direct memory at 220000000
+settings: Screen Orientation API on
+settings: HiddenPageDOMTimerThrottling on
+settings: HiddenPageCSSAnimationSuspension on
+[app msg] [wpe-ps5] [ps5-launch] launching network process 2 from /app0/ps5wk-child.elf
+[app msg] [wpe-ps5] [ps5-launch] listening on /system_tmp/ps5wk/ui-251.sock
+settings: WebGPU on
+[tabs] up to 2 live tabs (/data/ps5webkit/live-tabs: 1-4, default 2)
+browser: 0 bookmarks, 340 history entries, 17 sites with settings
+browser: the bar above the page
+[app msg] [wpe-ps5] page area: 104 px below the top (was 0)
+[dl] 3 downloads in the list (0 paused at start, 0 gone from the folder) in /data/ps5webkit/users/11028d21/downloads
+[adblock] on; 0 allowed site(s); store /data/ps5webkit/browser/contentfilters
+[adblock] site data /data/ps5webkit/adblock/adblock-scripting.txt (uBO Lite 2026.1116.1650, downloaded list): 33040 hosts, scriptlet calls 4153 main + 1156 isolated, 16764 cosmetic filters (916 procedural), library 97 + 38 declarations; 2.5 MB + 0.9 MB index, read in 9 ms
+[mem] adblock: site data loaded: flexible 242.0 MB free; direct memory 593.0 MB in use; direct heap 31.3 MB mapped (peak 31.3, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 13 (peak 271.1 MB, 13 made, 0 failed, 0 zero fills, 0 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 10 live, 15.0 MB (10 created, 0 libc)
+[mem] web view created: flexible 242.0 MB free; direct memory 593.3 MB in use; direct heap 31.3 MB mapped (peak 31.3, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 15 (peak 271.4 MB, 15 made, 0 failed, 0 zero fills, 1 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 12 live, 15.3 MB (12 created, 0 libc)
+launch argument 0: 
+test URL list: 1 URLs
+browser: test run: one tab, the saved session is neither restored nor written
+test URL 1/1: file:///data/ps5webkit/phase0/static.html
+[app msg] [wpe-ps5] [ps5-launch] launching web process 4 from /app0/ps5wk-child.elf
+[wc] context: GL 4.6 (Core Profile) Mesa 26.2.0 (WebCore version 460, desktop), 199 extensions (GL_EXTENSIONS string null: glGetStringi), npot 1 unpack_subimage 1 packed_depth_stencil 1 YUV_target 0, max texture 16384
+[texmap] PS5 tile uploads: 16 MB staging ring at 201fa8000, slot alignment 256, GLSL 4.30
+[wc] S1b: PASS 1920x1080: TextureMapper 0.0 ms; apply (9 layers, 16 tile uploads, 10.7 MB) 6.1 ms incl. GPU, uploads 4.86 ms; first paint 76.3 ms incl. GPU (8 programs compiled in 58.2 ms, 0 failed, GLSL 300 es); warm paint 0.70 ms CPU, 0.72 ms incl. GPU avg, 0.86 max (3 runs); probes 5/5; checksum 94d70efe; GL errors apply 0x0 first paint 0x0 warm 0x0 readback 0x0
+[ascroll] scroll measurements on: [ascroll] lines while the page scrolls
+[wc] GPU compositor ready in 136.0 ms
+[wc] main thread waited 136.0 ms for the compositor's set-up: ready
+[app msg] [wpe-ps5] PS5Renderer: GPU compositor ready (136.0 ms)
+[wc] page 6: WC compositor (drawing area 21, GL host)
+[ascroll] drawing area 21: async scrolling (the title's scrolling tree; stick frame, overflow off, sync on; defaults)
+control: listening on /system_tmp/ps5wk/ps5browser-control.sock
+push: listening on TCP 9040 (http://<this PS5>:9040/), PIN required
+[app msg] [wpe-ps5] pad: read 0x0, not intercepted, connected 1 (raw buttons 0x0)
+[mem] adblock: loaded: flexible 242.0 MB free; direct memory 628.8 MB in use; direct heap 49.3 MB mapped (peak 57.2, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 22 (peak 285.9 MB, 22 made, 0 failed, 0 zero fills, 17 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 18 live, 21.8 MB (18 created, 0 libc)
+[adblock] loaded compiled list ubol-b (uBO Lite 2026.1116.1650, update, 136089 rules) in 140 ms
+[adblock] filter on for (no page) (list ready)
+[app msg] [wpe-ps5] ui canvas: fonts loaded
+[app msg] [wpe-ps5] [ps5-launch network2] sent 144116360 bytes + header to elfldr in 391 ms
+[network2] [ps5wk-child 253] network process 2 starting (parent 98, flexible memory 8080 MB)
+[app msg] [wpe-ps5] [ps5-launch] network process 2 is payload pid 253, connected 1260 ms after launch; IPC fd passed
+[network2] [ps5wk-child 253] locks: futex (ps5locks; /data/ps5webkit/no-fastlock turns it off); malloc: libpas (ps5malloc; /data/ps5webkit/no-pasmalloc turns it off)
+[network2] [ps5wk-child 253] stderr: a write waits 0.5 s at most (buffer 256 KB)
+[network2] [ps5wk-child 253] rendezvous: connected to /system_tmp/ps5wk/ui-251.sock after 0 ms, IPC fd 8
+[network2] [ps5wk-child 253] stale files: removed 5 from /system_tmp/ps5wk, 0 not removed (errno 0)
+[network2] [ps5wk-child 253] [health] no payloads left over from earlier title runs
+[network2] [watchdog network2] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding); reports also in /data/ps5webkit/prof/watchdog-network2-253.txt, touch /data/ps5webkit/prof/watchdog-dump for the stacks of every thread
+[app msg] [wpe-ps5] [ps5-launch web4] sent 144116360 bytes + header to elfldr in 267 ms
+[web4] [ps5wk-child 254] web process 4 starting (parent 98, flexible memory 8080 MB)
+[app msg] [wpe-ps5] [ps5-launch] web process 4 is payload pid 254, connected 2119 ms after launch; IPC fd passed
+[web4] [ps5wk-child 254] locks: futex (ps5locks; /data/ps5webkit/no-fastlock turns it off); malloc: libpas (ps5malloc; /data/ps5webkit/no-pasmalloc turns it off)
+[web4] [ps5wk-child 254] stderr: a write waits 0.5 s at most (buffer 256 KB)
+[web4] [ps5wk-child 254] rendezvous: connected to /system_tmp/ps5wk/ui-251.sock after 0 ms, IPC fd 8
+[web4] [ps5wk-child 254] JIT: on (PS5WK_JIT=1; JSC_useJIT=true), executable pool 256 MB (/data/ps5webkit/no-bigjitpool: 128 MB); WebAssembly on
+[web4] [ps5wk-child 254] [probe] clock_gettime: CLOCK_MONOTONIC 2234 ns, CLOCK_REALTIME 1103 ns per call (20000 calls, 1)
+[web4] [ps5wk-child 254] video decoding: hardware in the title (codecs 0x107, up to 8192x4352); MSE/canPlayType limit 7680x4320@60
+[web4] [watchdog web4] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding); reports also in /data/ps5webkit/prof/watchdog-web4-254.txt, touch /data/ps5webkit/prof/watchdog-dump for the stacks of every thread
+[web4] 
+[web4] ** (WPEWebProcess:254): WARNING **: 01:55:56.938: Error loading the injected bundle (/user/homebrew/lib/wpe-webkit-2.0/injected-bundle/libWPEInjectedBundle.so): error_code=0xffffffff
+load started: file:///data/ps5webkit/phase0/static.html
+[network2] [ps5wk-child 253] [perf] network bytes for the overlay: interface counters
+load committed: file:///data/ps5webkit/phase0/static.html
+load finished: file:///data/ps5webkit/phase0/static.html
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/static.html "" (2.3 s after start)
+[mem] load finished: flexible 242.0 MB free; direct memory 630.3 MB in use; direct heap 51.3 MB mapped (peak 57.2, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 22 (peak 286.2 MB, 23 made, 0 failed, 0 zero fills, 22 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 18 live, 22.0 MB (19 created, 0 libc)
+RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/static.html loaded in 2.3 s: title ""; flexible 242.0 MB
+[mem] after test URL 1: flexible 242.0 MB free; direct memory 630.3 MB in use; direct heap 51.3 MB mapped (peak 57.2, 0 libc fallbacks, init ready); anon mmaps 264.1 MB in 22 (peak 286.2 MB, 23 made, 0 failed, 0 zero fills, 22 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 18 live, 22.0 MB (19 created, 0 libc)
+[web4] [wc] tile arena: chunk 1 of 8 MB (8 MB in 1 chunks), allocated in 0.03 ms on the main thread
+[wc] tile arena chunk 1 mapped in 0.21 ms
+[wc] tile arena chunk 2 mapped in 0.40 ms
+[web4] [wc] tile arena: chunk 2 of 8 MB (16 MB in 2 chunks), allocated in 0.01 ms on the main thread
+[wc] 1.6 s: 2 updates (apply 2.71 ms avg, 5.4 max; 0 unchanged), 0 presents; 1 pages, 27 layers; tiles uploaded 24 (24 draws, 14.0 MB, 3.57 ms, 0.149 ms per upload, 0 fence waits, 0 finishes); 2 paints (4.15 ms avg, 8.0 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 22.4 MB (pool 1.3); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 19.2 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.03 avg 0.0 max
+[wc] 1.6 s: 2 updates answered when applied (async scrolling)
+[ascroll] 1.6 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 2 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[wc] 1.0 s: 35 updates (apply 0.17 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 27 layers; tiles uploaded 70 (70 draws, 2.7 MB, 5.12 ms, 0.073 ms per upload, 0 fence waits, 0 finishes); 35 paints (0.25 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 21.1 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 0.4 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 1.0 s: 35 updates answered when applied (async scrolling)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 35 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[app msg] [wpe-ps5] [present] 62 frames (12.4/s), render 1.12 ms avg 15.0 max, swap 0.0 ms avg 0.1 max, vsync interval 16.83 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.22 ms avg, video 0.00, scene 0.32, draw 0.57 avg 4.3 max (incl. the wait for the previous flip)
+[wc] 1.0 s: 60 updates (apply 0.16 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 27 layers; tiles uploaded 120 (120 draws, 4.7 MB, 8.56 ms, 0.071 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.24 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 21.1 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 1.3 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 1.0 s: 60 updates answered when applied (async scrolling)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[wc] 1.0 s: 60 updates (apply 0.16 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 27 layers; tiles uploaded 120 (120 draws, 4.7 MB, 8.68 ms, 0.072 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.25 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 21.1 MB (pool 0.0); programs 9 (64 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 1.4 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[web4] [wc] tile arena: chunk 2 released (8 MB in 1 chunks)
+[app msg] [wpe-ps5] [ps5-launch] launching task update (/data/ps5webkit/update/job.ini) from /app0/ps5wk-child.elf
+[app msg] [wpe-ps5] [ps5-launch update] sent 144116360 bytes + header to elfldr in 193 ms
