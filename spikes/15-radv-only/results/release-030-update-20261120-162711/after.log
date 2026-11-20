@@ -1,0 +1,4 @@
+ps5browser: WPE WebKit 2.55.0, pid 680, build 20261120-162359-e8ba953ad1
+runtime: installing /app0/runtime into /data/ps5webkit (bundled 2943b42e559f5f18, installed 5f47aa08a549f6de)
+runtime: installed 330 files, 91.7 MB, in 5290 ms
+[update] the last install: ok 0.3.0 (running 0.3.0)

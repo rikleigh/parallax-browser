@@ -1,0 +1,142 @@
+ps5browser: WPE WebKit 2.55.0, pid 673, build 20261119-085645-91f31930c3
+[update] test settings: source http://<mac>:8765/releases.json, ProsperoStore folder /data/ps5webkit/update-store-test
+[update] check job started (running 0.2.2)
+[update] [update-job] a development build (PS5WK_UPDATE_TESTING): the job file's source and ProsperoStore folder count
+[update] [update-job] check for PPSA99207 01.002.002 (source http://<mac>:8765/releases.json, a test source)
+[update] [update-job] installed copy: /data/homebrew/PPSA99207 (01.002.002)
+[update] [update-job] ProsperoStore (/data/ps5webkit/update-store-test): no receipt
+[update] [update-job] status: Looking for a newer version…
+[update] [update-job] newest release v0.3.0 (0.3.0, 191363232 bytes, sha256 06bb6e09848acbd6e0a2ec97afaaad166485490d6ffb71f456d7d9a3f45c2755): newer
+[update] (output closed after 1.0 s)
+[update] check done: available
+[update] the test's yes: Update
+[update] download job started (running 0.2.2)
+[update] [update-job] download for PPSA99207 01.002.002 (source http://<mac>:8765/releases.json, a test source)
+[update] [update-job] status: Downloading v0.3.0…
+[update] [update-job] downloading http://<mac>:8765/parallax-browser-0.3.0.zip to /data/ps5webkit/update/staging/release.zip
+[update] [update-job] progress: download 1448 191363232
+[update] [update-job] progress: download 3362056 191363232
+[update] [update-job] progress: download 7342056 191363232
+[update] [update-job] progress: download 10921664 191363232
+[update] [update-job] progress: download 13213600 191363232
+[update] [update-job] progress: download 14348832 191363232
+[update] [update-job] progress: download 15110480 191363232
+[update] [update-job] progress: download 16922392 191363232
+[update] [update-job] progress: download 19839384 191363232
+[update] [update-job] progress: download 22566680 191363232
+[web4] [render] wc phases (ms per update): layout before 0.2, scroll events 0.0, animations 0.0, rAF callbacks 0.0, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.0
+[update] [update-job] progress: download 24866240 191363232
+[update] [update-job] progress: download 27255728 191363232
+[update] [update-job] progress: download 29462696 191363232
+[update] [update-job] progress: download 31374632 191363232
+[update] [update-job] progress: download 33027888 191363232
+[update] [update-job] progress: download 34902368 191363232
+[update] [update-job] progress: download 37274424 191363232
+[update] [update-job] progress: download 39334456 191363232
+[update] [update-job] progress: download 41284024 191363232
+[update] [update-job] progress: download 43261000 191363232
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.0, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.0
+[update] [update-job] progress: download 45343296 191363232
+[update] [update-job] progress: download 47490640 191363232
+[update] [update-job] progress: download 49532232 191363232
+[update] [update-job] progress: download 51627136 191363232
+[update] [update-job] progress: download 53714144 191363232
+[update] [update-job] progress: download 56587808 191363232
+[update] [update-job] progress: download 59131488 191363232
+[update] [update-job] progress: download 61787040 191363232
+[update] [update-job] progress: download 64518360 191363232
+[update] [update-job] progress: download 67035656 191363232
+[update] [update-job] progress: download 68656344 191363232
+[update] [update-job] progress: download 70613376 191363232
+[update] [update-job] progress: download 73009352 191363232
+[update] [update-job] progress: download 75288904 191363232
+[update] [update-job] progress: download 77836120 191363232
+[update] [update-job] progress: download 80834784 191363232
+[update] [update-job] progress: download 83631976 191363232
+[update] [update-job] progress: download 86248272 191363232
+[update] [update-job] progress: download 88971600 191363232
+[update] [update-job] progress: download 90853744 191363232
+[update] [update-job] progress: download 93258848 191363232
+[update] [update-job] progress: download 96253664 191363232
+[update] [update-job] progress: download 98584640 191363232
+[update] [update-job] progress: download 100711440 191363232
+[update] [update-job] progress: download 102737648 191363232
+[update] [update-job] progress: download 105545296 191363232
+[update] [update-job] progress: download 108494992 191363232
+[update] [update-job] progress: download 111462088 191363232
+[update] [update-job] progress: download 114038200 191363232
+[update] [update-job] progress: download 115719080 191363232
+[update] [update-job] progress: download 117044000 191363232
+[update] [update-job] progress: download 118396808 191363232
+[update] [update-job] progress: download 119497816 191363232
+[update] [update-job] progress: download 121485720 191363232
+[update] [update-job] progress: download 123697256 191363232
+[update] [update-job] progress: download 125614008 191363232
+[update] [update-job] progress: download 127323400 191363232
+[update] [update-job] progress: download 129767120 191363232
+[update] [update-job] progress: download 131625656 191363232
+[update] [update-job] progress: download 133419112 191363232
+[update] [update-job] progress: download 135224944 191363232
+[update] [update-job] progress: download 137238416 191363232
+[update] [update-job] progress: download 139703008 191363232
+[update] [update-job] progress: download 142029168 191363232
+[update] [update-job] progress: download 144514816 191363232
+[update] [update-job] progress: download 147076776 191363232
+[update] [update-job] progress: download 149029072 191363232
+[update] [update-job] progress: download 150512960 191363232
+[update] [update-job] progress: download 152010640 191363232
+[update] [update-job] progress: download 153851056 191363232
+[update] [update-job] progress: download 156378656 191363232
+[update] [update-job] progress: download 159119568 191363232
+[update] [update-job] progress: download 161853272 191363232
+[update] [update-job] progress: download 164509616 191363232
+[update] [update-job] progress: download 166914128 191363232
+[update] [update-job] progress: download 169670608 191363232
+[update] [update-job] progress: download 172908584 191363232
+[update] [update-job] progress: download 175395176 191363232
+[update] [update-job] progress: download 178148072 191363232
+[update] [update-job] progress: download 179883392 191363232
+[update] [update-job] progress: download 182461488 191363232
+[update] [update-job] progress: download 184906712 191363232
+[update] [update-job] progress: download 187016200 191363232
+[update] [update-job] progress: download 188664464 191363232
+[update] [update-job] progress: download 190654360 191363232
+[update] [update-job] progress: download 191363232 191363232
+[update] [update-job] downloaded and checked in 42.5 s
+[update] [update-job] status: Unpacking v0.3.0…
+[update] [update-job] progress: unpack 9228 470678289
+[update] [update-job] progress: unpack 28518522 470678289
+[update] [update-job] progress: unpack 42479851 470678289
+[update] [update-job] progress: unpack 61715540 470678289
+[update] [update-job] progress: unpack 78385083 470678289
+[update] [update-job] progress: unpack 92231076 470678289
+[update] [update-job] progress: unpack 92353822 470678289
+[update] [update-job] progress: unpack 92804002 470678289
+[update] [update-job] progress: unpack 93414114 470678289
+[update] [update-job] progress: unpack 94113333 470678289
+[update] [update-job] progress: unpack 95265119 470678289
+[update] [update-job] progress: unpack 107618251 470678289
+[update] [update-job] progress: unpack 130625798 470678289
+[update] [update-job] progress: unpack 153483573 470678289
+[update] [update-job] progress: unpack 175122866 470678289
+[update] [update-job] progress: unpack 196877644 470678289
+[update] [update-job] progress: unpack 219338373 470678289
+[update] [update-job] progress: unpack 241213339 470678289
+[update] [update-job] progress: unpack 264377556 470678289
+[update] [update-job] progress: unpack 291395077 470678289
+[update] [update-job] progress: unpack 315411083 470678289
+[update] [update-job] progress: unpack 337523801 470678289
+[update] [update-job] progress: unpack 360599675 470678289
+[update] [update-job] progress: unpack 382338557 470678289
+[update] [update-job] progress: unpack 404413077 470678289
+[update] [update-job] progress: unpack 426253311 470678289
+[update] [update-job] progress: unpack 449639674 470678289
+[update] [update-job] progress: unpack 470678289 470678289
+[update] [update-job] unpacked in 13.7 s
+[update] [update-job] ready: v0.3.0 in /data/ps5webkit/update/staging
+[update] (output closed after 57.2 s)
+[update] download done: ready
+[update] the test's yes: Restart now
+[update] installing 0.3.0 from /data/ps5webkit/update/staging (the test's yes): the browser closes
+[update] [SceLncUtil] W:\Build\J03950016\vsh\common_lib\lnc_util\src\lnc_util_ipc_client.cpp(382) getAppStatus: LNC_ISOK::0x80940004
+[update] [relaunch] ready: PPSA99207 pid 673 (app 0x6018); waiting for /data/ps5webkit/home/tmp/relaunch-go-673; then the update in /data/ps5webkit/update/staging

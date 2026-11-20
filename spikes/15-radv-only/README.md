@@ -1045,6 +1045,12 @@ memory is 23 MB higher in every runner case (static 239 → 262 MB, video
   three live tabs, and the video-WebGL-WebGPU sequence 5 times. No crash,
   abort or device lost; `crash-title.txt` unchanged.
 
+**Release 0.3.0 (2026-11-20).** `make-release.sh` packages `build-radv`,
+and `contentVersion` is 01.003.000. The update from a 0.2.2 build to the
+0.3.0 zip passed on the console (`port/webkit/UPDATES.md`, "0.2.2 to 0.3.0"):
+the update installed, 0.3.0 started, and the settings, update and plain
+pages rendered ([results/release-030-update-20261120-162711/](results/release-030-update-20261120-162711/)).
+
 ## Run it
 
 ```sh

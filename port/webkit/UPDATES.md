@@ -339,3 +339,26 @@ Not tested on the console: ProsperoStore's journal (the Mac test covers
 it), a folder on an external or USB drive, a rename that fails part way,
 the update page waiting out View in VR, and a release built by
 `make-release.sh` (its hook check runs at the next release build).
+
+## 0.2.2 to 0.3.0, console test (2026-11-20)
+
+0.3.0 is the first release from the RADV build. The zip is
+`make-release.sh 0.3.0` at `fc80cec`. The 0.2.2 development build (the
+issue 3 build, with the test hooks) was installed as PPSA99207, with the zip
+served from the Mac (`update-source`, `update-test-yes`, an empty
+`update-store-root`). Log:
+`spikes/15-radv-only/results/release-030-update-20261120-162711/`.
+
+| Step | Result |
+| --- | --- |
+| Check | "newest release v0.3.0 … newer", in 1.0 s |
+| Download, 191 MB | 42.5 s, size and SHA-256 checked |
+| Unpack, 471 MB | 13.7 s |
+| Install | Restart now; the helper swapped the folder and started the title |
+| After | 0.3.0 running (release build `20261120-162359`, no log host): `contentVersion` 01.003.000, `INSTALL.txt` naming `fc80cec`, the runtime installed (330 files, 5.3 s), "the last install: ok 0.3.0" |
+| Byte for byte | `ps5wk-child.elf` and `sce_sys/param.json` match the zip. `eboot.bin` doesn't, and that isn't the updater's doing: on the console it is a plain ELF, 9 MB larger than the zip's signed file. The 0.2.3 release's eboot, installed by `launch.sh --install`, differs from its zip the same way. Compare an eboot by the build it reports, not by its bytes |
+| 0.3.0's own check, against GitHub and the real store folder | The store's receipt names this folder, so ProsperoStore manages it; the newest GitHub release, v0.2.3, is "not newer". Up to date |
+| Smoke | `parallax://settings`, `parallax://update` ("This is Parallax Browser 0.3.0") and a plain page render; no crash |
+
+The console was put back as it was: the 0.2.3 release reinstalled, the
+update work folder and `crash-title.txt` as they were, and no test files.

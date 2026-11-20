@@ -1,0 +1,9 @@
+ps5browser: WPE WebKit 2.55.0, pid 685, build 20261120-162359-e8ba953ad1
+[update] check job started (running 0.3.0)
+[update] [update-job] check for PPSA99207 01.003.000 (source <url>)
+[update] [update-job] installed copy: /data/homebrew/PPSA99207 (01.003.000)
+[update] [update-job] ProsperoStore (/data/prosperostore): the receipt names this folder (/data/homebrew/PPSA99207, version 01.002.002): the store's
+[update] [update-job] status: Looking for a newer version…
+[update] [update-job] newest release v0.2.3 (0.2.3, 194540784 bytes, sha256 7dd590553f8afd675ffb7e0389bedcd76473f9570cc73e59c85a1210c6c09eb5): not newer
+[update] (output closed after 1.7 s)
+[update] check done: up-to-date
