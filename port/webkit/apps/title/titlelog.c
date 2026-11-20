@@ -639,6 +639,32 @@ static int flushLog(int timeoutMs)
     }
 }
 
+/* crashguard.c's signal handler, just before _exit: its report into the
+ * queue, then out for up to 1 s (flushLog). Bounded at every step: the
+ * crashed thread may hold the lock (0.5 s of trylock, then nothing) or be the
+ * sender (nothing; the report is in crash-title.txt either way). The report
+ * bypasses the private mode's dropping: it names no page. */
+int ps5wk_crash_log_report(const char* text, size_t n)
+{
+    if (!started || !n || pthread_equal(pthread_self(), senderThread))
+        return 0;
+    int locked = 0;
+    for (int waited = 0; waited <= 500 && !locked; waited++) {
+        if (!pthread_mutex_trylock(&lock))
+            locked = 1;
+        else
+            usleep(1000);
+    }
+    if (!locked)
+        return 0;
+    absorbStderrLocked();
+    if (ringFree() >= n)
+        ringPut(text, n);
+    wakeLocked();
+    pthread_mutex_unlock(&lock);
+    return flushLog(1000);
+}
+
 /* ---- start ---- */
 
 /* /data/ps5webkit/log-sink: "[host]:port [queue=<KB>] [stall=<s>]". */

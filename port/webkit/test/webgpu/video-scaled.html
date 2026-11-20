@@ -1,0 +1,228 @@
+<!doctype html>
+<!-- WebGPU video textures from a video whose decoded size isn't the size the
+     page sees. copyExternalImageToTexture copies in the element's size
+     (videoWidth x videoHeight), so a frame decoded at another size has to be
+     scaled to it; importExternalTexture samples in 0..1 and needs no scaling.
+     Clips (toolchain/wpe-webkit/media, uploaded to ../media/):
+       anamorphic-1440x1080-sar4x3-h264.mp4: 1440x1080 with 4:3 pixels, so
+         1920x1080 on screen; the left half red, the right half blue.
+       switch-h264.mp4: 396x704, then 540x960, then 1280x720, then 396x704,
+         5 s each, the new sizes in band only: the container (and so
+         videoWidth x videoHeight) says 396x704 throughout, so from 5 s to
+         15 s every frame is decoded at another size than the page sees.
+     Cases:
+       anamorphic-size: videoWidth x videoHeight is 1920x1080.
+       anamorphic-copy: copyExternalImageToTexture into a 1920x1080 texture
+         cleared to magenta: no magenta left, red on the left, blue on the
+         right, and the red-to-blue edge within 2 % of the middle (a frame
+         copied unscaled would put it at 720, three eighths across).
+       anamorphic-external: the external texture drawn into a 1920x1080
+         target: the edge in the middle as well.
+       switch-copy: for 20 s from the start, every 250 ms, two copies of the
+         frame at the element's size, one into a texture cleared to magenta,
+         one into one cleared to green; no point may be magenta in the
+         first and green in the second (a copy the title skipped or cut
+         short leaves each its clear colour; the clip has magenta and green
+         of its own, so one clear colour can't tell, and the two copies may
+         be of consecutive frames, so they needn't match). Lists the element sizes seen.
+       uncaptured-errors: none.
+     Open file:///data/ps5webkit/webgpu/video-scaled.html. Log lines:
+     RESULT webgpu-video-scaled <case> PASS|FAIL|SKIP <why>, then the summary. -->
+<meta charset="utf-8">
+<title>WebGPU video at another size</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  video { width: 480px; height: 270px; background: #000; margin-right: 16px; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+<div id="row"></div>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+const ANAMORPHIC = '../media/anamorphic-1440x1080-sar4x3-h264.mp4';
+const SWITCH = '../media/switch-h264.mp4';
+const MAGENTA = { r: 1, g: 0, b: 1, a: 1 };
+const GREEN = { r: 0, g: 1, b: 0, a: 1 };
+const WGSL = `
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var t: texture_external;
+struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                                vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  let xy = corners[i];
+  return V(vec4f(xy, 0.0, 1.0), vec2f(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5));
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  return textureSampleBaseClampToEdge(t, s, v.uv);
+}`;
+
+function startVideo(url) {
+  const video = document.createElement('video');
+  document.getElementById('row').appendChild(video);
+  return new Promise(resolve => {
+    let done = false;
+    const finish = why => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      resolve({ video, why });
+    };
+    const timer = setTimeout(() => finish('not playing after 10 s (readyState ' + video.readyState + ')'), 10000);
+    const poll = setInterval(() => {
+      if (video.readyState >= 2 && video.videoWidth > 0 && !video.paused && video.currentTime > 0) finish('');
+    }, 50);
+    video.addEventListener('error', () => finish('video error ' + (video.error ? video.error.code : '')));
+    video.muted = true;
+    video.loop = true;
+    video.playsInline = true;
+    video.src = url;
+    const playing = video.play();
+    if (playing && playing.catch) playing.catch(e => finish('play() rejected: ' + T.describe(e)));
+  });
+}
+
+function clearedTexture(device, width, height, colour = MAGENTA) {
+  const texture = device.createTexture({
+    size: [width, height], format: 'rgba8unorm',
+    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+  const encoder = device.createCommandEncoder();
+  encoder.beginRenderPass({ colorAttachments: [{ view: texture.createView(), clearValue: colour, loadOp: 'clear', storeOp: 'store' }] }).end();
+  device.queue.submit([encoder.finish()]);
+  return texture;
+}
+
+const isMagenta = ([r, g, b]) => r > 200 && g < 50 && b > 200;
+const isRed = ([r, g, b]) => r > 160 && g < 80 && b < 80;
+const isBlue = ([r, g, b]) => b > 160 && r < 80 && g < 80;
+
+// The share of a 32x32 grid still magenta.
+function magentaShare(image) {
+  let magenta = 0, all = 0;
+  const stepX = Math.max(1, image.width >> 5), stepY = Math.max(1, image.height >> 5);
+  for (let y = stepY >> 1; y < image.height; y += stepY)
+    for (let x = stepX >> 1; x < image.width; x += stepX, all++)
+      if (isMagenta(T.pixel(image, x, y))) magenta++;
+  return magenta / all;
+}
+
+// The share of a 32x32 grid the copies didn't cover: magenta in the first, green in the second.
+const isGreen = ([r, g, b]) => g > 200 && r < 50 && b < 50;
+function differingShare(a, b) {
+  let uncovered = 0, all = 0;
+  const stepX = Math.max(1, a.width >> 5), stepY = Math.max(1, a.height >> 5);
+  for (let y = stepY >> 1; y < a.height; y += stepY)
+    for (let x = stepX >> 1; x < a.width; x += stepX, all++)
+      if (isMagenta(T.pixel(a, x, y)) && isGreen(T.pixel(b, x, y))) uncovered++;
+  return uncovered / all;
+}
+
+// The red-to-blue edge on the middle row: red at the left, blue at the right, the edge in the middle.
+function checkHalves(image) {
+  const y = image.height >> 1, w = image.width;
+  const left = T.pixel(image, Math.round(w * 0.05), y), right = T.pixel(image, Math.round(w * 0.95), y);
+  T.assert(isRed(left), 'left is ' + left.join(',') + ', not red');
+  T.assert(isBlue(right), 'right is ' + right.join(',') + ', not blue');
+  let edge = -1;
+  for (let x = 0; x < w; x++) {
+    const [r, , b] = T.pixel(image, x, y);
+    if (b > r) { edge = x; break; }
+  }
+  T.assert(Math.abs(edge - w / 2) <= w * 0.02, 'the red-to-blue edge is at x ' + edge + ' of ' + w + ' (want ' + w / 2 + ')');
+  return 'red to blue at x ' + edge + ' of ' + w;
+}
+
+T.run('video-scaled', async () => {
+  const g = await T.getDevice();
+  if (!g) return;
+  const { device } = g;
+
+  const a = await startVideo(ANAMORPHIC);
+  if (a.why) {
+    T.skip('anamorphic-size', 'no video: ' + ANAMORPHIC + ' ' + a.why);
+  } else {
+    const video = a.video;
+    await T.test('anamorphic-size', async () => {
+      T.assert(video.videoWidth === 1920 && video.videoHeight === 1080, 'videoWidth x videoHeight ' + video.videoWidth + 'x' + video.videoHeight);
+      return '1440x1080 with 4:3 pixels is ' + video.videoWidth + 'x' + video.videoHeight;
+    }, device);
+
+    await T.test('anamorphic-copy', async () => {
+      const width = video.videoWidth, height = video.videoHeight;
+      const texture = clearedTexture(device, width, height);
+      const before = performance.now();
+      device.queue.copyExternalImageToTexture({ source: video }, { texture }, [width, height]);
+      const image = await T.readTexture(device, texture);
+      const ms = performance.now() - before;
+      texture.destroy();
+      const share = magentaShare(image);
+      T.assert(share === 0, Math.round(share * 100) + ' % of the texture is still magenta: the copy was skipped or partial');
+      return width + 'x' + height + ' in ' + ms.toFixed(1) + ' ms; ' + checkHalves(image);
+    }, device);
+
+    await T.test('anamorphic-external', async () => {
+      const width = 1920, height = 1080;
+      const target = clearedTexture(device, width, height);
+      const module = device.createShaderModule({ code: WGSL });
+      const pipeline = await T.step(device.createRenderPipelineAsync({
+        layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+      }), 'createRenderPipelineAsync');
+      const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+      const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: sampler }, { binding: 1, resource: device.importExternalTexture({ source: video }) },
+      ] });
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: 'load', storeOp: 'store' }] });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(6);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+      const image = await T.readTexture(device, target);
+      target.destroy();
+      return checkHalves(image);
+    }, device);
+    video.pause();
+    video.remove();
+  }
+
+  const s = await startVideo(SWITCH);
+  if (s.why) {
+    T.skip('switch-copy', 'no video: ' + SWITCH + ' ' + s.why);
+  } else {
+    const video = s.video;
+    video.loop = false;
+    await T.test('switch-copy', async () => {
+      const sizes = new Map();
+      let copies = 0, worst = 0, worstAt = '';
+      const end = performance.now() + 20000;
+      while (performance.now() < end && !video.ended) {
+        const width = video.videoWidth, height = video.videoHeight;
+        const a = clearedTexture(device, width, height), b = clearedTexture(device, width, height, GREEN);
+        device.queue.copyExternalImageToTexture({ source: video }, { texture: a }, [width, height]);
+        device.queue.copyExternalImageToTexture({ source: video }, { texture: b }, [width, height]);
+        const imageA = await T.readTexture(device, a), imageB = await T.readTexture(device, b);
+        a.destroy();
+        b.destroy();
+        const share = differingShare(imageA, imageB);
+        const key = width + 'x' + height;
+        sizes.set(key, (sizes.get(key) || 0) + 1);
+        copies++;
+        if (share > worst) { worst = share; worstAt = key + ' at ' + video.currentTime.toFixed(2) + ' s'; }
+        await new Promise(r => setTimeout(r, 250));
+      }
+      const seen = [...sizes].map(([k, n]) => k + ' (' + n + ')').join(', ');
+      T.assert(worst === 0, copies + ' copies; in one ' + Math.round(worst * 100) + ' % of the texture was not covered (' + worstAt + '); sizes ' + seen);
+      return copies + ' copies, every one covered the texture; sizes ' + seen;
+    }, device);
+    video.pause();
+  }
+
+  await T.test('uncaptured-errors', async () => {
+    T.assert(!T.uncaptured.length, T.uncaptured.join('; '));
+    return 'none';
+  }, device);
+});
+</script>

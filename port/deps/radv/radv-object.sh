@@ -3,7 +3,11 @@
 # own Mesa 26.2: 4163 global symbols in common).
 #   port/deps/radv/radv-object.sh   -> build/radv-ps5/radv-local.o
 # Needs build/radv-ps5/install from build-radv.sh. Used by the spike titles
-# and by port/webkit/apps/title/package.sh (WebGPU builds).
+# and by port/webkit/apps/title/package.sh (WebGPU builds). GPU=radv titles
+# have no ps5-opengl (HANDOVER-radv.md Phase 5) but link the same object:
+# GPU=gl WebGPU builds still need it, and with only the ICD's entry points
+# global, RADV's own copies of libraries (zlib, from its meson fallback)
+# can't meet the title's.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$ROOT/env.sh" >/dev/null

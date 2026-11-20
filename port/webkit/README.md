@@ -1147,6 +1147,15 @@ BLD=$PWD/toolchain/wpe-webkit/build-cpu port/webkit/apps/title/package.sh
 - WebKit is a static library (`WebKit_LIBRARY_TYPE STATIC` on PS5); the
   executables in `apps/` link it. The title relinks ps5browser's link line
   with PS5VR's native-app CRT and ps5-opengl (`apps/title/package.sh`).
+- `GPU=radv` (not released yet; `spikes/15-radv-only/README.md`): the
+  title's GL is WebKit's ANGLE on its Vulkan backend over RADV, from the
+  `src-radv` worktree (branch `ps5-radv`, `patches-radv/` on top of
+  `ps5-webgl`) into `build-radv`. ANGLE is built with the Vulkan backend
+  only (0142). `package.sh` sees `PS5WK_GPU_RADV` in the build's cache and
+  links no ps5-opengl: `dlshim.c` hands epoxy ANGLE's entry points,
+  `titlert.c` sends stdout to `/download0/ps5browser.log`, and
+  `titleradv.c` has what RADV needs from the title. The libSceAgc stub is
+  the SDK's.
 
 ## Patches (`patches/`, applied in order by `build.sh src`)
 
@@ -1863,6 +1872,23 @@ three proxy drains) play every picture, 0 decode errors (598 of 601 shown,
 pictures, 0 errors, ~60 frames/s. Harness (fake decoder):
 `switch-h264.m2ts` at 30 frames/s through the switches. The decoder's
 close line counts `format changes`.
+
+**Broken again by the small H.264 decoders (2026-11-09, found and fixed
+2026-11-20).** Since streams up to 640x480 (by area) got a decoder of their
+own size, `switch-h264.mp4` (396x704 first) got a 400x704 one; the in-band
+switch to 544x960 drained and reset it, but it was still 400x704, and every
+call failed (rc 0x811d0302/0303) until the stream came back to 396x704: 300
+of 600 pictures, 80 errors, 10 resets, on the release browser too. The MP4's
+caps keep 396x704, so no DOPEN reopened it. Now a new in-band H.264 SPS
+bigger than the decoder reopens it in place on the decoder thread
+(`growDecoder`: the old pictures drained and shown, the old decoder and its
+output buffers closed, its budget given back, then 1920x1088 or the new size
+opened under the budget; if that fails the stream gets no more pictures, as
+a refused DOPEN). Checked on PPSA99208 (2026-11-20): `switch-h264.mp4` 600
+of 600 pictures, 0 errors, one reopen (544x960 into 400x704 -> 1920x1088, 196
+ms, 9 frames dropped at the switch), the later switches drained and reset;
+`switch-h264.m2ts` 600/600, 0 errors; a 380x222 preview still gets its own
+384x224 decoder; 1080p H.264 unchanged.
 
 **Hover previews that froze the page (a VR site, found 2026-10-30).** Listing
 pages play small H.264 High clips on hover (380x222 `avc1.640016`, level

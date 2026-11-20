@@ -17,6 +17,9 @@
 #   switch-h264.mp4         H.264 avc3 (parameter sets in band, as BBC News's DASH streams)
 #                           changing size mid-stream: 396x704, 540x960, 1280x720, 396x704,
 #                           5 s each, AAC with the beeps, 20 s; switch-h264.m2ts the same in MPEG-TS
+#   anamorphic-1440x1080-sar4x3-h264.mp4
+#                           1440x1080 H.264 High with 4:3 pixels (1920x1080 on screen), the left
+#                           half red, the right half blue, no audio, 20 s (webgpu/video-scaled.html)
 #   preview-*.mp4           hover previews for preview.html: 380x222/440x248 H.264 High with
 #                           B-frames, no audio, 6 s, with and without the VUI reorder limits
 #   feed-*                  for feed.html (several players at once): 480x854 and 854x480 H.264
@@ -116,6 +119,12 @@ preview preview-380x222-l20-novui.mp4 380x222 2.0 novui
 
 # Audio only, for "is there sound at all" checks on the TV (sine is 1/8 of
 # full scale: peak about 0.35).
+if [ ! -s "$OUT/anamorphic-1440x1080-sar4x3-h264.mp4" ]; then
+    $FF -f lavfi -i "color=red:s=720x1080:r=30:d=20" -f lavfi -i "color=blue:s=720x1080:r=30:d=20" \
+        -filter_complex "[0][1]hstack=inputs=2,setsar=4/3,format=yuv420p" -c:v libx264 -profile:v high -level 4.0 -g 30 \
+        -movflags +faststart "$OUT/anamorphic-1440x1080-sar4x3-h264.mp4"
+fi
+
 if [ ! -s "$OUT/sound-test.m4a" ]; then
     $FF -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000" -af "volume=2.8,aformat=channel_layouts=stereo" \
         -t 60 -c:a aac -b:a 128k -movflags +faststart "$OUT/sound-test.m4a"

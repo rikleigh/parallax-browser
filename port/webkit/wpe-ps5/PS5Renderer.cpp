@@ -47,6 +47,13 @@ extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
 extern "C" int ps5_agc_gate2_wait_present(void) __attribute__((weak));
 
 namespace {
+#if PS5WK_GPU_RADV
+// GPU=radv: the compositor, WebGL and WebGPU are all RADV, whose PS5 winsys puts the process's
+// submissions in order on one queue: no lock, and no flush of its own before the swap.
+struct GPUSubmitLock {
+    void release() { }
+};
+#else
 struct GPUSubmitLock {
     GPUSubmitLock()
     {
@@ -65,6 +72,7 @@ struct GPUSubmitLock {
     }
     bool m_released { false };
 };
+#endif
 }
 
 // GL is reached through libepoxy. In the title its dlopen()/dlsym() resolve
@@ -897,6 +905,19 @@ void PS5Renderer::threadMain()
 #if !PS5WK_GPU_RADV // ANGLE waits in its swapchain acquire instead
         if (ps5wk_gpu_submit_lock && ps5_agc_gate2_wait_present)
             ps5_agc_gate2_wait_present();
+#else
+        // GPU=radv: ANGLE's wait for the next swapchain image, now and outside its locks
+        // (eglPrepareSwapBuffersANGLE acquires in an unlocked tail call). Left to the frame's
+        // first draw into the window, it was made holding the share group's lock (on in this
+        // build since the WebGL video crash fix) for most of a frame, and every other thread's GL
+        // call waited for it: Dawn's video reads 4-14 ms in eglMakeCurrent, measured (HANDOVER-radv.md
+        // Phase 4). The same place as ps5-opengl's wait above.
+        {
+            using PrepareSwap = EGLBoolean (*)(EGLDisplay, EGLSurface);
+            static PrepareSwap prepareSwap = reinterpret_cast<PrepareSwap>(eglGetProcAddress("eglPrepareSwapBuffersANGLE"));
+            if (prepareSwap && m_eglSurface)
+                prepareSwap(m_eglDisplay, m_eglSurface);
+        }
 #endif
         // Until the swap: its wait for the vsync is not held against Dawn.
         GPUSubmitLock gpuSubmitLock;

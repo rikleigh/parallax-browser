@@ -1,0 +1,92 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/video-texture.html?run=1795174487
+push: loading file:///data/ps5webkit/phase0/webgpu/video-texture.html?run=1795174487
+load started: file:///data/ps5webkit/phase0/webgpu/video-texture.html?run=1795174487
+load committed: file:///data/ps5webkit/phase0/webgpu/video-texture.html?run=1795174487
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[web4] [WPEWebKit:Media:-] MediaElementSession::clientWillBeginAutoplaying(381846721755431F) state = Idle
+[app msg] [video] stream 2 from pid 485 is a decoder connection
+[vdec] Videodec2 1920x1088 codec 1 profile 100 depth 4: decoder memory flexible 23.7 MB, direct 70.2 MB (+ queue 4.6, input 32); frame 3.2 MB (align 0x100), level 41; flexible free 262 -> 238 MB, direct memory in use 521 -> 628 MB
+[web4] [WPEWebKit:Media:-] MediaElementSession::setState(381846721755431F) Autoplaying, canProduceAudio=false
+[web4] [WPEWebKit:Media:-] HTMLMediaElement::updateShouldPlay(381846721755431F) autoplay blocked with reason: PageConsentRequired: Not enough data
+[web4] [WPEWebKit:Media:-] HTMLMediaElement::setPreload(381846721755431F) auto
+[web4] [WPEWebKit:Media:-] MediaElementSession::clientWillBeginAutoplaying(381846721755431F) state = Autoplaying
+[web4] [WPEWebKit:Media:-] MediaElementSession::clientWillBeginPlayback(381846721755431F) state = Autoplaying
+[web4] [WPEWebKit:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 4042058121396699935
+[web4] [WPEWebKit:Media:-] MediaSessionManagerInterface::setCurrentSession(0) 4042058121396699935, size = 1
+[web4] [WPEWebKit:Media:-] MediaElementSession::setState(381846721755431F) Playing, canProduceAudio=false
+[web4] [WPEWebKit:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 4042058121396699935 returning true
+[web4] WebKit wasn't able to find a WebVTT encoder. Subtitles handling will be degraded unless gst-plugins-bad is installed.
+[web4] [render] wc: 25 updates in 6.3 s (4.0/s), 0.9 ms average, p50 0.7, p95 2.3, 3.2 ms max; update 0.6 avg; paint 0.2 avg 0.5 p95 (0.29 Mpx, 3.0 tiles avg); frame done 13.9 ms avg; rAF clock 5.9/s (6 idle); reply to next update 236.3 ms avg 2790.9 max (22 of 25 waiting at the reply, 3 started by the idle timer); tile wait 0.4 ms avg
+[web4] [render] intersection observers since start: 1 targets computed (0 explicit root, 1 intersecting or new, 0 near, 0 due; 0 of them clipped out last time), 0 far or clipped-out ones skipped
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.4, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.1, other 0.1
+[web4] [render] wc flush: 25 layer tree flushes, 0.22 ms avg; layers per flush: 7 walked, 0 skipped (culled), 1.5 changed
+[web4] [render] paint cull (per update): 1 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 0 not eligible
+[web4] [render] wc tiles: record 0.7 ms/s (1.14 Mpx/s), raster 1.5 ms/s wall (1.14 Mpx/s, 286 items, 12 async), shm allocations 0.0/s, old way 0
+[app msg] [vdec] decoder 1 for pid 485: H.264 profile 1, 8-bit, 1920x1088 (stream 1920x1080), up in 27 ms; 12 output buffers of 3.2 MB; costs 155 MB direct, 24.0 MB flexible; budget 1 decoders, 155 MB (peak 1, 155 MB; 0 refused, 0 waited, 0 VP9 sized to the stream)
+[web4] [ps5vdecproxy] 212b982e0: video/x-h264 1920x1080 8-bit: the title opened a hardware decoder in 210 ms
+[app msg] [video] stream 3 from pid 485 connected (with a stream key)
+[app msg] [vdec] decoder 1: 1920x1080 fits the decoder (1920x1088); kept
+[app msg] [vdec] decoder 1: SPS 0: profile 100 (constraints 0x00) level 4.0, 120x68 MBs (1920x1088), 4 reference frames, frame_num 4 bits, POC type 0; VUI reorder 2, max_dec_frame_buffering 4; the level's DPB holds 4 frames at this size
+[ps5audio] calling sceAudioOutInit (bound)
+[ps5audio] sceAudioOutInit -> 0x00000000
+[ps5audio] stream from pid 485: 2 ch, sceAudioOut (handle 0x20000000), 1 open
+[ps5audio] port 0x20000000 (pid 485) opened: GetPortState 0x00000000: output 0x81, 2 ch, volume -1, reroutes 11, flag 0x0
+[app msg] [wpe-ps5] video stream 3: 1920x1080 hardware-decoded NV12
+load finished: file:///data/ps5webkit/phase0/webgpu/video-texture.html?run=1795174487
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/video-texture.html?run=1795174487 "WebGPU video texture" (0.3 s after start)
+[mem] load finished: flexible 238.0 MB free; direct memory 685.8 MB in use; direct heap 42.5 MB mapped (peak 224.6, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 52 (peak 350.5 MB, 79 made, 0 failed, 0 zero fills, 108 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 49 live, 77.4 MB (76 created, 0 libc); WebGL 0 contexts (9 made), drawing buffers ~0.0 MB; WebGPU buffers and textures 0.0 MB (peak 1536.0, budget 1536, 2 refused)
+[webgpu] title: canvas 2035 of WebProcess 4
+[webgpu] title: video read context ready
+[webgpu] title: video frame 1920x1080 copied for a WebGPU texture, no CPU copy, in 1.97 ms (1 copies, 1 images)
+[webgpu] title: canvas 2035: first frame, 640x360, format 26, opaque, in an image shared with the compositor (no CPU copy)
+[web4] [ps5videosink] 2140a2330: connected to /system_tmp/ps5wk/video-482.sock
+[web4] [ps5vdecproxy] 212b982e0: video/x-h264 1920x1080 8-bit (avc): hardware decoder in 0 ms
+[web4] [ps5videosink] 2140a2330: 1920x1080 NV12 decoded in the title, BT.709 limited range
+[web4] [ps5audiosink] 2 ch to the title's audio server (/system_tmp/ps5wk/audio-482.sock)
+[web4] [WPEWebKit:Media:-] MediaElementSession::clientWillBeginPlayback(381846721755431F) state = Playing
+[web4] [WPEWebKit:Media:-] HTMLMediaElement::mediaPlayerPlaybackStateChanged(381846721755431F) playerPaused: false, shouldBePaused: false
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:55:16: CONSOLE LOG [webgpu-video-texture] video ../media/sync-1080p30-h264.mp4 1920x1080, duration 60.0 s
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-video-texture setup PASS texture_external pipeline for bgra8unorm
+[network2] [ps5wk-child 484] [mem] network2 at 60 s: 17 threads, rss 167.6 MB, peak 167.3 MB; flexible free 8064.0 MB (-16.0 since start); libpas pages 256.0 MB (2.1 given back, 253.9 committed), resident in big mappings 4.5 MB, compact 0.1 of 128 MB; mmaps 27 live, 386.2 MB (peak 386.2, largest 128.0), 192 calls, 24 munmaps, 0 failed; JIT off; locks futex: 1 mutex parks, 863 cond waits, 0 rwlock parks; malloc libpas: 0 foreign frees, 0 foreign reallocs, 0 fallbacks
+[wc] 1.0 s: 47 updates (apply 0.07 ms avg, 1.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 28 (28 draws, 14.7 MB, 2.42 ms, 0.087 ms per upload, 0 fence waits, 0 finishes); 48 paints (0.21 ms avg, 0.4 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 47 updates answered when applied (async scrolling)
+[wc] 1.0 s: 1 video layers, 1 paints for video frames only
+[wc] 1.0 s: WebGL 1 contexts (10 made), 1 layers shown, drawing buffers ~2.8 MB (in the GL texture cap)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 47 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[web4] [ps5wk-child 485] [mem] web4 at 60 s: 49 threads, rss 216.1 MB, peak 463.9 MB; flexible free 8064.0 MB (-16.0 since start); libpas pages 256.0 MB (29.1 given back, 226.9 committed), resident in big mappings 122.9 MB, compact 0.1 of 128 MB; mmaps 79 live, 801.3 MB (peak 1053.4, largest 256.0), 1665 calls, 150 munmaps, 0 failed; JIT code 0.2 MB (committed 0.2 of 256 MB), compiled Baseline 48 / DFG 49 / FTL 8 (0 / 17 / 29 ms), 0 failed, 0 allocations refused, thresholds x1.00; locks futex: 303 mutex parks, 9584 cond waits, 0 rwlock parks; malloc libpas: 0 foreign frees, 0 foreign reallocs, 0 fallbacks
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.1 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 0 (0 draws, 0.0 MB, 0.00 ms, 0.000 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.21 ms avg, 0.5 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.1 max
+[wc] 1.0 s: 60 updates answered when applied (async scrolling)
+[wc] 1.0 s: 1 video layers, 0 paints for video frames only
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[web4] [render] compositing: 16 updates in 5.2 s, 0.1 ms avg, 0.2 max (9 with a requirements traversal, 14 with a backing/hierarchy update)
+[web4] [render] compositing requirements per traversal: 3 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfP video 4, selfPDS RenderView 1, selfP RenderView 1, selfS RenderView 1, selfPD RenderView 1, selfD RenderView 1
+[ps5audio] port 0x20000000 (pid 485) after 2 s: GetPortState 0x00000000: output 0x81, 2 ch, volume -1, reroutes 11, flag 0x0
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-video-texture external-texture PASS 120 frames, 60.0 fps, 0.25 ms of JavaScript per frame; brightest channel 255, 50 colours on a 32x32 grid; video time 0.05 to 0.09 s
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-video-texture copy-external-image PASS 1920x1080 copied and read back in 25.0 ms; brightest channel 255, 58 colours on a 32x32 grid
+IPC: socket 75 in process 482 reported condition 0x11 (HUP/ERR/NVAL)
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 16 (16 draws, 1.5 MB, 0.51 ms, 0.032 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.19 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 8 (8 draws, 0.2 MB, 0.19 ms, 0.023 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.18 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-video-texture video-frame-callback PASS 10 callbacks in 1840 ms, each imported and drawn; last frame 1920x1080 at media time 1.967, presentedFrames 71
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-video-texture uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-video-texture summary PASS 5/5
+[app msg] [wpe-ps5] [cpu] title: main thread busy 1 % (outside poll), process CPU 0.30 cores, render thread CPU 1 %
+[web4] [WPEWebKit:Media:-] MediaSessionManagerInterface::dumpSessionStates(0)  Sessions:
+[wc] 1.0 s: 60 updates (apply 0.03 ms avg, 0.4 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 12 (12 draws, 1.2 MB, 0.61 ms, 0.051 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.27 ms avg, 0.5 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.0 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.1 max
+[app msg] [wpe-ps5] [present] 302 frames (60.3/s), render 0.44 ms avg 1.4 max, swap 0.1 ms avg 0.4 max, vsync interval 16.66 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 87 video frames (87 hardware-decoded), copy+convert 0.05 ms avg 0.3 max
+[app msg] [wpe-ps5] [present] render: apply 0.04 ms avg, video 0.02, scene 0.25, draw 0.14 avg 0.4 max (incl. the wait for the previous flip)
+[web4] (381846721755431F): VideoAudio, Playing, File, 1920x1080 avc1.640028, mp4a.40.2
+[web4] 
+[web4] [render] wc: 288 updates in 5.0 s (57.5/s), 0.5 ms average, p50 0.4, p95 0.7, 4.8 ms max; update 0.4 avg; paint 0.0 avg 0.0 p95 (0.01 Mpx, 0.2 tiles avg); frame done 16.0 ms avg; rAF clock 59.5/s (5 idle); reply to next update 0.9 ms avg 234.9 max (285 of 288 waiting at the reply, 3 started by the idle timer); tile wait 0.1 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.3, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 1 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.1
+[web4] [render] wc flush: 288 layer tree flushes, 0.03 ms avg; layers per flush: 8 walked, 0 skipped (culled), 1.0 changed
+[web4] [render] paint cull (per update): 0 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 0 not eligible
+[web4] [render] wc tiles: record 0.5 ms/s (0.53 Mpx/s), raster 1.5 ms/s wall (0.53 Mpx/s, 133 items, 11 async), shm allocations 0.0/s, old way 0
+[app msg] [video] stream 3 (pid 485): 28.6 frames/s received, 19.0/s shown, 48 dropped (48 in all), shown 7.7 ms after due on average; held 1/2/3/4+ vsyncs: 6/86/1/1, last holds 2222222222222222; hidden 0x0+0+0
+[web4] [ps5videosink] 2140a2330: 28.8 frames/s sent, 14.0 ms before due on average (-82.0 min), 0 without a free slot; title so far: 95 shown, 48 dropped
+[app msg] [vdec] decoder 1 (pid 485): 32.9 AUs/s in, 31.5 pictures/s out; decode call 1.33 ms avg 15.89 max, waited 1389 ms for slots; 7/12 slots held (0 pinned), 1 AUs queued; so far 159 pictures, 0 hidden, 0 errors, 0 skipped, 0 without pts, 0 resets after errors, 0 flagged, 0 lost without a release
+[web4] [ps5vdecproxy] 212b982e0: 32.7 AUs/s sent (7.5 Mbit/s), 29.5 pictures/s; waited 1997 ms for the title; 0 released, 9 stale, 0 clipped, 0 late, 0 of older epochs, 0 given back unrendered so far
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 8 (8 draws, 0.2 MB, 0.20 ms, 0.025 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 8 (8 draws, 0.2 MB, 0.19 ms, 0.023 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.21 ms avg, 0.5 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.1 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] [render] compositing: 8 updates in 5.0 s, 0.1 ms avg, 0.2 max (3 with a requirements traversal, 8 with a backing/hierarchy update)
+[web4] [render] compositing requirements per traversal: 4 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfD RenderView 3

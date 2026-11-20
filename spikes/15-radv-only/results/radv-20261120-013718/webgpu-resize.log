@@ -1,0 +1,53 @@
+IPC: error sending on socket 73 in process 120: Error sending message: Socket is not connected
+IPC: socket 73 in process 120 reported condition 0x11 (HUP/ERR/NVAL)
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/resize.html?run=1795138795
+push: loading file:///data/ps5webkit/phase0/webgpu/resize.html?run=1795138795
+load started: file:///data/ps5webkit/phase0/webgpu/resize.html?run=1795138795
+load committed: file:///data/ps5webkit/phase0/webgpu/resize.html?run=1795138795
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[webgpu] title: canvas d45 of WebProcess 4
+load finished: file:///data/ps5webkit/phase0/webgpu/resize.html?run=1795138795
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/resize.html?run=1795138795 "" (0.0 s after start)
+[mem] load finished: flexible 239.0 MB free; direct memory 514.0 MB in use; direct heap 34.5 MB mapped (peak 224.6, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 49 (peak 350.5 MB, 67 made, 0 failed, 0 zero fills, 69 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 46 live, 76.1 MB (64 created, 0 libc); WebGL 2 contexts (3 made), drawing buffers ~1.8 MB; WebGPU buffers and textures 1.8 MB (peak 1536.0, budget 1536, 2 refused)
+[webgpu] title: canvas d45: first frame, 320x180, format 26, opaque
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize initial-320x180 PASS 320x180 bgra8unorm, 62.6 fps
+[wc] 1.0 s: 60 updates (apply 0.04 ms avg, 1.2 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 88 (88 draws, 42.8 MB, 7.28 ms, 0.083 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 18.3 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.4 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates answered when applied (async scrolling)
+[wc] 1.0 s: WebGL 2 contexts (3 made), 1 layers shown, drawing buffers ~3.5 MB (in the GL texture cap)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize size-640x360 PASS 640x360 bgra8unorm, 60.2 fps
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize size-1280x720 PASS 1280x720 bgra8unorm, 60.4 fps
+IPC: socket 76 in process 120 reported condition 0x11 (HUP/ERR/NVAL)
+[wc] 1.0 s: 60 updates (apply 0.03 ms avg, 0.4 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 84 (105 draws, 283.1 MB, 28.37 ms, 0.338 ms per upload, 2 fence waits, 0 finishes); 60 paints (0.14 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 35.4 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.3 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: WebGL 1 contexts (3 made), 1 layers shown, drawing buffers ~15.8 MB (in the GL texture cap)
+[web4] [render] wc: 300 updates in 5.0 s (59.9/s), 0.4 ms average, p50 0.4, p95 0.8, 7.5 ms max; update 0.3 avg; paint 0.0 avg 0.0 p95 (0.01 Mpx, 0.3 tiles avg); frame done 16.2 ms avg; rAF clock 59.9/s (0 idle); reply to next update 0.0 ms avg 0.2 max (300 of 300 waiting at the reply, 0 started by the idle timer); tile wait 0.1 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.3, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.0
+[web4] [render] wc flush: 300 layer tree flushes, 0.03 ms avg; layers per flush: 7 walked, 0 skipped (culled), 1.0 changed
+[web4] [render] paint cull (per update): 0 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 0 not eligible
+[web4] [render] wc tiles: record 0.6 ms/s (0.79 Mpx/s), raster 0.8 ms/s wall (0.79 Mpx/s, 184 items, 9 async), shm allocations 0.0/s, old way 0
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize size-1920x1080 PASS 1920x1080 bgra8unorm, 61.0 fps
+[web4] [render] compositing: 13 updates in 5.1 s, 0.1 ms avg, 0.4 max (6 with a requirements traversal, 9 with a backing/hierarchy update)
+[web4] [render] compositing requirements per traversal: 3 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfD RenderView 4, selfP RenderView 1, selfDS RenderView 1
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 16.58 ms avg 16.8 max, swap 0.1 ms avg 0.5 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.03 ms avg, video 0.00, scene 0.37, draw 16.17 avg 16.5 max (incl. the wait for the previous flip)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize size-16x16 PASS 16x16 bgra8unorm, 61.9 fps
+[wc] 1.0 s: 60 updates (apply 0.03 ms avg, 0.5 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 96 (105 draws, 78.9 MB, 10.22 ms, 0.106 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.14 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.4 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: WebGL 1 contexts (3 made), 1 layers shown, drawing buffers ~0.4 MB (in the GL texture cap)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize size-320x180 PASS 320x180 bgra8unorm, 60.1 fps
+[app msg] [wpe-ps5] [cpu] title: main thread busy 1 % (outside poll), process CPU 0.09 cores, render thread CPU 1 %
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize unconfigure PASS throws InvalidStateError while unconfigured; 320x180 bgra8unorm, 59.9 fps
+[wc] 1.0 s: 60 updates (apply 0.03 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 86 (86 draws, 14.1 MB, 3.89 ms, 0.045 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.3 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize format-rgba16float PASS 320x180 rgba16float, 60.2 fps; getConfiguration() reports format rgba16float, toneMapping standard; back to bgra8unorm
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.4 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 83 (83 draws, 13.8 MB, 3.87 ms, 0.047 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.4 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.1 max
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize device-change PASS second device: 320x180 bgra8unorm, 60.4 fps; first device again
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-resize uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-resize summary PASS 10/10
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 80 (80 draws, 14.6 MB, 3.80 ms, 0.047 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.3 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] [wc] tile arena: chunk 3 released (8 MB in 1 chunks)
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.0 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 60 (60 draws, 13.2 MB, 3.53 ms, 0.059 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.2 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] [render] wc: 300 updates in 5.0 s (59.9/s), 0.5 ms average, p50 0.4, p95 0.7, 14.6 ms max; update 0.4 avg; paint 0.0 avg 0.0 p95 (0.01 Mpx, 0.4 tiles avg); frame done 16.2 ms avg; rAF clock 59.9/s (0 idle); reply to next update 0.0 ms avg 0.1 max (300 of 300 waiting at the reply, 0 started by the idle timer); tile wait 0.1 ms avg
+[web4] [render] wc tiles: record 0.7 ms/s (0.35 Mpx/s), raster 1.2 ms/s wall (0.35 Mpx/s, 134 items, 9 async), shm allocations 0.0/s, old way 0
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 16.60 ms avg 16.8 max, swap 0.1 ms avg 0.4 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.03 ms avg, video 0.00, scene 0.21, draw 16.35 avg 16.5 max (incl. the wait for the previous flip)
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.0 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 60 (60 draws, 13.2 MB, 3.41 ms, 0.057 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.3 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max

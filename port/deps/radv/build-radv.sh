@@ -16,10 +16,16 @@ MESA_REV=01d70579b8d410d6a482e36c6f184798ae4c83ad      # pinned by ref/PS5_Vulka
 SDK_FORK="$ROOT/ref/mihawk-PS5_PayloadSDK"
 SDK_FORK_REV=b83202be73e930050e00de0f1b4d9ec46c0391bf  # pinned by ref/PS5_Vulkan/tools/setup-native-dependencies.sh
 W="$ROOT/build/radv-ps5"; SRC="$W/src"; BLD="$W/build"; CLC="$W/clc-build"; INST="$W/install"
-VENV="$ROOT/spikes/02-gl-egl/ps5-opengl/build/venv"    # meson 1.10.1, mako, pyyaml (Spike 2's)
+VENV="$W/venv"    # meson 1.10.1, mako, pyyaml, packaging (as Spike 2's ps5-opengl build had)
 BREW=/opt/homebrew
+if [[ ! -x $VENV/bin/meson ]]; then
+    echo "python venv $VENV (meson 1.10.1, mako, pyyaml, packaging)"
+    mkdir -p "$W"
+    py=$(command -v python3.13 || command -v python3.12 || command -v python3)
+    "$py" -m venv "$VENV"
+    "$VENV/bin/pip" install -q meson==1.10.1 mako pyyaml packaging
+fi
 export PATH="$VENV/bin:$BREW/opt/bison/bin:$PATH"
-[[ -x $VENV/bin/meson ]] || { echo "run spikes/02-gl-egl/ps5-opengl/build.sh once (creates the meson venv)" >&2; exit 1; }
 
 if [[ ${1:-} == --clean ]]; then rm -rf "$SRC" "$BLD" "$CLC" "$W/sdkfork"; fi
 mkdir -p "$W"

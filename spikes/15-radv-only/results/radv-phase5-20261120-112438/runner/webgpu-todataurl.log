@@ -1,0 +1,44 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795174481
+push: loading file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795174481
+load started: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795174481
+load committed: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795174481
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[webgpu] title: canvas 1ef0 of WebProcess 4
+load finished: file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795174481
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/todataurl.html?run=1795174481 "" (0.0 s after start)
+[mem] load finished: flexible 262.0 MB free; direct memory 533.5 MB in use; direct heap 40.5 MB mapped (peak 224.6, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 48 (peak 350.5 MB, 71 made, 0 failed, 0 zero fills, 90 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 45 live, 75.9 MB (68 created, 0 libc); WebGL 4 contexts (7 made), drawing buffers ~2.3 MB; WebGPU buffers and textures 0.7 MB (peak 1536.0, budget 1536, 2 refused)
+[webgpu] title: canvas 1ef0: first frame, 64x64, format 26, opaque, in an image shared with the compositor (no CPU copy)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-toDataURL PASS the pattern
+[wc] 1.0 s: 60 updates (apply 0.04 ms avg, 1.4 max; 0 unchanged), 0 presents; 1 pages, 10 layers; tiles uploaded 21 (21 draws, 8.6 MB, 1.54 ms, 0.073 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.18 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.6 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.2 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates answered when applied (async scrolling)
+[wc] 1.0 s: WebGL 4 contexts (7 made), 1 layers shown, drawing buffers ~2.4 MB (in the GL texture cap)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-toBlob PASS the pattern
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-createImageBitmap PASS the pattern
+[web4] [render] wc: 300 updates in 5.0 s (59.9/s), 0.5 ms average, p50 0.4, p95 0.9, 6.9 ms max; update 0.4 avg; paint 0.0 avg 0.0 p95 (0.02 Mpx, 0.2 tiles avg); frame done 16.1 ms avg; rAF clock 60.3/s (1 idle); reply to next update 0.1 ms avg 8.7 max (300 of 300 waiting at the reply, 1 started by the idle timer); tile wait 0.1 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 0.3, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.0
+[web4] [render] wc flush: 300 layer tree flushes, 0.03 ms avg; layers per flush: 9 walked, 0 skipped (culled), 2.7 changed
+[web4] [render] paint cull (per update): 0 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 0 not eligible
+[web4] [render] wc tiles: record 0.5 ms/s (1.21 Mpx/s), raster 1.6 ms/s wall (1.21 Mpx/s, 233 items, 11 async), shm allocations 0.0/s, old way 0
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl same-task-drawImage PASS the pattern
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-toDataURL PASS the pattern (the presented frame is kept)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-toBlob PASS the pattern (the presented frame is kept)
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 0.34 ms avg 1.8 max, swap 0.1 ms avg 0.4 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.04 ms avg, video 0.00, scene 0.21, draw 0.09 avg 0.2 max (incl. the wait for the previous flip)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-createImageBitmap PASS the pattern (the presented frame is kept)
+IPC: socket 78 in process 482 reported condition 0x11 (HUP/ERR/NVAL)
+[webgpu] title: canvas 1f58 of WebProcess 4
+[webgpu] title: canvas 1f58: first frame, 64x64, format 26, opaque, in an image shared with the compositor (no CPU copy)
+[webgpu] title: canvas 1f6d of WebProcess 4
+[webgpu] title: canvas 1f6d: first frame, 64x64, format 26, premultiplied, in an image shared with the compositor (no CPU copy)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl later-frame-drawImage PASS the pattern (the presented frame is kept)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl alpha-opaque PASS drawImage and toDataURL give 128,64,0,255
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl alpha-premultiplied PASS drawImage and toDataURL give 255,128,0,128
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-todataurl uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-todataurl summary PASS 11/11
+[app msg] [wpe-ps5] [cpu] title: main thread busy 1 % (outside poll), process CPU 0.07 cores, render thread CPU 1 %
+[wc] 1.5 s: 20 updates (apply 0.13 ms avg, 0.6 max; 0 unchanged), 0 presents; 1 pages, 12 layers; tiles uploaded 50 (50 draws, 8.8 MB, 2.16 ms, 0.043 ms per upload, 0 fence waits, 0 finishes); 20 paints (0.14 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 15.1 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.2 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.5 s: 20 updates answered when applied (async scrolling)
+[wc] 1.5 s: WebGL 3 contexts (9 made), 3 layers shown, drawing buffers ~0.3 MB (in the GL texture cap)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 20 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00

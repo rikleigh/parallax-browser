@@ -1,0 +1,24 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795147178
+push: loading file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795147178
+load started: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795147178
+load committed: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795147178
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+load finished: file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795147178
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/buffer-map.html?run=1795147178 "" (0.0 s after start)
+[mem] load finished: flexible 239.0 MB free; direct memory 3589.1 MB in use; direct heap 32.5 MB mapped (peak 32.5, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 49 (peak 350.5 MB, 61 made, 0 failed, 0 zero fills, 51 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 46 live, 78.0 MB (58 created, 0 libc); WebGPU buffers and textures 0.0 MB (peak 1536.0, budget 1536, 2 refused)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map mapped-at-creation PASS 48 bytes round trip, mapAsync after 2.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map odd-multiple-of-4 PASS 1028 bytes round trip, mapAsync after 1.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map mapped-at-creation-no-map-usage PASS 256 bytes written through a STORAGE buffer mapped at creation
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map partial-ranges PASS two disjoint ranges written, a partial mapping read
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map typed-views PASS Float32Array and Int32Array views over one range
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map map-write PASS 128 bytes written through mapAsync(WRITE)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map remap PASS three rounds
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map round-trip-1MiB PASS 1048576 bytes round trip, mapAsync after 5.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map round-trip-16MiB PASS 16777216 bytes round trip, mapAsync after 48.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map round-trip-64MiB PASS 67108864 bytes round trip, mapAsync after 152.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-buffer-map adapter-again PASS 19 features, the same as before the device
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-buffer-map summary PASS 11/11
+[wc] 1.5 s: 7 updates (apply 0.34 ms avg, 1.3 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 24 (24 draws, 10.9 MB, 1.93 ms, 0.081 ms per upload, 0 fence waits, 0 finishes); 7 paints (0.13 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.3 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 1.8 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 1.5 s: 7 updates answered when applied (async scrolling)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 7 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00

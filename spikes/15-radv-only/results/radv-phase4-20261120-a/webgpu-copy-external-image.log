@@ -1,0 +1,34 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/copy-external-image.html?run=1795147206
+push: loading file:///data/ps5webkit/phase0/webgpu/copy-external-image.html?run=1795147206
+load started: file:///data/ps5webkit/phase0/webgpu/copy-external-image.html?run=1795147206
+load committed: file:///data/ps5webkit/phase0/webgpu/copy-external-image.html?run=1795147206
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+load finished: file:///data/ps5webkit/phase0/webgpu/copy-external-image.html?run=1795147206
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/copy-external-image.html?run=1795147206 "" (0.0 s after start)
+[mem] load finished: flexible 239.0 MB free; direct memory 529.6 MB in use; direct heap 42.5 MB mapped (peak 224.6, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 48 (peak 350.5 MB, 73 made, 0 failed, 0 zero fills, 105 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 45 live, 75.9 MB (70 created, 0 libc); WebGL 3 contexts (9 made), drawing buffers ~0.3 MB; WebGPU buffers and textures 0.1 MB (peak 1536.0, budget 1536, 2 refused)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image canvas-2d-flipY-false PASS four quadrants as painted
+[stall] 60 s: 0 over 100 ms (0 over 250 ms), 0 ms in all, longest 0 ms; pages in payloads
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image canvas-2d-flipY-true PASS four quadrants, top and bottom swapped
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image image-bitmap-flipY-false PASS four quadrants as painted
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image image-bitmap-flipY-true PASS four quadrants, top and bottom swapped
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image offscreen-canvas-flipY-false PASS four quadrants as painted
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image offscreen-canvas-flipY-true PASS four quadrants, top and bottom swapped
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image image-element-flipY-false PASS four quadrants as painted
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image image-element-flipY-true PASS four quadrants, top and bottom swapped
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image image-data-flipY-false PASS four quadrants as painted
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image image-data-flipY-true PASS four quadrants, top and bottom swapped
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image canvas-2d-to-bgra8unorm PASS four quadrants, red and blue the right way round
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image alpha-canvas-2d-straight PASS 255,128,0,128
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image alpha-canvas-2d-premultiplied PASS 128,64,0,128
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image alpha-image-bitmap-straight PASS 255,128,0,128
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image alpha-image-bitmap-premultiplied PASS 128,64,0,128
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-copy-external-image uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-copy-external-image summary PASS 16/16
+[mem] every 60 s: flexible 239.0 MB free; direct memory 529.6 MB in use; direct heap 42.5 MB mapped (peak 224.6, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 48 (peak 350.5 MB, 73 made, 0 failed, 0 zero fills, 105 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 45 live, 75.9 MB (70 created, 0 libc); WebGL 3 contexts (9 made), drawing buffers ~0.3 MB; WebGPU buffers and textures 0.0 MB (peak 1536.0, budget 1536, 2 refused)
+[network2] [ps5wk-child 199] [mem] network2 at 60 s: 17 threads, rss 168.0 MB, peak 167.8 MB; flexible free 8066.0 MB (-14.0 since start); libpas pages 256.0 MB (2.6 given back, 253.5 committed), resident in big mappings 4.3 MB, compact 0.1 of 128 MB; mmaps 27 live, 386.2 MB (peak 386.2, largest 128.0), 186 calls, 23 munmaps, 0 failed; JIT off; locks futex: 5 mutex parks, 760 cond waits, 3 rwlock parks; malloc libpas: 0 foreign frees, 0 foreign reallocs, 0 fallbacks
+IPC: socket 75 in process 197 reported condition 0x11 (HUP/ERR/NVAL)
+[wc] 1.5 s: 5 updates (apply 0.43 ms avg, 1.2 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 24 (24 draws, 12.0 MB, 1.74 ms, 0.073 ms per upload, 0 fence waits, 0 finishes); 5 paints (0.12 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.3 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 15.8 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.5 s: 5 updates answered when applied (async scrolling)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 5 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[web4] [ps5wk-child 200] [mem] web4 at 60 s: 35 threads, rss 208.5 MB, peak 464.8 MB; flexible free 8068.0 MB (-12.0 since start); libpas pages 256.0 MB (30.5 given back, 225.6 committed), resident in big mappings 114.7 MB, compact 0.1 of 128 MB; mmaps 62 live, 797.5 MB (peak 1053.4, largest 256.0), 1497 calls, 148 munmaps, 0 failed; JIT code 0.2 MB (committed 0.2 of 256 MB), compiled Baseline 45 / DFG 48 / FTL 8 (0 / 21 / 33 ms), 0 failed, 0 allocations refused, thresholds x1.00; locks futex: 249 mutex parks, 8858 cond waits, 0 rwlock parks; malloc libpas: 0 foreign frees, 0 foreign reallocs, 0 fallbacks

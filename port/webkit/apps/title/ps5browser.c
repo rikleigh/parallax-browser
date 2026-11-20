@@ -1397,6 +1397,29 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  * SIGKILL that ends the title. */
 extern char spike_title_relaunch[16] __attribute__((weak));
 
+/* The running title's ID, from its own param.json: PPSA99207, or another
+ * when the same build is packaged as a test title (PPSA99208, the GPU=radv
+ * test browser). Restart browser starts this one again; with the fixed
+ * PPSA99207 the restart helper refused to restart PPSA99208 ("PPSA99207 is
+ * not pid N"). Updates keep PPSA99207: the release zip installs only there. */
+static const char* ownTitleId(void)
+{
+    static char id[16];
+    if (!id[0]) {
+        char found[16] = PS5WK_TITLE_ID;
+        gchar* text = NULL;
+        if (g_file_get_contents("/app0/sce_sys/param.json", &text, NULL, NULL)) {
+            const char* key = strstr(text, "\"titleId\"");
+            const char* quote = key ? strchr(key + 9, '"') : NULL;
+            if (quote && !strncmp(quote + 1, "PPSA", 4) && strspn(quote + 1, "PSA0123456789") == 9 && quote[10] == '"')
+                snprintf(found, sizeof found, "%.9s", quote + 1);
+        }
+        g_free(text);
+        memcpy(id, found, sizeof id);
+    }
+    return id;
+}
+
 static gboolean isSettingsURI(const char* uri)
 {
     return uri && g_str_has_prefix(uri, PS5WK_SETTINGS_URL);
@@ -1748,6 +1771,7 @@ static const char* restartBrowserWith(const char* from, const char* staging)
 {
     if (!spike_title_relaunch)
         return "only the PS5 title can restart itself";
+    const char* title = staging ? PS5WK_TITLE_ID : ownTitleId();
     if (windDownStart || g_atomic_int_get(&relaunchState))
         return "the browser is already closing";
     /* The helper, or else the launcher payload (tools/launcher, developers). */
@@ -1758,7 +1782,7 @@ static const char* restartBrowserWith(const char* from, const char* staging)
     if (!helper) {
         if (!launcherAsk("status\n", reply, sizeof reply))
             return "the restart helper is missing and the launcher payload isn't running: close the browser and start it again from the home screen";
-        if (strncmp(reply, "OK ", 3) || !strstr(reply, PS5WK_TITLE_ID)) {
+        if (strncmp(reply, "OK ", 3) || !strstr(reply, title)) {
             spike_log("settings: restart refused, launcher status \"%s\"", reply);
             return "the launcher doesn't see the browser running";
         }
@@ -1782,9 +1806,9 @@ static const char* restartBrowserWith(const char* from, const char* staging)
         snprintf(relaunchGoFile, sizeof relaunchGoFile, "/data/ps5webkit/home/tmp/relaunch-go-%d", (int)getpid());
         char argument[300];
         if (staging)
-            snprintf(argument, sizeof argument, "%s:%d:%s:%s", PS5WK_TITLE_ID, (int)getpid(), relaunchGoFile, staging);
+            snprintf(argument, sizeof argument, "%s:%d:%s:%s", title, (int)getpid(), relaunchGoFile, staging);
         else
-            snprintf(argument, sizeof argument, "%s:%d:%s", PS5WK_TITLE_ID, (int)getpid(), relaunchGoFile);
+            snprintf(argument, sizeof argument, "%s:%d:%s", title, (int)getpid(), relaunchGoFile);
         g_atomic_int_set(&relaunchState, 1);
         if (!wpe_process_manager_ps5_run_task_elf(wpe_process_manager_get_default(), PS5WK_RELAUNCH_ELF, staging ? "update" : "relaunch", argument,
                 relaunchOutput, relaunchEnded, NULL)) {
@@ -1799,7 +1823,7 @@ static const char* restartBrowserWith(const char* from, const char* staging)
     }
     spike_log("settings: browser restart asked by %s; launcher says \"%s\"; coming back to %s", from, reply, uri ? uri : "the home page");
     g_free(uri);
-    snprintf(spike_title_relaunch, sizeof spike_title_relaunch, "%s", PS5WK_TITLE_ID);
+    snprintf(spike_title_relaunch, sizeof spike_title_relaunch, "%s", title);
     g_main_context_invoke(NULL, beginWindDown, NULL);
     return NULL;
 }
@@ -3233,6 +3257,40 @@ static void* stallWatch(void* data)
 /* Did the last run end in a crash? The crash handler appends to
  * crash-title.txt; each start touches title-started. A report written after
  * the last start is that run's crash. */
+/* Test knob: /data/ps5webkit/crash-title-test, read at start, makes the
+ * title fault 10 s later (a null write on a thread of its own), to check that
+ * the crash report reaches the log and crash-title.txt (stack line included).
+ * Delete the knob after: every start crashes while it is there. */
+/* Three calls deep, so the report's stack line has return addresses of ours. */
+static __attribute__((noinline)) int crashTestDepth(volatile int* target, int depth)
+{
+    /* Through a volatile pointer: real calls, not a loop the compiler made. */
+    int (*volatile next)(volatile int*, int) = crashTestDepth;
+    if (depth)
+        return next(target, depth - 1) + 1;
+    *target = 1;
+    return 0;
+}
+
+static void* crashTestThread(void* data)
+{
+    sleep(10);
+    spike_log("crash test: /data/ps5webkit/crash-title-test is there: a null write, three calls deep");
+    crashTestDepth((volatile int*)data, 3);
+    return NULL;
+}
+
+static void startCrashTest(void)
+{
+    struct stat knob;
+    pthread_t thread;
+    if (stat("/data/ps5webkit/crash-title-test", &knob))
+        return;
+    spike_log("crash test: the title faults in 10 s (/data/ps5webkit/crash-title-test)");
+    if (!pthread_create(&thread, NULL, crashTestThread, NULL))
+        pthread_detach(thread);
+}
+
 static gboolean titleCrashedLastRun(void)
 {
     struct stat crash, started;
@@ -3259,6 +3317,7 @@ int main(int argc, char** argv)
     const gboolean lastRunCrashed = titleCrashedLastRun();
     ps5wk_crash_guard_report_file("/data/ps5webkit/crash-title.txt");
     ps5wk_crash_guard_install("title");
+    startCrashTest();
     loadStart = g_get_monotonic_time();
     startedAt = g_get_real_time() / G_USEC_PER_SEC;
     signal(SIGPIPE, SIG_IGN);
@@ -3503,7 +3562,7 @@ int main(int argc, char** argv)
      * again only if the launcher still sees this title in front. */
     if (spike_title_relaunch && spike_title_relaunch[0]) {
         char reply[160];
-        if (!launcherAsk("status\n", reply, sizeof reply) || strncmp(reply, "OK ", 3) || !strstr(reply, PS5WK_TITLE_ID)) {
+        if (!launcherAsk("status\n", reply, sizeof reply) || strncmp(reply, "OK ", 3) || !strstr(reply, spike_title_relaunch)) {
             spike_log("settings: no restart after all (launcher status \"%s\")", reply);
             spike_title_relaunch[0] = 0;
         }

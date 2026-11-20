@@ -247,8 +247,10 @@ if [ "$GPU" = radv ]; then
     # ANGLE gets its Vulkan backend (PlatformWPE.cmake), wpe-ps5 renders on it.
     # Headers: RADV's install (port/deps/build.sh radv), SPIR-V from Dawn's
     # source (port/deps/build.sh dawn), VulkanMemoryAllocator at ANGLE's DEPS
-    # pin (fetched once by step_vma).
+    # pin (fetched once by step_vma). Dawn: the radv-only one (port/deps/build.sh
+    # dawn-radv: Phase 4's host-pointer textures), not the sysroot's.
     WEBKIT_OPTIONS+=(-DPS5WK_GPU_RADV=ON
+        -DPS5WK_DAWN_ROOT="$ROOT/toolchain/wpe-deps/install/dawn-radv"
         -DPS5WK_VULKAN_INCLUDE="$ROOT/build/radv-ps5/install/include"
         -DPS5WK_SPIRV_HEADERS_INCLUDE="$ROOT/toolchain/wpe-deps/src/dawn/third_party/spirv-headers/src/include"
         -DPS5WK_SPIRV_TOOLS_INCLUDE="$ROOT/toolchain/wpe-deps/src/dawn/third_party/spirv-tools/src/include"

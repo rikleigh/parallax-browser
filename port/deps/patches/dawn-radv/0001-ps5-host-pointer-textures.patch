@@ -1,0 +1,362 @@
+PS5 (ps5webkit GPU=radv only, HANDOVER-radv.md Phase 4; spikes/15-radv-only 15e):
+textures over memory another VkDevice of the title allocated (ANGLE's), by
+host-pointer import, so that WebGPU takes video frames and hands canvas frames
+to the compositor with no CPU copy. New files and a CMake list entry only
+(PS5HostPointerTexture.h, vulkan/PS5HostPointerTextureVk.cpp): nothing that
+exists changes behaviour. Applied by port/deps/build.sh dawn-radv only, which
+installs into its own prefix (toolchain/wpe-deps/install/dawn-radv); the
+release builds' Dawn (port/deps/build.sh dawn, the sysroot) never has it.
+
+--- a/src/dawn/native/CMakeLists.txt
++++ b/src/dawn/native/CMakeLists.txt
+@@ -764,6 +764,11 @@
+     list(APPEND headers
+         "${DAWN_INCLUDE_DIR}/dawn/native/VulkanBackend.h"
+     )
++    if (PS5)
++        # ps5webkit GPU=radv: textures over another VkDevice's memory (PS5HostPointerTexture.h).
++        list(APPEND headers "${DAWN_INCLUDE_DIR}/dawn/native/PS5HostPointerTexture.h")
++        list(APPEND sources "vulkan/PS5HostPointerTextureVk.cpp")
++    endif ()
+     list(APPEND private_headers
+         "vulkan/BackendVk.h"
+         "vulkan/BindGroupLayoutVk.h"
+--- a/include/dawn/native/PS5HostPointerTexture.h
++++ b/include/dawn/native/PS5HostPointerTexture.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 Parallax Browser contributors. BSD-3-Clause, as Dawn.
++//
++// PS5 (ps5webkit GPU=radv, spikes/15-radv-only 15e): textures whose memory another VkDevice of
++// the same process allocated on the same RADV. A PS5 RADV buffer's GPU address is its CPU
++// mapping, and a host-pointer import (VK_EXT_external_memory_host) on a second device reaches the
++// same memory at the same address. RADV lays an image out from its create info alone, so an image
++// made from the identical create info, with VkExternalMemoryImageCreateInfo{HOST_ALLOCATION} on
++// both devices (no DCC or HTILE then), aliases the other device's image: zero copy, tiled.
++//
++// There are no shared semaphores: the hand-off between the devices is a CPU wait (the other
++// device's fence or glFinish before BeginAccess; Dawn's queue's OnSubmittedWorkDone after
++// EndAccess). Only the radv build of the browser links a Dawn with these functions.
++
++#ifndef INCLUDE_DAWN_NATIVE_PS5HOSTPOINTERTEXTURE_H_
++#define INCLUDE_DAWN_NATIVE_PS5HOSTPOINTERTEXTURE_H_
++
++#include <vulkan/vulkan.h>
++
++#include "dawn/native/DawnNative.h"
++
++namespace dawn::native::vulkan {
++
++struct DAWN_NATIVE_EXPORT HostPointerTextureDescriptorPS5 {
++    // 2D, one mip level, one layer, one sample. Its usage's Vulkan usage flags must be in
++    // imageCreateInfo's, its format imageCreateInfo's format.
++    const WGPUTextureDescriptor* textureDescriptor = nullptr;
++    // The create info the other device made the image with. Its pNext is ignored: Dawn chains
++    // VkExternalMemoryImageCreateInfo{HOST_ALLOCATION}, which the other device's must have too.
++    const VkImageCreateInfo* imageCreateInfo = nullptr;
++    // The image's memory: its address, aligned to minImportedHostPointerAlignment, and a size
++    // that is a multiple of that alignment and holds the image.
++    void* pointer = nullptr;
++    uint64_t size = 0;
++};
++
++// A texture over the memory, or nullptr (an error is reported on the device). Its contents are
++// undefined until BeginAccessHostPointerTexturePS5 says otherwise. Destroying it frees only
++// Dawn's objects, once the GPU is done with them; the memory stays the other device's.
++DAWN_NATIVE_EXPORT WGPUTexture CreateHostPointerTexturePS5(WGPUDevice device,
++                                                           const HostPointerTextureDescriptorPS5* descriptor);
++
++// The other device is done with the image (the caller waited for it): its contents are what it
++// left, in `layout`, when `initialized`; otherwise undefined. The next use of the texture
++// transitions it from `layout`. False for a texture that is not one of these.
++DAWN_NATIVE_EXPORT bool BeginAccessHostPointerTexturePS5(WGPUTexture texture,
++                                                         VkImageLayout layout,
++                                                         bool initialized);
++
++// Submits the work recorded so far, and gives the layout the image is in once it is done (what
++// the other device's next access starts from). The caller waits for that work (the queue's
++// OnSubmittedWorkDone) before the other device touches the image.
++DAWN_NATIVE_EXPORT bool EndAccessHostPointerTexturePS5(WGPUTexture texture, VkImageLayout* layout);
++
++}  // namespace dawn::native::vulkan
++
++#endif  // INCLUDE_DAWN_NATIVE_PS5HOSTPOINTERTEXTURE_H_
+--- a/src/dawn/native/vulkan/PS5HostPointerTextureVk.cpp
++++ b/src/dawn/native/vulkan/PS5HostPointerTextureVk.cpp
+@@ -0,0 +1,277 @@
++// Copyright 2026 Parallax Browser contributors. BSD-3-Clause, as Dawn.
++//
++// PS5 (ps5webkit GPU=radv): see include/dawn/native/PS5HostPointerTexture.h.
++
++#include <mutex>
++#include <unordered_set>
++#include <utility>
++
++// Include vulkan_platform.h before PS5HostPointerTexture.h includes vulkan.h so that we use our
++// version of the non-dispatchable handles.
++#include "src/dawn/common/vulkan_platform.h"
++
++#include "dawn/native/PS5HostPointerTexture.h"
++#include "src/dawn/native/ChainUtils.h"
++#include "src/dawn/native/vulkan/DeviceVk.h"
++#include "src/dawn/native/vulkan/FencedDeleter.h"
++#include "src/dawn/native/vulkan/QueueVk.h"
++#include "src/dawn/native/vulkan/TextureVk.h"
++#include "src/dawn/native/vulkan/VulkanError.h"
++
++namespace dawn::native::vulkan {
++
++namespace {
++
++// The live textures of this kind, so that the functions below never take another texture for one.
++std::mutex gLiveTexturesMutex;
++std::unordered_set<const TextureBase*>& LiveTextures() {
++    static auto* textures = new std::unordered_set<const TextureBase*>;
++    return *textures;
++}
++
++class HostPointerTexture final : public Texture {
++  public:
++    static ResultOrError<Ref<TextureBase>> Create(Device* device,
++                                                  const HostPointerTextureDescriptorPS5* descriptor) {
++        DAWN_INVALID_IF(descriptor->textureDescriptor == nullptr || descriptor->imageCreateInfo == nullptr,
++                        "A host-pointer texture needs a texture descriptor and a VkImageCreateInfo.");
++        TextureDescriptor reifiedDescriptor =
++            WithTrivialFrontendDefaults(*FromAPI(descriptor->textureDescriptor));
++        UnpackedPtr<TextureDescriptor> textureDescriptor;
++        DAWN_TRY_ASSIGN(textureDescriptor, ValidateAndUnpack(&reifiedDescriptor));
++        DAWN_TRY(ValidateTextureDescriptor(device, textureDescriptor));
++        DAWN_TRY(ValidateVulkanImageCanBeWrapped(device, textureDescriptor));
++
++        Ref<HostPointerTexture> texture =
++            AcquireRef(new HostPointerTexture(device, textureDescriptor));
++        DAWN_TRY(texture->Initialize(descriptor));
++        {
++            std::lock_guard<std::mutex> lock(gLiveTexturesMutex);
++            LiveTextures().insert(texture.Get());
++        }
++        return Ref<TextureBase>(std::move(texture));
++    }
++
++    static HostPointerTexture* From(WGPUTexture texture) {
++        if (texture == nullptr) {
++            return nullptr;
++        }
++        TextureBase* base = FromAPI(texture);
++        std::lock_guard<std::mutex> lock(gLiveTexturesMutex);
++        return LiveTextures().count(base) ? static_cast<HostPointerTexture*>(ToBackend(base))
++                                          : nullptr;
++    }
++
++    void BeginAccess(VkImageLayout layout, bool initialized) {
++        // Whatever Dawn last did with it is over (the caller waited for it), and the image is
++        // now as the other device left it: the next use is a transition from that layout.
++        mSubresourceLastSyncInfos.Fill({wgpu::TextureUsage::None, wgpu::ShaderStage::None});
++        mAcquireLayout = initialized ? layout : VK_IMAGE_LAYOUT_UNDEFINED;
++        mAcquirePending = true;
++        SetIsSubresourceContentInitialized(initialized, GetAllSubresources());
++        MarkDirtyInResourceTables();
++    }
++
++    VkImageLayout EndAccessLayout() const {
++        // With no use since BeginAccess no barrier was recorded: the image is still as it came.
++        return mAcquirePending ? mAcquireLayout : GetCurrentLayout(Aspect::Color);
++    }
++
++  private:
++    using Texture::Texture;
++
++    ~HostPointerTexture() override { Forget(); }
++
++    void Forget() {
++        std::lock_guard<std::mutex> lock(gLiveTexturesMutex);
++        LiveTextures().erase(this);
++    }
++
++    MaybeError Initialize(const HostPointerTextureDescriptorPS5* descriptor) {
++        Device* device = ToBackend(GetDevice());
++        const VulkanDeviceInfo& info = device->GetDeviceInfo();
++        DAWN_INVALID_IF(!info.HasExt(DeviceExt::ExternalMemoryHost),
++                        "VK_EXT_external_memory_host is not enabled on the device.");
++
++        // The other device's image, exactly: RADV lays an image out from its create info.
++        const VkImageCreateInfo& given = *descriptor->imageCreateInfo;
++        const VkFormat format = VulkanImageFormat(device, GetFormat().format);
++        const VkImageUsageFlags usage =
++            VulkanImageUsage(device, GetInternalUsage(), GetFormat()) |
++            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        VkImageCreateFlags flags =
++            VulkanImageCreateFlags(device, GetInternalUsage(), GetFormat(), GetSampleCount());
++        if (GetViewFormats().any()) {
++            flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++        }
++        DAWN_INVALID_IF(given.imageType != VK_IMAGE_TYPE_2D || given.format != format ||
++                            given.extent.width != GetBaseSize().width ||
++                            given.extent.height != GetBaseSize().height ||
++                            given.extent.depth != 1 || given.mipLevels != 1 ||
++                            given.arrayLayers != 1 || given.samples != VK_SAMPLE_COUNT_1_BIT ||
++                            given.tiling != VK_IMAGE_TILING_OPTIMAL,
++                        "The VkImageCreateInfo (format %u, %ux%ux%u, %u levels, %u layers) is not "
++                        "the texture's (format %u, %ux%u).",
++                        static_cast<uint32_t>(given.format), given.extent.width, given.extent.height,
++                        given.extent.depth, given.mipLevels, given.arrayLayers,
++                        static_cast<uint32_t>(format), GetBaseSize().width,
++                        GetBaseSize().height);
++        DAWN_INVALID_IF((given.usage & usage) != usage,
++                        "The image's usage (0x%x) lacks the texture's (0x%x).",
++                        static_cast<uint32_t>(given.usage), static_cast<uint32_t>(usage));
++        DAWN_INVALID_IF((given.flags & flags) != flags,
++                        "The image's flags (0x%x) lack the texture's (0x%x).",
++                        static_cast<uint32_t>(given.flags), static_cast<uint32_t>(flags));
++
++        const uint64_t alignment = info.externalMemoryHostProperties.minImportedHostPointerAlignment;
++        const uint64_t address = reinterpret_cast<uintptr_t>(descriptor->pointer);
++        DAWN_INVALID_IF(address == 0 || alignment == 0 || address % alignment != 0 ||
++                            descriptor->size == 0 || descriptor->size % alignment != 0,
++                        "The memory (%u bytes at 0x%x) is not aligned to %u bytes.",
++                        descriptor->size, address, alignment);
++
++        VkExternalMemoryImageCreateInfo external = {};
++        external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++        VkImageCreateInfo createInfo = given;
++        createInfo.pNext = &external;
++        createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        createInfo.queueFamilyIndexCount = 0;
++        createInfo.pQueueFamilyIndices = nullptr;
++        createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        DAWN_TRY(CheckVkOOMThenSuccess(
++            device->fn.CreateImage(device->GetVkDevice(), &createInfo, nullptr, &*mHandle),
++            "CreateImage"));
++
++        VkMemoryRequirements requirements;
++        device->fn.GetImageMemoryRequirements(device->GetVkDevice(), mHandle, &requirements);
++        DAWN_INVALID_IF(requirements.size > descriptor->size,
++                        "The image needs %u bytes, the memory has %u.",
++                        static_cast<uint64_t>(requirements.size), descriptor->size);
++
++        VkMemoryHostPointerPropertiesEXT hostPointerProperties = {};
++        hostPointerProperties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
++        DAWN_TRY(CheckVkSuccess(device->fn.GetMemoryHostPointerPropertiesEXT(
++                                    device->GetVkDevice(),
++                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++                                    descriptor->pointer, &hostPointerProperties),
++                                "vkGetMemoryHostPointerPropertiesEXT"));
++        const uint32_t types = requirements.memoryTypeBits & hostPointerProperties.memoryTypeBits;
++        DAWN_INVALID_IF(types == 0, "No memory type for the image (0x%x) takes the pointer (0x%x).",
++                        requirements.memoryTypeBits, hostPointerProperties.memoryTypeBits);
++        uint32_t memoryTypeIndex = 0;
++        bool found = false;
++        for (uint32_t pass = 0; pass < 2 && !found; ++pass) {
++            for (uint32_t i = 0; i < info.memoryTypes.size() && !found; ++i) {
++                const bool deviceLocal =
++                    info.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++                if ((types & (1u << i)) && (pass == 1 || deviceLocal)) {
++                    memoryTypeIndex = i;
++                    found = true;
++                }
++            }
++        }
++        DAWN_INVALID_IF(!found, "No memory type in 0x%x.", types);
++
++        VkImportMemoryHostPointerInfoEXT import = {};
++        import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
++        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++        import.pHostPointer = descriptor->pointer;
++        VkMemoryAllocateInfo allocateInfo = {};
++        allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        allocateInfo.pNext = &import;
++        allocateInfo.allocationSize = descriptor->size;
++        allocateInfo.memoryTypeIndex = memoryTypeIndex;
++        DAWN_TRY(CheckVkOOMThenSuccess(
++            device->fn.AllocateMemory(device->GetVkDevice(), &allocateInfo, nullptr, &*mMemory),
++            "vkAllocateMemory (host pointer)"));
++        DAWN_TRY(CheckVkSuccess(
++            device->fn.BindImageMemory(device->GetVkDevice(), mHandle, mMemory, 0),
++            "BindImageMemory"));
++
++        SetLabelHelper("Dawn_PS5HostPointerTexture");
++        return {};
++    }
++
++    void DestroyImpl(DestroyReason reason) override {
++        Forget();
++        Device* device = ToBackend(GetDevice());
++        if (mHandle != VK_NULL_HANDLE) {
++            device->GetFencedDeleter()->DeleteWhenUnused(mHandle);
++        }
++        if (mMemory != VK_NULL_HANDLE) {
++            // Only the import: the memory itself is the other device's.
++            device->GetFencedDeleter()->DeleteWhenUnused(mMemory);
++            mMemory = VK_NULL_HANDLE;
++        }
++        Texture::DestroyImpl(reason);
++    }
++
++    void TweakTransition(CommandRecordingContext* recordingContext,
++                         std::vector<VkImageMemoryBarrier>* barriers,
++                         size_t transitionBarrierStart) override {
++        if (!mAcquirePending || barriers->size() <= transitionBarrierStart) {
++            return;
++        }
++        // The first barrier after BeginAccess: from the other device's layout. Its writes are
++        // done (a CPU wait) and in the same L2, so nothing is made available here.
++        for (size_t i = transitionBarrierStart; i < barriers->size(); ++i) {
++            VkImageMemoryBarrier& barrier = (*barriers)[i];
++            if (barrier.image != mHandle) {
++                continue;
++            }
++            barrier.oldLayout = mAcquireLayout;
++            barrier.srcAccessMask = 0;
++        }
++        mAcquirePending = false;
++    }
++
++    VkDeviceMemory mMemory = VK_NULL_HANDLE;
++    VkImageLayout mAcquireLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    bool mAcquirePending = false;
++};
++
++}  // namespace
++
++WGPUTexture CreateHostPointerTexturePS5(WGPUDevice cDevice,
++                                        const HostPointerTextureDescriptorPS5* descriptor) {
++    if (cDevice == nullptr || descriptor == nullptr) {
++        return nullptr;
++    }
++    Device* device = ToBackend(FromAPI(cDevice));
++    auto deviceGuard = device->GetGuard();
++    Ref<TextureBase> texture;
++    if (device->ConsumedError(HostPointerTexture::Create(device, descriptor), &texture,
++                              "creating a PS5 host-pointer texture")) {
++        return nullptr;
++    }
++    return ToAPI(ReturnToAPI(std::move(texture)));
++}
++
++bool BeginAccessHostPointerTexturePS5(WGPUTexture cTexture, VkImageLayout layout, bool initialized) {
++    HostPointerTexture* texture = HostPointerTexture::From(cTexture);
++    if (texture == nullptr) {
++        return false;
++    }
++    auto deviceGuard = ToBackend(texture->GetDevice())->GetGuard();
++    if (texture->GetHandle() == VK_NULL_HANDLE) {
++        return false;
++    }
++    texture->BeginAccess(layout, initialized);
++    return true;
++}
++
++bool EndAccessHostPointerTexturePS5(WGPUTexture cTexture, VkImageLayout* layout) {
++    HostPointerTexture* texture = HostPointerTexture::From(cTexture);
++    if (texture == nullptr || layout == nullptr) {
++        return false;
++    }
++    Device* device = ToBackend(texture->GetDevice());
++    auto deviceGuard = device->GetGuard();
++    *layout = texture->EndAccessLayout();
++    // What is recorded and not yet submitted (a copy into it, a pass that samples it) goes now,
++    // so that the queue's OnSubmittedWorkDone covers it.
++    return !device->ConsumedError(device->GetQueue()->SubmitPendingCommands());
++}
++
++}  // namespace dawn::native::vulkan

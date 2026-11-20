@@ -33,7 +33,15 @@
 // that way faulted in ps5wk_crash_guard_install, before the handlers existed.
 extern char __ehdr_start;
 extern char __init_array_start;
-static uintptr_t textStart, textEnd;
+// The end of .text (lld defines it when referenced): the scan's bound when
+// code can't be read. Weak: 0 where the linker doesn't.
+extern char _etext __attribute__((weak));
+static uintptr_t textStart, textEnd, codeEnd;
+// Whether the bytes of .text can be read. A title's code is mapped
+// execute-only: afterCall's look at the call instruction faulted (the
+// 2026-11-20 crash test), so there the scan lists every stack word that
+// points into .text, return addresses or not.
+static int codeReadable;
 
 // JSC's executable memory (WebKit patch 0030), so a pc in JIT code is named.
 void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* committed) __attribute__((weak));
@@ -45,6 +53,23 @@ void ps5wk_jit_memory(void** start, void** end, size_t* allocated, size_t* commi
 static char guardTag[32] = "?";
 static int reportFd = -1; /* ps5wk_crash_guard_report_file */
 static volatile sig_atomic_t inHandler;
+
+// The title's log (titlelog.c), when this is linked into it. In the title fd 2
+// is not the log: a title cannot dup2 over it, so titlelog points libc's stderr
+// stream at its pipe instead, and write(2, ...) went nowhere. The report is
+// kept here as written and handed over before _exit; the hook only try-locks
+// and waits a bounded time.
+int ps5wk_crash_log_report(const char* text, size_t n) __attribute__((weak));
+static char reportText[2048];
+static size_t reportLength, reportSent;
+// The stack scan stops at the first page it cannot read instead of faulting
+// there (2026-11-20: a fault in the scan killed the title outright, the
+// nested handler never ran, and nothing but the first line was written).
+// mincore() doesn't do: a guard page is mapped, with no access. A write()
+// from the page into a pipe fails with EFAULT instead (probePipe, made by
+// ps5wk_crash_guard_install, non-blocking; each probe's byte is read back).
+static uintptr_t pageSize = 4096;
+static int probePipe[2] = { -1, -1 };
 
 typedef struct {
     char text[512];
@@ -112,7 +137,45 @@ static void flush(line_t* line)
     if (reportFd >= 0)
         ignored = write(reportFd, line->text, line->length);
     (void)ignored;
+    for (size_t i = 0; i < line->length && reportLength < sizeof reportText; i++)
+        reportText[reportLength++] = line->text[i];
 }
+
+// What the log hasn't had yet, to the log.
+static void sendReport(void)
+{
+    if (ps5wk_crash_log_report && reportLength > reportSent) {
+        size_t from = reportSent;
+        reportSent = reportLength;
+        ps5wk_crash_log_report(reportText + from, reportLength - from);
+    }
+}
+
+static void finish(int code)
+{
+    sendReport();
+    _exit(code);
+}
+
+// Whether the page holding address can be read. Without the pipe, only sp's
+// own page counts as known.
+static int pageReadable(uintptr_t address)
+{
+    if (probePipe[1] < 0)
+        return 0;
+    const uintptr_t page = address & ~(pageSize - 1);
+    if (write(probePipe[1], (const void*)page, 1) != 1)
+        return 0;
+    char byte;
+    ssize_t ignored = read(probePipe[0], &byte, 1);
+    (void)ignored;
+    return 1;
+}
+
+// The stack line being built: a fault while scanning (past the top of the
+// thread's stack) re-enters the handler, which prints what was found so far.
+static line_t scanLine;
+static volatile sig_atomic_t scanning;
 
 static const char* signalName(int sig)
 {
@@ -139,6 +202,12 @@ static int afterCall(uintptr_t address)
 {
     if (address < textStart + 8 || !inText(address))
         return 0;
+    if (!codeReadable)
+        return address < codeEnd;
+    // The 7 bytes before it may be on a page that isn't mapped (the image
+    // base's page, where the ELF header would be, or a gap between segments).
+    if (!pageReadable(address - 7) || !pageReadable(address - 1))
+        return 0;
     const unsigned char* b = (const unsigned char*)address;
     if (b[-5] == 0xe8)
         return 1; // call rel32
@@ -157,8 +226,19 @@ static int afterCall(uintptr_t address)
 
 static void handler(int sig, siginfo_t* info, void* context)
 {
-    if (inHandler)
-        _exit(71);
+    if (inHandler) {
+        // A fault in the report itself. Once: the partial stack line, and
+        // the report to the log; a fault in that ends here.
+        if (inHandler > 1)
+            _exit(71);
+        inHandler = 2;
+        if (scanning) {
+            scanning = 0;
+            put(&scanLine, " (scan stopped: a fault reading the stack)");
+            flush(&scanLine);
+        }
+        finish(71);
+    }
     inHandler = 1;
 
     // The PS5 kernel's ucontext is not the SDK header's: FreeBSD's mcontext
@@ -203,34 +283,50 @@ static void handler(int sig, siginfo_t* info, void* context)
     put(&line, " thread ");
     putHex(&line, (uintptr_t)pthread_self());
     flush(&line);
+    // The first line to the log now: the scan below can still go wrong.
+    sendReport();
 
     // Stack scan, printed in chunks so a fault while scanning loses little.
     if (sp && !(sp & 7)) {
-        startLine(&line);
-        put(&line, "stack:");
+        startLine(&scanLine);
+        put(&scanLine, codeReadable ? "stack:" : "stack (code not readable: every .text value):");
         int found = 0, inLine = 0;
+        scanning = 1;
+        // sp's own page too (a stack overflow faults on it).
+        if (probePipe[1] >= 0 && !pageReadable(sp)) {
+            put(&scanLine, " (sp's page can't be read)");
+            found = SCAN_WORDS; // no scan; the line is flushed below
+        }
         const uintptr_t* word = (const uintptr_t*)sp;
         for (int i = 0; i < SCAN_WORDS && found < MAX_CANDIDATES; i++) {
+            uintptr_t at = (uintptr_t)&word[i];
+            if (!(at & (pageSize - 1)) && !pageReadable(at)) {
+                put(&scanLine, " (end of the mapped stack)");
+                break;
+            }
             uintptr_t value = word[i];
             if (!afterCall(value))
                 continue;
-            put(&line, " +");
-            putHex(&line, value - base);
+            put(&scanLine, " +");
+            putHex(&scanLine, value - base);
             found++;
             if (++inLine == 8) {
-                flush(&line);
-                startLine(&line);
-                put(&line, "stack:");
+                flush(&scanLine);
+                startLine(&scanLine);
+                put(&scanLine, codeReadable ? "stack:" : "stack (code not readable: every .text value):");
                 inLine = 0;
             }
         }
+        scanning = 0;
+        if (found == SCAN_WORDS)
+            found = 0, inLine = 1;
         if (inLine || !found) {
             if (!found)
-                put(&line, " (no .text addresses)");
-            flush(&line);
+                put(&scanLine, " (no .text addresses)");
+            flush(&scanLine);
         }
     }
-    _exit(70);
+    finish(70);
 }
 
 void ps5wk_crash_guard_thread(void)
@@ -266,6 +362,18 @@ void ps5wk_crash_guard_install(const char* tag)
     }
     textStart = (uintptr_t)&__ehdr_start;
     textEnd = (uintptr_t)&__init_array_start;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page >= 4096 && !(page & (page - 1)))
+        pageSize = (uintptr_t)page;
+    if (probePipe[0] < 0 && !pipe(probePipe)) {
+        for (int i = 0; i < 2; i++) {
+            fcntl(probePipe[i], F_SETFL, fcntl(probePipe[i], F_GETFL) | O_NONBLOCK);
+            fcntl(probePipe[i], F_SETFD, FD_CLOEXEC);
+        }
+    }
+    codeEnd = (uintptr_t)&_etext > textStart && (uintptr_t)&_etext <= textEnd ? (uintptr_t)&_etext : textEnd;
+    // This function's own bytes: readable or not, as all of .text is.
+    codeReadable = probePipe[1] >= 0 && pageReadable((uintptr_t)&ps5wk_crash_guard_install);
     ps5wk_crash_guard_thread();
     static const int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS };
     for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++) {

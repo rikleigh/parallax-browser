@@ -629,8 +629,29 @@ the release build's [results/phase0-20261119-013048/](results/phase0-20261119-01
   (`webgpu-latency-log`). RADV's PS5 winsys already puts every submission
   of the process on one queue under its own lock, and there is no second
   driver on radv, so the lock is a no-op there (`titleradv.c`): readbacks
-  60/s, 0.2 ms each; the owner saw the cube turn smoothly. The WebGPU and
-  WebGL cases still need a rerun on this build.
+  60/s, 0.2 ms each; the owner saw the cube turn smoothly.
+- **Rerun on this build (2026-11-20, the 07:55 package with both fixes):**
+  [results/radv-20261120-013718/](results/radv-20261120-013718/), all
+  pass, no crash or device loss. WebGL: `readpixels` 29/29, `busy`
+  59.7-60.2 frames/s at 100 to 2000 objects (JS 0.31 / 0.38 / 0.64 / 1.10
+  / 2.07 ms), `webgl/video` 59.9-60.0 frames/s, GL error 0. WebGPU: all 14
+  pages pass with the same counts; triangle 63.2, two-canvases 59.9,
+  cube, resize and `todataurl` 59.9, `video-texture` 60.3 (59.9),
+  `webgl-and-webgpu` 59.9 frames/s. Direct memory 452-707 MB, 3.6 GB at
+  `buffer-map`, back to ~0.5 GB on the next page. (The summary's present
+  rate for short pages, e.g. triangle's 6.8/s, is a 5 s stats window
+  that ends after the page did; the pages' own counters are the ones
+  quoted.)
+- **Owner headset check (2026-11-20), View in VR on PPSA99208:** the 1080p
+  clip, flat (guessed right), "looks fine".
+  [results/radv-vr-headset-20261120.log](results/radv-vr-headset-20261120.log):
+  headset up in 711 ms on RADV eye buffers (`sw_mode 27`), 60.0-60.2
+  headset frames/s once up, render 0.58-0.60 ms avg (release 0.86-0.99),
+  29.4-29.9 video frames/s shown, 0 begin or submit errors, all frames
+  tracked; recentre at entry, two right-stick seeks, back to the TV with
+  O (released in 1204 ms, the TV at 59.9 frames/s after). An 18.8 s
+  session: the projections (△), play/pause (X) and recentre (□) weren't
+  pressed in it (`vr-selftest` covers those on this build).
 - Pages, scrolling, both videos, WebGL and WebGL video all ran at 59.9
   frames/s on the TV run, except the 2800-layer page scrolling itself by
   script (`&auto=6`): about 52 frames/s, held back by the WebProcess (18 ms
@@ -638,16 +659,339 @@ the release build's [results/phase0-20261119-013048/](results/phase0-20261119-01
 
 **Left for later:**
 
-- Owner checks: the headset (View in VR) on PPSA99208, the WebGPU video
-  texture page on the TV, and the owner's notes on the six TV pages.
+- **Regression: WebGPU video textures** (owner on the TV, 2026-11-20: the
+  picture and clock are right, "the framerate isn't smooth";
+  [results/radv-webgpu-video-texture-tv-20261120.log](results/radv-webgpu-video-texture-tv-20261120.log)).
+  `video-texture` passes 5/5 on every radv run, but its own counters:
+  `importExternalTexture` 47.0-50.3 frames/s with 3.4-4.8 ms of JS a
+  frame (release 60.0, 0.30 ms); `copyExternalImageToTexture` 2.0-3.3 s
+  (release 36 ms). The title's read of each video frame for Dawn
+  (`PS5WebGPUVideoRead.cpp`, compute pass + `glMapBufferRange`, under
+  `readerLock`) takes ~32 ms on ANGLE/RADV against 1.2 ms on ps5-opengl,
+  so the canvas gets at most ~30 fresh frames/s. **Timed** (2026-11-20,
+  a build with per-step timers, 120-read averages,
+  [results/radv-webgpu-videoread-timing-20261120.log](results/radv-webgpu-videoread-timing-20261120.log)):
+  `eglMakeCurrent` 4-14 ms (waiting on ANGLE's share-context lock, which
+  the compositor's thread holds while ANGLE waits for the next swapchain
+  image; the lock is on in the radv build since the WebGL video crash
+  fix) and the `memcpy` out of the mapped 8 MB buffer 15.1-15.4 ms
+  (~530 MB/s: the mapping is uncached; the RADV memory type seen in 15c
+  is flags 0x7, no `HOST_CACHED`). The copy, dispatch, flush, map and
+  release are ~0.3 ms together. Not a GPU wait, so double-buffering the
+  readback wouldn't help. Phase 4 (Dawn takes the converted frame as a
+  `VkImage`, 15e) removes the read and both costs; the same two costs
+  apply to any other CPU readback on radv (Dawn's `MapAsync`,
+  `glReadPixels`), so check those in Phase 4 too. The summary's 60 present/s for this page hid it: read
+  the pages' own RESULT lines. **Fixed in Phase 4** (below): 60.0
+  frames/s, 0.30 ms of JS; the copy 27 ms.
+- **Owner TV pages (2026-11-19):** the six pages looked fine (owner,
+  2026-11-20).
+- **Long session (2026-11-20):** `wcfeed.html?mins=30` on PPSA99208 (49
+  videos playing):
+  [results/radv-longfeed-20261120-022551.log](results/radv-longfeed-20261120-022551.log).
+  All 325 five-second windows at 59.9 frames/s or more, rAF 59.9-60.0;
+  direct memory 600-1030 MB with the scroll position and no growth (893
+  MB at the end), flexible free 186-234 MB, WebProcess RSS 258-268 MB; no
+  crash, abort or device loss. Black frames weren't counted (no tool for
+  it outside Spike 12's two-driver test).
+- **Smoke and browser features (2026-11-20, PPSA99208, no TV):** a site
+  over the network, `parallax://settings` and `parallax://update` 3/3;
+  Safer browsing on (JIT and WebAssembly off in the new WebProcess, WebGL
+  and WebGPU off: `readpixels` gets no context) and off again (29/29);
+  WebGPU off (`navigator.gpu` absent) and on (adapter 11/11); pages in
+  the browser process (`web_in_title=1`: the WebProcess in the title,
+  hardware video, WebGL 29/29, WebGPU adapter 11/11); the GL texture cap
+  at 40 MB on the feed (coverage reduced, then the page reloaded on the
+  CPU path, 30 rAF/s, as designed). Settings were put back to their
+  defaults (all were at the default before).
+- **Crash missed on the night, found 2026-11-20 morning:** the live-tabs
+  attempt (video page, then `webgl-readpixels` pushed into the same tab)
+  killed the title (pid 182, build 20261120-030636, the Phase 2/3 build):
+  `crash-title.txt` has SIGSEGV at address 0x0, pc elf +0x52811. The log
+  stops just after `[webgl] title: ANGLE context 581 for WebGL 2` with no
+  crash line (the handler wrote the file but the log didn't get it), so
+  the run script's crash count said 0 and its "not running" was taken
+  for a slow `--status`. That build's ELF wasn't kept; against the Phase
+  4 ELF the pc falls in `WTF::WordLock::unlock`, which may not hold for
+  the older build. Not seen in any Phase 4 run (WebGPU 14 pages, WebGL
+  29/29, compositor, video, VR, the TV pages below). **Replayed 5 times
+  on the Phase 4 build (2026-11-20 09:23):** fresh title on the 1080p
+  video page, 8 s, then `webgl-readpixels` and `webgpu/adapter` pushed
+  into the same tab: the title alive after every round, WebGL 29/29 and
+  adapter 11/11 each time, `crash-title.txt` unchanged. Not reproduced.
+  Log: `results/radv-vidgl-repro-20261120.log`. **The crash's place**:
+  package.sh had kept that build's ELF
+  (`titles-radv-wip/debug/20261120-030636-e6f88ff0af/`): elf +0x52811 is
+  `__wrap_pthread_mutex_lock` (`apps/common/ps5locks.c:302`, reading the
+  mutex's word), so something locked a null `pthread_mutex_t*`. Who did
+  isn't known: the report had no stack line (below).
+- **Crash reports fixed (2026-11-20).** Why that crash left only one line:
+  (1) the crash guard wrote with `write(2, ...)`, and in the title fd 2
+  isn't the log (titlelog points libc's `stderr` stream at its pipe; a
+  title can't dup2 over fd 2), so nothing reached the log; (2) the stack
+  scan faulted and killed the process: the call-instruction check read
+  code bytes, and a title's code is execute-only. Now
+  (`apps/common/crashguard.c`, `apps/title/titlelog.c`): the report is
+  also handed to the log through `ps5wk_crash_log_report` (trylock for at
+  most 0.5 s, then a flush of at most 1 s), the first line before the
+  scan; the scan checks each page before reading it (a `write()` from it
+  into a pipe, EFAULT instead of a fault) and stops at the end of the
+  mapped stack; where code can't be read it lists every stack word in
+  `.text` (`stack (code not readable: every .text value)`), unfiltered; a
+  fault in the report prints what it had. Test knob:
+  `/data/ps5webkit/crash-title-test` makes the title fault 10 s after
+  start, three calls deep (delete it after). Checked: the report in the
+  log and in `crash-title.txt`, the stack line symbolizing to
+  `crashTestDepth` x3, `crashTestThread`, `stack_trampoline`
+  (`results/radv-crashreport3-20261120-102453/`). These files are shared
+  with the release build: it gets the same when next built.
+- **Left for the owner:** *Restart browser* (it restarts the running
+  title since 2026-11-20: it used to pass PPSA99207 to the restart helper
+  whatever was running, and the helper refused PPSA99208, "PPSA99207 is not
+  pid N"; checked through the API: the helper restarted PPSA99208 in about
+  1.5 s), the update path from 0.2.2 (it means installing the radv build as
+  PPSA99207: updates still name PPSA99207 only), and live tabs (a test run has
+  one tab, so they need a normal run, with the owner's session).
 - Overlay GPU time from `EXT_disjoint_timer_query` (today `GPU n/a`).
 - sRGB WebGL textures fed from video get the frame encoded twice on radv
   (ANGLE has no `EXT_sRGB_write_control` here).
-- Phase 4: WebGPU canvases still reach the compositor through the GL path
-  (`CopyTextureToBuffer` + `MapAsync`); share Dawn's images instead (15e).
-- Phase 5: ps5-opengl is still linked (WebGL no longer uses it in this
-  build, but ANGLE's GL backend and `dlshim.c`'s table still reference it).
+- Phase 4: done (below); the owner's TV check passed (2026-11-20).
+- Phase 5: done (below): the radv build links no ps5-opengl. The 0.3.0
+  release is still to do.
 - Long runs, memory over hours, GPU faults: not tested.
+
+## Phase 4: WebGPU without the CPU round trips (2026-11-20)
+
+On PPSA99208, the same runner as Phase 0
+([results/radv-phase4-20261120-a/](results/radv-phase4-20261120-a/): WebGPU
+and WebGL; [results/radv-phase4-20261120-b/](results/radv-phase4-20261120-b/):
+static, feed, 2800 layers, the three videos, VR simulation). WebKit's side is
+`patches-radv/0141-ps5-radv-webgpu-shared-images.patch`; Dawn's is
+`port/deps/patches/dawn-radv/`.
+
+**What changed:**
+
+- **Shared images** (`PS5SharedImages.cpp`). The title makes RGBA8/BGRA8
+  `VkImage`s on ANGLE's `VkDevice`, with
+  `VkExternalMemoryImageCreateInfo { HOST_ALLOCATION }`, in host-visible
+  memory. Each is wrapped for GL with `EGL_VULKAN_IMAGE_ANGLE`. Dawn
+  aliases one with an image made from the same create info, over a
+  host-pointer import of the same memory (15e). Each side hands the image
+  over after a CPU wait for its own work: `glFinish` or a GL fence on the
+  title's side, `OnSubmittedWorkDone` on Dawn's. Dawn keeps its aliases
+  per device (16, newest kept), by an image id that is never reused.
+- **Video into WebGPU (0123/0124).** For `importExternalTexture(video)`, GL
+  copies the stream's converted frame into a free shared image on
+  RemoteGPU's work queue (the same blit as WebGL's video copy). Dawn's
+  alias becomes the external texture's plane. The image goes back once the
+  texture has expired and Dawn's work with it is done. A process has at
+  most 8 such images (192 MB); past that, or when Dawn can't alias one,
+  the old readback path runs. `copyExternalImageToTexture(video)` doesn't
+  bring pixels to the WebProcess any more. It sends
+  `CopyVideoStreamFrameToTexturePS5` on the stream, and the title runs
+  Dawn's `CopyTextureForBrowser` from the shared image into the
+  destination, flipped when asked. That covers rgba8/bgra8 (and their
+  sRGB forms), rgb10a2 and rgba16float, with no source origin; the rest
+  go the pixel way.
+- **Canvas present (0110/0132).** A presented frame of an 8-bit format is
+  copied on the GPU (`CopyTextureToTexture`) into one of the canvas's
+  shared images (at most 4). The WC scene draws that image's GL texture.
+  GL takes the image when the frame is latched, and lets it go with a
+  fence when the frame is replaced; the image is free for Dawn again
+  once the fence has passed. There's no `CopyTextureToBuffer` or
+  `MapAsync`, and no CPU copy. rgba16float canvases still go the pixel
+  way, which converts them. The canvas doesn't render straight into the
+  compositor's image: the page reuses its three render buffers while the
+  compositor may still show one, so a copy on the GPU (about 8 MB at
+  1080p) keeps the two apart.
+- **Readback** (`toDataURL`, `drawImage`, `createImageBitmap`) is
+  unchanged: Dawn reads the render buffer (`readPixels`). The Web
+  Inspector's read of the last shown frame (`currentFrame` false) has no
+  CPU copy to use now, so it falls back to that same read. Any CPU
+  readback on radv still costs the uncached mapping (~530 MB/s; the PS5
+  winsys has no `HOST_CACHED` type).
+- **The compositor takes its swapchain image before its frame, outside
+  ANGLE's locks** (`PS5Renderer.cpp`: `eglPrepareSwapBuffersANGLE`,
+  which acquires in an unlocked tail call, where ps5-opengl's flip wait
+  was). Before, the acquire ran in the frame's first draw, holding the
+  share group's lock for most of a frame. That was the 4-14 ms
+  `eglMakeCurrent` wait in Dawn's video reads. WebGL waited for it too:
+  `webgl-and-webgpu` went from 5.56 to 2.93 ms of JS a frame (release
+  3.09). The `[present]` line's render time is now the frame's work
+  (0.4-0.5 ms on the plain pages, 16 ms before), as it is on the release
+  build.
+- **The GPU submit lock is out of the radv build.** Its Dawn leaves 0004
+  out (`dawn-radv/0002` reverts it), and `PS5Renderer.cpp`'s
+  `GPUSubmitLock`, WebGL's batch lock and flush (0122,
+  `RemoteGraphicsContextGLPS5.cpp`) and the video read's lock are
+  compiled out. `titleradv.c` keeps its two empty functions, because
+  `ps5browser.c` turns WebGPU on when they exist.
+
+**How Dawn's change stays off the release build.** `port/deps/build.sh
+dawn-radv` unpacks Dawn again into `src/dawn-radv`. It applies
+`patches/dawn` and then `patches/dawn-radv` (0001: a new
+`dawn/native/PS5HostPointerTexture.h` and
+`vulkan/PS5HostPointerTextureVk.cpp`, new files only; 0002: no lock), and
+installs into `toolchain/wpe-deps/install/dawn-radv`. Only GPU=radv
+`port/webkit/build.sh` links that prefix (`-DPS5WK_DAWN_ROOT`, used by
+WebGPUDawn's CMakeLists on the `ps5-radv` branch). `step_dawn`, the
+sysroot's `libwebgpu_dawn.a` (13 Nov), `build-webgpu` and the PPSA99207
+packages weren't touched.
+
+**Console, before (radv, [radv-20261120-013718](results/radv-20261120-013718/))
+and after, against the release build ([phase0-20261119-013048](results/phase0-20261119-013048/));
+the pages' own RESULT lines:**
+
+| Page | Release | radv before | radv after |
+| --- | --- | --- | --- |
+| `video-texture`: `importExternalTexture` every frame | 60.0 fps, 0.30 ms JS | 50.3 fps, 3.44 ms (47.0, 4.80 on 11-19) | **60.0 fps, 0.30 ms** |
+| `video-texture`: `copyExternalImageToTexture` + readback, 1080p | 36.0 ms | 1967 ms (3300) | **27.0 ms** |
+| `video-texture`: 10 `requestVideoFrameCallback`s | 1877 ms, media time 1.967 | 330 ms, 4.000 | 1888 ms, 1.967 |
+| triangle, 30 frames | 60.4 fps, 0.13 ms | 63.2, 0.17 | 60.7, 0.20 |
+| cube, 120 frames | 60.0, 0.28 | 59.9, 0.28 | 60.0, 0.24 |
+| resize, 320x180 to 1920x1080 | 60.1-62.5 (1920x1080: 60.9) | 59.9-62.6 (61.0) | 60.0-61.9 (61.1) |
+| two-canvases, three canvases | 59.9, 0.27 | 59.9, 0.28 | 59.9, 0.27 |
+| `webgl-and-webgpu`, 900 frames | 60.0, 3.09 ms | 59.9, 5.56 | 59.8, 2.93 |
+| `todataurl` | 11/11 | 11/11 | 11/11 |
+
+- **All 14 WebGPU pages pass** with the release build's counts: adapter
+  11/11, device 29/29, compute 6/6, offscreen-readback 7/7, errors 11/11,
+  buffer-map 11/11, triangle 3/3, cube 3/3, resize 10/10, two-canvases
+  7/7, todataurl 11/11, copy-external-image 16/16, video-texture 5/5,
+  webgl-and-webgpu 5/5. There was no uncaptured error, device loss or
+  crash. The title logs "first frame ... in an image shared with the
+  compositor" for every 8-bit canvas, and "video frame 1920x1080 copied
+  for a WebGPU texture, no CPU copy" (1.97 ms for the first copy,
+  `glFinish` included).
+- **`video-frame-callback` and the video's own counters now match the
+  release build exactly:** 19.0 shown/s while the page starts and 49
+  dropped at the clip's start, as on release; the clip time during the
+  animation is 0.04 to 0.09 s (release 0.04 to 0.08). The radv
+  "before" numbers there (330 ms) were an artefact of its slow imports,
+  not a better result.
+- **WebGL:** `readpixels` 29/29. `busy` 59.7-60.4 frames/s at 100 to
+  2000 objects (JS 0.34 / 0.56 / 1.06 / 1.80 / 3.17 ms; one frame of 45
+  ms at 250). `webgl/video` 59.9-60.0 frames/s, centre pixel 0,5,108,255,
+  GL error 0. The `busy` JS times are higher than before (0.31-2.07 ms) in
+  this one run; not looked into. The frame rate held.
+- **Compositor, video and VR on the same build** (the swapchain change
+  touches every frame): static 59.9 (42.9), feed 60.0 (59.9), 2800 layers
+  60.0 (59.9) with scene paint 7.54 (9.36) ms, the three videos 59.9
+  (59.9) with convert 0.03-0.04 ms, `vr-sim` + `vr-selftest` PASS (15
+  captures, 8 projections, 4 entries in 71 s). Render time 0.41-0.45 ms
+  except the feed (1.61) and the 2800 layers (9.46).
+- **Memory:** direct memory 452-707 MB on the WebGPU pages, 3.6 GB at
+  `buffer-map` and back after, as before; 452-1232 MB on the compositor
+  cases. A 1080p shared image is 8.3 MB (whole 64 KiB granules).
+
+**Not done or not checked:**
+
+- ~~The TV~~: **owner check, 2026-11-20, all good** on PPSA99208:
+  `video-texture` smooth with the right colours (5/5, 60.0 fps, 0.30 ms
+  JS, copy 25 ms), `cube` smooth (3/3, 60.1 fps), `two-canvases` each
+  canvas its own picture, detach and reattach fine (7/7), `resize` (10/10;
+  the soft, stepped triangle the owner saw was case 5, 16x16 shown at
+  640x360, as expected). No crash. Log:
+  `results/radv-phase4-tv-20261120.log`.
+- Rendering straight into the compositor's image (no GPU copy) needs the
+  canvas's render buffers to come from the pool. Not done; the copy costs
+  the GPU about 8 MB of bandwidth a frame at 1080p.
+- ~~A video in WebGPU whose decoded size isn't the copy size~~ **fixed
+  2026-11-20:** the page sends the element's size (videoWidth x
+  videoHeight) with the copy, and the title scales the frame to it on the
+  GPU (into the frame-size read texture, then a linear blit into the
+  shared image) where the decoded size differs, as the pixel way scaled
+  it on the CPU. New page `webgpu/video-scaled.html` (5/5 on PPSA99208):
+  a 1440x1080 clip with 4:3 pixels (`media/anamorphic-1440x1080-sar4x3-h264.mp4`,
+  1920x1080 on screen) copied and imported with its red-to-blue edge at
+  x 960 of 1920, the scaled copy 5.5-7 ms; `switch-h264.mp4` (in-band
+  size changes, the element 396x704 throughout) copied 79 times, every
+  copy covering the texture. `video-texture` 5/5, `copy-external-image`
+  16/16, `cube`, WebGL 29/29 after it. Logs: `results/radv-sizefix*-20261120-*`.
+- `switch-h264.mp4` decoded with 80 errors, 220 AUs skipped before a
+  keyframe and 10 resets (300 of 600 pictures) on **both** builds: the
+  release browser (PPSA99207, build 20261119-094042) and radv the same,
+  so not radv's. **Fixed 2026-11-20** (`wpe-ps5/PS5VideoDecoder.cpp`,
+  shared with the release build): the 2026-11-09 small H.264 decoders
+  (its own 400x704) met the in-band switch to 544x960; such an SPS now
+  reopens the decoder in place. 600/600 pictures, 0 errors; see
+  port/webkit/README.md ("Broken again by the small H.264 decoders").
+  `video-scaled` 5/5 after it (its switch case now really decodes at
+  544x960 and 1280x720 into a 396x704 element, so the scaled copy runs).
+  Logs: `results/radv-vdecgrow-20261120-103823/`,
+  `results/radv-videoscaled-20261120-104518/`.
+- The `busy` JS rise above, and the GPU cost of the per-frame copies, have
+  not been looked into.
+
+## Phase 5: no ps5-opengl (2026-11-20)
+
+The `GPU=radv` title links no ps5-opengl. Build `20261120-112401-938bd6e031`
+on PPSA99208, with the Phase 0 runner and the browser features
+([results/radv-phase5-20261120-112438/](results/radv-phase5-20261120-112438/)).
+
+**What changed:**
+
+- **ANGLE** is built with its Vulkan backend only
+  (`patches-radv/0142-ps5-radv-angle-vulkan-only.patch`, `PlatformWPE.cmake`).
+  Its GL backend would have loaded a native GL through `libEGL`, which
+  `dlshim.c` now answers with ANGLE itself. `PS5ExternalTexture.cpp` builds
+  without `TextureGL` (on Vulkan it already returned the texture's name).
+- **`package.sh`** reads `PS5WK_GPU_RADV` from the build's cache before
+  anything else. Then it skips `libPS5OpenGL.a`, `-u ps5_agc_gate2_run`,
+  `egl_symbols.inc` and ps5-opengl's `runtime_shims.c`, and takes the SDK's
+  `libSceAgc` and `libSceAgcDriver` stubs. The `GPU=gl` path is as before
+  (checked: the release's `build-webgpu` still packages).
+- **What ps5-opengl was quietly providing:**
+  - `open_memstream`, for RADV's `u_memstream` (hang reports, debug
+    dumps). The SDK's libc has none, nor funopen or fmemopen. ps5-opengl's
+    version fails with ENOSYS, and so does the one in `titleradv.c` now:
+    RADV never had a memory stream in the release either.
+  - A strong import of `sceSystemServiceHideSplashScreen`. With only
+    `PS5Renderer.cpp`'s weak reference, `libSceSystemService` wasn't a
+    needed library and the converter found no stub for it. It is in
+    `dlshim.c`'s list of strong imports now.
+  - stdout and stderr into a file before the title log starts:
+    `titlert.c` (`/download0/ps5browser.log`). libc.a has the `__assert`,
+    `openlog`, `popen` and `pclose` that `runtime_shims.c` also defined.
+- **`build-radv.sh`** makes its own meson venv (`build/radv-ps5/venv`)
+  instead of using Spike 2's. A `--clean` build with it gave an archive
+  byte-identical to the one before.
+- **`radv-object.sh`** is kept as it is: the `GPU=gl` WebGPU build still
+  needs it, and with only the ICD's entry points global, RADV's own zlib
+  (its meson fallback: `inflate`, `deflate`, `crc32`, `adler32`) can't
+  meet the title's.
+
+**Size:** `ps5browser.elf` text 190.4 MB → 169.1 MB, bss 26.2 → 23.5 MB.
+The eboot is 167 MiB (the release's, with ps5-opengl and RADV both in it, is 185 MiB).
+The smaller image shows as free flexible memory: the lowest free flexible
+memory is 23 MB higher in every runner case (static 239 → 262 MB, video
+215 → 238 MB).
+
+**Results:** the same as Phase 4.
+
+| case | Phase 4 | Phase 5 |
+| --- | --- | --- |
+| static, present/s best (median) | 59.9 (42.9) | 59.9 (43.0) |
+| feed, render ms | 1.61 | 1.65 |
+| layers2800, render / scene paint ms | 9.46 / 7.54 | 9.75 / 7.38 |
+| video 1080p / 2160p / 2160p10, present/s | 59.9 / 59.9 / 59.9 | 59.9 / 59.9 / 59.9 |
+| webgl-busy, webgl-video | 59.9, 59.9 | 59.9, 59.9 |
+| webgpu-cube, webgpu-video-texture | 59.9, 60.2 | 59.9, 60.3 |
+| vr-sim | 59.9 (47.4) | 59.9 (47.4) |
+
+- WebGL `readpixels` 29/29. Every WebGPU page passes (adapter 11/11,
+  device 29/29, compute 6/6, offscreen-readback 7/7, errors 11/11,
+  buffer-map 11/11, triangle 3/3, cube 3/3, resize 10/10, two-canvases 7/7,
+  todataurl 11/11, copy-external-image 16/16, video-texture 5/5,
+  webgl-and-webgpu 5/5).
+- The VR self-test passes (15 eye-buffer captures, 8 projections).
+- The feed's peak direct memory was 1612 MB (Phase 4: 1232). Across
+  earlier runs it has been between 1232 and 1990 MB; it depends on when the
+  15 decoders peak together.
+- Features: the smoke run, Safer browsing on and off, WebGPU off and on,
+  pages in the browser process, the GL texture cap's fallback to the CPU,
+  three live tabs, and the video-WebGL-WebGPU sequence 5 times. No crash,
+  abort or device lost; `crash-title.txt` unchanged.
 
 ## Run it
 
@@ -679,6 +1023,7 @@ Phase 0 and the radv build (Phase 2/3):
 
 ```sh
 spikes/15-radv-only/phase0/run.sh                       # release build (PPSA99207); PS5_PIN for the WebGPU pages
+port/deps/build.sh dawn-radv                            # once (Phase 4): the radv build's own Dawn
 GPU=radv NINJA_TARGETS="ps5wk-child ps5browser" port/webkit/build.sh src shim configure build
 TITLE=PPSA99208 NAME="Parallax RADV test" BLD=toolchain/wpe-webkit/build-radv \
     OUT=toolchain/wpe-webkit/titles-radv port/webkit/apps/title/package.sh

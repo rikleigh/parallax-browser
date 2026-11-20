@@ -382,7 +382,7 @@ static unsigned h264MaxDpbMbs(unsigned level)
     }
 }
 
-static std::string describeH264SPS(const uint8_t* nal, size_t n)
+static std::string describeH264SPS(const uint8_t* nal, size_t n, unsigned* codedWidth = nullptr, unsigned* codedHeight = nullptr)
 {
     // nal: the SPS NAL unit after its start code (header byte first).
     if (n < 4)
@@ -424,6 +424,10 @@ static std::string describeH264SPS(const uint8_t* nal, size_t n)
     }
     unsigned refs = b.ue(), gaps = b.u(1);
     unsigned widthMbs = b.ue() + 1, heightMapUnits = b.ue() + 1, frameMbsOnly = b.u(1);
+    if (codedWidth && codedHeight && !b.overrun) {
+        *codedWidth = widthMbs * 16;
+        *codedHeight = heightMapUnits * (frameMbsOnly ? 1 : 2) * 16;
+    }
     if (!frameMbsOnly)
         b.u(1);
     b.u(1);
@@ -494,6 +498,31 @@ static std::string describeH264SPS(const uint8_t* nal, size_t n)
         dpbFrames && (refs > dpbFrames || maxDecFrames > static_cast<int>(dpbFrames)) ? " (MORE THAN THE LEVEL ALLOWS)" : "",
         b.overrun ? " (truncated)" : "");
     return line;
+}
+
+// The largest coded size among the SPSs of an Annex-B buffer (H.264 only); false: none read.
+static bool h264SequenceSize(const std::vector<uint8_t>& sets, int& width, int& height)
+{
+    width = height = 0;
+    const uint8_t* p = sets.data();
+    size_t n = sets.size();
+    for (size_t k = 0; k + 3 < n; k++) {
+        if (p[k] || p[k + 1] || p[k + 2] != 1)
+            continue;
+        size_t start = k + 3, end = start;
+        while (end + 2 < n && !(p[end] == 0 && p[end + 1] == 0 && (p[end + 2] == 1 || (p[end + 2] == 0 && end + 3 < n && p[end + 3] == 1))))
+            end++;
+        if (end + 2 >= n)
+            end = n;
+        unsigned w = 0, h = 0;
+        if ((p[start] & 0x1f) == 7) {
+            describeH264SPS(p + start, end - start, &w, &h);
+            width = std::max(width, static_cast<int>(w));
+            height = std::max(height, static_cast<int>(h));
+        }
+        k = end - 1;
+    }
+    return width > 0 && height > 0;
 }
 
 // The SPSs of an Annex-B buffer, described (H.264 only).
@@ -837,9 +866,14 @@ static void recover(Decoder& d, uint32_t epoch)
 }
 
 static void drain(Decoder&, uint32_t epoch);
+static void growDecoder(Decoder&, int width, int height, uint32_t epoch);
 
 static void processAU(Decoder& d, AccessUnit& au)
 {
+    if (!d.hw) { // growDecoder could not open a bigger one: nothing decodes from here
+        sendPicture(d, au.key, au.epoch, 3, nullptr);
+        return;
+    }
     d.aus++;
     d.windowAUs++;
     if (au.epoch != d.epoch)
@@ -912,7 +946,22 @@ static void processAU(Decoder& d, AccessUnit& au)
         if (!sequence.empty()) {
             if (sequence != d.sequenceSets)
                 logSequence(d.sequenceSets.empty() ? "" : "new ", d.id, d.codec, sequence);
-            if (!d.sequenceSets.empty() && sequence != d.sequenceSets && !d.needKeyframe && !d.injectNoSequenceReset) {
+            // An H.264 stream opened at its own small size (openHardware) whose
+            // new SPS doesn't fit: Videodec2 failed every call after the reset
+            // (0x811d0302/0303, switch-h264.mp4 at 544x960 in a 400x704
+            // decoder, 2026-11-20; the caps keep the MP4's size, so no DOPEN
+            // reopens it). The decoder is reopened at the bigger size here.
+            int sequenceWidth = 0, sequenceHeight = 0;
+            bool grows = d.codec == PS5WK_VCODEC_H264 && h264SequenceSize(sequence, sequenceWidth, sequenceHeight)
+                && (sequenceWidth > d.width || sequenceHeight > d.height);
+            if (grows) {
+                d.formatChanges++;
+                growDecoder(d, sequenceWidth, sequenceHeight, au.epoch);
+                if (!d.hw) {
+                    sendPicture(d, au.key, au.epoch, 3, nullptr);
+                    return;
+                }
+            } else if (!d.sequenceSets.empty() && sequence != d.sequenceSets && !d.needKeyframe && !d.injectNoSequenceReset) {
                 d.formatChanges++;
                 DLOG("decoder %u: new sequence parameters at AU %u: drained and reset (%llu so far)", d.id, au.key,
                     (unsigned long long)d.formatChanges);
@@ -1581,6 +1630,103 @@ static bool readFully(int fd, void* buffer, size_t size)
         got += static_cast<size_t>(n);
     }
     return true;
+}
+
+// The decoder thread, at an in-band H.264 sequence the decoder is too small for (processAU): a
+// decoder opened at a small stream's own size (openHardware) is reopened bigger in place. The
+// old pictures are drained (they are shown), the old decoder and its output buffers go (the
+// buffers on the renderer's thread after the frame in flight, as closeHardware has it; pictures
+// the WebProcess still names are then not found, as after a close), and one of 1920x1088, or the
+// new size if bigger, is opened under the decoder budget. If that fails, the stream gets no more
+// pictures (processAU answers every AU with an error), as a refused DOPEN would leave it.
+static void growDecoder(Decoder& d, int width, int height, uint32_t epoch)
+{
+    const int oldWidth = d.width, oldHeight = d.height;
+    drain(d, epoch);
+    int openWidth = (width + 15) & ~15, openHeight = (height + 15) & ~15;
+    if (openWidth * openHeight <= 1920 * 1088) {
+        openWidth = std::max(openWidth, 1920);
+        openHeight = std::max(openHeight, 1088);
+    }
+    std::vector<Slot> oldSlots;
+    g_mutex_lock(&d.lock);
+    oldSlots = std::move(d.slots);
+    d.slots.clear();
+    g_mutex_unlock(&d.lock);
+    // d.hw keeps the old handle until the new one replaces it: the socket thread takes AUs only
+    // while it isn't null (it never uses it), and a DOPEN joins this thread before closing it.
+    backend->close(d.hw);
+    for (auto& slot : oldSlots) {
+        if (slot.map)
+            provider.free(slot.glBuffer, slot.map, slot.bytes);
+    }
+    releaseBudget(d);
+
+    BudgetLimits limits = readBudgetLimits();
+    Cost cost = estimateCost(d.codec, d.bitDepth, openWidth, openHeight);
+    char why[240] = "";
+    if (!admit(d, limits, cost, why, sizeof why)) {
+        d.hw = nullptr;
+        DLOG("decoder %u: %dx%d doesn't fit the decoder (%dx%d), and %dx%d is over the decoder budget after %d ms: %s; no more pictures from this stream",
+            d.id, width, height, oldWidth, oldHeight, openWidth, openHeight, limits.waitMS, why);
+        return;
+    }
+    char error[200] = "";
+    size_t frameBytes = 0, frameAlign = 0;
+    int64_t start = nowUS();
+    g_mutex_lock(&openLock);
+    void* hw = backend->open(d.codec, d.profile, d.bitDepth, openWidth, openHeight, &frameBytes, &frameAlign, error, sizeof error);
+    g_mutex_unlock(&openLock);
+    std::vector<Slot> slots;
+    if (hw) {
+        frameAlign = std::max<size_t>(frameAlign, 256);
+        unsigned count = frameBytes <= (16u << 20) ? 12 : frameBytes <= (50u << 20) ? 9 : 8;
+        for (unsigned i = 0; i < count; i++) {
+            Slot slot;
+            slot.bytes = frameBytes + frameAlign;
+            if (!provider.allocate(slot.bytes, &slot.glBuffer, &slot.map))
+                break;
+            uintptr_t a = reinterpret_cast<uintptr_t>(slot.map);
+            slot.frame = reinterpret_cast<uint8_t*>((a + frameAlign - 1) & ~(static_cast<uintptr_t>(frameAlign) - 1));
+            slots.push_back(slot);
+        }
+        if (slots.size() < 4) {
+            for (auto& slot : slots)
+                provider.free(slot.glBuffer, slot.map, slot.bytes);
+            slots.clear();
+            backend->close(hw);
+            hw = nullptr;
+            snprintf(error, sizeof error, "output buffers");
+        }
+    }
+    if (!hw) {
+        d.hw = nullptr;
+        settleBudget(d, nullptr);
+        DLOG("decoder %u: %dx%d doesn't fit the decoder (%dx%d), and opening %dx%d failed (%s); no more pictures from this stream",
+            d.id, width, height, oldWidth, oldHeight, openWidth, openHeight, error);
+        return;
+    }
+    size_t slotBytes = 0;
+    for (auto& slot : slots)
+        slotBytes += slot.bytes;
+    Cost settled { std::max(cost.directMB, slotBytes / 1048576.0), cost.flexibleMB };
+    settleBudget(d, &settled);
+    g_mutex_lock(&d.lock);
+    d.slots = std::move(slots);
+    g_cond_broadcast(&d.cond);
+    g_mutex_unlock(&d.lock);
+    d.hw = hw;
+    d.width = openWidth;
+    d.height = openHeight;
+    d.frameBytes = frameBytes;
+    d.frameAlign = frameAlign;
+    d.needKeyframe = true;
+    d.hwStuck = false;
+    d.errorRun = 0;
+    d.ausSinceReset = d.picturesSinceReset = 0;
+    DLOG("decoder %u: %dx%d doesn't fit the decoder (%dx%d): reopened at %dx%d in %.0f ms (%zu output buffers of %.1f MB); %s",
+        d.id, width, height, oldWidth, oldHeight, openWidth, openHeight, (nowUS() - start) / 1000.0, d.slots.size(),
+        (frameBytes + frameAlign) / 1048576.0, budgetSummary().c_str());
 }
 
 void serve(int fd, int pid, int streamID)

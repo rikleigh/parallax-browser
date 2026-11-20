@@ -1,0 +1,1988 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+index 96df0ccd57..f63af60628 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
++++ b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+@@ -1539,6 +1539,36 @@ ExceptionOr<void> GPUQueue::copyExternalImageToTexture(ScriptExecutionContext& c
+         return { };
+     }
+ 
++#if USE(DAWN) && ENABLE(VIDEO)
++    // PS5, GPU=radv: a hardware-decoded video's frame is copied in the title, on the GPU, and no
++    // pixels come here. The queue says false where it cannot (the pixel way below); the formats
++    // are those Dawn's CopyTextureForBrowser writes. A video frame is opaque: its alpha is 1
++    // premultiplied or not.
++    if (auto* videoElement = std::get_if<Ref<HTMLVideoElement>>(&source.source)) {
++        uint32_t originX = 0, originY = 0;
++        if (source.origin)
++            populdateXYFromOrigin(*source.origin, originX, originY);
++        bool gpuCopyFormat = false;
++        switch (destination.texture->format()) {
++        case GPUTextureFormat::Rgba8unorm:
++        case GPUTextureFormat::Rgba8unormSRGB:
++        case GPUTextureFormat::Bgra8unorm:
++        case GPUTextureFormat::Bgra8unormSRGB:
++        case GPUTextureFormat::Rgb10a2unorm:
++        case GPUTextureFormat::Rgba16float:
++            gpuCopyFormat = true;
++            break;
++        default:
++            break;
++        }
++        RefPtr player = (*videoElement)->player();
++        uint64_t key = player && player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0;
++        if (key && gpuCopyFormat && !originX && !originY
++            && m_backing->ps5CopyVideoStreamFrameToTexture(key, (*videoElement)->videoWidth(), (*videoElement)->videoHeight(), static_cast<const GPUImageCopyTexture&>(destination).convertToBacking(), backingCopySize, source.flipY))
++            return { };
++    }
++#endif
++
+     bool callbackScopeIsSafe { true };
+     bool needsYFlip = source.flipY;
+     bool needsPremultipliedAlpha = destination.premultipliedAlpha;
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h
+index 53da93a4a1..a48e8a8c15 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUCompositorIntegrationImpl.h
+@@ -81,6 +81,23 @@ public:
+     // RemoteCompositorIntegration: the title's WC scene). Called on the implementation's thread.
+     void setFrameSink(FrameSink&& sink) { m_frameSink = WTF::move(sink); }
+     void frameWasPresented(uint32_t frameIndex, std::span<const uint8_t>, uint32_t width, uint32_t height, ::WebGPU::TextureFormat, ::WebGPU::CanvasAlphaMode);
++    // PS5, GPU=radv: the same, for frames in images shared with the compositor
++    // (::WebGPU::PresentationContextDescriptor::acquireSharedImage, presentSharedImage). Without
++    // one the frames go as pixels.
++    struct SharedImageSink {
++        WTF::Function<RefPtr<::WebGPU::PS5SharedImage>(uint32_t width, uint32_t height, ::WebGPU::TextureFormat)> acquire;
++        WTF::Function<void(uint32_t frameIndex, Ref<::WebGPU::PS5SharedImage>&&, std::optional<uint32_t> vkLayout, ::WebGPU::CanvasAlphaMode)> present;
++    };
++    void setSharedImageSink(SharedImageSink&& sink) { m_sharedImageSink = WTF::move(sink); }
++    RefPtr<::WebGPU::PS5SharedImage> acquireSharedImage(uint32_t width, uint32_t height, ::WebGPU::TextureFormat format)
++    {
++        return m_sharedImageSink.acquire ? m_sharedImageSink.acquire(width, height, format) : nullptr;
++    }
++    void sharedImageWasPresented(uint32_t frameIndex, Ref<::WebGPU::PS5SharedImage>&& image, std::optional<uint32_t> vkLayout, ::WebGPU::CanvasAlphaMode alphaMode)
++    {
++        if (m_sharedImageSink.present)
++            m_sharedImageSink.present(frameIndex, WTF::move(image), vkLayout, alphaMode);
++    }
+     // What a render buffer's texture holds now (::WebGPU::PresentationContext::readPixels): the
+     // frame being drawn, or the last one. An empty span when there is nothing to read.
+     void readPixels(uint32_t bufferIndex, CompletionHandler<void(std::span<const uint8_t>, uint32_t width, uint32_t height, ::WebGPU::TextureFormat)>&& completionHandler)
+@@ -120,6 +137,7 @@ private:
+     WTF::Function<void(CompletionHandler<void()>&&)> m_onSubmittedWorkScheduledCallback;
+ #elif USE(DAWN)
+     FrameSink m_frameSink;
++    SharedImageSink m_sharedImageSink;
+ #endif
+ 
+     const RefPtr<::WebGPU::PresentationContext> m_presentationContext;
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUImpl.cpp b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUImpl.cpp
+index b106081aa4..6ac9a3d75b 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUImpl.cpp
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUImpl.cpp
+@@ -86,6 +86,17 @@ RefPtr<WebGPU::PresentationContext> WebGPUIntegrationImpl::createPresentationCon
+             if (RefPtr integration = weakIntegration.get())
+                 integration->frameWasPresented(frameIndex, pixels, width, height, format, alphaMode);
+         },
++        // PS5, GPU=radv: frames in images shared with the compositor, when the sink has them.
++        .acquireSharedImage = [weakIntegration = WeakPtr { compositorIntegration.get() }](uint32_t width, uint32_t height, WebGPU::TextureFormat format) -> RefPtr<WebGPU::PS5SharedImage> {
++            if (RefPtr integration = weakIntegration.get())
++                return integration->acquireSharedImage(width, height, format);
++            return nullptr;
++        },
++        .presentSharedImage = [weakIntegration = WeakPtr { compositorIntegration.get() }](uint32_t frameIndex, Ref<WebGPU::PS5SharedImage>&& image, std::optional<uint32_t> vkLayout, WebGPU::CanvasAlphaMode alphaMode) {
++            // With no integration the image just goes: its canvas, which had it, went first.
++            if (RefPtr integration = weakIntegration.get())
++                integration->sharedImageWasPresented(frameIndex, WTF::move(image), vkLayout, alphaMode);
++        },
+     });
+ #endif
+     if (result)
+diff --git a/Source/WebGPU/WebGPUCpp.h b/Source/WebGPU/WebGPUCpp.h
+index ac0475f8e3..2d0cbc5128 100644
+--- a/Source/WebGPU/WebGPUCpp.h
++++ b/Source/WebGPU/WebGPUCpp.h
+@@ -63,6 +63,7 @@
+ #include <wtf/Ref.h>
+ #include <wtf/Seconds.h>
+ #include <wtf/SwiftBridging.h>
++#include <wtf/ThreadSafeRefCounted.h>
+ #include <wtf/ThreadSafeWeakPtr.h>
+ #include <wtf/Variant.h>
+ #include <wtf/Vector.h>
+@@ -881,12 +882,46 @@ struct PresentationContextDescriptor {
+     Function<void(Function<void(std::span<const IOSurfaceRef>)>&&, Function<void(CompletionHandler<void()>&&)>&&)> registerCompositorIntegration;
+ };
+ #elif USE(DAWN)
++// PS5, GPU=radv (HANDOVER-radv.md Phase 4; spikes/15-radv-only 15e): an image of the title's
++// compositor device (ANGLE's VkDevice on RADV), in memory whose CPU address is its GPU address,
++// which Dawn aliases with an image of its own: a video frame comes in, or a canvas frame goes
++// out, with no copy through the CPU. Each side hands the image over after a CPU wait for its own
++// work (glFinish or a GL fence; Dawn's OnSubmittedWorkDone). The title makes and frees them
++// (WebKit's PS5SharedImages.h); one never changes size, format or memory.
++class PS5SharedImage : public ThreadSafeRefCounted<PS5SharedImage> {
++public:
++    virtual ~PS5SharedImage() = default;
++    // Unique among the images ever made, so that Dawn can keep its alias by it.
++    uint64_t identifier { 0 };
++    // The memory: aligned to and a multiple of the host-pointer import alignment.
++    void* address { nullptr };
++    uint64_t size { 0 };
++    // The VkImageCreateInfo the image was made with (its pNext aside), which Dawn's must equal.
++    const void* vkImageCreateInfo { nullptr };
++    uint32_t width { 0 };
++    uint32_t height { 0 };
++    // Rgba8unorm or Bgra8unorm.
++    TextureFormat format { TextureFormat::Rgba8unorm };
++
++protected:
++    PS5SharedImage() = default;
++};
++
+ // A canvas surface with no shared textures: each presented frame is handed over as pixels.
+ struct PresentationContextDescriptor {
+     // Called on the instance's thread once a presented frame's pixels are ready: tightly packed
+     // rows (bytesPerRow = width * 4 for the 8-bit formats, width * 8 for RGBA16Float), top row
+     // first, in `format`. The span is borrowed for the call.
+     Function<void(uint32_t frameIndex, std::span<const uint8_t>, uint32_t width, uint32_t height, TextureFormat, CanvasAlphaMode)> presentFrame;
++    // PS5, GPU=radv: when given, a presented frame of an 8-bit format is copied on the GPU into a
++    // shared image of its size and format (Rgba8unorm or Bgra8unorm) that acquireSharedImage gives;
++    // null: none is free now, and the frame is dropped. presentSharedImage is called once for each
++    // image acquired, on the instance's thread: once the copy is done, with the VkImageLayout the
++    // image is in (from then on it is the compositor's, until it gives it back), or with no layout
++    // when nothing was copied into it (it is free again; the frame then goes the pixel way, as do
++    // all later frames when Dawn could not alias the image).
++    Function<RefPtr<PS5SharedImage>(uint32_t width, uint32_t height, TextureFormat)> acquireSharedImage;
++    Function<void(uint32_t frameIndex, Ref<PS5SharedImage>&&, std::optional<uint32_t> vkLayout, CanvasAlphaMode)> presentSharedImage;
+ };
+ #endif
+ 
+@@ -1448,6 +1483,15 @@ public:
+     // PS5 (Dawn): an external texture showing one video frame, given as RGBA8 rows from the
+     // picture's top (the title reads its decoded frames back: PS5WebGPUVideoRead.cpp).
+     virtual RefPtr<ExternalTexture> ps5ImportExternalTexture(std::span<const uint8_t>, uint32_t, uint32_t) { return nullptr; }
++#if USE(DAWN)
++    // PS5, GPU=radv: an external texture showing a shared image the title filled (a video frame,
++    // RGBA8, row 0 the picture's top) and left in `vkLayout` (a VkImageLayout), after waiting for
++    // its GPU. `released` is called once, on the instance's thread, when Dawn is done with it (the
++    // external texture was destroyed and the work submitted until then has finished, or the
++    // device went), with the layout Dawn left it in. Null when the image cannot be aliased:
++    // `released` is not called then.
++    virtual RefPtr<ExternalTexture> ps5ImportSharedImage(PS5SharedImage&, uint32_t /* vkLayout */, Function<void(uint32_t vkLayout)>&&) { return nullptr; }
++#endif
+     virtual RefPtr<BindGroupLayout> createBindGroupLayout(const BindGroupLayoutDescriptor&) = 0;
+     virtual RefPtr<PipelineLayout> createPipelineLayout(const PipelineLayoutDescriptor&) = 0;
+     virtual RefPtr<BindGroup> createBindGroup(const BindGroupDescriptor&) = 0;
+@@ -1591,6 +1635,17 @@ public:
+     // (MediaPlayerPrivate::ps5VideoStreamKey()) as RGBA8 rows from the picture's top. False: no
+     // frame. Only the WebProcess's proxy has it: the frames are the title's.
+     virtual bool ps5ReadVideoStreamFrame(uint64_t, Vector<uint8_t>&, uint32_t&, uint32_t&) { return false; }
++    // PS5, GPU=radv: copyExternalImageToTexture from the newest frame of one of the title's video
++    // streams, on the GPU (no pixels come to the WebProcess). The WebProcess's proxy sends it to
++    // the title, which does the copy (below) or, with no frame, leaves the destination as it was,
++    // as the pixel way does. The frame is scaled to the element's video size (videoWidth x
++    // videoHeight) where it was decoded at another. False: this queue cannot (the pixel way then).
++    virtual bool ps5CopyVideoStreamFrameToTexture(uint64_t, uint32_t /* videoWidth */, uint32_t /* videoHeight */, const TexelCopyTextureInfo&, const Extent3D&, bool /* flipY */) { return false; }
++    // PS5, GPU=radv, in the title: the copy, from a shared image the title filled with the frame
++    // (RGBA8, row 0 the picture's top) and left in `vkLayout`, with Dawn's CopyTextureForBrowser.
++    // True when it was recorded: `released` is then called as for Device::ps5ImportSharedImage.
++    // False: nothing was recorded, and `released` is not called.
++    virtual bool ps5CopySharedImageToTexture(PS5SharedImage&, uint32_t /* vkLayout */, const TexelCopyTextureInfo&, const Extent3D&, bool /* flipY */, Function<void(uint32_t vkLayout)>&&) { return false; }
+ #endif
+     virtual void setLabel(String&&) = 0;
+     virtual bool isValid() const = 0;
+diff --git a/Source/WebGPU/WebGPUDawn/CMakeLists.txt b/Source/WebGPU/WebGPUDawn/CMakeLists.txt
+index 0cbe040913..d70ba00447 100644
+--- a/Source/WebGPU/WebGPUDawn/CMakeLists.txt
++++ b/Source/WebGPU/WebGPUDawn/CMakeLists.txt
+@@ -8,6 +8,17 @@ if (NOT PS5_WPE_SYSROOT)
+     message(FATAL_ERROR "WebGPUDawn needs PS5_WPE_SYSROOT, where Dawn is installed")
+ endif ()
+ 
++# GPU=radv: the Dawn of port/deps/build.sh dawn-radv, in a prefix of its own (its host-pointer
++# textures, dawn/native/PS5HostPointerTexture.h); the release builds keep the sysroot's.
++if (PS5WK_GPU_RADV)
++    if (NOT PS5WK_DAWN_ROOT OR NOT EXISTS "${PS5WK_DAWN_ROOT}/include/dawn/native/PS5HostPointerTexture.h")
++        message(FATAL_ERROR "PS5WK_GPU_RADV needs PS5WK_DAWN_ROOT, a Dawn from port/deps/build.sh dawn-radv")
++    endif ()
++    set(WebGPUDawn_DAWN_ROOT "${PS5WK_DAWN_ROOT}")
++else ()
++    set(WebGPUDawn_DAWN_ROOT "${PS5_WPE_SYSROOT}")
++endif ()
++
+ set(WebGPUDawn_SOURCES
+     Adapter.cpp
+     BindGroup.cpp
+@@ -53,18 +64,24 @@ target_include_directories(WebGPUDawn PRIVATE
+     "${WebGPU_PRIVATE_FRAMEWORK_HEADERS_DIR}"
+ )
+ # Dawn's headers: <webgpu/webgpu_cpp.h> and <dawn/native/DawnNative.h>.
+-target_include_directories(WebGPUDawn SYSTEM PRIVATE
+-    "${PS5_WPE_SYSROOT}/include"
++target_include_directories(WebGPUDawn SYSTEM BEFORE PRIVATE
++    "${WebGPUDawn_DAWN_ROOT}/include"
+ )
+ 
+ target_compile_definitions(WebGPUDawn PRIVATE
+     STATICALLY_LINKED_WITH_WEBGPU
+ )
+ 
++if (PS5WK_GPU_RADV)
++    # <vulkan/vulkan.h> for PS5HostPointerTexture.h: RADV's.
++    target_include_directories(WebGPUDawn SYSTEM PRIVATE "${PS5WK_VULKAN_INCLUDE}")
++    target_compile_definitions(WebGPUDawn PRIVATE PS5WK_GPU_RADV=1)
++endif ()
++
+ # WTF and bmalloc headers come with WebKit::WTF. Whatever links WebGPUDawn links Dawn after it.
+ target_link_libraries(WebGPUDawn
+     PRIVATE WebKit::WTF
+-    PUBLIC "${PS5_WPE_SYSROOT}/lib/libwebgpu_dawn.a"
++    PUBLIC "${WebGPUDawn_DAWN_ROOT}/lib/libwebgpu_dawn.a"
+ )
+ 
+ add_dependencies(WebGPUDawn WebGPU_CopyCppAPIHeaders)
+diff --git a/Source/WebGPU/WebGPUDawn/Device.cpp b/Source/WebGPU/WebGPUDawn/Device.cpp
+index 9c4eb8db5d..acc917b096 100644
+--- a/Source/WebGPU/WebGPUDawn/Device.cpp
++++ b/Source/WebGPU/WebGPUDawn/Device.cpp
+@@ -32,6 +32,10 @@
+ #include "Queue.h"
+ #include "XRBinding.h"
+ 
++#if PS5WK_GPU_RADV
++#include <dawn/native/PS5HostPointerTexture.h>
++#endif
++
+ namespace WebGPU::Dawn {
+ 
+ // More than a page that mishandles its errors needs. The rest are dropped.
+@@ -66,7 +70,11 @@ RefPtr<DeviceImpl> DeviceImpl::create(const wgpu::Adapter& adapter, InstanceImpl
+             instance->pumpSoon();
+         return nullptr;
+     }
+-    return adoptRef(*new DeviceImpl(WTF::move(device), instance, WTF::move(callbackState)));
++    Ref result = adoptRef(*new DeviceImpl(WTF::move(device), instance, WTF::move(callbackState)));
++#if PS5WK_GPU_RADV
++    result->m_queue->setDevice(result.get());
++#endif
++    return result;
+ }
+ 
+ DeviceImpl::DeviceImpl(wgpu::Device&& device, InstanceImpl* instance, Ref<CallbackState>&& callbackState)
+@@ -79,6 +87,7 @@ DeviceImpl::DeviceImpl(wgpu::Device&& device, InstanceImpl* instance, Ref<Callba
+     if (instance)
+         instance->addDevice(*this);
+ 
++
+     for (auto feature : allFeatureNames()) {
+         if (auto dawnFeature = toDawn(feature); dawnFeature && m_device.HasFeature(*dawnFeature))
+             m_features.append(feature);
+@@ -324,4 +333,108 @@ RefPtr<ExternalTexture> DeviceImpl::ps5ImportExternalTexture(std::span<const uin
+     return ExternalTextureImpl::create(WTF::move(externalTexture), WTF::move(texture), WTF::move(*charge));
+ }
+ 
++#if PS5WK_GPU_RADV
++// How many aliases a device keeps: a canvas's few images and a video's few, for some of each.
++static constexpr size_t maximumSharedImageAliases = 16;
++
++wgpu::Texture DeviceImpl::ps5SharedImageAlias(PS5SharedImage& image)
++{
++    for (size_t i = 0; i < m_sharedImageAliases.size(); ++i) {
++        if (m_sharedImageAliases[i].identifier == image.identifier) {
++            auto alias = WTF::move(m_sharedImageAliases[i]);
++            m_sharedImageAliases.removeAt(i);
++            m_sharedImageAliases.append(WTF::move(alias));
++            return m_sharedImageAliases.last().texture;
++        }
++    }
++
++    wgpu::TextureDescriptor textureDescriptor;
++    textureDescriptor.label = "shared image";
++    textureDescriptor.size = { image.width, image.height, 1 };
++    textureDescriptor.format = image.format == TextureFormat::Bgra8unorm ? wgpu::TextureFormat::BGRA8Unorm : wgpu::TextureFormat::RGBA8Unorm;
++    // Sampled as a video frame, copied into as a canvas frame (and out of, for a later copy).
++    textureDescriptor.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
++    dawn::native::vulkan::HostPointerTextureDescriptorPS5 descriptor;
++    descriptor.textureDescriptor = reinterpret_cast<const WGPUTextureDescriptor*>(&textureDescriptor);
++    descriptor.imageCreateInfo = static_cast<const VkImageCreateInfo*>(image.vkImageCreateInfo);
++    descriptor.pointer = image.address;
++    descriptor.size = image.size;
++    // Its errors are the title's, not the page's.
++    m_device.PushErrorScope(wgpu::ErrorFilter::Validation);
++    wgpu::Texture texture = wgpu::Texture::Acquire(dawn::native::vulkan::CreateHostPointerTexturePS5(m_device.Get(), &descriptor));
++    m_device.PopErrorScope(wgpu::CallbackMode::AllowProcessEvents, [this, protectedThis = Ref { *this }](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView message) {
++        if (type != wgpu::ErrorType::NoError && !std::exchange(m_loggedSharedImageFailure, true))
++            WTFLogAlways("[webgpu] title: Dawn could not alias an image shared with the compositor: %.*s", static_cast<int>(message.length), message.data);
++    });
++    if (RefPtr instance = m_instance.get())
++        instance->pumpSoon();
++    if (!texture)
++        return nullptr;
++    if (m_sharedImageAliases.size() >= maximumSharedImageAliases) {
++        m_sharedImageAliases.first().texture.Destroy();
++        m_sharedImageAliases.removeAt(0);
++    }
++    m_sharedImageAliases.append({ image.identifier, texture });
++    return texture;
++}
++
++void DeviceImpl::ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<void(uint32_t vkLayout)>&& done)
++{
++    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++    dawn::native::vulkan::EndAccessHostPointerTexturePS5(alias.Get(), &layout);
++    RefPtr instance = m_instance.get();
++    if (!instance) {
++        // Nothing pumps Dawn's callbacks any more: the device is going, and Dawn waits for its GPU
++        // work as it goes.
++        done(layout);
++        return;
++    }
++    // Called once the work submitted until now is done, or with an error once the device is lost
++    // or destroyed: either way Dawn is done with the image.
++    m_device.GetQueue().OnSubmittedWorkDone(wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(done)), layout](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
++        pending->handler()(layout);
++    });
++}
++
++// https://gpuweb.github.io/gpuweb/#dom-gpudevice-importexternaltexture, for a video frame the
++// title copied into a shared image on the GPU: Dawn's alias of the image is the external texture's
++// only plane, sampled as it is (identity transfer functions and gamut matrix, as the pixel way).
++RefPtr<ExternalTexture> DeviceImpl::ps5ImportSharedImage(PS5SharedImage& image, uint32_t vkLayout, Function<void(uint32_t vkLayout)>&& released)
++{
++    wgpu::Texture alias = ps5SharedImageAlias(image);
++    if (!alias)
++        return nullptr;
++    if (!dawn::native::vulkan::BeginAccessHostPointerTexturePS5(alias.Get(), static_cast<VkImageLayout>(vkLayout), true))
++        return nullptr;
++
++    static const float identityTransfer[7] = { 1, 1, 0, 1, 0, 0, 0 }; // g, a, b, c, d, e, f: x
++    static const float identityGamut[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
++    wgpu::ExternalTextureDescriptor descriptor;
++    descriptor.plane0 = alias.CreateView();
++    descriptor.cropSize = { image.width, image.height };
++    descriptor.apparentSize = { image.width, image.height };
++    descriptor.srcTransferFunctionParameters = identityTransfer;
++    descriptor.dstTransferFunctionParameters = identityTransfer;
++    descriptor.gamutConversionMatrix = identityGamut;
++    wgpu::ExternalTexture externalTexture = m_device.CreateExternalTexture(&descriptor);
++    if (!externalTexture) {
++        // Nothing was recorded with the alias: the image can be given back at once.
++        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++        dawn::native::vulkan::EndAccessHostPointerTexturePS5(alias.Get(), &layout);
++        released(layout);
++        return ExternalTextureImpl::create();
++    }
++    // The texture expires when the task that imported it ends; Dawn's work with it is submitted by
++    // then. The image goes back to the title once that work is done.
++    return ExternalTextureImpl::createShared(WTF::move(externalTexture), [weakThis = ThreadSafeWeakPtr { *this }, alias, released = WTF::move(released)]() mutable {
++        RefPtr protectedThis = weakThis.get();
++        if (!protectedThis) {
++            released(VK_IMAGE_LAYOUT_UNDEFINED);
++            return;
++        }
++        protectedThis->ps5EndSharedImageAccess(alias, WTF::move(released));
++    });
++}
++#endif
++
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebGPU/WebGPUDawn/Device.h b/Source/WebGPU/WebGPUDawn/Device.h
+index babfa0258c..28e4d3a988 100644
+--- a/Source/WebGPU/WebGPUDawn/Device.h
++++ b/Source/WebGPU/WebGPUDawn/Device.h
+@@ -52,6 +52,15 @@ public:
+     RefPtr<Buffer> createBuffer(const BufferDescriptor&) final;
+     RefPtr<Texture> createTexture(const TextureDescriptor&) final;
+     RefPtr<ExternalTexture> ps5ImportExternalTexture(std::span<const uint8_t> rgba, uint32_t width, uint32_t height) final;
++#if PS5WK_GPU_RADV
++    RefPtr<ExternalTexture> ps5ImportSharedImage(PS5SharedImage&, uint32_t vkLayout, Function<void(uint32_t vkLayout)>&& released) final;
++    // Dawn's alias of a shared image (dawn/native/PS5HostPointerTexture.h): made the first time,
++    // then kept for the image's next frames. Null when it cannot be made (logged once).
++    wgpu::Texture ps5SharedImageAlias(PS5SharedImage&);
++    // After the alias's work is recorded: submits it, and calls `done` with the layout the image is
++    // left in once the GPU has finished it (or the device went). On the instance's thread.
++    void ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<void(uint32_t vkLayout)>&& done);
++#endif
+     RefPtr<Sampler> createSampler(const SamplerDescriptor&) final;
+     RefPtr<BindGroupLayout> createBindGroupLayout(const BindGroupLayoutDescriptor&) final;
+     RefPtr<PipelineLayout> createPipelineLayout(const PipelineLayoutDescriptor&) final;
+@@ -129,6 +138,18 @@ private:
+     CompletionHandler<void(DeviceLostReason, String&&)> m_deviceLostCallback;
+     std::optional<LostInfo> m_lostInfo;
+     bool m_isLost { false };
++
++#if PS5WK_GPU_RADV
++    struct SharedImageAlias {
++        uint64_t identifier;
++        wgpu::Texture texture;
++    };
++    // The newest last. An image's identifier is never reused, so an alias of an image that is gone
++    // is never used again; it goes when newer ones push it out (only Dawn's image and its import
++    // of the memory: the memory is ANGLE's).
++    Vector<SharedImageAlias> m_sharedImageAliases;
++    bool m_loggedSharedImageFailure { false };
++#endif
+ };
+ 
+ inline DeviceImpl& fromAPI(Device& device)
+diff --git a/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp b/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp
+index bc5ffc0a5d..21cb577e75 100644
+--- a/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp
++++ b/Source/WebGPU/WebGPUDawn/ExternalTexture.cpp
+@@ -42,8 +42,21 @@ void ExternalTextureImpl::destroy()
+     if (m_texture)
+         m_texture.Destroy();
+     m_charge = { };
++#if PS5WK_GPU_RADV
++    // Not the shared image's alias, which stays with the device: Dawn's work on it is submitted,
++    // and the image is given back once it has finished.
++    if (auto ended = std::exchange(m_ended, nullptr))
++        ended();
++#endif
+ }
+ 
++#if PS5WK_GPU_RADV
++ExternalTextureImpl::~ExternalTextureImpl()
++{
++    destroy();
++}
++#endif
++
+ void ExternalTextureImpl::undestroy()
+ {
+ }
+diff --git a/Source/WebGPU/WebGPUDawn/ExternalTexture.h b/Source/WebGPU/WebGPUDawn/ExternalTexture.h
+index 7e8f8fb3ee..2bdfe419d2 100644
+--- a/Source/WebGPU/WebGPUDawn/ExternalTexture.h
++++ b/Source/WebGPU/WebGPUDawn/ExternalTexture.h
+@@ -52,6 +52,20 @@ public:
+         return result;
+     }
+ 
++#if PS5WK_GPU_RADV
++    // GPU=radv: a shared image's frame (DeviceImpl::ps5ImportSharedImage). The texture is Dawn's
++    // alias of the image, which the device keeps for the next frames; `ended` runs once, when
++    // this is destroyed (or goes without being destroyed), and gives the image back.
++    static Ref<ExternalTextureImpl> createShared(wgpu::ExternalTexture&& externalTexture, Function<void()>&& ended)
++    {
++        Ref result = adoptRef(*new ExternalTextureImpl);
++        result->m_externalTexture = WTF::move(externalTexture);
++        result->m_ended = WTF::move(ended);
++        return result;
++    }
++    ~ExternalTextureImpl();
++#endif
++
+     const wgpu::ExternalTexture& dawnExternalTexture() const { return m_externalTexture; }
+ 
+     void destroy() final;
+@@ -65,6 +79,9 @@ private:
+     wgpu::ExternalTexture m_externalTexture;
+     wgpu::Texture m_texture;
+     MemoryCharge m_charge;
++#if PS5WK_GPU_RADV
++    Function<void()> m_ended;
++#endif
+     bool m_destroyed { false };
+ };
+ 
+diff --git a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+index c859dc8a8e..706771946d 100644
+--- a/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
++++ b/Source/WebGPU/WebGPUDawn/PresentationContext.cpp
+@@ -30,6 +30,10 @@
+ #include "Texture.h"
+ #include <wtf/StdLibExtras.h>
+ 
++#if PS5WK_GPU_RADV
++#include <dawn/native/PS5HostPointerTexture.h>
++#endif
++
+ namespace WebGPU::Dawn {
+ 
+ // https://gpuweb.github.io/gpuweb/#dom-gputexelcopybufferlayout-bytesperrow
+@@ -39,8 +43,17 @@ Ref<PresentationContextImpl> PresentationContextImpl::create(const PresentationC
+ {
+     // The descriptor is a call parameter that is not kept, but its function is what the context
+     // is for, and a WTF::Function cannot be copied. The callers build the descriptor for the call.
+-    auto& presentFrame = const_cast<PresentationContextDescriptor&>(descriptor).presentFrame;
+-    return adoptRef(*new PresentationContextImpl(WTF::move(presentFrame), instance));
++    auto& mutableDescriptor = const_cast<PresentationContextDescriptor&>(descriptor);
++    Ref context = adoptRef(*new PresentationContextImpl(WTF::move(mutableDescriptor.presentFrame), instance));
++#if PS5WK_GPU_RADV
++    if (mutableDescriptor.acquireSharedImage && mutableDescriptor.presentSharedImage) {
++        Ref sink = adoptRef(*new SharedImageSink);
++        sink->acquire = WTF::move(mutableDescriptor.acquireSharedImage);
++        sink->present = WTF::move(mutableDescriptor.presentSharedImage);
++        context->m_sharedImageSink = WTF::move(sink);
++    }
++#endif
++    return context;
+ }
+ 
+ PresentationContextImpl::PresentationContextImpl(PresentFrameFunction&& presentFrame, InstanceImpl& instance)
+@@ -263,6 +276,11 @@ void PresentationContextImpl::present(uint32_t frameIndex)
+     if (!texture)
+         return;
+ 
++#if PS5WK_GPU_RADV
++    if (m_sharedImageSink && presentWithSharedImage(frameIndex, *texture))
++        return;
++#endif
++
+     // The copy is submitted now, so that it is of the frame as it is presented. It goes to the
+     // buffer that is not being mapped. When that buffer already has a frame that waits for the
+     // one in flight, this frame replaces it.
+@@ -385,4 +403,66 @@ void PresentationContextImpl::readPixels(uint32_t bufferIndex, CompletionHandler
+     });
+ }
+ 
++#if PS5WK_GPU_RADV
++bool PresentationContextImpl::presentWithSharedImage(uint32_t frameIndex, TextureImpl& texture)
++{
++    auto& configuration = *m_configuration;
++    TextureFormat imageFormat;
++    switch (configuration.format) {
++    case TextureFormat::Bgra8unorm:
++    case TextureFormat::Bgra8unormSRGB:
++        imageFormat = TextureFormat::Bgra8unorm;
++        break;
++    case TextureFormat::Rgba8unorm:
++    case TextureFormat::Rgba8unormSRGB:
++        imageFormat = TextureFormat::Rgba8unorm;
++        break;
++    default:
++        // rgba16float: the pixel way, which converts it.
++        return false;
++    }
++    if (!m_instance.get())
++        return false;
++
++    Ref sink = *m_sharedImageSink;
++    RefPtr image = sink->acquire(configuration.width, configuration.height, imageFormat);
++    // All the canvas's images are on their way or shown: the compositor is behind, and this frame
++    // is dropped (as one that waits behind a readback is).
++    if (!image)
++        return true;
++
++    Ref device = configuration.device;
++    wgpu::Texture alias = device->ps5SharedImageAlias(*image);
++    if (!alias || !dawn::native::vulkan::BeginAccessHostPointerTexturePS5(alias.Get(), VK_IMAGE_LAYOUT_UNDEFINED, false)) {
++        // Dawn cannot alias it: this frame and the next ones the pixel way.
++        sink->present(frameIndex, image.releaseNonNull(), std::nullopt, configuration.alphaMode);
++        m_sharedImageSink = nullptr;
++        return false;
++    }
++
++    // The frame as it is presented, into the image (all of it: its old contents do not matter).
++    // An sRGB canvas's bytes are copied as they are, as the pixel way reads them.
++    wgpu::TexelCopyTextureInfo source;
++    source.texture = texture.dawnTexture();
++    wgpu::TexelCopyTextureInfo destination;
++    destination.texture = alias;
++    wgpu::Extent3D extent { configuration.width, configuration.height, 1 };
++    wgpu::CommandEncoder encoder = device->dawnDevice().CreateCommandEncoder();
++    encoder.CopyTextureToTexture(&source, &destination, &extent);
++    wgpu::CommandBuffer commands = encoder.Finish();
++    device->dawnDevice().GetQueue().Submit(1, &commands);
++
++    auto presentTime = MonotonicTime::now();
++    device->ps5EndSharedImageAccess(alias, [weakThis = ThreadSafeWeakPtr { *this }, generation = m_generation, frameIndex, sink = WTF::move(sink), image = image.releaseNonNull(), alphaMode = configuration.alphaMode, presentTime](uint32_t layout) mutable {
++        // A frame of an earlier configuration is not shown.
++        RefPtr protectedThis = weakThis.get();
++        bool current = protectedThis && protectedThis->m_generation == generation && protectedThis->m_configuration;
++        if (current)
++            protectedThis->m_lastFrameGPUCost = MonotonicTime::now() - presentTime;
++        sink->present(frameIndex, WTF::move(image), current ? std::optional<uint32_t> { layout } : std::nullopt, alphaMode);
++    });
++    return true;
++}
++#endif
++
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebGPU/WebGPUDawn/PresentationContext.h b/Source/WebGPU/WebGPUDawn/PresentationContext.h
+index ec16353252..bdb4579a03 100644
+--- a/Source/WebGPU/WebGPUDawn/PresentationContext.h
++++ b/Source/WebGPU/WebGPUDawn/PresentationContext.h
+@@ -75,7 +75,21 @@ public:
+ private:
+     using PresentFrameFunction = Function<void(uint32_t frameIndex, std::span<const uint8_t>, uint32_t width, uint32_t height, TextureFormat, CanvasAlphaMode)>;
+ 
++#if PS5WK_GPU_RADV
++    // GPU=radv: frames go to the compositor in shared images (PresentationContextDescriptor).
++    // Held by the frames on their way too, so that the last one finds it after this is gone.
++    struct SharedImageSink : public ThreadSafeRefCounted<SharedImageSink> {
++        Function<RefPtr<PS5SharedImage>(uint32_t width, uint32_t height, TextureFormat)> acquire;
++        Function<void(uint32_t frameIndex, Ref<PS5SharedImage>&&, std::optional<uint32_t> vkLayout, CanvasAlphaMode)> present;
++    };
++#endif
++
+     PresentationContextImpl(PresentFrameFunction&&, InstanceImpl&);
++#if PS5WK_GPU_RADV
++    // A copy of the frame into a shared image is on its way: true. False: the frame goes the
++    // pixel way.
++    bool presentWithSharedImage(uint32_t frameIndex, TextureImpl&);
++#endif
+ 
+     // As many as the Web Process keeps textures for (RemotePresentationContextProxy::textureCount).
+     // A render buffer has a texture only once the canvas uses it.
+@@ -132,6 +146,9 @@ private:
+     std::optional<QueuedFrame> m_queuedFrame;
+     Vector<uint8_t> m_rowStorage;
+     Seconds m_lastFrameGPUCost { 0_s };
++#if PS5WK_GPU_RADV
++    RefPtr<SharedImageSink> m_sharedImageSink;
++#endif
+ };
+ 
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebGPU/WebGPUDawn/Queue.cpp b/Source/WebGPU/WebGPUDawn/Queue.cpp
+index 57668693ce..89c0c74cbf 100644
+--- a/Source/WebGPU/WebGPUDawn/Queue.cpp
++++ b/Source/WebGPU/WebGPUDawn/Queue.cpp
+@@ -31,6 +31,11 @@
+ #include "Conversions.h"
+ #include "Texture.h"
+ 
++#if PS5WK_GPU_RADV
++#include "Device.h"
++#include <dawn/native/PS5HostPointerTexture.h>
++#endif
++
+ namespace WebGPU::Dawn {
+ 
+ void QueueImpl::submit(Vector<Ref<CommandBuffer>>&& commandBuffers)
+@@ -76,6 +81,30 @@ void QueueImpl::writeTexture(const TexelCopyTextureInfo& destination, std::span<
+     m_queue.WriteTexture(&dawnDestination, data.data(), data.size(), &dawnDataLayout, &dawnWriteSize);
+ }
+ 
++#if PS5WK_GPU_RADV
++// https://gpuweb.github.io/gpuweb/#dom-gpuqueue-copyexternalimagetotexture, for a video frame the
++// title copied into a shared image on the GPU. Dawn's CopyTextureForBrowser converts it to the
++// destination's format and flips it when asked; a video frame is opaque, so the alpha modes match.
++bool QueueImpl::ps5CopySharedImageToTexture(PS5SharedImage& image, uint32_t vkLayout, const TexelCopyTextureInfo& destination, const Extent3D& copySize, bool flipY, Function<void(uint32_t vkLayout)>&& released)
++{
++    RefPtr device = static_cast<DeviceImpl*>(m_device.get().get());
++    if (!device)
++        return false;
++    wgpu::Texture alias = device->ps5SharedImageAlias(image);
++    if (!alias || !dawn::native::vulkan::BeginAccessHostPointerTexturePS5(alias.Get(), static_cast<VkImageLayout>(vkLayout), true))
++        return false;
++    wgpu::TexelCopyTextureInfo source;
++    source.texture = alias;
++    auto dawnDestination = toDawn(destination);
++    auto dawnCopySize = toDawn(copySize);
++    wgpu::CopyTextureForBrowserOptions options;
++    options.flipY = flipY;
++    m_queue.CopyTextureForBrowser(&source, &dawnDestination, &dawnCopySize, &options);
++    device->ps5EndSharedImageAccess(alias, WTF::move(released));
++    return true;
++}
++#endif
++
+ void QueueImpl::setLabel(String&& label)
+ {
+     auto labelUTF8 = label.utf8();
+diff --git a/Source/WebGPU/WebGPUDawn/Queue.h b/Source/WebGPU/WebGPUDawn/Queue.h
+index 8e4feb839a..d95eee6216 100644
+--- a/Source/WebGPU/WebGPUDawn/Queue.h
++++ b/Source/WebGPU/WebGPUDawn/Queue.h
+@@ -44,6 +44,11 @@ public:
+     void onSubmittedWorkDone(CompletionHandler<void()>&&) final;
+     void writeBuffer(Buffer&, uint64_t bufferOffset, std::span<const uint8_t> data) final;
+     void writeTexture(const TexelCopyTextureInfo& destination, std::span<const uint8_t> data, const TexelCopyBufferLayout&, const Extent3D& writeSize) final;
++#if PS5WK_GPU_RADV
++    bool ps5CopySharedImageToTexture(PS5SharedImage&, uint32_t vkLayout, const TexelCopyTextureInfo&, const Extent3D&, bool flipY, Function<void(uint32_t vkLayout)>&&) final;
++    // The device whose queue this is (a DeviceImpl): its shared image aliases.
++    void setDevice(Device& device) { m_device = device; }
++#endif
+     void setLabel(String&&) final;
+     bool isValid() const final { return !!m_queue; }
+ 
+@@ -58,6 +63,9 @@ private:
+ 
+     wgpu::Queue m_queue;
+     ThreadSafeWeakPtr<InstanceImpl> m_instance;
++#if PS5WK_GPU_RADV
++    ThreadSafeWeakPtr<Device> m_device;
++#endif
+ };
+ 
+ } // namespace WebGPU::Dawn
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
+index 7ebbf101bb..777cbbe2ff 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteDevice.cpp
+@@ -37,6 +37,9 @@
+ #include "RemoteDeviceMessages.h"
+ #if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
+ #include "PS5WebGLLayers.h"
++#if PS5WK_GPU_RADV
++#include "PS5SharedImages.h"
++#endif
+ #endif
+ #include "RemoteExternalTexture.h"
+ #include "RemoteGPU.h"
+@@ -457,6 +460,23 @@ void RemoteDevice::resolveDeviceLostPromise(CompletionHandler<void(::WebGPU::Dev
+ // names it from now on): without a frame of the stream yet, one black pixel.
+ void RemoteDevice::importExternalTextureFromVideoStreamPS5(uint64_t streamKey, WebGPUIdentifier identifier)
+ {
++#if ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++    // GPU=radv: the frame is copied on the GPU into an image Dawn aliases (no readback), and the
++    // image is the stream's again once Dawn is done with it.
++    uint32_t vkLayout = 0;
++    if (RefPtr slot = PS5WebGLLayers::copyVideoFrameToSharedImage(streamKey, vkLayout)) {
++        RefPtr externalTexture = m_backing->ps5ImportSharedImage(*slot, vkLayout, [slot](uint32_t) {
++            slot->state = PS5SharedImageSlot::State::Free;
++        });
++        if (externalTexture) {
++            Ref objectHeap = m_objectHeap.get();
++            auto remoteExternalTexture = RemoteExternalTexture::create(*externalTexture, objectHeap, protect(m_streamConnection), protect(m_gpu), identifier);
++            objectHeap->addObject(identifier, remoteExternalTexture);
++            return;
++        }
++        slot->state = PS5SharedImageSlot::State::Free;
++    }
++#endif
+     Vector<uint8_t> pixels;
+     uint32_t width = 0, height = 0;
+ #if ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
+index 16e2cef10f..0b75205ef3 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
+@@ -41,6 +41,9 @@
+ 
+ #if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK)
+ #include "PS5WebGLLayers.h"
++#if PS5WK_GPU_RADV
++#include "PS5SharedImages.h"
++#endif
+ #endif
+ 
+ #if PLATFORM(COCOA) && ENABLE(VIDEO)
+@@ -296,6 +299,43 @@ void RemoteQueue::readVideoStreamFramePS5(uint64_t streamKey, CompletionHandler<
+ #endif
+     completionHandler(std::nullopt, 0, 0);
+ }
++
++// PS5, GPU=radv: copyExternalImageToTexture(video) on the GPU: the frame is copied into an image
++// Dawn aliases (no readback), scaled to the element's video size if it was decoded at another,
++// and from there into the destination. With no frame, or one smaller than the copy (a size
++// change between the page's call and this), the destination is left alone, as the pixel way
++// leaves it with no frame.
++void RemoteQueue::copyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const WebGPU::ImageCopyTexture& destination, const WebGPU::Extent3D& copySize, bool flipY)
++{
++#if ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++    Ref objectHeap = m_objectHeap.get();
++    auto convertedDestination = objectHeap->convertFromBacking(destination);
++    if (!convertedDestination)
++        return;
++    uint32_t vkLayout = 0;
++    RefPtr slot = PS5WebGLLayers::copyVideoFrameToSharedImage(streamKey, vkLayout, videoWidth, videoHeight);
++    if (!slot)
++        return;
++    if (copySize.width > slot->width || copySize.height > slot->height || copySize.depthOrArrayLayers != 1) {
++        static bool logged;
++        if (!std::exchange(logged, true))
++            WTFLogAlways("[webgpu] title: copyExternalImageToTexture of a %ux%u video frame into %ux%u: not copied", slot->width, slot->height, copySize.width, copySize.height);
++        slot->state = PS5SharedImageSlot::State::Free;
++        return;
++    }
++    if (!protect(m_backing)->ps5CopySharedImageToTexture(*slot, vkLayout, *convertedDestination, copySize, flipY, [slot](uint32_t) {
++        slot->state = PS5SharedImageSlot::State::Free;
++    }))
++        slot->state = PS5SharedImageSlot::State::Free;
++#else
++    UNUSED_PARAM(streamKey);
++    UNUSED_PARAM(videoWidth);
++    UNUSED_PARAM(videoHeight);
++    UNUSED_PARAM(destination);
++    UNUSED_PARAM(copySize);
++    UNUSED_PARAM(flipY);
++#endif
++}
+ #endif
+ 
+ void RemoteQueue::setLabel(String&& label)
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
+index bc104507ff..a58fba667e 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
+@@ -123,6 +123,7 @@ private:
+ 
+ #if USE(DAWN)
+     void readVideoStreamFramePS5(uint64_t streamKey, CompletionHandler<void(std::optional<WebCore::SharedMemoryHandle>&&, uint32_t, uint32_t)>&&);
++    void copyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const WebGPU::ImageCopyTexture& destination, const WebGPU::Extent3D& copySize, bool flipY);
+ #endif
+ 
+     void copyExternalImageToTexture(
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
+index a5e5bac178..71b8d41556 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
+@@ -49,6 +49,7 @@ messages -> RemoteQueue Stream {
+ #endif
+ #if USE(DAWN)
+     void ReadVideoStreamFramePS5(uint64_t streamKey) -> (std::optional<WebCore::SharedMemory::Handle> pixels, uint32_t width, uint32_t height) Synchronous NotStreamEncodableReply
++    void CopyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, WebKit::WebGPU::ImageCopyTexture destination, WebKit::WebGPU::Extent3D copySize, bool flipY)
+ #endif
+     void SetLabel(String label)
+ }
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5SharedImages.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5SharedImages.cpp
+new file mode 100644
+index 0000000000..322a7ed9cb
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5SharedImages.cpp
+@@ -0,0 +1,434 @@
++/*
++ * PS5, GPU=radv: images Dawn and the compositor share (PS5SharedImages.h).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ */
++
++#include "config.h"
++#include "PS5SharedImages.h"
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++
++#include <WebCore/PlatformDisplay.h>
++#include <epoxy/egl.h>
++#include <epoxy/gl.h>
++#include <vulkan/vulkan.h>
++#include <wtf/Lock.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/Vector.h>
++
++// RADV's, in the title only (weak: the WebProcess payload links this without RADV).
++extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance, const char*) __attribute__((weak));
++
++namespace WebKit {
++
++namespace {
++
++constexpr EGLint kEGLDeviceEXT = 0x322C, kEGLVulkanInstanceANGLE = 0x34A9, kEGLVulkanPhysicalDeviceANGLE = 0x34AB,
++    kEGLVulkanDeviceANGLE = 0x34AC, kEGLVulkanImageANGLE = 0x34D3, kEGLVulkanImageCreateInfoHiANGLE = 0x34D4,
++    kEGLVulkanImageCreateInfoLoANGLE = 0x34D5;
++
++// The compositor's VkDevice (ANGLE's), and what is called on it.
++struct Vulkan {
++    bool tried { false };
++    bool ready { false };
++    EGLDisplay display { EGL_NO_DISPLAY };
++    VkDevice device { VK_NULL_HANDLE };
++    VkPhysicalDeviceMemoryProperties memory { };
++    uint64_t hostAlignment { 0 };
++    PFN_vkCreateImage createImage { };
++    PFN_vkDestroyImage destroyImage { };
++    PFN_vkGetImageMemoryRequirements imageRequirements { };
++    PFN_vkAllocateMemory allocate { };
++    PFN_vkFreeMemory freeMemory { };
++    PFN_vkBindImageMemory bind { };
++    PFN_vkMapMemory map { };
++    EGLImageKHR (*createEGLImage)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*) { };
++    EGLBoolean (*destroyEGLImage)(EGLDisplay, EGLImageKHR) { };
++    void (*acquireTextures)(GLuint, const GLuint*, const GLenum*) { };
++    void (*releaseTextures)(GLuint, const GLuint*, GLenum*) { };
++};
++
++Lock s_vulkanLock;
++Vulkan s_vulkan WTF_GUARDED_BY_LOCK(s_vulkanLock);
++std::atomic<uint64_t> s_nextIdentifier { 1 };
++std::atomic<uint64_t> s_bytes { 0 };
++
++bool setUp() WTF_REQUIRES_LOCK(s_vulkanLock)
++{
++    auto& vk = s_vulkan;
++    if (vk.tried)
++        return vk.ready;
++    vk.tried = true;
++    auto fail = [](const char* why) {
++        WTFLogAlways("[webgpu] title: no images shared with the compositor (%s): WebGPU video and canvases go through the CPU", why);
++        return false;
++    };
++    vk.display = WebCore::PlatformDisplay::sharedDisplay().eglDisplay();
++    typedef EGLBoolean (*QueryDisplayAttrib)(EGLDisplay, EGLint, EGLAttrib*);
++    typedef EGLBoolean (*QueryDeviceAttrib)(void*, EGLint, EGLAttrib*);
++    auto queryDisplay = reinterpret_cast<QueryDisplayAttrib>(eglGetProcAddress("eglQueryDisplayAttribEXT"));
++    auto queryDevice = reinterpret_cast<QueryDeviceAttrib>(eglGetProcAddress("eglQueryDeviceAttribEXT"));
++    EGLAttrib eglDevice = 0, instance = 0, physical = 0, device = 0;
++    if (!queryDisplay || !queryDevice || !queryDisplay(vk.display, kEGLDeviceEXT, &eglDevice)
++        || !queryDevice(reinterpret_cast<void*>(eglDevice), kEGLVulkanInstanceANGLE, &instance)
++        || !queryDevice(reinterpret_cast<void*>(eglDevice), kEGLVulkanPhysicalDeviceANGLE, &physical)
++        || !queryDevice(reinterpret_cast<void*>(eglDevice), kEGLVulkanDeviceANGLE, &device))
++        return fail("the compositor's display is not ANGLE on Vulkan");
++    if (!vk_icdGetInstanceProcAddr)
++        return fail("RADV is not linked in");
++    auto vkInstance = reinterpret_cast<VkInstance>(instance);
++    auto vkPhysical = reinterpret_cast<VkPhysicalDevice>(physical);
++    vk.device = reinterpret_cast<VkDevice>(device);
++    auto getDeviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(vk_icdGetInstanceProcAddr(vkInstance, "vkGetDeviceProcAddr"));
++    auto memoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(vk_icdGetInstanceProcAddr(vkInstance, "vkGetPhysicalDeviceMemoryProperties"));
++    auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(vk_icdGetInstanceProcAddr(vkInstance, "vkGetPhysicalDeviceProperties2"));
++    if (!getDeviceProc || !memoryProperties || !properties2)
++        return fail("no Vulkan entry points");
++    memoryProperties(vkPhysical, &vk.memory);
++    VkPhysicalDeviceExternalMemoryHostPropertiesEXT host = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
++    VkPhysicalDeviceProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host };
++    properties2(vkPhysical, &properties);
++    // What Dawn's import needs, and the 64 KiB tiles of the GPU's own layouts.
++    vk.hostAlignment = std::max<uint64_t>(host.minImportedHostPointerAlignment, 0x10000);
++#define DEVICE_PROC(field, name) vk.field = reinterpret_cast<PFN_##name>(getDeviceProc(vk.device, #name))
++    DEVICE_PROC(createImage, vkCreateImage);
++    DEVICE_PROC(destroyImage, vkDestroyImage);
++    DEVICE_PROC(imageRequirements, vkGetImageMemoryRequirements);
++    DEVICE_PROC(allocate, vkAllocateMemory);
++    DEVICE_PROC(freeMemory, vkFreeMemory);
++    DEVICE_PROC(bind, vkBindImageMemory);
++    DEVICE_PROC(map, vkMapMemory);
++#undef DEVICE_PROC
++    vk.createEGLImage = reinterpret_cast<decltype(vk.createEGLImage)>(eglGetProcAddress("eglCreateImageKHR"));
++    vk.destroyEGLImage = reinterpret_cast<decltype(vk.destroyEGLImage)>(eglGetProcAddress("eglDestroyImageKHR"));
++    vk.acquireTextures = reinterpret_cast<decltype(vk.acquireTextures)>(eglGetProcAddress("glAcquireTexturesANGLE"));
++    vk.releaseTextures = reinterpret_cast<decltype(vk.releaseTextures)>(eglGetProcAddress("glReleaseTexturesANGLE"));
++    vk.ready = vk.createImage && vk.destroyImage && vk.imageRequirements && vk.allocate && vk.freeMemory && vk.bind && vk.map
++        && vk.createEGLImage && vk.destroyEGLImage && vk.acquireTextures && vk.releaseTextures && host.minImportedHostPointerAlignment;
++    if (!vk.ready)
++        return fail("missing Vulkan, EGL image or ANGLE texture entry points, or VK_EXT_external_memory_host");
++    WTFLogAlways("[webgpu] title: images shared with the compositor (host-pointer import, alignment %llu)", static_cast<unsigned long long>(host.minImportedHostPointerAlignment));
++    return true;
++}
++
++GLenum glLayout(uint32_t vkLayout)
++{
++    switch (static_cast<VkImageLayout>(vkLayout)) {
++    case VK_IMAGE_LAYOUT_GENERAL: return GL_LAYOUT_GENERAL_EXT;
++    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return GL_LAYOUT_COLOR_ATTACHMENT_EXT;
++    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return GL_LAYOUT_SHADER_READ_ONLY_EXT;
++    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return GL_LAYOUT_TRANSFER_SRC_EXT;
++    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return GL_LAYOUT_TRANSFER_DST_EXT;
++    default: return GL_NONE;
++    }
++}
++
++uint32_t vkLayout(GLenum layout)
++{
++    switch (layout) {
++    case GL_LAYOUT_GENERAL_EXT: return VK_IMAGE_LAYOUT_GENERAL;
++    case GL_LAYOUT_COLOR_ATTACHMENT_EXT: return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    case GL_LAYOUT_SHADER_READ_ONLY_EXT: return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    case GL_LAYOUT_TRANSFER_SRC_EXT: return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    case GL_LAYOUT_TRANSFER_DST_EXT: return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    default: return VK_IMAGE_LAYOUT_UNDEFINED;
++    }
++}
++
++} // namespace
++
++struct PS5SharedImageSlot::Objects {
++    VkExternalMemoryImageCreateInfo external { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
++    VkImageCreateInfo info { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    VkImage image { VK_NULL_HANDLE };
++    VkDeviceMemory memory { VK_NULL_HANDLE };
++    EGLImageKHR eglImage { EGL_NO_IMAGE_KHR };
++    GLuint texture { 0 };
++    bool acquired { false };
++    uint64_t bytes { 0 };
++    // Garbage: past this fence (after the texture's deletion) ANGLE is done with the image.
++    GLsync freed { nullptr };
++};
++
++namespace {
++
++// The objects of slots no one has any more, and slots given back; render thread.
++Lock s_garbageLock;
++Vector<PS5SharedImageSlot::Objects*>& garbage() WTF_REQUIRES_LOCK(s_garbageLock)
++{
++    static NeverDestroyed<Vector<PS5SharedImageSlot::Objects*>> objects;
++    return objects;
++}
++struct Returning {
++    Ref<PS5SharedImageSlot> slot;
++    GLsync fence;
++};
++Vector<Returning>& returning() WTF_REQUIRES_LOCK(s_garbageLock)
++{
++    static NeverDestroyed<Vector<Returning>> slots;
++    return slots;
++}
++
++void destroyObjects(PS5SharedImageSlot::Objects* objects)
++{
++    Locker locker { s_vulkanLock };
++    auto& vk = s_vulkan;
++    if (objects->eglImage != EGL_NO_IMAGE_KHR)
++        vk.destroyEGLImage(vk.display, objects->eglImage);
++    if (objects->image)
++        vk.destroyImage(vk.device, objects->image, nullptr);
++    if (objects->memory)
++        vk.freeMemory(vk.device, objects->memory, nullptr);
++    s_bytes -= objects->bytes;
++    delete objects;
++}
++
++} // namespace
++
++RefPtr<PS5SharedImageSlot> PS5SharedImageSlot::create(uint32_t width, uint32_t height, ::WebGPU::TextureFormat format)
++{
++    if (!width || !height || width > 8192 || height > 8192)
++        return nullptr;
++    VkFormat vkFormat;
++    switch (format) {
++    case ::WebGPU::TextureFormat::Rgba8unorm:
++        vkFormat = VK_FORMAT_R8G8B8A8_UNORM;
++        break;
++    case ::WebGPU::TextureFormat::Bgra8unorm:
++        vkFormat = VK_FORMAT_B8G8R8A8_UNORM;
++        break;
++    default:
++        return nullptr;
++    }
++
++    Locker locker { s_vulkanLock };
++    if (!setUp())
++        return nullptr;
++    auto& vk = s_vulkan;
++    static bool loggedFailure;
++    auto fail = [&](const char* what, int result, Objects* objects) -> RefPtr<PS5SharedImageSlot> {
++        if (!std::exchange(loggedFailure, true))
++            WTFLogAlways("[webgpu] title: a %ux%u image shared with the compositor could not be made (%s %d)", width, height, what, result);
++        if (objects->memory)
++            vk.freeMemory(vk.device, objects->memory, nullptr);
++        if (objects->image)
++            vk.destroyImage(vk.device, objects->image, nullptr);
++        delete objects;
++        return nullptr;
++    };
++
++    auto* objects = new Objects;
++    objects->external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++    auto& info = objects->info;
++    // With the external-memory struct: RADV then gives it no DCC or HTILE, and Dawn's image of
++    // the same create info has the same layout (15e: without it the two differ).
++    info.pNext = &objects->external;
++    info.imageType = VK_IMAGE_TYPE_2D;
++    info.format = vkFormat;
++    info.extent = { width, height, 1 };
++    info.mipLevels = 1;
++    info.arrayLayers = 1;
++    info.samples = VK_SAMPLE_COUNT_1_BIT;
++    info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    VkResult result = vk.createImage(vk.device, &info, nullptr, &objects->image);
++    if (result != VK_SUCCESS)
++        return fail("vkCreateImage", result, objects);
++    VkMemoryRequirements requirements;
++    vk.imageRequirements(vk.device, objects->image, &requirements);
++    // Host-visible (it must be mapped: the mapping is the address), device-local if there is one.
++    int type = -1;
++    const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    for (int pass = 0; pass < 2 && type < 0; pass++) {
++        for (uint32_t i = 0; i < vk.memory.memoryTypeCount && type < 0; i++) {
++            VkMemoryPropertyFlags flags = vk.memory.memoryTypes[i].propertyFlags;
++            if ((requirements.memoryTypeBits & (1u << i)) && (flags & need) == need && (pass || (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
++                type = static_cast<int>(i);
++        }
++    }
++    if (type < 0)
++        return fail("no host-visible memory type", static_cast<int>(requirements.memoryTypeBits), objects);
++    // Whole import granules, so that Dawn can import all of it.
++    objects->bytes = (requirements.size + vk.hostAlignment - 1) & ~(vk.hostAlignment - 1);
++    VkMemoryDedicatedAllocateInfo dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
++    dedicated.image = objects->image;
++    VkMemoryAllocateInfo allocation = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated };
++    allocation.allocationSize = objects->bytes;
++    allocation.memoryTypeIndex = static_cast<uint32_t>(type);
++    result = vk.allocate(vk.device, &allocation, nullptr, &objects->memory);
++    if (result != VK_SUCCESS)
++        return fail("vkAllocateMemory", result, objects);
++    result = vk.bind(vk.device, objects->image, objects->memory, 0);
++    if (result != VK_SUCCESS)
++        return fail("vkBindImageMemory", result, objects);
++    void* address = nullptr;
++    result = vk.map(vk.device, objects->memory, 0, VK_WHOLE_SIZE, 0, &address);
++    if (result != VK_SUCCESS || !address || (reinterpret_cast<uintptr_t>(address) & (vk.hostAlignment - 1)))
++        return fail("vkMapMemory (or the address is not aligned)", result, objects);
++
++    const uint64_t infoAddress = reinterpret_cast<uintptr_t>(&objects->info);
++    const EGLint attributes[] = {
++        kEGLVulkanImageCreateInfoHiANGLE, static_cast<EGLint>(infoAddress >> 32),
++        kEGLVulkanImageCreateInfoLoANGLE, static_cast<EGLint>(infoAddress & 0xffffffffu),
++        EGL_NONE
++    };
++    objects->eglImage = vk.createEGLImage(vk.display, EGL_NO_CONTEXT, kEGLVulkanImageANGLE, reinterpret_cast<EGLClientBuffer>(&objects->image), attributes);
++    if (objects->eglImage == EGL_NO_IMAGE_KHR)
++        return fail("eglCreateImageKHR(EGL_VULKAN_IMAGE_ANGLE)", eglGetError(), objects);
++
++    s_bytes += objects->bytes;
++    RefPtr slot = adoptRef(*new PS5SharedImageSlot);
++    slot->m_objects = objects;
++    slot->identifier = s_nextIdentifier++;
++    slot->address = address;
++    slot->size = objects->bytes;
++    slot->vkImageCreateInfo = &objects->info;
++    slot->width = width;
++    slot->height = height;
++    slot->format = format;
++    return slot;
++}
++
++PS5SharedImageSlot::~PS5SharedImageSlot()
++{
++    if (!m_objects)
++        return;
++    Locker locker { s_garbageLock };
++    garbage().append(std::exchange(m_objects, nullptr));
++}
++
++unsigned PS5SharedImageSlot::glTexture()
++{
++    if (!m_objects->texture) {
++        GLint previous = 0;
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
++        glGenTextures(1, &m_objects->texture);
++        glBindTexture(GL_TEXTURE_2D, m_objects->texture);
++        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_objects->eglImage);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glBindTexture(GL_TEXTURE_2D, previous);
++    }
++    return m_objects->texture;
++}
++
++void PS5SharedImageSlot::acquireForGL(uint32_t layout)
++{
++    GLuint texture = glTexture();
++    const GLenum gl = glLayout(layout);
++    void (*acquire)(GLuint, const GLuint*, const GLenum*);
++    {
++        Locker locker { s_vulkanLock };
++        acquire = s_vulkan.acquireTextures;
++    }
++    acquire(1, &texture, &gl);
++    m_objects->acquired = true;
++}
++
++uint32_t PS5SharedImageSlot::releaseFromGL()
++{
++    if (!m_objects->acquired)
++        return VK_IMAGE_LAYOUT_UNDEFINED;
++    GLuint texture = glTexture();
++    GLenum layout = GL_NONE;
++    void (*release)(GLuint, const GLuint*, GLenum*);
++    {
++        Locker locker { s_vulkanLock };
++        release = s_vulkan.releaseTextures;
++    }
++    release(1, &texture, &layout);
++    m_objects->acquired = false;
++    return vkLayout(layout);
++}
++
++namespace PS5SharedImages {
++
++bool available()
++{
++    Locker locker { s_vulkanLock };
++    return setUp();
++}
++
++void giveBack(PS5SharedImageSlot& slot)
++{
++    slot.releaseFromGL();
++    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    glFlush();
++    slot.state = PS5SharedImageSlot::State::Returning;
++    Locker locker { s_garbageLock };
++    returning().append({ Ref { slot }, fence });
++}
++
++void collectGarbage()
++{
++    Vector<Returning> back;
++    Vector<PS5SharedImageSlot::Objects*> objects;
++    {
++        Locker locker { s_garbageLock };
++        back = std::exchange(returning(), { });
++        objects = std::exchange(garbage(), { });
++    }
++    Vector<Returning> stillReturning;
++    for (auto& entry : back) {
++        GLenum status = entry.fence ? glClientWaitSync(entry.fence, 0, 0) : GL_ALREADY_SIGNALED;
++        if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED || status == GL_WAIT_FAILED) {
++            if (entry.fence)
++                glDeleteSync(entry.fence);
++            entry.slot->state = PS5SharedImageSlot::State::Free;
++        } else
++            stillReturning.append(WTF::move(entry));
++    }
++    // Dropped outside the lock: the last reference to a slot puts its objects in the garbage.
++    back.clear();
++
++    Vector<PS5SharedImageSlot::Objects*> stillGarbage;
++    for (auto* object : objects) {
++        if (!object->freed) {
++            if (object->texture) {
++                if (object->acquired) {
++                    GLenum layout = GL_NONE;
++                    void (*release)(GLuint, const GLuint*, GLenum*);
++                    {
++                        Locker locker { s_vulkanLock };
++                        release = s_vulkan.releaseTextures;
++                    }
++                    release(1, &object->texture, &layout);
++                }
++                glDeleteTextures(1, &object->texture);
++                object->texture = 0;
++            }
++            object->freed = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            glFlush();
++            stillGarbage.append(object);
++            continue;
++        }
++        GLenum status = glClientWaitSync(object->freed, 0, 0);
++        if (status == GL_TIMEOUT_EXPIRED) {
++            stillGarbage.append(object);
++            continue;
++        }
++        glDeleteSync(object->freed);
++        destroyObjects(object);
++    }
++
++    if (stillReturning.isEmpty() && stillGarbage.isEmpty())
++        return;
++    Locker locker { s_garbageLock };
++    returning().appendVector(WTF::move(stillReturning));
++    garbage().appendVector(stillGarbage);
++}
++
++uint64_t bytes()
++{
++    return s_bytes.load();
++}
++
++} // namespace PS5SharedImages
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5SharedImages.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5SharedImages.h
+new file mode 100644
+index 0000000000..5018355be2
+--- /dev/null
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5SharedImages.h
+@@ -0,0 +1,86 @@
++/*
++ * PS5, GPU=radv: images Dawn and the compositor share (HANDOVER-radv.md Phase 4).
++ * Copyright (C) 2026 Parallax Browser contributors. BSD-2-Clause, as WebKit.
++ *
++ * The compositor (ANGLE on Vulkan) and Dawn are two VkDevices on one RADV in
++ * one process. A PS5 RADV buffer's GPU address is its CPU mapping, and Dawn's
++ * host-pointer import of that memory reaches it at the same address, so an
++ * image made here and an image Dawn makes from the same create info (both with
++ * VkExternalMemoryImageCreateInfo { HOST_ALLOCATION }) are one image
++ * (spikes/15-radv-only 15e; Dawn's side: port/deps/patches/dawn-radv). There
++ * are no shared semaphores: whoever hands the image over has waited for its
++ * own GPU work first (glFinish or a GL fence here, OnSubmittedWorkDone there).
++ *
++ * Two users:
++ * - video into WebGPU (PS5WebGPUVideoRead.cpp): the video stream's frame is
++ *   copied into one with GL on RemoteGPU's work queue, and Dawn samples it as
++ *   an external texture;
++ * - canvas frames out of WebGPU (PS5WebGPUCanvas.cpp): Dawn copies a presented
++ *   frame into one, and the WC scene draws it.
++ */
++
++#pragma once
++
++#if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++
++#include <WebCore/WebGPUCppAPI.h>
++#include <atomic>
++#include <wtf/RefPtr.h>
++
++namespace WebKit {
++
++class PS5SharedImageSlot final : public ::WebGPU::PS5SharedImage {
++public:
++    // Who has the image. Free: whoever takes it next. Dawn: Dawn is copying into or reading it.
++    // Compositor: GL has it (acquired). Returning: GL let it go and its fence has not passed.
++    enum class State : uint8_t { Free, Dawn, Compositor, Returning };
++
++    // Any thread: an RGBA8 or BGRA8 image of the compositor's VkDevice, in host-visible memory,
++    // with its EGL image. Null when the compositor is not ANGLE on Vulkan or memory is short
++    // (logged once).
++    static RefPtr<PS5SharedImageSlot> create(uint32_t width, uint32_t height, ::WebGPU::TextureFormat);
++    // Its objects go to PS5SharedImages::collectGarbage().
++    ~PS5SharedImageSlot();
++
++    // A thread with a context of the compositor's share group current. The GL texture over the
++    // image, made by the first call.
++    unsigned glTexture();
++    // GL takes the image: its contents are kept when `vkLayout` (a VkImageLayout) is not
++    // UNDEFINED. Then gives it back, with the layout GL left it in.
++    void acquireForGL(uint32_t vkLayout);
++    uint32_t releaseFromGL();
++
++    std::atomic<State> state { State::Free };
++    uint64_t bytes() const { return size; }
++
++    // Its Vulkan, EGL and GL objects (PS5SharedImages.cpp).
++    struct Objects;
++
++private:
++    PS5SharedImageSlot() = default;
++
++    Objects* m_objects { nullptr };
++};
++
++namespace PS5SharedImages {
++
++// The compositor is ANGLE on Vulkan over RADV, and images can be made (set up on first call).
++bool available();
++
++// Render thread, with the compositor's context current (the canvas's frame is no longer
++// shown): GL lets the slot go, and it is Free once the GPU is past that. Takes a reference.
++void giveBack(PS5SharedImageSlot&);
++
++// Render thread, compositor context current, every frame (PS5WebGLLayers::collectGarbage):
++// slots given back whose fence has passed become Free; images no one has any more are freed
++// once the GPU is done with them.
++void collectGarbage();
++
++// How much memory the images take, for the [mem] line.
++uint64_t bytes();
++
++} // namespace PS5SharedImages
++
++} // namespace WebKit
++
++#endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+index 7b9a5006a3..e015fd58cd 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.cpp
+@@ -8,6 +8,9 @@
+ #if USE(DAWN)
+ #include "PS5WebGPUCanvas.h"
+ #endif
++#if USE(DAWN) && PS5WK_GPU_RADV
++#include "PS5SharedImages.h"
++#endif
+ 
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
+ 
+@@ -157,6 +160,9 @@ void collectGarbage()
+ #if USE(DAWN)
+     PS5WebGPUCanvas::trimSpareTextures();
+ #endif
++#if USE(DAWN) && PS5WK_GPU_RADV
++    PS5SharedImages::collectGarbage();
++#endif
+ }
+ 
+ static std::atomic<CopyVideoFrameFunction> s_copyVideoFrame;
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+index a6154bc57f..e3f521392a 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLLayers.h
+@@ -31,6 +31,8 @@
+ 
+ namespace WebKit {
+ 
++class PS5SharedImageSlot;
++
+ class PS5WebGLLayer final : public ThreadSafeRefCounted<PS5WebGLLayer>, public WebCore::TextureMapperPlatformLayer {
+ public:
+     static Ref<PS5WebGLLayer> create() { return adoptRef(*new PS5WebGLLayer); }
+@@ -108,6 +110,15 @@ bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY);
+ // RemoteGPU's work queue (PS5WebGPUVideoRead.cpp, WebGPU builds): the newest frame of the
+ // stream as RGBA8 rows from the picture's top. False: no frame.
+ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);
++#if PS5WK_GPU_RADV && USE(DAWN)
++// RemoteGPU's work queue (GPU=radv, PS5WebGPUVideoRead.cpp): the newest frame of the stream
++// copied with GL into an image shared with Dawn (PS5SharedImages.h), GL's work on it finished.
++// The image is the caller's (its state is Dawn) until the caller sets it Free again; `vkLayout`
++// is the layout GL left it in. Null: no frame, or no image (the caller reads pixels instead).
++// With a want size (the video element's videoWidth x videoHeight) other than the decoded one,
++// the image is that size and the frame is scaled into it; 0, 0: the decoded size.
++RefPtr<PS5SharedImageSlot> copyVideoFrameToSharedImage(uint64_t key, uint32_t& vkLayout, uint32_t wantWidth = 0, uint32_t wantHeight = 0);
++#endif
+ // eglBindAPI(EGL_OPENGL_ES_API) on this thread (ps5-opengl's EGL).
+ void bindESAPI();
+ // glFlush of the native context current on this thread, if any (ps5-opengl): what ANGLE drew is
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+index 060b8e6d69..19de610165 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.cpp
+@@ -10,6 +10,9 @@
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
+ 
+ #include "PS5WebGLLayers.h"
++#if PS5WK_GPU_RADV
++#include "PS5SharedImages.h"
++#endif
+ #include <WebCore/BitmapTexture.h>
+ #include <WebCore/CoordinatedPlatformLayerBuffer.h>
+ #include <WebCore/PixelFormat.h>
+@@ -114,6 +117,58 @@ private:
+     RefPtr<BitmapTexture> m_texture;
+ };
+ 
++#if PS5WK_GPU_RADV
++// GPU=radv: one frame in an image shared with the compositor (PS5SharedImages.h), as the layer's
++// buffer. Render thread: GL takes the image before the first paint that shows it (latch), and
++// lets it go when the buffer dies (PS5WebGLLayers::collectGarbage); it is free for Dawn again once
++// the GPU is past the compositor's last draw of it.
++class SharedImageBuffer final : public CoordinatedPlatformLayerBuffer {
++public:
++    SharedImageBuffer(Ref<PS5SharedImageSlot>&& slot, uint32_t vkLayout, bool opaque)
++        : CoordinatedPlatformLayerBuffer(Type::RGB, IntSize(slot->width, slot->height), { }, nullptr)
++        , m_slot(WTF::move(slot))
++        , m_vkLayout(vkLayout)
++        , m_opaque(opaque)
++    {
++    }
++
++    ~SharedImageBuffer()
++    {
++        if (m_taken)
++            PS5SharedImages::giveBack(m_slot.get());
++        else
++            m_slot->state = PS5SharedImageSlot::State::Free; // never shown: GL never had it
++    }
++
++    // Render thread, the compositor's context current, outside TextureMapper's passes.
++    void take()
++    {
++        if (m_taken)
++            return;
++        m_slot->acquireForGL(m_vkLayout);
++        m_slot->state = PS5SharedImageSlot::State::Compositor;
++        m_taken = true;
++    }
++
++private:
++    void paintToTextureMapper(TextureMapper& textureMapper, const FloatRect& targetRect, const TransformationMatrix& modelViewMatrix, float opacity) final
++    {
++        // Row 0 is the canvas's top, as a BitmapTexture's from its pixels; an opaque canvas's alpha
++        // is not looked at (no blending), a premultiplied one's is.
++        if (m_taken)
++            textureMapper.drawTexture(m_slot->glTexture(), m_opaque ? OptionSet<TextureMapperFlags> { } : TextureMapperFlags::ShouldBlend, targetRect, modelViewMatrix, opacity);
++    }
++
++    const Ref<PS5SharedImageSlot> m_slot;
++    const uint32_t m_vkLayout;
++    const bool m_opaque;
++    bool m_taken { false };
++};
++
++// A canvas keeps at most this many: one shown, one waiting to be, one or two being copied into.
++constexpr size_t maximumSharedImagesPerCanvas = 4;
++#endif
++
+ } // namespace
+ 
+ // The pixels of the frames all canvases hold on the CPU (each canvas: the one shown, the one
+@@ -207,6 +262,59 @@ RefPtr<PS5WebGPUCanvas::Frame> PS5WebGPUCanvas::lastFrame() const
+     return m_lastFrame;
+ }
+ 
++#if PS5WK_GPU_RADV
++RefPtr<PS5SharedImageSlot> PS5WebGPUCanvas::acquireSharedImage(uint32_t width, uint32_t height, ::WebGPU::TextureFormat format)
++{
++    Locker locker { m_slotsLock };
++    // Images of another size or format go once they are free (their objects at the render
++    // thread's next frame).
++    m_slots.removeAllMatching([&](auto& slot) {
++        return (slot->width != width || slot->height != height || slot->format != format) && slot->state == PS5SharedImageSlot::State::Free;
++    });
++    for (auto& slot : m_slots) {
++        auto expected = PS5SharedImageSlot::State::Free;
++        if (slot->width == width && slot->height == height && slot->format == format && slot->state.compare_exchange_strong(expected, PS5SharedImageSlot::State::Dawn))
++            return slot.ptr();
++    }
++    if (m_slots.size() >= maximumSharedImagesPerCanvas)
++        return nullptr;
++    // The bound the pixel way has for the frames all canvases hold.
++    const uint64_t bytes = static_cast<uint64_t>(width) * height * 4;
++    if (PS5SharedImages::bytes() + bytes > maximumFrameBytes) {
++        if (!std::exchange(m_loggedSharedBudget, true))
++            WTFLogAlways("[webgpu] title: canvas %" PRIx64 ": frame not shown, the canvases' images already take %.0f MB", m_key & ~keyTag, PS5SharedImages::bytes() / 1048576.0);
++        return nullptr;
++    }
++    RefPtr slot = PS5SharedImageSlot::create(width, height, format);
++    if (!slot)
++        return nullptr;
++    slot->state = PS5SharedImageSlot::State::Dawn;
++    m_slots.append(*slot);
++    uint64_t total = 0;
++    for (auto& each : m_slots)
++        total += each->bytes();
++    m_layer->setDrawingBufferBytes(total);
++    return slot;
++}
++
++void PS5WebGPUCanvas::sharedImageWasPresented(Ref<PS5SharedImageSlot>&& slot, std::optional<uint32_t> vkLayout, ::WebGPU::CanvasAlphaMode alphaMode)
++{
++    if (!vkLayout) {
++        slot->state = PS5SharedImageSlot::State::Free;
++        return;
++    }
++    const uint32_t width = slot->width, height = slot->height;
++    const auto format = slot->format;
++    auto buffer = makeUnique<SharedImageBuffer>(WTF::move(slot), *vkLayout, alphaMode == ::WebGPU::CanvasAlphaMode::Opaque);
++    auto* bufferPointer = buffer.get();
++    m_layer->setBuffer(WTF::move(buffer), [bufferPointer] {
++        bufferPointer->take();
++    });
++    if (!std::exchange(m_loggedSharedFirstFrame, true))
++        WTFLogAlways("[webgpu] title: canvas %" PRIx64 ": first frame, %ux%u, format %u, %s, in an image shared with the compositor (no CPU copy)", m_key & ~keyTag, width, height, static_cast<unsigned>(format), alphaMode == ::WebGPU::CanvasAlphaMode::Opaque ? "opaque" : "premultiplied");
++}
++#endif
++
+ } // namespace WebKit
+ 
+ #endif
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
+index 6a0152e487..053671980d 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUCanvas.h
+@@ -20,6 +20,7 @@
+ namespace WebKit {
+ 
+ class PS5WebGLLayer;
++class PS5SharedImageSlot;
+ 
+ // A WebGPU canvas in the title: the frames Dawn hands over as pixels
+ // (WebGPU::PresentationContextDescriptor::presentFrame; Dawn on RADV shares
+@@ -62,6 +63,16 @@ public:
+     // Any thread: the newest frame, or null before the first.
+     RefPtr<Frame> lastFrame() const;
+ 
++#if PS5WK_GPU_RADV
++    // GPU=radv (PS5SharedImages.h): frames in images shared with the compositor, with no copy
++    // through the CPU. Work queue: a free image of the size and format for Dawn to copy a frame
++    // into (its state then Dawn), or null when the compositor still has all of them.
++    RefPtr<PS5SharedImageSlot> acquireSharedImage(uint32_t width, uint32_t height, ::WebGPU::TextureFormat);
++    // Work queue: Dawn's copy into the image is done, and it is in `vkLayout`; or, with none,
++    // nothing was copied into it. lastFrame() has no pixels for these frames.
++    void sharedImageWasPresented(Ref<PS5SharedImageSlot>&&, std::optional<uint32_t> vkLayout, ::WebGPU::CanvasAlphaMode);
++#endif
++
+ private:
+     PS5WebGPUCanvas(WebCore::ProcessIdentifier, uint64_t key);
+ 
+@@ -73,6 +84,12 @@ private:
+     bool m_loggedFormat { false };
+     bool m_loggedFrameBudget { false };
+     bool m_loggedFirstFrame { false };
++#if PS5WK_GPU_RADV
++    Lock m_slotsLock;
++    Vector<Ref<PS5SharedImageSlot>> m_slots WTF_GUARDED_BY_LOCK(m_slotsLock);
++    bool m_loggedSharedFirstFrame { false };
++    bool m_loggedSharedBudget { false };
++#endif
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+index b2948ce6d8..7fe8e0a3d8 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGPUVideoRead.cpp
+@@ -8,6 +8,9 @@
+ 
+ #if ENABLE(GPU_PROCESS) && ENABLE(WEBGL) && USE(DAWN) && USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS) && defined(PS5_PAYLOAD_SDK)
+ 
++#if PS5WK_GPU_RADV
++#include "PS5SharedImages.h"
++#endif
+ #include <WebCore/GLContext.h>
+ #include <WebCore/PlatformDisplay.h>
+ #include <epoxy/egl.h>
+@@ -43,8 +46,25 @@ struct Reader {
+     GLuint buffer { 0 };
+     size_t bufferBytes { 0 };
+     bool computeFailed { false };
++#if PS5WK_GPU_RADV
++    // GPU=radv: the images video frames are copied into for Dawn (copyVideoFrameToSharedImage), of
++    // the newest size only. A page that imports every frame has two or three with Dawn at a time.
++    Vector<Ref<PS5SharedImageSlot>> slots;
++    unsigned sharedCopies { 0 };
++    unsigned sharedWindow { 0 };
++    double sharedMilliseconds { 0 };
++    bool sharedFailed { false };
++#endif
+ };
+ 
++#if PS5WK_GPU_RADV
++// An image goes back once Dawn's work with its external texture is done, which is a frame or two
++// after the task that imported it; one the page drops without it expiring comes back when it is
++// collected. Past these the frame is read back the old way.
++constexpr size_t maximumSharedSlots = 8;
++constexpr uint64_t maximumSharedSlotBytes = 192 * MB;
++#endif
++
+ constexpr GLuint outputBinding = 6;
+ 
+ bool readWithCompute(Reader& state, int width, int height, std::span<uint8_t> rgba)
+@@ -130,8 +150,152 @@ Reader& reader()
+     return instance;
+ }
+ 
++// Each RemoteGPU has a work queue of its own, and they share the reader.
++Lock s_readerLock;
++
++// The reader's context, made the first time (readerLock held).
++bool readerContextReady(Reader& state)
++{
++    if (!state.context && !state.failed) {
++        bindESAPI();
++        auto& display = WebCore::PlatformDisplay::sharedDisplay();
++        state.context = WebCore::GLContext::create(display.glDisplay(), WebCore::GLContext::Target::Surfaceless, display.sharingGLContext());
++        state.failed = !state.context;
++        WTFLogAlways("[webgpu] title: video read context %s", state.failed ? "could not be made: video sources stay black" : "ready");
++    }
++    return !!state.context;
++}
++
++// The frame-size texture the title's frame is copied into first (readerLock held, the reader's
++// context current).
++void ensureFrameTexture(Reader& state, int frameWidth, int frameHeight)
++{
++    if (state.texture && state.width == frameWidth && state.height == frameHeight)
++        return;
++    if (state.texture)
++        glDeleteTextures(1, &state.texture);
++    if (!state.framebuffer)
++        glGenFramebuffers(1, &state.framebuffer);
++    glGenTextures(1, &state.texture);
++    glBindTexture(GL_TEXTURE_2D, state.texture);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frameWidth, frameHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    state.width = frameWidth;
++    state.height = frameHeight;
++}
++
+ } // namespace
+ 
++#if PS5WK_GPU_RADV
++RefPtr<PS5SharedImageSlot> copyVideoFrameToSharedImage(uint64_t key, uint32_t& vkLayout, uint32_t wantWidth, uint32_t wantHeight)
++{
++    auto copy = copyVideoFrameFunction();
++    auto frameSize = videoFrameSizeFunction();
++    int frameWidth = 0, frameHeight = 0;
++    if (!key || !copy || !frameSize || !frameSize(key, &frameWidth, &frameHeight))
++        return nullptr;
++    if (frameWidth <= 0 || frameHeight <= 0 || frameWidth > 8192 || frameHeight > 8192)
++        return nullptr;
++    // The size the page sees (videoWidth x videoHeight) when it isn't the decoded one (anamorphic
++    // video, a crop, or a stream whose size just changed): the frame is scaled to it on the GPU,
++    // as the pixel way scaled it on the CPU, so the copy's texels are where the page expects.
++    if (wantWidth > 8192 || wantHeight > 8192)
++        return nullptr;
++    const bool scale = wantWidth && wantHeight && (wantWidth != static_cast<uint32_t>(frameWidth) || wantHeight != static_cast<uint32_t>(frameHeight));
++
++    Locker locker { s_readerLock };
++    auto& state = reader();
++    if (state.sharedFailed || !PS5SharedImages::available() || !readerContextReady(state))
++        return nullptr;
++
++    // A free image of the frame's size; the others go once free (their objects at the render
++    // thread's next frame).
++    const uint32_t width = scale ? wantWidth : frameWidth, height = scale ? wantHeight : frameHeight;
++    state.slots.removeAllMatching([&](auto& slot) {
++        return (slot->width != width || slot->height != height) && slot->state == PS5SharedImageSlot::State::Free;
++    });
++    RefPtr<PS5SharedImageSlot> slot;
++    for (auto& candidate : state.slots) {
++        auto expected = PS5SharedImageSlot::State::Free;
++        if (candidate->width == width && candidate->height == height && candidate->state.compare_exchange_strong(expected, PS5SharedImageSlot::State::Dawn)) {
++            slot = candidate.ptr();
++            break;
++        }
++    }
++    if (!slot) {
++        uint64_t bytes = 0;
++        for (auto& each : state.slots)
++            bytes += each->bytes();
++        if (state.slots.size() >= maximumSharedSlots || bytes + static_cast<uint64_t>(width) * height * 4 > maximumSharedSlotBytes)
++            return nullptr;
++        slot = PS5SharedImageSlot::create(width, height, ::WebGPU::TextureFormat::Rgba8unorm);
++        if (!slot) {
++            state.sharedFailed = true;
++            return nullptr;
++        }
++        slot->state = PS5SharedImageSlot::State::Dawn;
++        state.slots.append(*slot);
++    }
++
++    EGLDisplay display = WebCore::PlatformDisplay::sharedDisplay().eglDisplay();
++    auto start = MonotonicTime::now();
++    bool ok = false;
++    bindESAPI();
++    if (eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, static_cast<EGLContext>(state.context->platformContext()))) {
++        // The copy overwrites all of it: what was there before does not matter.
++        slot->acquireForGL(0 /* VK_IMAGE_LAYOUT_UNDEFINED */);
++        // Row 0 of the copy is the picture's top (flipY false), as WebGPU's texel (0, 0) is. To be
++        // scaled, the frame goes into the frame-size texture first, then is stretched across.
++        if (scale)
++            ensureFrameTexture(state, frameWidth, frameHeight);
++        if (void* done = copy(key, scale ? state.texture : slot->glTexture(), false)) {
++            glDeleteSync(static_cast<GLsync>(done));
++            // The stream's size may have changed since it was asked for: then the copy covered part
++            // of the image only.
++            int copiedWidth = 0, copiedHeight = 0;
++            ok = frameSize(key, &copiedWidth, &copiedHeight) && copiedWidth == frameWidth && copiedHeight == frameHeight;
++            if (ok && scale) {
++                // Linear, as drawImage(video) and the compositor scale a video.
++                GLuint drawFramebuffer = 0;
++                glGenFramebuffers(1, &drawFramebuffer);
++                glBindFramebuffer(GL_READ_FRAMEBUFFER, state.framebuffer);
++                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, state.texture, 0);
++                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
++                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot->glTexture(), 0);
++                glBlitFramebuffer(0, 0, frameWidth, frameHeight, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++                glDeleteFramebuffers(1, &drawFramebuffer);
++            }
++        }
++        vkLayout = slot->releaseFromGL();
++        // The hand-off to Dawn: GL's copy and release are done on the GPU (no shared semaphores).
++        glFinish();
++        ok = ok && glGetError() == GL_NO_ERROR;
++        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    }
++    if (!ok) {
++        slot->state = PS5SharedImageSlot::State::Free;
++        return nullptr;
++    }
++    // The time of the first copy, then the average of every 600.
++    state.sharedMilliseconds += (MonotonicTime::now() - start).milliseconds();
++    state.sharedWindow++;
++    if (!state.sharedCopies++ || state.sharedWindow == 600) {
++        char scaled[40] = "";
++        if (scale)
++            snprintf(scaled, sizeof(scaled), " scaled to %ux%u", width, height);
++        WTFLogAlways("[webgpu] title: video frame %dx%d copied for a WebGPU texture%s, no CPU copy, in %.2f ms (%u copies, %zu images)",
++            frameWidth, frameHeight, scaled, state.sharedMilliseconds / state.sharedWindow, state.sharedCopies, state.slots.size());
++        state.sharedMilliseconds = 0;
++        state.sharedWindow = 0;
++    }
++    return slot;
++}
++#endif
++
+ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
+ {
+     auto copy = copyVideoFrameFunction();
+@@ -142,43 +306,23 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+     if (frameWidth <= 0 || frameHeight <= 0 || frameWidth > 8192 || frameHeight > 8192)
+         return false;
+ 
+-    // Each RemoteGPU has a work queue of its own, and they share the reader.
+-    static Lock readerLock;
+-    Locker locker { readerLock };
++    Locker locker { s_readerLock };
+     auto& state = reader();
+-    if (!state.context && !state.failed) {
+-        bindESAPI();
+-        auto& display = WebCore::PlatformDisplay::sharedDisplay();
+-        state.context = WebCore::GLContext::create(display.glDisplay(), WebCore::GLContext::Target::Surfaceless, display.sharingGLContext());
+-        state.failed = !state.context;
+-        WTFLogAlways("[webgpu] title: video read context %s", state.failed ? "could not be made: video sources stay black" : "ready");
+-    }
+-    if (!state.context)
++    if (!readerContextReady(state))
+         return false;
+ 
+     // The context's own display: ps5-opengl's default display, or (GPU=radv)
+     // the compositor's ANGLE display, which isn't ANGLE's default one.
+     EGLDisplay display = WebCore::PlatformDisplay::sharedDisplay().eglDisplay();
++#if !PS5WK_GPU_RADV // GPU=radv: one driver, nothing to keep apart (RemoteGraphicsContextGLPS5.cpp)
+     if (ps5wk_gpu_submit_lock)
+         ps5wk_gpu_submit_lock();
++#endif
+     bool ok = false;
+     auto start = MonotonicTime::now();
+     bindESAPI();
+     if (eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, static_cast<EGLContext>(state.context->platformContext()))) {
+-        if (!state.texture || state.width != frameWidth || state.height != frameHeight) {
+-            if (state.texture)
+-                glDeleteTextures(1, &state.texture);
+-            if (!state.framebuffer)
+-                glGenFramebuffers(1, &state.framebuffer);
+-            glGenTextures(1, &state.texture);
+-            glBindTexture(GL_TEXTURE_2D, state.texture);
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frameWidth, frameHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+-            glBindTexture(GL_TEXTURE_2D, 0);
+-            state.width = frameWidth;
+-            state.height = frameHeight;
+-        }
++        ensureFrameTexture(state, frameWidth, frameHeight);
+         // Row 0 of the copy is the picture's top (flipY false), and so is the first row read.
+         if (void* done = copy(key, state.texture, false)) {
+             glDeleteSync(static_cast<GLsync>(done));
+@@ -204,8 +348,10 @@ bool readVideoFramePixels(uint64_t key, Vector<uint8_t>& rgba, uint32_t& width,
+         glFlush();
+         eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+     }
++#if !PS5WK_GPU_RADV
+     if (ps5wk_gpu_submit_unlock)
+         ps5wk_gpu_submit_unlock();
++#endif
+ 
+     if (ok) {
+         width = frameWidth;
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
+index f5dd923879..73bfd3c790 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteCompositorIntegrationPS5.cpp
+@@ -27,6 +27,9 @@
+ #include "GPUConnectionToWebProcess.h"
+ #include "Logging.h"
+ #include "PS5WebGPUCanvas.h"
++#if PS5WK_GPU_RADV
++#include "PS5SharedImages.h"
++#endif
+ #include "RemoteGPU.h"
+ #include "StreamServerConnection.h"
+ #include <WebCore/SharedMemory.h>
+@@ -191,6 +194,22 @@ void RemoteCompositorIntegration::ps5CreateCanvas(RemoteGPU& gpu)
+ 
+     Ref canvas = PS5WebGPUCanvas::create(connection->webProcessIdentifier(), PS5WebGPUCanvas::layerKey(m_identifier.toUInt64()));
+     m_ps5Canvas = canvas.ptr();
++#if PS5WK_GPU_RADV
++    // GPU=radv: the frames go to the compositor in images it shares with Dawn, not as pixels
++    // (the pixel way below stays for the frames that can't: rgba16float, or no images).
++    if (PS5SharedImages::available()) {
++        implementation->setSharedImageSink({
++            .acquire = [canvas](uint32_t width, uint32_t height, ::WebGPU::TextureFormat format) -> RefPtr<::WebGPU::PS5SharedImage> {
++                return canvas->acquireSharedImage(width, height, format);
++            },
++            .present = [canvas](uint32_t, Ref<::WebGPU::PS5SharedImage>&& image, std::optional<uint32_t> vkLayout, ::WebGPU::CanvasAlphaMode alphaMode) {
++                // Every image the sink hands out is one of the canvas's slots.
++                Ref slot = static_cast<PS5SharedImageSlot&>(image.get());
++                canvas->sharedImageWasPresented(WTF::move(slot), vkLayout, alphaMode);
++            },
++        });
++    }
++#endif
+     // The sink keeps the canvas, not this: frames can arrive for as long as the implementation's
+     // presentation context lives. ps5DestroyCanvas() takes the sink away again.
+     implementation->setFrameSink([canvas = WTF::move(canvas), storage = Vector<uint8_t> { }](uint32_t, std::span<const uint8_t> pixels, uint32_t width, uint32_t height, ::WebGPU::TextureFormat format, ::WebGPU::CanvasAlphaMode alphaMode) mutable {
+@@ -203,8 +222,12 @@ void RemoteCompositorIntegration::ps5DestroyCanvas()
+ {
+     if (!m_ps5Canvas)
+         return;
+-    if (RefPtr implementation = dynamicDowncast<WebCore::WebGPUCompositorIntegrationImpl>(m_backing.get()))
++    if (RefPtr implementation = dynamicDowncast<WebCore::WebGPUCompositorIntegrationImpl>(m_backing.get())) {
+         implementation->setFrameSink(nullptr);
++#if PS5WK_GPU_RADV
++        implementation->setSharedImageSink({ });
++#endif
++    }
+     // The last reference: its layer leaves the registry, and the scene draws nothing more of it.
+     m_ps5Canvas = nullptr;
+ }
+diff --git a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+index 8bb60f96cb..d693d954c1 100644
+--- a/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
++++ b/Source/WebKit/GPUProcess/graphics/ps5/RemoteGraphicsContextGLPS5.cpp
+@@ -50,6 +50,20 @@ namespace PS5WebGLLayers {
+ // device exists: with none, nothing of RADV's runs and a WebGL-only page pays nothing.
+ static std::atomic<unsigned> s_webGPUDevices;
+ 
++#if PS5WK_GPU_RADV
++// GPU=radv: WebGL (ANGLE), the compositor (ANGLE) and WebGPU (Dawn) are all RADV, whose PS5 winsys
++// puts every submission of the process in order on one queue: there is nothing to keep apart,
++// so no lock and no flush between batches (HANDOVER-radv.md Phase 4).
++void webGPUDeviceAdded()
++{
++    s_webGPUDevices++;
++}
++
++void webGPUDeviceRemoved()
++{
++    s_webGPUDevices--;
++}
++#else
+ void webGPUDeviceAdded()
+ {
+     if (!s_webGPUDevices++)
+@@ -61,9 +75,13 @@ void webGPUDeviceRemoved()
+     if (!--s_webGPUDevices)
+         WTFLogAlways("[webgl] no WebGPU device left: WebGL's work without the GPU submission lock");
+ }
++#endif
+ 
+ static bool batchBegin()
+ {
++#if PS5WK_GPU_RADV
++    return false;
++#endif
+     if (!ps5wk_gpu_submit_lock || !s_webGPUDevices.load(std::memory_order_relaxed))
+         return false;
+     ps5wk_gpu_submit_lock();
+diff --git a/Source/WebKit/Platform/WC.cmake b/Source/WebKit/Platform/WC.cmake
+index c537ba2aba..7053d5f121 100644
+--- a/Source/WebKit/Platform/WC.cmake
++++ b/Source/WebKit/Platform/WC.cmake
+@@ -67,6 +67,13 @@ if (PORT STREQUAL "WPE" AND (ENABLE_WPE_PLATFORM_PS5 OR NOT ENABLE_GPU_PROCESS))
+ 
+             WebProcess/GPU/graphics/ps5/RemoteGraphicsContextGLProxyPS5.cpp
+         )
++        # GPU=radv (HANDOVER-radv.md Phase 4): images of the compositor's VkDevice that Dawn
++        # aliases (video frames into WebGPU, canvas frames out of it, no CPU copy).
++        if (PS5WK_GPU_RADV AND ENABLE_WEBGPU)
++            list(APPEND WebKit_SOURCES GPUProcess/graphics/ps5/PS5SharedImages.cpp)
++            list(APPEND WebKit_SYSTEM_INCLUDE_DIRECTORIES "${PS5WK_VULKAN_INCLUDE}")
++            list(APPEND WebKit_PRIVATE_DEFINITIONS PS5WK_GPU_RADV=1)
++        endif ()
+     endif ()
+ 
+     # Async scrolling (COMPOSITING-PLAN.md): the scrolling state tree goes
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
+index 9b9e19128c..24f7dcb04c 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
+@@ -113,6 +113,18 @@ bool RemoteQueueProxy::ps5ReadVideoStreamFrame(uint64_t streamKey, Vector<uint8_
+     height = frameHeight;
+     return true;
+ }
++
++#if PS5WK_GPU_RADV
++bool RemoteQueueProxy::ps5CopyVideoStreamFrameToTexture(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const ::WebGPU::TexelCopyTextureInfo& destination, const ::WebGPU::Extent3D& copySize, bool flipY)
++{
++    auto convertedDestination = m_convertToBackingContext->convertToBacking(destination);
++    if (!convertedDestination)
++        return false;
++    // On the stream, in order with the page's other calls (its readback of the texture after it).
++    auto sendResult = send(Messages::RemoteQueue::CopyVideoStreamFrameToTexturePS5(streamKey, videoWidth, videoHeight, *convertedDestination, copySize, flipY));
++    return sendResult == IPC::Error::NoError;
++}
++#endif
+ #endif
+ 
+ void RemoteQueueProxy::writeTexture(const ::WebGPU::TexelCopyTextureInfo& destination, std::span<const uint8_t> data, const ::WebGPU::TexelCopyBufferLayout& dataLayout, const ::WebGPU::Extent3D& writeSize)
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
+index 13412ccd34..6cd29d93c2 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
+@@ -66,6 +66,9 @@ public:
+ #endif
+ #if USE(DAWN)
+     bool ps5ReadVideoStreamFrame(uint64_t streamKey, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) final;
++#if PS5WK_GPU_RADV
++    bool ps5CopyVideoStreamFrameToTexture(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const ::WebGPU::TexelCopyTextureInfo& destination, const ::WebGPU::Extent3D& copySize, bool flipY) final;
++#endif
+ #endif
+     void setLabel(String&&) final;
+     bool isValid() const final;

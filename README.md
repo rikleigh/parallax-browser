@@ -220,13 +220,15 @@ that title with your homebrew tool. Your data in `/data/ps5webkit` stays.
 The build cross-compiles WebKit and about 30 libraries for the PS5, on a
 Mac with Apple silicon. The steps are:
 
-1. Run `brew install llvm@18 socat cmake ninja wget nasm bison glib gperf`,
-   then `. ./env.sh`. Put the console's address in `PS5_HOST` and the
+1. Run `brew install llvm@18 socat cmake ninja wget nasm bison glib gperf
+   llvm libclc spirv-llvm-translator`, then `. ./env.sh`. The last three
+   build RADV's OpenCL kernels. Put the console's address in `PS5_HOST` and the
    Mac's in `PS5WK_LOG_HOST`, in `env.local.sh`, which git ignores.
 2. Clone the reference checkouts into `ref/`, which git also ignores. The
    scripts expect exactly these folder names. Each fetch takes only the
-   commit the build uses. `ps5-opengl` and `WebKit` must be at these
-   commits, because the build scripts check them out by hash. A plain
+   commit the build uses. `ps5-opengl`, `WebKit`, `PS5_Mesa` and
+   `mihawk-PS5_PayloadSDK` must be at these commits, because the build
+   scripts check them out by hash. A plain
    `git clone --depth 1` would get the latest commit instead, and a full
    WebKit clone is very large.
 
@@ -241,6 +243,8 @@ Mac with Apple silicon. The steps are:
    refclone ps5-opengl https://github.com/mihawk-99/ps5-opengl ec06d8c2da0359e274e409046f0a9586965e4010
    refclone pacbrew-repo https://github.com/ps5-payload-dev/pacbrew-repo 722187f0ee246c0d7d57401c8a97de1c7f4e2ff0
    refclone WebKit https://github.com/WebKit/WebKit 15486a017817cad93f25fdffeb013278866970fc
+   refclone PS5_Mesa https://github.com/mpereiraesaa/PS5_Mesa 01d70579b8d410d6a482e36c6f184798ae4c83ad
+   refclone mihawk-PS5_PayloadSDK https://github.com/mihawk-99/PS5_PayloadSDK b83202be73e930050e00de0f1b4d9ec46c0391bf
    ```
 
    Then build the SDK into `toolchain/ps5-payload-sdk`, as in
@@ -252,7 +256,8 @@ Mac with Apple silicon. The steps are:
    installs the build that the browser links against. It is the same
    build with the per-draw profiling compiled out, and `package.sh` looks
    for it in that folder. Last, `port/deps/build.sh all` builds the
-   libraries into `toolchain/wpe-sysroot`. See
+   libraries into `toolchain/wpe-sysroot`, and `port/deps/build.sh dawn
+   radv` builds WebGPU's Dawn and RADV, the Vulkan driver under it. See
    [port/deps/README.md](port/deps/README.md).
 4. `port/webkit/build.sh` applies the patches in `port/webkit/patches/` to
    WebKit and builds it. Then `port/webkit/apps/title/package.sh` writes
@@ -265,6 +270,20 @@ Mac with Apple silicon. The steps are:
    which makes uploads faster.
 
 `tools/logserver.sh` collects the browser's log on the Mac.
+
+**The RADV build** is in progress and not released yet
+([spikes/15-radv-only/README.md](spikes/15-radv-only/README.md)). It
+draws everything with WebKit's ANGLE on its Vulkan backend over RADV, and
+doesn't use ps5-opengl, so it can skip the ps5-opengl builds in step 3.
+`port/deps/build.sh dawn-radv` builds its Dawn. Then
+`GPU=radv port/webkit/build.sh` builds it in `toolchain/wpe-webkit/build-radv`,
+from the `src-radv` worktree with `port/webkit/patches-radv/` on top. To
+package it as a test title next to the release:
+
+```sh
+TITLE=PPSA99208 NAME="Parallax RADV test" BLD=toolchain/wpe-webkit/build-radv \
+    OUT=toolchain/wpe-webkit/titles-radv-wip port/webkit/apps/title/package.sh
+```
 
 `tools/make-release.sh <version>` builds the release zip from the WebGPU
 build (`WEBGPU=1 port/webkit/build.sh`, in `build-webgpu`). It refuses a

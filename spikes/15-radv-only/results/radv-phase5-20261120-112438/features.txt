@@ -1,0 +1,133 @@
+== smoke: a site over the network, parallax://settings, parallax://update
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS https://example.com/ "Example Domain" (2.2 s after start)
+   RESULT ps5browser url PASS 1/3 https://example.com/ loaded in 2.2 s: title "Example Domain"; flexible 262.0 MB
+   RESULT ps5browser load PASS parallax://settings "" (0.0 s after start)
+   RESULT ps5browser url PASS 2/3 parallax://settings loaded in 0.0 s: title ""; flexible 262.0 MB
+   RESULT ps5browser load PASS parallax://update "" (0.0 s after start)
+   RESULT ps5browser url PASS 3/3 parallax://update loaded in 0.0 s: title ""; flexible 262.0 MB
+   crashes/aborts/device lost: 0
+== safer browsing on: JIT, wasm, WebGL off; then off again
+   settings: Saved: Safer browsing. Restart the page to apply.
+   settings: Saved: Safer browsing. Restart the page to apply.
+   [web4] [ps5wk-child 500] JIT: on (PS5WK_JIT=1; JSC_useJIT=true), executable pool 256 MB (/data/ps5webkit/no-bigjitpool: 128 MB); WebAssembly on
+   settings from http <mac>: Saved: Safer browsing. Restart the page to apply. (safer=1)
+   settings: WebGL off (Safer browsing)
+   settings: WebGPU off (Safer browsing)
+   RESULT ps5browser page-restart PASS new WebProcess committed file:///data/ps5webkit/phase0/static.html
+   [web5] [ps5wk-child 501] JIT: off, LLInt only (Safer browsing, PS5WK_JIT=0; JSC_useJIT=false), executable pool none; WebAssembly off
+   RESULT webgl-readpixels default-aa FAIL no WebGL 2 context
+   RESULT webgl-readpixels default-plain FAIL no WebGL 2 context
+   RESULT webgl-readpixels summary 0/2 passed
+   settings from http <mac>: Saved: Safer browsing. Restart the page to apply. (safer=0)
+   RESULT ps5browser page-restart PASS new WebProcess committed file:///data/ps5webkit/phase0/webgl-readpixels.html?run=1795174758
+   [web6] [ps5wk-child 503] JIT: on (PS5WK_JIT=1; JSC_useJIT=true), executable pool 256 MB (/data/ps5webkit/no-bigjitpool: 128 MB); WebAssembly on
+   RESULT webgl-readpixels summary 29/29 passed
+   RESULT webgl-readpixels summary 29/29 passed
+   crashes/aborts/device lost: 0
+== WebGPU setting off, then on
+   settings: Saved: WebGPU.
+   settings: Saved: WebGPU.
+   RESULT webgpu-adapter navigator-gpu FAIL no navigator.gpu
+   RESULT webgpu-adapter summary FAIL 0/1
+   RESULT webgpu-adapter navigator-gpu PASS secure context true
+   RESULT webgpu-adapter summary PASS 11/11
+   crashes/aborts/device lost: 0
+== pages in the browser process (web_in_title=1): static, video, WebGL, WebGPU
+   settings: Saved: Pages in the browser process (experimental). Restart the browser to apply.
+   settings: Saved: Pages in the browser process (experimental). Restart the browser to apply.
+   [web4] [ps5wk-child 512] video decoding: hardware in the title (codecs 0x107, up to 8192x4352); MSE/canPlayType limit 7680x4320@60
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/static.html "" (2.2 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/static.html loaded in 2.2 s: title ""; flexible 262.0 MB
+   settings from http <mac>: Saved: Pages in the browser process (experimental). Restart the browser to apply. (web_in_title=1)
+   RESULT ps5browser load PASS about:blank "" (3.0 s after start)
+   [web-in-title] stdout to the log: yes (a FILE on fd 2)
+   [web-in-title] video decoding: hardware in the title (up to 8192x4352); MSE/canPlayType limit 7680x4320@60
+   [web-in-title] on (Settings: Pages in the browser process): the first WebProcess runs in the title; JIT on (PS5WK_JIT=1; JSC_useJIT=true), WebAssembly true, executable pool 256 MB in direct memory
+   [app msg] [wpe-ps5] [ps5-launch] rendezvous on its own thread (a WebProcess runs in the title)
+   [app msg] [wpe-ps5] [ps5-launch] launching web process 4 in the title (pages in the browser process: /data/ps5webkit/pages-in-browser)
+   [web-in-title] fonts: fontconfig has 47 system fonts already
+   [web-in-title] starting WebProcess 4 in the title (IPC fd 58)
+   [web-in-title] WebProcess 4 initialized; its messages run on the title's main loop
+   [app msg] [wpe-ps5] [ps5-launch] web process 4 runs in the title (pid 513); started in 1.0 ms
+   [web-in-title] page scripts on the main thread stop after 10 s of CPU time (PS5WK_SCRIPT_LIMIT_S)
+   [wc] 1.7 s: 1 updates (apply 1.11 ms avg, 1.1 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 8 (8 draws, 7.1 MB, 0.97 ms, 0.121 ms per upload, 0 fence waits, 0 finishes); 1 paints (0
+   [ascroll] 1.7 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 1 tree commits; per-frame step 0.0 px avg,
+   [ps5videosink] 20025dfdb0: 1920x1080 NV12 decoded in the title, BT.709 limited range
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4 "Video test" (2.1 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4 loaded in 2.1 s: title "Video test"; flexible 206.0 MB
+   crashes/aborts/device lost: 0
+== GL texture cap at 40 MB on the feed: reduced coverage, then the CPU path
+   [wc] GL texture cap 40 MB (/data/ps5webkit/wc-gl-cap)
+   [wc] GL textures 40.2 MB over the 40 MB cap (texture pool 16.4 MB): tiles for the visible rect only (back after 3 s under 24 MB)
+   [wc] GL textures 47.9 MB still over the 40 MB cap 5.0 s after reducing coverage (texture pool 12.3 MB): this page goes to the CPU path
+   [wc] page 6: ending its WebProcess, the page reloads on the CPU path
+   [wc] this WebProcess paints on the CPU: its page went over the GL texture cap
+   WCFEED 10 s: scrollY 5040, 15 videos playing, rAF 15.5/s
+   WCFEED 20 s: scrollY 15768, 15 videos playing, rAF 29.4/s
+   WCFEED 30 s: scrollY 26736, 15 videos playing, rAF 30.0/s
+   WCFEED 40 s: scrollY 37752, 15 videos playing, rAF 30.0/s
+   WCFEED 50 s: scrollY 48744, 15 videos playing, rAF 30.0/s
+   WCFEED DONE after 60 s, scrollY 41782
+   crashes/aborts/device lost: 0
+== live tabs: video, WebGL and WebGPU pages in three tabs
+   [app msg] [vdec] decoder 48 (pid 521): 38.3 AUs/s in, 35.5 pictures/s out; decode call 0.58 ms avg 7.00 max, waited 2612 ms for slots; 12/12 slots held (0 pinned), 5 AUs queued; so far 178 pictures, 0
+   [mem] main: flexible 262.0 MB free; direct memory 4.4 MB in use; direct heap 2.0 MB mapped (peak 2.0, 0 libc fallbacks, init ready); anon mmaps 0.1 MB in 3 (peak 0.4 MB, 3 made, 0 failed, 0 zero fills
+   [mem] display connected: flexible 262.0 MB free; direct memory 133.6 MB in use; direct heap 14.0 MB mapped (peak 14.0, 0 libc fallbacks, init ready); anon mmaps 0.1 MB in 24 (peak 49.7 MB, 24 made, 0 
+   [mem] anonymous mmap of 128.0 MB (align 0x8000000, prot 3) -> direct memory at 208000000
+   [mem] anonymous mmap of 128.0 MB (align 0x10000, prot 3) -> direct memory at 210000000
+   [tabs] up to 2 live tabs (/data/ps5webkit/live-tabs: 1-4, default 2)
+   [mem] adblock: site data loaded: flexible 262.0 MB free; direct memory 400.7 MB in use; direct heap 22.5 MB mapped (peak 22.5, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 31 (peak 308.3 MB, 
+   [mem] web view created: flexible 262.0 MB free; direct memory 400.9 MB in use; direct heap 22.5 MB mapped (peak 22.5, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 33 (peak 308.5 MB, 33 made, 
+   browser: test run: one tab, the saved session is neither restored nor written
+   [mem] adblock: loaded: flexible 262.0 MB free; direct memory 443.6 MB in use; direct heap 24.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 39 (peak 315.1 MB, 39 made, 0
+   [web4] [ps5wk-child 526] JIT: on (PS5WK_JIT=1; JSC_useJIT=true), executable pool 256 MB (/data/ps5webkit/no-bigjitpool: 128 MB); WebAssembly on
+   [mem] load finished: flexible 238.0 MB free; direct memory 632.6 MB in use; direct heap 26.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 43 (peak 316.8 MB, 44 made, 0 f
+   [mem] after test URL 1: flexible 238.0 MB free; direct memory 632.6 MB in use; direct heap 26.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 43 (peak 316.8 MB, 44 made, 
+   [ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 57 tree commits; per-frame step 0.0 px avg
+   [ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg
+   [app msg] [video] stream 3 (pid 526): 30.0 frames/s received, 30.0/s shown, 0 dropped (0 in all), shown 3.6 ms after due on average; held 1/2/3/4+ vsyncs: 1/147/1/0, last holds 2222222222222222; hidde
+   [app msg] [vdec] decoder 1 (pid 526): 32.6 AUs/s in, 31.3 pictures/s out; decode call 1.16 ms avg 15.94 max, waited 607 ms for slots; 7/12 slots held (0 pinned), 2 AUs queued; so far 160 pictures, 0 h
+   [app msg] [vdec] decoder 1 from pid 526 closed: 268 AUs (6.6 MB), 261 pictures, 0 hidden, 0 errors (first rc 0x00000000), 0 skipped before a keyframe, 0 refused, 0 format changes, 0 resets after error
+   [mem] load finished: flexible 261.0 MB free; direct memory 484.9 MB in use; direct heap 32.5 MB mapped (peak 32.5, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 52 (peak 317.3 MB, 55 made, 0 f
+   RESULT webgl-readpixels summary 29/29 passed
+   crashes/aborts/device lost: 0
+== video then WebGL then WebGPU in one tab, 5 times (crash-title.txt has 5 lines)
+  run 1: title still running: yes; crash-title.txt lines 5
+   [webgl] title: ANGLE context 551 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 562 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 651 for WebGL 1, max texture 16384
+   RESULT webgl-readpixels summary 29/29 passed
+   RESULT webgpu-adapter summary PASS 11/11
+   crashes/aborts/device lost: 0
+  run 2: title still running: yes; crash-title.txt lines 5
+   [webgl] title: ANGLE context 557 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 568 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 657 for WebGL 1, max texture 16384
+   RESULT webgl-readpixels summary 29/29 passed
+   RESULT webgpu-adapter summary PASS 11/11
+   crashes/aborts/device lost: 0
+  run 3: title still running: yes; crash-title.txt lines 5
+   [webgl] title: ANGLE context 553 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 564 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 653 for WebGL 1, max texture 16384
+   RESULT webgl-readpixels summary 29/29 passed
+   RESULT webgpu-adapter summary PASS 11/11
+   crashes/aborts/device lost: 0
+  run 4: title still running: yes; crash-title.txt lines 5
+   [webgl] title: ANGLE context 551 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 562 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 651 for WebGL 1, max texture 16384
+   RESULT webgl-readpixels summary 29/29 passed
+   RESULT webgpu-adapter summary PASS 11/11
+   crashes/aborts/device lost: 0
+  run 5: title still running: yes; crash-title.txt lines 5
+   [webgl] title: ANGLE context 555 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 566 for WebGL 2, max texture 16384
+   [webgl] title: ANGLE context 655 for WebGL 1, max texture 16384
+   RESULT webgl-readpixels summary 29/29 passed
+   RESULT webgpu-adapter summary PASS 11/11
+   crashes/aborts/device lost: 0
+==> logs in /Users/rikleigh/git/ps5webkit/spikes/15-radv-only/results/radv-phase5-20261120-112438/features
+==> settings back to their defaults, clean-up
+OK none

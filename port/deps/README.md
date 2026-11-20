@@ -170,8 +170,9 @@ Things a consumer must know:
 - **ICU**: `libicudata.a` (full, 31.9 MB) is what `icu-uc.pc` links;
   `libicudata-slim.a` (18 MB) is a drop-in alternative.
 - **libepoxy** dlopens `libEGL.so.1`/`libGL` on first GL call; a
-  CPU-painted WebProcess never makes one. The UIProcess (title) gets GL from
-  ps5-opengl, not from this epoxy.
+  CPU-painted WebProcess never makes one. In the title, this epoxy's
+  dlopen/dlsym are answered by `apps/title/dlshim.c`: GL comes from
+  ps5-opengl, or in `GPU=radv` builds from WebKit's ANGLE.
 - **No translations**: gettext is proxy-libintl (stubs).
 
 ## PS5 libc findings (13.60, from the smoke test)

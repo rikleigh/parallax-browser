@@ -1,0 +1,48 @@
+PS5 (ps5webkit GPU=radv only, HANDOVER-radv.md Phase 4): undoes patches/dawn's
+0004-ps5-gpu-submit-lock for the radv build. Its lock kept RADV's submissions
+from falling between two of ps5-opengl's; in the radv build the compositor,
+WebGL and WebGPU are all RADV, whose PS5 winsys orders the process's
+submissions on one queue, and the title's lock functions there are empty
+markers (port/webkit/apps/title/titleradv.c). The release builds' Dawn keeps
+0004.
+
+--- a/src/dawn/native/vulkan/QueueVk.cpp
++++ b/src/dawn/native/vulkan/QueueVk.cpp
+@@ -53,27 +53,6 @@
+ #include "src/utils/compiler.h"
+ #include "src/utils/numeric.h"
+ 
+-#if DAWN_PLATFORM_IS(PS5)
+-// PS5 title: RADV shares the GPU with ps5-opengl (the browser's compositor). One queue submit
+-// becomes one or more AGC submissions that rely on the state the first one set, so none of
+-// the other driver's may fall between them. The title has the lock (weak: absent elsewhere).
+-extern "C" void ps5wk_gpu_submit_lock(void) __attribute__((weak));
+-extern "C" int ps5wk_gpu_submit_unlock(void) __attribute__((weak));
+-namespace {
+-struct Ps5GpuSubmitLock {
+-    Ps5GpuSubmitLock() {
+-        if (ps5wk_gpu_submit_lock) {
+-            ps5wk_gpu_submit_lock();
+-        }
+-    }
+-    ~Ps5GpuSubmitLock() {
+-        if (ps5wk_gpu_submit_unlock) {
+-            ps5wk_gpu_submit_unlock();
+-        }
+-    }
+-};
+-}  // namespace
+-#endif
+ 
+ namespace dawn::native::vulkan {
+ 
+@@ -368,9 +347,6 @@
+     platform::metrics::DawnHistogramTimer timer(device->GetPlatform());
+     {
+         TRACE_EVENT(DAWN_TRACE_CATEGORY("recording"), "vkQueueSubmit");
+-#if DAWN_PLATFORM_IS(PS5)
+-        Ps5GpuSubmitLock ps5GpuSubmitLock;
+-#endif
+         DAWN_TRY_WITH_CLEANUP(
+             CheckVkSuccess(device->fn.QueueSubmit(mQueue, 1, &submitInfo, fence), "vkQueueSubmit"),
+             {

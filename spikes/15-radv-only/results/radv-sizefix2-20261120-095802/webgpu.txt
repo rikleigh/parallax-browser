@@ -1,0 +1,33 @@
+RESULT webgpu-video-scaled anamorphic-size PASS 1440x1080 with 4:3 pixels is 1920x1080
+RESULT webgpu-video-scaled anamorphic-copy PASS 1920x1080 in 35.0 ms; red to blue at x 960 of 1920
+RESULT webgpu-video-scaled anamorphic-external PASS red to blue at x 960 of 1920
+RESULT webgpu-video-scaled switch-copy FAIL Error: 80 copies; one left 12 % magenta (396x704 at 17.21 s); sizes 396x704 (80)
+RESULT webgpu-video-scaled uncaptured-errors PASS none
+RESULT webgpu-video-scaled summary FAIL 4/5
+RESULT webgpu-video-texture setup PASS texture_external pipeline for bgra8unorm
+RESULT webgpu-video-texture external-texture PASS 120 frames, 60.0 fps, 0.26 ms of JavaScript per frame; brightest channel 255, 50 colours on a 32x32 grid; video time 0.02 to 0.07 s
+RESULT webgpu-video-texture copy-external-image PASS 1920x1080 copied and read back in 26.0 ms; brightest channel 255, 58 colours on a 32x32 grid
+RESULT webgpu-video-texture video-frame-callback PASS 10 callbacks in 1855 ms, each imported and drawn; last frame 1920x1080 at media time 1.967, presentedFrames 71
+RESULT webgpu-video-texture uncaptured-errors PASS none
+RESULT webgpu-video-texture summary PASS 5/5
+RESULT webgpu-copy-external-image canvas-2d-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image canvas-2d-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-bitmap-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-bitmap-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image offscreen-canvas-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image offscreen-canvas-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-element-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-element-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-data-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-data-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image canvas-2d-to-bgra8unorm PASS four quadrants, red and blue the right way round
+RESULT webgpu-copy-external-image alpha-canvas-2d-straight PASS 255,128,0,128
+RESULT webgpu-copy-external-image alpha-canvas-2d-premultiplied PASS 128,64,0,128
+RESULT webgpu-copy-external-image alpha-image-bitmap-straight PASS 255,128,0,128
+RESULT webgpu-copy-external-image alpha-image-bitmap-premultiplied PASS 128,64,0,128
+RESULT webgpu-copy-external-image uncaptured-errors PASS none
+RESULT webgpu-copy-external-image summary PASS 16/16
+RESULT webgpu-cube setup PASS bgra8unorm, 36 indices
+RESULT webgpu-cube animation PASS 120 frames, 60.3 fps, 0.26 ms of JavaScript per frame
+RESULT webgpu-cube centre-pixel PASS centre 28,35,70,255, corner 25,25,31,255
+RESULT webgpu-cube summary PASS 3/3

@@ -1,0 +1,23 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/compute.html?run=1795138774
+push: loading file:///data/ps5webkit/phase0/webgpu/compute.html?run=1795138774
+load started: file:///data/ps5webkit/phase0/webgpu/compute.html?run=1795138774
+[web4] [render] compositing: 8 updates in 6.2 s, 0.1 ms avg, 0.1 max (7 with a requirements traversal, 7 with a backing/hierarchy update)
+load committed: file:///data/ps5webkit/phase0/webgpu/compute.html?run=1795138774
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+load finished: file:///data/ps5webkit/phase0/webgpu/compute.html?run=1795138774
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/compute.html?run=1795138774 "" (0.0 s after start)
+[mem] load finished: flexible 239.0 MB free; direct memory 503.1 MB in use; direct heap 28.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 50 (peak 340.3 MB, 53 made, 0 failed, 0 zero fills, 42 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 47 live, 84.1 MB (50 created, 0 libc); WebGPU buffers and textures 0.0 MB (peak 0.0, budget 1536, 0 refused)
+[web4] [render] compositing requirements per traversal: 2 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfS RenderView 5, selfP RenderView 2
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-compute fill PASS 4096 values right (last 12292)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-compute indirect PASS 4096 values right (last 20486)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-compute matrix PASS 64x64 product matches JavaScript (c[0]=-95, c[last]=42)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-compute async-pipeline PASS 4096 values right (last 12292), pipeline ready after 1.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-compute default-entry-point PASS 4096 values right (last 12292), compute stage with no entryPoint
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-compute timing PASS first pipeline to work done 3.0 ms; 100 dispatches submitted in 1.0 ms, read back after 4.0 ms
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-compute summary PASS 6/6
+[wc] 2.1 s: 37 updates (apply 0.11 ms avg, 1.2 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 82 (82 draws, 12.2 MB, 3.09 ms, 0.038 ms per upload, 0 fence waits, 0 finishes); 37 paints (0.10 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.3 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.6 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.01 avg 0.0 max
+[wc] 2.1 s: 37 updates answered when applied (async scrolling)
+[ascroll] 2.1 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 37 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[app msg] [wpe-ps5] [present] 80 frames (13.0/s), render 1.51 ms avg 16.7 max, swap 0.1 ms avg 0.4 max, vsync interval 17.34 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.12 ms avg, video 0.00, scene 0.10, draw 1.28 avg 16.3 max (incl. the wait for the previous flip)

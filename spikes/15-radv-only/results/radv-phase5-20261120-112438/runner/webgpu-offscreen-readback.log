@@ -1,0 +1,22 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795174452
+push: loading file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795174452
+load started: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795174452
+load committed: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795174452
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+load finished: file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795174452
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/offscreen-readback.html?run=1795174452 "" (0.0 s after start)
+[mem] load finished: flexible 262.0 MB free; direct memory 535.5 MB in use; direct heap 30.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 53 (peak 350.5 MB, 56 made, 0 failed, 0 zero fills, 45 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 50 live, 94.4 MB (53 created, 0 libc); WebGPU buffers and textures 0.3 MB (peak 0.3, budget 1536, 0 refused)
+IPC: socket 78 in process 482 reported condition 0x11 (HUP/ERR/NVAL)
+IPC: socket 85 in process 482 reported condition 0x11 (HUP/ERR/NVAL)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback triangle PASS centre red, corners blue, upright
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback msaa-resolve PASS centre red, corner blue, 409 blended edge pixels
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback depth PASS the near quad stays in front of the later far one
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback write-texture-sample PASS four quadrants right, first texel row at the top
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback write-buffer-copy PASS 256 bytes right (two copies, untouched bytes zero)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback rgba16float PASS centre 1.5,0.25,-1,1 and corner 0.25,0.5,2,1 kept
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-offscreen-readback mip-levels PASS levels 64, 32, 16 hold red, green, blue; a view of level 2 samples blue
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-offscreen-readback summary PASS 7/7
+[wc] 1.5 s: 3 updates (apply 0.47 ms avg, 1.1 max; 0 unchanged), 0 presents; 1 pages, 9 layers; tiles uploaded 12 (12 draws, 9.4 MB, 1.13 ms, 0.094 ms per upload, 0 fence waits, 0 finishes); 3 paints (0.12 ms avg, 0.1 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.3 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 15.8 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.07 avg 0.2 max
+[wc] 1.5 s: 3 updates answered when applied (async scrolling)
+[ascroll] 1.5 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 3 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00

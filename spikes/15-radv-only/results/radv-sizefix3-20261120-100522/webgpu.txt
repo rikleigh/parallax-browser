@@ -1,0 +1,6 @@
+RESULT webgpu-video-scaled anamorphic-size PASS 1440x1080 with 4:3 pixels is 1920x1080
+RESULT webgpu-video-scaled anamorphic-copy PASS 1920x1080 in 33.0 ms; red to blue at x 960 of 1920
+RESULT webgpu-video-scaled anamorphic-external PASS red to blue at x 960 of 1920
+RESULT webgpu-video-scaled switch-copy PASS 79 copies, every one covered the texture; sizes 396x704 (79)
+RESULT webgpu-video-scaled uncaptured-errors PASS none
+RESULT webgpu-video-scaled summary PASS 5/5

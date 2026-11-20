@@ -23,7 +23,7 @@ WK="$ROOT/toolchain/wpe-webkit"
 # The WebKit build with WebGL and every patch (port/webkit/build.sh default).
 BLD="${BLD:-$WK/build-webgl}"
 OUT="${OUT:-$WK/titles}"
-# ps5-opengl built with the browser's patches (spikes/02-gl-egl/ps5-opengl/
+# GPU=gl builds (the release): ps5-opengl built with the browser's patches (spikes/02-gl-egl/ps5-opengl/
 # patches, through 0020: WebGL draw batching, the VAO fast path, video copies
 # on the GPU, no flush or index scan of unchanged buffers, HDR MSAA resolves
 # on the GPU, cube faces rendered in place) and its per-draw profiling
@@ -55,8 +55,25 @@ fi
 # 2. Title runtime objects + our shims.
 TF=(-fno-plt -fno-stack-protector -ffunction-sections -fdata-sections)
 prospero-clang++ -std=c++20 -O2 -fno-exceptions -fno-rtti "${TF[@]}" -c "$NATIVE/app_crt.cpp" -o "$W/obj/app_crt.o"
-prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchReturnFromMain -Dmkstemps=ps5_opengl_mkstemps \
-    -c "$PSGL/runtime_shims.c" -o "$W/obj/runtime_shims.o"
+# GPU=radv builds (port/webkit/build.sh; HANDOVER-radv.md): the title
+# renders on WebKit's ANGLE with its Vulkan backend over RADV, epoxy's GL is
+# ANGLE (dlshim.c), and ps5-opengl isn't linked (Phase 5). Package them as a
+# test title, e.g. TITLE=PPSA99208 NAME="Parallax RADV test" BLD=.../build-radv.
+RADV_FLAGS=()
+GPU_RADV=0
+if grep -q '^PS5WK_GPU_RADV:[A-Z]*=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
+    RADV_FLAGS=(-DPS5WK_GPU_RADV=1)
+    GPU_RADV=1
+    echo "GPU=radv: the title renders on ANGLE (Vulkan, RADV), without ps5-opengl"
+fi
+rm -f "$W/obj/runtime_shims.o" "$W/obj/titlert.o" "$W/obj/egl_symbols.inc"
+if (( GPU_RADV )); then
+    # stdout and stderr into a file, as ps5-opengl's runtime_shims.c does (titlert.c).
+    prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlert.c" -o "$W/obj/titlert.o"
+else
+    prospero-clang -std=c11 -O2 "${TF[@]}" -DcatchReturnFromMain=ps5_opengl_catchReturnFromMain -Dmkstemps=ps5_opengl_mkstemps \
+        -c "$PSGL/runtime_shims.c" -o "$W/obj/runtime_shims.o"
+fi
 # The heap: Spike 10's dheap.c (dlmalloc over direct memory) instead of
 # ps5-opengl's app_heap.c, plus titlemem.c (anonymous mmaps and thread stacks
 # in direct memory, memory report).
@@ -88,28 +105,27 @@ prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/../common/profiler.c" -
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/../common/ps5unwind.c" -o "$W/obj/ps5unwind.o"
 cp "$SYS/lib/libc.a" "$W/libc-title.a"
 /opt/homebrew/opt/llvm@18/bin/llvm-ar d "$W/libc-title.a" syscalls.o
-/opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |
+(( GPU_RADV )) || /opt/homebrew/opt/llvm@18/bin/llvm-nm "$PREFIX/lib/libps5_opengl_core33.a" 2>/dev/null |
     awk '$2 == "T" && $3 ~ /^egl[A-Z]/ { print "EGL_SYMBOL(" $3 ")" }' | sort -u > "$W/obj/egl_symbols.inc"
-# GPU=radv builds (port/webkit/build.sh; HANDOVER-radv.md Phase 2): the
-# title renders on WebKit's ANGLE with its Vulkan backend over RADV, and
-# epoxy's GL is ANGLE (dlshim.c). Package them as a test title, e.g.
-# TITLE=PPSA99208 NAME="Parallax RADV test" BLD=.../build-radv.
-RADV_FLAGS=()
-if grep -q '^PS5WK_GPU_RADV:[A-Z]*=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
-    RADV_FLAGS=(-DPS5WK_GPU_RADV=1)
-    echo "GPU=radv: the title renders on ANGLE (Vulkan, RADV)"
-fi
 prospero-clang -std=c11 -O2 "${TF[@]}" ${RADV_FLAGS[@]+"${RADV_FLAGS[@]}"} -I"$W/obj" -c "$HERE/dlshim.c" -o "$W/obj/dlshim.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -I"$ROOT/spikes" -DLOG_HOST="\"$PS5WK_LOG_HOST\"" -DLOG_PORT="$PS5WK_LOG_PORT" \
     -c "$ROOT/spikes/common/title_exit.c" -o "$W/obj/title_exit.o"
 prospero-clang -std=c11 -O2 "${TF[@]}" -I"$ROOT/spikes" -c "$ROOT/spikes/common/psvr2/psvr2.c" -o "$W/obj/psvr2.o"
 
 # WebGPU builds (WEBGPU=1 port/webkit/build.sh: Dawn on RADV, spikes/12-webgpu):
-# RADV as one object with only its ICD entry points global (ps5-opengl has a
-# Mesa of its own), titleradv.c for what it needs from the title, and the payload SDK's
+# RADV as one object with only its ICD entry points global (GPU=gl: ps5-opengl
+# has a Mesa of its own), titleradv.c for what it needs from the title, and the payload SDK's
 # AGC driver stub (116 exports, a superset of ps5-opengl's 5: RADV imports
 # sceAgcDriverSetHsOffchipParam). Dawn itself is in ninja's link line.
 AGCDRIVER="$PREFIX/lib/libSceAgcDriver.so"
+AGC="$PREFIX/lib/libSceAgc.so"
+# ps5-opengl and the libSceAgc stub it was built against (GPU=gl only).
+gl_inputs=(-u ps5_agc_gate2_run --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib")
+if (( GPU_RADV )); then
+    gl_inputs=()
+    AGC="$SYS/lib/libSceAgc.so"
+    AGCDRIVER="$SYS/lib/libSceAgcDriver.so"
+fi
 webgpu_inputs=()
 rm -f "$W/obj/cpu_model.o" "$W/obj/titleradv.o"
 if grep -q '^USE_DAWN:BOOL=ON' "$BLD/CMakeCache.txt" 2>/dev/null; then
@@ -155,10 +171,10 @@ title_link() {
         --wrap=recvmsg --wrap=sendmsg --wrap=recv --wrap=send --wrap=recvfrom --wrap=sendto --wrap=close --wrap=socket \
         --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL \
         --gc-sections --error-limit=0 -e _start -o "$W/llvm-pie.elf" ${TITLE_LDFLAGS:-} "$@" \
-        "$W"/obj/*.o "${inputs[@]}" ${webgpu_inputs[@]+"${webgpu_inputs[@]}"} "$BLD/shim/libps5shim.a" -u ps5_agc_gate2_run \
-        --start-group "$PREFIX/lib/libPS5OpenGL.a" --end-group -L"$PREFIX/lib" -L"$SYS/lib" \
+        "$W"/obj/*.o "${inputs[@]}" ${webgpu_inputs[@]+"${webgpu_inputs[@]}"} "$BLD/shim/libps5shim.a" \
+        ${gl_inputs[@]+"${gl_inputs[@]}"} -L"$SYS/lib" \
         "$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a" "$LIBCXX/lib/libunwind.a" \
-        "$PREFIX/lib/libSceAgc.so" "$AGCDRIVER" \
+        "$AGC" "$AGCDRIVER" \
         "$SYS/lib/libScePad.so" "$SYS/lib/libSceUserService.so" "$SYS/lib/libSceImeDialog.so" "$W/tool/libSceCommonDialog.so" \
         --as-needed "${sdk_stubs[@]}" --start-group "$W/libc-title.a" --end-group \
         2> "$W/link.log" || {
@@ -171,7 +187,7 @@ title_link
 # __cxa_thread_atexit_impl, optional SCE calls) stay undefined dynamic
 # symbols, which the converter rejects: define them as 0 (null) and relink.
 NM=/opt/homebrew/opt/llvm@18/bin/llvm-nm
-for so in "${sdk_stubs[@]}" "$PREFIX/lib/libSceAgc.so" "$AGCDRIVER"; do
+for so in "${sdk_stubs[@]}" "$AGC" "$AGCDRIVER"; do
     "$NM" -D --defined-only "$so" 2>/dev/null | awk '{print $NF}'
 done | sort -u > "$W/stub-symbols.txt"
 defsyms=()
@@ -199,7 +215,7 @@ title_link "${defsyms[@]}" "$W/importcheck.o"
 
 # 4. Convert, fake-sign, assemble the folder title.
 "$TOOL" link --in "$W/llvm-pie.elf" --out "$W/eboot.elf" --stub-dir "$SYS/lib" \
-    --stub "$PREFIX/lib/libSceAgc.so" --stub "$AGCDRIVER" --stub "$W/tool/libSceCommonDialog.so" \
+    --stub "$AGC" --stub "$AGCDRIVER" --stub "$W/tool/libSceCommonDialog.so" \
     --module-sdk 0x02000009 --companion-sdk 0x08050001 --file-name eboot.elf
 app="$OUT/$TITLE"; rm -rf -- "$app"; mkdir -p "$app/sce_sys" "$app/sce_module"
 "$TOOL" self --sign --in "$W/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <sys/types.h>
 
 /* compiler-rt's __cpu_model, which __builtin_cpu_supports() reads: addrlib's
@@ -38,6 +39,25 @@ int posix_fallocate(int fd, off_t offset, off_t len)
  * around a vkQueueSubmit (port/deps/patches/dawn), the render thread around
  * the GL work of a frame (PS5Renderer.cpp), not across its waits.
  * Recursive; unlock reports whether the caller held it. */
+#if PS5WK_GPU_RADV
+/* GPU=radv: ANGLE (the compositor, WebGL) and Dawn are both RADV, and RADV's
+ * PS5 winsys has one queue for the process, its submissions in order under
+ * its own lock: there is no other driver to keep apart. Held here, the lock
+ * was held through ANGLE's swapchain acquire (in the frame's first draw,
+ * about 13 of 16.7 ms), and Dawn's canvas readbacks waited about a second
+ * each (a WebGPU cube shown at 1 frame/s; 2026-11-19). Nothing in the radv
+ * build calls them any more (Phase 4: its Dawn has no 0004, PS5Renderer.cpp
+ * and WebKit's WebGL and WebGPU video paths leave the lock out), but they
+ * stay: ps5browser.c turns WebGPU on when they exist. */
+void ps5wk_gpu_submit_lock(void)
+{
+}
+
+int ps5wk_gpu_submit_unlock(void)
+{
+    return 0;
+}
+#else
 static pthread_mutex_t gpu_submit_mutex;
 static pthread_once_t gpu_submit_once = PTHREAD_ONCE_INIT;
 static __thread int gpu_submit_depth;
@@ -51,23 +71,6 @@ static void gpu_submit_init(void)
     pthread_mutexattr_destroy(&attr);
 }
 
-#if PS5WK_GPU_RADV
-/* GPU=radv: ANGLE (the compositor, WebGL) and Dawn are both RADV, and RADV's
- * PS5 winsys has one queue for the process, its submissions in order under
- * its own lock: there is no other driver to keep apart. Held here, the lock
- * was held through ANGLE's swapchain acquire (in the frame's first draw,
- * about 13 of 16.7 ms), and Dawn's canvas readbacks waited about a second
- * each (a WebGPU cube shown at 1 frame/s; 2026-11-19). The functions stay:
- * ps5browser.c turns WebGPU on when they exist. */
-void ps5wk_gpu_submit_lock(void)
-{
-}
-
-int ps5wk_gpu_submit_unlock(void)
-{
-    return 0;
-}
-#else
 void ps5wk_gpu_submit_lock(void)
 {
     pthread_once(&gpu_submit_once, gpu_submit_init);
@@ -86,6 +89,22 @@ int ps5wk_gpu_submit_unlock(void)
 #endif
 
 #if PS5WK_GPU_RADV
+/* Mesa's u_memstream (RADV's hang reports and debug dumps, ACO's
+ * diagnostics). The SDK's libc declares open_memstream but has no
+ * open_memstream, funopen, fopencookie or fmemopen. GPU=gl builds get this
+ * same failing version from ps5-opengl (src/platform/ps5_mesa_shims.c), so
+ * RADV has never had a memory stream here: its callers check for the
+ * failure and skip the dump. */
+FILE* open_memstream(char** buffer, size_t* size)
+{
+    if (buffer)
+        *buffer = NULL;
+    if (size)
+        *size = 0;
+    errno = ENOSYS;
+    return NULL;
+}
+
 /* ANGLE's Vulkan loader hook (ANGLE patch "ps5-static-vulkan-lookup", from
  * spikes/15-radv-only): RADV is linked in, so ANGLE takes the driver's
  * vkGetInstanceProcAddr instead of dlopen()ing a loader. */

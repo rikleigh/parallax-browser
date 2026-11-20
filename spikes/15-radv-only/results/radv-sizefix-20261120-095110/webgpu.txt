@@ -1,0 +1,149 @@
+RESULT webgpu-video-scaled anamorphic-size PASS 1440x1080 with 4:3 pixels is 1920x1080
+RESULT webgpu-video-scaled anamorphic-copy PASS 1920x1080 in 33.0 ms; red to blue at x 960 of 1920
+RESULT webgpu-video-scaled anamorphic-external PASS red to blue at x 960 of 1920
+RESULT webgpu-video-scaled switch-copy FAIL Error: one size only: 396x704 (80)
+RESULT webgpu-video-scaled uncaptured-errors PASS none
+RESULT webgpu-video-scaled summary FAIL 4/5
+RESULT webgpu-video-texture setup PASS texture_external pipeline for bgra8unorm
+RESULT webgpu-video-texture external-texture PASS 120 frames, 57.6 fps, 0.25 ms of JavaScript per frame; brightest channel 255, 50 colours on a 32x32 grid; video time 0.02 to 0.16 s
+RESULT webgpu-video-texture copy-external-image PASS 1920x1080 copied and read back in 26.0 ms; brightest channel 255, 58 colours on a 32x32 grid
+RESULT webgpu-video-texture video-frame-callback PASS 10 callbacks in 1772 ms, each imported and drawn; last frame 1920x1080 at media time 1.967, presentedFrames 71
+RESULT webgpu-video-texture uncaptured-errors PASS none
+RESULT webgpu-video-texture summary PASS 5/5
+RESULT webgpu-copy-external-image canvas-2d-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image canvas-2d-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-bitmap-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-bitmap-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image offscreen-canvas-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image offscreen-canvas-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-element-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-element-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image image-data-flipY-false PASS four quadrants as painted
+RESULT webgpu-copy-external-image image-data-flipY-true PASS four quadrants, top and bottom swapped
+RESULT webgpu-copy-external-image canvas-2d-to-bgra8unorm PASS four quadrants, red and blue the right way round
+RESULT webgpu-copy-external-image alpha-canvas-2d-straight PASS 255,128,0,128
+RESULT webgpu-copy-external-image alpha-canvas-2d-premultiplied PASS 128,64,0,128
+RESULT webgpu-copy-external-image alpha-image-bitmap-straight PASS 255,128,0,128
+RESULT webgpu-copy-external-image alpha-image-bitmap-premultiplied PASS 128,64,0,128
+RESULT webgpu-copy-external-image uncaptured-errors PASS none
+RESULT webgpu-copy-external-image summary PASS 16/16
+RESULT webgpu-adapter navigator-gpu PASS secure context true
+RESULT webgpu-adapter request-adapter PASS
+RESULT webgpu-adapter request-adapter-low-power PASS playstation playstation playstation
+RESULT webgpu-adapter request-adapter-high-performance PASS playstation playstation playstation
+RESULT webgpu-adapter request-adapter-fallback PASS no fallback adapter (null)
+RESULT webgpu-adapter info PASS vendor="playstation" architecture="playstation" device="playstation" description="playstation" subgroupMinSize=32 subgroupMaxSize=64 isFallbackAdapter=false
+RESULT webgpu-adapter features PASS 19: bgra8unorm-storage clip-distances core-features-and-limits depth-clip-control depth32float-stencil8 dual-source-blending float32-blendable float32-filterable indirect-first-instance primitive-index rg11b10ufloat-renderable shader-f16 subgroups texture-component-swizzle texture-compression-bc texture-compression-bc-sliced-3d texture-formats-tier1 texture-formats-tier2 timestamp-query
+RESULT webgpu-adapter limits PASS 35 limits, all at least the default
+RESULT webgpu-adapter is-fallback-adapter PASS adapter.info.isFallbackAdapter=false adapter.isFallbackAdapter=false
+RESULT webgpu-adapter preferred-canvas-format PASS bgra8unorm
+RESULT webgpu-adapter wgsl-language-features PASS 7: packed_4x8_integer_dot_product pointer_composite_access readonly_and_readwrite_storage_textures subgroup_id subgroup_uniformity texture_formats_tier1 unrestricted_pointer_parameters
+RESULT webgpu-adapter summary PASS 11/11
+RESULT webgpu-device request-device PASS
+RESULT webgpu-device default-features PASS 1 feature(s): core-features-and-limits
+RESULT webgpu-device default-limits PASS 31 limits are the defaults
+RESULT webgpu-device feature-bgra8unorm-storage PASS
+RESULT webgpu-device feature-clip-distances PASS
+RESULT webgpu-device feature-core-features-and-limits PASS
+RESULT webgpu-device feature-depth-clip-control PASS
+RESULT webgpu-device feature-depth32float-stencil8 PASS
+RESULT webgpu-device feature-dual-source-blending PASS
+RESULT webgpu-device feature-float32-blendable PASS
+RESULT webgpu-device feature-float32-filterable PASS
+RESULT webgpu-device feature-indirect-first-instance PASS
+RESULT webgpu-device feature-primitive-index PASS
+RESULT webgpu-device feature-rg11b10ufloat-renderable PASS
+RESULT webgpu-device feature-shader-f16 PASS
+RESULT webgpu-device feature-subgroups PASS
+RESULT webgpu-device feature-texture-component-swizzle PASS
+RESULT webgpu-device feature-texture-compression-bc PASS
+RESULT webgpu-device feature-texture-compression-bc-sliced-3d PASS
+RESULT webgpu-device feature-texture-formats-tier1 PASS
+RESULT webgpu-device feature-texture-formats-tier2 PASS
+RESULT webgpu-device feature-timestamp-query PASS
+RESULT webgpu-device required-limit-granted PASS maxTextureDimension2D=16384
+RESULT webgpu-device unsupported-feature-rejects PASS TypeError: Type error
+RESULT webgpu-device over-limit-rejects PASS maxBindGroups=5: OperationError: The operation failed for an operation-specific reason.
+RESULT webgpu-device second-request-device PASS rejected: OperationError: The operation failed for an operation-specific reason.
+RESULT webgpu-device label PASS
+RESULT webgpu-device submitted-work-done PASS 5.0 ms
+RESULT webgpu-device destroy-lost PASS reason destroyed, message ""
+RESULT webgpu-device summary PASS 29/29
+RESULT webgpu-compute fill PASS 4096 values right (last 12292)
+RESULT webgpu-compute indirect PASS 4096 values right (last 20486)
+RESULT webgpu-compute matrix PASS 64x64 product matches JavaScript (c[0]=-95, c[last]=42)
+RESULT webgpu-compute async-pipeline PASS 4096 values right (last 12292), pipeline ready after 2.0 ms
+RESULT webgpu-compute default-entry-point PASS 4096 values right (last 12292), compute stage with no entryPoint
+RESULT webgpu-compute timing PASS first pipeline to work done 5.0 ms; 100 dispatches submitted in 0.0 ms, read back after 3.0 ms
+RESULT webgpu-compute summary PASS 6/6
+RESULT webgpu-offscreen-readback triangle PASS centre red, corners blue, upright
+RESULT webgpu-offscreen-readback msaa-resolve PASS centre red, corner blue, 409 blended edge pixels
+RESULT webgpu-offscreen-readback depth PASS the near quad stays in front of the later far one
+RESULT webgpu-offscreen-readback write-texture-sample PASS four quadrants right, first texel row at the top
+RESULT webgpu-offscreen-readback write-buffer-copy PASS 256 bytes right (two copies, untouched bytes zero)
+RESULT webgpu-offscreen-readback rgba16float PASS centre 1.5,0.25,-1,1 and corner 0.25,0.5,2,1 kept
+RESULT webgpu-offscreen-readback mip-levels PASS levels 64, 32, 16 hold red, green, blue; a view of level 2 samples blue
+RESULT webgpu-offscreen-readback summary PASS 7/7
+RESULT webgpu-errors scope-bad-buffer PASS Buffer usages (BufferUsage::(MapRead|MapWrite)) is invalid. If a buffer usage contains BufferUsage::MapRead the only other allowed usage is BufferUsage::CopyDst...
+RESULT webgpu-errors mapped-at-creation-size PASS threw RangeError: GPUDevice.createBuffer: mappedAtCreation = true and bufferSize(5) is not a multiple of 4
+RESULT webgpu-errors scope-bad-bind-group PASS Binding usage (BufferUsage::Storage) of [Buffer (unlabeled)] doesn't match expected usage (BufferUsage::Uniform). - While validating entries[0] against { bindi...
+RESULT webgpu-errors scope-out-of-memory PASS validation error (over maxBufferSize 268435456): Buffer size (1125899906842624) exceeds the max buffer size limit (268435456). - While calling [Device].CreateBuffer([BufferDescriptor """"]).
+RESULT webgpu-errors memory-budget PASS buffer 13 of 128 MiB refused (); the same 12 fit again after destroy()
+RESULT webgpu-errors nested-scopes PASS inner catches, other filters pass the error out, one error per scope
+RESULT webgpu-errors pop-empty-stack PASS OperationError: popErrorScope failed
+RESULT webgpu-errors uncaptured-error PASS Buffer usages (BufferUsage::(MapRead|MapWrite)) is invalid. If a buffer usage contains BufferUsage::MapRead the only other allowed usage is BufferUsage::CopyDst...
+RESULT webgpu-errors wgsl-compilation-info PASS line 3 column 19 offset 79 length 12: unresolved value 'not_declared'
+RESULT webgpu-errors pipeline-async-rejects PASS GPUPipelineError reason validation: Entry point ""no_such_entry_point"" doesn't exist in the shader module [ShaderModule (unlabeled)]. ...
+RESULT webgpu-errors destroyed-buffer PASS mapAsync rejects (OperationError), writeBuffer and submit are validation errors
+RESULT webgpu-errors summary PASS 11/11
+RESULT webgpu-triangle configure PASS bgra8unorm 640x360
+RESULT webgpu-triangle first-frame-readback PASS drawImage + getImageData give 51,102,153,255
+RESULT webgpu-triangle animation PASS 30 frames, 61.0 fps, 0.30 ms of JavaScript per frame
+RESULT webgpu-triangle summary PASS 3/3
+RESULT webgpu-cube setup PASS bgra8unorm, 36 indices
+RESULT webgpu-cube animation PASS 120 frames, 60.0 fps, 0.23 ms of JavaScript per frame
+RESULT webgpu-cube centre-pixel PASS centre 28,35,70,255, corner 25,25,31,255
+RESULT webgpu-cube summary PASS 3/3
+RESULT webgpu-resize initial-320x180 PASS 320x180 bgra8unorm, 61.5 fps
+RESULT webgpu-resize size-640x360 PASS 640x360 bgra8unorm, 60.4 fps
+RESULT webgpu-resize size-1280x720 PASS 1280x720 bgra8unorm, 60.4 fps
+RESULT webgpu-resize size-1920x1080 PASS 1920x1080 bgra8unorm, 60.9 fps
+RESULT webgpu-resize size-16x16 PASS 16x16 bgra8unorm, 61.7 fps
+RESULT webgpu-resize size-320x180 PASS 320x180 bgra8unorm, 60.2 fps
+RESULT webgpu-resize unconfigure PASS throws InvalidStateError while unconfigured; 320x180 bgra8unorm, 60.0 fps
+RESULT webgpu-resize format-rgba16float PASS 320x180 rgba16float, 60.4 fps; getConfiguration() reports format rgba16float, toneMapping standard; back to bgra8unorm
+RESULT webgpu-resize device-change PASS second device: 320x180 bgra8unorm, 60.5 fps; first device again
+RESULT webgpu-resize uncaptured-errors PASS none
+RESULT webgpu-resize summary PASS 10/10
+RESULT webgpu-two-canvases configure PASS canvases a and b on one device, c on a second
+RESULT webgpu-two-canvases canvas-a PASS 204,51,51,255
+RESULT webgpu-two-canvases canvas-b PASS 51,204,51,255
+RESULT webgpu-two-canvases canvas-c-second-device PASS 51,51,204,255
+RESULT webgpu-two-canvases animation PASS 60 frames of three canvases, 59.9 fps, 0.28 ms of JavaScript per frame
+RESULT webgpu-two-canvases detach-reattach PASS drawn through 36 frames out of and back in the document, then read back right
+RESULT webgpu-two-canvases uncaptured-errors PASS none
+RESULT webgpu-two-canvases summary PASS 7/7
+RESULT webgpu-todataurl same-task-toDataURL PASS the pattern
+RESULT webgpu-todataurl same-task-toBlob PASS the pattern
+RESULT webgpu-todataurl same-task-createImageBitmap PASS the pattern
+RESULT webgpu-todataurl same-task-drawImage PASS the pattern
+RESULT webgpu-todataurl later-frame-toDataURL PASS the pattern (the presented frame is kept)
+RESULT webgpu-todataurl later-frame-toBlob PASS the pattern (the presented frame is kept)
+RESULT webgpu-todataurl later-frame-createImageBitmap PASS the pattern (the presented frame is kept)
+RESULT webgpu-todataurl later-frame-drawImage PASS the pattern (the presented frame is kept)
+RESULT webgpu-todataurl alpha-opaque PASS drawImage and toDataURL give 128,64,0,255
+RESULT webgpu-todataurl alpha-premultiplied PASS drawImage and toDataURL give 255,128,0,128
+RESULT webgpu-todataurl uncaptured-errors PASS none
+RESULT webgpu-todataurl summary PASS 11/11
+RESULT webgpu-buffer-map mapped-at-creation PASS 48 bytes round trip, mapAsync after 1.0 ms
+RESULT webgpu-buffer-map odd-multiple-of-4 PASS 1028 bytes round trip, mapAsync after 1.0 ms
+RESULT webgpu-buffer-map mapped-at-creation-no-map-usage PASS 256 bytes written through a STORAGE buffer mapped at creation
+RESULT webgpu-buffer-map partial-ranges PASS two disjoint ranges written, a partial mapping read
+RESULT webgpu-buffer-map typed-views PASS Float32Array and Int32Array views over one range
+RESULT webgpu-buffer-map map-write PASS 128 bytes written through mapAsync(WRITE)
+RESULT webgpu-buffer-map remap PASS three rounds
+RESULT webgpu-buffer-map round-trip-1MiB PASS 1048576 bytes round trip, mapAsync after 6.0 ms
+RESULT webgpu-buffer-map round-trip-16MiB PASS 16777216 bytes round trip, mapAsync after 44.0 ms
+RESULT webgpu-buffer-map round-trip-64MiB PASS 67108864 bytes round trip, mapAsync after 127.0 ms
+RESULT webgpu-buffer-map adapter-again PASS 19 features, the same as before the device
+RESULT webgpu-buffer-map summary PASS 11/11

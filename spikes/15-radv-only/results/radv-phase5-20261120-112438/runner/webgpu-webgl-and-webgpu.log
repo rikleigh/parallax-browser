@@ -1,0 +1,96 @@
+push from http <mac>: file:///data/ps5webkit/phase0/webgpu/webgl-and-webgpu.html?run=1795174495
+push: loading file:///data/ps5webkit/phase0/webgpu/webgl-and-webgpu.html?run=1795174495
+load started: file:///data/ps5webkit/phase0/webgpu/webgl-and-webgpu.html?run=1795174495
+[web4] [WPEWebKit:Media:-] MediaElementSession::clientWillBeDOMSuspended(381846721755431F) 
+[app msg] [video] stream 3 from pid 485 closed
+[app msg] [vdec] decoder 1 from pid 485 closed: 230 AUs (6.0 MB), 223 pictures, 0 hidden, 0 errors (first rc 0x00000000), 0 skipped before a keyframe, 0 refused, 0 format changes, 0 resets after errors; 13 PRELEASEs, 0 waits of 10 s for a slot, 0 pictures lost without a release
+[vdec] decoder closed: flexible free 261 MB, direct memory in use 628 MB (its output buffers go back with the next frame)
+[app msg] [vdec] decoder 1 released: budget 0 decoders, 0 MB (peak 1, 155 MB; 0 refused, 0 waited, 0 VP9 sized to the stream)
+load committed: file:///data/ps5webkit/phase0/webgpu/webgl-and-webgpu.html?run=1795174495
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+ac_compute_device_uuid's output is based on invalid pci bus info.
+[webgl] title: ANGLE context 11310 for WebGL 2, max texture 16384
+[webgpu] title: canvas 2c36 of WebProcess 4
+[app msg] [video] stream 3 removed: 206 frames received, 158 shown, 48 dropped
+load finished: file:///data/ps5webkit/phase0/webgpu/webgl-and-webgpu.html?run=1795174495
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgpu/webgl-and-webgpu.html?run=1795174495 "" (0.0 s after start)
+[mem] load finished: flexible 261.0 MB free; direct memory 590.0 MB in use; direct heap 46.5 MB mapped (peak 224.6, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 54 (peak 350.5 MB, 84 made, 0 failed, 0 zero fills, 116 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 51 live, 79.2 MB (81 created, 0 libc); WebGL 3 contexts (12 made), drawing buffers ~2.8 MB; WebGPU buffers and textures 0.9 MB (peak 1536.0, budget 1536, 2 refused)
+[ps5audio] port 0x20000000 (pid 485) closing: GetPortState 0x00000000: output 0x81, 2 ch, volume -1, reroutes 11, flag 0x0
+[webgl] title: first frame finished
+[ps5audio] stream from pid 485 closed: 7.1 s of audio in 7.2 s (peak 0, rms 0 of 32767; 0 output errors, first 0x00000000; 0 dropouts, 0.0 ms)
+[webgpu] title: canvas 2c36: first frame, 320x180, format 26, opaque, in an image shared with the compositor (no CPU copy)
+[web4] [WPEWebKit:Media:-] MediaElementSession::processClientWillPausePlayback(381846721755431F) state = Playing
+[web4] [WPEWebKit:Media:-] MediaElementSession::setState(381846721755431F) Paused, canProduceAudio=true
+[web4] [WPEWebKit:Media:-] HTMLMediaElement::removeVideoTrack(381846721755431F) id: 1, 1920x1080 avc1.640028
+[web4] [ps5videosink] 2140a2330: stop after 208 frames sent (title: 158 shown, 48 dropped; 0 without a free slot; 208 hardware-decoded, 1 preroll frames not sent again)
+[web4] [ps5vdecproxy] 212b982e0: stop after 230 AUs, 212 pictures, 0 released, 9 stale, 0 clipped, 0 dropped late, 4 given back unrendered
+[web4] [WPEWebKit:Media:-] MediaElementSession::stopSession(381846721755431F) 
+[web4] [WPEWebKit:Media:-] HTMLMediaElement::pauseInternal(381846721755431F) returning because context is suspended
+[web4] [webgl] remote context 11310: WebGL 2, alpha 1
+[web4] [webgl] page: WebGL 2 context for  (the main frame, canvas in the document 320x180)
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu setup PASS WebGL2 and WebGPU canvases
+[web4] [webgl] first frame prepared for display
+[web4] CONSOLE RENDERING INFO WebGL debug message: type:performance, id:0 severity: high: GPU stall due to ReadPixels
+[web4] CONSOLE RENDERING INFO WebGL debug message: type:performance, id:0 severity: high: GPU stall due to ReadPixels (this message will no longer repeat)
+IPC: socket 77 in process 482 reported condition 0x11 (HUP/ERR/NVAL)
+[wc] 1.0 s: 57 updates (apply 0.04 ms avg, 1.3 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 18 (18 draws, 7.8 MB, 1.16 ms, 0.064 ms per upload, 0 fence waits, 0 finishes); 58 paints (0.20 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 16.0 max, applied to swap 0.00 avg 0.0 max, swap to reply 1.18 avg 66.2 max
+[wc] 1.0 s: 57 updates answered when applied (async scrolling)
+[wc] 1.0 s: 0 video layers, 1 paints for video frames only
+[wc] 1.0 s: WebGL 2 contexts (12 made), 2 layers shown, drawing buffers ~1.4 MB (in the GL texture cap)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 57 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.15 ms, 0.037 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.8 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates answered when applied (async scrolling)
+[ascroll] 1.0 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 60 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
+[app msg] [wpe-ps5] [cpu] title: main thread busy 2 % (outside poll), process CPU 0.32 cores, render thread CPU 1 %
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.16 ms, 0.039 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[app msg] [wpe-ps5] [present] 299 frames (59.7/s), render 0.39 ms avg 1.6 max, swap 0.1 ms avg 0.3 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 71 video frames (71 hardware-decoded), copy+convert 0.04 ms avg 0.1 max
+[app msg] [wpe-ps5] [present] render: apply 0.03 ms avg, video 0.01, scene 0.24, draw 0.10 avg 0.3 max (incl. the wait for the previous flip)
+[web4] [render] wc: 297 updates in 5.0 s (59.3/s), 1.9 ms average, p50 1.6, p95 6.7, 12.4 ms max; update 1.9 avg; paint 0.0 avg 0.0 p95 (0.01 Mpx, 0.1 tiles avg); frame done 14.8 ms avg; rAF clock 59.7/s (1 idle); reply to next update 0.1 ms avg 16.9 max (297 of 297 waiting at the reply, 1 started by the idle timer); tile wait 0.0 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 1.7, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.1
+[web4] [render] wc flush: 297 layer tree flushes, 0.03 ms avg; layers per flush: 8 walked, 0 skipped (culled), 1.6 changed
+[web4] [render] paint cull (per update): 0 layers painted into tiles, 0 skipped outside the dirty rect, 0 with self-painting descendants, 0 not eligible
+[web4] [render] wc tiles: record 0.2 ms/s (0.42 Mpx/s), raster 0.6 ms/s wall (0.42 Mpx/s, 88 items, 5 async), shm allocations 0.0/s, old way 0
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.14 ms, 0.034 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.1 max
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.3 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.24 ms, 0.060 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[web4] [WPEWebKit:Media:-] MediaSessionManagerInterface::dumpSessionStates(0)  Sessions:
+[webgl] title: 59.7 frames/s; the WebGL thread 0.27 ms CPU per frame (max 0.5), 2% of a core; 2 contexts, drawing buffers ~1.4 MB
+[webgl] title:   context 11310 (WebGL 2, 320x180, 5 s old): 300 frames, 13.2 ms of the WebGL thread per second
+[web4] 
+[web4] [webgl] sync calls: 534 in 5.0 s, 53 ms waiting (1% of the time); slowest kinds: RemoteGraphicsContextGL_PrepareForDisplay 299/28ms/max 0ms RemoteGraphicsContextGL_ReadPixelsInline 225/23ms/max 1ms RemoteGraphicsContextGL_GetShaderi 2/0ms/max 0ms RemoteGraphicsContextGL_GetErrors 2/0ms/max 0ms RemoteGraphicsContextGL_GetProgrami 1/0ms/max 0ms RemoteGraphicsContextGL_GetShaderInfoLog 2/0ms/max 0ms
+[web4] [render] compositing: 8 updates in 5.4 s, 0.1 ms avg, 0.1 max (2 with a requirements traversal, 8 with a backing/hierarchy update)
+[web4] [render] compositing requirements per traversal: 3 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfP RenderView 1, selfDS RenderView 1
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.15 ms, 0.037 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.14 ms, 0.035 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[app msg] [wpe-ps5] [cpu] title: main thread busy 1 % (outside poll), process CPU 0.36 cores, render thread CPU 1 %
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.17 ms, 0.042 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 15.0 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 0.35 ms avg 0.6 max, swap 0.1 ms avg 0.3 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.02 ms avg, video 0.00, scene 0.23, draw 0.09 avg 0.2 max (incl. the wait for the previous flip)
+[web4] [render] wc: 300 updates in 5.0 s (60.0/s), 3.1 ms average, p50 2.0, p95 6.7, 7.7 ms max; update 3.0 avg; paint 0.0 avg 0.0 p95 (0.00 Mpx, 0.1 tiles avg); frame done 13.6 ms avg; rAF clock 60.0/s (0 idle); reply to next update 0.0 ms avg 0.1 max (300 of 300 waiting at the reply, 0 started by the idle timer); tile wait 0.0 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 2.8, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.1
+[web4] [render] wc flush: 300 layer tree flushes, 0.02 ms avg; layers per flush: 8 walked, 0 skipped (culled), 2.0 changed
+[web4] [render] wc tiles: record 0.2 ms/s (0.06 Mpx/s), raster 0.3 ms/s wall (0.06 Mpx/s, 20 items, 5 async), shm allocations 0.0/s, old way 0
+[web4] [webgl] sync calls: 525 in 5.0 s, 51 ms waiting (1% of the time); slowest kinds: RemoteGraphicsContextGL_PrepareForDisplay 300/28ms/max 0ms RemoteGraphicsContextGL_ReadPixelsInline 225/22ms/max 0ms
+[webgl] title: 59.9 frames/s; the WebGL thread 0.27 ms CPU per frame (max 0.5), 2% of a core; 2 contexts, drawing buffers ~1.4 MB
+[webgl] title:   context 11310 (WebGL 2, 320x180, 10 s old): 300 frames, 12.9 ms of the WebGL thread per second
+[web4] [render] compositing: 5 updates in 5.0 s, 0.0 ms avg, 0.0 max (0 with a requirements traversal, 5 with a backing/hierarchy update)
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.16 ms, 0.040 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.14 ms, 0.035 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 15.0 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.16 ms, 0.040 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.8 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 0.35 ms avg 0.6 max, swap 0.1 ms avg 0.4 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[app msg] [wpe-ps5] [present] render: apply 0.02 ms avg, video 0.00, scene 0.23, draw 0.09 avg 0.1 max (incl. the wait for the previous flip)
+[web4] [render] wc: 300 updates in 5.0 s (59.9/s), 3.1 ms average, p50 2.1, p95 6.8, 8.0 ms max; update 3.0 avg; paint 0.0 avg 0.0 p95 (0.00 Mpx, 0.1 tiles avg); frame done 13.5 ms avg; rAF clock 59.9/s (0 idle); reply to next update 0.0 ms avg 0.3 max (300 of 300 waiting at the reply, 0 started by the idle timer); tile wait 0.0 ms avg
+[web4] [render] wc phases (ms per update): layout before 0.0, scroll events 0.0, animations 0.0, rAF callbacks 2.9, layout after rAF 0.0, resize observers 0.0, intersection observers 0.0 (targets per update: 0 computed, 0 far ones skipped), final layout + compositing 0.0, other 0.1
+[web4] [render] wc tiles: record 0.2 ms/s (0.06 Mpx/s), raster 0.2 ms/s wall (0.06 Mpx/s, 20 items, 5 async), shm allocations 0.0/s, old way 0
+[webgl] title:   context 11310 (WebGL 2, 320x180, 15 s old): 300 frames, 12.9 ms of the WebGL thread per second
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu frames PASS 900 frames, 59.8 fps, 2.83 ms of JavaScript per frame
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu webgl-pixels PASS 0 of 226 reads wrong
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu webgpu-pixels PASS 0 of 226 reads wrong
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:42:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu uncaptured-errors PASS none
+[web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu summary PASS 5/5
+[web4] [render] compositing: 5 updates in 5.0 s, 0.1 ms avg, 0.1 max (1 with a requirements traversal, 5 with a backing/hierarchy update)
+[web4] [render] compositing requirements per traversal: 4 layers on the full path, 0 unchanged; started full traversals (dirty bits: C paint order children, P post-layout, D descendants, S later layers): selfD RenderView 1
+[wc] 1.0 s: 60 updates (apply 0.02 ms avg, 0.4 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 8 (8 draws, 1.8 MB, 0.34 ms, 0.042 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 14.9 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.0 s: 60 updates (apply 0.01 ms avg, 0.2 max; 0 unchanged), 0 presents; 1 pages, 11 layers; tiles uploaded 4 (4 draws, 0.2 MB, 0.16 ms, 0.039 ms per upload, 0 fence waits, 0 finishes); 60 paints (0.20 ms avg, 0.2 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 14.8 MB (pool 0.0); programs 9 (27 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 15.0 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[app msg] [wpe-ps5] [present] 300 frames (59.9/s), render 0.35 ms avg 0.7 max, swap 0.1 ms avg 0.3 max, vsync interval 16.68 ms; 0 page uploads, 0.0 ms avg 0.0 max (0.00 MB each); 0 video frames (0 hardware-decoded), copy+convert 0.00 ms avg 0.0 max
+[web4] [render] wc: 300 updates in 5.0 s (59.9/s), 3.1 ms average, p50 2.0, p95 6.8, 8.6 ms max; update 3.0 avg; paint 0.0 avg 0.0 p95 (0.00 Mpx, 0.1 tiles avg); frame done 13.5 ms avg; rAF clock 59.9/s (0 idle); reply to next update 0.0 ms avg 0.2 max (300 of 300 waiting at the reply, 0 started by the idle timer); tile wait 0.0 ms avg
+[web4] [render] wc tiles: record 0.2 ms/s (0.14 Mpx/s), raster 0.5 ms/s wall (0.14 Mpx/s, 36 items, 5 async), shm allocations 0.0/s, old way 0

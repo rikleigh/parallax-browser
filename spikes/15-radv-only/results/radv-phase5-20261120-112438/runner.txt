@@ -1,0 +1,163 @@
+==> pages and clips to /data/ps5webkit/phase0
+== static (file:///data/ps5webkit/phase0/static.html, 40 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/static.html "" (2.2 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/static.html loaded in 2.2 s: title ""; flexible 262.0 MB
+== feed (file:///data/ps5webkit/phase0/wcfeed.html?mins=1, 80 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/wcfeed.html?mins=1 "WC feed stress" (6.2 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/wcfeed.html?mins=1 loaded in 6.2 s: title "WC feed stress"; flexible 174.0 MB
+== layers2800 (file:///data/ps5webkit/phase0/scrolljank.html?layers=2800&cluster=2500, 40 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/scrolljank.html?layers=2800&cluster=2500 "" (2.1 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/scrolljank.html?layers=2800&cluster=2500 loaded in 2.1 s: title ""; flexible 262.0 MB
+== video-1080p (file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4, 30 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4 "Video test" (2.4 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4 loaded in 2.4 s: title "Video test"; flexible 238.0 MB
+== video-2160p (file:///data/ps5webkit/phase0/video.html?src=media/sync-2160p30-hevc.mp4, 30 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-2160p30-hevc.mp4 "Video test" (2.5 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-2160p30-hevc.mp4 loaded in 2.5 s: title "Video test"; flexible 209.0 MB
+== video-2160p10 (file:///data/ps5webkit/phase0/video.html?src=media/sync-2160p30-hevc10.mp4, 30 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-2160p30-hevc10.mp4 "Video test" (2.3 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-2160p30-hevc10.mp4 loaded in 2.3 s: title "Video test"; flexible 209.0 MB
+== webgl-readpixels (file:///data/ps5webkit/phase0/webgl-readpixels.html, 60 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgl-readpixels.html "" (2.2 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/webgl-readpixels.html loaded in 2.2 s: title ""; flexible 262.0 MB
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels default-antialiased-rgba8 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels default-plain-rgba8 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba8 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba8-read-format PASS (it is RGBA/UNSIGNED_BYTE)
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels r8 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rg8 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels srgb8-alpha8 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgb565 PASS
+   [web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba4 PASS
+== webgl-busy (file:///data/ps5webkit/phase0/webgl-busy.html, 90 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgl-busy.html "" (2.1 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/webgl-busy.html loaded in 2.1 s: title ""; flexible 262.0 MB
+   [web4] file:///data/ps5webkit/phase0/webgl-busy.html:31:33: CONSOLE LOG [webgl-busy] RESULT webgl-busy n=100 60.4 fps, JS 0.33 ms per frame (max 2.0), 0 frames over 33 ms (longest 
+   [web4] file:///data/ps5webkit/phase0/webgl-busy.html:31:33: CONSOLE LOG [webgl-busy] RESULT webgl-busy n=250 59.9 fps, JS 0.57 ms per frame (max 4.0), 0 frames over 33 ms (longest 
+   [web4] file:///data/ps5webkit/phase0/webgl-busy.html:31:33: CONSOLE LOG [webgl-busy] RESULT webgl-busy n=500 59.9 fps, JS 1.00 ms per frame (max 3.0), 0 frames over 33 ms (longest 
+   [web4] file:///data/ps5webkit/phase0/webgl-busy.html:31:33: CONSOLE LOG [webgl-busy] RESULT webgl-busy n=1000 59.9 fps, JS 1.81 ms per frame (max 3.0), 0 frames over 33 ms (longest
+   [web4] file:///data/ps5webkit/phase0/webgl-busy.html:31:33: CONSOLE LOG [webgl-busy] RESULT webgl-busy n=2000 59.9 fps, JS 3.20 ms per frame (max 5.0), 0 frames over 33 ms (longest
+== webgl-video (file:///data/ps5webkit/phase0/webgl-video.html?clip=/data/ps5webkit/phase0/media/sync-1080p30-h264.mp4, 30 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgl-video.html?clip=/data/ps5webkit/phase0/media/sync-1080p30-h264.mp4 "WebGL video" (2.3 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/webgl-video.html?clip=/data/ps5webkit/phase0/media/sync-1080p30-h264.mp4 loaded in 2.3 s: title "WebGL video"; flexible
+== webgpu-start (file:///data/ps5webkit/phase0/static.html, 15 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/static.html "" (2.2 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/static.html loaded in 2.2 s: title ""; flexible 262.0 MB
+== webgpu-adapter
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-adapter summary PASS 11/11
+== webgpu-device
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-device summary PASS 29/29
+== webgpu-compute
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-compute summary PASS 6/6
+== webgpu-offscreen-readback
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-offscreen-readback summary PASS 7/7
+== webgpu-errors
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-errors summary PASS 11/11
+== webgpu-buffer-map
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-buffer-map summary PASS 11/11
+== webgpu-triangle
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-triangle summary PASS 3/3
+== webgpu-cube
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-cube summary PASS 3/3
+== webgpu-resize
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-resize summary PASS 10/10
+== webgpu-two-canvases
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-two-canvases summary PASS 7/7
+== webgpu-todataurl
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-todataurl summary PASS 11/11
+== webgpu-copy-external-image
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-copy-external-image summary PASS 16/16
+== webgpu-video-texture
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-video-texture summary PASS 5/5
+== webgpu-webgl-and-webgpu
+   [web4] file:///data/ps5webkit/phase0/webgpu/webgpu-test.js:66:16: CONSOLE LOG RESULT webgpu-webgl-and-webgpu summary PASS 5/5
+== vr-sim (file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4, 180 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4 "Video test" (2.4 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-1080p30-h264.mp4 loaded in 2.4 s: title "Video test"; flexible 238.0 MB
+   RESULT ps5browser vr PASS headset shows the video (up)
+   RESULT ps5browser vr-selftest PASS 15 eye-buffer captures, 8 projections, controls, 4 entries in 71 s; VR off now
+==> logs in /Users/rikleigh/git/ps5webkit/spikes/15-radv-only/results/radv-phase5-20261120-112438/runner
+| case | present/s best (median) | render ms | scene paint ms med (max) | draws/paint | upload ms each | convert ms | direct MB max | flexible MB min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| static | 59.9 (43.0) | 0.45 | 0.17 (10.91) | 20 | 0.040 | - | 452 | 262 |
+| feed | 59.9 (59.9) | 1.65 | 0.83 (2.25) | 53 | 0.059 | 0.07 | 1612 | 174 |
+| layers2800 | 60.0 (60.0) | 9.75 | 7.38 (9.17) | 929 | 0.028 | - | 452 | 262 |
+| video-1080p | 59.9 (59.9) | 0.42 | - (-) | - | 0.041 | 0.03 | 633 | 238 |
+| video-2160p | 59.9 (59.9) | 0.43 | - (-) | - | 0.042 | 0.03 | 924 | 209 |
+| video-2160p10 | 59.9 (59.9) | 0.45 | - (-) | - | 0.046 | 0.04 | 1203 | 209 |
+| webgl-readpixels | - (-) | - | - (-) | - | 0.039 | - | 455 | 262 |
+| webgl-busy | 59.9 (59.9) | 0.35 | - (-) | - | 0.045 | - | 453 | 262 |
+| webgl-video | 59.9 (59.9) | 0.44 | - (-) | - | 0.046 | 0.03 | 641 | 238 |
+| webgpu-start | 20.2 (17.2) | 0.41 | - (-) | - | 0.029 | - | 452 | 262 |
+| webgpu-adapter | - (-) | - | - (-) | - | 0.110 | - | 476 | 262 |
+| webgpu-device | - (-) | - | - (-) | - | 0.035 | - | 503 | 262 |
+| webgpu-compute | 13.5 (13.5) | 0.29 | - (-) | - | 0.040 | - | 503 | 262 |
+| webgpu-offscreen-readback | - (-) | - | - (-) | - | 0.094 | - | 536 | 262 |
+| webgpu-errors | - (-) | - | - (-) | - | 0.071 | - | 511 | 262 |
+| webgpu-buffer-map | - (-) | - | - (-) | - | 0.080 | - | 3589 | 262 |
+| webgpu-triangle | 5.4 (5.4) | 0.40 | - (-) | - | 0.061 | - | 707 | 262 |
+| webgpu-cube | 59.9 (59.9) | 0.29 | - (-) | - | 0.049 | - | 514 | 262 |
+| webgpu-resize | 59.9 (59.9) | 0.29 | - (-) | - | 0.037 | - | 516 | 262 |
+| webgpu-two-canvases | - (-) | - | - (-) | - | 0.060 | - | 514 | 262 |
+| webgpu-todataurl | 59.9 (59.9) | 0.34 | - (-) | - | 0.052 | - | 534 | 262 |
+| webgpu-copy-external-image | - (-) | - | - (-) | - | 0.070 | - | 530 | 262 |
+| webgpu-video-texture | 60.3 (60.3) | 0.44 | - (-) | - | 0.052 | 0.05 | 686 | 238 |
+| webgpu-webgl-and-webgpu | 59.9 (59.9) | 0.35 | - (-) | - | 0.047 | 0.04 | 590 | 261 |
+| vr-sim | 59.9 (47.4) | 0.42 | - (-) | - | 0.038 | 0.05 | 758 | 238 |
+
+webgl-readpixels:
+   RESULT webgl-readpixels summary 29/29 passed
+webgl-busy:
+   RESULT webgl-busy n=100 60.4 fps, JS 0.33 ms per frame (max 2.0), 0 frames over 33 ms (longest 17 ms), WebGL 2, GL error 0x0
+   RESULT webgl-busy n=250 59.9 fps, JS 0.57 ms per frame (max 4.0), 0 frames over 33 ms (longest 25 ms), WebGL 2, GL error 0x0
+   RESULT webgl-busy n=500 59.9 fps, JS 1.00 ms per frame (max 3.0), 0 frames over 33 ms (longest 19 ms), WebGL 2, GL error 0x0
+   RESULT webgl-busy n=1000 59.9 fps, JS 1.81 ms per frame (max 3.0), 0 frames over 33 ms (longest 17 ms), WebGL 2, GL error 0x0
+   RESULT webgl-busy n=2000 59.9 fps, JS 3.20 ms per frame (max 5.0), 0 frames over 33 ms (longest 18 ms), WebGL 2, GL error 0x0
+webgl-video:
+   webgl-video 59.9 fps, 120 uploads, video 1920x1080 at 21.8 s, centre pixel 2,5,108,255, GL error 0x0
+   webgl-video 59.9 fps, 120 uploads, video 1920x1080 at 23.8 s, centre pixel 0,5,108,255, GL error 0x0
+webgpu-adapter:
+   RESULT webgpu-adapter summary PASS 11/11
+webgpu-device:
+   RESULT webgpu-device summary PASS 29/29
+webgpu-compute:
+   RESULT webgpu-compute summary PASS 6/6
+webgpu-offscreen-readback:
+   RESULT webgpu-offscreen-readback summary PASS 7/7
+webgpu-errors:
+   RESULT webgpu-errors summary PASS 11/11
+webgpu-buffer-map:
+   RESULT webgpu-buffer-map summary PASS 11/11
+webgpu-triangle:
+   RESULT webgpu-triangle summary PASS 3/3
+webgpu-cube:
+   RESULT webgpu-cube summary PASS 3/3
+webgpu-resize:
+   RESULT webgpu-resize summary PASS 10/10
+webgpu-two-canvases:
+   RESULT webgpu-two-canvases summary PASS 7/7
+webgpu-todataurl:
+   RESULT webgpu-todataurl summary PASS 11/11
+webgpu-copy-external-image:
+   RESULT webgpu-copy-external-image summary PASS 16/16
+webgpu-video-texture:
+   RESULT webgpu-video-texture summary PASS 5/5
+webgpu-webgl-and-webgpu:
+   RESULT webgpu-webgl-and-webgpu summary PASS 5/5
+vr-sim:
+   RESULT ps5browser vr-selftest PASS 15 eye-buffer captures, 8 projections, controls, 4 entries in 71 s; VR off now
+   [app msg] [vr] headset simulation ended after 1.1 s: 65 frames (60.9/s), 65 tracked, 0 begin errors, 0 submit errors, 21 TV redraws (swap max 0.1 ms); released in 0 ms
+   [app msg] [vr] headset simulation ended after 1.1 s: 67 frames (60.8/s), 67 tracked, 0 begin errors, 0 submit errors, 22 TV redraws (swap max 0.1 ms); released in 0 ms
+   [app msg] [vr] headset simulation ended after 1.1 s: 66 frames (60.9/s), 66 tracked, 0 begin errors, 0 submit errors, 22 TV redraws (swap max 0.1 ms); released in 0 ms
+==> clean-up

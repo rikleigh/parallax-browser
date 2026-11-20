@@ -55,22 +55,26 @@ fetch() {
     FETCHED="$f"
 }
 
-# unpack <name> <archive>: fresh, empty src/<name>, archive's top dir stripped.
+# unpack <name> <archive> [patch dir...]: fresh, empty src/<name>, archive's top dir stripped,
+# then the patches of each dir in turn (default: patches/<name>).
 unpack() {
-    local name=$1 arc=$2 d="$W/src/$1"
+    local name=$1 arc=$2 d="$W/src/$1" pd
+    shift 2
+    [ $# -gt 0 ] || set -- "$name"
     rm -rf "$d"; mkdir -p "$d"
     case "$arc" in
         *.zip) local t="$W/src/.$name-zip"; rm -rf "$t"; mkdir -p "$t"
                unzip -q "$arc" -d "$t"; mv "$t"/*/* "$d"/; rm -rf "$t" ;;
         *) tar -xf "$arc" -C "$d" --strip-components=1 ;;
     esac
-    if [ -d "$PATCHES/$name" ]; then
-        for p in "$PATCHES/$name"/*.patch; do
+    for pd in "$@"; do
+        [ -d "$PATCHES/$pd" ] || continue
+        for p in "$PATCHES/$pd"/*.patch; do
             [ -f "$p" ] || continue
-            echo "patch $name: $(basename "$p")"
+            echo "patch $name: $pd/$(basename "$p")"
             patch -s -d "$d" -p1 < "$p"
         done
-    fi
+    done
     SRC="$d"
     BLD="$W/build/$name"
     rm -rf "$BLD"; mkdir -p "$BLD"
@@ -889,7 +893,25 @@ step_fonts() {
 DAWN_COMMIT=088a8d00efd1c70b58c549d355401d115904b648   # branch point of chromium/8103 (M157)
 step_dawn() {
     log "dawn ${DAWN_COMMIT:0:12} (WebGPU: Vulkan + OpenGL ES + null backends, Tint)"
-    local gh=https://github.com tp
+    dawn_build dawn "$SYSROOT" dawn
+}
+
+# The GPU=radv browser's Dawn (HANDOVER-radv.md Phase 4): the same Dawn with
+# patches/dawn-radv on top (textures over ANGLE's image memory, spikes/15-radv-only
+# 15e), in its own src/build trees and installed into its own prefix, which only
+# GPU=radv port/webkit/build.sh links (-DPS5WK_DAWN_ROOT). The sysroot's Dawn, which
+# the release builds link, is left as step_dawn made it.
+DAWN_RADV_PREFIX="$W/install/dawn-radv"
+step_dawn_radv() {
+    log "dawn-radv ${DAWN_COMMIT:0:12} (Dawn + patches/dawn-radv -> ${DAWN_RADV_PREFIX#$ROOT/})"
+    mkdir -p "$DAWN_RADV_PREFIX"
+    dawn_build dawn-radv "$DAWN_RADV_PREFIX" dawn dawn-radv
+}
+
+# dawn_build <name> <install prefix> <patch dir...>
+dawn_build() {
+    local name=$1 prefix=$2 gh=https://github.com tp
+    shift 2
     # dawn_dep <dir under third_party> <url> <sha256> <file>: a fresh directory
     dawn_dep() {
         fetch "$2" "$3" "$4"
@@ -898,7 +920,7 @@ step_dawn() {
     }
     fetch $gh/google/dawn/archive/$DAWN_COMMIT.tar.gz \
         f5ff77afd294d706c62ad478bdaa49429bf057f8fa80f968f5b2fd15334ef375 dawn-$DAWN_COMMIT.tar.gz
-    unpack dawn "$FETCHED"
+    unpack "$name" "$FETCHED" "$@"
     tp="$SRC/third_party"
     dawn_dep abseil-cpp $gh/abseil/abseil-cpp/archive/7f008af1930f59d869a816795ac5d445e3628e4d.tar.gz \
         e74737a89933b4beb590633d0333399d4cf069c99c70145f6a0a40b65362a86d dawn-abseil-cpp-7f008af1.tar.gz
@@ -926,7 +948,7 @@ step_dawn() {
     # NDEBUG: Dawn insists on it or DAWN_ENABLE_ASSERTS (cmake_pkg empties the
     # release flags). TINT_BUILD_AS_OTHER_OS: Tint's *_other.cc (no terminal
     # queries, no /proc/self/exe, no child processes) instead of the Linux ones.
-    cmake_pkg dawn \
+    cmake_pkg "$name" -DCMAKE_INSTALL_PREFIX="$prefix" \
         -DPython3_EXECUTABLE="$(command -v python3)" \
         -DCMAKE_C_FLAGS_RELEASE=-DNDEBUG -DCMAKE_CXX_FLAGS_RELEASE=-DNDEBUG -DTINT_BUILD_AS_OTHER_OS=ON \
         -DDAWN_JINJA2_DIR="$tp/.jinja2/src/jinja2" -DDAWN_MARKUPSAFE_DIR="$tp/.markupsafe/src/markupsafe" \
@@ -940,15 +962,16 @@ step_dawn() {
         -DTINT_BUILD_WGSL_READER=ON -DTINT_BUILD_SPV_WRITER=ON -DTINT_BUILD_GLSL_WRITER=ON \
         -DTINT_BUILD_SPV_READER=OFF -DTINT_BUILD_WGSL_WRITER=OFF -DTINT_BUILD_HLSL_WRITER=OFF \
         -DTINT_BUILD_MSL_WRITER=OFF -DTINT_BUILD_GLSL_VALIDATOR=OFF
-    echo "dawn: built in $((SECONDS - t0)) s"
+    echo "$name: built in $((SECONDS - t0)) s"
     # Dawn's install rules leave out dawn::platform::Platform (its code is in
     # the archive; DawnInstanceDescriptor::platform takes one).
-    install -d "$SYSROOT/include/dawn/platform"
-    install -m644 "$SRC"/include/dawn/platform/*.h "$SYSROOT/include/dawn/platform/"
+    install -d "$prefix/include/dawn/platform"
+    install -m644 "$SRC"/include/dawn/platform/*.h "$prefix/include/dawn/platform/"
     # The exported CMake package carries abseil's host-probed link flags
     # (-lrt, EXECINFO_LIBRARY-NOTFOUND) and an absolute path: link the archive.
-    rm -rf "$SYSROOT/lib/cmake/Dawn"
-    fix_sysroot; cleanup dawn
+    rm -rf "$prefix/lib/cmake/Dawn"
+    [ "$prefix" = "$SYSROOT" ] && fix_sysroot
+    cleanup "$name"
 }
 
 # RADV (the Vulkan driver under Dawn, WebGPU builds): Mesa with the PS5 winsys
@@ -981,13 +1004,13 @@ STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv p
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
           cacert fonts mime xkeyboard_config)
 STEPS_M2=(dav1d ffmpeg libogg libvorbis opus gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
-# Not in any default set (WebGPU builds): build.sh dawn radv
-STEPS_GPU=(dawn radv)
+# Not in any default set (WebGPU builds): build.sh dawn radv; GPU=radv builds: dawn-radv
+STEPS_GPU=(dawn radv dawn-radv)
 
 if [ "${1:-}" = "--list" ]; then
     echo "# Milestone 1 (default)"; printf '%s\n' "${STEPS_M1[@]}" | tr _ -
     echo "# Milestone 2 (media): build.sh m2"; printf '%s\n' "${STEPS_M2[@]}" | tr _ -
-    echo "# WebGPU builds: build.sh dawn radv"; printf '%s\n' "${STEPS_GPU[@]}" | tr _ -
+    echo "# WebGPU builds: build.sh dawn radv (GPU=radv: dawn-radv too)"; printf '%s\n' "${STEPS_GPU[@]}" | tr _ -
     exit 0
 fi
 STEPS=("$@")
