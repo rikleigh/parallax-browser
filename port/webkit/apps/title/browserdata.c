@@ -821,7 +821,7 @@ void ps5wk_session_save(GPtrArray* tabs, int active)
 
 /* ---------------------------------------------------------------- downloads */
 
-static const char* const downloadStates[] = { "running", "paused", "failed", "done", "cancelled" };
+static const char* const downloadStates[] = { "running", "paused", "failed", "done", "cancelled", "asking" };
 
 const char* ps5wk_download_state_name(int state)
 {
@@ -838,7 +838,24 @@ void ps5wk_download_record_clear(PS5WKDownloadRecord* r)
     g_free(r->lastModified);
     g_free(r->error);
     g_free(r->sha256);
+    g_free(r->dir);
+    g_free(r->referer);
+    g_free(r->after);
+    g_free(r->moveTo);
+    g_free(r->job);
+    g_free(r->jobError);
+    g_free(r->jobOut);
+    g_free(r->titleID);
+    g_free(r->titleName);
     memset(r, 0, sizeof *r);
+}
+
+/* A folder a download may be in: under /data or a drive, no "." or "..". */
+static gboolean downloadFolderOK(const char* dir)
+{
+    if (!dir || (strncmp(dir, "/data/", 6) && strncmp(dir, "/mnt/usb", 8) && strncmp(dir, "/mnt/ext", 8)))
+        return FALSE;
+    return !strstr(dir, "/../") && !g_str_has_suffix(dir, "/..") && !strstr(dir, "/./") && !strstr(dir, "//");
 }
 
 void ps5wk_download_record_free(gpointer data)
@@ -888,6 +905,26 @@ GPtrArray* ps5wk_downloads_load(void)
         r->error = jdup(item, "error");
         r->sha256 = jdup(item, "sha256");
         r->restarted = jnum(item, "restarted", 0) != 0;
+        r->dir = jdup(item, "dir");
+        if (r->dir && !downloadFolderOK(r->dir))
+            g_clear_pointer(&r->dir, g_free);
+        r->engine = jnum(item, "engine", 0) == 1 ? PS5WK_DL_SERVICE : PS5WK_DL_WEBKIT;
+        r->referer = jdup(item, "referer");
+        r->after = jdup(item, "after");
+        r->moveTo = jdup(item, "moveTo");
+        if (r->moveTo && !downloadFolderOK(r->moveTo))
+            g_clear_pointer(&r->moveTo, g_free);
+        r->job = jdup(item, "job");
+        r->jobState = (int)jnum(item, "jobState", 0);
+        if (r->jobState == PS5WK_JOB_RUNNING) {
+            /* the browser closed during it */
+            r->jobState = PS5WK_JOB_FAILED;
+            r->jobError = g_strdup("The browser closed before it finished");
+        } else
+            r->jobError = jdup(item, "jobError");
+        r->jobOut = jdup(item, "jobOut");
+        r->titleID = jdup(item, "titleId");
+        r->titleName = jdup(item, "titleName");
         g_ptr_array_add(records, r);
     }
     jfree(root);
@@ -917,7 +954,27 @@ void ps5wk_downloads_save(GPtrArray* records)
         g_string_append_printf(out, ",\"started\":%" G_GINT64_FORMAT ",\"finished\":%" G_GINT64_FORMAT, r->started, r->finished);
         jsonMember(out, "error", r->error);
         jsonMember(out, "sha256", r->sha256);
-        g_string_append_printf(out, ",\"restarted\":%d}", r->restarted ? 1 : 0);
+        g_string_append_printf(out, ",\"restarted\":%d", r->restarted ? 1 : 0);
+        if (r->dir)
+            jsonMember(out, "dir", r->dir);
+        g_string_append_printf(out, ",\"engine\":%d", r->engine);
+        if (r->referer)
+            jsonMember(out, "referer", r->referer);
+        if (r->after)
+            jsonMember(out, "after", r->after);
+        if (r->moveTo)
+            jsonMember(out, "moveTo", r->moveTo);
+        if (r->job) {
+            jsonMember(out, "job", r->job);
+            g_string_append_printf(out, ",\"jobState\":%d", r->jobState);
+            jsonMember(out, "jobError", r->jobError);
+            jsonMember(out, "jobOut", r->jobOut);
+        }
+        if (r->titleID) {
+            jsonMember(out, "titleId", r->titleID);
+            jsonMember(out, "titleName", r->titleName);
+        }
+        g_string_append_c(out, '}');
     }
     g_string_append(out, "]}\n");
     writeFileAtomically("downloads.json", out->str, out->len);

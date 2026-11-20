@@ -89,7 +89,14 @@ typedef enum {
     PS5WK_DL_FAILED,  /* error says why; the .part file stays (Retry) */
     PS5WK_DL_DONE,
     PS5WK_DL_CANCELLED, /* the .part file is gone */
+    PS5WK_DL_ASKING,    /* waiting for where to save it (the download manager's page) */
 } PS5WKDownloadState;
+
+/* How a download's data comes (PS5WKDownloadRecord.engine). */
+enum { PS5WK_DL_WEBKIT, PS5WK_DL_SERVICE };
+
+/* A job on a finished download (PS5WKDownloadRecord.jobState). */
+enum { PS5WK_JOB_NONE, PS5WK_JOB_RUNNING, PS5WK_JOB_DONE, PS5WK_JOB_FAILED };
 
 typedef struct {
     unsigned id;
@@ -106,6 +113,18 @@ typedef struct {
     char* error;     /* why it failed, or a note ("started over from zero") */
     char* sha256;    /* lowercase hex, once the finished file was read */
     gboolean restarted; /* the last resume started over from zero */
+    /* the download manager (README "Downloads") */
+    char* dir;       /* the folder the file is in; NULL: the user's downloads folder */
+    int engine;      /* PS5WK_DL_WEBKIT, PS5WK_DL_SERVICE (several connections) */
+    char* referer;   /* the page it came from (asked again with it) */
+    char* after;     /* when done: "extract", "extract-install", "extract-image", NULL */
+    char* moveTo;    /* a WebKit download for another folder: moved there when done */
+    char* job;       /* the last job on it: "extract", "install", "image", "move" */
+    int jobState;    /* PS5WK_JOB_* */
+    char* jobError;
+    char* jobOut;    /* what the job made: a folder, an image, the installed app's folder */
+    char* titleID;   /* an installed app's */
+    char* titleName;
 } PS5WKDownloadRecord;
 
 /* downloads.json: the records (PS5WKDownloadRecord*, free with

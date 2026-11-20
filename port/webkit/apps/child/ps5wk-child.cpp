@@ -51,6 +51,8 @@
 extern "C" int ps5wk_adblock_job(const char* jobPath);
 // update-job.c: the browser's own updates (UPDATES.md; a task payload).
 extern "C" int ps5wk_update_job(const char* jobPath);
+// dl-job.c: the download service (README "Downloads"; a task payload).
+extern "C" int ps5wk_dl_job(const char* jobPath);
 
 namespace WebKit {
 // Source/WebKit/WebProcess/WebProcessMain.h, NetworkProcess/NetworkProcessMain.h
@@ -1061,6 +1063,15 @@ int main(int, char**)
         setupEnvironment(path);
         g_io_openssl_load(nullptr);
         int result = ps5wk_update_job(path);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(result);
+    }
+    if (!strcmp(type, "dl")) {
+        ps5wk_crash_guard_install("dl");
+        setupEnvironment(path);
+        g_io_openssl_load(nullptr);
+        int result = ps5wk_dl_job(path);
         fflush(stdout);
         fflush(stderr);
         _exit(result);

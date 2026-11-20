@@ -19,18 +19,34 @@ GET /file/<size>[/<name>]?options    the file (HEAD too)
     drop=N[,M...]  close the connection when the file offset reaches N (each
               point once per server run and file: a resume goes past it)
     stall=N   stop sending at offset N and keep the connection open (once)
+    stallall=N  the same at every request that reaches offset N (never recovers)
+    maxconn=N  at most N answers for this path at once; more get `busy`
+    busy=429|503  the answer beyond maxconn (default 429)
+    retryafter=S  Retry-After: S on those answers
+    changeafter=N  after N requests for this path, the next version of the
+              file (ETag, Last-Modified and content), as /version does for all
+    cookie=NAME=VALUE  403 unless the request's Cookie header has it
 GET /signed/<size>/<name>?exp=T&...  the file while time() < T, else 403
     (an expiring CDN address)
 GET /release/<size>/<name>?...       302 to /signed/... valid for 20 s (a
-    release link that redirects to a signed address; the options pass on)
+    release link that redirects to a signed address; the options pass on;
+    ttl=S: valid for S s instead)
 GET /version?v=N                     the files change (ETag, Last-Modified
     and content): a resume with the old validator gets a 200
+GET /real/<name>?options              a real file from --root (by its name
+    only), with the options above that don't change the bytes (noranges,
+    cookie, attach, rate, maxconn); for the archive peek (peek-test.sh)
+GET /stats[?reset=1]                 JSON per path: requests, bytes sent,
+    busy answers (maxconn); reset=1 clears the counts
 GET /page                            links for every case
-GET /auto?case=attr|blob             a page that clicks its own download link
+GET /auto?case=attr|blob|href[&href=URL]  a page that clicks its own download
+    link (href: any address, e.g. /real/app.zip?attach=1)
 """
 import argparse
 import hashlib
 import http.server
+import json
+import os
 import socketserver
 import struct
 import sys
@@ -42,6 +58,15 @@ BLOCK = 4096
 FILL = bytes((i * 131 + 7) & 0xFF for i in range(BLOCK))
 state = {"version": 1, "fired": set()}
 lock = threading.Lock()
+active = {}   # path: answers being sent (maxconn)
+stats = {}    # path: {"requests", "bytes", "busy"} (/stats)
+requests = {}  # path: GET requests so far (changeafter)
+
+
+def count(path, key, n=1):
+    with lock:
+        entry = stats.setdefault(path, {"requests": 0, "bytes": 0, "busy": 0})
+        entry[key] += n
 
 
 def block(i, version):
@@ -59,6 +84,18 @@ def generate(start, end, version):
         piece = data[off:off + (chunk_end - pos)]
         yield piece
         pos += len(piece)
+
+
+def read_real(path, start, end):
+    with open(path, "rb") as f:
+        f.seek(start)
+        left = end - start
+        while left > 0:
+            piece = f.read(min(left, 1 << 20))
+            if not piece:
+                return
+            left -= len(piece)
+            yield piece
 
 
 def sha(size, version):
@@ -130,16 +167,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # (for log-only tests: the pad can't click remotely)
             case = q.get("case", "attr")
             script = ("var b=new Blob(['made by the page\\n'.repeat(1000)],{type:'text/plain'});a.href=URL.createObjectURL(b);a.download='made-by-page.txt';"
-                      if case == "blob" else "a.href='/file/3145728/attr.dat?type=text/plain';a.download='from-attribute.txt';")
+                      if case == "blob" else "a.href=%s;" % json.dumps(q.get("href", "/")) if case == "href"
+                      else "a.href='/file/3145728/attr.dat?type=text/plain';a.download='from-attribute.txt';")
             return self.send_simple(200, "<!doctype html><title>auto %s</title><body><a id=a>link</a><script>var a=document.getElementById('a');%s"
                                          "setTimeout(function(){a.click()},500)</script>" % (case, script))
+        if parts[0] == "stats":
+            with lock:
+                text = json.dumps(stats, indent=1, sort_keys=True) + "\n"
+                if q.get("reset"):
+                    stats.clear()
+            return self.send_simple(200, text)
         if parts[0] == "version":
             with lock:
                 state["version"] = int(q.get("v", state["version"] + 1))
             return self.send_simple(200, "version %d\n" % state["version"])
         if parts[0] == "release" and len(parts) >= 2:
+            count(u.path, "requests")
             q2 = dict(q)
-            q2["exp"] = str(int(time.time()) + 20)
+            q2["exp"] = str(int(time.time()) + int(q.get("ttl", "20")))
             q2["sig"] = hashlib.sha1(q2["exp"].encode()).hexdigest()[:16]
             loc = "/signed/%s?%s" % ("/".join(parts[1:]), urllib.parse.urlencode(q2))
             return self.send_simple(302, "see %s\n" % loc, {"Location": loc})
@@ -147,11 +192,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if int(q.get("exp", "0")) < time.time():
                 return self.send_simple(403, "this signed address has expired\n")
             parts = ["file"] + parts[1:]
+        real = None
+        if parts[0] == "real" and len(parts) == 2 and state.get("root"):
+            real = os.path.join(state["root"], os.path.basename(parts[1]))
+            if not os.path.isfile(real):
+                return self.send_simple(404, "not found\n")
+            parts = ["file", str(os.path.getsize(real)), parts[1]]
         if parts[0] != "file" or len(parts) < 2:
             return self.send_simple(404, "not found\n")
         size = int(parts[1])
         name = q.get("name") or (parts[2] if len(parts) > 2 else "file-%d.bin" % size)
         version = state["version"]
+        self.real = real
+        if not head:
+            count(u.path, "requests")
+        if q.get("changeafter"):
+            with lock:
+                if not head:
+                    requests[u.path] = requests.get(u.path, 0) + 1
+                if requests.get(u.path, 0) > int(q["changeafter"]):
+                    version += 1
+        if q.get("cookie"):
+            want = q["cookie"].strip()
+            have = [c.strip() for c in (self.headers.get("Cookie") or "").split(";")]
+            if want not in have:
+                return self.send_simple(403, "this file needs the cookie %s\n" % want)
+        if q.get("maxconn") and not head:
+            with lock:
+                busy = active.get(u.path, 0) >= int(q["maxconn"])
+                if not busy:
+                    active[u.path] = active.get(u.path, 0) + 1
+            if busy:
+                count(u.path, "busy")
+                code = int(q.get("busy", "429"))
+                extra = {"Retry-After": q["retryafter"]} if q.get("retryafter") else None
+                return self.send_simple(code, "too many connections\n", extra)
+            try:
+                return self.send_file(head, q, u, size, name, version)
+            finally:
+                self.release(u.path)
+        return self.send_file(head, q, u, size, name, version)
+
+    def release(self, path):
+        """The end of a maxconn answer (once: before its last piece, or when it ends)."""
+        if getattr(self, "released", None) == path:
+            return
+        self.released = path
+        with lock:
+            active[path] = active.get(path, 1) - 1
+
+    def send_file(self, head, q, u, size, name, version):
+        self.released = None
         key = (u.path, version)
         start, end, partial = 0, size, False
         rng = self.headers.get("Range")
@@ -190,16 +281,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rate = float(q.get("rate", "0")) * 1024
         drops = [int(x) for x in q.get("drop", "").split(",") if x]
         stall = int(q.get("stall", "-1"))
+        stallall = int(q.get("stallall", "-1"))
         sent, t0, pos = 0, time.time(), start
         try:
-            for piece in generate(start, end, version):
+            for piece in (read_real(self.real, start, end) if getattr(self, "real", None) else generate(start, end, version)):
                 while piece:
+                    if pos == stallall:
+                        self.log_message("stalling at %d (every time)", stallall)
+                        time.sleep(600)
+                        return
                     cut = len(piece)
                     for d in drops + ([stall] if stall >= 0 else []):
                         if pos < d < pos + cut and (key, d) not in state["fired"]:
                             cut = d - pos
+                    if pos < stallall < pos + cut:
+                        cut = stallall - pos
                     n = min(cut, 65536)
+                    if q.get("maxconn") and pos + n == end:
+                        self.release(u.path)
                     self.wfile.write(piece[:n])
+                    count(u.path, "bytes", n)
                     piece = piece[n:]
                     pos += n
                     sent += n
@@ -229,6 +330,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
 
 def main():
@@ -236,7 +338,9 @@ def main():
     ap.add_argument("--port", type=int, default=8781)
     ap.add_argument("--sha", type=int, help="print the SHA-256 of a file of this size and exit")
     ap.add_argument("--version", type=int, default=1)
+    ap.add_argument("--root", help="the folder /real/<name> serves")
     a = ap.parse_args()
+    state["root"] = a.root
     if a.sha is not None:
         print(sha(a.sha, a.version))
         return

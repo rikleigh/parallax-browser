@@ -999,10 +999,114 @@ step_mime() {
     install -m644 "$HERE/runtime/share/mime/globs2" "$RUNTIME/share/mime/globs2"
 }
 
+# ---- archive unpacking for downloads (ps5wk-child: apps/common/ps5archive.c)
+# libarchive reads ZIP, 7z, RAR4/RAR5 and tar; bzip2, xz and zstd are its
+# decompressors next to zlib. Readers only matter: no tools, no crypto (the
+# download service refuses encrypted archives).
+
+# libbz2.a: tar.bz2, bzip2 ZIP entries and 7z BZip2 coders. Upstream has
+# only a Makefile that builds the tools too; the seven library sources are
+# compiled directly.
+step_bzip2() {
+    log "bzip2 1.0.8 (libarchive: .bz2, bzip2 in ZIP and 7z)"
+    fetch https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz \
+        ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269
+    unpack bzip2 "$FETCHED"
+    local f
+    for f in blocksort huffman crctable randtable compress decompress bzlib; do
+        prospero-clang $CFLAGS_COMMON -D_FILE_OFFSET_BITS=64 -Wall -c "$SRC/$f.c" -o "$BLD/$f.o"
+    done
+    rm -f "$SYSROOT/lib/libbz2.a"
+    prospero-ar rcs "$SYSROOT/lib/libbz2.a" "$BLD"/*.o
+    install -m644 "$SRC/bzlib.h" "$SYSROOT/include/"
+    cat > "$SYSROOT/lib/pkgconfig/bzip2.pc" <<EOF
+prefix=\${pcfiledir}/../..
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: bzip2
+Description: bzip2 compression library
+Version: 1.0.8
+Libs: -L\${libdir} -lbz2
+Cflags: -I\${includedir}
+EOF
+    cleanup bzip2
+}
+
+# liblzma.a: tar.xz, 7z LZMA/LZMA2 and its BCJ/ARM filters, LZMA and xz
+# ZIP entries. Single-threaded (libarchive only decodes, and
+# ps5wk-child's pthread imports are checked by check-lock-imports.sh).
+step_xz() {
+    log "xz 5.8.1 (liblzma for libarchive: .xz, 7z LZMA/LZMA2)"
+    fetch https://github.com/tukaani-project/xz/releases/download/v5.8.1/xz-5.8.1.tar.xz \
+        0b54f79df85912504de0b14aec7971e3f964491af1812d83447005807513cd9e
+    unpack xz "$FETCHED"
+    cmake_pkg xz -DXZ_THREADS=no -DXZ_NLS=OFF -DXZ_DOC=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF \
+        -DXZ_TOOL_LZMADEC=OFF -DXZ_TOOL_LZMAINFO=OFF -DXZ_TOOL_SCRIPTS=OFF \
+        -DXZ_MICROLZMA_ENCODER=OFF -DXZ_MICROLZMA_DECODER=OFF
+    fix_sysroot; cleanup xz
+}
+
+# libzstd.a: tar.zst and zstd ZIP entries (method 93). Decompression and
+# compression (libarchive references both), no threads, no legacy formats.
+# ZSTD_TRACE=0: its tracing hooks are weak undefined symbols, which would
+# be dynamic imports of the payload that nothing exports.
+step_zstd() {
+    log "zstd 1.5.7 (libarchive: .zst)"
+    local CFLAGS_COMMON="$CFLAGS_COMMON -DZSTD_TRACE=0"
+    fetch https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz \
+        eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+    unpack zstd "$FETCHED"
+    SRC="$SRC/build/cmake"
+    cmake_pkg zstd -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON \
+        -DZSTD_BUILD_TESTS=OFF -DZSTD_BUILD_CONTRIB=OFF -DZSTD_MULTITHREAD_SUPPORT=OFF \
+        -DZSTD_LEGACY_SUPPORT=OFF -DZSTD_PROGRAMS_LINK_SHARED=OFF
+    fix_sysroot; cleanup zstd
+}
+
+# libarchive.a: the reader for downloaded archives (ZIP incl. zip64,
+# 7z, RAR4/RAR5, tar and its compressed forms, multivolume through
+# archive_read_open_filenames). Static, no tools/tests, no crypto library
+# (ZIP/7z/RAR encryption stays unreadable; ps5archive.c refuses it first),
+# no xml (xar), lz4, libb2 (RAR5 uses the bundled BLAKE2s), acl, xattr or
+# iconv (names come out as UTF-8, see below).
+#
+# The console's nl_langinfo(CODESET) is always "US-ASCII" (the SDK libc has
+# no locales), so libarchive would turn every non-ASCII name (7z and RAR
+# UTF-16, ZIP and RAR5 UTF-8) into '?'s. The one edit below makes its
+# "current charset" UTF-8 on the PS5 (__PROSPERO__); file names there are
+# UTF-8.
+#
+# The SDK toolchain sets CMAKE_FIND_PACKAGE_PREFER_CONFIG, so find_package
+# (LibLZMA) takes xz's config file, which doesn't set the LIBLZMA_* variables
+# libarchive checks: they are given here.
+step_libarchive() {
+    log "libarchive 3.8.1 (ps5archive.c: downloaded archives)"
+    fetch https://www.libarchive.org/downloads/libarchive-3.8.1.tar.xz \
+        19f917d42d530f98815ac824d90c7eaf648e9d9a50e4f309c812457ffa5496b5
+    unpack libarchive "$FETCHED"
+    perl -0pi -e 's/(#elif HAVE_NL_LANGINFO\n\treturn nl_langinfo\(CODESET\);)/#elif defined(__PROSPERO__)\n\treturn "UTF-8"; \/* ps5webkit: no locales on the PS5 *\/\n$1/' \
+        "$SRC/libarchive/archive_string.c"
+    grep -q 'ps5webkit: no locales' "$SRC/libarchive/archive_string.c" ||
+        die "libarchive: the UTF-8 charset edit didn't apply (archive_string.c changed?)"
+    cmake_pkg libarchive -DENABLE_INSTALL=ON -DENABLE_TEST=OFF -DENABLE_COVERAGE=OFF -DENABLE_WERROR=OFF \
+        -DENABLE_TAR=OFF -DENABLE_CPIO=OFF -DENABLE_CAT=OFF -DENABLE_UNZIP=OFF \
+        -DENABLE_OPENSSL=OFF -DENABLE_MBEDTLS=OFF -DENABLE_NETTLE=OFF -DENABLE_CNG=OFF \
+        -DENABLE_LIBB2=OFF -DENABLE_LZ4=OFF -DENABLE_LZO=OFF -DENABLE_LIBXML2=OFF -DENABLE_EXPAT=OFF \
+        -DENABLE_WIN32_XMLLITE=OFF -DENABLE_PCREPOSIX=OFF -DENABLE_PCRE2POSIX=OFF -DENABLE_LIBGCC=OFF \
+        -DENABLE_ACL=OFF -DENABLE_XATTR=OFF -DENABLE_ICONV=OFF \
+        -DENABLE_ZLIB=ON -DENABLE_BZip2=ON -DENABLE_LZMA=ON -DENABLE_ZSTD=ON \
+        -DLIBLZMA_FOUND=ON -DLIBLZMA_INCLUDE_DIR="$SYSROOT/include" -DLIBLZMA_INCLUDE_DIRS="$SYSROOT/include" \
+        -DLIBLZMA_LIBRARY="$SYSROOT/lib/liblzma.a" -DLIBLZMA_LIBRARIES="$SYSROOT/lib/liblzma.a"
+    grep -E '/share/man/' "$BLD/install_manifest.txt" | while read -r f; do rm -f "$f"; done
+    fix_sysroot; cleanup libarchive
+}
+
 STEPS_M1=(tools compat zlib brotli libpng libjpeg_turbo libwebp expat libiconv proxy_libintl
           libxml2 libxslt sqlite libpsl icu freetype harfbuzz fontconfig pcre2 libffi glib
           openssl nghttp2 libsoup glib_networking libepoxy libxkbcommon lcms2
-          cacert fonts mime xkeyboard_config)
+          cacert fonts mime xkeyboard_config
+          bzip2 xz zstd libarchive)
 STEPS_M2=(dav1d ffmpeg libogg libvorbis opus gstreamer gst_plugins_base gst_plugins_good gst_plugins_bad gst_libav gst_full)
 # Not in any default set (WebGPU builds): build.sh dawn radv; GPU=radv builds: dawn-radv
 STEPS_GPU=(dawn radv dawn-radv)

@@ -299,7 +299,7 @@ step_configure() {
     # find modules only name the top-level archives.
     local depslibs=""
     [ -z "${FAKE_DEPS:-}" ] && depslibs="$("$PKGCONFIG" --libs gio-unix-2.0 gioopenssl libsoup-3.0 fontconfig freetype2 \
-        harfbuzz-icu libxml-2.0 sqlite3 gstreamer-full-1.0 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl | sed 's/ -licudata//g')"
+        harfbuzz-icu libxml-2.0 sqlite3 gstreamer-full-1.0 libwebpdemux libwebpmux libjpeg libpng16 epoxy xkbcommon openssl zlib libpsl libarchive | sed 's/ -licudata//g')"
     ( . "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
       export PKG_CONFIG="$pc"
       cmake -G Ninja -S "$SRC" -B "$BLD" \

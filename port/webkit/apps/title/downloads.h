@@ -52,6 +52,13 @@ unsigned ps5wk_downloads_active(double* progress);
 const char* ps5wk_downloads_action(const char* action, int index, const char* url);
 void ps5wk_downloads_json(GString* out);
 
+/* The download manager's page (dlm.c, parallax://downloads): its state as
+ * JSON (any thread), and its actions ("do=save|pause|resume|cancel|remove|
+ * delete|forget|extract|extract-install|extract-image|jobstop|after|peek|
+ * settings|favorite|task|taskstop|taskremove", main loop: NULL or why not). */
+char* ps5wk_downloads_manager_json(void);
+const char* ps5wk_downloads_manage(GHashTable* params);
+
 /* Settings: the folder, its free space, the finished ones. */
 void ps5wk_downloads_clear_finished(void);
 /* Any thread: the free space on /data in bytes, -1 if not known (the title

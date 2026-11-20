@@ -901,8 +901,12 @@ link has a `download` attribute (also `blob:` files a page makes). It goes
 through WebKit's own download path (`WebKitNetworkSession::download-started`,
 `WebKitDownload`): the NetworkProcess streams it to disk, so a big file never
 sits in memory, and the title only follows its signals
-(`apps/title/downloads.c`). Stage 1 only saves files: nothing is opened,
-run or installed.
+(`apps/title/downloads.c`). Since 2026-11-20 most downloads are handed to
+the **download service** instead (several connections, any drive, then
+unpacking, installing apps and exFAT images): see *The download manager*
+below. What follows is the WebKit path, which still takes every download
+the service can't (a form's POST, `blob:` and `data:` files, servers
+without ranges).
 
 - **Where:** the PS5 user's `downloads/<name>` (`/data/ps5webkit/users/<id>/downloads`), the name the server
   suggests (`Content-Disposition`, the download attribute, else the
@@ -990,6 +994,150 @@ on), and with `push-off` nothing outside the PS5 reaches it.
 does. The log has `[dl]` lines (the request and its `Range`/`If-Range`, the
 HTTP status, `resumed at N bytes`, `starting over from zero`, retries,
 `done`, the SHA-256 and its speed) and `push: <name> to <ip>: ... MB/s`.
+
+### The download manager (2026-11-20)
+
+GitHub issue #4: downloads were slow next to another PS5 browser whose
+download manager uses parallel connections. Measured on the owner's
+console first (Wi-Fi): one WebKit download from a fast server ran at
+3.9-5.1 MB/s, four at once at 4.6-5.1 MB/s together, plain http the same,
+and FTP to the console 4.2 MB/s: that link was the limit, not the browser.
+Parallel connections help where a server limits each connection (file
+hosts commonly do) and on faster links; they can't beat the link itself.
+
+**The hand-off.** When WebKit's answer for a page's download comes
+(`decide-destination`: headers only, nothing written) and it is a `GET`,
+http(s), `200` with a `Content-Length` and `Accept-Ranges: bytes`, the
+title cancels WebKit's transfer and gives the download to the service
+(`engine: 1` in `downloads.json`). Anything else stays WebKit's: asking a
+form's POST or a one-off address again could fail. The service asks the
+**original** address again (redirects followed), with the browser's
+User-Agent, the page as Referer and the browser's cookies for the original
+and final addresses (`webkit_cookie_manager_get_cookies`, HttpOnly ones
+included, passed as cookies.txt lines).
+
+**The service** (`apps/child/dl-job.c`) is a task payload of the child
+ELF, like the updater: started by the title when something needs it
+(`apps/title/dlservice.c`), it listens on 127.0.0.1 on a port the system
+picks, prints it, and takes one connection that must give the token from
+its job file (which it deletes). It ends when the title's task connection
+closes, after stopping its downloads so their state files stay. A payload
+because the console slows a title's own writes to about 2 MB/s after a few
+hundred megabytes, and because a title can't see every drive.
+
+- **Several connections** (`apps/common/ps5fetch.c`): the file is cut
+  into chunks (8 MiB); up to *Connections per download* workers (default
+  8, Settings 1-16) each take the lowest chunk no one has and ask for it
+  with `Range`, so writes stay near the front of the file (exFAT USB
+  drives can't hold sparse files). The first request (chunk 0 with a
+  `Range`) decides: a `206` with a total starts the others, a `200` is
+  read whole on one connection. A range of another file (start, total or
+  validator differ) is never joined. `429`/`503` while others work lowers
+  the number of connections; an expired final address goes back to the
+  original one. Data goes to `<name>.part` (pwrite), which bytes are on
+  disk to `<name>.part.ps5dl`, so pause, a title restart and a crash all
+  resume where they were.
+- **Where:** each download asks where to go (Settings: *Ask where to save
+  each download*): the user's Downloads folder, a favourite folder, or any
+  folder on internal storage (`/data`), M.2 (`/mnt/ext0-1`) or USB
+  (`/mnt/usb0-7`), with *New folder* and *Always save here*. WebKit
+  downloads still write to the Downloads folder and are moved to the
+  chosen folder when done.
+- **After the download** (chosen when saving, or later): *Unpack*,
+  *Unpack & install app*, *Unpack & make exFAT image*.
+  - Unpacking (`apps/common/ps5archive.c`, libarchive with zlib, bzip2,
+    xz and zstd): ZIP, 7z, RAR4 and RAR5, tar and its compressed forms,
+    split sets (`.7z.001`, `.zip.001`, `.part1.rar`, `.rar` + `.r00`).
+    Hostile archives are refused before anything is written: absolute or
+    `..` paths, links, devices, encrypted entries, over 200000 entries or
+    512 GiB. The free space is checked first. It unpacks next to the
+    archive, into a folder named like it; the archive is kept unless
+    Settings says to delete it (all its parts).
+  - Installing (`apps/common/ps5install.c`): the shallowest folder with
+    `sce_sys/param.json` and `eboot.bin` is moved (renamed, no copy) to
+    `<drive>/homebrew/<TITLE_ID>` (an installed copy is replaced), then
+    registered as `tools/launcher` does: `/user/app/<ID>/sce_sys` and
+    `mount.lnk`, then `sceAppInstUtilAppInstallAll` (13.60 has no
+    `AppInstallTitleDir`). Needs etaHEN, which mounts `mount.lnk`.
+  - exFAT images (`apps/common/ps5exfat.c`): for ShadowMountPlus, the
+    app's folder contents at the image root, 64 KiB clusters, the
+    specification's up-case table (the console refuses others),
+    `<drive>/homebrew/<TITLE_ID>.exfat`.
+- **What's inside, and a suggestion** (`apps/common/ps5peek.c`, the
+  service's `peek`): when an archive is handed off, the service looks
+  inside it on the server before it is downloaded, with `Range` requests
+  for only the parts that list its files (`ps5fetch_ranges`: 64 KiB
+  blocks, up to 24 MiB and 10 s in all). ZIP is read directly (the end
+  record and the central directory, ZIP64 too: one request for most;
+  libarchive's seekable reader would visit every file's local header),
+  then `param.json` alone from its local header (stored or deflated).
+  7-Zip's directory is at the end (a few requests); RAR has a header
+  before each file (a request each); a tar.gz, the later parts of a set
+  and files inside 7-Zip's solid blocks mostly don't fit, and a finished
+  download is looked at on the drive instead (the page asks once). The
+  card then shows the app's name, title ID and version (from
+  `param.json`; if that can't be read, an ID in the folder's or file's
+  name), which version is installed (`/user/appmeta/<ID>/param.json`,
+  what the system registered, then `/user/app/<ID>/sce_sys`), the
+  format, file count and unpacked size, and pre-selects: an app →
+  *Unpack & install app*, or what was chosen for the last archive with
+  an app (`app-after` in `downloads.ini`; Settings shows it and can
+  forget it); several apps or other files → *Unpack*; an archive that
+  can't be unpacked (encrypted, unsafe paths) → only *Keep the file*.
+  With *Don't ask*, an archive holding one app gets that last choice
+  without asking, never before one was made. Finished archives get the
+  same suggestion as their first button.
+- **The manager's page** (`apps/title/dlm.c`): `parallax://downloads` on
+  the TV (it opens over the tab when a download waits for a folder; X on a
+  finished or waiting row in the menu's Downloads list opens it), and
+  `http://<ps5>:9040/dlm` from a phone (the link server's PIN rules). Tabs:
+  *Downloads* (waiting ones on top, progress, speed, connections, the jobs
+  on files), *Files* (the drives with free space, folders, unpack/install/
+  image any file or folder already there, rename, delete with a second
+  press, favourites, *Save downloads here by default*), *Settings*.
+- **API:** `GET /dlm.json` (everything the page shows), `GET
+  /dlm/fs?op=roots|ls&path=`, `POST /dlm do=save|pause|resume|cancel|remove|
+  delete|forget|extract|extract-install|extract-image|jobstop|after|peek|
+  settings|favorite|task|taskstop|taskremove|mkdir|rmpath|rename`. Settings
+  are in `<profile>/downloads.ini`. The log's `[dl]` and `[dl-job]` lines
+  say what happened.
+
+**Checked on the console** (2026-11-20, Wi-Fi, through the API and the
+link server; the page's look through debug screenshots, not the pad):
+- A test server limiting each connection to 256 KiB/s, 64 MB: 1
+  connection 0.25 MB/s, 8 connections 2.0 MB/s (8x), SHA-256 right.
+- A GitHub release asset (161 MB, redirected to its signed address): 1
+  connection 24 s (7.1 MB/s), 8 connections 14 s (about 11.5 MB/s, peaks
+  of 23 MB/s); SHA-256 the release's digest.
+- Pause and resume continued from the `.ps5dl`; the browser stopped at
+  18 MB and started again resumed there (67.7 MB sent for 67.1 MB).
+- A page that sets a cookie and clicks its download link (403 without the
+  cookie): handed off and saved with the cookie.
+- *Where to save*: a new folder made from the page, the file saved there.
+- A ZIP with a homebrew app in a wrapper folder: *Unpack & install app*
+  moved it to `/data/homebrew/<ID>`, `sceAppInstUtilAppInstallAll` gave 0,
+  and the app started from the system's launcher (ShadowMountPlus logged
+  the `mount.lnk` mount). A split 7z (`.001` + `.002`) unpacked. A file
+  that isn't an archive: *This isn't an archive that can be unpacked*.
+- *Make exFAT image* of that app: `/data/homebrew/PPSA99009.exfat`,
+  fetched back, `fsck_exfat` clean, the same files mounted on the Mac.
+- The look inside (later the same day): a 41 MB ZIP holding an app was
+  read from one request (113 KB, 40-50 ms) before the card showed; its
+  name, ID, version and the installed version (01.003.000, from
+  `/user/appmeta`) were right. Choosing *Unpack* for it remembered the
+  choice; with *Don't ask*, the next such ZIP was unpacked without
+  asking. The finished ZIPs already in the list were looked at on the
+  drive when the page opened (ProsperoWeb's: its app found; the data
+  ZIP: files, no app).
+- Not checked yet: ShadowMountPlus (1.7beta7 here) mounting such an image
+  (it logged nothing about it in the minutes watched), RAR archives on the
+  console, USB and M.2 drives (none attached), the pad on the TV.
+- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (46 cases,
+  `--quick` 37), `archive-test.sh` (173), `exfat-test.sh` (66,
+  `--no-big` 50), `install-test.sh` (12), `peek-test.sh` (24: ZIP,
+  ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
+  not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
+  a slow server, on the drive).
 
 **Test server:** `port/webkit/test/downloads/serve.py [--port 8781]`
 generates files of any size (each 4 KB block numbered, so a wrong join

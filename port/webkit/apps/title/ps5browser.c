@@ -33,6 +33,7 @@
 #include "browser.h"
 #include "runtime.h"
 #include "downloads.h"
+#include "dlm.h"
 #include "qrcode.h"
 #include "settings.h"
 #include "profile.h"
@@ -1272,7 +1273,8 @@ static const char pushBrand[] =
 static char* pushDownloadsSection(const char* pin, gboolean pinOK)
 {
     if (!pinOK)
-        return g_strdup("<h2>Downloads</h2><p>Open this page with <code>?pin=&lt;PIN&gt;</code> to see the files downloaded on the PS5.</p>");
+        return g_strdup("<h2>Downloads</h2><p>Open this page with <code>?pin=&lt;PIN&gt;</code> to see the files downloaded on the PS5"
+                        " and the <a href=\"/dlm\">download manager</a>.</p>");
     char* list = ps5wk_downloads_finished_json();
     /* inside a <script>: no "</" can end it early */
     GString* safe = g_string_new(NULL);
@@ -1283,8 +1285,10 @@ static char* pushDownloadsSection(const char* pin, gboolean pinOK)
             g_string_append_c(safe, *c);
     }
     char* pinJS = pin ? jsonString(pin) : g_strdup("null");
-    char* section = g_strdup_printf("<h2>Downloads</h2><div class=\"card dls\" id=\"dls\"></div>"
+    char* section = g_strdup_printf("<h2>Downloads</h2><p><a id=\"dlmlink\" href=\"/dlm\">Open the download manager</a>: progress,"
+        " unpacking, installing apps and the files on the PS5's drives.</p><div class=\"card dls\" id=\"dls\"></div>"
         "<script>(function(){var list=%s,pin=%s,box=document.getElementById('dls');"
+        "if(pin)document.getElementById('dlmlink').href='/dlm?pin='+encodeURIComponent(pin);"
         "function size(b){return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(1)+' MB':b>=1024?Math.round(b/1024)+' KB':b+' B'}"
         "if(!list.length){var p=document.createElement('p');p.textContent='Nothing yet. Files you download in the PS5 browser come here, to save on this device.';box.appendChild(p);return}"
         "list.forEach(function(d){var row=document.createElement('div');row.className='dl';"
@@ -2295,6 +2299,7 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
     gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
         || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad") || !strcmp(path, "/update") || !strcmp(path, "/update.json");
     gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
+    gboolean dlmPath = !strcmp(path, "/dlm") || !strcmp(path, "/dlm.json") || !strcmp(path, "/dlm/fs");
 
     /* Every request from the network: the Host must be this PS5 by address
      * or a local name (not a site's name that DNS rebinding points here), and
@@ -2303,7 +2308,7 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
      * anywhere, so a CORS preflight (OPTIONS) gets this refusal as well. */
     if (!trusted && !settingsRequestAllowed(host, origin)) {
         spike_log("push: refused %s %s from %s (Host \"%s\", Origin \"%s\")", method, path, from, host, origin);
-        if (settingsPath || browserPath)
+        if (settingsPath || browserPath || dlmPath)
             settingsReplyJSON(client, 403, FALSE, "refused: open this page at the PS5's IP address (http://<ip>:9040/)");
         else
             pushReply(client, 403, "text/plain", "ERR refused: send requests to the PS5's IP address, not from another site\n");
@@ -2332,6 +2337,22 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
 
     if (settingsPath) {
         settingsServe(client, from, trusted, get, post, path, query, body, type, pinOK);
+    } else if (dlmPath) {
+        /* The download manager (dlm.c): the page itself needs no PIN (its
+         * script asks for one), its data and actions do, as Settings'. */
+        int code = 200;
+        const char* replyType = "application/json";
+        char* reply = NULL;
+        if (!pinOK && !trusted && !(get && !strcmp(path, "/dlm")))
+            settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
+        else if (windDownStart && post)
+            settingsReplyJSON(client, 503, FALSE, "the browser is closing");
+        else if (ps5wk_dlm_serve(method, path, query, body, &code, &replyType, &reply)) {
+            if (post)
+                spike_log("downloads page from %s: %s %s", from, method, path);
+            pushReply(client, code, replyType, reply);
+        }
+        g_free(reply);
     } else if (browserPath) {
         /* Tabs, bookmarks, history and simulated menu keys (browserui.c):
          * the settings' rules (the PIN, except for the PS5's own pages). */
@@ -2686,7 +2707,7 @@ static void onParallaxRequest(WebKitURISchemeRequest* request, gpointer data)
     const char* path = uri ? g_uri_get_path(uri) : "";
     const char* query = uri ? g_uri_get_query(uri) : NULL;
     gboolean root = !*path || !strcmp(path, "/");
-    if (!host || (strcmp(host, "settings") && strcmp(host, "gamepad") && strcmp(host, "start") && strcmp(host, "update"))) {
+    if (!host || (strcmp(host, "settings") && strcmp(host, "gamepad") && strcmp(host, "start") && strcmp(host, "update") && strcmp(host, "downloads"))) {
         schemeFinishText(request, 404, "no such page\n");
         if (uri)
             g_uri_unref(uri);
@@ -2698,7 +2719,7 @@ static void onParallaxRequest(WebKitURISchemeRequest* request, gpointer data)
     }
     /* Each page at its root is the link server's page of that name. */
     const char* route = !root ? path : !strcmp(host, "settings") ? "/settings" : !strcmp(host, "gamepad") ? "/gamepad"
-        : !strcmp(host, "update") ? "/update" : NULL;
+        : !strcmp(host, "update") ? "/update" : !strcmp(host, "downloads") ? "/dlm" : NULL;
     if (route && !strcmp(route, "/parallax-logo.png"))
         route = "/logo.png";
     if (!route || strlen(route) + (query ? strlen(query) : 0) > 2000) {
