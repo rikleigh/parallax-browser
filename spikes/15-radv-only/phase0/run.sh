@@ -138,6 +138,26 @@ case_vr()      {
     run_case vr-sim "file://$P/video.html?src=media/sync-1080p30-h264.mp4" 180 "RESULT ps5browser vr-selftest" vr-sim=1 vr-selftest=1
 }
 
+# 8K HEVC and HLS (not in the default set: a 254 MB upload, and the HLS streams come from
+# tools/serve-media.py on this Mac, whose address the logs then hold). The HLS sets
+# (test/media/make-media.sh) start on their low variant and switch up; hls-vr's mixed.m3u8
+# switches between 2160x1080 and 3840x1920 60 fps every few segments.
+case_media()   {
+    put "$MEDIA/sync-3840p30-hevc.mp4" "$P/media/sync-3840p30-hevc.mp4"
+    run_case video-8k "file://$P/video.html?src=media/sync-3840p30-hevc.mp4" 40 ""
+    python3 -I "$ROOT/tools/serve-media.py" --port 8771 "$MEDIA" > "$OUT/.serve-media.log" 2>&1 &
+    local server=$!
+    sleep 1
+    local hls="type=application/x-mpegURL" s
+    for s in hls-ts/master hls-fmp4/master hls-vr/master hls-vr/mixed; do
+        run_case "$(echo "$s" | tr / -)" "file://$P/video.html?src=http://$MAC:8771/$s.m3u8&$hls" 55 ""
+    done
+    kill "$server" 2>/dev/null || true
+    rm -f "$OUT/.serve-media.log"
+    # View in VR on the 8K clip (8K VR video: the decoder and the eye buffers at once)
+    run_case vr-sim-8k "file://$P/video.html?src=media/sync-3840p30-hevc.mp4" 180 "RESULT ps5browser vr-selftest" vr-sim=1 vr-selftest=1
+}
+
 trap cleanup EXIT
 setup
 cases=("$@"); [[ ${#cases[@]} -gt 0 ]] || cases=(static feed layers video webgl webgpu vr)

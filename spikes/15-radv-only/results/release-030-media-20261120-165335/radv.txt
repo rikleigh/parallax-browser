@@ -1,0 +1,43 @@
+==> pages and clips to /data/ps5webkit/phase0
+== video-8k (file:///data/ps5webkit/phase0/video.html?src=media/sync-3840p30-hevc.mp4, 40 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-3840p30-hevc.mp4 "Video test" (2.8 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-3840p30-hevc.mp4 loaded in 2.8 s: title "Video test"; flexible 121.0 MB
+== hls-ts-master (file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-ts/master.m3u8&type=application/x-mpegURL, 55 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-ts/master.m3u8&type=application/x-mpegURL "Video test" (2.7 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-ts/master.m3u8&type=application/x-mpegURL loaded in 2.7 s: title "Video te
+== hls-fmp4-master (file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-fmp4/master.m3u8&type=application/x-mpegURL, 55 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-fmp4/master.m3u8&type=application/x-mpegURL "Video test" (2.8 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-fmp4/master.m3u8&type=application/x-mpegURL loaded in 2.8 s: title "Video 
+== hls-vr-master (file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-vr/master.m3u8&type=application/x-mpegURL, 55 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-vr/master.m3u8&type=application/x-mpegURL "Video test" (2.7 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-vr/master.m3u8&type=application/x-mpegURL loaded in 2.7 s: title "Video te
+== hls-vr-mixed (file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-vr/mixed.m3u8&type=application/x-mpegURL, 55 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-vr/mixed.m3u8&type=application/x-mpegURL "Video test" (2.7 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=http://<mac>:8771/hls-vr/mixed.m3u8&type=application/x-mpegURL loaded in 2.7 s: title "Video tes
+== vr-sim-8k (file:///data/ps5webkit/phase0/video.html?src=media/sync-3840p30-hevc.mp4, 180 s)
+   RESULT ps5browser display PASS PS5 display connected
+   RESULT ps5browser load PASS file:///data/ps5webkit/phase0/video.html?src=media/sync-3840p30-hevc.mp4 "Video test" (2.6 s after start)
+   RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/video.html?src=media/sync-3840p30-hevc.mp4 loaded in 2.6 s: title "Video test"; flexible 121.0 MB
+   RESULT ps5browser vr PASS headset shows the video (up)
+   RESULT ps5browser vr-selftest PASS 15 eye-buffer captures, 8 projections, controls, 4 entries in 71 s; VR off now
+==> logs in /Users/rikleigh/git/ps5webkit/spikes/15-radv-only/results/release-030-media-20261120-165335/radv
+| case | present/s best (median) | render ms | scene paint ms med (max) | draws/paint | upload ms each | convert ms | direct MB max | flexible MB min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| video-8k | 60.0 (59.9) | 0.76 | - (-) | - | 0.058 | 0.05 | 1950 | 121 |
+| hls-ts-master | 59.9 (59.9) | 0.34 | - (-) | - | 0.039 | 0.03 | 534 | 246 |
+| hls-fmp4-master | 59.9 (59.9) | 0.35 | - (-) | - | 0.039 | 0.03 | 579 | 239 |
+| hls-vr-master | 59.9 (59.9) | 0.53 | - (-) | - | 0.046 | 0.04 | 878 | 199 |
+| hls-vr-mixed | 59.9 (59.9) | 0.51 | - (-) | - | 0.046 | 0.04 | 878 | 199 |
+| vr-sim-8k | 59.9 (47.4) | 0.78 | - (-) | - | 0.049 | 0.06 | 2087 | 121 |
+
+vr-sim-8k:
+   RESULT ps5browser vr-selftest PASS 15 eye-buffer captures, 8 projections, controls, 4 entries in 71 s; VR off now
+   [app msg] [vr] headset simulation ended after 1.1 s: 66 frames (60.8/s), 66 tracked, 0 begin errors, 0 submit errors, 23 TV redraws (swap max 0.2 ms); released in 0 ms
+   [app msg] [vr] headset simulation ended after 1.1 s: 65 frames (60.8/s), 65 tracked, 0 begin errors, 0 submit errors, 23 TV redraws (swap max 0.2 ms); released in 0 ms
+   [app msg] [vr] headset simulation ended after 1.1 s: 68 frames (60.8/s), 68 tracked, 0 begin errors, 0 submit errors, 24 TV redraws (swap max 0.2 ms); released in 0 ms
+==> clean-up

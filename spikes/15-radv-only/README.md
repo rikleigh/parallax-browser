@@ -1051,6 +1051,29 @@ and `contentVersion` is 01.003.000. The update from a 0.2.2 build to the
 the update installed, 0.3.0 started, and the settings, update and plain
 pages rendered ([results/release-030-update-20261120-162711/](results/release-030-update-20261120-162711/)).
 
+**8K HEVC and HLS before the release (2026-11-20).** The runner's new
+`media` cases ran on the 0.3.0 code (PPSA99208, the dev build of `fc80cec`)
+and on the 0.2.3 release (PPSA99207), one after the other:
+[results/release-030-media-20261120-165335/](results/release-030-media-20261120-165335/).
+The HLS streams came from `tools/serve-media.py` on the Mac.
+
+| case | frames shown (dropped), 0.3.0 / 0.2.3 | decoder, both builds | render ms, 0.3.0 / 0.2.3 | copy+convert ms (CPU) | direct MB max | flexible MB min |
+| --- | --- | --- | --- | --- | --- | --- |
+| `video-8k` (7680x3840 HEVC, 30 s) | 893 (0) / 893 (0) | 900/900 pictures, 0 errors | 0.76 / 3.10 | 0.05 / 3.02 | 1950 / 1926 | 121 / 101 |
+| `hls-ts` (H.264, 640x360 up to 1280x720) | 1177 (6) / 1179 (5) | 1200/1200, 0 errors | 0.34 / 0.97 | 0.03 / 0.28 | 534 / 714 | 246 / 226 |
+| `hls-fmp4` (HEVC, 960x540 up to 1920x1080) | 1178 (5) / 1176 (6) | 1200/1200, 0 errors | 0.35 / 1.01 | 0.03 / 0.27 | 579 / 745 | 239 / 219 |
+| `hls-vr` (H.264 2160x1080 up to 3840x1920 60 fps) | 2748 (4) / 2701 (2) | 2760/2760, 0 errors | 0.53 / 1.79 | 0.04 / 0.81 | 878 / 920 | 199 / 179 |
+| `hls-vr` `mixed.m3u8` (switching every few segments) | 2426 (6) / 2424 (3) | 2514/2514, 0 errors, 5 format changes, 0 resets | 0.51 / 1.76 | 0.04 / 0.81 | 878 / 920 | 199 / 179 |
+| `vr-sim-8k` (View in VR on the 8K clip) | self-test PASS on both (15 captures, 8 projections) | 0 errors | 0.78 / 2.10 | 0.06 / 3.03 | 2087 / 2100 | 121 / 101 |
+
+The TV composited 59.9-60.0 frames/s in every case on both builds, with no
+crash, abort or device loss. Both builds play every case the same way. The
+render and convert times are CPU times: on ANGLE the work is recorded and
+then runs on the GPU, so they show the CPU freed, not a faster GPU. This
+covers the checklist's 8K and HLS item. The three.js example pages (they
+need the network) haven't been run on RADV; `busy.html`, which draws as
+three.js does, has.
+
 ## Run it
 
 ```sh
