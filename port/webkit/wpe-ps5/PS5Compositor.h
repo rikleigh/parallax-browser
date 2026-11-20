@@ -51,8 +51,8 @@ struct PS5CompositorContext {
     // conversion on the GPU and the next conversion waits for the copy.
     // Returns a GL sync object after the copy (the caller waits on it in the
     // context that reads the texture, then deletes it), or null: no frame.
-    // GPU=radv, in an OpenGL ES 2.0 context (WebGL 1): (void*)1, copied in
-    // that context, with no fence.
+    // GPU=radv, in a WebGL context: (void*)1, copied in that context, with
+    // no fence (WebGL 1's has none).
     void* (*copyVideoFrame)(uint64_t key, unsigned texture, bool flipY);
     // Any thread: the size of the stream's newest converted frame; false: none.
     bool (*videoFrameSize)(uint64_t key, int* width, int* height);

@@ -1,5 +1,5 @@
 diff --git a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
-index 69974ab9ca..b018729714 100644
+index 69974ab9ca..710c1e9958 100644
 --- a/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
 +++ b/Source/WebKit/GPUProcess/graphics/ps5/PS5WebGLVideoCopy.cpp
 @@ -81,7 +81,10 @@ bool copyVideoFrameNative(uint64_t key, unsigned nativeTexture, bool flipY)
@@ -7,8 +7,8 @@ index 69974ab9ca..b018729714 100644
          if (!done)
              return false;
 -        glDeleteSync(static_cast<GLsync>(done)); // same context: already in order
-+        // (void*)1: a WebGL 1 context (OpenGL ES 2.0, no fences), copied with no fence
-+        // (PS5Renderer::copyVideoFrame). Otherwise a fence: same context, already in order.
++        // (void*)1: copied in this WebGL context with no fence (PS5Renderer::copyVideoFrame;
++        // WebGL 1's context, OpenGL ES 2.0, has none). Otherwise a fence: same context, in order.
 +        if (done != reinterpret_cast<void*>(1))
 +            glDeleteSync(static_cast<GLsync>(done));
          return true;

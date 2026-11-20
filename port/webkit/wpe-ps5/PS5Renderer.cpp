@@ -1227,9 +1227,13 @@ bool PS5Renderer::videoFrameSize(uint64_t key, int* width, int* height)
 }
 
 #if PS5WK_GPU_RADV
-// copyVideoFrame in an OpenGL ES 2.0 context (WebGL 1 on ANGLE): the frame
-// copied with glCopySubTextureCHROMIUM (CHROMIUM_copy_texture, enabled in the
-// context the first time; ANGLE's Vulkan backend has it). No fences: the
+// copyVideoFrame in a WebGL context (WebGL 1 or 2 on ANGLE): the frame copied
+// with glCopySubTextureCHROMIUM (CHROMIUM_copy_texture, enabled in the
+// context the first time; ANGLE's Vulkan backend has it), which stores the
+// frame's bytes as they are in any format, as texImage2D does: sRGB
+// textures too, which a blit encoded (ES has no switch for that, and ANGLE
+// no EXT_sRGB_write_control here), and it can flip, which WebGL 1's
+// ANGLE_framebuffer_blit can't. WebGL 1 has no fences either. None here: the
 // frame's writer flushed it under s_sharedVideoLock (publishVideoFrame), the
 // copy is flushed under it too, and the next write waits for that lock
 // (waitForVideoFrameCopies). ANGLE's contexts here share one device and one
@@ -1239,7 +1243,7 @@ bool PS5Renderer::videoFrameSize(uint64_t key, int* width, int* height)
 // (WebKit's PS5WebGLVideoCopy.cpp knows the value).
 static void* const kVideoFrameCopiedInContext = reinterpret_cast<void*>(1);
 
-static bool copyVideoFrameES2(GLuint source, GLuint destination, int width, int height, bool flipY)
+static bool copyVideoFrameWebGL(GLuint source, GLuint destination, int width, int height, bool flipY)
 {
     using RequestExtension = void (*)(const char*);
     using CopySubTexture = void (*)(GLuint, GLint, GLenum, GLuint, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLboolean, GLboolean, GLboolean);
@@ -1254,7 +1258,7 @@ static bool copyVideoFrameES2(GLuint source, GLuint destination, int width, int 
         if (!requestable || !strstr(requestable, "GL_CHROMIUM_copy_texture")) {
             if (!loggedFailure) {
                 loggedFailure = true;
-                g_message("[wpe-ps5] video frame copy: no CHROMIUM_copy_texture in a WebGL 1 context: no video in WebGL 1 textures");
+                g_message("[wpe-ps5] video frame copy: no CHROMIUM_copy_texture in a WebGL context: no video in WebGL textures");
             }
             return false;
         }
@@ -1274,14 +1278,16 @@ void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
     GLsync done = nullptr;
     g_mutex_lock(&s_sharedVideoLock);
 #if PS5WK_GPU_RADV
-    // GPU=radv: this runs in the caller's context. A WebGL 1 context is
-    // OpenGL ES 2.0 on ANGLE, without fences or glBlitFramebuffer (epoxy
-    // aborted at glWaitSync: "No provider of glWaitSync found", a WebGL 1
-    // page's video texture, 2026-11-20), and ANGLE_framebuffer_blit, which
-    // WebKit enables there, can't flip. CHROMIUM_copy_texture can.
-    if (epoxy_gl_version() < 30) {
+    // GPU=radv: this runs in the caller's context. WebGL's (WebKit's
+    // PS5WebGLVideoCopy.cpp; ANGLE_webgl_compatibility) copy with
+    // CHROMIUM_copy_texture (copyVideoFrameWebGL). A WebGL 1 context is
+    // OpenGL ES 2.0, without fences or glBlitFramebuffer: epoxy aborted at
+    // glWaitSync ("No provider of glWaitSync found", a WebGL 1 page's video
+    // texture, 2026-11-20). WebGPU's reader context blits below, into its
+    // RGBA8 and BGRA8 textures.
+    if (epoxy_has_gl_extension("GL_ANGLE_webgl_compatibility")) {
         void* copied = nullptr;
-        if (auto* entry = sharedVideoFrame(key, false); entry && entry->written && copyVideoFrameES2(entry->texture, texture, entry->width, entry->height, flipY))
+        if (auto* entry = sharedVideoFrame(key, false); entry && entry->written && copyVideoFrameWebGL(entry->texture, texture, entry->width, entry->height, flipY))
             copied = kVideoFrameCopiedInContext;
         g_mutex_unlock(&s_sharedVideoLock);
         return copied;
@@ -1300,10 +1306,7 @@ void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
         // stores them: no linear-to-sRGB encoding on the write (on by
         // default in ES contexts; EXT_sRGB_write_control turns it off).
 #if PS5WK_GPU_RADV
-        // GPU=radv: this runs in WebGL's own ANGLE context (WebKit's
-        // PS5WebGLVideoCopy.cpp), whose errors the page sees, and ANGLE has
-        // no EXT_sRGB_write_control here: no sRGB toggle.
-        // TODO: sRGB WebGL textures get the frame encoded twice.
+        // GPU=radv: WebGPU's textures here, never sRGB (WebGL's copy above).
 #else
         static bool checkedSRGB;
         if (!checkedSRGB) {

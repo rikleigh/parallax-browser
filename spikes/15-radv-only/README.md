@@ -753,8 +753,10 @@ the release build's [results/phase0-20261119-013048/](results/phase0-20261119-01
   PPSA99207: updates still name PPSA99207 only), and live tabs (a test run has
   one tab, so they need a normal run, with the owner's session).
 - Overlay GPU time from `EXT_disjoint_timer_query` (today `GPU n/a`).
-- sRGB WebGL textures fed from video get the frame encoded twice on radv
-  (ANGLE has no `EXT_sRGB_write_control` here).
+- sRGB WebGL textures fed from video got the frame encoded twice on radv
+  (a blit into sRGB encodes, and ANGLE has no `EXT_sRGB_write_control`
+  here). Fixed 2026-11-20 with the WebGL 1 fix below: every WebGL context
+  now copies with `CHROMIUM_copy_texture`.
 - Phase 4: done (below); the owner's TV check passed (2026-11-20).
 - Phase 5: done (below): the radv build links no ps5-opengl. The 0.3.0
   release is still to do.
@@ -774,9 +776,17 @@ the release build's [results/phase0-20261119-013048/](results/phase0-20261119-01
   ([results/radv-webgl1video-20261120-122646/](results/radv-webgl1video-20261120-122646/)):
   `webgl/video-formats.html?gl=1` passes every case in both rounds (RGBA,
   RGB, `SRGB_ALPHA_EXT`, sub-image uploads, flipY off), WebGL 2's run is as
-  before, and `readpixels` is 29/29. The WebGL 2 sRGB cases still fail
-  (the double encoding above); the CHROMIUM copy gets sRGB right in WebGL
-  1, so it may fix them too.
+  before, and `readpixels` is 29/29. The WebGL 2 sRGB cases still failed
+  (the double encoding above).
+  Then every WebGL context, 1 or 2 (`ANGLE_webgl_compatibility`), took the
+  same copy, which stores the frame's bytes as they are in any format;
+  WebGPU's reader context still blits, into RGBA8 and BGRA8 only
+  ([results/radv-webglsrgb-20261120-130657/](results/radv-webglsrgb-20261120-130657/)):
+  `video-formats.html` passes every case in WebGL 1 and 2, sRGB included
+  (`SRGB8_ALPHA8`, max difference 0, was 73), `readpixels` 29/29, the
+  runner's WebGL cases at 59.9 frames/s, and every WebGPU page passes
+  (`video-texture` at 60.0 frames/s, its first second's 49 dropped video
+  frames as in Phase 4 and 5).
 
 ## Phase 4: WebGPU without the CPU round trips (2026-11-20)
 

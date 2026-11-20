@@ -1,0 +1,148 @@
+[log] connected to <mac>:9999
+[log] non-blocking log: TCP <mac>:9999 (buffer 512 KB, dropped lines noted), file /data/ps5webkit/ps5browser.log, stderr: the stderr stream writes into a pipe (/data/ps5webkit/log-sink: TCP <mac>:9999, queue 512 KB, stall 30 s)
+title ps5browser pid 616: unjailed 1, file log on, tcp log to <mac>:9999 queued (non-blocking sender) (errno 0)
+ps5browser: WPE WebKit 2.55.0, pid 616, build 20261120-130625-00e69c57b7
+runtime: /data/ps5webkit is up to date (5f47aa08a549f6de)
+[mem] main: flexible 262.0 MB free; direct memory 4.4 MB in use; direct heap 2.0 MB mapped (peak 2.0, 0 libc fallbacks, init ready); anon mmaps 0.1 MB in 3 (peak 0.4 MB, 3 made, 0 failed, 0 zero fills, 0 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 2 live, 0.3 MB (2 created, 0 libc)
+imports: 0 of 456 NULL
+probe: [recv MSG_DONTWAIT on empty: -1/35] [stream: F_GETFL 2/0 F_SETFL -1/13 FIONBIO -1] socketpair stream rc 0 errno 0 (F_SETFD 0); [recv MSG_DONTWAIT on empty: -1/35] [seqpacket: F_GETFL 2/0 F_SETFL -1/13 FIONBIO -1] socketpair seqpacket rc 0 errno 0 (F_SETFD 0); [recv MSG_DONTWAIT on empty: -1/35] [dgram: F_GETFL 2/0 F_SETFL -1/13 FIONBIO -1] socketpair dgram rc 0 errno 0 (F_SETFD 0); pipe rc 0 errno 0
+probe: fcntl(p[0], F_GETFD) = 0 (errno 0); fcntl(p[0], F_SETFD, FD_CLOEXEC) = 0 (errno 0); fcntl(p[0], F_GETFL) = 2 (errno 0); fcntl(p[0], F_SETFL, O_NONBLOCK) = 0 (errno 0); fcntl(p[0], F_GETFL) = 6 (errno 0); ioctl(p[1], FIONBIO, &one) = 0 (errno 0); F_DUPFD -> 32; d = dup(q[0] = 0) = 30 (errno 1); pipe2(q, O_CLOEXEC) = 0 (errno 0); 
+[app msg] [vdec] backend Videodec2: codecs 0x107, up to 8192x4352; sysmodule 0xcf -> 0x00000000; load /T4bfP5KWzb/common/lib/libSceVideodec2.sprx -> 0xd1; 0 bound by name, 10 by 13.60 offsets (anchor matched), 0 missing
+[user] User1 (user 0x11028d21, rc 0x00000000; name rc 0x00000000): data in /data/ps5webkit/users/11028d21
+ac_compute_device_uuid's output is based on invalid pci bus info.
+wsi/videoout: 119.88 Hz accepted, but a vblank comes every 16.681 ms; 59.94 Hz restored
+[app msg] [wpe-ps5] PS5Renderer: ANGLE on Vulkan, EGL 1.5, display up in 6.5 ms, surface and context in 125.2 ms (2 8888 window configs tried); ANGLE (AMD, Vulkan 1.4.354 (PlayStation 5 GPU (RADV NAVI21) (0x00000000)), radv-26.2.0); OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)
+[app msg] [wpe-ps5] PS5Renderer: EGL 1.5 (ANGLE 2.1.29096 git hash: e9f64dda0c5b), GL OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b), 1920x1080, render thread; page in a persistent GL buffer
+[app msg] [video] listening on /system_tmp/ps5wk/video-616.sock
+[app msg] [wpe-ps5] pad: init 0x0, user 285379873, open -> 56559360
+[app msg] [wpe-ps5] pad: the stick also scrolls from the pad's own thread while the main thread is stuck
+ime: sysmodule 0x96 -> 0x00000000; imports bound (Init 800f78c00, CommonDialogInitialize 800e48d40)
+[app msg] [wpe-ps5] ime: libSceImeDialog bound; sceCommonDialogInitialize -> 0x0
+[app msg] [wpe-ps5] display connected: 1920x1080, pad 56559360
+RESULT ps5browser display PASS PS5 display connected
+[mem] display connected: flexible 262.0 MB free; direct memory 133.6 MB in use; direct heap 14.0 MB mapped (peak 14.0, 0 libc fallbacks, init ready); anon mmaps 0.1 MB in 24 (peak 49.7 MB, 24 made, 0 failed, 0 zero fills, 0 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 23 live, 49.6 MB (23 created, 0 libc)
+audio: server started (sceAudioOut); self-test file: absent
+[ps5audio] listening on /system_tmp/ps5wk/audio-616.sock (sceAudioOut)
+[mem] anonymous mmap of 128.0 MB (align 0x8000000, prot 3) -> direct memory at 208000000
+[mem] anonymous mmap of 128.0 MB (align 0x10000, prot 3) -> direct memory at 210000000
+settings: Screen Orientation API on
+settings: HiddenPageDOMTimerThrottling on
+settings: HiddenPageCSSAnimationSuspension on
+[app msg] [wpe-ps5] [ps5-launch] launching network process 2 from /app0/ps5wk-child.elf
+[app msg] [wpe-ps5] [ps5-launch] listening on /system_tmp/ps5wk/ui-616.sock
+settings: WebGPU on
+[tabs] up to 2 live tabs (/data/ps5webkit/live-tabs: 1-4, default 2)
+browser: 0 bookmarks, 347 history entries, 17 sites with settings
+browser: the bar above the page
+[app msg] [wpe-ps5] page area: 104 px below the top (was 0)
+[dl] 3 downloads in the list (0 paused at start, 0 gone from the folder) in /data/ps5webkit/users/11028d21/downloads
+[adblock] on; 0 allowed site(s); store /data/ps5webkit/browser/contentfilters
+[adblock] site data /data/ps5webkit/adblock/adblock-scripting.txt (uBO Lite 2026.1116.1650, downloaded list): 33040 hosts, scriptlet calls 4153 main + 1156 isolated, 16764 cosmetic filters (916 procedural), library 97 + 38 declarations; 2.5 MB + 0.9 MB index, read in 11 ms
+[mem] adblock: site data loaded: flexible 262.0 MB free; direct memory 400.7 MB in use; direct heap 22.5 MB mapped (peak 22.5, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 31 (peak 308.3 MB, 31 made, 0 failed, 0 zero fills, 0 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 28 live, 52.1 MB (28 created, 0 libc)
+[mem] web view created: flexible 262.0 MB free; direct memory 400.9 MB in use; direct heap 22.5 MB mapped (peak 22.5, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 33 (peak 308.5 MB, 33 made, 0 failed, 0 zero fills, 1 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 30 live, 52.4 MB (30 created, 0 libc)
+launch argument 0: 
+test URL list: 1 URLs
+browser: test run: one tab, the saved session is neither restored nor written
+test URL 1/1: file:///data/ps5webkit/phase0/webgl-readpixels.html
+[app msg] [wpe-ps5] [ps5-launch] launching web process 4 from /app0/ps5wk-child.elf
+[wc] context: GL OpenGL ES 3.1 (ANGLE 2.1.29096 git hash: e9f64dda0c5b) (WebCore version 310, GLES), 175 extensions (GL_EXTENSIONS string present), npot 1 unpack_subimage 1 packed_depth_stencil 1 YUV_target 0, max texture 16384
+[texmap] PS5 tile uploads: 16 MB staging ring at 4000600000, slot alignment 256, GLSL ES 3.10
+[wc] S1b: PASS 1920x1080: TextureMapper 0.0 ms; apply (9 layers, 16 tile uploads, 10.7 MB) 4.7 ms incl. GPU, uploads 4.27 ms; first paint 59.5 ms incl. GPU (8 programs compiled in 23.8 ms, 0 failed, GLSL 300 es); warm paint 0.39 ms CPU, 0.54 ms incl. GPU avg, 0.69 max (3 runs); probes 5/5; checksum 51e05cc7; GL errors apply 0x0 first paint 0x0 warm 0x0 readback 0x0
+[ascroll] scroll measurements on: [ascroll] lines while the page scrolls
+[wc] GPU compositor ready in 82.0 ms
+[wc] main thread waited 82.0 ms for the compositor's set-up: ready
+[app msg] [wpe-ps5] PS5Renderer: GPU compositor ready (82.0 ms)
+[wc] page 6: WC compositor (drawing area 21, GL host)
+[ascroll] drawing area 21: async scrolling (the title's scrolling tree; stick frame, overflow off, sync on; defaults)
+control: listening on /system_tmp/ps5wk/ps5browser-control.sock
+push: listening on TCP 9040 (http://<this PS5>:9040/), PIN required
+[app msg] [wpe-ps5] pad: read 0x0, not intercepted, connected 1 (raw buttons 0x0)
+[mem] adblock: loaded: flexible 262.0 MB free; direct memory 443.6 MB in use; direct heap 24.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 39 (peak 315.1 MB, 39 made, 0 failed, 0 zero fills, 17 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 36 live, 58.9 MB (36 created, 0 libc)
+[adblock] loaded compiled list ubol-b (uBO Lite 2026.1116.1650, update, 136089 rules) in 86 ms
+[adblock] filter on for (no page) (list ready)
+[app msg] [wpe-ps5] ui canvas: fonts loaded
+[app msg] [wpe-ps5] [ps5-launch network2] sent 146037808 bytes + header to elfldr in 273 ms
+[network2] [ps5wk-child 618] network process 2 starting (parent 98, flexible memory 8080 MB)
+[app msg] [wpe-ps5] [ps5-launch] network process 2 is payload pid 618, connected 1073 ms after launch; IPC fd passed
+[network2] [ps5wk-child 618] locks: futex (ps5locks; /data/ps5webkit/no-fastlock turns it off); malloc: libpas (ps5malloc; /data/ps5webkit/no-pasmalloc turns it off)
+[network2] [ps5wk-child 618] stderr: a write waits 0.5 s at most (buffer 256 KB)
+[network2] [ps5wk-child 618] rendezvous: connected to /system_tmp/ps5wk/ui-616.sock after 0 ms, IPC fd 10
+[network2] [ps5wk-child 618] stale files: removed 3 from /system_tmp/ps5wk, 0 not removed (errno 0)
+[network2] [ps5wk-child 618] [health] no payloads left over from earlier title runs
+[network2] [watchdog network2] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding); reports also in /data/ps5webkit/prof/watchdog-network2-618.txt, touch /data/ps5webkit/prof/watchdog-dump for the stacks of every thread
+[app msg] [wpe-ps5] [ps5-launch web4] sent 146037808 bytes + header to elfldr in 255 ms
+[web4] [ps5wk-child 619] web process 4 starting (parent 98, flexible memory 8080 MB)
+[app msg] [wpe-ps5] [ps5-launch] web process 4 is payload pid 619, connected 1948 ms after launch; IPC fd passed
+[network2] [ps5wk-child 618] [perf] network bytes for the overlay: interface counters
+[web4] [ps5wk-child 619] locks: futex (ps5locks; /data/ps5webkit/no-fastlock turns it off); malloc: libpas (ps5malloc; /data/ps5webkit/no-pasmalloc turns it off)
+[web4] [ps5wk-child 619] stderr: a write waits 0.5 s at most (buffer 256 KB)
+[web4] [ps5wk-child 619] rendezvous: connected to /system_tmp/ps5wk/ui-616.sock after 0 ms, IPC fd 10
+[web4] [ps5wk-child 619] JIT: on (PS5WK_JIT=1; JSC_useJIT=true), executable pool 256 MB (/data/ps5webkit/no-bigjitpool: 128 MB); WebAssembly on
+[web4] [ps5wk-child 619] [probe] clock_gettime: CLOCK_MONOTONIC 2159 ns, CLOCK_REALTIME 1049 ns per call (20000 calls, 1)
+[web4] [ps5wk-child 619] video decoding: hardware in the title (codecs 0x107, up to 8192x4352); MSE/canPlayType limit 7680x4320@60
+[web4] [watchdog web4] on: reports a main thread that does not turn for 3 s (PS5WK_WATCHDOG_S; CFI unwinding); reports also in /data/ps5webkit/prof/watchdog-web4-619.txt, touch /data/ps5webkit/prof/watchdog-dump for the stacks of every thread
+[web4] 
+[web4] ** (WPEWebProcess:619): WARNING **: 13:30:24.943: Error loading the injected bundle (/user/homebrew/lib/wpe-webkit-2.0/injected-bundle/libWPEInjectedBundle.so): error_code=0xffffffff
+load started: file:///data/ps5webkit/phase0/webgl-readpixels.html
+load committed: file:///data/ps5webkit/phase0/webgl-readpixels.html
+[app msg] [wpe-ps5] gamepad mode off: 0 key(s), left stick gamepad, right stick gamepad
+[webgl] title: WebGL on the compositor's ANGLE display (1.5 (ANGLE 2.1.29096 git hash: e9f64dda0c5b)), sharing its GL names
+[webgl] title: GPU process side started (WebGL; WebGPU on Dawn, Vulkan driver linked)
+[webgl] title: GPU connection for WebProcess 4
+[ps5-gpu] in-title GPU process: dropped GPUProcessProxy_SetMediaCodecCapabilities (no GPUProcessProxy)
+[webgl] title: ANGLE context 15 for WebGL 2, max texture 16384
+[webgl] title: ANGLE context 26 for WebGL 2, max texture 16384
+[webgl] title: ANGLE context 115 for WebGL 1, max texture 16384
+load finished: file:///data/ps5webkit/phase0/webgl-readpixels.html
+RESULT ps5browser load PASS file:///data/ps5webkit/phase0/webgl-readpixels.html "" (2.1 s after start)
+[mem] load finished: flexible 262.0 MB free; direct memory 455.1 MB in use; direct heap 28.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 49 (peak 316.5 MB, 50 made, 0 failed, 0 zero fills, 32 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 46 live, 60.4 MB (47 created, 0 libc); WebGL 3 contexts (3 made), drawing buffers ~0.0 MB
+RESULT ps5browser url PASS 1/1 file:///data/ps5webkit/phase0/webgl-readpixels.html loaded in 2.1 s: title ""; flexible 262.0 MB
+[mem] after test URL 1: flexible 262.0 MB free; direct memory 455.1 MB in use; direct heap 28.5 MB mapped (peak 32.4, 0 libc fallbacks, init ready); anon mmaps 256.1 MB in 49 (peak 316.5 MB, 50 made, 0 failed, 0 zero fills, 32 passed through; fixed mmaps outside them: 0 to direct memory, 0 to flexible, 0.0 MB); thread stacks 46 live, 60.4 MB (47 created, 0 libc); WebGL 3 contexts (3 made), drawing buffers ~0.0 MB
+[webgl] title: first frame finished
+[wc] tile arena chunk 1 mapped in 0.22 ms
+[wc] tile arena chunk 2 mapped in 0.85 ms
+[web4] [webgl] remote context 15: WebGL 2, alpha 1
+[web4] [webgl] page: WebGL 2 context for  (the main frame, canvas in the document 16x16)
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels default-antialiased-rgba8 PASS
+[web4] [webgl] remote context 26: WebGL 2, alpha 1
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels default-plain-rgba8 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba8 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba8-read-format PASS (it is RGBA/UNSIGNED_BYTE)
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels r8 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rg8 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels srgb8-alpha8 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgb565 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba4 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgb5-a1 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgb565-read-format 0x1907/0x8363 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba4-read-format 0x1908/0x8033 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgb5-a1-read-format 0x1908/0x8034 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgb10-a2 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba8ui PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba32i PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba16f-float PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba16f-half-float PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels rgba32f PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels r11f-g11f-b10f PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels r32f PASS
+[web4] [webgl] remote context 115: WebGL 1, alpha 1
+[web4] [webgl] page: WebGL 1 context for  (the main frame, canvas in the document 16x16)
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels webgl1-rgb-565 0x1907/0x8363 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels webgl1-rgba-4444 0x1908/0x8033 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels webgl1-rgba-5551 0x1908/0x8034 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels webgl1-rgb-8 0x1908/0x1401 PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels msaa-resolved PASS
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels msaa-direct-read-rejected PASS errors 0x502
+[web4] CONSOLE RENDERING INFO WebGL debug message: type:performance, id:0 severity: high: GPU stall due to ReadPixels
+[web4] CONSOLE RENDERING INFO WebGL debug message: type:performance, id:0 severity: high: GPU stall due to ReadPixels (this message will no longer repeat)
+[web4] CONSOLE RENDERING ERROR WebGL: INVALID_OPERATION: glReadPixelsRobustANGLE: Invalid operation on multisampled framebuffer.
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels pbo-fence PASS  (signalled after 0 frames)
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:43:14: CONSOLE LOG RESULT webgl-readpixels pbo-fence-align1-rowlength PASS  (signalled after 0 frames)
+[web4] [webgl] first frame prepared for display
+[web4] [wc] tile arena: chunk 1 of 8 MB (8 MB in 1 chunks), allocated in 0.03 ms on the main thread
+[web4] [wc] tile arena: chunk 2 of 8 MB (16 MB in 2 chunks), allocated in 0.01 ms on the main thread
+[web4] file:///data/ps5webkit/phase0/webgl-readpixels.html:335:14: CONSOLE LOG RESULT webgl-readpixels summary 29/29 passed
+[wc] 1.6 s: 3 updates (apply 0.60 ms avg, 1.4 max; 0 unchanged), 0 presents; 1 pages, 13 layers; tiles uploaded 23 (23 draws, 10.2 MB, 1.49 ms, 0.065 ms per upload, 0 fence waits, 0 finishes); 3 paints (0.22 ms avg, 0.3 max; 0 for animations only, longest gap 0.0 ms, 0 waited for); GL textures 17.5 MB (pool 1.3); programs 8 (24 ms, 0 failed, GLSL 300 es); update in the title: queued 0.00 ms avg 8.6 max, applied to swap 0.00 avg 0.0 max, swap to reply 0.02 avg 0.0 max
+[wc] 1.6 s: 3 updates answered when applied (async scrolling)
+[wc] 1.6 s: WebGL 3 contexts (3 made), 3 layers shown, drawing buffers ~0.0 MB (in the GL texture cap)
+[ascroll] 1.6 s: wheel events in the title 0, sent to the WebProcess first 0; clamped at the painted edge 0 (0 px); lead over the WebProcess 0 px avg, 0 max; 3 tree commits; per-frame step 0.0 px avg, sd 0.0; scrollbar hidden/shown 0; root could not take 0 (to the WebProcess), frame steps nothing took 0; sub-scroller moves in the title 0; snaps after wheel 0; clamped with zero lead (sent on) 0; lookahead 1.00
