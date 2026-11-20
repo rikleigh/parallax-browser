@@ -176,6 +176,11 @@ check "a cookie the server wants, missing" "$(peek "app.zip?cookie=k=v")" "ERR:a
 printf '127.0.0.1\tFALSE\t/\tFALSE\t0\tk\tv\n' > "$work/cookies.txt"
 check "the cookie given" "$(peek "app.zip?cookie=k=v" --cookies "$work/cookies.txt")" "j['titleId']=='PPSA01234'"
 check "too slow (rate=8 KiB/s, 1.5 s)" "$(peek "app.zip?rate=8" --timeout 1500)" "ERR:"
+# a few bytes a second: every read gets something, so only the deadline stops it
+t0=$(date +%s)
+out="$(peek "app.zip?rate=0.02" --timeout 2000)"
+took=$(($(date +%s) - t0))
+if [[ "$out" == "ERR It took too long"* ]] && [ "$took" -le 5 ]; then pass "a server sending 20 bytes a second: given up after ${took} s"; else failed "a dribbling server: $out after ${took} s"; fi
 for f in rar5_multiple_files.rar rar_windows.rar; do
     if [ -f "$files/$f" ]; then
         check "RAR: $f" "$(peek "$f")" "j['format'].startswith('RAR') and j['entries']>0 and j['titles']==0"

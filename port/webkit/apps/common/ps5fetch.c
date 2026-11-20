@@ -114,6 +114,7 @@
 #define STATE_EVERY_US G_USEC_PER_SEC
 #define RETRY_AFTER_MAX_S 60
 #define STATE_GROUP "ps5dl"
+#define MAX_TOTAL (16ll << 40) /* 16 TiB: a bigger size is a broken or hostile answer */
 
 static const unsigned backoffSeconds[] = { 1, 2, 4, 8, 15 };
 
@@ -842,6 +843,12 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
         ? soup_message_headers_get_content_length(headers)
         : -1;
     gint64 total = status == 206 ? rangeTotal : length;
+    if (total > MAX_TOTAL) {
+        /* a hostile or broken answer: a list of chunks that size would
+         * take the engine's lock (and memory) for good */
+        fail(f, FALSE, "The server gave an impossible size (%" G_GINT64_FORMAT " bytes)", total);
+        return NEXT_END;
+    }
     const char* etag = soup_message_headers_get_one(headers, "ETag");
     const char* modified = soup_message_headers_get_one(headers, "Last-Modified");
     gboolean same = sameValidator(f->etag, f->lastModified, etag, modified) && total == f->total;
@@ -860,9 +867,11 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
         replaceString(&f->etag, etag);
         replaceString(&f->lastModified, modified);
         f->ranges = status == 206;
+        if (!enoughSpace(f))
+            return NEXT_END;
         if (f->ranges)
             makeChunks(f);
-        if (!enoughSpace(f) || !openPart(f))
+        if (!openPart(f))
             return NEXT_END;
         if (f->ranges) {
             w->chunk = (gint64)(job->start / f->chunk);
@@ -1429,6 +1438,31 @@ static void rangesFail(PS5FetchRanges* r, const char* format, ...)
     va_end(args);
 }
 
+/* Cancels a request when the deadline passes (a server that sends a byte
+ * now and then would keep libsoup's per-read timeout from firing). */
+typedef struct {
+    GMutex lock;
+    GCond cond;
+    gboolean done;
+    gint64 deadline;
+    GCancellable* cancel;
+} Watchdog;
+
+static gpointer watchdogMain(gpointer data)
+{
+    Watchdog* w = data;
+    g_mutex_lock(&w->lock);
+    while (!w->done) {
+        if (!g_cond_wait_until(&w->cond, &w->lock, w->deadline)) {
+            if (!w->done)
+                g_cancellable_cancel(w->cancel);
+            break;
+        }
+    }
+    g_mutex_unlock(&w->lock);
+    return NULL;
+}
+
 static uint64_t blockLength(PS5FetchRanges* r, uint64_t block)
 {
     uint64_t start = block * RANGES_BLOCK;
@@ -1476,14 +1510,18 @@ static gboolean rangesFetch(PS5FetchRanges* r, uint64_t first)
     soup_message_set_site_for_cookies(message, uri);
     soup_message_set_is_top_level_navigation(message, TRUE);
     r->requests++;
+    Watchdog watch = { .deadline = r->deadline, .cancel = g_cancellable_new() };
+    g_mutex_init(&watch.lock);
+    g_cond_init(&watch.cond);
+    GThread* watcher = g_thread_new("dl-peek-watch", watchdogMain, &watch);
     GError* error = NULL;
-    GInputStream* stream = soup_session_send(r->session, message, NULL, &error);
+    GInputStream* stream = soup_session_send(r->session, message, watch.cancel, &error);
     gboolean ok = FALSE;
     if (!stream) {
-        rangesFail(r, "%s", error ? error->message : "network error");
+        rangesFail(r, "%s", g_cancellable_is_cancelled(watch.cancel) ? "It took too long" : error ? error->message : "network error");
         g_clear_error(&error);
         g_object_unref(message);
-        return FALSE;
+        goto finish;
     }
     guint status = soup_message_get_status(message);
     goffset rangeStart = 0, rangeEnd = 0, rangeTotal = 0;
@@ -1496,8 +1534,8 @@ static gboolean rangesFetch(PS5FetchRanges* r, uint64_t first)
     else {
         guchar* data = g_malloc(end - start);
         gsize got = 0;
-        if (!g_input_stream_read_all(stream, data, end - start, &got, NULL, &error) || got != end - start)
-            rangesFail(r, "%s", error ? error->message : "the answer was cut short");
+        if (!g_input_stream_read_all(stream, data, end - start, &got, watch.cancel, &error) || got != end - start)
+            rangesFail(r, "%s", g_cancellable_is_cancelled(watch.cancel) ? "It took too long" : error ? error->message : "the answer was cut short");
         else {
             r->bytes += end - start;
             for (uint64_t b = first; b <= last; b++) {
@@ -1525,6 +1563,15 @@ static gboolean rangesFetch(PS5FetchRanges* r, uint64_t first)
     g_input_stream_close(stream, NULL, NULL);
     g_object_unref(stream);
     g_object_unref(message);
+finish:
+    g_mutex_lock(&watch.lock);
+    watch.done = TRUE;
+    g_cond_signal(&watch.cond);
+    g_mutex_unlock(&watch.lock);
+    g_thread_join(watcher);
+    g_mutex_clear(&watch.lock);
+    g_cond_clear(&watch.cond);
+    g_object_unref(watch.cancel);
     return ok;
 }
 

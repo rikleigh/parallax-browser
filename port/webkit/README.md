@@ -1080,13 +1080,19 @@ hundred megabytes, and because a title can't see every drive.
   name), which version is installed (`/user/appmeta/<ID>/param.json`,
   what the system registered, then `/user/app/<ID>/sce_sys`), the
   format, file count and unpacked size, and pre-selects: an app →
-  *Unpack & install app*, or what was chosen for the last archive with
-  an app (`app-after` in `downloads.ini`; Settings shows it and can
-  forget it); several apps or other files → *Unpack*; an archive that
-  can't be unpacked (encrypted, unsafe paths) → only *Keep the file*.
-  With *Don't ask*, an archive holding one app gets that last choice
-  without asking, never before one was made. Finished archives get the
-  same suggestion as their first button.
+  *Unpack & install app*; several apps or other files → *Unpack*; an
+  archive that can't be unpacked (encrypted, unsafe paths) → only *Keep
+  the file*. Nothing is remembered and nothing is installed unless the
+  user chose it for that file. Finished archives get the same suggestion
+  as their first button.
+- **Replacing an installed app is always asked.** An install (after
+  unpacking, or *Install app* in Files) of an app whose ID is installed
+  (`/user/appmeta`, `/user/app/<ID>/sce_sys`, or `<drive>/homebrew/<ID>`
+  already there) is refused by the service unless the job says
+  `replace=1`; for an archive this is checked from its `param.json`
+  before anything is unpacked. The card says *Installed already* and
+  offers *Replace version X* (a second press). The download card warns
+  beforehand when the installed version is known.
 - **The manager's page** (`apps/title/dlm.c`): `parallax://downloads` on
   the TV (it opens over the tab when a download waits for a folder; X on a
   finished or waiting row in the menu's Downloads list opens it), and
@@ -1094,7 +1100,11 @@ hundred megabytes, and because a title can't see every drive.
   *Downloads* (waiting ones on top, progress, speed, connections, the jobs
   on files), *Files* (the drives with free space, folders, unpack/install/
   image any file or folder already there, rename, delete with a second
-  press, favourites, *Save downloads here by default*), *Settings*.
+  press (a job, so a big folder doesn't hold up the link server),
+  favourites, *Save downloads here by default*), *Settings*. From another
+  device the page's data and actions need the link server's PIN; with
+  no PIN set up (`/data/ps5webkit/push-pin.txt`) only the TV's own page
+  can use them (they delete, move and install files on every drive).
 - **API:** `GET /dlm.json` (everything the page shows), `GET
   /dlm/fs?op=roots|ls&path=`, `POST /dlm do=save|pause|resume|cancel|remove|
   delete|forget|extract|extract-install|extract-image|jobstop|after|peek|
@@ -1124,20 +1134,30 @@ link server; the page's look through debug screenshots, not the pad):
 - The look inside (later the same day): a 41 MB ZIP holding an app was
   read from one request (113 KB, 40-50 ms) before the card showed; its
   name, ID, version and the installed version (01.003.000, from
-  `/user/appmeta`) were right. Choosing *Unpack* for it remembered the
-  choice; with *Don't ask*, the next such ZIP was unpacked without
-  asking. The finished ZIPs already in the list were looked at on the
+  `/user/appmeta`) were right. (A remembered choice for app archives,
+  applied without asking under *Don't ask*, was tried then and removed
+  after the review: installs are always the user's choice per file.) The
+  finished ZIPs already in the list were looked at on the
   drive when the page opened (ProsperoWeb's: its app found; the data
   ZIP: files, no app).
 - Not checked yet: ShadowMountPlus (1.7beta7 here) mounting such an image
   (it logged nothing about it in the minutes watched), RAR archives on the
   console, USB and M.2 drives (none attached), the pad on the TV.
-- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (46 cases,
-  `--quick` 37), `archive-test.sh` (173), `exfat-test.sh` (66,
-  `--no-big` 50), `install-test.sh` (12), `peek-test.sh` (24: ZIP,
+- After a review (2026-11-21), on the console: an app archive installed
+  (v1); v2 of it with *Unpack & install app* was refused before
+  unpacking (*version 01.00.000 is already installed*), the file's entry
+  kept its name; *Replace* (replace=1) installed v2 (01.002.000); *Install
+  app* on an unpacked v1 folder in Files was refused the same way; a
+  Files delete answered in 0.03 s and ran as a job; pause then resume at
+  once went on downloading (in that run the pause had ended before the
+  resume came, so the queued restart wasn't exercised); cancel deleted
+  the files; the manager's data and actions without the PIN: 403.
+- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
+  `--quick` 38), `archive-test.sh` (173), `exfat-test.sh` (66,
+  `--no-big` 50), `install-test.sh` (12), `peek-test.sh` (25: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
   not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
-  a slow server, on the drive).
+  a slow server, one sending 20 bytes a second, on the drive).
 
 **Test server:** `port/webkit/test/downloads/serve.py [--port 8781]`
 generates files of any size (each 4 KB block numbered, so a wrong join

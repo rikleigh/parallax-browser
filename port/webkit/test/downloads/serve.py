@@ -26,6 +26,8 @@ GET /file/<size>[/<name>]?options    the file (HEAD too)
     changeafter=N  after N requests for this path, the next version of the
               file (ETag, Last-Modified and content), as /version does for all
     cookie=NAME=VALUE  403 unless the request's Cookie header has it
+    fakesize=N  a 206's Content-Range says the file is N bytes (a broken or
+              hostile server)
 GET /signed/<size>/<name>?exp=T&...  the file while time() < T, else 403
     (an expiring CDN address)
 GET /release/<size>/<name>?...       302 to /signed/... valid for 20 s (a
@@ -266,7 +268,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not q.get("nolen"):
             self.send_header("Content-Length", str(end - start))
         if partial:
-            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end - 1, size))
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end - 1, int(q.get("fakesize", size))))
         if not q.get("noranges"):
             self.send_header("Accept-Ranges", "bytes")
         if not q.get("novalidator"):

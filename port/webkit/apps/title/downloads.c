@@ -51,6 +51,8 @@
 #define STALL_S 45
 #define FREE_MARGIN (16 * 1024 * 1024LL) /* left free on /data after a download */
 #define NAME_MAX_BYTES 180
+#define PEEK_GIVE_UP_S 120
+#define COOKIES_MAX_BYTES (1024 * 1024) /* more: sent without (the service drops lines over 8 MiB) */
 
 typedef struct {
     PS5WKDownloadRecord r; /* first: what downloads.json keeps */
@@ -88,6 +90,10 @@ typedef struct {
     char* peekError;
     gboolean peeking;
     gboolean peekedLocal; /* the finished file was looked at (not again) */
+    gint64 peekStarted;   /* monotonic us: a look that takes too long is given up */
+    /* the last install was refused: this version of the app is installed
+     * ("?": not known); the page offers to replace it */
+    char* replaceVersion;
 } Download;
 
 static WPEDisplayPS5* display;
@@ -119,6 +125,7 @@ typedef struct {
     char* error;
     char* out;
     char* titleName;
+    char* replaceVersion; /* as Download's */
 } Task;
 static GPtrArray* tasks; /* Task*, newest first */
 static unsigned nextTask = 1;
@@ -146,6 +153,7 @@ static void downloadFree(gpointer data)
     g_free(d->refused);
     g_free(d->peek);
     g_free(d->peekError);
+    g_free(d->replaceVersion);
     if (d->session)
         g_object_unref(d->session);
     ps5wk_download_record_clear(&d->r);
@@ -664,10 +672,7 @@ static struct {
     char* folder;           /* the default folder; NULL: the user's downloads folder */
     gboolean deleteArchives; /* after they were unpacked */
     char** favorites;       /* folders, NULL-terminated */
-    /* what was last chosen for an archive holding one app ("none",
-     * "extract", "extract-install", "extract-image"); NULL: never */
-    char* appAfter;
-} settings = { 8, TRUE, NULL, FALSE, NULL, NULL };
+} settings = { 8, TRUE, NULL, FALSE, NULL };
 
 static char* settingsPath(void)
 {
@@ -696,11 +701,6 @@ static void loadSettings(void)
             g_free(folder);
         g_strfreev(settings.favorites);
         settings.favorites = g_key_file_get_string_list(file, "downloads", "favorites", NULL, NULL);
-        char* appAfter = g_key_file_get_string(file, "downloads", "app-after", NULL);
-        g_free(settings.appAfter);
-        settings.appAfter = appAfter && *appAfter ? appAfter : NULL;
-        if (!settings.appAfter)
-            g_free(appAfter);
     }
     g_free(path);
     g_key_file_unref(file);
@@ -715,8 +715,6 @@ static void saveSettings(void)
     g_key_file_set_string(file, "downloads", "folder", settings.folder ? settings.folder : "");
     if (settings.favorites)
         g_key_file_set_string_list(file, "downloads", "favorites", (const char* const*)settings.favorites, g_strv_length(settings.favorites));
-    if (settings.appAfter)
-        g_key_file_set_string(file, "downloads", "app-after", settings.appAfter);
     char* path = settingsPath();
     gsize length = 0;
     char* text = g_key_file_to_data(file, &length, NULL);
@@ -831,29 +829,25 @@ static void startPeek(Download* d, gboolean local)
         char* path = pathIn(d, FALSE);
         d->peeking = TRUE;
         d->peekedLocal = TRUE;
+        d->peekStarted = g_get_monotonic_time();
         ps5wk_dlservice_send("peek", "id", id, "path", path, NULL);
         g_free(path);
     } else {
         if (d->r.engine != PS5WK_DL_SERVICE || d->r.size <= 0 || isSetPartName(d->r.file))
             return;
         d->peeking = TRUE;
+        d->peekStarted = g_get_monotonic_time();
         withCookies(d, TRUE, FALSE);
     }
     changed(FALSE);
 }
 
-static const char* afterNoun(const char* after)
-{
-    return !g_strcmp0(after, "extract-install") ? "unpack and install the app"
-        : !g_strcmp0(after, "extract-image")    ? "unpack and make an exFAT image"
-        : !g_strcmp0(after, "extract")          ? "unpack it"
-                                                : "keep the file";
-}
-
-/* "peekend": what the archive holds. With "ask" off, an archive holding one
- * app gets what was chosen for the last one (never a first time). */
+/* "peekend": what the archive holds (the page shows it and suggests what
+ * to do; nothing is done without being asked). */
 static void peekEnded(Download* d, GHashTable* params)
 {
+    if (!d->peeking)
+        return; /* given up already (PEEK_GIVE_UP_S) */
     d->peeking = FALSE;
     const char* ok = g_hash_table_lookup(params, "ok");
     const char* json = g_hash_table_lookup(params, "json");
@@ -863,15 +857,6 @@ static void peekEnded(Download* d, GHashTable* params)
     } else {
         setString(&d->peekError, g_hash_table_lookup(params, "error"));
         spike_log("[dl] %u: couldn't look inside: %s", d->r.id, d->peekError ? d->peekError : "?");
-    }
-    gboolean oneApp = d->peek && strstr(d->peek, "\"titles\":1,") && strstr(d->peek, "\"refused\":null");
-    if (oneApp && !settings.ask && !d->r.after && d->r.jobState == PS5WK_JOB_NONE && settings.appAfter && strcmp(settings.appAfter, "none")
-        && (d->r.state == PS5WK_DL_RUNNING || d->r.state == PS5WK_DL_PAUSED || d->r.state == PS5WK_DL_DONE)) {
-        setString(&d->r.after, settings.appAfter);
-        spike_log("[dl] %u: holds an app: %s, as last time", d->r.id, settings.appAfter);
-        notice("%s holds an app: the browser will %s, as last time", d->r.file, afterNoun(settings.appAfter));
-        if (d->r.state == PS5WK_DL_DONE)
-            startAfter(d);
     }
     changed(FALSE);
 }
@@ -947,6 +932,15 @@ static void appendCookies(GString* text, GList* cookies)
     }
 }
 
+static const char* cookiesToSend(const Download* d, const char* cookies)
+{
+    if (cookies && strlen(cookies) > COOKIES_MAX_BYTES) {
+        spike_log("[dl] %u: %zu bytes of cookies: sent without them", d->r.id, strlen(cookies));
+        return NULL;
+    }
+    return cookies && *cookies ? cookies : NULL;
+}
+
 static void sendFetch(Download* d, const char* cookies, gboolean fresh)
 {
     if (d->r.state != PS5WK_DL_RUNNING || d->r.engine != PS5WK_DL_SERVICE)
@@ -955,7 +949,7 @@ static void sendFetch(Download* d, const char* cookies, gboolean fresh)
     snprintf(id, sizeof id, "%u", d->r.id);
     snprintf(conns, sizeof conns, "%u", settings.connections);
     ps5wk_dlservice_send("fetch", "id", id, "url", d->r.url, "ua", *userAgent ? userAgent : NULL, "ref", d->r.referer, "cookies",
-        cookies && *cookies ? cookies : NULL, "dir", folderOf(d), "name", d->r.file, "fresh", fresh ? "1" : "0", "conns", conns, NULL);
+        cookiesToSend(d, cookies), "dir", folderOf(d), "name", d->r.file, "fresh", fresh ? "1" : "0", "conns", conns, NULL);
     spike_log("[dl] %u: %s %s to %s/%s (%u connections)", d->r.id, fresh ? "asking" : "continuing", d->r.url, folderOf(d), d->r.file,
         settings.connections);
 }
@@ -966,7 +960,7 @@ static void sendPeek(Download* d, const char* cookies)
     snprintf(id, sizeof id, "%u", d->r.id);
     snprintf(size, sizeof size, "%" G_GINT64_FORMAT, d->r.size);
     ps5wk_dlservice_send("peek", "id", id, "url", d->r.url, "size", size, "ua", *userAgent ? userAgent : NULL, "ref", d->r.referer,
-        "cookies", cookies && *cookies ? cookies : NULL, NULL);
+        "cookies", cookiesToSend(d, cookies), NULL);
 }
 
 static void onCookies(GObject* source, GAsyncResult* result, gpointer data)
@@ -1148,7 +1142,7 @@ static void serviceProgress(Download* d, GHashTable* params)
 static const char* jobNoun(const char* job)
 {
     return !g_strcmp0(job, "extract") ? "Unpacking" : !g_strcmp0(job, "install") ? "Installing" : !g_strcmp0(job, "image") ? "Making the image"
-        : !g_strcmp0(job, "move") ? "Moving" : "Working";
+        : !g_strcmp0(job, "move") ? "Moving" : !g_strcmp0(job, "delete") ? "Deleting" : "Working";
 }
 
 static void jobEnded(Download* d, GHashTable* params)
@@ -1157,8 +1151,11 @@ static void jobEnded(Download* d, GHashTable* params)
     const char* error = g_hash_table_lookup(params, "error");
     const char* out = g_hash_table_lookup(params, "out");
     const char* titleID = g_hash_table_lookup(params, "title");
-    const char* name = g_hash_table_lookup(params, "name");
+    const char* name = g_hash_table_lookup(params, "titlename");
+    const char* installed = g_hash_table_lookup(params, "installed");
     gboolean success = ok && !strcmp(ok, "1");
+    /* refused: the app is installed and replacing it wasn't asked for */
+    setString(&d->replaceVersion, !success && installed && *installed ? installed : NULL);
     d->jobPhase[0] = 0;
     d->jobDone = d->jobTotal = 0;
     d->r.jobState = success ? PS5WK_JOB_DONE : PS5WK_JOB_FAILED;
@@ -1181,7 +1178,9 @@ static void jobEnded(Download* d, GHashTable* params)
     }
     spike_log("[dl] %u: %s %s%s%s", d->r.id, d->r.job ? d->r.job : "job", success ? "done" : "failed: ", success ? (out ? out : "") : "",
         success ? "" : d->r.jobError);
-    if (!success)
+    if (d->replaceVersion)
+        notice("%s\nReplace it from Downloads", d->r.jobError);
+    else if (!success)
         notice("%s %s failed\n%s", jobNoun(d->r.job), d->r.file ? d->r.file : "", d->r.jobError);
     else if (d->r.titleID && (!g_strcmp0(d->r.job, "install") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-install"))))
         notice("Installed %s\nIt's on the home screen", d->r.titleName ? d->r.titleName : d->r.titleID);
@@ -1225,10 +1224,14 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
     const char* error = g_hash_table_lookup(params, "error");
     setString(&t->error, success ? NULL : (error && *error ? error : "Failed"));
     setString(&t->out, g_hash_table_lookup(params, "out"));
-    setString(&t->titleName, g_hash_table_lookup(params, "name"));
+    setString(&t->titleName, g_hash_table_lookup(params, "titlename"));
+    const char* installed = g_hash_table_lookup(params, "installed");
+    setString(&t->replaceVersion, !success && installed && *installed ? installed : NULL);
     t->phase[0] = 0;
     char* base = g_path_get_basename(t->src);
-    if (!success)
+    if (t->replaceVersion)
+        notice("%s\nReplace it from Downloads", t->error);
+    else if (!success)
         notice("%s %s failed\n%s", jobNoun(t->kind), base, t->error);
     else if (t->titleName && (!strcmp(t->kind, "install") || !g_strcmp0(t->then, "install")))
         notice("Installed %s\nIt's on the home screen", t->titleName);
@@ -1247,6 +1250,7 @@ static void taskFree(gpointer data)
     g_free(t->error);
     g_free(t->out);
     g_free(t->titleName);
+    g_free(t->replaceVersion);
     g_free(t);
 }
 
@@ -1297,8 +1301,11 @@ static void onServiceEvent(const char* verb, GHashTable* params, gpointer user)
     Download* d = byParam(params);
     if (!d)
         return;
+    /* a download's name in its folder (the service may have made it
+     * unique): only from the download's own events */
     const char* name = g_hash_table_lookup(params, "name");
-    if (name && *name && !strchr(name, '/') && name[0] != '.')
+    if ((!strcmp(verb, "fetch") || !strcmp(verb, "fetchend")) && name && *name && !strchr(name, '/') && strcmp(name, ".")
+        && strcmp(name, ".."))
         setString(&d->r.file, name);
     if (!strcmp(verb, "fetch"))
         serviceProgress(d, params);
@@ -1318,7 +1325,7 @@ static void onServiceEvent(const char* verb, GHashTable* params, gpointer user)
 }
 
 /* A job on d's finished file. kind: "extract", "install", "image", "move". */
-static const char* startJob(Download* d, const char* kind, const char* then, const char* destination)
+static const char* startJob(Download* d, const char* kind, const char* then, const char* destination, gboolean replace)
 {
     if (d->r.state != PS5WK_DL_DONE || !d->r.file)
         return "not a finished download";
@@ -1360,11 +1367,13 @@ static const char* startJob(Download* d, const char* kind, const char* then, con
     setString(&d->r.job, kind);
     d->r.jobState = PS5WK_JOB_RUNNING;
     setString(&d->r.jobError, NULL);
+    setString(&d->replaceVersion, NULL);
     snprintf(d->jobPhase, sizeof d->jobPhase, "%s", kind);
     d->jobDone = d->jobTotal = 0;
     ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "delete",
-        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, NULL);
-    spike_log("[dl] %u: %s %s -> %s%s%s", d->r.id, kind, src, dest ? dest : "-", then ? " then " : "", then ? then : "");
+        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
+    spike_log("[dl] %u: %s %s -> %s%s%s%s", d->r.id, kind, src, dest ? dest : "-", then ? " then " : "", then ? then : "",
+        replace ? " (replacing)" : "");
     g_free(src);
     g_free(dest);
     g_free(image);
@@ -1378,18 +1387,18 @@ static void startAfter(Download* d)
 {
     if (d->r.moveTo && titleSees(d) && strcmp(d->r.moveTo, PS5WK_DOWNLOADS_DIR)) {
         char* dest = g_strdup_printf("%s/%s", d->r.moveTo, d->r.file);
-        startJob(d, "move", NULL, dest);
+        startJob(d, "move", NULL, dest, FALSE);
         g_free(dest);
         return;
     }
     if (!d->r.after)
         return;
     if (!strcmp(d->r.after, "extract"))
-        startJob(d, "extract", NULL, NULL);
+        startJob(d, "extract", NULL, NULL, FALSE);
     else if (!strcmp(d->r.after, "extract-install"))
-        startJob(d, "extract", "install", NULL);
+        startJob(d, "extract", "install", NULL, FALSE);
     else if (!strcmp(d->r.after, "extract-image"))
-        startJob(d, "extract", "image", NULL);
+        startJob(d, "extract", "image", NULL, FALSE);
 }
 
 /* ---------------------------------------------------------------- a transfer's signals (WebKit's) */
@@ -1800,6 +1809,13 @@ static gboolean tick(gpointer data)
         }
         if (d->download && d->speed > 0 && now - d->lastData > 2 * G_USEC_PER_SEC)
             d->speed = 0; /* nothing arriving: no speed, no ETA */
+        if (d->peeking && now - d->peekStarted > PEEK_GIVE_UP_S * G_USEC_PER_SEC) {
+            /* the service's own limit is 10 s on a server; a drive's big
+             * archive can take long, but not this long */
+            d->peeking = FALSE;
+            setString(&d->peekError, "Looking inside took too long");
+            changed(FALSE);
+        }
         any = any || d->r.state == PS5WK_DL_RUNNING;
     }
     if (any)
@@ -2099,6 +2115,8 @@ void ps5wk_downloads_square(unsigned index)
     if (!d)
         return;
     if (d->r.state == PS5WK_DL_RUNNING || d->r.state == PS5WK_DL_PAUSED || (d->r.state == PS5WK_DL_FAILED && d->r.received > 0)) {
+        /* waiting to retry: nothing runs on the service, its files are deleted here */
+        gboolean waiting = d->retryTimer != 0;
         if (d->retryTimer) {
             g_source_remove(d->retryTimer);
             d->retryTimer = 0;
@@ -2108,7 +2126,7 @@ void ps5wk_downloads_square(unsigned index)
         if (d->download) {
             d->cancelling = TRUE;
             webkit_download_cancel(d->download);
-        } else if (d->r.engine == PS5WK_DL_SERVICE && d->r.state == PS5WK_DL_RUNNING && !d->retryTimer) {
+        } else if (d->r.engine == PS5WK_DL_SERVICE && d->r.state == PS5WK_DL_RUNNING && !waiting) {
             char id[16];
             d->cancelling = TRUE;
             ps5wk_dlservice_send("cancel", "id", idText(d, id, sizeof id), NULL);
@@ -2230,7 +2248,6 @@ static void updateManagerSnapshot(void)
         settings.deleteArchives ? "true" : "false");
     jsonKey(out, "folder", settings.folder ? settings.folder : PS5WK_DOWNLOADS_DIR);
     jsonKey(out, "userFolder", PS5WK_DOWNLOADS_DIR);
-    jsonKey(out, "appAfter", settings.appAfter);
     g_string_append(out, ",\"favorites\":[");
     for (unsigned i = 0; settings.favorites && settings.favorites[i]; i++) {
         if (i)
@@ -2265,6 +2282,7 @@ static void updateManagerSnapshot(void)
         g_string_append_printf(out, ",\"peeking\":%s,\"peekedLocal\":%s,\"peek\":%s", d->peeking ? "true" : "false",
             d->peekedLocal ? "true" : "false", d->peek ? d->peek : "null");
         jsonKey(out, "peekError", d->peekError);
+        jsonKey(out, "replaceVersion", d->replaceVersion);
         g_string_append_c(out, '}');
     }
     g_string_append(out, "],\"tasks\":[");
@@ -2279,6 +2297,7 @@ static void updateManagerSnapshot(void)
         jsonKey(out, "error", t->error);
         jsonKey(out, "out", t->out);
         jsonKey(out, "titleName", t->titleName);
+        jsonKey(out, "replaceVersion", t->replaceVersion);
         g_string_append_c(out, '}');
     }
     g_string_append(out, "]}\n");
@@ -2303,7 +2322,7 @@ static gboolean folderAllowed(const char* dir)
     return !strstr(dir, "/../") && !g_str_has_suffix(dir, "/..") && !strstr(dir, "/./") && !strstr(dir, "//") && strlen(dir) < 900;
 }
 
-static const char* startTask(const char* kind, const char* then, const char* src)
+static const char* startTask(const char* kind, const char* then, const char* src, gboolean replace)
 {
     if (!folderAllowed(src))
         return "That file isn't in a place the browser can use";
@@ -2352,8 +2371,8 @@ static const char* startTask(const char* kind, const char* then, const char* src
     } else if (!strcmp(kind, "image"))
         dest = g_strdup("auto");
     ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "delete",
-        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, NULL);
-    spike_log("[dl] task %s: %s %s%s%s", id, kind, src, then ? " then " : "", then ? then : "");
+        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
+    spike_log("[dl] task %s: %s %s%s%s%s", id, kind, src, then ? " then " : "", then ? then : "", replace ? " (replacing)" : "");
     g_free(dest);
     g_free(image);
     changed(TRUE);
@@ -2385,14 +2404,6 @@ const char* ps5wk_downloads_manage(GHashTable* params)
         const char* del = textParam(params, "deleteArchives");
         if (del)
             settings.deleteArchives = !strcmp(del, "1") || !strcmp(del, "true");
-        /* "": forget it */
-        const char* appAfter = g_hash_table_lookup(params, "appAfter");
-        if (appAfter) {
-            if (*appAfter && strcmp(appAfter, "none") && strcmp(appAfter, "extract") && strcmp(appAfter, "extract-install")
-                && strcmp(appAfter, "extract-image"))
-                return "appAfter=none|extract|extract-install|extract-image or nothing";
-            setString(&settings.appAfter, appAfter);
-        }
         const char* folder = textParam(params, "folder");
         if (folder) {
             if (!folderAllowed(folder))
@@ -2425,15 +2436,19 @@ const char* ps5wk_downloads_manage(GHashTable* params)
     if (!strcmp(action, "task")) {
         const char* kind = textParam(params, "kind");
         const char* path = textParam(params, "path");
+        const char* replaceText = textParam(params, "replace");
+        gboolean replace = replaceText && !strcmp(replaceText, "1");
         if (!kind || !path)
             return "kind and path";
-        if (!strcmp(kind, "extract") || !strcmp(kind, "install") || !strcmp(kind, "image"))
-            return startTask(kind, NULL, path);
+        if (!strcmp(kind, "extract") || !strcmp(kind, "image") || !strcmp(kind, "delete"))
+            return startTask(kind, NULL, path, FALSE);
+        if (!strcmp(kind, "install"))
+            return startTask(kind, NULL, path, replace);
         if (!strcmp(kind, "extract-install"))
-            return startTask("extract", "install", path);
+            return startTask("extract", "install", path, replace);
         if (!strcmp(kind, "extract-image"))
-            return startTask("extract", "image", path);
-        return "kind=extract|extract-install|extract-image|install|image";
+            return startTask("extract", "image", path, FALSE);
+        return "kind=extract|extract-install|extract-image|install|image|delete";
     }
     if (!strcmp(action, "taskstop") || !strcmp(action, "taskremove")) {
         const char* id = textParam(params, "id");
@@ -2461,14 +2476,10 @@ const char* ps5wk_downloads_manage(GHashTable* params)
         setString(&d->r.dir, strcmp(dir, PS5WK_DOWNLOADS_DIR) ? dir : NULL);
         setString(&d->r.after, after && strcmp(after, "none") ? after : NULL);
         const char* remember = textParam(params, "remember");
-        if (remember && !strcmp(remember, "1"))
+        if (remember && !strcmp(remember, "1")) {
             setString(&settings.folder, strcmp(dir, PS5WK_DOWNLOADS_DIR) ? dir : NULL);
-        /* chosen for an archive holding one app: suggested for the next */
-        const char* app = textParam(params, "app");
-        if (app && !strcmp(app, "1"))
-            setString(&settings.appAfter, after ? after : "none");
-        if ((remember && !strcmp(remember, "1")) || (app && !strcmp(app, "1")))
             saveSettings();
+        }
         spike_log("[dl] %u: save to %s%s%s", d->r.id, folderOf(d), d->r.after ? ", then " : "", d->r.after ? d->r.after : "");
         notice("Download started: %s", d->r.file);
         serviceStart(d, TRUE);
@@ -2510,12 +2521,15 @@ const char* ps5wk_downloads_manage(GHashTable* params)
         changed(TRUE);
         return NULL;
     }
+    /* replace=1: the user agreed to replace the installed app */
+    const char* replaceText = textParam(params, "replace");
+    gboolean replace = replaceText && !strcmp(replaceText, "1");
     if (!strcmp(action, "extract"))
-        return startJob(d, "extract", NULL, NULL);
+        return startJob(d, "extract", NULL, NULL, FALSE);
     if (!strcmp(action, "extract-install"))
-        return startJob(d, "extract", "install", NULL);
+        return startJob(d, "extract", "install", NULL, replace);
     if (!strcmp(action, "extract-image"))
-        return startJob(d, "extract", "image", NULL);
+        return startJob(d, "extract", "image", NULL, FALSE);
     if (!strcmp(action, "jobstop")) {
         if (d->r.jobState != PS5WK_JOB_RUNNING)
             return "no job is running";

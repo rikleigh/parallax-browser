@@ -266,6 +266,17 @@ for c in none expired; do
     fi
 done
 
+# a server whose answer claims an absurd size (2^62 bytes): refused at
+# once, not cut into chunks (that took the engine's lock for good)
+f="$work/huge.bin"
+t0=$(date +%s)
+r=$(drive --conns 4 "$base/file/8388608/huge.bin?fakesize=4611686018427387904" "$f")
+if [ "$(field state "$r")" = failed ] && [[ "$(field error "$r")" == *"impossible size"* ]] && [ $(($(date +%s) - t0)) -lt 10 ] && [ ! -e "$f.part" ]; then
+    pass "an impossible size: refused ($(field error "$r"))"
+else
+    failed "an impossible size: $r"
+fi
+
 # 12. cancel
 f="$work/cancel.bin"
 r=$(drive --conns 4 --chunk $mib --cancel-at 4000000 "$base/file/33554432/cancel.bin?rate=1024" "$f")
@@ -285,12 +296,12 @@ fi
 
 # 13. not enough free space: fails before writing anything
 f="$work/huge.bin"
-r=$(drive --conns 4 "$base/file/1125899906842624/huge.bin" "$f")
+r=$(drive --conns 4 "$base/file/8796093022208/huge.bin" "$f")
 if [ "$(field state "$r")" = failed ] && [ "$(field retryable "$r")" = 0 ] && [[ "$r" == *"free space"* ]] && [ ! -e "$f.part" ] \
-    && [ ! -e "$f.part.ps5dl" ] && [ "$(field total "$r")" = 1125899906842624 ]; then
-    pass "1 PiB: refused before writing ($(field error "$r"))"
+    && [ ! -e "$f.part.ps5dl" ] && [ "$(field total "$r")" = 8796093022208 ]; then
+    pass "8 TiB: refused before writing ($(field error "$r"))"
 else
-    failed "1 PiB: $r"
+    failed "8 TiB: $r"
 fi
 
 # 14. past 4 GiB: a resume at 5 GiB of a 6 GiB file (a sparse .part)

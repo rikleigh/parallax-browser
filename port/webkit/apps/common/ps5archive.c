@@ -69,8 +69,12 @@ static const char* shown(const char* name, char* out, size_t size)
         memcpy(out, name, length + 1);
         return out;
     }
-    /* "...the end of it": the file name is the useful part */
-    snprintf(out, size, "...%s", name + length - (size - 4));
+    /* "...the end of it": the file name is the useful part; started on a
+     * character's first byte (not a UTF-8 continuation byte) */
+    const char* tail = name + length - (size - 4);
+    while (*tail && ((unsigned char)*tail & 0xC0) == 0x80)
+        tail++;
+    snprintf(out, size, "...%s", tail);
     return out;
 }
 
@@ -1185,7 +1189,7 @@ static int zipDirectory(const PS5ArchiveSource* src, unsigned char** dir, uint64
         }
         uint64_t recordAt = (uint64_t)zip32(end - 20 + 8) | (uint64_t)zip32(end - 20 + 12) << 32;
         unsigned char record[56];
-        if (recordAt + sizeof record > src->size) {
+        if (recordAt > src->size || src->size - recordAt < sizeof record) {
             free(tail);
             return 1;
         }
@@ -1203,7 +1207,7 @@ static int zipDirectory(const PS5ArchiveSource* src, unsigned char** dir, uint64
         offset = (uint64_t)zip32(record + 48) | (uint64_t)zip32(record + 52) << 32;
     }
     free(tail);
-    if (offset + size > src->size || size > ZIP_DIR_MAX || (entries && size < 46 * entries))
+    if (offset > src->size || size > src->size - offset || size > ZIP_DIR_MAX || entries > size / 46)
         return 1;
     *dir = malloc(size ? size : 1);
     if (!*dir) {
@@ -1374,15 +1378,15 @@ static int zipReadEntry(const PS5ArchiveSource* src, const char* name, char* buf
     if (e.method != 0 && e.method != 8)
         return 1;
     unsigned char header[30];
-    if (e.local + sizeof header > src->size)
+    if (e.local > src->size || src->size - e.local < sizeof header)
         return 1;
     r = sourceReadAll(src, e.local, header, sizeof header, error, errorSize);
     if (r)
         return r;
     if (memcmp(header, "PK\3\4", 4))
         return 1;
-    uint64_t dataAt = e.local + 30 + zip16(header + 26) + zip16(header + 28);
-    if (dataAt + e.compressed > src->size)
+    uint64_t dataAt = e.local + 30 + zip16(header + 26) + zip16(header + 28); /* local <= size - 30: no wrap */
+    if (dataAt > src->size || e.compressed > src->size - dataAt)
         return 1;
     unsigned char* data = malloc(e.compressed ? e.compressed : 1);
     if (!data) {

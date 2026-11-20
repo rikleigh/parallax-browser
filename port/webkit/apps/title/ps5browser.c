@@ -2339,11 +2339,18 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
         settingsServe(client, from, trusted, get, post, path, query, body, type, pinOK);
     } else if (dlmPath) {
         /* The download manager (dlm.c): the page itself needs no PIN (its
-         * script asks for one), its data and actions do, as Settings'. */
+         * script asks for one); its data and actions (which delete, move and
+         * install files on every drive) need the PIN from another device,
+         * so without a PIN set up only the TV's own page can use them, as
+         * the cookie import (unlike Settings, which is open without one). */
         int code = 200;
         const char* replyType = "application/json";
         char* reply = NULL;
-        if (!pinOK && !trusted && !(get && !strcmp(path, "/dlm")))
+        gboolean page = get && !strcmp(path, "/dlm");
+        if (!trusted && !page && !pushPIN)
+            settingsReplyJSON(client, 403, FALSE,
+                "The download manager needs a PIN from another device: put one in /data/ps5webkit/push-pin.txt");
+        else if (!trusted && !page && !pinOK)
             settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
         else if (windDownStart && post)
             settingsReplyJSON(client, 503, FALSE, "the browser is closing");

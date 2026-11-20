@@ -142,14 +142,41 @@ static void dropConnection(guint startedAs, const char* why)
     }
 }
 
+/* "k=v&k2=v2", percent-encoded: a table of new strings. Unlike
+ * g_uri_parse_params, a value that isn't valid UTF-8 once decoded is
+ * repaired (U+FFFD) instead of failing the whole line. */
+static GHashTable* parseParams(const char* text)
+{
+    GHashTable* table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    char** pairs = g_strsplit(text ? text : "", "&", -1);
+    for (char** pair = pairs; *pair; pair++) {
+        if (!**pair)
+            continue;
+        char* equals = strchr(*pair, '=');
+        char* key = g_uri_unescape_segment(*pair, equals ? equals : NULL, NULL);
+        char* value = equals ? g_uri_unescape_string(equals + 1, NULL) : g_strdup("");
+        if (key && value) {
+            if (!g_utf8_validate(value, -1, NULL)) {
+                char* valid = g_utf8_make_valid(value, -1);
+                g_free(value);
+                value = valid;
+            }
+            g_hash_table_replace(table, key, value);
+        } else {
+            g_free(key);
+            g_free(value);
+        }
+    }
+    g_strfreev(pairs);
+    return table;
+}
+
 static void handleLine(char* text)
 {
     char* space = strchr(text, ' ');
     if (space)
         *space = 0;
-    GHashTable* params = g_uri_parse_params(space ? space + 1 : "", -1, "&", G_URI_PARAMS_NONE, NULL);
-    if (!params)
-        params = g_hash_table_new(g_str_hash, g_str_equal);
+    GHashTable* params = parseParams(space ? space + 1 : "");
     if (!strcmp(text, "rep")) {
         const char* n = g_hash_table_lookup(params, "n");
         unsigned number = n ? (unsigned)atoi(n) : 0;

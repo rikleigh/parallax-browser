@@ -8,7 +8,8 @@
  *   GET  /dlm            the page
  *   GET  /dlm.json       the state (downloads.c's snapshot)
  *   GET  /dlm/fs?op=roots | op=ls&path=   the drives, a folder (the service)
- *   POST /dlm  do=mkdir&path&name | do=rmpath&path | do=rename&path&name
+ *   POST /dlm  do=mkdir&path&name | do=rename&path&name | do=rmpath&path (a
+ *              delete job: the same as do=task&kind=delete)
  *              (the service), anything else downloads.c's actions
  *
  * Route threads. downloads.c's actions run on the main loop (this thread
@@ -71,7 +72,7 @@ static GHashTable* formParams(const char* text)
     }
     GHashTable* params = g_uri_parse_params(copy, -1, "&", G_URI_PARAMS_NONE, NULL);
     g_free(copy);
-    return params ? params : g_hash_table_new(g_str_hash, g_str_equal);
+    return params ? params : g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 }
 
 static const char* value(GHashTable* params, const char* key)
@@ -125,10 +126,17 @@ gboolean ps5wk_dlm_serve(const char* method, const char* path, const char* query
     if (!strcmp(path, "/dlm") && post) {
         GHashTable* params = formParams(body && *body ? body : query);
         const char* action = value(params, "do");
-        if (action && (!strcmp(action, "mkdir") || !strcmp(action, "rmpath") || !strcmp(action, "rename"))) {
+        if (action && !strcmp(action, "rmpath")) {
+            /* a delete job (a task), not a request: a big folder would hold
+             * the link server for its whole length */
+            g_hash_table_replace(params, g_strdup("do"), g_strdup("task"));
+            g_hash_table_replace(params, g_strdup("kind"), g_strdup("delete"));
+            action = value(params, "do");
+        }
+        if (action && (!strcmp(action, "mkdir") || !strcmp(action, "rename"))) {
             char* error = NULL;
-            const char* op = !strcmp(action, "rmpath") ? "delete" : action;
-            char* json = ps5wk_dlservice_request(60000, &error, op, "path", value(params, "path"), "name", value(params, "name"), NULL);
+            const char* op = action;
+            char* json = ps5wk_dlservice_request(15000, &error, op, "path", value(params, "path"), "name", value(params, "name"), NULL);
             spike_log("[dl] page: %s %s%s%s: %s", op, value(params, "path") ? value(params, "path") : "", value(params, "name") ? " " : "",
                 value(params, "name") ? value(params, "name") : "", json ? "ok" : (error ? error : "?"));
             *reply = serviceReply(json, error);
@@ -219,7 +227,7 @@ const char ps5wk_dlm_page_html[] =
     "<nav id=\"tabs\"></nav>\n"
     "<section id=\"view\"></section>\n"
     "</main><script>\n"
-    "var S=null,pin='',tv=document.documentElement.className=='tv',tab='list',ask={},peekAsked={},armed='',fs={path:null,data:null,roots:null,error:'',pick:null,newName:null,rename:null};\n"
+    "var S=null,pin='',tv=document.documentElement.className=='tv',tab='list',ask={},peekAsked={},deletesSeen=null,armed='',fs={path:null,data:null,roots:null,error:'',pick:null,newName:null,rename:null};\n"
     "try{pin=sessionStorage.getItem('ps5pin')||''}catch(e){}\n"
     "var q=new URLSearchParams(location.search);if(q.get('pin'))pin=q.get('pin');if(q.get('tab'))tab=q.get('tab');\n"
     "function $(id){return document.getElementById(id)}\n"
@@ -247,11 +255,16 @@ const char ps5wk_dlm_page_html[] =
     "    if(p.installed)h+='<br>'+(p.version&&p.installed==p.version?'This version is already installed':'Version '+esc(p.installed)+' is installed')}\n"
     "  else if(p.titles>1)h+=p.titles+' apps';\n"
     "  return h}\n"
+    "function peekText(p){if(!p)return'';var t='';\n"
+    "  if(p.titleId){t=(p.name||p.titleId)+' \\u00b7 '+p.titleId+(p.version?' \\u00b7 version '+p.version:'');if(p.installed)t+=' \\u00b7 '+(p.version&&p.installed==p.version?'this version is installed':'version '+p.installed+' is installed')}\n"
+    "  else if(p.titles>1)t=p.titles+' apps';else t=p.format+' \\u00b7 '+p.entries+' file'+(p.entries==1?'':'s');\n"
+    "  if(p.refused)t+=' \\u00b7 can\\u2019t be unpacked: '+p.refused;return t}\n"
     "function peekFacts(p){return esc(p.format)+' \\u00b7 '+p.entries+' file'+(p.entries==1?'':'s')+(p.sizesKnown?' \\u00b7 '+size(p.unpacked)+' unpacked':'')}\n"
     "function suggestion(p){if(!p)return null;if(p.refused)return{after:'none',why:'it can\\u2019t be unpacked ('+p.refused.replace(/\\.$/,'')+')'};\n"
-    "  if(p.titles==1){var a=S.settings.appAfter;return{after:a||'extract-install',why:a?'it holds an app, and you chose this last time':'it holds an app'}}\n"
+    "  if(p.titles==1)return{after:'extract-install',why:'it holds an app'};\n"
     "  if(p.titles>1)return{after:'extract',why:'it holds '+p.titles+' apps: unpack it, then install each one from Files'};\n"
     "  return{after:'extract',why:'it holds files, not an app'}}\n"
+    "function replaceNote(p){return p&&p.installed&&p.titleId?'Version '+(p.installed=='?'?'(not known)':p.installed)+' of '+(p.name||p.titleId)+' is installed: you\\u2019ll be asked before it\\u2019s replaced.':''}\n"
     "/* ---- the downloads waiting for a folder ---- */\n"
     "function askCard(d){var a=ask[d.id]||(ask[d.id]={dir:S.settings.folder,after:'none',touched:false,remember:false});var arch=d.archive,p=d.peek,sg=suggestion(p);\n"
     "  if(sg&&!a.touched)a.after=sg.after;\n"
@@ -263,9 +276,10 @@ const char ps5wk_dlm_page_html[] =
     "  b.push(btn('ask'+d.id+'-browse','Choose another folder\\u2026',function(){fs.pick={id:d.id};tab='files';fs.path=fs.path||null;openFolder(fs.path)}));h+=buttons(b);\n"
     "  if(arch){h+='<p class=\"help\">When it\\u2019s done:'+(sg?' <b>'+esc(afterNames[sg.after])+'</b> is suggested: '+esc(sg.why)+'.':'')+'</p>';\n"
     "    var o=p&&p.refused?['none']:['none','extract','extract-install','extract-image'];\n"
-    "    h+=buttons(o.map(function(x){return btn('ask'+d.id+'-a-'+x,afterNames[x],function(){a.after=x;a.touched=true;render()},a.after==x?'on':'')}))}\n"
+    "    h+=buttons(o.map(function(x){return btn('ask'+d.id+'-a-'+x,afterNames[x],function(){a.after=x;a.touched=true;render()},a.after==x?'on':'')}));\n"
+    "    if(a.after=='extract-install'&&replaceNote(p))h+='<p class=\"help warn\">'+esc(replaceNote(p))+'</p>'}\n"
     "  h+=buttons([btn('ask'+d.id+'-rem',(a.remember?'\\u2611':'\\u2610')+' Always save here',function(){a.remember=!a.remember;render()}),\n"
-    "    btn('ask'+d.id+'-go','Download',function(){post({do:'save',id:d.id,dir:a.dir,after:arch?a.after:'none',remember:a.remember?1:0,app:p&&p.titles==1&&!p.refused?1:0});delete ask[d.id]},'primary'),\n"
+    "    btn('ask'+d.id+'-go','Download',function(){post({do:'save',id:d.id,dir:a.dir,after:arch?a.after:'none',remember:a.remember?1:0});delete ask[d.id]},'primary'),\n"
     "    btn('ask'+d.id+'-no','Don\\u2019t download',function(){post({do:'remove',id:d.id})})]);\n"
     "  return h+'</div>'}\n"
     "/* ---- the list ---- */\n"
@@ -280,21 +294,25 @@ const char ps5wk_dlm_page_html[] =
     "    if(d.jobState==1){var jp=d.jobTotal>0?Math.min(100,d.jobDone*100/d.jobTotal):-1;st={extract:'Unpacking',install:'Installing',image:'Making image',move:'Moving'}[d.jobPhase||d.job]||'Working';st+=jp>=0?' '+Math.floor(jp)+'%':'\\u2026';cls='';pc=jp;\n"
     "      b.push(btn(k+'-jstop','Stop',function(){post({do:'jobstop',id:d.id})}))}\n"
     "    else{if(d.jobState==2&&d.titleId){st='Installed';detail='\\u201c'+(d.titleName||d.titleId)+'\\u201d is on the home screen'}else if(d.jobState==2&&d.jobOut){detail+=' \\u00b7 made '+short(d.jobOut)}\n"
-    "      if(d.jobState==3){cls='warn';detail={extract:'Unpacking',install:'Installing',image:'Making the image',move:'Moving'}[d.job]+' failed: '+(d.jobError||'')}\n"
+    "      if(d.jobState==3&&d.replaceVersion){st='Installed already';cls='warn';detail=d.jobError||''}\n"
+    "      else if(d.jobState==3){cls='warn';detail={extract:'Unpacking',install:'Installing',image:'Making the image',move:'Moving'}[d.job]+' failed: '+(d.jobError||'')}\n"
     "      if(d.archive){var p=d.peek,sg=d.jobState==2?null:suggestion(p);\n"
     "        if(!p&&!d.peeking&&!d.peekedLocal&&!peekAsked[d.id]){peekAsked[d.id]=1;post({do:'peek',id:d.id})}\n"
-    "        if(d.peeking)detail+=' \\u00b7 looking inside\\u2026';else if(p&&d.jobState!=2){var pl=peekLine(p).replace(/<br>/g,' \\u00b7 ').replace(/<[^>]*>/g,'');detail+=' \\u00b7 '+(pl?pl:peekFacts(p).replace(/<[^>]*>/g,''))+(p.refused?' \\u00b7 can\\u2019t be unpacked: '+p.refused:'')}\n"
+    "        if(d.replaceVersion)b.push(btn(k+'-replace','Replace '+(d.replaceVersion=='?'?'the installed app':'version '+d.replaceVersion),confirmFirst(k+'-replace',function(){post({do:'extract-install',id:d.id,replace:1})}),'primary'));\n"
+    "        if(d.peeking)detail+=' \\u00b7 looking inside\\u2026';else if(p&&d.jobState!=2&&!d.replaceVersion)detail+=' \\u00b7 '+peekText(p);\n"
     "        if(!(p&&p.refused)){var acts=['extract','extract-install','extract-image'];if(sg&&acts.indexOf(sg.after)>0){acts.splice(acts.indexOf(sg.after),1);acts.unshift(sg.after)}\n"
-    "          acts.forEach(function(x){b.push(btn(k+'-'+x,afterNames[x]+(sg&&sg.after==x&&d.jobState!=2?' (suggested)':''),function(){post({do:x,id:d.id})},sg&&sg.after==x&&d.jobState!=2?'primary':''))})}}\n"
+    "          acts.forEach(function(x){var on=sg&&sg.after==x&&d.jobState!=2&&!d.replaceVersion;b.push(btn(k+'-'+x,afterNames[x]+(on?' (suggested)':''),function(){post({do:x,id:d.id})},on?'primary':''))})}}\n"
     "      b.push(btn(k+'-show','Show in Files',function(){tab='files';openFolder(d.dir)}));b.push(btn(k+'-forget','Remove from list',function(){post({do:'forget',id:d.id})}));\n"
     "      b.push(btn(k+'-del','Delete file',confirmFirst(k+'-del',function(){post({do:'delete',id:d.id})})))}}\n"
     "  var h='<div class=\"card\"><div class=\"row\"><div class=\"grow\"><div class=\"name\">'+esc(d.file||d.url)+'</div><div class=\"sub\">'+esc(short(d.dir))+' \\u00b7 '+esc(d.host)+'</div></div><div class=\"state '+cls+'\">'+esc(st)+'</div></div>';\n"
     "  if(pc>=0)h+='<div class=\"bar\"><div style=\"width:'+pc.toFixed(1)+'%\"></div></div>';\n"
     "  if(d.state!='done'&&d.after)detail+=(detail?' \\u00b7 ':'')+'then '+afterLabel(d.after);\n"
     "  return h+'<div class=\"sub '+(cls=='warn'?'warn':'')+'\">'+esc(detail)+'</div>'+buttons(b)+'</div>'}\n"
-    "function taskCard(t){var k=t.id,base=t.src.split('/').pop(),st='',cls='',detail='',b=[];var what={extract:t.then=='install'?'Unpack & install':t.then=='image'?'Unpack & make image':'Unpack',install:'Install',image:'Make exFAT image'}[t.kind];\n"
-    "  if(t.state==1){var p=t.total>0?Math.min(100,t.done*100/t.total):-1;st=(p>=0?Math.floor(p)+'%':'Working\\u2026');detail=what;b.push(btn(k+'-stop','Stop',function(){post({do:'taskstop',id:t.id})}))}\n"
-    "  else{st=t.state==2?'Done':'Failed';cls=t.state==2?'ok':'warn';detail=t.state==2?(t.titleName?'\\u201c'+t.titleName+'\\u201d is on the home screen':'Made '+short(t.out||'')):(t.error||'');b.push(btn(k+'-rm','Clear',function(){post({do:'taskremove',id:t.id})}))}\n"
+    "function taskCard(t){var k=t.id,base=t.src.split('/').pop(),st='',cls='',detail='',b=[];var what={extract:t.then=='install'?'Unpack & install':t.then=='image'?'Unpack & make image':'Unpack',install:'Install',image:'Make exFAT image','delete':'Delete'}[t.kind];\n"
+    "  if(t.state==1){var p=t.total>0?Math.min(100,t.done*100/t.total):-1;st=(p>=0?Math.floor(p)+'%':'Working\\u2026');detail=what;if(t.kind!='delete')b.push(btn(k+'-stop','Stop',function(){post({do:'taskstop',id:t.id})}))}\n"
+    "  else{st=t.state==2?'Done':t.replaceVersion?'Installed already':'Failed';cls=t.state==2?'ok':'warn';detail=t.state==2?(t.titleName?'\\u201c'+t.titleName+'\\u201d is on the home screen':t.kind=='delete'?'Deleted':'Made '+short(t.out||'')):(t.error||'');\n"
+    "    if(t.replaceVersion)b.push(btn(k+'-replace','Replace '+(t.replaceVersion=='?'?'the installed app':'version '+t.replaceVersion),confirmFirst(k+'-replace',function(){post({do:'task',kind:t.kind=='install'?'install':'extract-install',path:t.src,replace:1})}),'primary'));\n"
+    "    b.push(btn(k+'-rm','Clear',function(){post({do:'taskremove',id:t.id})}))}\n"
     "  var h='<div class=\"card\"><div class=\"row\"><div class=\"grow\"><div class=\"name\">'+esc(what+': '+base)+'</div><div class=\"sub\">'+esc(short(t.src))+'</div></div><div class=\"state '+cls+'\">'+esc(st)+'</div></div>';\n"
     "  if(t.state==1&&t.total>0)h+='<div class=\"bar\"><div style=\"width:'+(t.done*100/t.total).toFixed(1)+'%\"></div></div>';\n"
     "  return h+'<div class=\"sub '+cls+'\">'+esc(detail)+'</div>'+buttons(b)+'</div>'}\n"
@@ -320,7 +338,7 @@ const char ps5wk_dlm_page_html[] =
     "  (fs.data?fs.data.entries:[]).forEach(function(e,i){var p=fs.path+'/'+e.name,k='e'+i+'-'+e.name.length,b=[];\n"
     "    if(e.dir){b.push(btn(k+'-open','Open',function(){openFolder(p)},'primary'));if(e.app)b.push(btn(k+'-inst','Install app',function(){post({do:'task',kind:'install',path:p})}));b.push(btn(k+'-img','Make exFAT image',function(){post({do:'task',kind:'image',path:p})}))}\n"
     "    else if(e.archive){b.push(btn(k+'-x','Unpack',function(){post({do:'task',kind:'extract',path:p})}));b.push(btn(k+'-xi','Unpack & install app',function(){post({do:'task',kind:'extract-install',path:p})}));b.push(btn(k+'-xm','Unpack & make image',function(){post({do:'task',kind:'extract-image',path:p})}))}\n"
-    "    {b.push(btn(k+'-ren','Rename',function(){fs.rename={path:p,name:e.name};render();setTimeout(function(){var x=$('rename');if(x)x.focus()},0)}));b.push(btn(k+'-del','Delete',confirmFirst(k+'-del',function(){post({do:'rmpath',path:p}).then(function(){openFolder(fs.path)})})))}\n"
+    "    {b.push(btn(k+'-ren','Rename',function(){fs.rename={path:p,name:e.name};render();setTimeout(function(){var x=$('rename');if(x)x.focus()},0)}));b.push(btn(k+'-del','Delete',confirmFirst(k+'-del',function(){post({do:'task',kind:'delete',path:p})})))}\n"
     "    h+='<div class=\"entry\"><span class=\"tag\">'+(e.dir?(e.app?'APP':'DIR'):esc((e.name.split('.').pop()||'').slice(0,4).toUpperCase()))+'</span><div class=\"grow\"><div class=\"name\">'+esc(e.name)+'</div><div class=\"sub\">'+(e.dir?(e.app?'App folder':'Folder'):size(e.size))+' \\u00b7 '+new Date(e.mtime*1000).toLocaleString()+'</div></div>';\n"
     "    if(fs.rename&&fs.rename.path==p)h+='<div class=\"seg\"><input id=\"rename\" data-k=\"rename\" value=\"'+esc(fs.rename.name)+'\" oninput=\"fs.rename.name=this.value\">'+bare([btn(k+'-rok','Rename',function(){post({do:'rename',path:p,name:fs.rename.name}).then(function(){openFolder(fs.path)})},'primary'),btn(k+'-rno','Cancel',function(){fs.rename=null;render()})])+'</div>';\n"
     "    h+=buttons(b)+'</div>'});\n"
@@ -330,8 +348,6 @@ const char ps5wk_dlm_page_html[] =
     "  h+=buttons([1,2,4,8,12,16].map(function(n){return btn('c'+n,String(n),function(){post({do:'settings',connections:n})},s.connections==n?'on':'')}))+'</div>';\n"
     "  h+='<div class=\"card\"><div class=\"name\">Ask where to save each download</div><p class=\"help\">Off: downloads go straight to '+esc(short(s.folder))+'.</p>'+buttons([btn('ask1','Ask',function(){post({do:'settings',ask:1})},s.ask?'on':''),btn('ask0','Don\\u2019t ask',function(){post({do:'settings',ask:0})},s.ask?'':'on')])+'</div>';\n"
     "  h+='<div class=\"card\"><div class=\"name\">Default folder</div><p class=\"help\">'+esc(s.folder)+'</p>'+buttons([btn('dfu','Use this user\\u2019s Downloads',function(){post({do:'settings',folder:s.userFolder})},s.folder==s.userFolder?'on':''),btn('dfb','Choose in Files\\u2026',function(){tab='files';openFolder(null)})])+'</div>';\n"
-    "  h+='<div class=\"card\"><div class=\"name\">Archives that hold an app</div><p class=\"help\">'+(s.appAfter?'Suggested: <b>'+esc(afterNames[s.appAfter])+'</b> (what you chose last).'+(s.ask?'':' With \\u201cDon\\u2019t ask\\u201d it is done without asking.'):'Nothing chosen yet: <b>Unpack &amp; install app</b> is suggested, and nothing is done without asking.')+'</p>'\n"
-    "    +buttons(['extract-install','extract-image','extract','none'].map(function(x){return btn('aa-'+x,afterNames[x],function(){post({do:'settings',appAfter:x})},s.appAfter==x?'on':'')}).concat(s.appAfter?[btn('aa-clear','Forget the choice',function(){post({do:'settings',appAfter:''})})]:[]))+'</div>';\n"
     "  h+='<div class=\"card\"><div class=\"name\">After unpacking</div>'+buttons([btn('del0','Keep the archive',function(){post({do:'settings',deleteArchives:0})},s.deleteArchives?'':'on'),btn('del1','Delete the archive (all its parts)',function(){post({do:'settings',deleteArchives:1})},s.deleteArchives?'on':'')])+'</div>';\n"
     "  h+='<p class=\"help\">Unpacks ZIP, 7z (not BCJ2) and RAR (RAR4 and RAR5, also split and multipart sets; keep all parts in one folder). Archives with passwords aren\\u2019t supported. Installing an app needs etaHEN; exFAT images go to the drive\\u2019s homebrew folder as TITLEID.exfat for ShadowMountPlus.</p>';\n"
     "  return h}\n"
@@ -347,6 +363,7 @@ const char ps5wk_dlm_page_html[] =
     "  document.querySelectorAll('button[data-k]').forEach(function(b){var k=b.getAttribute('data-k');if(handlers[k])b.onclick=function(ev){if(armed&&armed!=k)armed='';handlers[k](ev)}});\n"
     "  var t=f&&document.querySelector('[data-k=\"'+f.replace(/\"/g,'')+'\"]');if(t)t.focus();else if(tv&&!document.activeElement.getAttribute('data-k')){var first=document.querySelector('#asking button,#view button');if(first)first.focus()}}\n"
     "var loaded=false;function load(){getj('/dlm.json').then(function(j){$('pinbox').hidden=true;if(j.ok===false){say(j.error);return}S=j;\n"
+    "  var dz=(j.tasks||[]).filter(function(t){return t.kind=='delete'&&t.state!=1}).map(function(t){return t.id}).join();if(deletesSeen!==null&&dz!=deletesSeen&&tab=='files'&&fs.path)openFolder(fs.path);deletesSeen=dz;\n"
     "  if(!loaded){loaded=true;if(tab=='files'&&!fs.roots&&!fs.path){openFolder(q.get('path'));return}}render()}).catch(function(){})}\n"
     "function closePage(){if(!tv){history.back();return}fetch('/browser/page',{method:'POST',headers:hdr(true),body:'action=close'}).then(function(r){return r.json()}).then(function(j){if(j.ok===false)history.back()},function(){history.back()})}\n"
     "$('back').hidden=!tv;$('back').onclick=closePage;\n"

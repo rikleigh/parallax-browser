@@ -29,8 +29,10 @@
  *     fetch    id url orig ua ref cookies path conns chunk
  *     stop     id                      (pause: .part and .ps5dl stay)
  *     cancel   id                      (.part and .ps5dl deleted)
- *     job      id kind=extract|install|image|move src dest [delete=1]
- *              [then=install|image] [image=<path>]
+ *     job      id kind=extract|install|image|move|delete src dest [delete=1]
+ *              [then=install|image] [image=<path>] [replace=1]
+ *              (an install that would replace an installed app is refused
+ *              without replace=1: jobend says installed=<version>)
  *     jobstop  id
  *     rm       path                    (a file or .part, and its .part.ps5dl)
  *     req      n op=roots|ls|mkdir|delete|rename|unique|saved path [to] [name]
@@ -43,7 +45,7 @@
  *              (every PROGRESS_MS while it runs)
  *     fetchend id state recv total error retryable restarted status final etag lm type
  *     job      id phase done total current
- *     jobend   id ok error out [title name version]
+ *     jobend   id ok error out [title titlename version] [installed]
  *     rep      n ok json | error
  *     peekend  id ok json | error
  *              json: {format, entries, unpacked, sizesKnown, titles,
@@ -88,7 +90,7 @@ int ps5wk_dl_job(const char* jobPath);
 
 #define PROGRESS_MS 500
 #define JOB_PROGRESS_MS 250
-#define LINE_MAX_BYTES (256 * 1024)
+#define LINE_MAX_BYTES (8 * 1024 * 1024) /* longer lines are dropped (logged) */
 #define JOBS_AT_ONCE 2
 
 static char* token;
@@ -103,8 +105,17 @@ static void appendParam(GString* line, const char* key, const char* value)
         g_string_append_c(line, '&');
     g_string_append(line, key);
     g_string_append_c(line, '=');
-    if (value)
+    if (!value)
+        return;
+    /* names from archives and servers may not be UTF-8: the title's parser
+     * would drop the whole line */
+    if (g_utf8_validate(value, -1, NULL))
         g_string_append_uri_escaped(line, value, NULL, FALSE);
+    else {
+        char* valid = g_utf8_make_valid(value, -1);
+        g_string_append_uri_escaped(line, valid, NULL, FALSE);
+        g_free(valid);
+    }
 }
 
 static void appendNumber(GString* line, const char* key, long long value)
@@ -205,6 +216,34 @@ static gboolean changeablePath(const char* path)
     return TRUE;
 }
 
+/* A folder new files may go in: one the browser can use, but not its own
+ * data under /data/ps5webkit (only the users' downloads folders there). */
+static gboolean writableFolder(const char* dir)
+{
+    if (!allowedPath(dir))
+        return FALSE;
+    if (!strncmp(dir, "/data/ps5webkit", 15) && (dir[15] == '/' || !dir[15])) {
+        const char* users = "/data/ps5webkit/users/";
+        if (strncmp(dir, users, strlen(users)))
+            return FALSE;
+        const char* rest = strchr(dir + strlen(users), '/'); /* after <id> */
+        return rest && !strncmp(rest, "/downloads", 10) && (!rest[10] || rest[10] == '/');
+    }
+    return TRUE;
+}
+
+/* A new file or folder at path: its folder writable, the name itself not
+ * the folder (a drive's root can't be replaced). */
+static gboolean writablePath(const char* path)
+{
+    if (!path || !allowedPath(path))
+        return FALSE;
+    char* folder = g_path_get_dirname(path);
+    gboolean ok = writableFolder(folder);
+    g_free(folder);
+    return ok;
+}
+
 static gboolean exists(const char* path)
 {
     struct stat st;
@@ -216,8 +255,15 @@ static gboolean exists(const char* path)
 typedef struct {
     char* id;
     char* name; /* the file's name in its folder */
-    PS5Fetch* fetch;
+    char* path; /* the file's (its .part is <path>.part): names in use */
+    PS5Fetch* fetch; /* NULL while starting */
+    gboolean starting; /* ps5fetch_start hasn't returned yet: not the ticker's */
+    gboolean stopping; /* asked to stop or cancel */
     gboolean ended; /* its ended callback ran: freed by the ticker */
+    /* a "fetch" for the same id that came while this one was stopping
+     * (pause, then resume at once): started by the ticker once this one
+     * has ended, and this one's "fetchend" isn't sent */
+    GHashTable* again;
 } Fetch;
 
 static GMutex fetchLock;
@@ -255,8 +301,12 @@ static void fetchEnded(PS5Fetch* fetch, PS5FetchState state, void* data)
         *s.error ? ": " : "", s.error);
     g_mutex_lock(&fetchLock);
     f->ended = TRUE;
+    gboolean again = f->again != NULL;
     g_mutex_unlock(&fetchLock);
-    sendLine(line);
+    if (again)
+        g_string_free(line, TRUE); /* started again: the title waits for that one */
+    else
+        sendLine(line);
 }
 
 static void fetchFree(gpointer data)
@@ -264,10 +314,15 @@ static void fetchFree(gpointer data)
     Fetch* f = data;
     if (f->fetch)
         ps5fetch_free(f->fetch);
+    if (f->again)
+        g_hash_table_unref(f->again);
     g_free(f->id);
     g_free(f->name);
+    g_free(f->path);
     g_free(f);
 }
+
+static void startFetch(GHashTable* p);
 
 /* Every PROGRESS_MS: the running downloads' progress; ended ones freed. */
 static gpointer tickerThread(gpointer data)
@@ -277,14 +332,21 @@ static gpointer tickerThread(gpointer data)
         g_usleep(PROGRESS_MS * 1000);
         GPtrArray* done = g_ptr_array_new_with_free_func(fetchFree);
         GPtrArray* lines = g_ptr_array_new();
+        GPtrArray* again = g_ptr_array_new_with_free_func((GDestroyNotify)g_hash_table_unref);
         g_mutex_lock(&fetchLock);
         GHashTableIter iter;
         gpointer key, value;
         g_hash_table_iter_init(&iter, fetches);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             Fetch* f = value;
+            if (f->starting)
+                continue;
             if (f->ended) {
                 g_hash_table_iter_steal(&iter);
+                if (f->again) {
+                    g_ptr_array_add(again, f->again);
+                    f->again = NULL;
+                }
                 g_ptr_array_add(done, f);
                 continue;
             }
@@ -303,6 +365,9 @@ static gpointer tickerThread(gpointer data)
             sendLine(g_ptr_array_index(lines, i));
         g_ptr_array_unref(lines);
         g_ptr_array_unref(done); /* waits for their workers: outside the lock */
+        for (unsigned i = 0; i < again->len; i++)
+            startFetch(g_ptr_array_index(again, i));
+        g_ptr_array_unref(again);
     }
     return NULL;
 }
@@ -316,6 +381,32 @@ static const char* param(GHashTable* p, const char* key)
 static gboolean validName(const char* name);
 static char* uniqueName(const char* folder, const char* name);
 
+/* Whether path (or its .part) is in use: on the disk, or by a download
+ * here that hasn't made its .part yet. fetchLock held. */
+static gboolean pathTaken(const char* path)
+{
+    char* part = g_strdup_printf("%s.part", path);
+    gboolean taken = exists(path) || exists(part);
+    g_free(part);
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, fetches);
+    while (!taken && g_hash_table_iter_next(&iter, &key, &value)) {
+        const Fetch* f = value;
+        taken = !f->ended && f->path && !strcmp(f->path, path);
+    }
+    return taken;
+}
+
+static void refuseFetch(const char* id, const char* why)
+{
+    GString* line = startLine("fetchend");
+    appendParam(line, "id", id ? id : "");
+    appendParam(line, "state", "failed");
+    appendParam(line, "error", why);
+    sendLine(line);
+}
+
 static void startFetch(GHashTable* p)
 {
     const char* id = param(p, "id");
@@ -323,68 +414,60 @@ static void startFetch(GHashTable* p)
     const char* dir = param(p, "dir");
     const char* given = param(p, "name");
     const char* fresh = param(p, "fresh");
-    /* dir and name; a fresh download gets a name free in the folder (a
-     * continued one keeps its own: its .part is there) */
-    char* name = NULL;
-    char* path = NULL;
-    if (dir && allowedPath(dir) && validName(given)) {
-        g_mkdir_with_parents(dir, 0777);
-        name = fresh && !strcmp(fresh, "1") ? uniqueName(dir, given) : g_strdup(given);
-        path = g_build_filename(dir, name, NULL);
-    } else if (param(p, "path")) {
-        path = g_strdup(param(p, "path"));
-        name = g_path_get_basename(path);
-    }
-    if (!id || !url || !path || !allowedPath(path)) {
-        g_free(name);
-        g_free(path);
-        GString* line = startLine("fetchend");
-        appendParam(line, "id", id ? id : "");
-        appendParam(line, "state", "failed");
-        appendParam(line, "error", "The download service refused the address or the folder");
-        sendLine(line);
+    if (!id || !url || !dir || !writableFolder(dir) || !validName(given)) {
+        refuseFetch(id, "The download service refused the address or the folder");
         return;
     }
+    g_mkdir_with_parents(dir, 0777);
+
     g_mutex_lock(&fetchLock);
     Fetch* old = g_hash_table_lookup(fetches, id);
-    g_mutex_unlock(&fetchLock);
-    if (old && !old->ended) {
-        JOBLOG("download %s is already running", id);
-        g_free(name);
-        g_free(path);
+    if (old && !old->ended && old->stopping) {
+        /* paused and resumed at once: after this one has stopped */
+        if (old->again)
+            g_hash_table_unref(old->again);
+        old->again = g_hash_table_ref(p);
+        g_mutex_unlock(&fetchLock);
+        JOBLOG("download %s: starts again once it has stopped", id);
         return;
     }
-    char* folder = g_path_get_dirname(path);
-    g_mkdir_with_parents(folder, 0777);
-    g_free(folder);
+    if (old && !old->ended) {
+        g_mutex_unlock(&fetchLock);
+        JOBLOG("download %s is already running", id);
+        return;
+    }
+    if (old)
+        g_hash_table_steal(fetches, id); /* ended, not freed yet: ours now */
+    /* a fresh download gets a name free in the folder, also among the
+     * downloads starting here (a continued one keeps its own: its .part
+     * is there) */
+    char* name = fresh && !strcmp(fresh, "1") ? uniqueName(dir, given) : g_strdup(given);
+    Fetch* f = g_new0(Fetch, 1);
+    f->id = g_strdup(id);
+    f->name = name;
+    f->path = g_build_filename(dir, name, NULL);
+    f->starting = TRUE;
+    g_hash_table_insert(fetches, f->id, f);
+    g_mutex_unlock(&fetchLock);
+    if (old)
+        fetchFree(old); /* waits for its workers: outside the lock */
+
     PS5FetchOptions o = { 0 };
     o.url = url;
     o.original_url = param(p, "orig");
     o.user_agent = param(p, "ua");
     o.referer = param(p, "ref");
     o.cookies = param(p, "cookies");
-    o.path = path;
+    o.path = f->path;
     const char* conns = param(p, "conns");
     o.connections = conns ? (unsigned)CLAMP(atoi(conns), 1, 16) : 8;
     const char* chunk = param(p, "chunk");
     o.chunk = chunk ? g_ascii_strtoull(chunk, NULL, 10) : 0;
-    Fetch* f = g_new0(Fetch, 1);
-    f->id = g_strdup(id);
-    f->name = name;
-    g_mutex_lock(&fetchLock);
-    if (old) {
-        g_hash_table_steal(fetches, id);
-        g_mutex_unlock(&fetchLock);
-        fetchFree(old);
-        g_mutex_lock(&fetchLock);
-    }
-    g_hash_table_insert(fetches, f->id, f);
-    g_mutex_unlock(&fetchLock);
-    JOBLOG("download %s: %s to %s, %u connections", id, url, path, o.connections);
+    JOBLOG("download %s: %s to %s, %u connections", id, url, f->path, o.connections);
     PS5Fetch* fetch = ps5fetch_start(&o, fetchEnded, f);
-    g_free(path); /* ps5fetch copied it */
     g_mutex_lock(&fetchLock);
     f->fetch = fetch;
+    f->starting = FALSE;
     if (!fetch)
         f->ended = TRUE;
     g_mutex_unlock(&fetchLock);
@@ -404,7 +487,13 @@ static void stopFetch(const char* id, gboolean cancel)
         return;
     g_mutex_lock(&fetchLock);
     Fetch* f = g_hash_table_lookup(fetches, id);
+    if (f && f->again) {
+        /* a start waiting for this one to stop: not any more */
+        g_hash_table_unref(f->again);
+        f->again = NULL;
+    }
     if (f && !f->ended && f->fetch) {
+        f->stopping = TRUE;
         if (cancel)
             ps5fetch_cancel(f->fetch);
         else
@@ -430,6 +519,8 @@ typedef struct {
     char* then;
     char* image;
     gboolean deleteSource;
+    gboolean replace; /* an install may replace the app installed with the same ID */
+    char installed[32]; /* refused: the version installed ("?": not known) */
     volatile int cancel;
     gint64 lastProgress;
 } Job;
@@ -479,9 +570,11 @@ static void jobEnd(Job* job, gboolean ok, const char* error, const char* out, co
     appendParam(line, "out", out);
     if (title) {
         appendParam(line, "title", title->title_id);
-        appendParam(line, "name", title->name);
+        appendParam(line, "titlename", title->name);
         appendParam(line, "version", title->version);
     }
+    if (*job->installed)
+        appendParam(line, "installed", job->installed); /* refused: replacing needs replace=1 */
     JOBLOG("job %s (%s) %s%s%s", job->id, job->kind, ok ? "done" : "failed", error ? ": " : "", error ? error : "");
     sendLine(line);
 }
@@ -489,6 +582,12 @@ static void jobEnd(Job* job, gboolean ok, const char* error, const char* out, co
 /* 0 or -1 with error; copies src (a file) to dest, then deletes src. */
 static int moveFile(Job* job, const char* src, const char* dest, char* error, size_t size)
 {
+    if (exists(dest)) {
+        char* base = g_path_get_basename(dest);
+        snprintf(error, size, "There is already something called %s there", base);
+        g_free(base);
+        return -1;
+    }
     if (!rename(src, dest))
         return 0;
     if (errno != EXDEV) {
@@ -603,6 +702,59 @@ static void autoImagePath(const char* source, const PS5TitleInfo* title, char* o
 
 static char* uniqueFolder(const char* parent, const char* name);
 
+/* Whether title is installed (registered, or its folder in its drive's
+ * homebrew folder, which an install replaces): the version in version. */
+static gboolean alreadyInstalled(const PS5TitleInfo* title, const char* drivePath, char* version, size_t size)
+{
+    PS5TitleInfo installed;
+    if (ps5install_installed(NULL, title->title_id, &installed)) {
+        snprintf(version, size, "%s", *installed.version ? installed.version : "?");
+        return TRUE;
+    }
+    char drive[64];
+    if (ps5install_drive_of(drivePath, drive, sizeof drive)) {
+        char* folder = g_strdup_printf("%s/homebrew/%s", drive, title->title_id);
+        gboolean there = exists(folder);
+        g_free(folder);
+        if (there) {
+            snprintf(version, size, "?");
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* The app in an archive, from its param.json (before unpacking). */
+static gboolean archiveTitle(const char* archive, PS5TitleInfo* title)
+{
+    PS5ArchiveInfo info;
+    char error[256];
+    if (ps5archive_inspect(archive, NULL, &info, error, sizeof error) || !info.has_title)
+        return FALSE;
+    char* name = g_strdup_printf("%s%ssce_sys/param.json", info.title_dir, *info.title_dir ? "/" : "");
+    char* text = g_malloc(256 * 1024);
+    gboolean ok = !ps5archive_read_entry(archive, NULL, name, text, 256 * 1024, NULL, error, sizeof error)
+        && !ps5install_parse_param(text, title);
+    g_free(name);
+    g_free(text);
+    return ok;
+}
+
+/* An install that would replace an installed app, not asked to: refused
+ * (job->installed set for the title's "Replace" button). */
+static gboolean refuseReplace(Job* job, const PS5TitleInfo* title, const char* drivePath, char* error, size_t size)
+{
+    char version[32];
+    if (job->replace || !alreadyInstalled(title, drivePath, version, sizeof version))
+        return FALSE;
+    snprintf(job->installed, sizeof job->installed, "%s", version);
+    if (strcmp(version, "?"))
+        snprintf(error, size, "%s (%s) version %s is already installed", title->name, title->title_id, version);
+    else
+        snprintf(error, size, "%s (%s) is already installed", title->name, title->title_id);
+    return TRUE;
+}
+
 static gpointer jobThread(gpointer data)
 {
     Job* job = data;
@@ -620,7 +772,10 @@ static gpointer jobThread(gpointer data)
     jobProgress(job, job->kind, 0, 0, "", TRUE);
     if (job->cancel)
         snprintf(error, sizeof error, "Cancelled");
-    else if (!strcmp(job->kind, "extract")) {
+    else if (!strcmp(job->kind, "extract") && job->then && !strcmp(job->then, "install") && !job->replace
+        && archiveTitle(job->src, &title) && refuseReplace(job, &title, job->dest, error, sizeof error)) {
+        haveTitle = TRUE; /* nothing unpacked */
+    } else if (!strcmp(job->kind, "extract")) {
         PS5ArchiveLimits limits = { 0 };
         if (exists(job->dest)) {
             /* never into a folder that is there already: "name (1)" */
@@ -649,7 +804,13 @@ static gpointer jobThread(gpointer data)
             ok = !ps5install_find(job->dest, 3, &title, found, sizeof found);
             if (!ok)
                 snprintf(error, sizeof error, "Unpacked to %s, but %s", job->dest, found);
-            else {
+            else if (refuseReplace(job, &title, title.dir, error, sizeof error)) {
+                /* the archive's param.json couldn't be read first: the
+                 * unpacked folder stays, to install from Files */
+                ok = FALSE;
+                haveTitle = TRUE;
+                snprintf(out, sizeof out, "%s", job->dest);
+            } else {
                 PS5InstallOptions o = { .do_register = true, .log = onInstallLog };
                 ok = !ps5install_title(&title, &o, out, sizeof out, error, sizeof error);
                 haveTitle = TRUE;
@@ -677,7 +838,10 @@ static gpointer jobThread(gpointer data)
         }
     } else if (!strcmp(job->kind, "install")) {
         ok = !ps5install_find(job->src, 3, &title, error, sizeof error);
-        if (ok) {
+        if (ok && refuseReplace(job, &title, title.dir, error, sizeof error)) {
+            ok = FALSE;
+            haveTitle = TRUE;
+        } else if (ok) {
             PS5InstallOptions o = { .do_register = true, .log = onInstallLog };
             ok = !ps5install_title(&title, &o, out, sizeof out, error, sizeof error);
             haveTitle = TRUE;
@@ -694,6 +858,11 @@ static gpointer jobThread(gpointer data)
         ok = !ps5exfat_build(haveTitle ? title.dir : job->src, image, &o, onImageProgress, job, &job->cancel, error, sizeof error);
         if (ok)
             snprintf(out, sizeof out, "%s", image);
+    } else if (!strcmp(job->kind, "delete")) {
+        /* the file manager's Delete: a job, as a big folder takes a while */
+        ok = !ps5install_remove_tree(job->src);
+        if (!ok)
+            snprintf(error, sizeof error, "Couldn't delete all of it (errno %d)", errno);
     } else if (!strcmp(job->kind, "move")) {
         ok = !moveFile(job, job->src, job->dest, error, sizeof error);
         if (ok)
@@ -727,9 +896,12 @@ static void startJob(GHashTable* p)
     const char* refused = NULL;
     if (!id || !kind || !src || !allowedPath(src))
         refused = "The job's file isn't in a place the browser can use";
-    else if (strcmp(kind, "install") && (!dest || (!allowedPath(dest) && !(!strcmp(kind, "image") && !strcmp(dest, "auto")))))
+    else if (!strcmp(kind, "delete") && !changeablePath(src))
+        refused = "That can't be deleted from here";
+    else if (strcmp(kind, "install") && strcmp(kind, "delete")
+        && (!dest || (!writablePath(dest) && !(!strcmp(kind, "image") && !strcmp(dest, "auto")))))
         refused = "The job's destination isn't in a place the browser can use";
-    else if (image && strcmp(image, "auto") && !allowedPath(image))
+    else if (image && strcmp(image, "auto") && !writablePath(image))
         refused = "The image's place isn't one the browser can use";
     else if (!strcmp(kind, "move") && !changeablePath(src))
         refused = "That file can't be moved";
@@ -746,6 +918,7 @@ static void startJob(GHashTable* p)
         job->then = g_strdup(param(p, "then"));
         job->image = g_strdup(image);
         job->deleteSource = param(p, "delete") && !strcmp(param(p, "delete"), "1");
+        job->replace = param(p, "replace") && !strcmp(param(p, "replace"), "1");
         g_hash_table_insert(jobs, job->id, job);
     }
     g_mutex_unlock(&jobLock);
@@ -924,10 +1097,8 @@ static char* uniqueName(const char* folder, const char* name)
     for (unsigned n = 0; n < 10000; n++) {
         char* candidate = n ? g_strdup_printf("%.*s (%u)%s", (int)(extension - name), name, n, extension) : g_strdup(name);
         char* full = g_strdup_printf("%s/%s", folder, candidate);
-        char* part = g_strdup_printf("%s.part", full);
-        gboolean taken = exists(full) || exists(part);
+        gboolean taken = pathTaken(full);
         g_free(full);
-        g_free(part);
         if (!taken)
             return candidate;
         g_free(candidate);
@@ -979,7 +1150,9 @@ static void request(GHashTable* p)
     else if (!strcmp(op, "mkdir")) {
         const char* name = param(p, "name");
         char* full = validName(name) ? g_build_filename(path, name, NULL) : NULL;
-        if (!full)
+        if (!writableFolder(path))
+            snprintf(error, sizeof error, "New folders can't be made there");
+        else if (!full)
             snprintf(error, sizeof error, "A folder's name can't be empty or hold / \\ : * ? \" < > |");
         else if (exists(full))
             snprintf(error, sizeof error, "There is already something called %s there", name);
@@ -1026,7 +1199,9 @@ static void request(GHashTable* p)
             snprintf(error, sizeof error, "Bad name");
         else {
             g_mkdir_with_parents(path, 0777);
+            g_mutex_lock(&fetchLock);
             char* free = uniqueName(path, name);
+            g_mutex_unlock(&fetchLock);
             GString* out = g_string_new("{\"name\":");
             jsonString(out, free);
             g_string_append_c(out, '}');
@@ -1052,6 +1227,14 @@ static void request(GHashTable* p)
         appendParam(line, "error", error);
     g_free(json);
     sendLine(line);
+}
+
+static gpointer requestThread(gpointer data)
+{
+    GHashTable* p = data;
+    request(p);
+    g_hash_table_unref(p);
+    return NULL;
 }
 
 /* "rm": a download's file, or its .part, and the .part.ps5dl beside it. */
@@ -1172,15 +1355,42 @@ static void startPeek(GHashTable* params)
 
 /* ---------------------------------------------------------------- the connection */
 
+/* "k=v&k2=v2", percent-encoded: a table of new strings. Unlike
+ * g_uri_parse_params, a value that isn't valid UTF-8 once decoded is
+ * repaired (U+FFFD) instead of failing the whole line. */
+static GHashTable* parseParams(const char* text)
+{
+    GHashTable* table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    char** pairs = g_strsplit(text ? text : "", "&", -1);
+    for (char** pair = pairs; *pair; pair++) {
+        if (!**pair)
+            continue;
+        char* equals = strchr(*pair, '=');
+        char* key = g_uri_unescape_segment(*pair, equals ? equals : NULL, NULL);
+        char* value = equals ? g_uri_unescape_string(equals + 1, NULL) : g_strdup("");
+        if (key && value) {
+            if (!g_utf8_validate(value, -1, NULL)) {
+                char* valid = g_utf8_make_valid(value, -1);
+                g_free(value);
+                value = valid;
+            }
+            g_hash_table_replace(table, key, value);
+        } else {
+            g_free(key);
+            g_free(value);
+        }
+    }
+    g_strfreev(pairs);
+    return table;
+}
+
 static void handleLine(char* text, gboolean* hello)
 {
     char* space = strchr(text, ' ');
     if (space)
         *space = 0;
     const char* verb = text;
-    GHashTable* p = g_uri_parse_params(space ? space + 1 : "", -1, "&", G_URI_PARAMS_NONE, NULL);
-    if (!p)
-        p = g_hash_table_new(g_str_hash, g_str_equal);
+    GHashTable* p = parseParams(space ? space + 1 : "");
     if (!*hello) {
         *hello = !strcmp(verb, "hello") && param(p, "token") && !strcmp(param(p, "token"), token);
         if (!*hello)
@@ -1195,8 +1405,16 @@ static void handleLine(char* text, gboolean* hello)
         startJob(p);
     else if (!strcmp(verb, "jobstop"))
         stopJob(param(p, "id"));
-    else if (!strcmp(verb, "req"))
-        request(p);
+    else if (!strcmp(verb, "req")) {
+        /* a thread each: a big delete mustn't hold up the lines after it */
+        GThread* thread = g_thread_try_new("dl-req", requestThread, g_hash_table_ref(p), NULL);
+        if (thread)
+            g_thread_unref(thread);
+        else {
+            request(p);
+            g_hash_table_unref(p);
+        }
+    }
     else if (!strcmp(verb, "rm"))
         removeDownloadFiles(param(p, "path"));
     else if (!strcmp(verb, "peek"))
@@ -1206,9 +1424,12 @@ static void handleLine(char* text, gboolean* hello)
     g_hash_table_unref(p);
 }
 
-static void serveClient(int fd)
+/* The connection's lines until it closes. TRUE if it was the title's
+ * (it said the token). */
+static gboolean serveClient(int fd)
 {
     gboolean hello = FALSE;
+    gboolean skipping = FALSE; /* in a line over LINE_MAX_BYTES: dropped */
     GString* pending = g_string_new(NULL);
     char buffer[16384];
     for (;;) {
@@ -1224,12 +1445,13 @@ static void serveClient(int fd)
             if (newline > pending->str && newline[-1] == '\r')
                 newline[-1] = 0;
             gboolean before = hello;
-            if (*pending->str)
+            if (*pending->str && !skipping)
                 handleLine(pending->str, &hello);
+            skipping = FALSE;
             g_string_erase(pending, 0, newline - pending->str + 1);
             if (!hello) {
                 g_string_free(pending, TRUE);
-                return;
+                return FALSE;
             }
             if (!before) {
                 g_mutex_lock(&sendLock);
@@ -1239,34 +1461,32 @@ static void serveClient(int fd)
             }
         }
         if (pending->len > LINE_MAX_BYTES) {
-            JOBLOG("a line over %d bytes: closed", LINE_MAX_BYTES);
-            break;
+            if (!hello)
+                break;
+            JOBLOG("a line over %d bytes: dropped", LINE_MAX_BYTES);
+            g_string_truncate(pending, 0);
+            skipping = TRUE;
         }
     }
     g_string_free(pending, TRUE);
+    return hello;
 }
 
-/* The title closed the task's connection: stop the downloads (their .part
- * and .ps5dl stay) and the jobs, then end. */
-static void* stdinWatcher(void* data)
+/* Stops the downloads (their .part and .ps5dl stay) and the jobs, then
+ * ends the process: the title starts a new service when it needs one. */
+static void stopAllAndExit(const char* why)
 {
-    (void)data;
-    for (;;) {
-        struct pollfd p = { 0, POLLIN, 0 };
-        int n = poll(&p, 1, -1);
-        if (n < 0 && errno == EINTR)
-            continue;
-        char c;
-        if (n < 0 || (p.revents & (POLLHUP | POLLERR | POLLNVAL)) || read(0, &c, 1) <= 0)
-            break;
-    }
-    JOBLOG("the title closed the connection: stopping the downloads and ending");
+    JOBLOG("%s: stopping the downloads and ending", why);
     g_mutex_lock(&fetchLock);
     GHashTableIter iter;
     gpointer key, value;
     g_hash_table_iter_init(&iter, fetches);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         Fetch* f = value;
+        if (f->again) {
+            g_hash_table_unref(f->again);
+            f->again = NULL;
+        }
         if (!f->ended && f->fetch)
             ps5fetch_stop(f->fetch);
     }
@@ -1290,6 +1510,23 @@ static void* stdinWatcher(void* data)
     }
     fflush(stderr);
     _exit(3);
+}
+
+/* The title closed the task's connection: stop the downloads (their .part
+ * and .ps5dl stay) and the jobs, then end. */
+static void* stdinWatcher(void* data)
+{
+    (void)data;
+    for (;;) {
+        struct pollfd p = { 0, POLLIN, 0 };
+        int n = poll(&p, 1, -1);
+        if (n < 0 && errno == EINTR)
+            continue;
+        char c;
+        if (n < 0 || (p.revents & (POLLHUP | POLLERR | POLLNVAL)) || read(0, &c, 1) <= 0)
+            break;
+    }
+    stopAllAndExit("the title closed the task");
     return NULL;
 }
 
@@ -1341,13 +1578,16 @@ int ps5wk_dl_job(const char* jobPath)
         }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        serveClient(fd);
+        gboolean title = serveClient(fd);
         g_mutex_lock(&sendLock);
         if (client == fd)
             client = -1;
         g_mutex_unlock(&sendLock);
         close(fd);
-        JOBLOG("the title's connection closed");
+        /* the title takes a closed connection for an ended service and
+         * starts another: this one mustn't go on writing the same files */
+        if (title)
+            stopAllAndExit("the title's connection closed");
     }
     return 0;
 }
