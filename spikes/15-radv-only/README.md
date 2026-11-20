@@ -759,6 +759,24 @@ the release build's [results/phase0-20261119-013048/](results/phase0-20261119-01
 - Phase 5: done (below): the radv build links no ps5-opengl. The 0.3.0
   release is still to do.
 - Long runs, memory over hours, GPU faults: not tested.
+- **WebGL 1 video textures aborted the title (fixed 2026-11-20).** The
+  owner's test on a VR video site: the title aborted when the video
+  started, before View in VR. The page draws its player with WebGL 1. On
+  radv the video copy runs in the page's own context (0140), and ANGLE
+  makes a WebGL 1 context OpenGL ES 2.0, which has no fences and no
+  `glBlitFramebuffer`. epoxy aborted at the copy's `glWaitSync` ("No
+  provider of glWaitSync found"). Every earlier video check was WebGL 2.
+  Now, in an ES 2.0 context, `PS5Renderer::copyVideoFrame` copies with
+  `glCopySubTextureCHROMIUM` (it can flip; `ANGLE_framebuffer_blit`
+  can't), with no fences: the frame's write, the copy and the next write
+  are flushed in turn under one lock, onto ANGLE's one queue. It returns
+  `(void*)1` for that, and 0143 has WebKit delete no fence then. Checked
+  ([results/radv-webgl1video-20261120-122646/](results/radv-webgl1video-20261120-122646/)):
+  `webgl/video-formats.html?gl=1` passes every case in both rounds (RGBA,
+  RGB, `SRGB_ALPHA_EXT`, sub-image uploads, flipY off), WebGL 2's run is as
+  before, and `readpixels` is 29/29. The WebGL 2 sRGB cases still fail
+  (the double encoding above); the CHROMIUM copy gets sRGB right in WebGL
+  1, so it may fix them too.
 
 ## Phase 4: WebGPU without the CPU round trips (2026-11-20)
 

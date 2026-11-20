@@ -1226,12 +1226,67 @@ bool PS5Renderer::videoFrameSize(uint64_t key, int* width, int* height)
     return *width > 0 && *height > 0;
 }
 
+#if PS5WK_GPU_RADV
+// copyVideoFrame in an OpenGL ES 2.0 context (WebGL 1 on ANGLE): the frame
+// copied with glCopySubTextureCHROMIUM (CHROMIUM_copy_texture, enabled in the
+// context the first time; ANGLE's Vulkan backend has it). No fences: the
+// frame's writer flushed it under s_sharedVideoLock (publishVideoFrame), the
+// copy is flushed under it too, and the next write waits for that lock
+// (waitForVideoFrameCopies). ANGLE's contexts here share one device and one
+// queue, so the GPU runs the write, the copy and the next write in that
+// order. Entry points from ANGLE directly: epoxy has no CHROMIUM_copy_texture.
+// What copyVideoFrame returns then: copied, and no fence to wait on or delete
+// (WebKit's PS5WebGLVideoCopy.cpp knows the value).
+static void* const kVideoFrameCopiedInContext = reinterpret_cast<void*>(1);
+
+static bool copyVideoFrameES2(GLuint source, GLuint destination, int width, int height, bool flipY)
+{
+    using RequestExtension = void (*)(const char*);
+    using CopySubTexture = void (*)(GLuint, GLint, GLenum, GLuint, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLboolean, GLboolean, GLboolean);
+    static RequestExtension requestExtension = reinterpret_cast<RequestExtension>(eglGetProcAddress("glRequestExtensionANGLE"));
+    static CopySubTexture copySubTexture = reinterpret_cast<CopySubTexture>(eglGetProcAddress("glCopySubTextureCHROMIUM"));
+    static bool loggedFailure;
+    if (!copySubTexture || !requestExtension)
+        return false;
+    if (!epoxy_has_gl_extension("GL_CHROMIUM_copy_texture")) {
+        constexpr GLenum requestableExtensionsANGLE = 0x93A8; // GL_REQUESTABLE_EXTENSIONS_ANGLE
+        const char* requestable = reinterpret_cast<const char*>(glGetString(requestableExtensionsANGLE));
+        if (!requestable || !strstr(requestable, "GL_CHROMIUM_copy_texture")) {
+            if (!loggedFailure) {
+                loggedFailure = true;
+                g_message("[wpe-ps5] video frame copy: no CHROMIUM_copy_texture in a WebGL 1 context: no video in WebGL 1 textures");
+            }
+            return false;
+        }
+        requestExtension("GL_CHROMIUM_copy_texture");
+    }
+    // The stream's row 0 is the picture's top, as texImage2D's without UNPACK_FLIP_Y.
+    copySubTexture(source, 0, GL_TEXTURE_2D, destination, 0, 0, 0, 0, 0, width, height, flipY, GL_FALSE, GL_FALSE);
+    glFlush();
+    return true;
+}
+#endif
+
 void* PS5Renderer::copyVideoFrame(uint64_t key, unsigned texture, bool flipY)
 {
     if (!key || !texture)
         return nullptr;
     GLsync done = nullptr;
     g_mutex_lock(&s_sharedVideoLock);
+#if PS5WK_GPU_RADV
+    // GPU=radv: this runs in the caller's context. A WebGL 1 context is
+    // OpenGL ES 2.0 on ANGLE, without fences or glBlitFramebuffer (epoxy
+    // aborted at glWaitSync: "No provider of glWaitSync found", a WebGL 1
+    // page's video texture, 2026-11-20), and ANGLE_framebuffer_blit, which
+    // WebKit enables there, can't flip. CHROMIUM_copy_texture can.
+    if (epoxy_gl_version() < 30) {
+        void* copied = nullptr;
+        if (auto* entry = sharedVideoFrame(key, false); entry && entry->written && copyVideoFrameES2(entry->texture, texture, entry->width, entry->height, flipY))
+            copied = kVideoFrameCopiedInContext;
+        g_mutex_unlock(&s_sharedVideoLock);
+        return copied;
+    }
+#endif
     if (auto* entry = sharedVideoFrame(key, false); entry && entry->written) {
         glWaitSync(entry->written, 0, GL_TIMEOUT_IGNORED);
         GLuint fbos[2] = { };
