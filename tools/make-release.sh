@@ -14,8 +14,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
-# The WebKit build with WebGL, WebGPU and every patch (WEBGPU=1 port/webkit/build.sh).
-BLD="${BLD:-$ROOT/toolchain/wpe-webkit/build-webgpu}"
+# The WebKit build on ANGLE's Vulkan backend over RADV, with WebGL, WebGPU and
+# every patch (GPU=radv port/webkit/build.sh). Releases up to 0.2.3 were the
+# ps5-opengl build (build-webgpu).
+BLD="${BLD:-$ROOT/toolchain/wpe-webkit/build-radv}"
 version="${1:-$(git -C "$ROOT" describe --tags --always --dirty)}"
 
 # The zip names a commit (INSTALL.txt): what is built must be that commit.
@@ -39,8 +41,9 @@ name="parallax-browser-$version"
 out="$ROOT/dist/$name"
 stage="$ROOT/dist/$name-debug"
 
-[[ -f $BLD/build.ninja ]] || { echo "missing $BLD: run WEBGPU=1 port/webkit/build.sh" >&2; exit 1; }
+[[ -f $BLD/build.ninja ]] || { echo "missing $BLD: run GPU=radv port/webkit/build.sh" >&2; exit 1; }
 grep -q '^ENABLE_WEBGPU:BOOL=ON' "$BLD/CMakeCache.txt" || { echo "$BLD is not a WebGPU build" >&2; exit 1; }
+grep -q '^PS5WK_GPU_RADV:[A-Z]*=ON' "$BLD/CMakeCache.txt" || { echo "$BLD is not a GPU=radv build" >&2; exit 1; }
 # package.sh links every object in title-work/obj: start from an empty one, so
 # nothing left from another build or an experiment gets in.
 rm -rf "$ROOT/toolchain/wpe-webkit/title-work/obj"

@@ -1087,7 +1087,8 @@ with the title folder at the top and installs or updates only that folder in
   package.sh` leaves `runtime/` out for faster development uploads.
 - `tools/make-release.sh` zips `PPSA99207/` (with `LICENSE`, the notices and
   `INSTALL.txt` inside), the start page without its test links in its
-  `runtime/`. It packages the WebGPU build (`build-webgpu`), starts from an
+  `runtime/`. It packages the RADV build (`build-radv`; up to 0.2.3 the
+  ps5-opengl WebGPU build, `build-webgpu`), starts from an
   empty `title-work/obj`, and refuses uncommitted changes to tracked files
   (`ALLOW_DIRTY=1` for a test zip).
 
@@ -1147,7 +1148,7 @@ BLD=$PWD/toolchain/wpe-webkit/build-cpu port/webkit/apps/title/package.sh
 - WebKit is a static library (`WebKit_LIBRARY_TYPE STATIC` on PS5); the
   executables in `apps/` link it. The title relinks ps5browser's link line
   with PS5VR's native-app CRT and ps5-opengl (`apps/title/package.sh`).
-- `GPU=radv` (not released yet; `spikes/15-radv-only/README.md`): the
+- `GPU=radv` (the release build from 0.3.0; `spikes/15-radv-only/README.md`): the
   title's GL is WebKit's ANGLE on its Vulkan backend over RADV, from the
   `src-radv` worktree (branch `ps5-radv`, `patches-radv/` on top of
   `ps5-webgl`) into `build-radv`. ANGLE is built with the Vulkan backend

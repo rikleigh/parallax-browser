@@ -271,22 +271,23 @@ Mac with Apple silicon. The steps are:
 
 `tools/logserver.sh` collects the browser's log on the Mac.
 
-**The RADV build** is in progress and not released yet
+**The RADV build** is the release build from 0.3.0
 ([spikes/15-radv-only/README.md](spikes/15-radv-only/README.md)). It
 draws everything with WebKit's ANGLE on its Vulkan backend over RADV, and
 doesn't use ps5-opengl, so it can skip the ps5-opengl builds in step 3.
 `port/deps/build.sh dawn-radv` builds its Dawn. Then
 `GPU=radv port/webkit/build.sh` builds it in `toolchain/wpe-webkit/build-radv`,
-from the `src-radv` worktree with `port/webkit/patches-radv/` on top. To
-package it as a test title next to the release:
+from the `src-radv` worktree with `port/webkit/patches-radv/` on top. The
+ps5-opengl build in steps 3 and 4 (releases up to 0.2.3) still builds. To
+package the RADV build as a test title next to the installed browser:
 
 ```sh
 TITLE=PPSA99208 NAME="Parallax RADV test" BLD=toolchain/wpe-webkit/build-radv \
     OUT=toolchain/wpe-webkit/titles-radv-wip port/webkit/apps/title/package.sh
 ```
 
-`tools/make-release.sh <version>` builds the release zip from the WebGPU
-build (`WEBGPU=1 port/webkit/build.sh`, in `build-webgpu`). It refuses a
+`tools/make-release.sh <version>` builds the release zip from the RADV
+build (`GPU=radv port/webkit/build.sh`, in `build-radv`). It refuses a
 working tree with uncommitted changes, since the zip names the commit. The
 zip has the `PPSA99207` folder at the top, as the homebrew catalog
 requires, and the build inside has no log address. For every release, raise
