@@ -30,6 +30,9 @@ SECTIONS {
         QUAD(0xcccccccccccccccc)
         *(.text .text.*)
         *(.plt .plt.*)
+        /* The end of the code: the crash guard's bound for return addresses
+         * where code can't be read (apps/common/crashguard.c). */
+        PROVIDE_HIDDEN(_etext = .);
     } : text
 
     .eh_frame_hdr : ALIGN(CONSTANT(MAXPAGESIZE)) {

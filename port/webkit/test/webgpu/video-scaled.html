@@ -25,6 +25,10 @@
          short leaves each its clear colour; the clip has magenta and green
          of its own, so one clear colour can't tell, and the two copies may
          be of consecutive frames, so they needn't match). Lists the element sizes seen.
+       same-frame: sync-1080p30-h264.mp4 playing; for 10 s, three copies in
+         one task into three textures: they must be the same frame (the
+         current playback position doesn't change within a task; the title
+         used to copy the stream's newest frame for each call).
        uncaptured-errors: none.
      Open file:///data/ps5webkit/webgpu/video-scaled.html. Log lines:
      RESULT webgpu-video-scaled <case> PASS|FAIL|SKIP <why>, then the summary. -->
@@ -41,6 +45,7 @@
 <script>
 const ANAMORPHIC = '../media/anamorphic-1440x1080-sar4x3-h264.mp4';
 const SWITCH = '../media/switch-h264.mp4';
+const MOVING = '../media/sync-1080p30-h264.mp4';
 const MAGENTA = { r: 1, g: 0, b: 1, a: 1 };
 const GREEN = { r: 0, g: 1, b: 0, a: 1 };
 const WGSL = `
@@ -216,6 +221,42 @@ T.run('video-scaled', async () => {
       const seen = [...sizes].map(([k, n]) => k + ' (' + n + ')').join(', ');
       T.assert(worst === 0, copies + ' copies; in one ' + Math.round(worst * 100) + ' % of the texture was not covered (' + worstAt + '); sizes ' + seen);
       return copies + ' copies, every one covered the texture; sizes ' + seen;
+    }, device);
+    video.pause();
+  }
+
+  const m = await startVideo(MOVING);
+  if (m.why) {
+    T.skip('same-frame', 'no video: ' + MOVING + ' ' + m.why);
+  } else {
+    const video = m.video;
+    await T.test('same-frame', async () => {
+      let tasks = 0, differing = 0, worst = 0;
+      const end = performance.now() + 10000;
+      while (performance.now() < end) {
+        const width = video.videoWidth, height = video.videoHeight;
+        const textures = [0, 1, 2].map(() => clearedTexture(device, width, height));
+        // One task: no await between the copies.
+        for (const texture of textures)
+          device.queue.copyExternalImageToTexture({ source: video }, { texture }, [width, height]);
+        const images = [];
+        for (const texture of textures)
+          images.push(await T.readTexture(device, texture));
+        textures.forEach(t => t.destroy());
+        tasks++;
+        // A 64x36 grid, every channel.
+        let points = 0, unequal = 0;
+        for (let y = Math.floor(height / 72); y < height; y += Math.floor(height / 36))
+          for (let x = Math.floor(width / 128); x < width; x += Math.floor(width / 64), points++) {
+            const a = T.pixel(images[0], x, y).join(), b = T.pixel(images[1], x, y).join(), c = T.pixel(images[2], x, y).join();
+            if (a !== b || a !== c) unequal++;
+          }
+        if (unequal) differing++;
+        worst = Math.max(worst, unequal / points);
+        await new Promise(r => setTimeout(r, 100));
+      }
+      T.assert(!differing, differing + ' of ' + tasks + ' tasks copied different frames (up to ' + Math.round(worst * 100) + ' % of the points differ)');
+      return tasks + ' tasks of three copies, each of one frame';
     }, device);
     video.pause();
   }

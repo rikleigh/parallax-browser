@@ -4,10 +4,12 @@
      clock), played by a <video> that is not in the page (as three.js
      players do), is uploaded with texImage2D(video) every animation frame
      (UNPACK_FLIP_Y on, as three.js) and drawn on a slowly turning quad in a
-     WebGL 2 canvas. On the TV: the test pattern, the right way up, its clock
-     running, on a tilted quad; the text under it gives the frame rate and
-     the centre pixel. Upload to /data/ps5webkit/webgl-video.html and open
-     file:///data/ps5webkit/webgl-video.html[?clip=sync-2160p30-hevc.mp4 or an absolute path][&attach=1]. -->
+     WebGL 2 canvas (?gl=1: WebGL 1, as many 360 and VR video players are;
+     its copy path differs on GPU=radv). On the TV: the test pattern, the
+     right way up, its clock running, on a tilted quad; the text under it
+     gives the frame rate and the centre pixel. Upload to
+     /data/ps5webkit/webgl-video.html and open
+     file:///data/ps5webkit/webgl-video.html[?clip=sync-2160p30-hevc.mp4 or an absolute path][&attach=1][&gl=1]. -->
 <html>
 <head>
 <meta charset="utf-8">
@@ -40,21 +42,27 @@ if (new URLSearchParams(location.search).get('attach')) {
 ['emptied', 'suspend', 'stalled', 'waiting', 'pause', 'ended', 'error'].forEach(e => video.addEventListener(e, () => log('video event ' + e + ' at ' + video.currentTime.toFixed(2) + ' s, readyState ' + video.readyState + (video.error ? ', error ' + video.error.code : ''))));
 video.play().then(() => log('playing ' + clip), err => log('play failed: ' + err));
 
-const gl = document.getElementById('c').getContext('webgl2', { antialias: false });
+const webGL1 = new URLSearchParams(location.search).get('gl') === '1';
+const gl = document.getElementById('c').getContext(webGL1 ? 'webgl' : 'webgl2', { antialias: false });
+log('WebGL ' + (webGL1 ? 1 : 2));
+// GLSL ES 1.00 for WebGL 1: the same shaders with its keywords.
+const glsl = source => webGL1 ? source.replace('#version 300 es\n', '').replace(/\bin vec2 p;/, 'attribute vec2 p;')
+  .replace(/\bout vec2 uv;/, 'varying vec2 uv;').replace(/\bin vec2 uv;/, 'varying vec2 uv;').replace(/ out vec4 o;/, '')
+  .replace('o = texture(t, uv);', 'gl_FragColor = texture2D(t, uv);') : source;
 const vs = gl.createShader(gl.VERTEX_SHADER);
-gl.shaderSource(vs, `#version 300 es
+gl.shaderSource(vs, glsl(`#version 300 es
 in vec2 p; out vec2 uv; uniform float a;
 void main() {
   uv = p * 0.5 + 0.5;
   float c = cos(a), s = sin(a);
   vec2 q = vec2(c * p.x - s * p.y, s * p.x + c * p.y) * 0.8;
   gl_Position = vec4(q, 0.0, 1.0);
-}`);
+}`));
 gl.compileShader(vs);
 const fs = gl.createShader(gl.FRAGMENT_SHADER);
-gl.shaderSource(fs, `#version 300 es
+gl.shaderSource(fs, glsl(`#version 300 es
 precision mediump float; in vec2 uv; uniform sampler2D t; out vec4 o;
-void main() { o = texture(t, uv); }`);
+void main() { o = texture(t, uv); }`));
 gl.compileShader(fs);
 const prog = gl.createProgram();
 gl.attachShader(prog, vs); gl.attachShader(prog, fs);

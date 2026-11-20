@@ -43,7 +43,7 @@ the previous refresh unless it says otherwise.
 | `draw` | the frame's draws (ms); includes waiting for the previous frame's flip, so it fills the rest of the vsync |
 | `render a/b` | everything before the swap (work + draw), avg/max, as the `[present]` log line's "render" |
 | `swap` | `eglSwapBuffers` avg/max (ms) |
-| `GPU n/a` | see below |
+| `GPU a/b` | GPU=radv: the GPU time of the render thread's GL work per frame, from its start to the swap (the compositor's scene, the UI, video conversion, the overlay), avg/max (ms), from `EXT_disjoint_timer_query` a few frames late. Not WebGL's or WebGPU's own work, which other contexts submit. GPU=gl: `n/a`, see below |
 | `CPU main/render/title` | the title's main (UI) thread and render thread (% of a core; each thread's own `getrusage(RUSAGE_THREAD)`: the thread CPU clocks, `pthread_getcpuclockid`, read ~0 on the PS5, so the `[cpu] title` log line's "render thread CPU" is not meaningful), the whole title process (cores) |
 | `web/net` | WebProcess(es) and NetworkProcess CPU (cores; `+` = more than one WebProcess) |
 | `MEM flex/direct` | the title's free flexible memory and the direct memory in use (MB) |
@@ -66,7 +66,7 @@ the top is 50 ms.
 
 ## Not measurable
 
-- **GPU time per frame**: ps5-opengl's timer queries (`GL_TIME_ELAPSED`,
+- **GPU time per frame** (GPU=gl; GPU=radv measures it): ps5-opengl's timer queries (`GL_TIME_ELAPSED`,
   `GL_TIMESTAMP`) are CPU clocks taken at begin/end
   (`ref/ps5-opengl/src/gallium/ps5/ps5_screen.c`, `ps5_begin_query`), not
   GPU timestamps, so they measure submission, not GPU work. The GPU's share

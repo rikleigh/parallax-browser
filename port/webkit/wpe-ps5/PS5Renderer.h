@@ -262,6 +262,17 @@ private:
     PageJob m_job;
     PS5PerfOverlay* m_perf { nullptr };
     bool m_perfOn { false };
+#if PS5WK_GPU_RADV
+    // The overlay's GPU time (PS5Renderer.cpp, beginGPUTimer).
+    static constexpr unsigned kGPUTimers = 4;
+    unsigned m_gpuTimers[kGPUTimers] { };
+    bool m_gpuTimerPending[kGPUTimers] { };
+    unsigned m_gpuTimerNext { 0 };
+    int m_gpuTimerSupport { -1 };
+    bool beginGPUTimer();
+    void endGPUTimer();
+    void collectGPUTimers();
+#endif
     uint64_t m_videoFramesConverted { 0 };
     bool m_drawPointer { false };
     double m_drawPointerX { 0 }, m_drawPointerY { 0 };

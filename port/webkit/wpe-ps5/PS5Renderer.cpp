@@ -897,6 +897,12 @@ void PS5Renderer::threadMain()
             if (m_perf)
                 m_perf->setActive(perfWanted);
             m_perfOn = perfWanted;
+#if PS5WK_GPU_RADV
+            if (!perfWanted) {
+                for (auto& pending : m_gpuTimerPending)
+                    pending = false; // not read: a query is ended, so it can begin again
+            }
+#endif
         }
 
         // The wait for the last frame's flip, before the lock and not inside the first draw under
@@ -921,6 +927,9 @@ void PS5Renderer::threadMain()
 #endif
         // Until the swap: its wait for the vsync is not held against Dawn.
         GPUSubmitLock gpuSubmitLock;
+#if PS5WK_GPU_RADV
+        const bool gpuTimer = m_perfOn && m_perf && beginGPUTimer();
+#endif
         setUpCompositorIfWanted();
         serviceBufferRequests();
         int64_t start = nowUS();
@@ -969,6 +978,10 @@ void PS5Renderer::threadMain()
             g_clear_pointer(&capturePath, g_free); // private browsing began meanwhile
         if (capturePath)
             writeCapture(capturePath);
+#if PS5WK_GPU_RADV
+        if (gpuTimer)
+            endGPUTimer();
+#endif
         gpuSubmitLock.release();
         int64_t swapStart = nowUS();
         eglSwapBuffers(m_eglDisplay, m_eglSurface);
@@ -1031,6 +1044,57 @@ void PS5Renderer::threadMain()
         maybeLogStats(swapEnd);
     }
 }
+
+#if PS5WK_GPU_RADV
+// The overlay's GPU time: EXT_disjoint_timer_query (ANGLE's, from Vulkan timestamps) around the
+// render thread's GL work of a frame, from its start to the swap: the compositor's scene, the UI,
+// video conversion, the overlay. Not WebGL's or WebGPU's own work, which other contexts submit.
+// Read a few frames later, oldest first; nothing while the overlay is off.
+bool PS5Renderer::beginGPUTimer()
+{
+    if (m_gpuTimerSupport < 0) {
+        m_gpuTimerSupport = epoxy_has_gl_extension("GL_EXT_disjoint_timer_query");
+        if (m_gpuTimerSupport)
+            glGenQueriesEXT(kGPUTimers, m_gpuTimers);
+        g_message("[wpe-ps5] performance overlay: GPU time %s", m_gpuTimerSupport ? "from EXT_disjoint_timer_query" : "n/a (no EXT_disjoint_timer_query)");
+    }
+    if (!m_gpuTimerSupport)
+        return false;
+    collectGPUTimers();
+    if (m_gpuTimerPending[m_gpuTimerNext])
+        return false; // the GPU is more than kGPUTimers frames behind: this frame isn't timed
+    glBeginQueryEXT(GL_TIME_ELAPSED_EXT, m_gpuTimers[m_gpuTimerNext]);
+    return true;
+}
+
+void PS5Renderer::endGPUTimer()
+{
+    glEndQueryEXT(GL_TIME_ELAPSED_EXT);
+    m_gpuTimerPending[m_gpuTimerNext] = true;
+    m_gpuTimerNext = (m_gpuTimerNext + 1) % kGPUTimers;
+}
+
+void PS5Renderer::collectGPUTimers()
+{
+    for (unsigned i = 0; i < kGPUTimers; i++) {
+        const unsigned slot = (m_gpuTimerNext + i) % kGPUTimers;
+        if (!m_gpuTimerPending[slot])
+            continue;
+        GLuint available = 0;
+        glGetQueryObjectuivEXT(m_gpuTimers[slot], GL_QUERY_RESULT_AVAILABLE_EXT, &available);
+        if (!available)
+            break; // the later ones aren't either
+        GLuint64 nanoseconds = 0;
+        glGetQueryObjectui64vEXT(m_gpuTimers[slot], GL_QUERY_RESULT_EXT, &nanoseconds);
+        m_gpuTimerPending[slot] = false;
+        // A disjoint operation (a GPU clock change, a reset) makes the results meaningless.
+        GLint disjoint = 0;
+        glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+        if (!disjoint && m_perf)
+            m_perf->noteGPUTime(nanoseconds / 1e6);
+    }
+}
+#endif
 
 void PS5Renderer::copyPage()
 {

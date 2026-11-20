@@ -80,6 +80,8 @@ public:
 
     void setActive(bool); // starts or parks the sampler thread
     void noteFrame(const PS5PerfFrame&);
+    // One frame's GPU time, a few frames late (GPU=radv: PS5Renderer's timer queries).
+    void noteGPUTime(double ms);
     // Draws over the current framebuffer (0, viewport = the TV).
     void draw(int width, int height, const PS5PerfState&);
     // When the text is due again (the render loop wakes for it).

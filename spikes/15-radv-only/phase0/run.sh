@@ -122,6 +122,9 @@ case_webgl()   {
     run_case webgl-readpixels "file://$P/webgl-readpixels.html" 60 "RESULT webgl-readpixels summary"
     run_case webgl-busy "file://$P/webgl-busy.html" 90 "RESULT webgl-busy n=2000"
     run_case webgl-video "file://$P/webgl-video.html?clip=$P/media/sync-1080p30-h264.mp4" 30 ""
+    # WebGL 1, as many 360 and VR video players are (on GPU=radv its copy path differs: a WebGL 1
+    # page's video aborted the title, 2026-11-20).
+    run_case webgl1-video "file://$P/webgl-video.html?gl=1&clip=$P/media/sync-1080p30-h264.mp4" 30 ""
 }
 case_webgpu()  {
     run_case webgpu-start "file://$P/static.html" 15 ""

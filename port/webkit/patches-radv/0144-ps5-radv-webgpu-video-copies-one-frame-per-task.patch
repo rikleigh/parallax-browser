@@ -1,0 +1,335 @@
+diff --git a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+index f63af60628..5d9e076652 100644
+--- a/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
++++ b/Source/WebCore/Modules/WebGPU/GPUQueue.cpp
+@@ -1541,7 +1541,9 @@ ExceptionOr<void> GPUQueue::copyExternalImageToTexture(ScriptExecutionContext& c
+ 
+ #if USE(DAWN) && ENABLE(VIDEO)
+     // PS5, GPU=radv: a hardware-decoded video's frame is copied in the title, on the GPU, and no
+-    // pixels come here. The queue says false where it cannot (the pixel way below); the formats
++    // pixels come here. Copies of one video within a task are of one frame (the current playback
++    // position doesn't change within a task): they carry the task's token, which ends at the end
++    // of its microtask checkpoint, and the GPU process copies a stream's frame once per token. The queue says false where it cannot (the pixel way below); the formats
+     // are those Dawn's CopyTextureForBrowser writes. A video frame is opaque: its alpha is 1
+     // premultiplied or not.
+     if (auto* videoElement = std::get_if<Ref<HTMLVideoElement>>(&source.source)) {
+@@ -1563,8 +1565,17 @@ ExceptionOr<void> GPUQueue::copyExternalImageToTexture(ScriptExecutionContext& c
+         }
+         RefPtr player = (*videoElement)->player();
+         uint64_t key = player && player->playerPrivate() ? player->playerPrivate()->ps5VideoStreamKey() : 0;
++        static uint64_t taskToken;
++        static bool taskTokenLive;
++        if (key && !taskTokenLive) {
++            taskToken++;
++            taskTokenLive = true;
++            protect((*videoElement)->document().eventLoop())->runAtEndOfMicrotaskCheckpoint([] {
++                taskTokenLive = false;
++            });
++        }
+         if (key && gpuCopyFormat && !originX && !originY
+-            && m_backing->ps5CopyVideoStreamFrameToTexture(key, (*videoElement)->videoWidth(), (*videoElement)->videoHeight(), static_cast<const GPUImageCopyTexture&>(destination).convertToBacking(), backingCopySize, source.flipY))
++            && m_backing->ps5CopyVideoStreamFrameToTexture(key, taskToken, (*videoElement)->videoWidth(), (*videoElement)->videoHeight(), static_cast<const GPUImageCopyTexture&>(destination).convertToBacking(), backingCopySize, source.flipY))
+             return { };
+     }
+ #endif
+diff --git a/Source/WebGPU/WebGPUCpp.h b/Source/WebGPU/WebGPUCpp.h
+index 2d0cbc5128..981ae5ebbd 100644
+--- a/Source/WebGPU/WebGPUCpp.h
++++ b/Source/WebGPU/WebGPUCpp.h
+@@ -1640,12 +1640,14 @@ public:
+     // the title, which does the copy (below) or, with no frame, leaves the destination as it was,
+     // as the pixel way does. The frame is scaled to the element's video size (videoWidth x
+     // videoHeight) where it was decoded at another. False: this queue cannot (the pixel way then).
+-    virtual bool ps5CopyVideoStreamFrameToTexture(uint64_t, uint32_t /* videoWidth */, uint32_t /* videoHeight */, const TexelCopyTextureInfo&, const Extent3D&, bool /* flipY */) { return false; }
++    virtual bool ps5CopyVideoStreamFrameToTexture(uint64_t, uint64_t /* taskToken */, uint32_t /* videoWidth */, uint32_t /* videoHeight */, const TexelCopyTextureInfo&, const Extent3D&, bool /* flipY */) { return false; }
+     // PS5, GPU=radv, in the title: the copy, from a shared image the title filled with the frame
+     // (RGBA8, row 0 the picture's top) and left in `vkLayout`, with Dawn's CopyTextureForBrowser.
+     // True when it was recorded: `released` is then called as for Device::ps5ImportSharedImage.
+     // False: nothing was recorded, and `released` is not called.
+-    virtual bool ps5CopySharedImageToTexture(PS5SharedImage&, uint32_t /* vkLayout */, const TexelCopyTextureInfo&, const Extent3D&, bool /* flipY */, Function<void(uint32_t vkLayout)>&&) { return false; }
++    // `endLayout`, when not null: the layout Dawn leaves the image in once the copy is done, for
++    // another Dawn access before anyone else has it (the same frame copied again in one task).
++    virtual bool ps5CopySharedImageToTexture(PS5SharedImage&, uint32_t /* vkLayout */, const TexelCopyTextureInfo&, const Extent3D&, bool /* flipY */, Function<void(uint32_t vkLayout)>&&, uint32_t* /* endLayout */ = nullptr) { return false; }
+ #endif
+     virtual void setLabel(String&&) = 0;
+     virtual bool isValid() const = 0;
+diff --git a/Source/WebGPU/WebGPUDawn/Device.cpp b/Source/WebGPU/WebGPUDawn/Device.cpp
+index acc917b096..beea3af506 100644
+--- a/Source/WebGPU/WebGPUDawn/Device.cpp
++++ b/Source/WebGPU/WebGPUDawn/Device.cpp
+@@ -378,7 +378,7 @@ wgpu::Texture DeviceImpl::ps5SharedImageAlias(PS5SharedImage& image)
+     return texture;
+ }
+ 
+-void DeviceImpl::ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<void(uint32_t vkLayout)>&& done)
++uint32_t DeviceImpl::ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<void(uint32_t vkLayout)>&& done)
+ {
+     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+     dawn::native::vulkan::EndAccessHostPointerTexturePS5(alias.Get(), &layout);
+@@ -387,13 +387,14 @@ void DeviceImpl::ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<vo
+         // Nothing pumps Dawn's callbacks any more: the device is going, and Dawn waits for its GPU
+         // work as it goes.
+         done(layout);
+-        return;
++        return layout;
+     }
+     // Called once the work submitted until now is done, or with an error once the device is lost
+     // or destroyed: either way Dawn is done with the image.
+     m_device.GetQueue().OnSubmittedWorkDone(wgpu::CallbackMode::AllowProcessEvents, [pending = makePendingCallback(*instance, WTF::move(done)), layout](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+         pending->handler()(layout);
+     });
++    return layout;
+ }
+ 
+ // https://gpuweb.github.io/gpuweb/#dom-gpudevice-importexternaltexture, for a video frame the
+diff --git a/Source/WebGPU/WebGPUDawn/Device.h b/Source/WebGPU/WebGPUDawn/Device.h
+index 28e4d3a988..7db24a40c4 100644
+--- a/Source/WebGPU/WebGPUDawn/Device.h
++++ b/Source/WebGPU/WebGPUDawn/Device.h
+@@ -59,7 +59,8 @@ public:
+     wgpu::Texture ps5SharedImageAlias(PS5SharedImage&);
+     // After the alias's work is recorded: submits it, and calls `done` with the layout the image is
+     // left in once the GPU has finished it (or the device went). On the instance's thread.
+-    void ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<void(uint32_t vkLayout)>&& done);
++    // Returns the layout the image is left in (as `done` gets it).
++    uint32_t ps5EndSharedImageAccess(const wgpu::Texture& alias, Function<void(uint32_t vkLayout)>&& done);
+ #endif
+     RefPtr<Sampler> createSampler(const SamplerDescriptor&) final;
+     RefPtr<BindGroupLayout> createBindGroupLayout(const BindGroupLayoutDescriptor&) final;
+diff --git a/Source/WebGPU/WebGPUDawn/Queue.cpp b/Source/WebGPU/WebGPUDawn/Queue.cpp
+index 89c0c74cbf..50948331b4 100644
+--- a/Source/WebGPU/WebGPUDawn/Queue.cpp
++++ b/Source/WebGPU/WebGPUDawn/Queue.cpp
+@@ -85,7 +85,7 @@ void QueueImpl::writeTexture(const TexelCopyTextureInfo& destination, std::span<
+ // https://gpuweb.github.io/gpuweb/#dom-gpuqueue-copyexternalimagetotexture, for a video frame the
+ // title copied into a shared image on the GPU. Dawn's CopyTextureForBrowser converts it to the
+ // destination's format and flips it when asked; a video frame is opaque, so the alpha modes match.
+-bool QueueImpl::ps5CopySharedImageToTexture(PS5SharedImage& image, uint32_t vkLayout, const TexelCopyTextureInfo& destination, const Extent3D& copySize, bool flipY, Function<void(uint32_t vkLayout)>&& released)
++bool QueueImpl::ps5CopySharedImageToTexture(PS5SharedImage& image, uint32_t vkLayout, const TexelCopyTextureInfo& destination, const Extent3D& copySize, bool flipY, Function<void(uint32_t vkLayout)>&& released, uint32_t* endLayout)
+ {
+     RefPtr device = static_cast<DeviceImpl*>(m_device.get().get());
+     if (!device)
+@@ -100,7 +100,9 @@ bool QueueImpl::ps5CopySharedImageToTexture(PS5SharedImage& image, uint32_t vkLa
+     wgpu::CopyTextureForBrowserOptions options;
+     options.flipY = flipY;
+     m_queue.CopyTextureForBrowser(&source, &dawnDestination, &dawnCopySize, &options);
+-    device->ps5EndSharedImageAccess(alias, WTF::move(released));
++    uint32_t layout = device->ps5EndSharedImageAccess(alias, WTF::move(released));
++    if (endLayout)
++        *endLayout = layout;
+     return true;
+ }
+ #endif
+diff --git a/Source/WebGPU/WebGPUDawn/Queue.h b/Source/WebGPU/WebGPUDawn/Queue.h
+index d95eee6216..98cb8281d2 100644
+--- a/Source/WebGPU/WebGPUDawn/Queue.h
++++ b/Source/WebGPU/WebGPUDawn/Queue.h
+@@ -45,7 +45,7 @@ public:
+     void writeBuffer(Buffer&, uint64_t bufferOffset, std::span<const uint8_t> data) final;
+     void writeTexture(const TexelCopyTextureInfo& destination, std::span<const uint8_t> data, const TexelCopyBufferLayout&, const Extent3D& writeSize) final;
+ #if PS5WK_GPU_RADV
+-    bool ps5CopySharedImageToTexture(PS5SharedImage&, uint32_t vkLayout, const TexelCopyTextureInfo&, const Extent3D&, bool flipY, Function<void(uint32_t vkLayout)>&&) final;
++    bool ps5CopySharedImageToTexture(PS5SharedImage&, uint32_t vkLayout, const TexelCopyTextureInfo&, const Extent3D&, bool flipY, Function<void(uint32_t vkLayout)>&&, uint32_t* endLayout) final;
+     // The device whose queue this is (a DeviceImpl): its shared image aliases.
+     void setDevice(Device& device) { m_device = device; }
+ #endif
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
+index 0b75205ef3..fdf82cc621 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.cpp
+@@ -84,7 +84,61 @@ RemoteQueue::RemoteQueue([[maybe_unused]] GPUConnectionToWebProcess& gpuConnecti
+     protect(m_streamConnection)->startReceivingMessages(*this, Messages::RemoteQueue::messageReceiverName(), m_identifier.toUInt64());
+ }
+ 
+-RemoteQueue::~RemoteQueue() = default;
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++// A frame copied into a shared image for copyExternalImageToTexture(video), with the page's task
++// token (GPUQueue.cpp): later copies of the same stream at the same size with the same token come
++// from this image, so the copies of one task are of one frame, whatever the title converted
++// meanwhile. The image stays Dawn's while it is kept or any copy from it is in flight; Dawn's
++// copies run in order on its queue, each from the layout the one before left.
++struct RemoteQueue::PS5VideoCopy : ThreadSafeRefCounted<RemoteQueue::PS5VideoCopy> {
++    uint64_t streamKey { 0 };
++    uint64_t taskToken { 0 };
++    uint32_t videoWidth { 0 };
++    uint32_t videoHeight { 0 };
++    RefPtr<PS5SharedImageSlot> slot;
++    uint32_t vkLayout { 0 }; // the image's layout for the next copy
++
++    void started()
++    {
++        Locker locker { lock };
++        inFlight++;
++    }
++    // A copy is done on the GPU (Dawn's callback, any thread).
++    void finished()
++    {
++        Locker locker { lock };
++        inFlight--;
++        freeIfDone();
++    }
++    // Not kept any more (a new frame, or the queue is going).
++    void letGo()
++    {
++        Locker locker { lock };
++        kept = false;
++        freeIfDone();
++    }
++
++private:
++    void freeIfDone() WTF_REQUIRES_LOCK(lock)
++    {
++        if (kept || inFlight || !slot)
++            return;
++        slot->state = PS5SharedImageSlot::State::Free;
++        slot = nullptr;
++    }
++    Lock lock;
++    unsigned inFlight WTF_GUARDED_BY_LOCK(lock) { 0 };
++    bool kept WTF_GUARDED_BY_LOCK(lock) { true };
++};
++#endif
++
++RemoteQueue::~RemoteQueue()
++{
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++    if (RefPtr copy = std::exchange(m_ps5VideoCopy, nullptr))
++        copy->letGo();
++#endif
++}
+ 
+ void RemoteQueue::destruct()
+ {
+@@ -305,30 +359,50 @@ void RemoteQueue::readVideoStreamFramePS5(uint64_t streamKey, CompletionHandler<
+ // and from there into the destination. With no frame, or one smaller than the copy (a size
+ // change between the page's call and this), the destination is left alone, as the pixel way
+ // leaves it with no frame.
+-void RemoteQueue::copyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const WebGPU::ImageCopyTexture& destination, const WebGPU::Extent3D& copySize, bool flipY)
++void RemoteQueue::copyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint64_t taskToken, uint32_t videoWidth, uint32_t videoHeight, const WebGPU::ImageCopyTexture& destination, const WebGPU::Extent3D& copySize, bool flipY)
+ {
+ #if ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
+     Ref objectHeap = m_objectHeap.get();
+     auto convertedDestination = objectHeap->convertFromBacking(destination);
+     if (!convertedDestination)
+         return;
+-    uint32_t vkLayout = 0;
+-    RefPtr slot = PS5WebGLLayers::copyVideoFrameToSharedImage(streamKey, vkLayout, videoWidth, videoHeight);
+-    if (!slot)
+-        return;
++    // The frame this task copied already, or the stream's newest.
++    RefPtr copy = m_ps5VideoCopy;
++    if (!copy || !taskToken || copy->taskToken != taskToken || copy->streamKey != streamKey || copy->videoWidth != videoWidth || copy->videoHeight != videoHeight) {
++        if (RefPtr previous = std::exchange(m_ps5VideoCopy, nullptr))
++            previous->letGo();
++        uint32_t vkLayout = 0;
++        RefPtr slot = PS5WebGLLayers::copyVideoFrameToSharedImage(streamKey, vkLayout, videoWidth, videoHeight);
++        if (!slot)
++            return;
++        copy = adoptRef(*new PS5VideoCopy);
++        copy->streamKey = streamKey;
++        copy->taskToken = taskToken;
++        copy->videoWidth = videoWidth;
++        copy->videoHeight = videoHeight;
++        copy->slot = WTF::move(slot);
++        copy->vkLayout = vkLayout;
++        m_ps5VideoCopy = copy;
++    }
++    RefPtr slot = copy->slot;
+     if (copySize.width > slot->width || copySize.height > slot->height || copySize.depthOrArrayLayers != 1) {
+         static bool logged;
+         if (!std::exchange(logged, true))
+             WTFLogAlways("[webgpu] title: copyExternalImageToTexture of a %ux%u video frame into %ux%u: not copied", slot->width, slot->height, copySize.width, copySize.height);
+-        slot->state = PS5SharedImageSlot::State::Free;
+         return;
+     }
+-    if (!protect(m_backing)->ps5CopySharedImageToTexture(*slot, vkLayout, *convertedDestination, copySize, flipY, [slot](uint32_t) {
+-        slot->state = PS5SharedImageSlot::State::Free;
+-    }))
+-        slot->state = PS5SharedImageSlot::State::Free;
++    copy->started();
++    uint32_t endLayout = copy->vkLayout;
++    if (!protect(m_backing)->ps5CopySharedImageToTexture(*slot, copy->vkLayout, *convertedDestination, copySize, flipY, [copy](uint32_t) {
++        copy->finished();
++    }, &endLayout)) {
++        copy->finished();
++        return;
++    }
++    copy->vkLayout = endLayout;
+ #else
+     UNUSED_PARAM(streamKey);
++    UNUSED_PARAM(taskToken);
+     UNUSED_PARAM(videoWidth);
+     UNUSED_PARAM(videoHeight);
+     UNUSED_PARAM(destination);
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
+index a58fba667e..5e3240f7ad 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.h
+@@ -123,7 +123,7 @@ private:
+ 
+ #if USE(DAWN)
+     void readVideoStreamFramePS5(uint64_t streamKey, CompletionHandler<void(std::optional<WebCore::SharedMemoryHandle>&&, uint32_t, uint32_t)>&&);
+-    void copyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const WebGPU::ImageCopyTexture& destination, const WebGPU::Extent3D& copySize, bool flipY);
++    void copyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint64_t taskToken, uint32_t videoWidth, uint32_t videoHeight, const WebGPU::ImageCopyTexture& destination, const WebGPU::Extent3D& copySize, bool flipY);
+ #endif
+ 
+     void copyExternalImageToTexture(
+@@ -153,6 +153,12 @@ private:
+ #if PLATFORM(COCOA) && ENABLE(VIDEO)
+     SharedVideoFrameReader m_sharedVideoFrameReader;
+ #endif
++#if USE(DAWN) && ENABLE(WEBGL) && USE(GRAPHICS_LAYER_WC) && defined(PS5_PAYLOAD_SDK) && PS5WK_GPU_RADV
++    // The video frame copied last for copyExternalImageToTexture, kept for the page's other
++    // copies of that stream in the same task (RemoteQueue.cpp).
++    struct PS5VideoCopy;
++    RefPtr<PS5VideoCopy> m_ps5VideoCopy;
++#endif
+ };
+ 
+ } // namespace WebKit
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
+index 71b8d41556..ba68b6ac6d 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteQueue.messages.in
+@@ -49,7 +49,7 @@ messages -> RemoteQueue Stream {
+ #endif
+ #if USE(DAWN)
+     void ReadVideoStreamFramePS5(uint64_t streamKey) -> (std::optional<WebCore::SharedMemory::Handle> pixels, uint32_t width, uint32_t height) Synchronous NotStreamEncodableReply
+-    void CopyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, WebKit::WebGPU::ImageCopyTexture destination, WebKit::WebGPU::Extent3D copySize, bool flipY)
++    void CopyVideoStreamFrameToTexturePS5(uint64_t streamKey, uint64_t taskToken, uint32_t videoWidth, uint32_t videoHeight, WebKit::WebGPU::ImageCopyTexture destination, WebKit::WebGPU::Extent3D copySize, bool flipY)
+ #endif
+     void SetLabel(String label)
+ }
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
+index 24f7dcb04c..f68b15a7d9 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.cpp
+@@ -115,13 +115,13 @@ bool RemoteQueueProxy::ps5ReadVideoStreamFrame(uint64_t streamKey, Vector<uint8_
+ }
+ 
+ #if PS5WK_GPU_RADV
+-bool RemoteQueueProxy::ps5CopyVideoStreamFrameToTexture(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const ::WebGPU::TexelCopyTextureInfo& destination, const ::WebGPU::Extent3D& copySize, bool flipY)
++bool RemoteQueueProxy::ps5CopyVideoStreamFrameToTexture(uint64_t streamKey, uint64_t taskToken, uint32_t videoWidth, uint32_t videoHeight, const ::WebGPU::TexelCopyTextureInfo& destination, const ::WebGPU::Extent3D& copySize, bool flipY)
+ {
+     auto convertedDestination = m_convertToBackingContext->convertToBacking(destination);
+     if (!convertedDestination)
+         return false;
+     // On the stream, in order with the page's other calls (its readback of the texture after it).
+-    auto sendResult = send(Messages::RemoteQueue::CopyVideoStreamFrameToTexturePS5(streamKey, videoWidth, videoHeight, *convertedDestination, copySize, flipY));
++    auto sendResult = send(Messages::RemoteQueue::CopyVideoStreamFrameToTexturePS5(streamKey, taskToken, videoWidth, videoHeight, *convertedDestination, copySize, flipY));
+     return sendResult == IPC::Error::NoError;
+ }
+ #endif
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
+index 6cd29d93c2..c0ffd88475 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteQueueProxy.h
+@@ -67,7 +67,7 @@ public:
+ #if USE(DAWN)
+     bool ps5ReadVideoStreamFrame(uint64_t streamKey, Vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) final;
+ #if PS5WK_GPU_RADV
+-    bool ps5CopyVideoStreamFrameToTexture(uint64_t streamKey, uint32_t videoWidth, uint32_t videoHeight, const ::WebGPU::TexelCopyTextureInfo& destination, const ::WebGPU::Extent3D& copySize, bool flipY) final;
++    bool ps5CopyVideoStreamFrameToTexture(uint64_t streamKey, uint64_t taskToken, uint32_t videoWidth, uint32_t videoHeight, const ::WebGPU::TexelCopyTextureInfo& destination, const ::WebGPU::Extent3D& copySize, bool flipY) final;
+ #endif
+ #endif
+     void setLabel(String&&) final;

@@ -752,7 +752,31 @@ the release build's [results/phase0-20261119-013048/](results/phase0-20261119-01
   1.5 s), the update path from 0.2.2 (it means installing the radv build as
   PPSA99207: updates still name PPSA99207 only), and live tabs (a test run has
   one tab, so they need a normal run, with the owner's session).
-- Overlay GPU time from `EXT_disjoint_timer_query` (today `GPU n/a`).
+- **Follow-ups (2026-11-20)**
+  ([results/radv-followups-20261120-135314/](results/radv-followups-20261120-135314/)):
+  - **Overlay GPU time:** the render thread times each frame's GL work,
+    from its start to the swap, with `EXT_disjoint_timer_query` (ANGLE's,
+    from RADV's 100 MHz timestamps), four queries in a ring, read a few
+    frames late, none while the overlay is off. The overlay's `GPU` shows
+    avg/max (`shots/02--10s.png`: `GPU 0.4/0.7` on a WebGL 1 video page).
+  - **One frame per task for WebGPU video copies** (0144): two
+    `copyExternalImageToTexture(video)` calls in one task could copy
+    different frames (the title took the stream's newest for each). The
+    WebProcess gives each copy the task's token (until the end of its
+    microtask checkpoint); RemoteQueue keeps the shared image of the first
+    copy and makes the task's other copies of that stream from it, Dawn
+    reporting the layout it leaves the image in for the next. New case
+    `video-scaled.html` `same-frame`: 68 tasks of three copies, each of one
+    frame.
+  - **The crash report's code bound:** `_etext` came out 0 (the title's own
+    linker script didn't define it, and `package.sh` nulled the weak
+    reference), so the scan's bound was `__init_array_start`, past
+    `.rodata`. `ps5-pie-webkit.ld` defines it now, at the end of `.text`.
+    The deliberate fault's report is as before (its stack had nothing
+    between the two bounds) and symbolizes to `crashTestDepth` x3,
+    `crashTestThread`, `stack_trampoline`.
+  - **WebGL 1 video in the runner:** `webgl/video.html?gl=1`, case
+    `webgl1-video` (59.9 frames/s), next to `webgl-video`.
 - sRGB WebGL textures fed from video got the frame encoded twice on radv
   (a blit into sRGB encodes, and ANGLE has no `EXT_sRGB_write_control`
   here). Fixed 2026-11-20 with the WebGL 1 fix below: every WebGL context

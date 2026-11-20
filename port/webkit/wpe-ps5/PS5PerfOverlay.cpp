@@ -330,6 +330,8 @@ struct PS5PerfOverlay::Impl {
         unsigned frames, intervals, missed, uploads, composited, ovlFrames;
         double renderSum, renderMax, workSum, workMax, swapSum, swapMax, applySum, videoSum, sceneSum, drawSum, intervalSum, intervalMax, uploadSum;
         double ovlSum, ovlMax;
+        unsigned gpuFrames;
+        double gpuSum, gpuMax;
     } win { };
     int64_t lastSwapEnd { 0 };
     static constexpr unsigned kRing = 512;
@@ -482,6 +484,14 @@ void PS5PerfOverlay::setActive(bool active)
         m_nextUpdateUS = 0;
     }
     g_message("[wpe-ps5] [perf] overlay %s", active ? "on" : "off");
+}
+
+void PS5PerfOverlay::noteGPUTime(double ms)
+{
+    auto& w = m_impl->win;
+    w.gpuFrames++;
+    w.gpuSum += ms;
+    w.gpuMax = std::max(w.gpuMax, ms);
 }
 
 void PS5PerfOverlay::noteFrame(const PS5PerfFrame& f)
@@ -806,8 +816,11 @@ void PS5PerfOverlay::Impl::rebuild(int64_t now, int width, int height, const PS5
         ms(w.intervalMax, 25, 40), w.intervalMax, cLabel, cLabel, cValue, w.workSum / frames, cLabel, ms(w.workMax, 10, 14), w.workMax));
     lines.push_back(format("%c apply %c%.1f %cvideo %c%.1f %cscene %c%.1f %cdraw %c%.1f", cLabel, cValue, w.applySum / frames, cLabel, cValue,
         w.videoSum / frames, cLabel, cValue, w.sceneSum / frames, cLabel, cValue, w.drawSum / frames));
-    lines.push_back(format("%c render %c%.1f%c/%c%.1f %cswap %c%.1f%c/%c%.1f %cGPU %cn/a", cLabel, cValue, w.renderSum / frames, cLabel, cValue,
-        w.renderMax, cLabel, cValue, w.swapSum / frames, cLabel, cValue, w.swapMax, cLabel, cDim));
+    // GPU: the render thread's GL work per frame, start to swap (GPU=radv; ps5-opengl has no
+    // timer queries).
+    std::string gpu = w.gpuFrames ? format("%c%.1f%c/%c%.1f", cValue, w.gpuSum / w.gpuFrames, cLabel, ms(w.gpuMax, 10, 14), w.gpuMax) : format("%cn/a", cDim);
+    lines.push_back(format("%c render %c%.1f%c/%c%.1f %cswap %c%.1f%c/%c%.1f %cGPU %s", cLabel, cValue, w.renderSum / frames, cLabel, cValue,
+        w.renderMax, cLabel, cValue, w.swapSum / frames, cLabel, cValue, w.swapMax, cLabel, gpu.c_str()));
 
     // CPU.
     auto percent = [&](double a, double b) { return haveSample && a >= 0 && b >= 0 ? 100 * (a - b) / sampleSeconds : -1.0; };

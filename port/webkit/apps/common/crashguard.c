@@ -33,8 +33,9 @@
 // that way faulted in ps5wk_crash_guard_install, before the handlers existed.
 extern char __ehdr_start;
 extern char __init_array_start;
-// The end of .text (lld defines it when referenced): the scan's bound when
-// code can't be read. Weak: 0 where the linker doesn't.
+// The end of .text: the scan's bound when code can't be read (a title, whose
+// linker script, ps5-pie-webkit.ld, defines it). Weak: 0 where nothing does
+// (payloads, linked with the SDK's script, whose code can be read).
 extern char _etext __attribute__((weak));
 static uintptr_t textStart, textEnd, codeEnd;
 // Whether the bytes of .text can be read. A title's code is mapped
