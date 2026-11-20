@@ -30,6 +30,7 @@
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
 #include "runtime.h"
+#include "WPEProcessManagerPS5.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -48,15 +49,34 @@ typedef struct {
     unsigned files;
     guint64 bytes;
     int error; /* errno of the first failure */
+    gboolean inData; /* it was in /data/ps5webkit (not reading /app0) */
     char failed[256];
 } CopyState;
 
-static void fail(CopyState* state, const char* what, const char* path)
+static void failWhere(CopyState* state, const char* what, const char* path, gboolean inData)
 {
     if (state->error)
         return;
     state->error = errno ? errno : EIO;
+    state->inData = inData;
     snprintf(state->failed, sizeof state->failed, "%s %s", what, path);
+}
+
+/* A failure writing in /data/ps5webkit. */
+static void fail(CopyState* state, const char* what, const char* path)
+{
+    failWhere(state, what, path, TRUE);
+}
+
+/* A failure reading the title's own files: no repair of /data helps. */
+static void failSource(CopyState* state, const char* what, const char* path)
+{
+    failWhere(state, what, path, FALSE);
+}
+
+static gboolean refusedInData(const CopyState* state)
+{
+    return state->inData && (state->error == EACCES || state->error == EPERM);
 }
 
 static void copyFile(const char* from, const char* to, CopyState* state)
@@ -64,7 +84,7 @@ static void copyFile(const char* from, const char* to, CopyState* state)
     static char buffer[1 << 20];
     int in = open(from, O_RDONLY);
     if (in < 0) {
-        fail(state, "open", from);
+        failSource(state, "open", from);
         return;
     }
     char* tmp = g_strconcat(to, ".tmp", NULL);
@@ -82,7 +102,7 @@ static void copyFile(const char* from, const char* to, CopyState* state)
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0) {
-            fail(state, "read", from);
+            failSource(state, "read", from);
             ok = FALSE;
             break;
         }
@@ -200,7 +220,7 @@ static void copyListed(char** lines, CopyState* state)
             continue;
         if (!listedPathOK(name)) {
             errno = EINVAL;
-            fail(state, "refused", name);
+            failSource(state, "refused", name);
             break;
         }
         char* source = g_build_filename(RUNTIME_FROM, name, NULL);
@@ -221,10 +241,12 @@ static char* readStamp(const char* dir)
     return contents;
 }
 
-int ps5wk_runtime_install(char* error, size_t errorSize)
+int ps5wk_runtime_install(char* error, size_t errorSize, gboolean* dataRefused)
 {
     if (error && errorSize)
         *error = 0;
+    if (dataRefused)
+        *dataRefused = FALSE;
     char* bundled = readStamp(RUNTIME_FROM);
     if (!bundled) {
         /* A development title packaged with NO_RUNTIME=1: the files were
@@ -241,6 +263,8 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
             openAllFolders(lines, &opened);
         spike_log("runtime: %s is up to date (%s)%s%s", RUNTIME_TO, bundled, opened.error ? "; couldn't open " : "",
             opened.error ? opened.failed : "");
+        if (dataRefused)
+            *dataRefused = refusedInData(&opened);
         g_strfreev(lines);
         g_free(installed);
         g_free(bundled);
@@ -251,7 +275,7 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
     gint64 start = g_get_monotonic_time();
     CopyState state = { 0 };
     if (!lines)
-        fail(&state, "read", RUNTIME_FROM "/" RUNTIME_LIST);
+        failSource(&state, "read", RUNTIME_FROM "/" RUNTIME_LIST);
     else if (g_mkdir_with_parents(RUNTIME_TO, 0777))
         fail(&state, "mkdir", RUNTIME_TO);
     else {
@@ -279,5 +303,120 @@ int ps5wk_runtime_install(char* error, size_t errorSize)
     g_strfreev(lines);
     g_free(installed);
     g_free(bundled);
+    if (dataRefused)
+        *dataRefused = result < 0 && refusedInData(&state);
     return result;
+}
+
+/* GitHub issue 3: the title runs as uid 1, its payloads as uid 0, and a
+ * folder a payload made at the default umask (before 0.2.3) is 0755 and
+ * root's: the title can't write in it. Seen as "couldn't install its
+ * files", no icons (the bar's are font glyphs) and no ad blocker (it saves
+ * its lists in adblock/ and browser/contentfilters). A title can't chmod
+ * what isn't its own, and access() can't be trusted in a title
+ * (titlesys.c), so: a test file in each folder the title writes in, and if
+ * one is refused, the restart helper (a payload, root) opens the tree. */
+
+static const char* const writtenFolders[] = {
+    "", "home", "home/cache", "home/tmp", "cache", "cache/fontconfig", "fonts", "adblock", "adblock/work", "browser",
+    "browser/contentfilters", "update", "users",
+};
+
+gboolean ps5wk_data_locked(char* which, size_t whichSize)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(writtenFolders); i++) {
+        char* folder = g_build_filename(RUNTIME_TO, writtenFolders[i], NULL);
+        char* test = g_strdup_printf("%s/.write-test-%d", folder, (int)getpid());
+        int fd = open(test, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        int error = fd < 0 ? errno : 0;
+        if (fd >= 0) {
+            close(fd);
+            unlink(test);
+        }
+        g_free(test);
+        /* A folder that isn't there yet is made by the title itself. */
+        if (error == EACCES || error == EPERM) {
+            if (which && whichSize)
+                snprintf(which, whichSize, "%s (errno %d)", folder, error);
+            g_free(folder);
+            return TRUE;
+        }
+        g_free(folder);
+    }
+    return FALSE;
+}
+
+#define REPAIR_ELF "/app0/ps5wk-relaunch.elf"
+#define REPAIR_TIMEOUT_S 30
+
+/* One repair a run (the title's start): static, so a helper that answers
+ * after the wait gave up writes into something that is still there. */
+static struct {
+    GMutex lock;
+    GCond cond;
+    gboolean ended, done;
+    unsigned changed, failed;
+} repairWait;
+
+static void repairOutput(const char* line, gpointer data)
+{
+    (void)data;
+    unsigned changed, failed;
+    const char* done = strstr(line, "repair done ");
+    if (!done || sscanf(done, "repair done %u %u", &changed, &failed) != 2)
+        return;
+    g_mutex_lock(&repairWait.lock);
+    repairWait.done = TRUE;
+    repairWait.changed = changed;
+    repairWait.failed = failed;
+    g_cond_broadcast(&repairWait.cond); /* the result is in: no need to wait for the connection to close */
+    g_mutex_unlock(&repairWait.lock);
+}
+
+static void repairEnded(gboolean launched, gpointer data)
+{
+    (void)launched;
+    (void)data;
+    g_mutex_lock(&repairWait.lock);
+    repairWait.ended = TRUE;
+    g_cond_broadcast(&repairWait.cond);
+    g_mutex_unlock(&repairWait.lock);
+}
+
+int ps5wk_data_repair(char* error, size_t errorSize)
+{
+    if (error && errorSize)
+        *error = 0;
+    int fd = open(REPAIR_ELF, O_RDONLY);
+    if (fd < 0) {
+        if (error && errorSize)
+            snprintf(error, errorSize, "the restart helper is missing");
+        return -1;
+    }
+    close(fd);
+    /* Before the display connects: a manager of its own, for this task. */
+    WPEProcessManager* manager = wpe_process_manager_ps5_new(NULL);
+    gint64 start = g_get_monotonic_time();
+    if (!wpe_process_manager_ps5_run_task_elf(manager, REPAIR_ELF, "repair", RUNTIME_TO, repairOutput, repairEnded, NULL)) {
+        g_object_unref(manager);
+        if (error && errorSize)
+            snprintf(error, errorSize, "the restart helper couldn't be started");
+        return -1;
+    }
+    gint64 end = start + REPAIR_TIMEOUT_S * G_USEC_PER_SEC;
+    g_mutex_lock(&repairWait.lock);
+    while (!repairWait.done && !repairWait.ended && g_cond_wait_until(&repairWait.cond, &repairWait.lock, end))
+        ;
+    gboolean ended = repairWait.ended, done = repairWait.done;
+    unsigned changed = repairWait.changed, failed = repairWait.failed;
+    g_mutex_unlock(&repairWait.lock);
+    g_object_unref(manager); /* the task holds its own reference */
+    spike_log("runtime: repair %s after %.0f ms: %u opened to all, %u failed", done ? "done" : ended ? "ended without a result" : "TIMED OUT",
+        (g_get_monotonic_time() - start) / 1000.0, changed, failed);
+    if (!done) {
+        if (error && errorSize)
+            snprintf(error, errorSize, ended ? "the restart helper didn't run" : "the restart helper didn't answer in %d s", REPAIR_TIMEOUT_S);
+        return -1;
+    }
+    return (int)changed;
 }
