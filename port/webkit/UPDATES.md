@@ -340,6 +340,29 @@ it), a folder on an external or USB drive, a rename that fails part way,
 the update page waiting out View in VR, and a release built by
 `make-release.sh` (its hook check runs at the next release build).
 
+## 0.3.0 to 0.4.0, console test (2026-11-21)
+
+The zip is `make-release.sh 0.4.0` at `6315e4b`. The updater
+(`updates.c`, `update-job.c`, `ps5update.c`, the restart helper and
+`package.sh`) is the same as in 0.3.0, so the old version was a development
+build of `b2a3843` (with the test hooks) with `contentVersion` set to
+01.003.000, the zip and a feed in the API's form served from the Mac
+(`update-source`, `update-test-yes`, an empty `update-store-root`).
+
+| Step | Result |
+| --- | --- |
+| Check | "newest release v0.4.0 … newer", in 1.2 s |
+| Download, 192 MB | 93-104 s (Wi-Fi), size and SHA-256 checked |
+| Unpack, 471 MB | 14.4 s |
+| Install, first try | Refused: "ProsperoStore manages this install". Only the eboot and the child had been replaced on the console; the restart helper was still a release one (no hooks), which reads the real `/data/prosperostore`, where the store's receipt names this folder. Right for a release. With `update-test-yes` the browser checked and downloaded again at each start (twice), so the file was removed first |
+| Install, with the development helper | Restart now; the helper swapped the folder and started the title |
+| After | 0.4.0 running (release build, no log host): `contentVersion` 01.004.000, `INSTALL.txt` naming `6315e4b`, "the last install: ok 0.4.0", the previous copy in `update/previous`; the link server answers, and the profile's tabs, downloads and download settings are as before |
+
+To test an update, install the whole development title (`launch.sh
+--install`), not only its eboot and child: the restart helper must be a
+development one too. The test files were removed afterwards; 0.4.0 stays
+installed.
+
 ## 0.2.2 to 0.3.0, console test (2026-11-20)
 
 0.3.0 is the first release from the RADV build. The zip is
