@@ -40,6 +40,7 @@ typedef enum { TYPE_CHOICE, TYPE_BOOL, TYPE_NUMBER, TYPE_TEXT } SettingType;
 
 typedef struct {
     const char* id;
+    const char* group;    /* one of groups[]: where the page shows it */
     SettingKind kind;
     SettingType type;
     const char* name;     /* the child.env variable, or the file */
@@ -52,70 +53,95 @@ typedef struct {
     int min, max;         /* numbers */
 } Setting;
 
+/* The page's groups, in its order (the settings below are in that order
+ * too). The page gives general, link, ads and security a place in its first
+ * sections; every other group is a heading in its Advanced section, so a
+ * new group needs no change to the page. */
+static const struct {
+    const char* id;
+    const char* title;
+} groups[] = {
+    { "general", "General" },
+    { "link", "Phone and computer" },
+    { "ads", "Ad blocking" },
+    { "security", "Security" },
+    { "scripts", "Scripts" },
+    { "graphics", "Graphics" },
+    { "video", "Video" },
+    { "memory", "Memory" },
+    { "experimental", "Experimental and diagnostics" },
+};
+
 /* Semantics and defaults: ps5wk-child.cpp (JIT, memory limit), patches
  * 0032 (painting, scrolling), 0031 (decommit), 0017 (hole punch), 0016
  * (VP9), titlevdec.c (no-hwdec), DrawingAreaProxyWCPS5.cpp in WebKit
  * (compositing, WC builds only), adblock.c (adblock: applied at once,
  * ps5browser.c calls ps5wk_adblock_setting_changed), wpe-ps5/PS5Renderer.cpp
  * (perf-overlay, read at start; ps5browser.c applies changes at once and
- * keeps the file in step with the pad's L3 + R3), ps5browser.c (the rest). */
+ * keeps the file in step with the pad's L3 + R3), ps5browser.c (the rest).
+ * Help: the page always shows the first sentence (up to the first ". ") and
+ * the rest behind its More button, so the first one says what the setting
+ * is. What applies a setting is not in the help: the page says it. */
 static const Setting settings[] = {
-    /* Security (the first four: the page's first section) */
-    { "safer", KIND_FLAG_ON, TYPE_BOOL, "safer-browsing", "0", PS5WK_SETTINGS_PAGE, "Safer browsing",
-        "Turns off the JavaScript JIT, WebAssembly, WebGL and WebGPU, where most attacks on browsers start. Pages run slower (scripts several times slower) and some games and 3D sites won't work. The four settings below keep their own values for when it's off. Also the shield button in the browser menu.",
-        NULL, 0, 0 },
-    { "jit", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
-        "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes. Off also removes the most common way in for attacks.",
-        "1=All tiers (fastest)|dfg=Up to DFG|baseline=Baseline only|0=Off (interpreter)", 0, 0 },
-    { "wasm", KIND_ENV, TYPE_BOOL, "PS5WK_WASM", "1", PS5WK_SETTINGS_PAGE, "WebAssembly",
-        "Compiled code that some games, editors and video tools run in the page. Needs the JIT (off with it).",
-        NULL, 0, 0 },
-    { "webgl", KIND_FLAG, TYPE_BOOL, "no-webgl", "1", 0, "WebGL",
-        "3D graphics for pages and games, on the PS5's GPU. Off: games and maps that need it show an error. Applies to pages loaded from now on.",
-        NULL, 0, 0 },
-    { "webgpu", KIND_FLAG, TYPE_BOOL, "no-webgpu", "1", 0, "WebGPU",
-        "The newer 3D and GPU computing interface for pages and games, on the PS5's GPU. Off: sites fall back to WebGL where they can; try it if a site's 3D or video effects misbehave. Applies to pages loaded from now on.",
-        NULL, 0, 0 },
-    { "web_in_title", KIND_FLAG_ON, TYPE_BOOL, "pages-in-browser", "0", PS5WK_SETTINGS_BROWSER, "Pages in the browser process (experimental)",
-        "Runs pages inside the browser itself instead of in a separate process. Faster: pages get more of the PS5's CPU, and games and heavy pages run up to twice as fast. But a page's work shares the browser's own thread, so on busy pages (feeds that keep adding posts) the menu, the pointer and clicks pause for up to a second now and then. Also, a page that crashes closes the whole browser, and pages are not kept apart from the browser. The settings under Pages then apply when the browser restarts. Safer browsing always keeps pages in their own process.",
-        NULL, 0, 0 },
-    { "paint_threads", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
-        "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",
-        "1=1|2=2|3=3|4=4|6=6|8=8", 1, 8 },
-    { "scroll_copy", KIND_ENV, TYPE_BOOL, "PS5WK_SCROLL_COPY", "1", PS5WK_SETTINGS_PAGE, "Fast scrolling",
-        "Scrolling moves the pixels already drawn instead of drawing the whole view again.", NULL, 0, 0 },
-    { "mem_restart_mb", KIND_ENV, TYPE_NUMBER, "PS5WK_MEM_RESTART_MB", "3072", PS5WK_SETTINGS_PAGE, "Page memory limit",
-        "When a page's process has used this much memory, the next link you follow opens in a fresh process, before memory runs out.",
-        "0=Off|2048=2 GB|3072=3 GB|4096=4 GB|6144=6 GB", 0, 16384 },
-    { "pas_decommit", KIND_ENV, TYPE_BOOL, "PS5WK_PAS_DECOMMIT", "1", PS5WK_SETTINGS_PAGE, "Give back freed memory",
-        "Returns memory that pages no longer use to the system. Off keeps it (the old behaviour). The network process picks it up at the next browser start.",
-        NULL, 0, 0 },
-    { "holepunch", KIND_ENV, TYPE_BOOL, "PS5WK_HOLEPUNCH", "1", PS5WK_SETTINGS_PAGE, "Video under the page",
-        "Video is drawn straight to the screen beneath the page, which is smoother. Off paints every frame into the page.", NULL, 0, 0 },
-    { "media_vp9", KIND_ENV, TYPE_BOOL, "PS5WK_MEDIA_VP9", "1", PS5WK_SETTINGS_PAGE, "Offer VP9 video",
-        "Lets sites such as YouTube send VP9. Off makes YouTube send H.264 instead.", NULL, 0, 0 },
-    { "compositing", KIND_FLAG, TYPE_BOOL, "no-compositing", "1", PS5WK_SETTINGS_PAGE, "GPU compositing",
-        "Puts pages together on the GPU, in layers, and scrolls them on the GPU. Off draws pages on the CPU, as before; try it if a page looks wrong.",
-        NULL, 0, 0 },
-    { "hwdec", KIND_FLAG, TYPE_BOOL, "no-hwdec", "1", PS5WK_SETTINGS_BROWSER, "Hardware video decoding",
-        "The PS5's video decoder plays H.264, HEVC and VP9, up to 8K. Off decodes in software (1080p at most).", NULL, 0, 0 },
-    { "sound", KIND_FLAG, TYPE_BOOL, "audio-silent", "1", PS5WK_SETTINGS_BROWSER, "Sound",
-        "Off plays every page at volume 0.", NULL, 0, 0 },
-    { "link_server", KIND_FLAG, TYPE_BOOL, "push-off", "1", PS5WK_SETTINGS_BROWSER, "Link server on the network",
-        "Lets a phone or Mac send links here and open this page (port 9040). Off: only the PS5 itself can open Settings (from the browser menu).",
-        NULL, 0, 0 },
-    { "adblock", KIND_FLAG, TYPE_BOOL, "adblock-off", "1", 0, "Ad blocking",
-        "Blocks ads and trackers with uBlock Origin Lite's network rules, cosmetic filters and scriptlets. Applies at once; sites where ads are allowed, and the lists, are below.",
-        NULL, 0, 0 },
-    { "perf_overlay", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
-        "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",
-        NULL, 0, 0 },
-    { "home_url", KIND_FILE, TYPE_TEXT, "home-url.txt", "", 0, "Home page",
+    /* General: what most people come for */
+    { "home_url", "general", KIND_FILE, TYPE_TEXT, "home-url.txt", "", 0, "Home page",
         "Opens when the browser starts, in new tabs and with Home. Empty: the built-in start page. On the PS5: □ on the Home button in the browser menu makes the page shown the home page, or goes back to the start page.",
         NULL, 0, 0 },
-    { "search", KIND_FILE, TYPE_CHOICE, "search.txt", "google", 0, "Search engine",
+    { "search", "general", KIND_FILE, TYPE_CHOICE, "search.txt", "google", 0, "Search engine",
         "Searches for words typed in the address bar or on the start page, when they aren't an address.",
         "google=Google|bing=Bing|duckduckgo=DuckDuckGo|ddglite=DuckDuckGo Lite|brave=Brave Search|ecosia=Ecosia|startpage=Startpage", 0, 0 },
+    { "sound", "general", KIND_FLAG, TYPE_BOOL, "audio-silent", "1", PS5WK_SETTINGS_BROWSER, "Sound",
+        "Off plays every page at volume 0.", NULL, 0, 0 },
+    { "link_server", "link", KIND_FLAG, TYPE_BOOL, "push-off", "1", PS5WK_SETTINGS_BROWSER, "Link server on the network",
+        "Lets a phone or Mac send links here and open this page (port 9040). Off: only the PS5 itself can open Settings (from the browser menu).",
+        NULL, 0, 0 },
+    { "adblock", "ads", KIND_FLAG, TYPE_BOOL, "adblock-off", "1", 0, "Ad blocking",
+        "Blocks ads and trackers on every site, except the sites where you allow ads. Uses uBlock Origin Lite's network rules, cosmetic filters and scriptlets. Applies at once.",
+        NULL, 0, 0 },
+    /* Security: Safer browsing; what it turns off is under Scripts,
+     * Graphics and Experimental (isOverriddenBySafer) */
+    { "safer", "security", KIND_FLAG_ON, TYPE_BOOL, "safer-browsing", "0", PS5WK_SETTINGS_PAGE, "Safer browsing",
+        "Turns off the JavaScript JIT, WebAssembly, WebGL and WebGPU, where most attacks on browsers start. Pages run slower (scripts several times slower) and some games and 3D sites won't work. Those four settings (under Advanced) keep their own values for when it's off. Also the shield button in the browser menu.",
+        NULL, 0, 0 },
+    /* Advanced */
+    { "jit", "scripts", KIND_ENV, TYPE_CHOICE, "PS5WK_JIT", "1", PS5WK_SETTINGS_PAGE, "JavaScript JIT",
+        "Compiles page scripts to machine code. Lower tiers or Off are slower; try them if a site crashes. Off also removes the most common way in for attacks.",
+        "1=All tiers (fastest)|dfg=Up to DFG|baseline=Baseline only|0=Off (interpreter)", 0, 0 },
+    { "wasm", "scripts", KIND_ENV, TYPE_BOOL, "PS5WK_WASM", "1", PS5WK_SETTINGS_PAGE, "WebAssembly",
+        "Compiled code that some games, editors and video tools run in the page. Needs the JIT (off with it).",
+        NULL, 0, 0 },
+    { "webgl", "graphics", KIND_FLAG, TYPE_BOOL, "no-webgl", "1", 0, "WebGL",
+        "3D graphics for pages and games, on the PS5's GPU. Off: games and maps that need it show an error. Applies to pages loaded from now on.",
+        NULL, 0, 0 },
+    { "webgpu", "graphics", KIND_FLAG, TYPE_BOOL, "no-webgpu", "1", 0, "WebGPU",
+        "The newer 3D and GPU computing interface for pages and games, on the PS5's GPU. Off: sites fall back to WebGL where they can; try it if a site's 3D or video effects misbehave. Applies to pages loaded from now on.",
+        NULL, 0, 0 },
+    { "compositing", "graphics", KIND_FLAG, TYPE_BOOL, "no-compositing", "1", PS5WK_SETTINGS_PAGE, "GPU compositing",
+        "Puts pages together on the GPU, in layers, and scrolls them on the GPU. Off draws pages on the CPU, as before; try it if a page looks wrong.",
+        NULL, 0, 0 },
+    { "paint_threads", "graphics", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
+        "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",
+        "1=1|2=2|3=3|4=4|6=6|8=8", 1, 8 },
+    { "scroll_copy", "graphics", KIND_ENV, TYPE_BOOL, "PS5WK_SCROLL_COPY", "1", PS5WK_SETTINGS_PAGE, "Fast scrolling",
+        "Scrolling moves the pixels already drawn instead of drawing the whole view again.", NULL, 0, 0 },
+    { "hwdec", "video", KIND_FLAG, TYPE_BOOL, "no-hwdec", "1", PS5WK_SETTINGS_BROWSER, "Hardware video decoding",
+        "The PS5's video decoder plays H.264, HEVC and VP9, up to 8K. Off decodes in software (1080p at most).", NULL, 0, 0 },
+    { "media_vp9", "video", KIND_ENV, TYPE_BOOL, "PS5WK_MEDIA_VP9", "1", PS5WK_SETTINGS_PAGE, "Offer VP9 video",
+        "Lets sites such as YouTube send VP9. Off makes YouTube send H.264 instead.", NULL, 0, 0 },
+    { "holepunch", "video", KIND_ENV, TYPE_BOOL, "PS5WK_HOLEPUNCH", "1", PS5WK_SETTINGS_PAGE, "Video under the page",
+        "Video is drawn straight to the screen beneath the page, which is smoother. Off paints every frame into the page.", NULL, 0, 0 },
+    { "mem_restart_mb", "memory", KIND_ENV, TYPE_NUMBER, "PS5WK_MEM_RESTART_MB", "3072", PS5WK_SETTINGS_PAGE, "Page memory limit",
+        "When a page's process has used this much memory, the next link you follow opens in a fresh process, before memory runs out.",
+        "0=Off|2048=2 GB|3072=3 GB|4096=4 GB|6144=6 GB", 0, 16384 },
+    { "pas_decommit", "memory", KIND_ENV, TYPE_BOOL, "PS5WK_PAS_DECOMMIT", "1", PS5WK_SETTINGS_PAGE, "Give back freed memory",
+        "Returns memory that pages no longer use to the system. Off keeps it (the old behaviour). The network process picks it up at the next browser start.",
+        NULL, 0, 0 },
+    { "web_in_title", "experimental", KIND_FLAG_ON, TYPE_BOOL, "pages-in-browser", "0", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
+        "Runs pages inside the browser itself instead of in a separate process. Faster: pages get more of the PS5's CPU, and games and heavy pages run up to twice as fast. But a page's work shares the browser's own thread, so on busy pages (feeds that keep adding posts) the menu, the pointer and clicks pause for up to a second now and then. Also, a page that crashes closes the whole browser, and pages are not kept apart from the browser. Settings that need a page restart then need a browser restart. Safer browsing always keeps pages in their own process.",
+        NULL, 0, 0 },
+    { "perf_overlay", "experimental", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
+        "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",
+        NULL, 0, 0 },
 };
 #define SETTING_COUNT (sizeof settings / sizeof settings[0])
 
@@ -312,16 +338,11 @@ static void appendJSONString(GString* out, const char* s)
     g_string_append_c(out, '"');
 }
 
-/* The page's Security section: Safer browsing and what it turns off. */
+/* What Safer browsing turns off while it is on. */
 static gboolean isOverriddenBySafer(const Setting* s)
 {
     return !strcmp(s->id, "jit") || !strcmp(s->id, "wasm") || !strcmp(s->id, "webgl") || !strcmp(s->id, "webgpu")
         || !strcmp(s->id, "web_in_title");
-}
-
-static gboolean isSecurity(const Setting* s)
-{
-    return !strcmp(s->id, "safer") || isOverriddenBySafer(s);
 }
 
 static const char* scopeName(int scope)
@@ -361,7 +382,7 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append(out, ",\"inUse\":");
         appendJSONString(out, s->scope && applied[i] ? applied[i] : value);
         g_string_append_printf(out, ",\"restart\":\"%s\",\"pending\":%s,\"group\":\"%s\"", scopeName(scope),
-            waiting ? "true" : "false", isSecurity(s) ? "security" : s->kind == KIND_ENV || s->scope == PS5WK_SETTINGS_PAGE ? "page" : "browser");
+            waiting ? "true" : "false", s->group);
         /* Safer browsing on (on disk): these say they are off whatever
          * their own value is. */
         if (saferOn && isOverriddenBySafer(s))
@@ -392,9 +413,11 @@ char* ps5wk_settings_json(const char* extra)
         g_string_append_c(out, '}');
         g_free(value);
     }
-    g_string_append_printf(out, "],\"pagesInBrowser\":%s,\"pending\":{\"page\":%s,\"browser\":%s},\"groups\":{\"security\":\"Security\",\"page\":\"Pages\",\"browser\":\"Browser\"},"
-        "\"statusSerial\":%u,\"status\":", pagesInBrowser ? "true" : "false", pending[PS5WK_SETTINGS_PAGE] ? "true" : "false",
-        pending[PS5WK_SETTINGS_BROWSER] ? "true" : "false", statusSerial);
+    g_string_append_printf(out, "],\"pagesInBrowser\":%s,\"pending\":{\"page\":%s,\"browser\":%s},\"groups\":{", pagesInBrowser ? "true" : "false",
+        pending[PS5WK_SETTINGS_PAGE] ? "true" : "false", pending[PS5WK_SETTINGS_BROWSER] ? "true" : "false");
+    for (size_t i = 0; i < G_N_ELEMENTS(groups); i++)
+        g_string_append_printf(out, "%s\"%s\":\"%s\"", i ? "," : "", groups[i].id, groups[i].title);
+    g_string_append_printf(out, "},\"statusSerial\":%u,\"status\":", statusSerial);
     appendJSONString(out, status ? status : "");
     g_string_append(out, "}\n");
     g_free(env);
@@ -780,10 +803,19 @@ const char* ps5wk_settings_search_url(void)
 }
 
 /* The settings page: built from /settings.json by its script (no innerHTML:
- * every value is set as text). Large controls with a clear focus ring for
- * the D-pad (spatial navigation) at 1920x1080, buttons instead of <select>
- * (WPE has no popup menus here), and a second press to confirm what is
- * hard to undo. Light and dark. */
+ * every value is set as text). Five sections, one shown at a time, picked
+ * from a list of buttons (beside the section from 900 px wide, as on the TV;
+ * above it on a phone): General, Ads & privacy, Cookies & storage, Advanced,
+ * Update & restart. A setting is one row: its name, the first sentence of its
+ * help (More shows the rest), what it needs to apply, and its buttons. The
+ * status line and the restart banner stay in view (beside the section, or
+ * stuck to the top).
+ * For the D-pad (spatial navigation) at 1920x1080 and 960x540: large
+ * controls with a clear focus ring; every button of a row on the row's right
+ * edge, so up and down go from row to row and left and right along a row;
+ * Left from a row's first button goes to the section list (the script does
+ * that one move itself). Buttons instead of <select> (WPE has no popup menus
+ * here), and a second press to confirm what is hard to undo. Light and dark. */
 const char ps5wk_settings_page[] =
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
@@ -794,89 +826,175 @@ const char ps5wk_settings_page[] =
     "@media(prefers-color-scheme:dark){:root{--bg:#07061f;--fg:#f4f2ff;--muted:#b9b5e0;--card:#110f35;--line:#2b2766;--accent:#a77bff;--on:#01001a;--warn:#ffb648;--focus:#ff5cd6}}\n"
     ":root.tv{color-scheme:dark;--bg:#07061f;--fg:#f4f2ff;--muted:#b9b5e0;--card:#110f35;--line:#2b2766;--accent:#a77bff;--on:#01001a;--warn:#ffb648;--focus:#ff5cd6}\n"
     "*{box-sizing:border-box}\n"
+    "[hidden]{display:none!important}\n"
     "html{font-size:clamp(16px,1.25vw,26px)}\n"
     "body{margin:0;background:var(--bg);color:var(--fg);font:1rem/1.45 -apple-system,system-ui,sans-serif}\n"
-    "main{max-width:56rem;margin:0 auto;padding:1.2rem 16px 3rem}\n"
-    "header{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}\n"
+    "::selection{background:var(--accent);color:var(--on)}\n"
+    "main{max-width:62rem;margin:0 auto;padding:1rem 16px 3rem}\n"
+    "header{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;margin-bottom:.9rem}\n"
     "header img{width:2.6rem;height:2.6rem;margin:-.2rem}\n"
     "h1{font-size:1.6rem;margin:0;flex:1}\n"
     "h1 span{display:block;font-size:.8rem;font-weight:600;color:var(--muted);letter-spacing:.02em}\n"
-    "#phone{display:flex;gap:1.2rem;align-items:center}#phone[hidden]{display:none}\n"
-    "#phone svg{flex:none;width:11rem;height:11rem;border-radius:.6rem}\n"
-    "#phone .name{display:block;margin-bottom:.3rem}\n"
-    "#phone code{font-size:1.15rem;font-weight:600;color:var(--fg)}\n"
-    "h2{font-size:1rem;margin:1.8rem 0 .4rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}\n"
-    ".card{background:var(--card);border:1px solid var(--line);border-radius:.8rem;padding:.9rem 1rem;margin:.5rem 0}\n"
-    ".row{display:flex;flex-wrap:wrap;gap:.3rem .8rem;align-items:baseline}\n"
-    ".name{font-weight:600;font-size:1.1rem}\n"
-    ".badge{font-size:.8rem;padding:.05rem .55rem;border-radius:1rem;border:1px solid var(--line);color:var(--muted);white-space:nowrap}\n"
+    "h2{font-size:.9rem;margin:1.5rem 0 .4rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}\n"
+    "#side{display:contents}\n"
+    "nav{display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:.5rem}\n"
+    "nav button{text-align:left}\n"
+    "nav button[aria-current=true]{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 22%,transparent);font-weight:600}\n"
+    "nav .badge{margin-left:.5rem;border-color:var(--accent);color:var(--accent);font-weight:600}\n"
+    "#live{position:sticky;top:0;z-index:2;background:var(--bg)}\n"
+    "#status{margin:0;padding:.35rem 0;font-weight:600}\n"
+    "#status:empty{display:none}\n"
+    "#status.new{animation:said 1.4s ease-out}\n"
+    "@keyframes said{from{color:var(--accent)}}\n"
+    "@media(prefers-reduced-motion:reduce){#status.new{animation:none}}\n"
+    "#banner{border:2px solid var(--warn);border-radius:.8rem;padding:.6rem .8rem;margin:.2rem 0 .6rem;background:var(--card)}\n"
+    "#banner p{margin:0 0 .5rem}\n"
+    ".panel{background:var(--card);border:1px solid var(--line);border-radius:.8rem;padding:0 1rem;margin:.5rem 0}\n"
+    ".panel.pad{padding:.9rem 1rem}\n"
+    ".pad>p:first-child{margin-top:0}\n"
+    ".row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.2rem;padding:.8rem 0;border-bottom:1px solid var(--line)}\n"
+    ".panel>.row:last-child,.panel>.rows:last-child>.row:last-child{border-bottom:0}\n"
+    ".txt{flex:1 1 20rem;min-width:0}\n"
+    ".name{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .6rem;font-weight:600;font-size:1.08rem}\n"
+    ".badge{font-size:.8rem;font-weight:400;padding:.05rem .55rem;border-radius:1rem;border:1px solid var(--line);color:var(--muted);white-space:nowrap}\n"
     ".badge.wait{border-color:var(--warn);color:var(--warn);font-weight:600}\n"
-    ".card.overridden .seg{opacity:.55}\n"
-    ".help{color:var(--muted);margin:.25rem 0 .6rem}\n"
-    ".seg{display:flex;flex-wrap:wrap;gap:.5rem}\n"
+    ".help{color:var(--muted);margin:.2rem 0 0;font-size:.94rem;max-width:42rem}\n"
+    ".pad .help{margin:.3rem 0 .6rem}\n"
+    ".pad>:last-child{margin-bottom:0}\n"
+    ".panel>.pad{padding:.8rem 0}\n"
+    ".row.overridden .seg{opacity:.55}\n"
+    ".seg{display:flex;flex-wrap:wrap;align-items:center;gap:.45rem;max-width:100%}\n"
+    ".wide{flex:1 1 100%}\n"
+    ".seg:empty{display:none}\n"
     "button,input{font:inherit;color:inherit}\n"
-    "button{min-height:2.6rem;padding:.45rem 1rem;border-radius:.6rem;border:2px solid var(--line);background:transparent;cursor:pointer}\n"
+    "button{min-height:2.5rem;padding:.4rem .95rem;border-radius:.6rem;border:2px solid var(--line);background:transparent;cursor:pointer}\n"
     "button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--on);font-weight:600}\n"
     "button.primary{background:var(--accent);border-color:var(--accent);color:var(--on);font-weight:600}\n"
     "button.danger{border-color:var(--warn);color:var(--warn)}\n"
     "button.armed{background:var(--warn);border-color:var(--warn);color:var(--on)}\n"
+    "button:disabled{opacity:.5;cursor:default}\n"
+    "button.more{order:1;margin-left:auto;min-height:1.8rem;padding:0 .7rem;border-width:1px;border-radius:1rem;font-size:.85rem;color:var(--accent)}\n"
     "button:focus,input:focus{outline:5px solid var(--focus);outline-offset:3px}\n"
-    "input{flex:1;min-width:10rem;min-height:2.6rem;padding:.45rem .8rem;border:2px solid var(--line);border-radius:.6rem;background:var(--bg)}\n"
-    ".def{font-weight:400;opacity:.8}\n"
-    "#status{min-height:1.5em;margin:.6rem 0;font-weight:600}\n"
-    "#banner{border-color:var(--warn)}\n"
-    ".note{color:var(--muted)}\n"
+    "input{flex:1;min-width:10rem;min-height:2.5rem;padding:.4rem .8rem;border:2px solid var(--line);border-radius:.6rem;background:var(--bg);caret-color:var(--accent)}\n"
+    "#phone svg{flex:none;width:11rem;height:11rem;border-radius:.6rem}\n"
+    "#phone code{display:block;margin-top:.3rem;font-size:1.15rem;font-weight:600;color:var(--fg)}\n"
+    ".note{color:var(--muted);font-size:.94rem;max-width:42rem}\n"
     "code{word-break:break-all}\n"
-    ".sizes{width:100%;border-collapse:collapse;margin:.2rem 0 .6rem}.sizes td{padding:.3rem 0;border-bottom:1px solid var(--line)}\n"
+    ".sizes{width:100%;border-collapse:collapse;margin:.2rem 0 .8rem}.sizes td{padding:.3rem 0;border-bottom:1px solid var(--line)}\n"
     ".sizes td:last-child{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;padding-left:1rem}.sizes tr.total td{font-weight:600;border-bottom:0}\n"
+    "@media(min-width:900px){\n"
+    "#app{display:grid;grid-template-columns:14rem minmax(0,1fr);gap:0 1.6rem;align-items:start}\n"
+    "#side{display:block;position:sticky;top:.8rem}\n"
+    "nav{flex-direction:column;flex-wrap:nowrap}\n"
+    "#live{position:static}\n"
+    "#banner button{flex:1 1 100%}\n"
+    ".row>.seg{margin-left:auto;justify-content:flex-end}\n"
+    "button.more{order:0;margin-left:0}\n"
+    ".row>.seg.wide{margin-left:0;justify-content:flex-start}\n"
+    ".seg.wide>button.more{order:1;margin-left:auto}\n"
+    "#content>section>:first-child{margin-top:0}\n"
+    "}\n"
     "</style></head><body><main>\n"
     "<header><img src=\"/logo.png\" alt=\"\" onerror=\"this.remove()\"><h1><span>Parallax</span>Browser settings</h1><button id=\"back\" hidden>Back to the page</button></header>\n"
-    "<p id=\"status\" role=\"status\">Loading…</p>\n"
-    "<div id=\"phone\" class=\"card\" hidden></div>\n"
-    "<div id=\"banner\" class=\"card\" hidden><p id=\"bannerText\"></p><div class=\"seg\"><button id=\"bannerPage\" class=\"primary\" hidden>Restart page</button><button id=\"bannerBrowser\" class=\"primary\" hidden>Restart browser</button></div></div>\n"
-    "<div id=\"pinbox\" class=\"card\" hidden><p>This PS5 asks for the link server's PIN.</p><div class=\"row\"><input id=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" placeholder=\"PIN\"><button id=\"pinok\" class=\"primary\">OK</button></div></div>\n"
-    "<div id=\"list\"></div>\n"
-    "<div id=\"actions\" hidden>\n"
-    "<h2>Updates</h2>\n"
-    "<div class=\"card\" id=\"upCard\" hidden><div class=\"row\"><span class=\"name\" id=\"upVersion\"></span></div><p class=\"help\" id=\"upText\"></p>"
-    "<div class=\"seg\"><button id=\"upCheck\">Check for updates</button><button id=\"upOpen\" class=\"primary\" hidden>Open the update</button></div></div>\n"
-    "<h2>Ad blocking</h2>\n"
-    "<div class=\"card\" id=\"abSite\" hidden><div class=\"row\"><span class=\"name\" id=\"abSiteName\"></span><span class=\"badge\" id=\"abSiteBadge\"></span></div><p class=\"help\" id=\"abSiteHelp\"></p><div class=\"seg\"><button id=\"abSiteButton\" class=\"primary\"></button></div></div>\n"
-    "<div class=\"card\"><div class=\"row\"><span class=\"name\">Sites where ads are allowed</span></div><p class=\"help\" id=\"abSitesHelp\"></p><div class=\"seg\" id=\"abSites\"></div></div>\n"
-    "<div class=\"card\"><div class=\"row\"><span class=\"name\">Lists</span></div><p class=\"help\" id=\"abList\"></p><p class=\"help\" id=\"abStatus\"></p><div class=\"seg\"><button id=\"abUpdate\">Update lists now</button></div></div>\n"
-    "<h2>Gamepad mode</h2>\n"
-    "<div class=\"card\"><div class=\"row\"><span class=\"name\">Controls per site</span></div>"
-    "<p class=\"help\">Gamepad mode gives a game the whole controller (hold △ on the page to turn it on, Options to leave it), with keys on its buttons for keyboard games.</p>"
-    "<div class=\"seg\"><button id=\"gpOpen\" onclick=\"location.href=(location.protocol=='parallax:'?'parallax://gamepad':'/gamepad')+(pin?'?pin='+encodeURIComponent(pin):'')\">Button mapping</button></div></div>\n"
-    "<h2>Downloads</h2>\n"
-    "<div class=\"card\" id=\"dlCard\"><div class=\"row\"><span class=\"name\">Downloads folder</span><span class=\"badge\" id=\"dlFree\"></span></div>"
-    "<p class=\"help\"><code id=\"dlFolder\"></code></p><p class=\"help\" id=\"dlCount\"></p>"
-    "<div class=\"seg\"><button id=\"dlClear\" class=\"danger\">Clear finished downloads</button></div></div>\n"
-    "<h2>Storage</h2>\n"
-    "<div class=\"card\" id=\"stCard\"><div class=\"row\"><span class=\"name\" id=\"stUser\"></span><span class=\"badge\" id=\"stFree\"></span></div>"
-    "<p class=\"help\">Each PS5 user has their own cookies, cache, history, bookmarks, tabs and downloads.</p>"
-    "<table class=\"sizes\" id=\"stMine\"></table><p class=\"help\">On this PS5, shared by every user:</p><table class=\"sizes\" id=\"stShared\"></table>"
-    "<p class=\"help\">Clearing the cache only makes pages load more slowly the next time. Clearing cookies logs you out of every site. Clearing all website data also removes the cache, local storage and site databases. Your history, bookmarks and downloads stay.</p>\n"
-    "<div class=\"seg\"><button id=\"clearCache\">Clear cache</button><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
-    "<h2>Restart</h2>\n"
-    "<div class=\"card\"><p class=\"help\" id=\"restartHelp\">Restart page: the page's process starts again with the settings above (Pages). Restart browser: the browser closes and opens again on the page you were on (Browser settings).</p>\n"
-    "<div class=\"seg\"><button id=\"restartPage\">Restart page</button><button id=\"restartBrowser\">Restart browser</button></div></div>\n"
-    "<p class=\"note\" id=\"where\"></p>\n"
-    "<p class=\"note\">On the PS5: Options, then Settings (⚙) in the browser menu opens this page; O goes back. Ad blocking for the page you came from: the first card under Ad blocking.</p>\n"
+    "<div id=\"pinbox\" class=\"panel pad\" hidden><p>This PS5 asks for the link server's PIN.</p><div class=\"seg\"><input id=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" placeholder=\"PIN\"><button id=\"pinok\" class=\"primary\">OK</button></div></div>\n"
+    "<div id=\"app\"><div id=\"side\">\n"
+    "<nav id=\"nav\" aria-label=\"Sections\" hidden>\n"
+    "<button id=\"n-general\">General</button>\n"
+    "<button id=\"n-ads\">Ads &amp; privacy</button>\n"
+    "<button id=\"n-storage\">Cookies &amp; storage</button>\n"
+    "<button id=\"n-advanced\">Advanced</button>\n"
+    "<button id=\"n-system\">Update &amp; restart<span class=\"badge\" id=\"upBadge\" hidden></span></button>\n"
+    "</nav>\n"
+    "<div id=\"live\"><p id=\"status\" role=\"status\">Loading…</p>\n"
+    "<div id=\"banner\" hidden><p id=\"bannerText\"></p><div class=\"seg\"><button id=\"bannerPage\" class=\"primary\" hidden>Restart page</button><button id=\"bannerBrowser\" class=\"primary\" hidden>Restart browser</button></div></div></div>\n"
+    "</div><div id=\"content\" hidden>\n"
+    "<section id=\"t-general\" aria-labelledby=\"n-general\">\n"
+    "<div class=\"panel\"><div class=\"rows\" data-group=\"general\"></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Gamepad mode</div><p class=\"help\">Gives a game the whole controller, with keys on its buttons for keyboard games. Hold △ on the page to turn it on, Options to leave it.</p></div>\n"
+    "<div class=\"seg\"><button id=\"gpOpen\" onclick=\"location.href=(location.protocol=='parallax:'?'parallax://gamepad':'/gamepad')+(pin?'?pin='+encodeURIComponent(pin):'')\">Button mapping</button></div></div></div>\n"
+    "<h2>Phone and computer</h2>\n"
+    "<div class=\"panel\"><div id=\"phone\" class=\"row\" hidden></div><div class=\"rows\" data-group=\"link\"></div></div>\n"
+    "</section>\n"
+    "<section id=\"t-ads\" aria-labelledby=\"n-ads\" hidden>\n"
+    "<div class=\"panel\">\n"
+    "<div class=\"row\" id=\"abSite\" hidden><div class=\"txt\"><div class=\"name\"><span id=\"abSiteName\"></span><span class=\"badge\" id=\"abSiteBadge\"></span></div><p class=\"help\" id=\"abSiteHelp\"></p></div><div class=\"seg\"><button id=\"abSiteButton\" class=\"primary\"></button></div></div>\n"
+    "<div class=\"rows\" data-group=\"ads\"></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Sites where ads are allowed</div><p class=\"help\" id=\"abSitesHelp\"></p></div><div class=\"seg wide\" id=\"abSites\"></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Filter lists</div><p class=\"help\" id=\"abStatus\"></p><p class=\"help\" id=\"abList\" hidden></p></div><div class=\"seg\"><button id=\"abMore\" class=\"more\"></button><button id=\"abUpdate\">Update lists now</button></div></div>\n"
     "</div>\n"
+    "<h2>Security</h2>\n"
+    "<div class=\"panel\"><div class=\"rows\" data-group=\"security\"></div></div>\n"
+    "</section>\n"
+    "<section id=\"t-storage\" aria-labelledby=\"n-storage\" hidden>\n"
+    "<div class=\"panel\" id=\"stCard\"><div class=\"row\"><div class=\"txt\"><div class=\"name\"><span id=\"stUser\"></span><span class=\"badge\" id=\"stFree\"></span></div>\n"
+    "<p class=\"help\">Clearing the cache only makes pages load more slowly the next time. Clearing cookies logs you out of every site. Clearing all website data also removes the cache, local storage and site databases. Your history, bookmarks and downloads stay.</p></div>\n"
+    "<div class=\"seg\"><button id=\"clearCache\">Clear cache</button><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
+    "<div class=\"pad\"><p class=\"help\">Each PS5 user has their own cookies, cache, history, bookmarks, tabs and downloads.</p>\n"
+    "<table class=\"sizes\" id=\"stMine\"></table><p class=\"help\">On this PS5, shared by every user:</p><table class=\"sizes\" id=\"stShared\"></table></div></div>\n"
+    "<div id=\"dlCard\"><h2>Downloads</h2>\n"
+    "<div class=\"panel\"><div class=\"row\"><div class=\"txt\"><div class=\"name\">Downloads folder<span class=\"badge\" id=\"dlFree\"></span></div><p class=\"help\"><code id=\"dlFolder\"></code></p><p class=\"help\" id=\"dlCount\"></p></div>\n"
+    "<div class=\"seg\"><button id=\"dlClear\" class=\"danger\">Clear finished downloads</button></div></div></div></div>\n"
+    "</section>\n"
+    "<section id=\"t-advanced\" aria-labelledby=\"n-advanced\" hidden>\n"
+    "<p class=\"note\">For fixing a site that misbehaves, or tuning speed. The defaults suit almost every site.</p>\n"
+    "<div id=\"advGroups\"></div>\n"
+    "</section>\n"
+    "<section id=\"t-system\" aria-labelledby=\"n-system\" hidden>\n"
+    "<div class=\"panel\" id=\"upCard\" hidden><div class=\"row\"><div class=\"txt\"><div class=\"name\" id=\"upVersion\"></div><p class=\"help\" id=\"upText\"></p></div>\n"
+    "<div class=\"seg\"><button id=\"upCheck\">Check for updates</button><button id=\"upOpen\" class=\"primary\" hidden>Open the update</button></div></div></div>\n"
+    "<div class=\"panel\"><div class=\"row\" id=\"restartPageRow\"><div class=\"txt\"><div class=\"name\">Restart page</div><p class=\"help\">The page's process starts again, with the settings that need a page restart.</p></div><div class=\"seg\"><button id=\"restartPage\">Restart page</button></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Restart browser</div><p class=\"help\" id=\"restartHelp\"></p></div><div class=\"seg\"><button id=\"restartBrowser\">Restart browser</button></div></div></div>\n"
+    "<p class=\"note\" id=\"where\"></p>\n"
+    "<p class=\"note\">On the PS5: Options, then Settings (⚙) in the browser menu opens this page; O goes back. Ads on the page you came from: Ads &amp; privacy.</p>\n"
+    "</section>\n"
+    "</div></div>\n"
     "<script>\n"
-    "var S=null,pin='',started=0,polling=0;\n"
+    "var S=null,pin='',started=0,polling=0,tab='general',open={},slots={};\n"
     "try{pin=sessionStorage.getItem('ps5pin')||''}catch(e){}\n"
     "var query=new URLSearchParams(location.search);if(query.get('pin'))pin=query.get('pin');\n"
     "var onPS5=location.protocol=='parallax:'||location.hostname=='127.0.0.1'||location.hostname=='localhost';\n"
+    "var TABS=['general','ads','storage','advanced','system'];\n"
     "function $(id){return document.getElementById(id)}\n"
     "function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}\n"
-    "function say(t){$('status').textContent=t||''}\n"
+    "/* The result of every press: beside the sections on a wide screen, stuck to the top on a narrow one. */\n"
+    "function say(t){var s=$('status');s.textContent=t||'';s.classList.remove('new');if(t){void s.offsetWidth;s.classList.add('new')}}\n"
     "function api(method,path,body){\n"
     "  var h={'Accept':'application/json'};if(pin)h['X-PS5-PIN']=pin;if(body)h['Content-Type']='application/json';\n"
     "  return fetch(path,{method:method,headers:h,body:body?JSON.stringify(body):undefined,cache:'no-store'})\n"
     "    .then(function(r){return r.json().then(function(j){j.code=r.status;return j},function(){return{ok:false,code:r.status,error:'HTTP '+r.status}})});\n"
     "}\n"
+    "/* One section at a time: X on a section's button shows it (#advanced in the address opens on one). */\n"
+    "function show(t,keep){\n"
+    "  if(TABS.indexOf(t)<0)t='general';tab=t;\n"
+    "  TABS.forEach(function(x){$('t-'+x).hidden=x!=t;$('n-'+x).setAttribute('aria-current',String(x==t))});\n"
+    "  if(!keep)window.scrollTo(0,0);\n"
+    "  if(!onPS5)try{sessionStorage.setItem('ps5tab',t)}catch(e){}\n"
+    "}\n"
+    "TABS.forEach(function(x){$('n-'+x).onclick=function(){show(x)}});\n"
+    "(function(){var t=location.hash.slice(1);if(!t&&!onPS5)try{t=sessionStorage.getItem('ps5tab')}catch(e){}show(t,1)})();\n"
+    "[].forEach.call(document.querySelectorAll('[data-group]'),function(g){slots[g.getAttribute('data-group')]=g});\n"
+    "/* D-pad on the PS5, inside a section. The script makes three moves itself, so that they do not depend on how\n"
+    "   spatial navigation scores what is near: Up and Down go to the nearest button on the line above or below, row\n"
+    "   after row, and Left from the first button of a line goes to the section list (when that is beside the\n"
+    "   section). The rest is the browser's: along a line, in the section list, Up from the first line. */\n"
+    "document.addEventListener('keydown',function(e){\n"
+    "  var k=e.key,a=document.activeElement,down=k=='ArrowDown';\n"
+    "  if(!onPS5||e.defaultPrevented||(!down&&k!='ArrowUp'&&k!='ArrowLeft')||!a||!a.closest||!a.closest('#content .row'))return;\n"
+    "  var box=a.getBoundingClientRect(),n=$('n-'+tab),first=null,best=null;\n"
+    "  var near=[].map.call($('t-'+tab).querySelectorAll('button,input'),function(b){return{b:b,q:b.getBoundingClientRect()}})\n"
+    "    .filter(function(c){return c.b!=a&&!c.b.disabled&&c.q.width});\n"
+    "  if(k=='ArrowLeft'){\n"
+    "    if((a.tagName=='INPUT'&&a.value)||n.getBoundingClientRect().right>box.left)return;\n"
+    "    if(near.some(function(c){return c.q.right<=box.left+1&&c.q.bottom>box.top&&c.q.top<box.bottom}))return;\n"
+    "    e.preventDefault();n.focus();return;\n"
+    "  }\n"
+    "  near.forEach(function(c){c.d=down?c.q.top-box.bottom:box.top-c.q.bottom;if(c.d>=-1&&(!first||c.d<first.d))first=c});\n"
+    "  if(!first)return;\n"
+    "  near.forEach(function(c){var mid=(c.q.top+c.q.bottom)/2;if(c.d<-1||mid<first.q.top-1||mid>first.q.bottom+1)return;\n"
+    "    c.gap=Math.max(0,c.q.left-box.right,box.left-c.q.right);c.edge=Math.abs(c.q.right-box.right);\n"
+    "    if(!best||c.gap<best.gap||(c.gap==best.gap&&c.edge<best.edge))best=c});\n"
+    "  e.preventDefault();best.b.focus();best.b.closest('.row').scrollIntoView({block:'nearest'});\n"
+    "});\n"
     "function applies(s){return s.restart=='page'?'Restart page to apply':s.restart=='browser'?'Restart browser to apply':'No restart needed'}\n"
     "function options(s){\n"
     "  var o=s.type=='bool'?[{value:'1',label:'On'},{value:'0',label:'Off'}]:(s.choices||[]).slice();\n"
@@ -888,47 +1006,60 @@ const char ps5wk_settings_page[] =
     "  b.dataset.text=b.textContent;b.dataset.armed='1';b.classList.add('armed');b.textContent=text;\n"
     "  setTimeout(function(){if(b.dataset.armed){delete b.dataset.armed;b.classList.remove('armed');b.textContent=b.dataset.text}},5000);\n"
     "}\n"
+    "/* The first sentence of a help text is always shown; More shows the rest (and stays open over a redraw).\n"
+    "   More is one of the row's buttons, so the D-pad finds it: left and right move along a row, up and down from row to row. */\n"
+    "function sentences(h){var i=h.indexOf('. ');return i<0?[h,'']:[h.slice(0,i+1),h.slice(i+2)]}\n"
+    "function more(b,rest,key,about){\n"
+    "  function sync(){var o=!!open[key];rest.hidden=!o;b.textContent=o?'Less':'More';b.setAttribute('aria-label',(o?'Less about ':'More about ')+about);b.setAttribute('aria-expanded',String(o))}\n"
+    "  b.onclick=function(){open[key]=!open[key];sync()};sync();\n"
+    "}\n"
+    "function row(s){\n"
+    "  var r=el('div','row'+(s.overridden?' overridden':'')),t=el('div','txt'),n=el('div','name',s.label),h=sentences(s.help),p=el('p','help',h[0]);\n"
+    "  r.id='row-'+s.id;\n"
+    "  if(s.overridden)n.appendChild(el('span','badge','Off while Safer browsing is on'));\n"
+    "  if(s.pending)n.appendChild(el('span','badge wait','Changed: '+applies(s).toLowerCase()));\n"
+    "  else if(s.restart!='none')p.appendChild(el('span',null,s.restart=='page'?' Needs a page restart.':' Needs a browser restart.'));\n"
+    "  if(s.type!='text'&&s.value!=s['default'])n.appendChild(el('span','badge','Default: '+(options(s).filter(function(c){return c.value==s['default']})[0]||{label:s['default']}).label));\n"
+    "  var seg=el('div',s.type=='text'||options(s).length>4?'seg wide':'seg');\n"
+    "  t.appendChild(n);t.appendChild(p);\n"
+    "  if(h[1]){var rest=el('p','help',h[1]),m=el('button','more');m.id='m-'+s.id;seg.appendChild(m);t.appendChild(rest);more(m,rest,s.id,s.label)}\n"
+    "  r.appendChild(t);r.appendChild(seg);\n"
+    "  if(s.type=='text'){\n"
+    "    var input=el('input');input.id='in-'+s.id;input.value=s.value;input.placeholder='Built-in start page';\n"
+    "    input.setAttribute('aria-label',s.label);input.setAttribute('autocapitalize','off');input.setAttribute('spellcheck','false');input.setAttribute('inputmode','url');\n"
+    "    var save=el('button','primary','Save');save.id='b-'+s.id+'-save';\n"
+    "    save.onclick=function(){set(s,input.value,save.id)};\n"
+    "    input.onkeydown=function(e){if(e.key=='Enter')set(s,input.value,save.id)};\n"
+    "    seg.appendChild(input);seg.appendChild(save);\n"
+    "    if(s.value){var reset=el('button',null,'Use the start page');reset.id='b-'+s.id+'-reset';\n"
+    "      reset.onclick=function(){set(s,'',save.id)};seg.appendChild(reset)}\n"
+    "  }else options(s).forEach(function(o){\n"
+    "    var b=el('button',null,o.label);b.id='b-'+s.id+'-'+o.value;b.setAttribute('aria-pressed',String(o.value==s.value));\n"
+    "    b.onclick=function(){\n"
+    "      if(s.id=='link_server'&&o.value=='0'&&s.value!='0'&&!onPS5)\n"
+    "        arm(b,'Press again: this page then opens only on the PS5',function(){set(s,o.value,b.id)});\n"
+    "      else set(s,o.value,b.id);\n"
+    "    };\n"
+    "    seg.appendChild(b);\n"
+    "  });\n"
+    "  return r;\n"
+    "}\n"
+    "/* Each setting goes to its group's place in a section; a group with no place gets a heading under Advanced. */\n"
     "function render(focus){\n"
-    "  var list=$('list'),seen={};list.textContent='';\n"
+    "  var adv=$('advGroups'),made={},k;adv.textContent='';for(k in slots)slots[k].textContent='';\n"
     "  S.settings.forEach(function(s){\n"
-    "    if(!seen[s.group]){seen[s.group]=1;list.appendChild(el('h2',null,S.groups[s.group]||s.group))}\n"
-    "    var c=el('div','card'+(s.overridden?' overridden':'')),r=el('div','row');\n"
-    "    r.appendChild(el('span','name',s.label));\n"
-    "    r.appendChild(el('span','badge'+(s.pending?' wait':''),s.overridden?'Off: Safer browsing is on':s.pending?'Changed: '+applies(s).toLowerCase():applies(s)));\n"
-    "    c.appendChild(r);c.appendChild(el('p','help',s.help));\n"
-    "    if(s.type=='text'){\n"
-    "      var row=el('div','row'),input=el('input');input.id='in-'+s.id;input.value=s.value;input.placeholder='Built-in start page';\n"
-    "      input.setAttribute('autocapitalize','off');input.setAttribute('spellcheck','false');input.setAttribute('inputmode','url');\n"
-    "      var save=el('button','primary','Save');save.id='b-'+s.id+'-save';\n"
-    "      save.onclick=function(){set(s,input.value,save.id)};\n"
-    "      input.onkeydown=function(e){if(e.key=='Enter')set(s,input.value,save.id)};\n"
-    "      row.appendChild(input);row.appendChild(save);\n"
-    "      if(s.value){var reset=el('button',null,'Use the start page');reset.id='b-'+s.id+'-reset';\n"
-    "        reset.onclick=function(){set(s,'',save.id)};row.appendChild(reset)}\n"
-    "      c.appendChild(row);\n"
-    "    }else{\n"
-    "      var seg=el('div','seg');\n"
-    "      options(s).forEach(function(o){\n"
-    "        var b=el('button',null,o.label);b.id='b-'+s.id+'-'+o.value;b.setAttribute('aria-pressed',String(o.value==s.value));\n"
-    "        if(o.value==s['default'])b.appendChild(el('span','def',' (default)'));\n"
-    "        b.onclick=function(){\n"
-    "          if(s.id=='link_server'&&o.value=='0'&&s.value!='0'&&!onPS5)\n"
-    "            arm(b,'Press again: this page then opens only on the PS5',function(){set(s,o.value,b.id)});\n"
-    "          else set(s,o.value,b.id);\n"
-    "        };\n"
-    "        seg.appendChild(b);\n"
-    "      });\n"
-    "      c.appendChild(seg);\n"
-    "    }\n"
-    "    list.appendChild(c);\n"
+    "    var box=slots[s.group]||made[s.group];\n"
+    "    if(!box){adv.appendChild(el('h2',null,S.groups[s.group]||s.group));box=made[s.group]=el('div','panel');adv.appendChild(box)}\n"
+    "    box.appendChild(row(s));\n"
     "  });\n"
     "  var p=S.pending.page,w=S.pending.browser;\n"
     "  $('banner').hidden=!p&&!w;$('bannerPage').hidden=!p;$('bannerBrowser').hidden=!w;\n"
-    "  $('restartPage').hidden=!!S.pagesInBrowser;if(S.pagesInBrowser)$('restartHelp').textContent='Pages run in the browser process, so every setting above applies when the browser restarts. Restart browser: the browser closes and opens again on the page you were on.';\n"
-    "  $('bannerText').textContent=p&&w?'Some changes wait for a page restart, others for a browser restart.':p?'Changes wait for a page restart.':'Changes wait for a browser restart.';\n"
-    "  $('actions').hidden=false;$('back').hidden=!onPS5;renderAdblock();renderPhone();renderDownloads();renderStorage();renderUpdate();\n"
+    "  $('bannerText').textContent=p&&w?'Changes wait for a restart. Restart browser applies them all.':p?'Changes wait for a page restart.':'Changes wait for a browser restart.';\n"
+    "  $('restartPageRow').hidden=!!S.pagesInBrowser;\n"
+    "  $('restartHelp').textContent=(S.pagesInBrowser?'Pages run in the browser process, so every setting that needs a restart applies when the browser restarts. ':'')+'The browser closes and opens again on the page you were on.';\n"
+    "  $('nav').hidden=$('content').hidden=false;$('back').hidden=!onPS5;renderAdblock();renderPhone();renderDownloads();renderStorage();renderUpdate();\n"
     "  $('where').textContent=S.uri?'The PS5 is showing '+S.uri:'';\n"
-    "  var f=focus=='first'?list.querySelector('button[aria-pressed=true]'):focus&&$(focus);if(f)f.focus();\n"
+    "  var f=focus=='first'?$('n-'+tab):focus&&$(focus);if(f)f.focus();\n"
     "}\n"
     "function load(focus){\n"
     "  return api('GET','/settings.json').then(function(j){\n"
@@ -999,16 +1130,17 @@ const char ps5wk_settings_page[] =
     "}\n"
     "function renderPhone(){\n"
     "  var box=$('phone'),l=S.link;box.textContent='';box.hidden=!onPS5||!l;if(box.hidden)return;\n"
-    "  var t=el('div');t.appendChild(el('span','name','Send links from your phone'));\n"
+    "  var t=el('div','txt');t.appendChild(el('div','name','Send links from your phone'));\n"
     "  if(l.url&&l.qr){box.appendChild(qrSVG(l.qr));t.appendChild(el('p','help','Scan this with your phone\\'s camera, or open'));t.appendChild(el('code',null,l.url));\n"
     "    if(l.pin)t.appendChild(el('p','help','The page asks for the link server\\'s PIN.'))}\n"
     "  else t.appendChild(el('p','help',l.localOnly?'The link server is set to this PS5 only, so a phone can\\'t reach it. Turn on Link server on the network below, then restart the browser.':'This PS5 has no network address right now.'));\n"
     "  box.appendChild(t);\n"
     "}\n"
-    "function renderUpdate(){var u=S.update;$('upCard').hidden=!u;if(!u)return;$('upVersion').textContent='Parallax Browser '+u.running;\n"
+    "function renderUpdate(){var u=S.update,n=$('upBadge');$('upCard').hidden=!u;n.hidden=!u||!(u.state=='available'||u.state=='downloading'||u.state=='ready');if(!u)return;\n"
+    "  n.textContent=u.latest;$('upVersion').textContent='Parallax Browser '+u.running;\n"
     "  var t={'checking':'Looking for a newer version…','up-to-date':u.refused?'Version '+u.latest+' was refused ('+u.refused+'): the browser offers the next one.':'Up to date.','available':u.managed?'Version '+u.latest+' is available: ProsperoStore installed the browser, so update it there.':'Version '+u.latest+' is available.',\n"
     "    'downloading':'Downloading '+u.latest+(u.total?': '+Math.floor(u.done*100/u.total)+'%':'')+'…','ready':u.latest+' is ready: it installs when the browser next opens, or now from the update page.','installing':'Updating…',\n"
-    "    'failed':(u.refused?'Version '+u.latest+' was refused: ':u.retryDownload?'The download failed: ':'Couldn\\u2019t check: ')+(u.error||'')}[u.state]||'';\n"
+    "    'failed':(u.refused?'Version '+u.latest+' was refused: ':u.retryDownload?'The download failed: ':'Couldn’t check: ')+(u.error||'')}[u.state]||'';\n"
     "  if(u.checkedAt&&(u.state=='up-to-date'||u.state=='available'))t+=' Checked '+new Date(u.checkedAt*1000).toLocaleString()+'.';\n"
     "  if(u.lastInstall)t=u.lastInstall+'. '+t;$('upText').textContent=t+' The browser looks for a newer version each time it opens.';\n"
     "  $('upCheck').disabled=u.state=='checking'||u.state=='downloading'||u.state=='installing'||u.state=='ready';$('upOpen').hidden=!(u.state=='available'||u.state=='downloading'||u.state=='ready'||(u.state=='failed'&&u.retryDownload));\n"
@@ -1029,12 +1161,12 @@ const char ps5wk_settings_page[] =
     "  }\n"
     "  var list=$('abSites');list.textContent='';\n"
     "  a.sites.forEach(function(s,i){var b=el('button',null,'Remove '+s);b.id='ab-rm-'+i;b.onclick=function(){adblock('block',s,a.sites.length>1?'ab-rm-'+(i?i-1:0):'abUpdate')};list.appendChild(b)});\n"
-    "  $('abSitesHelp').textContent=a.sites.length?'Remove a site to block ads there again.':'None yet. Allow ads on a site from its page: Options, then Settings (⚙), then the button above.';\n"
-    "  var l=a.list;\n"
-    "  $('abList').textContent=l.version?'uBlock Origin Lite '+l.version+': '+l.rules+' rules, '+(l.origin=='update'?'downloaded '+when(l.generated):'bundled with the browser')+'. Last check for a new list: '+when(a.lastCheck)+' (once a day by itself).'+(a.scripting&&a.scripting.version?' Cosmetic filters for '+a.scripting.hosts+' site entries, '+(a.scripting.calls+a.scripting.isolatedCalls)+' scriptlet calls'+(a.scripting.site?'; on '+a.scripting.site+': '+(a.scripting.siteCalls+a.scripting.siteIsolatedCalls)+' scriptlets, '+a.scripting.siteCSS+' hiding rules'+(a.scripting.siteProcedurals?', '+a.scripting.siteProcedurals+' procedural':''):'')+'.':''):'No list yet.';\n"
-    "  $('abStatus').textContent=a.status||'';\n"
+    "  $('abSitesHelp').textContent=a.sites.length?'Remove a site to block ads there again.':'None yet. To allow ads on a site, open Settings (⚙) from its page: the site is then the first row here.';\n"
+    "  var l=a.list,d=l.version?'uBlock Origin Lite '+l.version+': '+l.rules+' rules, '+(l.origin=='update'?'downloaded '+when(l.generated):'bundled with the browser')+'. Last check for a new list: '+when(a.lastCheck)+' (once a day by itself).'+(a.scripting&&a.scripting.version?' Cosmetic filters for '+a.scripting.hosts+' site entries, '+(a.scripting.calls+a.scripting.isolatedCalls)+' scriptlet calls'+(a.scripting.site?'; on '+a.scripting.site+': '+(a.scripting.siteCalls+a.scripting.siteIsolatedCalls)+' scriptlets, '+a.scripting.siteCSS+' hiding rules'+(a.scripting.siteProcedurals?', '+a.scripting.siteProcedurals+' procedural':''):'')+'.':''):'No list yet.';\n"
+    "  $('abStatus').textContent=a.status||sentences(d)[0];$('abList').textContent=d;\n"
     "  var u=$('abUpdate');u.disabled=a.updating||a.compiling;u.textContent=a.updating?'Checking…':a.compiling?'Compiling…':'Update lists now';\n"
     "}\n"
+    "more($('abMore'),$('abList'),'abList','the filter lists');\n"
     "function pollAdblock(){var n=0;(function p(){api('GET','/settings.json').then(function(j){if(!j.ok)return;S=j;renderAdblock();if((j.adblock.updating||j.adblock.compiling)&&++n<150)setTimeout(p,2000)})})()}\n"
     "function adblock(what,site,focus){\n"
     "  say(what=='update'?'Checking for a new list…':'Saving…');\n"

@@ -243,19 +243,33 @@ served by the link server in `ps5browser.c`).
 - **On a Mac or phone:** open `http://192.168.1.50:9040/settings`. It
   follows the system's light or dark mode.
 
-Each setting has a one-line explanation, its current value, its default and
-a badge that says what applies it. When a saved change is not in use yet,
-the badge says so and a banner offers the restart that applies it. Changes
-are saved as soon as you press a button.
+The page has five sections, one shown at a time, picked from a list beside
+it on the TV (and a wide screen) or above it on a phone: **General** (home
+page, search engine, sound, gamepad mode, the phone link and its QR code),
+**Ads & privacy** (this site, ad blocking, allowed sites, filter lists,
+Safer browsing), **Cookies & storage** (clearing, sizes, downloads),
+**Advanced** (the engine settings, under Scripts, Graphics, Video, Memory
+and Experimental and diagnostics) and **Update & restart** (its entry shows
+the new version when there is one). Each setting is a row: its name, the
+first sentence of its help (*More* shows the rest), what applies it, and
+badges only for state (*Default: X* when it isn't at the default, *Changed:
+restart page to apply*, *Off while Safer browsing is on*). The result of a
+press and the restart banner stay in view beside the section (on a phone,
+stuck to the top). Changes are saved as soon as you press a button. On the
+PS5 the page moves Up and Down from row to row itself, and Left from a
+row's first button to the section list; the rest is WebKit's spatial
+navigation. In `/settings.json` each setting has its `group` (general, link,
+ads, security, scripts, graphics, video, memory, experimental) and `groups`
+names them; a group the page doesn't know becomes a heading under Advanced.
 
 | Setting | Stored as | Applies |
 | --- | --- | --- |
-| **Security** (the page's first section) | | |
+| **Security** (Ads & privacy) and **Advanced: Scripts, Graphics** | | |
 | Safer browsing (default off; also the shield button in the browser menu): the JIT, WebAssembly and WebGL off whatever their own settings say, which keep their values for when it goes | `/data/ps5webkit/safer-browsing` when on (read by each WebProcess, `ps5wk-child.cpp` configureJIT, over any `JSC_*` line; and by the title for WebGL) | page restart (the menu button restarts the page itself) |
 | JavaScript JIT: all tiers (default) / up to DFG / Baseline only / off | `child.env`: `PS5WK_JIT=1/dfg/baseline/0` | page restart |
 | WebAssembly (default on; off with the JIT) | `PS5WK_WASM=0` when off | page restart |
 | WebGL (default on) | `/data/ps5webkit/no-webgl` when off (`webkit_settings_set_enable_webgl` on the WebKitSettings every tab shares) | at once, for pages loaded from then on |
-| **Pages** | | |
+| **Advanced: Graphics, Memory, Video**; then General | | |
 | Painting threads: 1-8 (default 4; 1 = the old single-thread path) | `PS5WK_PAINT_THREADS` | page restart |
 | Fast scrolling (default on) | `PS5WK_SCROLL_COPY=0` when off | page restart |
 | Page memory limit: off / 2 / 3 (default) / 4 / 6 GB | `PS5WK_MEM_RESTART_MB` | page restart |
@@ -269,8 +283,8 @@ are saved as soon as you press a button.
 | Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |
 | Search engine for words typed in the address bar or the start page's field: Google (default), Bing, DuckDuckGo, DuckDuckGo Lite, Brave Search, Ecosia, Startpage | `search.txt` in the PS5 user's folder (no file: Google) | none |
 
-While Safer browsing is on, the JIT, WebAssembly and WebGL cards say *Off:
-Safer browsing is on* and their buttons dim (they can still be changed).
+While Safer browsing is on, the JIT, WebAssembly, WebGL and WebGPU rows say *Off
+while Safer browsing is on* and their buttons dim (they can still be changed).
 The menu's shield button (between Private browsing and New tab; filled in
 cyan with a tick while on) toggles the flag through the same settings code,
 applies WebGL at once, says so on the TV and restarts the page shown in a
@@ -284,7 +298,7 @@ no restart. The JIT's off switch also turns off JSC's regular-expression
 JIT (`disableAllJITOptions`).
 
 The page also has these actions: *Clear cache*, *Clear cookies* and *Clear
-all website data* in the Storage card (`webkit_website_data_manager_clear`
+all website data* in Cookies & storage (`webkit_website_data_manager_clear`
 on the browser's network session: the disk and memory caches, cookies, or
 every type, of any age; `POST /clear?what=cache|cookies|all`), *Restart
 page* and *Restart browser*. Clearing cookies or all data, turning the link
@@ -441,7 +455,7 @@ nothing is copied; `[user] first start with users: N items ... moved`).
 Users who start the browser later begin with nothing: no bookmarks, no
 history, no cookies.
 
-**Storage** (Settings, the Storage card): this user's webpage cache,
+**Storage** (Settings, Cookies & storage): this user's webpage cache,
 cookies and site data, downloads, and history, bookmarks and tabs, with a
 total; then what every user shares (the browser's files in `/data/ps5webkit`
 outside `users/`: fonts, Unicode data, the ad-block lists, logs) and the
