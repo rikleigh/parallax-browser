@@ -362,6 +362,125 @@ static void announceDone(const char* file, unsigned id, gboolean jobFollows)
     }
 }
 
+/* ---------------------------------------------------------------- an image's app reaching the home screen */
+
+/* ShadowMountPlus installs the app of an image in a homebrew folder by
+ * itself: it waits until the file has been unchanged for about 10 s and
+ * looks every 15 s, so the app shows up 10-30 s after the image is made
+ * (2026-11-21, 1.7beta7). The service says when it has (op "imageapp":
+ * its mount_img.lnk names the image). */
+#define IMAGE_WATCH_S 90
+#define IMAGE_POLL_S 3
+
+typedef struct {
+    char* image;
+    char* title;
+    char* name;
+    gint64 until; /* monotonic us */
+    gboolean asking;
+} ImageWatch;
+
+static GPtrArray* imageWatches;
+static guint imageWatchTimer;
+
+static void imageWatchFree(gpointer data)
+{
+    ImageWatch* w = data;
+    g_free(w->image);
+    g_free(w->title);
+    g_free(w->name);
+    g_free(w);
+}
+
+static ImageWatch* imageWatchOf(const char* image)
+{
+    for (unsigned i = 0; imageWatches && i < imageWatches->len; i++) {
+        ImageWatch* w = g_ptr_array_index(imageWatches, i);
+        if (!strcmp(w->image, image))
+            return w;
+    }
+    return NULL;
+}
+
+static void onImageApp(const char* json, const char* error, gpointer user)
+{
+    char* image = user;
+    ImageWatch* w = imageWatchOf(image);
+    g_free(image);
+    if (!w)
+        return;
+    w->asking = FALSE;
+    MJ* value = json ? mj_parse(json) : NULL;
+    if (mj_bool(value, "installed")) {
+        spike_log("[dl] %s: installed by ShadowMountPlus", w->image);
+        if (display) {
+            char* text = g_strdup_printf("%s is on the home screen", w->name);
+            wpe_display_ps5_show_message(display, text, 6);
+            g_free(text);
+        }
+        g_ptr_array_remove(imageWatches, w);
+    } else if (error)
+        spike_log("[dl] %s: %s", w->image, error);
+    mj_free(value);
+}
+
+static gboolean imageWatchTick(gpointer data)
+{
+    (void)data;
+    gint64 now = g_get_monotonic_time();
+    for (unsigned i = imageWatches->len; i-- > 0;) {
+        ImageWatch* w = g_ptr_array_index(imageWatches, i);
+        if (w->asking)
+            continue;
+        if (now > w->until) {
+            notice("%s isn't on the home screen yet\nShadowMountPlus adds the images in homebrew folders: is it running?", w->name);
+            g_ptr_array_remove_index(imageWatches, i);
+            continue;
+        }
+        w->asking = TRUE;
+        ps5wk_dlservice_request_async(8000, onImageApp, g_strdup(w->image), "imageapp", "path", w->image, "title", w->title, NULL);
+    }
+    if (imageWatches->len)
+        return G_SOURCE_CONTINUE;
+    imageWatchTimer = 0;
+    return G_SOURCE_REMOVE;
+}
+
+/* An image was made at image (of title, called name): say so, and again
+ * once its app is on the home screen. */
+static void imageMade(const char* image, const char* title, const char* name)
+{
+    if (!image)
+        return;
+    gboolean watched = title && *title && strstr(image, "/homebrew/") && g_str_has_suffix(image, ".exfat");
+    if (!watched) {
+        notice("Made the image %s", image);
+        return;
+    }
+    const char* shown = name && *name ? name : title;
+    if (display) {
+        char* text = g_strdup_printf("Image of %s made\nShadowMountPlus adds it to the home screen in about 30 s", shown);
+        wpe_display_ps5_show_message(display, text, 8);
+        g_free(text);
+    }
+    recentID = 0;
+    if (!imageWatches)
+        imageWatches = g_ptr_array_new_with_free_func(imageWatchFree);
+    ImageWatch* w = imageWatchOf(image);
+    if (!w) {
+        w = g_new0(ImageWatch, 1);
+        w->image = g_strdup(image);
+        g_ptr_array_add(imageWatches, w);
+    }
+    g_free(w->title);
+    g_free(w->name);
+    w->title = g_strdup(title);
+    w->name = g_strdup(shown);
+    w->until = g_get_monotonic_time() + IMAGE_WATCH_S * G_USEC_PER_SEC;
+    if (!imageWatchTimer)
+        imageWatchTimer = g_timeout_add_seconds(IMAGE_POLL_S, imageWatchTick, NULL);
+}
+
 /* A name for the folder: no path, no control characters, no leading dots;
  * at most NAME_MAX_BYTES bytes of UTF-8. */
 static char* sanitize(const char* suggested, const char* url)
@@ -1251,7 +1370,7 @@ static void jobEnded(Download* d, GHashTable* params)
     else if (d->r.titleID && (!g_strcmp0(d->r.job, "install") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-install"))))
         notice("Installed %s\nIt's on the home screen", d->r.titleName ? d->r.titleName : d->r.titleID);
     else if (!g_strcmp0(d->r.job, "image") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-image")))
-        notice("Made the image %s", out ? out : "");
+        imageMade(out, d->r.titleID, d->r.titleName);
     else if (!g_strcmp0(d->r.job, "extract"))
         notice("Unpacked %s\nto %s", d->r.file ? d->r.file : "", out ? out : "");
     changed(TRUE);
@@ -1303,6 +1422,8 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
         notice("%s %s failed\n%s", jobNoun(t->kind), base, t->error);
     else if (t->titleName && (!strcmp(t->kind, "install") || !g_strcmp0(t->then, "install")))
         notice("Installed %s\nIt's on the home screen", t->titleName);
+    else if (!strcmp(t->kind, "image") || !g_strcmp0(t->then, "image"))
+        imageMade(t->out, g_hash_table_lookup(params, "title"), t->titleName);
     else
         notice("%s %s: done\n%s", jobNoun(t->kind), base, t->out ? t->out : "");
     g_free(base);

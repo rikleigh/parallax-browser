@@ -1233,7 +1233,13 @@ link server; the page's look through debug screenshots, not the pad):
   `/data/homebrew/PPSA99009.exfat` (70 MB); within a minute
   ShadowMountPlus attached it as an LVD and mounted it as exfatfs
   (64 KiB blocks, "optimized-1.7"). It didn't install the app: the test
-  app had no `sce_sys/icon0.png` (above).
+  app had no `sce_sys/icon0.png` (above). With an icon it did, about 20 s after
+  the image was made: it waits until the file has been unchanged for about
+  10 s and looks every 15 s, then writes `/user/app/<ID>/mount_img.lnk`
+  (the image's path) and `/user/appmeta/<ID>`. So the notice says the app
+  comes in about 30 s, and the browser asks the service every 3 s (op
+  `imageapp`: the link names the image) and says when it is on the home
+  screen, or after 90 s that it isn't yet (is ShadowMountPlus running?).
 - Not checked yet: an image's app on the home screen (ShadowMountPlus
   needs restarting after the attempts without an icon), RAR archives on
   the console, USB and M.2 drives (none attached), the pad on the TV.

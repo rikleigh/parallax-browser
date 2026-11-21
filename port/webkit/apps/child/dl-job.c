@@ -35,9 +35,10 @@
  *              without replace=1: jobend says installed=<version>)
  *     jobstop  id
  *     rm       path                    (a file or .part, and its .part.ps5dl)
- *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials|partial path [to] [name]
- *              [dirs] (partials: the downloads with a .part.ps5dl in the
- *              folders in dirs, one per line)
+ *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials|partial|imageapp path [to] [name]
+ *              [dirs] [title] (partials: the downloads with a .part.ps5dl in the
+ *              folders in dirs, one per line; imageapp: {installed} for the
+ *              image at path, whether ShadowMountPlus has installed title from it)
  *     peek     id (url size [ua] [ref] [cookies] | path)
  *              what an archive holds, on a server (Range requests for
  *              the parts that list its files) or on a drive
@@ -1275,6 +1276,31 @@ static char* partialsJSON(const char* dirs)
     return g_string_free(out, FALSE);
 }
 
+/* Whether ShadowMountPlus has installed the app of the image at path:
+ * it writes /user/app/<ID>/mount_img.lnk (the image's path) when it does
+ * (2026-11-21, 1.7beta7), about 10-30 s after the image stops changing.
+ * A link from before (the image made again in the same place) counts: the
+ * app on the home screen starts from this image. */
+static char* imageAppJSON(const char* image, const char* title)
+{
+    gboolean installed = FALSE;
+    gboolean validID = title && strlen(title) == 9;
+    for (int i = 0; validID && i < 9; i++)
+        validID = i < 4 ? g_ascii_isupper(title[i]) : g_ascii_isdigit(title[i]);
+    if (validID) {
+        char link[128];
+        snprintf(link, sizeof link, "/user/app/%s/mount_img.lnk", title);
+        char* text = NULL;
+        struct stat is;
+        if (!stat(image, &is) && g_file_get_contents(link, &text, NULL, NULL)) {
+            g_strstrip(text);
+            installed = !strcmp(text, image);
+        }
+        g_free(text);
+    }
+    return g_strdup_printf("{\"installed\":%s}", installed ? "true" : "false");
+}
+
 static void request(GHashTable* p)
 {
     const char* n = param(p, "n");
@@ -1301,6 +1327,8 @@ static void request(GHashTable* p)
     }
     else if (!allowedPath(path))
         snprintf(error, sizeof error, "That place isn't one the browser can use");
+    else if (!strcmp(op, "imageapp"))
+        json = imageAppJSON(path, param(p, "title"));
     else if (!strcmp(op, "ls"))
         json = listJSON(path, error, sizeof error);
     else if (!strcmp(op, "mkdir")) {
