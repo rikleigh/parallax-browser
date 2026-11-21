@@ -43,8 +43,12 @@ first-class place for the modern web. It's built on WPE WebKit.
 - A profile for each PS5 user. Each user has their own cookies, history,
   bookmarks, tabs and downloads, and Settings shows how much storage each
   one uses.
-- Downloads with pause, resume and SHA-256 checksums. They survive a
-  browser restart.
+- A download manager. Large files download over several connections at
+  once, with pause, resume and SHA-256 checksums, and survive a browser
+  restart. Archives (ZIP, 7z, RAR, tar) can be unpacked, an app inside one
+  installed, or made into an exFAT image for ShadowMountPlus. The menu's
+  Files list browses the internal storage and USB drives, to move, copy,
+  rename and delete.
 - Ad blocking with the uBlock Origin Lite rule lists, which include network
   rules, cosmetic filters and scriptlets. It has no code for particular
   sites, and you can turn it off for each site.
@@ -83,7 +87,7 @@ first-class place for the modern web. It's built on WPE WebKit.
 | R2 | Zoom in |
 | Triangle | Keyboard |
 | Square | Reload |
-| Options | The menu, with the address field, tabs, bookmarks, history and downloads |
+| Options | The menu, with the address field, tabs, bookmarks, history, downloads and files. Within 8 seconds of a download finishing, it opens what to do with the file. |
 | R3 | View in VR |
 | L3 | Home page |
 | L3 and R3 together | Performance overlay |
