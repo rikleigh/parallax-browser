@@ -49,5 +49,22 @@ check "ERR -1" "no eboot.bin" "$("$work/t" find "$work/drive/downloads/noeboot")
 mkdir -p "$work/elsewhere/x"
 title "$work/elsewhere/x" PPSA05555 'Off drive'
 check "ERR -1 Apps can be installed from internal storage" "not on a console drive" "$("$work/t" install "$work/elsewhere/x" "$work/user")"
+# counting apps (an exFAT image is made only of exactly one)
+mkdir -p "$work/count/none/sub" "$work/count/two" "$work/count/nested"
+check "COUNT 0" "count: no app" "$("$work/t" count "$work/count/none")"
+title "$work/count/two/a/game" PPSA00011 'A'
+title "$work/count/two/b" PPSA00012 'B'
+check "COUNT 2" "count: two apps at different depths" "$("$work/t" count "$work/count/two")"
+check "COUNT 1" "count: the app folder itself" "$("$work/t" count "$work/count/two/b")"
+title "$work/count/nested" PPSA00013 'Outer'
+title "$work/count/nested/extras/inner" PPSA00014 'Inner'
+check "COUNT 1" "count: an app's own folders aren't searched" "$("$work/t" count "$work/count/nested")"
+title "$work/count/deep/1/2/3/4" PPSA00015 'Deep'
+check "COUNT 0" "count: deeper than 3 levels" "$("$work/t" count "$work/count/deep")"
+mkdir -p "$work/count/wide"
+for i in $(seq 1 300); do mkdir "$work/count/wide/f$i"; done
+title "$work/count/wide/f7/game" PPSA00016 'Wide A'
+title "$work/count/wide/f299/game" PPSA00017 'Wide B'
+check "COUNT -2" "count: too many folders on a level (not a wrong count)" "$("$work/t" count "$work/count/wide")"
 echo "$fails failure(s)"
 exit $((fails > 0))

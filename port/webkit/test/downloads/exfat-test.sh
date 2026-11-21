@@ -65,6 +65,14 @@ image_check() {
         failed "$name: $calls progress calls in ${seconds}s"
     fi
 
+    local checked
+    checked="$("$tool" verify "$image" "$src" || true)"
+    if [[ $checked == OK* ]] && [ "$(sed -E 's/.*last=([0-9]+)\/([0-9]+).*/\1/' <<<"$checked")" = "$(sed -E 's/.*last=([0-9]+)\/([0-9]+).*/\2/' <<<"$checked")" ]; then
+        pass "$name: read back and compared (ps5exfat_verify): $checked"
+    else
+        failed "$name: ps5exfat_verify: $checked"
+    fi
+
     local layout
     layout="$(python3 -I "$here/exfat/check.py" "$image" "$cluster" "$label" || true)"
     [[ $layout == OK* ]] && pass "$name: layout $layout" || failed "$name: layout $layout"
@@ -126,7 +134,74 @@ touch -t 203012312359.58 "$src/zero"
 image_check "mixed tree, 64 KiB clusters" "$src" "$work/mixed.exfat" 65536
 image_check "mixed tree, 4 KiB clusters (multi-cluster folders)" "$src" "$work/mixed4k.exfat" 4096
 image_check "mixed tree, 256 KiB clusters, label" "$src" "$work/mixed256k.exfat" 262144 PPSA12345
-rm -f "$work"/mixed*.exfat
+
+# ps5exfat_verify finds what differs.
+verify_refuses() { # name image folder pattern
+    local got
+    got="$("$tool" verify "$2" "$3" || true)"
+    if [[ $got == DIFF* ]] && grep -qi -- "$4" <<<"$got"; then pass "verify: $1: $got"; else failed "verify: $1: $got (wanted /$4/)"; fi
+}
+cp -R "$src" "$work/changed"
+python3 -I -c 'import sys; f=open(sys.argv[1],"r+b"); f.seek(1048000); b=f.read(1); f.seek(1048000); f.write(bytes([b[0]^1]))' "$work/changed/exact/1048577"
+verify_refuses "a byte changed in a file" "$work/mixed.exfat" "$work/changed" "differs"
+cp -R "$src" "$work/extra" && echo x >"$work/extra/deep/a/new.txt"
+verify_refuses "a file more in the folder" "$work/mixed.exfat" "$work/extra" "entries"
+cp -R "$src" "$work/fewer" && rm "$work/fewer/café.txt"
+verify_refuses "a file fewer in the folder" "$work/mixed.exfat" "$work/fewer" "not in the folder"
+cp -R "$src" "$work/longer" && echo more >>"$work/longer/zero"
+verify_refuses "a file's size changed" "$work/mixed.exfat" "$work/longer" "bytes in the image"
+rm -rf "$work/changed" "$work/extra" "$work/fewer" "$work/longer"
+# the image damaged: a byte in the root's first entry set, the boot sector
+root_entry=$(python3 -I - "$work/mixed.exfat" <<'PY'
+import struct, sys
+f = open(sys.argv[1], 'rb'); b = f.read(512)
+sector = 1 << b[108]; cluster = sector << b[109]
+heap, root = struct.unpack_from('<I', b, 88)[0], struct.unpack_from('<I', b, 96)[0]
+base = heap * sector + (root - 2) * cluster
+f.seek(base); d = f.read(cluster)
+for i in range(0, len(d), 32):
+    if d[i] == 0x85:
+        print(base + i + 40)  # in its stream entry (ValidDataLength)
+        break
+PY
+)
+cp "$work/mixed.exfat" "$work/damaged.exfat"
+python3 -I -c 'import sys; f=open(sys.argv[1],"r+b"); f.seek(int(sys.argv[2])); b=f.read(1); f.seek(int(sys.argv[2])); f.write(bytes([b[0]^0x40]))' "$work/damaged.exfat" "$root_entry"
+verify_refuses "an entry set damaged" "$work/damaged.exfat" "$src" "checksum"
+cp "$work/mixed.exfat" "$work/damaged.exfat"
+python3 -I -c 'import sys; f=open(sys.argv[1],"r+b"); f.seek(100); f.write(b"\x99")' "$work/damaged.exfat"
+verify_refuses "the boot sector damaged" "$work/damaged.exfat" "$src" "boot region"
+head -c 100000 /dev/urandom >"$work/damaged.exfat"
+verify_refuses "not an image" "$work/damaged.exfat" "$src" "not an exFAT"
+got="$("$tool" verify "$work/mixed.exfat" "$src" 2 || true)"
+[[ $got == CANCELLED* ]] && pass "verify: cancelled: $got" || failed "verify: cancel: $got"
+# one file listed twice and another left out (the counts still agree)
+mkdir -p "$work/pair/data" && echo aaaa >"$work/pair/data/a.txt" && echo bbbb >"$work/pair/data/b.txt"
+"$tool" build "$work/pair" "$work/pair.exfat" >/dev/null
+python3 -I - "$work/pair.exfat" <<'PY'
+import struct, sys
+f = open(sys.argv[1], 'r+b'); b = f.read(512)
+sector = 1 << b[108]; cluster = sector << b[109]
+heap, root = struct.unpack_from('<I', b, 88)[0], struct.unpack_from('<I', b, 96)[0]
+def off(c): return heap * sector + (c - 2) * cluster
+def sets(base):  # (name, offset, bytes, first cluster) of each file entry set
+    f.seek(base); d = f.read(cluster); out = []; i = 0
+    while i < len(d) and d[i]:
+        if d[i] == 0x85:
+            n = 1 + d[i + 1]; units = d[i + 35]
+            name = b''.join(d[i + 64 + 32 * (k // 15) + 2 + 2 * (k % 15):][:2] for k in range(units)).decode('utf-16le')
+            out.append((name, base + i, 32 * n, struct.unpack_from('<I', d, i + 52)[0])); i += 32 * n
+        else:
+            i += 32
+    return out
+data = [s for s in sets(off(root)) if s[0] == 'data'][0]
+inner = {s[0]: s for s in sets(off(data[3]))}
+a, bb = inner['a.txt'], inner['b.txt']
+f.seek(a[1]); raw = f.read(a[2]); f.seek(bb[1]); f.write(raw)  # b.txt's entry now says a.txt
+PY
+verify_refuses "a file listed twice, another left out" "$work/pair.exfat" "$work/pair" "twice"
+rm -rf "$work/pair" "$work/pair.exfat"
+rm -f "$work"/mixed*.exfat "$work/damaged.exfat"
 
 # An empty folder.
 mkdir -p "$work/empty-src"
@@ -172,6 +247,9 @@ refuse() { # expect name src image [cluster] [cancel-after]
     if [ "$1" != OK ] && [ -e "$4.part" ]; then failed "$2: $4.part was left behind"; fi
 }
 r="$work/refuse"
+mkdir -p "$r/self/sub" && echo x >"$r/self/a"
+refuse REFUSED "the image inside the folder it is made from" "$r/self" "$r/self/out.exfat"
+refuse REFUSED "the image in a folder inside it" "$r/self" "$r/self/sub/out.exfat"
 mkdir -p "$r/link/sub" && echo x >"$r/link/sub/a" && ln -s a "$r/link/sub/b"
 refuse REFUSED "a symbolic link in the folder" "$r/link" "$r/out1.exfat"
 mkdir -p "$r/fifo" && mkfifo "$r/fifo/pipe"

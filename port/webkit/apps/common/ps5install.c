@@ -277,6 +277,59 @@ int ps5install_find(const char* dir, unsigned depth, PS5TitleInfo* out, char* er
     return bad ? -2 : -1;
 }
 
+/* Wider than find's: a count cut short would be wrong (-2 then). */
+#define COUNT_WIDTH 256
+
+int ps5install_count(const char* dir, unsigned depth)
+{
+    FindPath* level = calloc(COUNT_WIDTH, sizeof(FindPath));
+    FindPath* next = calloc(COUNT_WIDTH, sizeof(FindPath));
+    if (!level || !next) {
+        free(level);
+        free(next);
+        return -1;
+    }
+    unsigned count = 0, titles = 0;
+    int cut = 0;
+    snprintf(level[count++], sizeof level[0], "%s", dir);
+    for (unsigned d = 0; d <= depth && count && !cut; d++) {
+        unsigned nextCount = 0;
+        for (unsigned i = 0; i < count; i++) {
+            PS5TitleInfo info;
+            if (!probe(level[i], &info)) {
+                titles++; /* an app's own folders aren't searched */
+                continue;
+            }
+            if (d == depth)
+                continue;
+            DIR* folder = opendir(level[i]);
+            if (!folder)
+                continue;
+            struct dirent* entry;
+            while ((entry = readdir(folder))) {
+                if (entry->d_name[0] == '.' || !strcmp(entry->d_name, "sce_sys"))
+                    continue;
+                char path[1024];
+                if ((size_t)snprintf(path, sizeof path, "%s/%s", level[i], entry->d_name) >= sizeof path || !isDir(path))
+                    continue;
+                if (nextCount == COUNT_WIDTH) {
+                    cut = 1;
+                    break;
+                }
+                snprintf(next[nextCount++], sizeof next[0], "%s", path);
+            }
+            closedir(folder);
+        }
+        memcpy(level, next, sizeof next[0] * nextCount);
+        count = nextCount;
+    }
+    free(level);
+    free(next);
+    if (cut)
+        return -2;
+    return (int)titles;
+}
+
 /* ---- files ---- */
 
 const char* ps5install_drive_of(const char* path, char* out, size_t size)

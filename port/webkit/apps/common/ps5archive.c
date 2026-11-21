@@ -1044,6 +1044,15 @@ static int finishInspect(PS5ArchiveInfo* info, EntryList* list, char* error, siz
     size_t topLength = strcspn(first, "/");
     int oneTop = topLength < sizeof info->top_folder - 1;
     int titleDepth = -1;
+    /* the title folders, to leave out one inside another (as the count of a
+     * folder on the drive does: an app's own folders aren't searched) */
+    char** titleDirs = calloc(list->count ? list->count : 1, sizeof *titleDirs);
+    unsigned titleCount = 0;
+    if (!titleDirs) {
+        fail(error, errorSize, "Out of memory");
+        result = -2;
+        goto done;
+    }
     for (unsigned i = 0; i < list->count; i++) {
         const Entry* e = &list->entries[i];
         if (oneTop && (strncmp(e->path, first, topLength) || (e->path[topLength] != '/' && e->path[topLength])
@@ -1069,13 +1078,25 @@ static int finishInspect(PS5ArchiveInfo* info, EntryList* list, char* error, siz
         depth += dirLength > 0;
         char dir[MAX_PATH_LENGTH + 8];
         snprintf(dir, sizeof dir, "%.*s", (int)dirLength, e->path);
-        info->titles++;
+        if ((titleDirs[titleCount] = strdup(dir)))
+            titleCount++;
         if (titleDepth < 0 || depth < titleDepth || (depth == titleDepth && strcmp(dir, info->title_dir) < 0)) {
             titleDepth = depth;
             info->has_title = true;
             snprintf(info->title_dir, sizeof info->title_dir, "%s", dir);
         }
     }
+    for (unsigned i = 0; i < titleCount; i++) {
+        int nested = 0;
+        for (unsigned k = 0; k < titleCount && !nested; k++) {
+            size_t n = strlen(titleDirs[k]);
+            nested = k != i && (!n || (!strncmp(titleDirs[i], titleDirs[k], n) && titleDirs[i][n] == '/'));
+        }
+        info->titles += !nested;
+    }
+    for (unsigned i = 0; i < titleCount; i++)
+        free(titleDirs[i]);
+    free(titleDirs);
     if (oneTop)
         snprintf(info->top_folder, sizeof info->top_folder, "%.*s/", (int)topLength, first);
 done:

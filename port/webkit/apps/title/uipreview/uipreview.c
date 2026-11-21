@@ -120,6 +120,27 @@ static const DownloadSample kDownloads[] = {
 #define DOWNLOAD_COUNT 7
 static int deleteArmedRow = -1;
 
+typedef struct {
+    const char *name, *kind, *detail, *state;
+    int tone;
+} FileSample;
+static const FileSample kDrives[] = {
+    { "Internal storage", "SSD", "212 GB free of 667 GB · ufs", "", BUI_TONE_PLAIN },
+    { "USB drive 1", "USB", "1.31 TB free of 1.82 TB · exfatfs", "", BUI_TONE_PLAIN },
+    { "★ USB drive 1 › homebrew", "★", "/mnt/usb0/homebrew", "", BUI_TONE_PLAIN },
+    { "Downloads", "DL", "This PS5 user's downloads folder", "", BUI_TONE_PLAIN },
+};
+static const FileSample kFolder[] = {
+    { "USB drive 1 › homebrew", "DIR", "1.31 TB free · 6 items", "★ Favourite", BUI_TONE_PLAIN },
+    { "ItemzFlow", "APP", "App folder · 02 Nov 21:40", "", BUI_TONE_PLAIN },
+    { "PS5-Xplorer", "APP", "App folder · 28 Oct 09:12", "", BUI_TONE_PLAIN },
+    { "payloads", "DIR", "Folder · 03 Nov 14:22", "", BUI_TONE_PLAIN },
+    { "Big_Buck_Bunny_1080p.zip", "ZIP", "1.21 GB · 03 Nov 11:05", "", BUI_TONE_PLAIN },
+    { "PPSA01234.exfat", "EXFAT", "4.00 GB · 01 Nov 19:30", "", BUI_TONE_PLAIN },
+    { "notes.txt", "TXT", "2 KB · 30 Oct 08:00", "", BUI_TONE_PLAIN },
+};
+static int filesAtDrives = 0, filesMoving = 0;
+
 static int tabCount = 5, shownTab = 0, armed = 0, bookmarkCount = 6;
 
 static void row(int index, BUIRow* r, void* user)
@@ -156,6 +177,21 @@ static void row(int index, BUIRow* r, void* user)
             snprintf(r->state, sizeof r->state, "Press \xE2\x96\xA1 again to delete the file");
             r->tone = BUI_TONE_WARN;
         }
+    } else if (s->section == SEC_FILES) {
+        const FileSample* f = filesAtDrives ? &kDrives[index] : &kFolder[index];
+        r->title = f->name;
+        if (!filesAtDrives && !index && filesMoving) {
+            r->title = "Move Big_Buck_Bunny_1080p.zip here";
+            snprintf(r->state, sizeof r->state, "□ Cancel");
+            r->tone = BUI_TONE_ACTIVE;
+        }
+        snprintf(r->kind, sizeof r->kind, "%s", f->kind);
+        snprintf(r->detail, sizeof r->detail, "%s", f->detail);
+        if (!r->state[0])
+            snprintf(r->state, sizeof r->state, "%s", f->state);
+        r->progress = -1;
+        if (!r->tone)
+            r->tone = f->tone;
     } else {
         if (!index) {
             r->title = armed ? "Press X again to clear all history" : "Clear all history";
@@ -437,6 +473,99 @@ int main(int argc, char** argv)
         menuShot("menu-downloads-details", &s);
         s.details = NULL;
     }
+
+    /* X on a finished archive: what to do with it */
+    {
+        BUIChoices d;
+        memset(&d, 0, sizeof d);
+        snprintf(d.title, sizeof d.title, "Big_Buck_Bunny_1080p.zip");
+        snprintf(d.lines[0], sizeof d.lines[0], "1.21 GB · Downloads · download.blender.org");
+        snprintf(d.lines[1], sizeof d.lines[1], "ItemzFlow · PPSA01234 · version 1.02 · version 1.00 is installed");
+        d.lineTones[1] = BUI_TONE_WARN;
+        d.lineCount = 2;
+        const struct { const char *label, *detail; int tone, confirm; } o[] = {
+            { "Unpack and install, replacing version 1.00", "It holds an app. Its saved data stays.", BUI_TONE_ACTIVE, 1 },
+            { "Unpack", "Into Downloads › Big_Buck_Bunny_1080p", 0, 0 },
+            { "Unpack and make an exFAT image", "USB drive 1 › homebrew › PPSA01234.exfat", 0, 0 },
+            { "Show in Files", "", 0, 0 },
+            { "Details", "", 0, 0 },
+            { "Remove from the list", "The file stays", 0, 0 },
+            { "Delete the file", "", BUI_TONE_WARN, 1 },
+        };
+        for (unsigned i = 0; i < G_N_ELEMENTS(o); i++) {
+            snprintf(d.choices[i].label, sizeof d.choices[i].label, "%s", o[i].label);
+            snprintf(d.choices[i].detail, sizeof d.choices[i].detail, "%s", o[i].detail);
+            d.choices[i].tone = o[i].tone;
+            d.choices[i].confirm = o[i].confirm;
+        }
+        d.count = G_N_ELEMENTS(o);
+        d.armed = -1;
+        s = baseState();
+        s.section = SEC_DOWNLOADS;
+        s.rowCount = DOWNLOAD_COUNT;
+        s.zone = ZONE_LIST;
+        s.listFocus = 2;
+        s.choices = &d;
+        menuShot("menu-downloads-choices", &s);
+        d.focus = 0;
+        d.armed = 0;
+        menuShot("menu-downloads-choices-armed", &s);
+        d.focus = 6;
+        d.armed = -1;
+        menuShot("menu-downloads-choices-scrolled", &s);
+
+        /* a download waiting for a folder */
+        memset(&d, 0, sizeof d);
+        snprintf(d.title, sizeof d.title, "Where should this download go?");
+        snprintf(d.lines[0], sizeof d.lines[0], "ps5-homebrew-store-1.4.zip · 2.00 GB · cdn.example.org");
+        snprintf(d.lines[1], sizeof d.lines[1], "It holds an app: Homebrew Store · PPSA05678 · version 1.4");
+        d.lineTones[1] = BUI_TONE_ACTIVE;
+        d.lineCount = 2;
+        const struct { const char *label, *detail; } f[] = {
+            { "Downloads", "This PS5 user's downloads folder · 212 GB free" },
+            { "★ USB drive 1 › homebrew", "/mnt/usb0/homebrew" },
+            { "USB drive 1", "1.31 TB free" },
+            { "Choose another folder…", "In Files" },
+            { "Don't download", "" },
+        };
+        for (unsigned i = 0; i < G_N_ELEMENTS(f); i++) {
+            snprintf(d.choices[i].label, sizeof d.choices[i].label, "%s", f[i].label);
+            snprintf(d.choices[i].detail, sizeof d.choices[i].detail, "%s", f[i].detail);
+        }
+        d.choices[0].tone = BUI_TONE_ACTIVE;
+        d.count = G_N_ELEMENTS(f);
+        d.armed = -1;
+        menuShot("menu-downloads-ask", &s);
+    }
+
+    /* Files */
+    s = baseState();
+    s.section = SEC_FILES;
+    filesAtDrives = 1;
+    s.rowCount = G_N_ELEMENTS(kDrives);
+    s.zone = ZONE_LIST;
+    s.listFocus = 1;
+    s.downloadCross = "Open";
+    menuShot("menu-files-drives", &s);
+    filesAtDrives = 0;
+    s.rowCount = G_N_ELEMENTS(kFolder);
+    s.listFocus = 4;
+    s.downloadCross = "Choose";
+    s.downloadSquare = "Delete";
+    s.listCircle = "Up";
+    menuShot("menu-files-folder", &s);
+    filesMoving = 1;
+    s.listFocus = 0;
+    s.downloadCross = "Move here";
+    s.downloadSquare = "Cancel the move";
+    menuShot("menu-files-moving", &s);
+    filesMoving = 0;
+    s.rowCount = 0;
+    s.downloadCross = s.downloadSquare = s.listCircle = NULL;
+    s.filesError = "The download service didn't answer · trying again";
+    menuShot("menu-files-error", &s);
+    s.filesError = NULL;
+    filesMoving = 0;
 
     s = baseState();
     s.section = SEC_DOWNLOADS;

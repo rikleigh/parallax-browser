@@ -1076,7 +1076,20 @@ hundred megabytes, and because a title can't see every drive.
   - exFAT images (`apps/common/ps5exfat.c`): for ShadowMountPlus, the
     app's folder contents at the image root, 64 KiB clusters, the
     specification's up-case table (the console refuses others),
-    `<drive>/homebrew/<TITLE_ID>.exfat`.
+    `<drive>/homebrew/<TITLE_ID>.exfat`. Only of exactly one app (a
+    folder with `sce_sys/param.json` and `eboot.bin`, up to 3 levels
+    down; `ps5install_count`): a folder or archive with none or several
+    is refused (an archive before it is unpacked, from its listing), and
+    the choice is only offered where one app was found (the look inside
+    an archive, an app folder in Files). Once written, the image is read
+    back as exFAT (`ps5exfat_verify`: the boot region's checksum, the FAT
+    chains, each entry set's checksum, the up-case table) and compared
+    with the folder, names, sizes and every byte (the job's "Checking the
+    image" phase); one that differs is deleted. (2026-11-21, after
+    comparing with Vibe-Code-Jesus's PS5Browser: the messages and
+    settings help in its 01.000.010 package say it takes a folder with `sce_sys/param.json` at its root
+    or one level down, refuses one holding several games, and checks the
+    image after building it.)
 - **What's inside, and a suggestion** (`apps/common/ps5peek.c`, the
   service's `peek`): when an archive is handed off, the service looks
   inside it on the server before it is downloaded, with `Range` requests
@@ -1125,18 +1138,55 @@ hundred megabytes, and because a title can't see every drive.
   `<dest>.part`, renamed when complete, and the original deleted for a
   move. Nothing is overwritten; a move into itself, out of the browser's
   own data, or of a file a listed download uses is refused.
-- **The manager's page** (`apps/title/dlm.c`): `parallax://downloads` on
-  the TV (it opens over the tab when a download waits for a folder; X on a
-  finished or waiting row in the menu's Downloads list opens it), and
-  `http://<ps5>:9040/dlm` from a phone (the link server's PIN rules). Tabs:
-  *Downloads* (waiting ones on top, progress, speed, connections, the jobs
-  on files), *Files* (the drives with free space, folders, unpack/install/
-  image any file or folder already there, rename, delete with a second
-  press (a job, so a big folder doesn't hold up the link server),
-  favourites, *Save downloads here by default*), *Settings*. From another
-  device the page's data and actions need the link server's PIN; with
-  no PIN set up (`/data/ps5webkit/push-pin.txt`) only the TV's own page
-  can use them (they delete, move and install files on every drive).
+- **On the TV, the menu** (2026-11-21; it replaced the manager's page on
+  the TV: `apps/title/browserui.c`, `downloads.c`, `files.c`). Options,
+  then R1 to *Downloads* or *Files*.
+  - *Downloads* lists the downloads, then the jobs started from Files,
+    then unfinished downloads the list lost. X pauses, resumes, retries,
+    continues, or stops a running job; on a finished download, or one
+    waiting for a folder, X opens a dialog over the list (up and down, X
+    picks, O back). Square cancels, clears, or deletes (a file on the
+    second press); R2 shows the details.
+  - A finished download's dialog: what the archive holds (looked at on
+    the drive when the dialog opens, if the server couldn't be asked),
+    the suggestion first (*Unpack and install the app* for one app, else
+    *Unpack*, both tagged *Suggested*), *Unpack and make an exFAT image*,
+    *Show in Files*, *Details*, *Remove from the list*, *Delete the file*
+    (a second press). When an installed version is known, the install
+    choice says *replacing version X* and takes a second press; after a
+    refused install, *Replace the installed version* (a second press).
+  - Where to save (Settings, *Ask where to save each download*, on at
+    first): the menu opens on the download's dialog: the default folder,
+    this user's Downloads, the favourites, the drives that take files,
+    *Choose another folder…* (Files; X on the folder's top row saves it
+    there), *Don't download*. Choosing what happens after the download
+    when saving is left to the phone's page; on the TV the *Downloaded*
+    notice says to press X on it.
+  - *Files*: the drives (free space, file system), the favourites and
+    Downloads; in a folder the first row is the folder itself (X: *New
+    folder…*, favourite, *Save new downloads here*, up). X on a folder
+    opens it (R2: its options); on a file or an app folder it shows what
+    can be done (install, unpack, exFAT image, *Move…*, *Copy…*,
+    *Rename…* with the system keyboard, *Delete* on a second press).
+    Square deletes (a second press), O goes up. Move and copy: open the
+    folder it goes into, X on the top row (*Move <name> here*); Square
+    there cancels. The jobs show in Downloads. Listing goes to the
+    service off the main loop (`ps5wk_dlservice_request_async`;
+    `apps/title/minijson.c` reads its JSON).
+  - The download settings (connections, asking where to save, the default
+    folder, deleting archives after unpacking) are in Settings, *Cookies &
+    storage* (sent as `POST /dlm do=settings`).
+- **The phone's page** (`apps/title/dlm.c`): `http://<ps5>:9040/dlm` (the
+  link server's PIN rules; `parallax://downloads` still serves it, but the
+  browser no longer opens it). Tabs: *Downloads* (waiting ones on top,
+  progress, speed, connections, the jobs on files, what happens after),
+  *Files* (the drives with free space, folders, unpack/install/image any
+  file or folder already there, rename, delete with a second press (a
+  job, so a big folder doesn't hold up the link server), favourites,
+  *Save downloads here by default*), *Settings*. From another device the
+  page's data and actions need the link server's PIN; with no PIN set up
+  (`/data/ps5webkit/push-pin.txt`) only the TV's own pages can use them
+  (they delete, move and install files on every drive).
 - **API:** `GET /dlm.json` (everything the page shows), `GET
   /dlm/fs?op=roots|ls&path=`, `POST /dlm do=save|pause|resume|cancel|remove|
   delete|forget|extract|extract-install|extract-image|jobstop|after|peek|
@@ -1172,7 +1222,9 @@ link server; the page's look through debug screenshots, not the pad):
   finished ZIPs already in the list were looked at on the
   drive when the page opened (ProsperoWeb's: its app found; the data
   ZIP: files, no app).
-- Not checked yet: ShadowMountPlus (1.7beta7 here) mounting such an image
+- Not checked yet: the menu's Downloads dialog and Files list on the
+  console (2026-11-21: drawn on the Mac with `uipreview`, built for the
+  console, not run there); ShadowMountPlus (1.7beta7 here) mounting such an image
   (it logged nothing about it in the minutes watched), RAR archives on the
   console, USB and M.2 drives (none attached), the pad on the TV.
 - After a review (2026-11-21), on the console: an app archive installed
@@ -1196,11 +1248,12 @@ link server; the page's look through debug screenshots, not the pad):
   between drives were tested on the Mac only.
 - **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
   `--quick` 38), `archive-test.sh` (173), `exfat-test.sh` (66,
-  `--no-big` 50), `install-test.sh` (12), `peek-test.sh` (25: ZIP,
+  `--no-big` 50; with the read-back check, `--no-big` 65, the full run
+  not repeated), `install-test.sh` (18), `peek-test.sh` (26: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
   not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
   a slow server, one sending 20 bytes a second, on the drive),
-  `files-test.sh` (27: copies and moves on one drive and to a disk
+  `files-test.sh` (34: copies and moves on one drive and to a disk
   image, no space, cancelled, links, FIFOs, names already there).
 
 **Test server:** `port/webkit/test/downloads/serve.py [--port 8781]`

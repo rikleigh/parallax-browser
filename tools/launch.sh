@@ -14,8 +14,10 @@
 # and sockets closed, then the title asks for its SIGKILL) and kills it only
 # if it is still running after STOP_WAIT seconds (default 10).
 # Any "ERR ... blocked ..." or missing reply: stop and look, don't retry.
-# Only titles in PS5WK_OWN_TITLES are stopped without -f, so the owner's own
-# games are never closed by accident.
+# Our titles are killed by title ID (launcher "killtitle"), never as "the
+# app in front". Only titles in PS5WK_OWN_TITLES are stopped without -f, so
+# the owner's own games are never closed by accident. -f may come before or
+# after the command (--stop -f).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/env.sh" >/dev/null
@@ -49,7 +51,21 @@ stop_title() {
     case "$r" in
         OK*) ;;
         ERR*blocked*|"") return 1 ;;              # the launcher is stuck: don't go on
-        *) echo "(no wind-down; killing)"; run kill; return ;;
+        *)
+            # Kill only our own title: the app in front may be the owner's
+            # (2026-11-21 this fallback killed ProsperoStore when the browser
+            # wasn't running).
+            local ok app tid
+            read -r ok app tid _ <<<"$(ask status)" # "OK <appid> <title>" or "OK none"
+            if [[ "$ok" == OK && "$app" == none ]]; then echo "OK nothing running"; return 0; fi
+            if [[ "$ok" == OK && " $OWN " == *" ${tid:-?} "* ]]; then
+                echo "(no wind-down; killing $tid)"; kill_own "$tid"; return
+            fi
+            if [[ $force == 1 && "$ok" == OK ]]; then
+                echo "(no wind-down; -f: killing $tid)"; run kill; return
+            fi
+            echo "not killing ${tid:-?}: not one of ours (PS5WK_OWN_TITLES=$OWN; -f to force)"
+            return 0 ;;
     esac
     for _ in $(seq $(( ${STOP_WAIT:-10} * 2 ))); do
         sleep 0.5
@@ -57,13 +73,25 @@ stop_title() {
         [[ "$ok" == OK && "$app" == none ]] && { echo "OK stopped (wound down)"; return 0; }
         [[ "$ok" != OK ]] && { echo "ERR status: $ok $app"; return 1; }
     done
-    echo "still running after ${STOP_WAIT:-10} s: killing"
-    run kill
+    # By title, never "whatever is in front": the browser may have gone and
+    # the owner started something else while we waited.
+    echo "still running after ${STOP_WAIT:-10} s: killing PPSA99207"
+    kill_own PPSA99207
+}
+
+# SIGKILL one of our titles by its ID: the launcher's "killtitle" only acts on
+# that title (and only PPSA99xxx), so the check and the kill can't be split by
+# another app coming to the front, as "kill" (the app in front) can.
+kill_own() {
+    if [[ " $OWN " != *" $1 "* ]]; then echo "not killing $1: not one of ours (PS5WK_OWN_TITLES=$OWN)"; return 1; fi
+    run killtitle "$1"
 }
 
 force=0
+for a in "$@"; do [[ "$a" == -f ]] && force=1; done # -f may come before or after the command
+args=(); for a in "$@"; do [[ "$a" != -f ]] && args+=("$a"); done
+set -- ${args[@]+"${args[@]}"}
 case "${1:-}" in
-    -f) force=1; shift ;;
     --status) ensure_launcher; run status; exit ;;
     --apps) ensure_launcher; run apps; exit ;;
     --also) ensure_launcher; run launch-also "${2:?title id}" ${3:-}; exit ;;
@@ -92,6 +120,8 @@ if [[ "$ok" == OK && "$app" != none ]]; then
         echo "$running is running and isn't one of ours; use -f to close it" >&2
         exit 1
     fi
-    if [[ "$running" == PPSA99207 ]]; then stop_title || exit 1; else run kill || exit 1; fi
+    if [[ "$running" == PPSA99207 ]]; then stop_title || exit 1
+    elif [[ " $OWN " == *" $running "* ]]; then kill_own "$running" || exit 1
+    else run kill || exit 1; fi # -f: the app in front, whatever it is
 fi
 run launch "$title" ${1:+"$1"}

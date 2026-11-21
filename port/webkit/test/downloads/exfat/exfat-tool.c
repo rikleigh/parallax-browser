@@ -1,6 +1,8 @@
 /* exfat-tool.c: ps5exfat on the Mac (exfat-test.sh builds and runs it).
  *   exfat-tool measure <folder> [cluster]: prints the image size
  *   exfat-tool build <folder> <image> [cluster] [label] [cancel-at-call]
+ *   exfat-tool verify <image> <folder> [cancel-at-call]: prints
+ *     "OK calls=<n> last=<done>/<total>", "DIFF <why>" or "CANCELLED"
  * build prints "OK <bytes> <seconds> <MB/s> calls=<n> last=<done>/<total>",
  * "REFUSED <why>" (-1), "FAILED <why>" (-2) or "CANCELLED <why>" (-3). */
 #include <stdio.h>
@@ -47,6 +49,18 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
         return 2;
+    if (argv[1][0] == 'v') {
+        volatile int cancel = 0;
+        Seen seen = { 0, 0, 0, argc > 4 ? (unsigned)strtoul(argv[4], NULL, 0) : 0, &cancel };
+        int r = ps5exfat_verify(argv[2], argv[3], progress, &seen, &cancel, error, sizeof error);
+        if (r == -3)
+            printf("CANCELLED %s\n", error);
+        else if (r)
+            printf("DIFF %s\n", error);
+        else
+            printf("OK calls=%u last=%llu/%llu\n", seen.calls, (unsigned long long)seen.done, (unsigned long long)seen.total);
+        return r ? 1 : 0;
+    }
     options.cluster_size = argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 0) : 0;
     options.label = argc > 5 && argv[5][0] ? argv[5] : NULL;
     volatile int cancel = 0;

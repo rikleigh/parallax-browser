@@ -1301,6 +1301,30 @@ static int writeImage(Layout* l, Output* out, const char* src, ps5exfat_progress
     return 0;
 }
 
+/* image's folder is src or a folder in it (the image would be in what it is
+ * made of, and never match it). Unknown (a folder that can't be resolved): no. */
+static int insideFolder(const char* image, const char* src)
+{
+    char* folder = strdup(image);
+    if (!folder)
+        return 0;
+    char* slash = strrchr(folder, '/');
+    if (!slash)
+        strcpy(folder, ".");
+    else if (slash == folder)
+        folder[1] = 0;
+    else
+        *slash = 0;
+    char* a = realpath(folder, NULL);
+    char* b = realpath(src, NULL);
+    free(folder);
+    size_t n = b ? strlen(b) : 0;
+    int inside = a && b && !strncmp(a, b, n) && (a[n] == 0 || a[n] == '/' || (n && b[n - 1] == '/'));
+    free(a);
+    free(b);
+    return inside;
+}
+
 int ps5exfat_build(const char* src, const char* image, const PS5ExfatOptions* options,
     ps5exfat_progress_fn progress, void* data, volatile int* cancel, char* error, size_t error_size)
 {
@@ -1312,6 +1336,10 @@ int ps5exfat_build(const char* src, const char* image, const PS5ExfatOptions* op
     struct stat st;
     if (!lstat(image, &st)) {
         fail(&l, 0, "%s already exists", image);
+        return -1;
+    }
+    if (insideFolder(image, src)) {
+        fail(&l, 0, "the image can't go inside the folder it is made from");
         return -1;
     }
     if (prepare(&l, src, options)) {
@@ -1378,4 +1406,497 @@ done:
     free(folder);
     freeLayout(&l);
     return result;
+}
+
+/* ---------------------------------------------------------------- reading an image back (ps5exfat_verify) */
+
+/* Read independently of the writer's layout: the boot region, the FAT and
+ * the directories as the specification describes them, so a mistake in
+ * the writer isn't repeated here. */
+
+typedef struct {
+    int fd;
+    uint64_t fileSize;
+    uint32_t sectorSize, clusterSize, clusterCount, heapOffset; /* heapOffset in sectors */
+    uint32_t* fat;
+    uint32_t fatEntries;
+    uint64_t done, total;
+    int counting; /* the first pass: only the sizes, for the progress */
+    ps5exfat_progress_fn progress;
+    void* data;
+    volatile int* cancel;
+    unsigned char* buffer; /* BUFFER bytes: the image */
+    unsigned char* other;  /* BUFFER bytes: the source */
+    char* error;
+    size_t errorSize;
+    double lastReport;
+} Check;
+
+static int checkFail(Check* c, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    if (c->error && c->errorSize)
+        vsnprintf(c->error, c->errorSize, format, args);
+    va_end(args);
+    return -1;
+}
+
+static uint16_t get16(const unsigned char* p)
+{
+    return (uint16_t)(p[0] | p[1] << 8);
+}
+
+static uint32_t get32(const unsigned char* p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint64_t get64(const unsigned char* p)
+{
+    return (uint64_t)get32(p) | (uint64_t)get32(p + 4) << 32;
+}
+
+static int readAt(int fd, void* buffer, size_t length, uint64_t offset)
+{
+    size_t got = 0;
+    while (got < length) {
+        ssize_t n = pread(fd, (char*)buffer + got, length - got, (off_t)(offset + got));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+static int validCluster(const Check* c, uint32_t cluster)
+{
+    return cluster >= 2 && cluster - 2 < c->clusterCount;
+}
+
+/* The clusters of a chain (or a contiguous run when noChain), in order:
+ * calls step for each one. length: bytes the stream has (its clusters
+ * must cover it, and a chain may not end early or loop). */
+static int forEachCluster(Check* c, uint32_t first, uint64_t length, int noChain, int (*step)(Check*, uint64_t offset, size_t bytes, void* user),
+    void* user)
+{
+    if (!length)
+        return first ? checkFail(c, "an empty stream has a cluster") : 0;
+    uint64_t clusters = (length + c->clusterSize - 1) / c->clusterSize;
+    if (clusters > c->clusterCount)
+        return checkFail(c, "a stream is longer than the volume");
+    uint32_t cluster = first;
+    uint64_t left = length;
+    for (uint64_t i = 0; i < clusters; i++) {
+        if (!validCluster(c, cluster))
+            return checkFail(c, "a stream points outside the volume (cluster %u)", cluster);
+        uint64_t offset = (uint64_t)c->heapOffset * c->sectorSize + (uint64_t)(cluster - 2) * c->clusterSize;
+        size_t bytes = left < c->clusterSize ? (size_t)left : c->clusterSize;
+        if (offset + bytes > c->fileSize)
+            return checkFail(c, "a stream is past the image's end");
+        int r = step(c, offset, bytes, user);
+        if (r)
+            return r;
+        left -= bytes;
+        if (i + 1 == clusters)
+            break;
+        if (noChain)
+            cluster++;
+        else {
+            if (cluster >= c->fatEntries)
+                return checkFail(c, "the FAT is too short");
+            uint32_t next = c->fat[cluster];
+            if (!validCluster(c, next))
+                return checkFail(c, "a FAT chain ends early (cluster %u -> %#x)", cluster, next);
+            cluster = next;
+        }
+    }
+    if (!noChain && validCluster(c, cluster) && cluster < c->fatEntries && c->fat[cluster] < 0xfffffff8u)
+        return checkFail(c, "a FAT chain goes on past its stream's end");
+    return 0;
+}
+
+typedef struct {
+    unsigned char* bytes;
+    size_t length, size;
+} Collected;
+
+static int collectStep(Check* c, uint64_t offset, size_t bytes, void* user)
+{
+    Collected* d = user;
+    if (d->length + bytes > d->size)
+        return checkFail(c, "a directory is too big");
+    if (readAt(c->fd, d->bytes + d->length, bytes, offset))
+        return checkFail(c, "the image couldn't be read (errno %d)", errno);
+    d->length += bytes;
+    return 0;
+}
+
+/* The root directory's length: its chain followed to the end. */
+static int64_t chainLength(Check* c, uint32_t first)
+{
+    uint64_t clusters = 0;
+    uint32_t cluster = first;
+    while (validCluster(c, cluster) && cluster < c->fatEntries) {
+        if (++clusters > c->clusterCount)
+            return checkFail(c, "the root directory's chain loops");
+        uint32_t next = c->fat[cluster];
+        if (next >= 0xfffffff8u)
+            return (int64_t)(clusters * c->clusterSize);
+        cluster = next;
+    }
+    return checkFail(c, "the root directory's chain is broken");
+}
+
+typedef struct {
+    int fd;
+    uint64_t sourceOffset;
+} Compare;
+
+static int compareStep(Check* c, uint64_t offset, size_t bytes, void* user)
+{
+    Compare* cmp = user;
+    for (size_t at = 0; at < bytes;) {
+        if (c->cancel && *c->cancel)
+            return checkFail(c, "Cancelled");
+        size_t n = bytes - at < BUFFER ? bytes - at : BUFFER;
+        if (readAt(c->fd, c->buffer, n, offset + at))
+            return checkFail(c, "the image couldn't be read (errno %d)", errno);
+        if (readAt(cmp->fd, c->other, n, cmp->sourceOffset))
+            return checkFail(c, "the source changed or couldn't be read (errno %d)", errno);
+        if (memcmp(c->buffer, c->other, n))
+            return -2;
+        at += n;
+        cmp->sourceOffset += n;
+        c->done += n;
+        double t = now();
+        if (c->progress && t - c->lastReport >= 0.25) {
+            c->lastReport = t;
+            c->progress(c->done, c->total, "", c->data);
+        }
+    }
+    return 0;
+}
+
+static int checkDirectory(Check* c, const char* src, const unsigned char* bytes, size_t length, int root, unsigned depth);
+typedef struct Names Names;
+static int checkEntries(Check* c, const char* src, const unsigned char* bytes, size_t length, int root, unsigned depth, Names* matched);
+
+/* The names a directory of the image holds (each must be in the folder,
+ * once: a count alone would pass one file listed twice and another left out). */
+struct Names {
+    char** names;
+    unsigned count, capacity;
+};
+
+static void namesFree(Names* n)
+{
+    for (unsigned i = 0; i < n->count; i++)
+        free(n->names[i]);
+    free(n->names);
+}
+
+static int namesAdd(Names* n, const char* name)
+{
+    if (n->count == n->capacity) {
+        unsigned capacity = n->capacity ? n->capacity * 2 : 64;
+        char** grown = realloc(n->names, capacity * sizeof *grown);
+        if (!grown)
+            return -1;
+        n->names = grown;
+        n->capacity = capacity;
+    }
+    if (!(n->names[n->count] = strdup(name)))
+        return -1;
+    n->count++;
+    return 0;
+}
+
+static int compareNames(const void* a, const void* b)
+{
+    return strcmp(*(char* const*)a, *(char* const*)b);
+}
+
+/* One entry set (file + stream + names) at e, n entries in all. */
+static int checkEntrySet(Check* c, const char* src, const unsigned char* e, unsigned n, unsigned depth, Names* matched)
+{
+    uint16_t sum = 0;
+    for (unsigned i = 0; i < 32 * n; i++) {
+        if (i == 2 || i == 3)
+            continue;
+        sum = (uint16_t)(((sum & 1) ? 0x8000 : 0) + (sum >> 1) + e[i]);
+    }
+    if (sum != get16(e + 2))
+        return checkFail(c, "an entry set's checksum is wrong in %s", src);
+    const unsigned char* stream = e + 32;
+    if (stream[0] != 0xc0)
+        return checkFail(c, "a file entry without its stream entry in %s", src);
+    unsigned units = stream[3];
+    if (!units || n < 2 + (units + 14) / 15)
+        return checkFail(c, "a file entry with a bad name in %s", src);
+    char name[256 * 3 + 1];
+    size_t out = 0;
+    for (unsigned i = 0; i < units; i++) {
+        const unsigned char* part = e + 64 + 32 * (i / 15);
+        if (part[0] != 0xc1)
+            return checkFail(c, "a file name entry is missing in %s", src);
+        uint32_t u = get16(part + 2 + 2 * (i % 15));
+        if (u >= 0xd800 && u < 0xdc00 && i + 1 < units) {
+            const unsigned char* nextPart = e + 64 + 32 * ((i + 1) / 15);
+            uint32_t low = get16(nextPart + 2 + 2 * ((i + 1) % 15));
+            if (low >= 0xdc00 && low < 0xe000) {
+                u = 0x10000 + ((u - 0xd800) << 10) + (low - 0xdc00);
+                i++;
+            }
+        }
+        if (u < 0x80)
+            name[out++] = (char)u;
+        else if (u < 0x800) {
+            name[out++] = (char)(0xc0 | u >> 6);
+            name[out++] = (char)(0x80 | (u & 0x3f));
+        } else if (u < 0x10000) {
+            name[out++] = (char)(0xe0 | u >> 12);
+            name[out++] = (char)(0x80 | ((u >> 6) & 0x3f));
+            name[out++] = (char)(0x80 | (u & 0x3f));
+        } else {
+            name[out++] = (char)(0xf0 | u >> 18);
+            name[out++] = (char)(0x80 | ((u >> 12) & 0x3f));
+            name[out++] = (char)(0x80 | ((u >> 6) & 0x3f));
+            name[out++] = (char)(0x80 | (u & 0x3f));
+        }
+    }
+    name[out] = 0;
+    int directory = (get16(e + 4) & 0x10) != 0;
+    int noChain = (stream[1] & 0x02) != 0;
+    uint64_t valid = get64(stream + 8), length = get64(stream + 24);
+    uint32_t first = get32(stream + 20);
+    char* path = joinPath(src, name);
+    if (!path)
+        return checkFail(c, "out of memory");
+    struct stat st;
+    int result = 0;
+    if (lstat(path, &st))
+        result = checkFail(c, "%s is in the image but not in the folder", path);
+    else if (directory != S_ISDIR(st.st_mode))
+        result = checkFail(c, "%s is a %s in the image", path, directory ? "folder" : "file");
+    else if (directory) {
+        if (length % c->clusterSize || length > MAX_DIRECTORY)
+            result = checkFail(c, "%s: a folder's length is wrong in the image", path);
+        else {
+            Collected d = { malloc(length ? length : 1), 0, length };
+            if (!d.bytes)
+                result = checkFail(c, "out of memory");
+            else {
+                result = forEachCluster(c, first, length, noChain, collectStep, &d);
+                if (!result)
+                    result = checkDirectory(c, path, d.bytes, d.length, 0, depth + 1);
+                free(d.bytes);
+            }
+        }
+    } else if (valid != length || length != (uint64_t)st.st_size)
+        result = checkFail(c, "%s: %llu bytes in the image, %llu in the folder", path, (unsigned long long)length,
+            (unsigned long long)st.st_size);
+    else if (c->counting)
+        c->total += length;
+    else if (length) {
+        Compare cmp = { open(path, O_RDONLY), 0 };
+        if (cmp.fd < 0)
+            result = checkFail(c, "%s couldn't be read (errno %d)", path, errno);
+        else {
+            result = forEachCluster(c, first, length, noChain, compareStep, &cmp);
+            if (result == -2)
+                result = checkFail(c, "%s differs from the image's copy", path);
+            close(cmp.fd);
+        }
+    } else if (first)
+        result = checkFail(c, "%s: an empty file with a cluster", path);
+    free(path);
+    if (!result && namesAdd(matched, name))
+        result = checkFail(c, "out of memory");
+    return result;
+}
+
+static int checkDirectory(Check* c, const char* src, const unsigned char* bytes, size_t length, int root, unsigned depth)
+{
+    if (depth > 64)
+        return checkFail(c, "folders nested too deep");
+    Names matched = { NULL, 0, 0 };
+    int result = checkEntries(c, src, bytes, length, root, depth, &matched);
+    if (!result && matched.count > 1) {
+        qsort(matched.names, matched.count, sizeof *matched.names, compareNames);
+        for (unsigned i = 1; i < matched.count && !result; i++) {
+            if (!strcmp(matched.names[i - 1], matched.names[i]))
+                result = checkFail(c, "%s/%s is in the image twice", src, matched.names[i]);
+        }
+    }
+    unsigned count = matched.count;
+    namesFree(&matched);
+    if (result)
+        return result;
+    /* everything in the folder is in the image (each image name is in the
+     * folder, once, so the same count means the same names) */
+    DIR* folder = opendir(src);
+    if (!folder)
+        return checkFail(c, "%s couldn't be read (errno %d)", src, errno);
+    unsigned there = 0;
+    struct dirent* entry;
+    while ((entry = readdir(folder)))
+        there += strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..");
+    closedir(folder);
+    if (there != count)
+        return checkFail(c, "%s has %u entries, the image %u", src, there, count);
+    return 0;
+}
+
+/* The entries of one directory of the image, each checked against the folder. */
+static int checkEntries(Check* c, const char* src, const unsigned char* bytes, size_t length, int root, unsigned depth, Names* matched)
+{
+    int sawBitmap = 0, sawUpcase = 0;
+    for (size_t at = 0; at + 32 <= length;) {
+        const unsigned char* e = bytes + at;
+        unsigned char type = e[0];
+        if (!type)
+            break; /* the end */
+        if (!(type & 0x80)) {
+            at += 32; /* unused */
+            continue;
+        }
+        if (type == 0x81 || type == 0x82 || type == 0x83 || type == 0xa0) {
+            if (!root)
+                return checkFail(c, "a volume entry outside the root in %s", src);
+            if (type == 0x81)
+                sawBitmap = 1;
+            if (type == 0x82) {
+                sawUpcase = 1;
+                if (get32(e + 4) != 0xe619d30du)
+                    return checkFail(c, "the up-case table isn't the specification's (the PS5 refuses others)");
+            }
+            at += 32;
+            continue;
+        }
+        if (type != 0x85)
+            return checkFail(c, "an unexpected entry (%#x) in %s", type, src);
+        unsigned n = 1u + e[1];
+        if (n < 3 || n > 19 || at + 32 * n > length)
+            return checkFail(c, "a file entry set is cut short in %s", src);
+        int r = checkEntrySet(c, src, e, n, depth, matched);
+        if (r)
+            return r;
+        at += 32 * n;
+    }
+    if (root && (!sawBitmap || !sawUpcase))
+        return checkFail(c, "the root has no %s", sawBitmap ? "up-case table" : "allocation bitmap");
+    return 0;
+}
+
+int ps5exfat_verify(const char* image, const char* src, ps5exfat_progress_fn progress, void* data, volatile int* cancel, char* error,
+    size_t error_size)
+{
+    Check c = { .fd = -1, .progress = progress, .data = data, .cancel = cancel, .error = error, .errorSize = error_size };
+    if (error && error_size)
+        error[0] = 0;
+    int result = -1;
+    unsigned char region[24 * SECTOR];
+    Collected root = { NULL, 0, 0 };
+    c.fd = open(image, O_RDONLY);
+    struct stat st;
+    if (c.fd < 0 || fstat(c.fd, &st)) {
+        checkFail(&c, "%s couldn't be opened (errno %d)", image, errno);
+        goto done;
+    }
+    c.fileSize = (uint64_t)st.st_size;
+    if (readAt(c.fd, region, sizeof region, 0)) {
+        checkFail(&c, "the image is too short");
+        goto done;
+    }
+    const unsigned char* b = region;
+    if (memcmp(b + 3, "EXFAT   ", 8) || b[510] != 0x55 || b[511] != 0xaa) {
+        checkFail(&c, "not an exFAT volume");
+        goto done;
+    }
+    unsigned sectorShift = b[108], clusterShift = b[109];
+    if (sectorShift != 9 || sectorShift + clusterShift > 25 || b[110] != 1) {
+        checkFail(&c, "an unexpected geometry (sectors 2^%u, clusters 2^%u sectors, %u FATs)", sectorShift, clusterShift, b[110]);
+        goto done;
+    }
+    /* the boot checksum, in both regions, and the backup the same */
+    uint32_t sum = checksum32(0, region, SECTOR, 1);
+    sum = checksum32(sum, region + SECTOR, 10 * SECTOR, 0);
+    for (unsigned i = 0; i < SECTOR; i += 4) {
+        if (get32(region + 11 * SECTOR + i) != sum) {
+            checkFail(&c, "the boot region's checksum is wrong");
+            goto done;
+        }
+    }
+    if (memcmp(region, region + 12 * SECTOR, 12 * SECTOR)) {
+        checkFail(&c, "the backup boot region differs");
+        goto done;
+    }
+    c.sectorSize = 1u << sectorShift;
+    c.clusterSize = c.sectorSize << clusterShift;
+    uint32_t fatOffset = get32(b + 80), fatLength = get32(b + 84);
+    c.heapOffset = get32(b + 88);
+    c.clusterCount = get32(b + 92);
+    uint64_t volume = get64(b + 72) * c.sectorSize;
+    uint64_t heapEnd = (uint64_t)c.heapOffset * c.sectorSize + (uint64_t)c.clusterCount * c.clusterSize;
+    if (volume > c.fileSize || heapEnd > volume || (uint64_t)fatLength * c.sectorSize < ((uint64_t)c.clusterCount + 2) * 4
+        || (uint64_t)fatOffset + fatLength > c.heapOffset) {
+        checkFail(&c, "the volume's sizes don't fit the image");
+        goto done;
+    }
+    c.fatEntries = c.clusterCount + 2;
+    if ((uint64_t)c.fatEntries * 4 > (512ull << 20) || !(c.fat = malloc((size_t)c.fatEntries * 4))) {
+        checkFail(&c, "the FAT is too big to check");
+        goto done;
+    }
+    if (readAt(c.fd, c.fat, (size_t)c.fatEntries * 4, (uint64_t)fatOffset * c.sectorSize)) {
+        checkFail(&c, "the FAT couldn't be read");
+        goto done;
+    }
+    for (uint32_t i = 0; i < c.fatEntries; i++)
+        c.fat[i] = get32((unsigned char*)&c.fat[i]);
+    c.buffer = malloc(BUFFER);
+    c.other = malloc(BUFFER);
+    if (!c.buffer || !c.other) {
+        checkFail(&c, "out of memory");
+        goto done;
+    }
+    int64_t rootLength = chainLength(&c, get32(b + 96));
+    if (rootLength < 0)
+        goto done;
+    if (rootLength > MAX_DIRECTORY) {
+        checkFail(&c, "the root directory is too big");
+        goto done;
+    }
+    root.size = (size_t)rootLength;
+    if (!(root.bytes = malloc(root.size))) {
+        checkFail(&c, "out of memory");
+        goto done;
+    }
+    if (forEachCluster(&c, get32(b + 96), (uint64_t)rootLength, 0, collectStep, &root))
+        goto done;
+    /* the sizes first (the progress's total), then the bytes */
+    c.counting = 1;
+    if (checkDirectory(&c, src, root.bytes, root.length, 1, 0))
+        goto done;
+    c.counting = 0;
+    if (progress)
+        progress(0, c.total, "", data);
+    if (checkDirectory(&c, src, root.bytes, root.length, 1, 0))
+        goto done;
+    if (progress)
+        progress(c.done, c.total, "", data);
+    result = 0;
+done:
+    if (result && cancel && *cancel && error && error_size)
+        snprintf(error, error_size, "Cancelled");
+    if (c.fd >= 0)
+        close(c.fd);
+    free(c.fat);
+    free(c.buffer);
+    free(c.other);
+    free(root.bytes);
+    return result ? (cancel && *cancel ? -3 : -1) : 0;
 }

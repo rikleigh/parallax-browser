@@ -352,7 +352,8 @@ void ps5wk_dlservice_send(const char* verb, ...)
     g_string_free(line, TRUE);
 }
 
-char* ps5wk_dlservice_request(guint timeoutMS, char** error, const char* op, ...)
+/* pairs: key, value, ..., NULL (values never NULL here). */
+static char* requestPairs(guint timeoutMS, char** error, const char* op, char** pairs)
 {
     Request request = { 0 };
     GString* line = g_string_new("req");
@@ -363,16 +364,10 @@ char* ps5wk_dlservice_request(guint timeoutMS, char** error, const char* op, ...
     snprintf(number, sizeof number, "%u", request.n);
     g_string_append_printf(line, " n=%s&op=", number);
     g_string_append_uri_escaped(line, op, NULL, FALSE);
-    va_list args;
-    va_start(args, op);
-    for (const char* key; (key = va_arg(args, const char*));) {
-        const char* value = va_arg(args, const char*);
-        if (!value)
-            continue;
-        g_string_append_printf(line, "&%s=", key);
-        g_string_append_uri_escaped(line, value, NULL, FALSE);
+    for (char** p = pairs; p && p[0] && p[1]; p += 2) {
+        g_string_append_printf(line, "&%s=", p[0]);
+        g_string_append_uri_escaped(line, p[1], NULL, FALSE);
     }
-    va_end(args);
     g_string_append_c(line, '\n');
 
     gint64 end = g_get_monotonic_time() + (gint64)timeoutMS * 1000;
@@ -405,6 +400,86 @@ char* ps5wk_dlservice_request(guint timeoutMS, char** error, const char* op, ...
     else
         g_free(request.error);
     return json;
+}
+
+/* The pairs after op (values NULL left out) as a NULL-terminated vector. */
+static char** collectPairs(va_list args)
+{
+    GPtrArray* out = g_ptr_array_new();
+    for (const char* key; (key = va_arg(args, const char*));) {
+        const char* value = va_arg(args, const char*);
+        if (!value)
+            continue;
+        g_ptr_array_add(out, g_strdup(key));
+        g_ptr_array_add(out, g_strdup(value));
+    }
+    g_ptr_array_add(out, NULL);
+    return (char**)g_ptr_array_free(out, FALSE);
+}
+
+char* ps5wk_dlservice_request(guint timeoutMS, char** error, const char* op, ...)
+{
+    va_list args;
+    va_start(args, op);
+    char** pairs = collectPairs(args);
+    va_end(args);
+    char* json = requestPairs(timeoutMS, error, op, pairs);
+    g_strfreev(pairs);
+    return json;
+}
+
+typedef struct {
+    guint timeoutMS;
+    char* op;
+    char** pairs;
+    char* json;
+    char* error;
+    PS5WKDlServiceReply done;
+    gpointer user;
+} AsyncRequest;
+
+static gboolean asyncReplied(gpointer data)
+{
+    AsyncRequest* a = data;
+    a->done(a->json, a->error, a->user);
+    g_free(a->json);
+    g_free(a->error);
+    g_free(a->op);
+    g_strfreev(a->pairs);
+    g_free(a);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer asyncThread(gpointer data)
+{
+    AsyncRequest* a = data;
+    a->json = requestPairs(a->timeoutMS, &a->error, a->op, a->pairs);
+    /* Always through the main loop: g_main_context_invoke would run it here,
+     * on this thread, when no loop owns the context (as the title shuts down). */
+    g_idle_add_full(G_PRIORITY_DEFAULT, asyncReplied, a, NULL);
+    return NULL;
+}
+
+void ps5wk_dlservice_request_async(guint timeoutMS, PS5WKDlServiceReply done, gpointer user, const char* op, ...)
+{
+    AsyncRequest* a = g_new0(AsyncRequest, 1);
+    a->timeoutMS = timeoutMS;
+    a->op = g_strdup(op);
+    va_list args;
+    va_start(args, op);
+    a->pairs = collectPairs(args);
+    va_end(args);
+    a->done = done;
+    a->user = user;
+    GError* error = NULL;
+    GThread* thread = g_thread_try_new("dl-request", asyncThread, a, &error);
+    if (!thread) {
+        a->error = g_strdup("Couldn't start a thread");
+        g_clear_error(&error);
+        g_idle_add_full(G_PRIORITY_DEFAULT, asyncReplied, a, NULL); /* later, as a reply would be */
+        return;
+    }
+    g_thread_unref(thread);
 }
 
 gboolean ps5wk_dlservice_connected(void)

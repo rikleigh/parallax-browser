@@ -31,20 +31,41 @@ void ps5wk_downloads_watch_session(WebKitNetworkSession* session);
  * frame, a link with a download attribute). */
 gboolean ps5wk_downloads_response_policy(WebKitWebView* view, WebKitResponsePolicyDecision* decision);
 
-/* The list, newest first (the menu's Downloads list). */
+/* The menu's Downloads list: the downloads (newest first), then the jobs
+ * on files from Files, then unfinished downloads found in the download
+ * folders that the list lost. */
 unsigned ps5wk_downloads_count(void);
 void ps5wk_downloads_row(unsigned index, BUIRow* row);
-/* What X and Square do for a row (footer hints): NULL = nothing. */
-void ps5wk_downloads_hints(unsigned index, const char** cross, const char** square);
-/* X: pause, resume, retry; a finished file's details. */
-void ps5wk_downloads_primary(unsigned index);
-/* Square: TRUE when it needs a second press (a finished file is deleted). */
+/* A download finished in the last few seconds (its notice says Options
+ * opens it): its index, once. */
+gboolean ps5wk_downloads_take_recent(unsigned* index);
+/* The list came into view (it looks for lost unfinished downloads). */
+void ps5wk_downloads_shown(void);
+/* What X, Square and R2 do for a row (footer hints): NULL = nothing. */
+void ps5wk_downloads_hints(unsigned index, const char** cross, const char** square, const char** r2);
+/* X: pause, resume, retry, continue, stop a job; TRUE: open the row's
+ * dialog instead (a finished download, one waiting for a folder). */
+gboolean ps5wk_downloads_primary(unsigned index);
+/* Square: TRUE when it needs a second press (a file is deleted). */
+/* The row the open dialog is about, where it is now (FALSE: gone). */
+gboolean ps5wk_downloads_choices_index(unsigned* index);
+/* What a row is, kept while rows come and go above it (g_free; NULL: no row). */
+char* ps5wk_downloads_row_key(unsigned index);
 gboolean ps5wk_downloads_square_needs_confirm(unsigned index);
 /* Square: cancel (running, paused: the .part goes), or delete the entry and
- * its file. */
+ * its file; clear a job; delete an unfinished download's files. */
 void ps5wk_downloads_square(unsigned index);
-/* The details card (strings valid until the next call). */
+/* The details card (strings valid until the next call; count 0: none). */
 void ps5wk_downloads_details(unsigned index, BUIDetails* details);
+/* The dialog for a row: open (FALSE: none), fill (FALSE: its row is gone
+ * or changed), a choice (returns BUI_CHOSEN_*). */
+gboolean ps5wk_downloads_choices_open(unsigned index);
+gboolean ps5wk_downloads_choices(BUIChoices* out);
+int ps5wk_downloads_choose(int id);
+/* Files: the favourite folders (NULL-terminated, or NULL; downloads.c's)
+ * and the folder new downloads go to. */
+char** ps5wk_downloads_favorites(void);
+const char* ps5wk_downloads_default_folder(void);
 /* Receiving now, and their progress together (< 0: a size not known). */
 unsigned ps5wk_downloads_active(double* progress);
 

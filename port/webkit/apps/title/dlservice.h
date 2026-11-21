@@ -25,6 +25,11 @@ void ps5wk_dlservice_send(const char* verb, ...) G_GNUC_NULL_TERMINATED;
  * NULL with *error (g_free) saying why. Pairs as above, then NULL. */
 char* ps5wk_dlservice_request(guint timeoutMS, char** error, const char* op, ...) G_GNUC_NULL_TERMINATED;
 
+/* The main loop: the same without waiting; done runs on the main loop
+ * with the reply's JSON or why not (both freed after it returns). */
+typedef void (*PS5WKDlServiceReply)(const char* json, const char* error, gpointer user);
+void ps5wk_dlservice_request_async(guint timeoutMS, PS5WKDlServiceReply done, gpointer user, const char* op, ...) G_GNUC_NULL_TERMINATED;
+
 /* Whether the service is connected now (any thread). */
 gboolean ps5wk_dlservice_connected(void);
 

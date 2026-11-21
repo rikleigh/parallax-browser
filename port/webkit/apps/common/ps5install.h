@@ -36,6 +36,11 @@ typedef struct {
  * valid titleId. */
 int ps5install_find(const char* dir, unsigned depth, PS5TitleInfo* out, char* error, size_t error_size);
 
+/* How many title folders dir holds (dir itself, or up to depth levels
+ * below; an app's own folders aren't searched), -1 out of memory, -2 too
+ * many folders on one level to search them all. */
+int ps5install_count(const char* dir, unsigned depth);
+
 /* Fills out from a param.json's text (out->dir left empty). 0, or -2
  * without a valid titleId. */
 int ps5install_parse_param(const char* text, PS5TitleInfo* out);

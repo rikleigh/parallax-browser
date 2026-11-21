@@ -13,9 +13,9 @@
 #include <wpe/ps5/wpe-ps5.h>
 
 enum { TB_BACK, TB_FORWARD, TB_RELOAD, TB_HOME, TB_ADDRESS, TB_TABS, TB_STAR, TB_FULLSCREEN, TB_GAMEPAD, TB_PRIVATE, TB_SAFER, TB_NEWTAB, TB_SETTINGS, TB_COUNT };
-enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_DOWNLOADS, SEC_COUNT };
+enum { SEC_TABS, SEC_BOOKMARKS, SEC_HISTORY, SEC_DOWNLOADS, SEC_FILES, SEC_COUNT };
 enum { ZONE_TOOLBAR, ZONE_LIST };
-enum { HOT_TOOLBAR, HOT_SECTION, HOT_ROW };
+enum { HOT_TOOLBAR, HOT_SECTION, HOT_ROW, HOT_CHOICE };
 
 /* Where the pointer can pick something (filled by the last draw). */
 typedef struct {
@@ -32,8 +32,9 @@ typedef struct {
     gboolean current; /* the tab shown */
     gboolean action;  /* "+ New tab", "Clear all history" */
     gboolean armed;   /* "Clear all history" pressed once */
-    /* the Downloads list: title = the file's name, url = the address it came from */
-    char kind[8];      /* the file-type tile: "ZIP", "ELF", "PKG" */
+    /* the Downloads and Files lists: title = the file's name, url = the
+     * address it came from (Files: NULL) */
+    char kind[8];      /* the file-type tile: "ZIP", "ELF", "PKG", "DIR" */
     double progress;   /* 0..1 for the bar under the name; < 0: no bar */
     gboolean running;  /* receiving: the bar's head glows */
     char detail[112];  /* "312 MB of 1.2 GB · 18.4 MB/s · 48 s left" */
@@ -50,6 +51,38 @@ typedef struct {
     const char* values[10];
     int count;
 } BUIDetails;
+
+/* A dialog over the list: what X on a download or a file offers (its
+ * owner, downloads.c or files.c, fills it; browserui.c moves the focus). */
+#define BUI_CHOICES_MAX 12
+typedef struct {
+    char label[96];
+    char detail[160]; /* a line under it ("" none) */
+    int tone;         /* BUI_TONE_ACTIVE: suggested; BUI_TONE_WARN: replaces or deletes */
+    int id;           /* the owner's */
+    gboolean confirm; /* done on a second press (the first arms it) */
+} BUIChoice;
+
+typedef struct {
+    char title[200];
+    char lines[3][200]; /* under the title: where it is, what's inside */
+    int lineTones[3];
+    int lineCount;
+    BUIChoice choices[BUI_CHOICES_MAX];
+    int count;
+    int focus; /* index */
+    int armed; /* index pressed once (confirm), -1 none */
+} BUIChoices;
+
+/* What a choice did (the dialog's owner tells browserui.c). */
+enum {
+    BUI_CHOSEN_CLOSE,      /* the dialog closes */
+    BUI_CHOSEN_STAY,       /* it stays (a choice armed, or nothing done) */
+    BUI_CHOSEN_FILES,      /* the Files list (it was set up) */
+    BUI_CHOSEN_DOWNLOADS,  /* the Downloads list */
+    BUI_CHOSEN_DETAILS,    /* the row's details card */
+    BUI_CHOSEN_MENU_CLOSE, /* done: back to the page (a download's folder chosen) */
+};
 
 typedef struct {
     int screenW, screenH;
@@ -76,14 +109,19 @@ typedef struct {
      * together (0..1, < 0: sizes not known) */
     unsigned downloadsActive;
     double downloadsProgress;
-    /* the footer in the Downloads list: what X and Square do for the row
-     * focused (NULL: nothing) */
+    /* the footer in the Downloads and Files lists: what X, Square and R2
+     * do for the row focused (NULL: nothing), and O (NULL: "Close") */
     const char* downloadCross;
     const char* downloadSquare;
+    const char* listR2;
+    const char* listCircle;
+    const char* filesError; /* Files: the drives couldn't be listed (why) */
     /* the footer on the Home button: what Square does (NULL: nothing) */
     const char* homeSquare;
     /* a details card over the list, or NULL */
     const BUIDetails* details;
+    /* a dialog over the list, or NULL */
+    const BUIChoices* choices;
     int rowCount, listTop, listFocus;
     void (*row)(int index, BUIRow* out, void* user);
     void* user;
@@ -93,6 +131,8 @@ int bui_bar_height(void);
 int bui_row_height(void);
 /* How many rows the menu's list shows. */
 int bui_visible_rows(int screenH);
+/* How many choices a dialog shows at once (it scrolls to the focus). */
+int bui_visible_choices(int screenH, const BUIChoices* choices);
 
 /* The bar, @interactive: in the menu or above the page (focus: zone
  * ZONE_TOOLBAR and toolbarFocus, -1 none; pointer targets), else the

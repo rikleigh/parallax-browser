@@ -35,9 +35,12 @@
 #include "browser.h"
 #include "dlservice.h"
 #include "downloads.h"
+#include "files.h"
+#include "minijson.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <libsoup/soup.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +115,7 @@ static char* snapSummaryJSON;
 static GPtrArray* snapFinishedNames; /* char* */
 static char* snapManagerJSON;
 static char* snapScanDirs; /* folders unfinished downloads may be in, one a line */
+static char* snapSettingsJSON; /* the settings, for settings.json */
 static GPtrArray* snapInUse; /* char*: paths downloads, jobs and tasks use (ps5wk_downloads_in_use) */
 
 /* Jobs on files that aren't downloads (the manager's file browser): an
@@ -322,6 +326,12 @@ static Download* at(int index)
     return list && index >= 0 && index < (int)list->len ? g_ptr_array_index(list, index) : NULL;
 }
 
+/* The download that finished last, for a few seconds: Options then opens
+ * its dialog (ps5wk_downloads_take_recent). */
+#define RECENT_S 8
+static unsigned recentID;
+static gint64 recentUntil; /* monotonic us */
+
 static void notice(const char* format, ...) G_GNUC_PRINTF(1, 2);
 static void notice(const char* format, ...)
 {
@@ -329,9 +339,27 @@ static void notice(const char* format, ...)
     va_start(args, format);
     char* text = g_strdup_vprintf(format, args);
     va_end(args);
+    recentID = 0; /* "Options: open it" is no longer what the notice says */
     if (display)
         wpe_display_ps5_show_message(display, text, 3);
     g_free(text);
+}
+
+/* d is done: say so, and let Options open it for a few seconds (unless a
+ * job chosen when saving starts by itself). */
+static void announceDone(const char* file, unsigned id, gboolean jobFollows)
+{
+    if (jobFollows) {
+        notice("Downloaded %s", file);
+        return;
+    }
+    recentID = id;
+    recentUntil = g_get_monotonic_time() + RECENT_S * G_USEC_PER_SEC;
+    if (display) {
+        char* text = g_strdup_printf("Downloaded %s\nOptions: open it", file);
+        wpe_display_ps5_show_message(display, text, RECENT_S);
+        g_free(text);
+    }
 }
 
 /* A name for the folder: no path, no control characters, no leading dots;
@@ -501,10 +529,13 @@ char* ps5wk_downloads_summary_json(void)
 {
     g_mutex_lock(&snapLock);
     char* counts = g_strdup(snapSummaryJSON ? snapSummaryJSON : "\"finished\":0,\"active\":0,\"total\":0");
-    g_mutex_unlock(&snapLock);
     /* the free space now (any thread: a file read) */
-    char* json = g_strdup_printf("{\"folder\":\"%s\",\"free\":%" G_GINT64_FORMAT ",%s}", PS5WK_DOWNLOADS_DIR, ps5wk_downloads_free_space(), counts);
+    char* settingsJSON = g_strdup(snapSettingsJSON ? snapSettingsJSON : "");
+    g_mutex_unlock(&snapLock);
+    char* json = g_strdup_printf("{\"folder\":\"%s\",\"free\":%" G_GINT64_FORMAT ",%s%s}", PS5WK_DOWNLOADS_DIR, ps5wk_downloads_free_space(), counts,
+        settingsJSON);
     g_free(counts);
+    g_free(settingsJSON);
     return json;
 }
 
@@ -550,10 +581,13 @@ static gboolean saveLater(gpointer data)
  * else (progress) within SAVE_S. */
 static void updateManagerSnapshot(void);
 
+static void snapSettings(void);
+
 static void changed(gboolean stateChanged)
 {
     dirty = TRUE;
     updateManagerSnapshot();
+    snapSettings();
     if (stateChanged) {
         saveNow();
         updateSnapshot();
@@ -678,7 +712,7 @@ static void endTransfer(Download* d)
 
 static struct {
     unsigned connections;   /* per download, 1..16 */
-    gboolean ask;           /* where to save each download: the manager's page asks */
+    gboolean ask;           /* where to save each download: the menu (or the phone's page) asks */
     char* folder;           /* the default folder; NULL: the user's downloads folder */
     gboolean deleteArchives; /* after they were unpacked */
     char** favorites;       /* folders, NULL-terminated */
@@ -735,6 +769,24 @@ static void saveSettings(void)
     g_key_file_unref(file);
 }
 
+/* The settings for settings.json (", ..." members), for any thread. */
+static void snapSettings(void)
+{
+    GString* out = g_string_new(NULL);
+    const char* folder = settings.folder ? settings.folder : PS5WK_DOWNLOADS_DIR;
+    char* name = ps5wk_files_place_name(folder);
+    g_string_append_printf(out, ",\"connections\":%u,\"ask\":%s,\"deleteArchives\":%s,\"defaultFolder\":", settings.connections,
+        settings.ask ? "true" : "false", settings.deleteArchives ? "true" : "false");
+    ps5wk_json_string(out, folder);
+    g_string_append(out, ",\"defaultName\":");
+    ps5wk_json_string(out, name);
+    g_free(name);
+    g_mutex_lock(&snapLock);
+    g_free(snapSettingsJSON);
+    snapSettingsJSON = g_string_free(out, FALSE);
+    g_mutex_unlock(&snapLock);
+}
+
 /* ---------------------------------------------------------------- the download service */
 
 static Download* byID(unsigned id)
@@ -785,16 +837,17 @@ static gboolean serviceWanted(Download* d, WebKitDownload* download, WebKitURIRe
     return ranges && !g_ascii_strncasecmp(ranges, "bytes", 5) && (!ranges[5] || ranges[5] == ' ' || ranges[5] == ',' || ranges[5] == '\t');
 }
 
-/* The manager's page over the tab shown (a download waits for a folder). */
-static void openManager(void)
+static void requestRoots(void);
+
+/* The menu's dialog for d (a download waits for a folder). */
+static void askWhere(Download* d)
 {
-    /* already shown (it reloads its state every second) */
-    WebKitWebView* view = ps5wk_browser_active_view();
-    const char* shown = view ? webkit_web_view_get_uri(view) : NULL;
-    if (shown && g_str_has_prefix(shown, "parallax://downloads"))
+    unsigned index = 0;
+    if (!g_ptr_array_find(list, d, &index))
         return;
-    if (!ps5wk_browser_open_page("parallax://downloads/"))
-        notice("Choose where to save it in Downloads\n(Options, then R1: Downloads)");
+    requestRoots();
+    if (!ps5wk_browser_show_download_choices(index)) /* in VR, or winding down */
+        notice("Choose where to save %s in Downloads\n(Options, then R1: Downloads)", d->r.file ? d->r.file : "it");
 }
 
 /* ---------------------------------------------------------------- looking inside archives (the manager's suggestion) */
@@ -907,7 +960,7 @@ static void handOff(Download* d, WebKitDownload* download, WebKitURIResponse* re
         d->r.state = PS5WK_DL_ASKING;
         changed(TRUE);
         startPeek(d, FALSE);
-        openManager();
+        askWhere(d);
         return;
     }
     setString(&d->r.dir, settings.folder);
@@ -1059,7 +1112,7 @@ static void serviceEnded(Download* d, GHashTable* params)
             setError(d, NULL);
         spike_log("[dl] %u: done: %s/%s, %" G_GINT64_FORMAT " bytes (%" G_GINT64_FORMAT " this time)", d->r.id, folderOf(d), d->r.file,
             d->r.received, d->r.received - d->serviceFrom);
-        notice("Downloaded %s", d->r.file);
+        announceDone(d->r.file, d->r.id, d->r.after != NULL || (d->r.moveTo && strcmp(d->r.moveTo, PS5WK_DOWNLOADS_DIR)));
         changed(TRUE);
         hashNext();
         startAfter(d);
@@ -1152,7 +1205,8 @@ static void serviceProgress(Download* d, GHashTable* params)
 static const char* jobNoun(const char* job)
 {
     return !g_strcmp0(job, "extract") ? "Unpacking" : !g_strcmp0(job, "install") ? "Installing" : !g_strcmp0(job, "image") ? "Making the image"
-        : !g_strcmp0(job, "move") ? "Moving" : !g_strcmp0(job, "copy") ? "Copying" : !g_strcmp0(job, "delete") ? "Deleting" : "Working";
+        : !g_strcmp0(job, "move") ? "Moving" : !g_strcmp0(job, "copy") ? "Copying" : !g_strcmp0(job, "delete") ? "Deleting"
+        : !g_strcmp0(job, "verify") ? "Checking the image" : "Working";
 }
 
 static void jobEnded(Download* d, GHashTable* params)
@@ -1201,6 +1255,7 @@ static void jobEnded(Download* d, GHashTable* params)
     else if (!g_strcmp0(d->r.job, "extract"))
         notice("Unpacked %s\nto %s", d->r.file ? d->r.file : "", out ? out : "");
     changed(TRUE);
+    ps5wk_files_refresh();
     if (moved && success && d->r.after)
         startAfter(d);
 }
@@ -1252,6 +1307,7 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
         notice("%s %s: done\n%s", jobNoun(t->kind), base, t->out ? t->out : "");
     g_free(base);
     changed(TRUE);
+    ps5wk_files_refresh();
 }
 
 static void taskFree(gpointer data)
@@ -1308,6 +1364,10 @@ static void onServiceEvent(const char* verb, GHashTable* params, gpointer user)
         return;
     }
     const char* taskID = g_hash_table_lookup(params, "id");
+    if (taskID && taskID[0] == 'f' && !strcmp(verb, "peekend")) {
+        ps5wk_files_peek_ended(taskID, params);
+        return;
+    }
     if (taskID && taskID[0] == 't') {
         taskEvent((unsigned)atoi(taskID + 1), verb, params);
         return;
@@ -1675,7 +1735,7 @@ static void onFinished(WebKitDownload* download, gpointer data)
         d->retries = 0;
         spike_log("[dl] %u: done: %s, %" G_GINT64_FORMAT " bytes (%" G_GINT64_FORMAT " this time, from %" G_GINT64_FORMAT ")", d->r.id, d->r.file,
             d->r.received, d->attemptBytes, d->attemptFrom);
-        notice("Downloaded %s", d->r.file);
+        announceDone(d->r.file, d->r.id, d->r.after != NULL || (d->r.moveTo && strcmp(d->r.moveTo, PS5WK_DOWNLOADS_DIR)));
     }
     d->pausing = d->cancelling = d->stalled = FALSE;
     d->speed = 0;
@@ -1875,10 +1935,6 @@ gboolean ps5wk_downloads_response_policy(WebKitWebView* view, WebKitResponsePoli
 
 /* ---------------------------------------------------------------- the menu's list */
 
-unsigned ps5wk_downloads_count(void)
-{
-    return list ? list->len : 0;
-}
 
 static const char* kindOf(const Download* d, char* out, size_t size)
 {
@@ -1899,7 +1955,7 @@ static const char* kindOf(const Download* d, char* out, size_t size)
     return out;
 }
 
-void ps5wk_downloads_row(unsigned index, BUIRow* r)
+static void downloadRow(unsigned index, BUIRow* r)
 {
     Download* d = at((int)index);
     if (!d)
@@ -1999,7 +2055,7 @@ void ps5wk_downloads_row(unsigned index, BUIRow* r)
     }
 }
 
-void ps5wk_downloads_hints(unsigned index, const char** cross, const char** square)
+static void downloadHints(unsigned index, const char** cross, const char** square)
 {
     Download* d = at((int)index);
     *cross = *square = NULL;
@@ -2019,8 +2075,8 @@ void ps5wk_downloads_hints(unsigned index, const char** cross, const char** squa
         *square = d->r.received > 0 ? "Cancel" : "Remove";
         break;
     case PS5WK_DL_DONE:
-        *cross = "Manage";
-        *square = "Delete file";
+        *cross = d->r.jobState == PS5WK_JOB_RUNNING ? "Stop" : "Options";
+        *square = d->r.jobState == PS5WK_JOB_RUNNING ? NULL : "Delete file";
         break;
     case PS5WK_DL_CANCELLED:
         *cross = "Download again";
@@ -2028,7 +2084,7 @@ void ps5wk_downloads_hints(unsigned index, const char** cross, const char** squa
         break;
     case PS5WK_DL_ASKING:
         *cross = "Choose folder";
-        *square = "Remove";
+        *square = "Don't download";
         break;
     }
 }
@@ -2075,11 +2131,12 @@ static void resumeDownload(Download* d)
     startAttempt(d, FALSE);
 }
 
-void ps5wk_downloads_primary(unsigned index)
+/* X on a download: TRUE when its dialog should open. */
+static gboolean downloadPrimary(unsigned index)
 {
     Download* d = at((int)index);
     if (!d)
-        return;
+        return FALSE;
     switch (d->r.state) {
     case PS5WK_DL_RUNNING:
         pauseDownload(d);
@@ -2096,15 +2153,21 @@ void ps5wk_downloads_primary(unsigned index)
         startAttempt(d, TRUE);
         break;
     case PS5WK_DL_DONE:
+        if (d->r.jobState == PS5WK_JOB_RUNNING) {
+            char id[16];
+            ps5wk_dlservice_send("jobstop", "id", idText(d, id, sizeof id), NULL);
+            return FALSE;
+        }
+        return TRUE;
     case PS5WK_DL_ASKING:
-        openManager();
-        break;
+        return TRUE;
     default:
         break;
     }
+    return FALSE;
 }
 
-gboolean ps5wk_downloads_square_needs_confirm(unsigned index)
+static gboolean downloadSquareNeedsConfirm(unsigned index)
 {
     Download* d = at((int)index);
     return d && d->r.state == PS5WK_DL_DONE;
@@ -2125,6 +2188,8 @@ static void removeEntry(Download* d)
             removeIn(d, FALSE);
     }
     spike_log("[dl] %u: removed (%s%s)", d->r.id, d->r.file ? d->r.file : d->r.url, d->r.state == PS5WK_DL_DONE ? ", file deleted" : "");
+    if (d->r.state == PS5WK_DL_ASKING)
+        ps5wk_files_pick_cancel(d->r.id);
     if (d->download) {
         /* gone when its transfer ends ("finished") */
         d->removing = TRUE;
@@ -2134,11 +2199,13 @@ static void removeEntry(Download* d)
     g_ptr_array_remove(list, d);
 }
 
-void ps5wk_downloads_square(unsigned index)
+static void downloadSquare(unsigned index)
 {
     Download* d = at((int)index);
     if (!d)
         return;
+    if (d->r.state == PS5WK_DL_DONE && d->r.jobState == PS5WK_JOB_RUNNING)
+        return; /* stop the job first */
     if (d->r.state == PS5WK_DL_RUNNING || d->r.state == PS5WK_DL_PAUSED || (d->r.state == PS5WK_DL_FAILED && d->r.received > 0)) {
         /* waiting to retry: nothing runs on the service, its files are deleted here */
         gboolean waiting = d->retryTimer != 0;
@@ -2164,7 +2231,7 @@ void ps5wk_downloads_square(unsigned index)
     changed(TRUE);
 }
 
-void ps5wk_downloads_details(unsigned index, BUIDetails* out)
+static void downloadDetails(unsigned index, BUIDetails* out)
 {
     static char path[512], size[96], sha[80], validator[160], times[128], state[200];
     Download* d = at((int)index);
@@ -2497,6 +2564,8 @@ static gboolean inUse(const char* path)
     return ps5wk_downloads_in_use(path);
 }
 
+static void dropPartial(const char* path);
+
 /* An unfinished download the list lost (found by the service's
  * "partials"): a paused entry again, continued at once. */
 static const char* adoptPartial(const char* path, const char* url, gint64 total, gint64 received)
@@ -2548,6 +2617,9 @@ static const char* adoptPartial(const char* path, const char* url, gint64 total,
     spike_log("[dl] %u: an unfinished download found again: %s (%s), %" G_GINT64_FORMAT " of %" G_GINT64_FORMAT " bytes", d->r.id, path,
         url, d->r.received, d->r.size);
     resumeDownload(d);
+    /* its "Unfinished" row is the download now. Last: path and url may be
+     * that row's own (they are freed with it) */
+    dropPartial(path);
     changed(TRUE);
     return NULL;
 }
@@ -2684,6 +2756,7 @@ const char* ps5wk_downloads_manage(GHashTable* params)
             saveSettings();
         }
         spike_log("[dl] %u: save to %s%s%s", d->r.id, folderOf(d), d->r.after ? ", then " : "", d->r.after ? d->r.after : "");
+        ps5wk_files_pick_cancel(d->r.id);
         notice("Download started: %s", d->r.file);
         serviceStart(d, TRUE);
         return NULL;
@@ -2742,6 +2815,856 @@ const char* ps5wk_downloads_manage(GHashTable* params)
     return "no such action";
 }
 
+/* ---------------------------------------------------------------- the menu's Downloads list and its dialog */
+
+/* The list: the downloads (newest first: the API's indexes), the jobs on
+ * files from Files (tasks), then unfinished downloads found in the
+ * download folders that the list lost (the service's "partials"). */
+
+typedef struct {
+    char* path;
+    char* name;
+    char* dir;
+    char* url;
+    gint64 received, total, mtime;
+} Partial;
+
+static GPtrArray* partials; /* Partial*, lost ones only */
+static gint64 partialsAt;   /* monotonic us of the last ask */
+static gboolean partialsAsking;
+static MJ* roots;           /* the drives, for "where to save" */
+static gboolean rootsAsking;
+
+static void partialFree(gpointer data)
+{
+    Partial* p = data;
+    g_free(p->path);
+    g_free(p->name);
+    g_free(p->dir);
+    g_free(p->url);
+    g_free(p);
+}
+
+static gboolean inList(const char* path)
+{
+    for (unsigned i = 0; list && i < list->len; i++) {
+        Download* d = g_ptr_array_index(list, i);
+        if (!d->r.file)
+            continue;
+        char* mine = g_build_filename(folderOf(d), d->r.file, NULL);
+        gboolean same = !strcmp(mine, path);
+        g_free(mine);
+        if (same)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void dropPartial(const char* path)
+{
+    for (unsigned i = 0; partials && i < partials->len; i++) {
+        if (!strcmp(((Partial*)g_ptr_array_index(partials, i))->path, path)) {
+            g_ptr_array_remove_index(partials, i);
+            ps5wk_browser_downloads_changed();
+            return;
+        }
+    }
+}
+
+static void onPartials(const char* json, const char* error, gpointer user)
+{
+    (void)user;
+    partialsAsking = FALSE;
+    MJ* value = json ? mj_parse(json) : NULL;
+    if (!value) {
+        if (error)
+            spike_log("[dl] unfinished downloads: %s", error);
+        return;
+    }
+    if (!partials)
+        partials = g_ptr_array_new_with_free_func(partialFree);
+    g_ptr_array_set_size(partials, 0);
+    for (unsigned i = 0; i < mj_length(value); i++) {
+        const MJ* x = mj_at(value, i);
+        const char* path = mj_string(x, "path");
+        const char* url = mj_string(x, "url");
+        if (!path || !url || inList(path))
+            continue;
+        Partial* p = g_new0(Partial, 1);
+        p->path = g_strdup(path);
+        p->name = g_strdup(mj_string(x, "name") ? mj_string(x, "name") : path);
+        p->dir = g_strdup(mj_string(x, "dir") ? mj_string(x, "dir") : "");
+        p->url = g_strdup(url);
+        p->received = (gint64)mj_number(x, "received", 0);
+        p->total = (gint64)mj_number(x, "total", -1);
+        p->mtime = (gint64)mj_number(x, "mtime", 0);
+        g_ptr_array_add(partials, p);
+    }
+    mj_free(value);
+    ps5wk_browser_downloads_changed();
+}
+
+static void requestPartials(gboolean now)
+{
+    gint64 t = g_get_monotonic_time();
+    if (partialsAsking || (!now && partialsAt && t - partialsAt < 15 * G_USEC_PER_SEC))
+        return;
+    partialsAt = t;
+    partialsAsking = TRUE;
+    char* dirs = ps5wk_downloads_scan_dirs();
+    ps5wk_dlservice_request_async(8000, onPartials, NULL, "partials", "dirs", dirs, NULL);
+    g_free(dirs);
+}
+
+static void onRoots(const char* json, const char* error, gpointer user)
+{
+    (void)user;
+    (void)error;
+    rootsAsking = FALSE;
+    MJ* value = json ? mj_parse(json) : NULL;
+    if (value && mj_kind(value) == MJ_ARRAY) {
+        mj_free(roots);
+        roots = value;
+        ps5wk_browser_downloads_changed();
+    } else
+        mj_free(value);
+}
+
+static void requestRoots(void)
+{
+    if (rootsAsking)
+        return;
+    rootsAsking = TRUE;
+    ps5wk_dlservice_request_async(8000, onRoots, NULL, "roots", NULL);
+}
+
+gboolean ps5wk_downloads_take_recent(unsigned* index)
+{
+    if (!recentID || g_get_monotonic_time() > recentUntil) {
+        recentID = 0;
+        return FALSE;
+    }
+    Download* d = byID(recentID);
+    recentID = 0;
+    unsigned i = 0;
+    if (!d || d->r.state != PS5WK_DL_DONE || d->r.jobState == PS5WK_JOB_RUNNING || !g_ptr_array_find(list, d, &i))
+        return FALSE;
+    *index = i;
+    return TRUE;
+}
+
+void ps5wk_downloads_shown(void)
+{
+    requestPartials(FALSE);
+}
+
+enum { M_NONE, M_DOWNLOAD, M_TASK, M_PARTIAL };
+
+static int menuItem(unsigned index, Download** d, Task** t, Partial** p)
+{
+    *d = NULL;
+    *t = NULL;
+    *p = NULL;
+    unsigned downloads = list ? list->len : 0, jobs = tasks ? tasks->len : 0, lost = partials ? partials->len : 0;
+    if (index < downloads) {
+        *d = g_ptr_array_index(list, index);
+        return M_DOWNLOAD;
+    }
+    index -= downloads;
+    if (index < jobs) {
+        *t = g_ptr_array_index(tasks, index);
+        return M_TASK;
+    }
+    index -= jobs;
+    if (index < lost) {
+        *p = g_ptr_array_index(partials, index);
+        return M_PARTIAL;
+    }
+    return M_NONE;
+}
+
+char* ps5wk_downloads_row_key(unsigned index)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        return g_strdup_printf("d%u", d->r.id);
+    case M_TASK:
+        return g_strdup_printf("t%u", t->id);
+    case M_PARTIAL:
+        return g_strdup_printf("p%s", p->path);
+    }
+    return NULL;
+}
+
+unsigned ps5wk_downloads_count(void)
+{
+    return (list ? list->len : 0) + (tasks ? tasks->len : 0) + (partials ? partials->len : 0);
+}
+
+static const char* taskWhat(const Task* t)
+{
+    if (!strcmp(t->kind, "extract"))
+        return !g_strcmp0(t->then, "install") ? "Unpack and install" : !g_strcmp0(t->then, "image") ? "Unpack and make an image" : "Unpack";
+    return !strcmp(t->kind, "install") ? "Install" : !strcmp(t->kind, "image") ? "Make an exFAT image" : !strcmp(t->kind, "delete") ? "Delete"
+        : !strcmp(t->kind, "move") ? "Move" : !strcmp(t->kind, "copy") ? "Copy" : "Job";
+}
+
+static void fileKind(const char* name, char* out, size_t size)
+{
+    const char* dot = name ? strrchr(name, '.') : NULL;
+    size_t n = 0;
+    if (dot && dot != name && strlen(dot + 1) <= 4) {
+        for (const char* c = dot + 1; *c && n + 1 < size && g_ascii_isalnum(*c); c++)
+            out[n++] = g_ascii_toupper(*c);
+    }
+    out[n] = 0;
+    if (!n)
+        snprintf(out, size, "FILE");
+}
+
+void ps5wk_downloads_row(unsigned index, BUIRow* r)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    static char title[300], from[128];
+    char a[32], b[32];
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        downloadRow(index, r);
+        return;
+    case M_TASK: {
+        char* base = g_path_get_basename(t->src);
+        snprintf(title, sizeof title, "%s: %s", taskWhat(t), base);
+        r->title = title;
+        fileKind(base, r->kind, sizeof r->kind);
+        g_free(base);
+        char* where = ps5wk_files_place_name(t->dest ? t->dest : t->src);
+        r->progress = -1;
+        if (t->state == PS5WK_JOB_RUNNING) {
+            r->tone = BUI_TONE_ACTIVE;
+            r->running = TRUE;
+            r->progress = t->total > 0 ? CLAMP((double)t->done / t->total, 0, 1) : -1;
+            if (r->progress >= 0)
+                snprintf(r->state, sizeof r->state, "%.0f%%", r->progress * 100);
+            else
+                snprintf(r->state, sizeof r->state, "%s…", jobNoun(*t->phase ? t->phase : t->kind));
+            formatBytes(a, sizeof a, t->done);
+            formatBytes(b, sizeof b, t->total);
+            snprintf(r->detail, sizeof r->detail, "%s%s%s%s%s", t->total > 0 ? a : "", t->total > 0 ? " of " : "", t->total > 0 ? b : "",
+                t->total > 0 ? " · " : "", where);
+        } else if (t->state == PS5WK_JOB_DONE) {
+            r->tone = BUI_TONE_DONE;
+            snprintf(r->state, sizeof r->state, "Done");
+            if (t->titleName)
+                snprintf(r->detail, sizeof r->detail, "“%s” is on the home screen%s%s", t->titleName, t->error ? " · " : "", t->error ? t->error : "");
+            else {
+                char* out = t->out ? ps5wk_files_place_name(t->out) : NULL;
+                snprintf(r->detail, sizeof r->detail, "%s%s%s", !strcmp(t->kind, "delete") ? "Deleted" : out ? out : where, t->error ? " · " : "",
+                    t->error ? t->error : "");
+                g_free(out);
+            }
+        } else {
+            r->tone = BUI_TONE_WARN;
+            snprintf(r->state, sizeof r->state, "%s", t->replaceVersion ? "Installed already" : "Failed");
+            snprintf(r->detail, sizeof r->detail, "%s", t->error ? t->error : "Failed");
+        }
+        g_free(where);
+        return;
+    }
+    case M_PARTIAL: {
+        r->title = p->name;
+        r->url = hostOf(p->url, from, sizeof from);
+        fileKind(p->name, r->kind, sizeof r->kind);
+        formatBytes(a, sizeof a, p->received);
+        formatBytes(b, sizeof b, p->total);
+        char* where = ps5wk_files_place_name(p->dir);
+        snprintf(r->detail, sizeof r->detail, "%s%s%s · in %s · not in the list", a, p->total > 0 ? " of " : "", p->total > 0 ? b : "", where);
+        g_free(where);
+        r->progress = p->total > 0 ? CLAMP((double)p->received / p->total, 0, 1) : -1;
+        r->tone = BUI_TONE_WARN;
+        snprintf(r->state, sizeof r->state, "Unfinished");
+        return;
+    }
+    }
+}
+
+void ps5wk_downloads_hints(unsigned index, const char** cross, const char** square, const char** r2)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    *cross = *square = *r2 = NULL;
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        downloadHints(index, cross, square);
+        *r2 = "Details";
+        break;
+    case M_TASK:
+        if (t->state == PS5WK_JOB_RUNNING)
+            *cross = strcmp(t->kind, "delete") ? "Stop" : NULL;
+        else {
+            *cross = "Options";
+            *square = "Clear";
+        }
+        break;
+    case M_PARTIAL:
+        *cross = "Continue";
+        *square = "Delete";
+        break;
+    }
+}
+
+gboolean ps5wk_downloads_primary(unsigned index)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        return downloadPrimary(index);
+    case M_TASK:
+        if (t->state == PS5WK_JOB_RUNNING) {
+            if (strcmp(t->kind, "delete")) {
+                char id[16];
+                snprintf(id, sizeof id, "t%u", t->id);
+                ps5wk_dlservice_send("jobstop", "id", id, NULL);
+            }
+            return FALSE;
+        }
+        return TRUE;
+    case M_PARTIAL: {
+        const char* why = adoptPartial(p->path, p->url, p->total, p->received); /* removes p when it works */
+        if (why)
+            notice("%s", why);
+        changed(TRUE);
+        return FALSE;
+    }
+    }
+    return FALSE;
+}
+
+gboolean ps5wk_downloads_square_needs_confirm(unsigned index)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        return downloadSquareNeedsConfirm(index);
+    case M_PARTIAL:
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void deletePartial(Partial* p)
+{
+    if (inList(p->path)) { /* continued since it was found (from the phone page): not lost any more */
+        g_ptr_array_remove(partials, p);
+        changed(FALSE);
+        notice("It is in the list now");
+        return;
+    }
+    if (inUse(p->path)) {
+        notice("A download in the list uses it");
+        return;
+    }
+    ps5wk_dlservice_send("rm", "path", p->path, NULL);
+    spike_log("[dl] an unfinished download deleted: %s", p->path);
+    g_ptr_array_remove(partials, p);
+    changed(FALSE);
+}
+
+void ps5wk_downloads_square(unsigned index)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        downloadSquare(index);
+        break;
+    case M_TASK:
+        if (t->state != PS5WK_JOB_RUNNING) {
+            g_ptr_array_remove(tasks, t);
+            changed(FALSE);
+        }
+        break;
+    case M_PARTIAL:
+        if (folderAllowed(p->path))
+            deletePartial(p);
+        break;
+    }
+}
+
+void ps5wk_downloads_details(unsigned index, BUIDetails* out)
+{
+    if (list && index < list->len)
+        downloadDetails(index, out);
+    else
+        memset(out, 0, sizeof *out);
+}
+
+/* ---- the dialog ---- */
+
+enum {
+    CD_SAVE = 1,  /* + the folder's slot */
+    CD_SAVE_LAST = CD_SAVE + BUI_CHOICES_MAX,
+    CD_BROWSE,
+    CD_DONT,
+    CD_INSTALL,
+    CD_REPLACE,
+    CD_EXTRACT,
+    CD_IMAGE,
+    CD_SHOW,
+    CD_DETAILS,
+    CD_FORGET,
+    CD_DELETE,
+    CT_REPLACE,
+    CT_SHOW,
+    CT_CLEAR,
+};
+
+static struct {
+    int type;          /* M_DOWNLOAD, M_TASK */
+    unsigned id;
+    char* folders[BUI_CHOICES_MAX]; /* CD_SAVE + i: where */
+    gboolean replaceKnown; /* CD_INSTALL replaces the installed app (the dialog said so) */
+} dlChosen;
+
+static void clearFolders(void)
+{
+    for (unsigned i = 0; i < BUI_CHOICES_MAX; i++)
+        g_clear_pointer(&dlChosen.folders[i], g_free);
+}
+
+gboolean ps5wk_downloads_choices_open(unsigned index)
+{
+    Download* d;
+    Task* t;
+    Partial* p;
+    clearFolders();
+    dlChosen.type = M_NONE;
+    switch (menuItem(index, &d, &t, &p)) {
+    case M_DOWNLOAD:
+        if (d->r.state != PS5WK_DL_DONE && d->r.state != PS5WK_DL_ASKING)
+            return FALSE;
+        dlChosen.type = M_DOWNLOAD;
+        dlChosen.id = d->r.id;
+        if (d->r.state == PS5WK_DL_ASKING)
+            requestRoots();
+        else if (!d->peek && !d->peeking && !d->peekedLocal)
+            startPeek(d, TRUE); /* a finished archive: what it holds */
+        return TRUE;
+    case M_TASK:
+        if (t->state == PS5WK_JOB_RUNNING)
+            return FALSE;
+        dlChosen.type = M_TASK;
+        dlChosen.id = t->id;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+gboolean ps5wk_downloads_choices_index(unsigned* index)
+{
+    if (dlChosen.type == M_DOWNLOAD) {
+        for (unsigned i = 0; list && i < list->len; i++) {
+            if (((Download*)g_ptr_array_index(list, i))->r.id == dlChosen.id) {
+                *index = i;
+                return TRUE;
+            }
+        }
+    } else if (dlChosen.type == M_TASK) {
+        for (unsigned i = 0; tasks && i < tasks->len; i++) {
+            if (((Task*)g_ptr_array_index(tasks, i))->id == dlChosen.id) {
+                *index = (list ? list->len : 0) + i;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+static void addChoice(BUIChoices* out, int id, int tone, gboolean confirm, const char* label, const char* detail)
+{
+    if (out->count >= BUI_CHOICES_MAX)
+        return;
+    BUIChoice* c = &out->choices[out->count++];
+    c->id = id;
+    c->tone = tone;
+    c->confirm = confirm;
+    snprintf(c->label, sizeof c->label, "%s", label);
+    snprintf(c->detail, sizeof c->detail, "%s", detail ? detail : "");
+}
+
+static void addLine(BUIChoices* out, int tone, const char* format, ...) G_GNUC_PRINTF(3, 4);
+static void addLine(BUIChoices* out, int tone, const char* format, ...)
+{
+    if (out->lineCount >= 3)
+        return;
+    va_list args;
+    va_start(args, format);
+    vsnprintf(out->lines[out->lineCount], sizeof out->lines[0], format, args);
+    va_end(args);
+    out->lineTones[out->lineCount++] = tone;
+}
+
+/* A folder to save to; FALSE when the dialog is full or it is there already. */
+static gboolean addFolder(BUIChoices* out, const char* folder, int tone, const char* label, const char* detail)
+{
+    for (unsigned i = 0; i < BUI_CHOICES_MAX; i++) {
+        if (dlChosen.folders[i] && !strcmp(dlChosen.folders[i], folder))
+            return FALSE;
+    }
+    for (unsigned i = 0; i < BUI_CHOICES_MAX; i++) {
+        if (!dlChosen.folders[i]) {
+            dlChosen.folders[i] = g_strdup(folder);
+            addChoice(out, CD_SAVE + (int)i, tone, FALSE, label, detail);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* What the archive holds, as lines (peek: ps5peek.h's JSON). */
+static void peekLines(BUIChoices* out, const Download* d, const MJ* peek)
+{
+    if (d->peeking)
+        addLine(out, BUI_TONE_PLAIN, "Looking inside…");
+    if (!peek)
+        return;
+    const char* id = mj_string(peek, "titleId");
+    const char* name = mj_string(peek, "name");
+    const char* version = mj_string(peek, "version");
+    const char* installed = mj_string(peek, "installed");
+    const char* refused = mj_string(peek, "refused");
+    int titles = (int)mj_number(peek, "titles", 0);
+    if (titles > 1)
+        addLine(out, BUI_TONE_ACTIVE, "It holds %d apps", titles);
+    else if (id)
+        addLine(out, BUI_TONE_ACTIVE, "It holds an app: %s · %s%s%s%s", name ? name : id, id, version ? " · version " : "", version ? version : "",
+            mj_bool(peek, "guessed") ? " (the ID from its name)" : "");
+    else {
+        char unpacked[32];
+        formatBytes(unpacked, sizeof unpacked, (gint64)mj_number(peek, "unpacked", -1));
+        int entries = (int)mj_number(peek, "entries", 0);
+        addLine(out, BUI_TONE_PLAIN, "%s · %d file%s%s%s", mj_string(peek, "format") ? mj_string(peek, "format") : "Archive", entries,
+            entries == 1 ? "" : "s", mj_bool(peek, "sizesKnown") ? " · " : "", mj_bool(peek, "sizesKnown") ? unpacked : "");
+    }
+    if (id && titles <= 1 && installed && *installed) {
+        if (version && !strcmp(installed, version))
+            addLine(out, BUI_TONE_WARN, "This version is installed already");
+        else if (!strcmp(installed, "?"))
+            addLine(out, BUI_TONE_WARN, "A version of it is installed");
+        else
+            addLine(out, BUI_TONE_WARN, "Version %s is installed", installed);
+    }
+    if (refused)
+        addLine(out, BUI_TONE_WARN, "It can't be unpacked: %s", refused);
+}
+
+static void askChoices(BUIChoices* out, Download* d, const MJ* peek)
+{
+    char size[32], host[128];
+    formatBytes(size, sizeof size, d->r.size);
+    snprintf(out->title, sizeof out->title, "Where should this download go?");
+    addLine(out, BUI_TONE_PLAIN, "%s · %s · %s", d->r.file ? d->r.file : "?", size, hostOf(d->r.url, host, sizeof host));
+    peekLines(out, d, peek);
+    /* the default folder first, then this user's Downloads, the
+     * favourites, the drives that take files */
+    const char* folder = settings.folder ? settings.folder : PS5WK_DOWNLOADS_DIR;
+    char* name = ps5wk_files_place_name(folder);
+    addFolder(out, folder, BUI_TONE_ACTIVE, name, settings.folder ? folder : "This PS5 user's downloads folder");
+    g_free(name);
+    addFolder(out, PS5WK_DOWNLOADS_DIR, BUI_TONE_PLAIN, "Downloads", "This PS5 user's downloads folder");
+    for (unsigned i = 0; settings.favorites && settings.favorites[i] && out->count < BUI_CHOICES_MAX - 4; i++) {
+        char* place = ps5wk_files_place_name(settings.favorites[i]);
+        char label[200];
+        snprintf(label, sizeof label, "★ %s", place);
+        addFolder(out, settings.favorites[i], BUI_TONE_PLAIN, label, settings.favorites[i]);
+        g_free(place);
+    }
+    for (unsigned i = 0; i < mj_length(roots) && out->count < BUI_CHOICES_MAX - 2; i++) {
+        const MJ* drive = mj_at(roots, i);
+        const char* path = mj_string(drive, "path");
+        const char* label = mj_string(drive, "label");
+        if (!path || !label || !strcmp(path, "/data") || !mj_bool(drive, "writable") || !folderAllowed(path))
+            continue;
+        char free[32], detail[64];
+        formatBytes(free, sizeof free, (gint64)mj_number(drive, "free", -1));
+        snprintf(detail, sizeof detail, "%s free", free);
+        addFolder(out, path, BUI_TONE_PLAIN, label, detail);
+    }
+    addChoice(out, CD_BROWSE, BUI_TONE_PLAIN, FALSE, "Choose another folder…", "In Files: open the folder, then X on the top row");
+    addChoice(out, CD_DONT, BUI_TONE_WARN, FALSE, "Don't download", NULL);
+}
+
+static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
+{
+    char size[32], host[128];
+    formatBytes(size, sizeof size, d->r.size);
+    snprintf(out->title, sizeof out->title, "%s", d->r.file ? d->r.file : "Download");
+    char* where = ps5wk_files_place_name(folderOf(d));
+    addLine(out, BUI_TONE_PLAIN, "%s · %s · %s", size, where, hostOf(d->r.url, host, sizeof host));
+    g_free(where);
+    gboolean archive = isArchiveName(d->r.file);
+    if (d->r.jobState == PS5WK_JOB_DONE && d->r.titleID)
+        addLine(out, BUI_TONE_DONE, "“%s” is on the home screen", d->r.titleName ? d->r.titleName : d->r.titleID);
+    else if (d->r.jobState == PS5WK_JOB_FAILED && !d->replaceVersion)
+        addLine(out, BUI_TONE_WARN, "%s failed: %s", jobNoun(d->r.job), d->r.jobError ? d->r.jobError : "?");
+    if (archive)
+        peekLines(out, d, peek);
+    dlChosen.replaceKnown = FALSE;
+    if (archive && !(peek && mj_string(peek, "refused"))) {
+        const char* id = mj_string(peek, "titleId");
+        const char* installed = mj_string(peek, "installed");
+        int titles = (int)mj_number(peek, "titles", 0);
+        gboolean done = d->r.jobState == PS5WK_JOB_DONE;
+        if (d->replaceVersion) {
+            char label[96];
+            snprintf(label, sizeof label, "Replace %s", !strcmp(d->replaceVersion, "?") ? "the installed app" : "the installed version");
+            char detail[160];
+            snprintf(detail, sizeof detail, "Version %s is installed: this installs the downloaded one over it",
+                strcmp(d->replaceVersion, "?") ? d->replaceVersion : "(not known)");
+            addChoice(out, CD_REPLACE, BUI_TONE_WARN, TRUE, label, detail);
+        }
+        char into[200];
+        char* stem = g_strdup(d->r.file);
+        /* the unpack folder's name, as startJob makes it */
+        for (int pass = 0; pass < 3; pass++) {
+            char* dot = strrchr(stem, '.');
+            if (!dot || dot == stem)
+                break;
+            gboolean number = strlen(dot + 1) >= 2 && strspn(dot + 1, "0123456789") == strlen(dot + 1);
+            gboolean part = !g_ascii_strncasecmp(dot + 1, "part", 4) && strspn(dot + 5, "0123456789") == strlen(dot + 5);
+            gboolean tar = !g_ascii_strcasecmp(dot + 1, "gz") || !g_ascii_strcasecmp(dot + 1, "xz") || !g_ascii_strcasecmp(dot + 1, "bz2");
+            *dot = 0;
+            if (!number && !part && !tar)
+                break;
+        }
+        char* folder = g_build_filename(folderOf(d), stem, NULL);
+        char* folderName = ps5wk_files_place_name(folder);
+        snprintf(into, sizeof into, "Into %s", folderName);
+        g_free(folderName);
+        g_free(folder);
+        g_free(stem);
+        /* the suggestion first: install (one app), else unpack */
+        gboolean suggestInstall = !done && !d->replaceVersion && id && titles == 1;
+        gboolean noApp = peek && !id && titles == 0; /* looked inside: no app */
+        if (!d->replaceVersion && !noApp) {
+            if (id && titles == 1 && installed && *installed) {
+                char label[96], detail[160];
+                const char* appName = mj_string(peek, "name") ? mj_string(peek, "name") : id;
+                if (strcmp(installed, "?"))
+                    snprintf(label, sizeof label, "Unpack and install, replacing version %s", installed);
+                else
+                    snprintf(label, sizeof label, "Unpack and install, replacing the installed app");
+                snprintf(detail, sizeof detail, "%s is installed: this installs the downloaded version over it", appName);
+                addChoice(out, CD_INSTALL, suggestInstall ? BUI_TONE_ACTIVE : BUI_TONE_WARN, TRUE, label, detail);
+                dlChosen.replaceKnown = TRUE;
+            } else
+                addChoice(out, CD_INSTALL, suggestInstall ? BUI_TONE_ACTIVE : BUI_TONE_PLAIN, FALSE, "Unpack and install the app",
+                    titles > 1 ? "It holds several apps: unpack it, then install each from Files" : peek ? NULL : "You're asked before an installed app is replaced");
+        }
+        addChoice(out, CD_EXTRACT, !done && !suggestInstall && !d->replaceVersion && peek ? BUI_TONE_ACTIVE : BUI_TONE_PLAIN, FALSE, "Unpack", into);
+        /* an image only of exactly one app (it wouldn't mount otherwise) */
+        if (id && titles == 1) {
+            char detail[160];
+            snprintf(detail, sizeof detail, "%s.exfat in the drive's homebrew folder, for ShadowMountPlus; checked once made", id);
+            addChoice(out, CD_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", detail);
+        }
+    }
+    addChoice(out, CD_SHOW, BUI_TONE_PLAIN, FALSE, "Show in Files", NULL);
+    addChoice(out, CD_DETAILS, BUI_TONE_PLAIN, FALSE, "Details", "Address, size, SHA-256");
+    addChoice(out, CD_FORGET, BUI_TONE_PLAIN, FALSE, "Remove from the list", "The file stays");
+    addChoice(out, CD_DELETE, BUI_TONE_WARN, TRUE, "Delete the file", NULL);
+}
+
+static void taskChoices(BUIChoices* out, Task* t)
+{
+    char* base = g_path_get_basename(t->src);
+    snprintf(out->title, sizeof out->title, "%s: %s", taskWhat(t), base);
+    g_free(base);
+    if (t->state == PS5WK_JOB_DONE)
+        addLine(out, BUI_TONE_DONE, "Done%s%s", t->error ? ": " : "", t->error ? t->error : "");
+    else
+        addLine(out, BUI_TONE_WARN, "%s", t->error ? t->error : "Failed");
+    if (t->replaceVersion) {
+        char detail[160];
+        snprintf(detail, sizeof detail, "Version %s is installed: this installs this one over it",
+            strcmp(t->replaceVersion, "?") ? t->replaceVersion : "(not known)");
+        addChoice(out, CT_REPLACE, BUI_TONE_WARN, TRUE, "Replace the installed app", detail);
+    }
+    if (strcmp(t->kind, "delete"))
+        addChoice(out, CT_SHOW, BUI_TONE_PLAIN, FALSE, "Show in Files", NULL);
+    addChoice(out, CT_CLEAR, BUI_TONE_PLAIN, FALSE, "Clear it from the list", NULL);
+}
+
+gboolean ps5wk_downloads_choices(BUIChoices* out)
+{
+    memset(out, 0, sizeof *out);
+    out->armed = -1;
+    if (dlChosen.type == M_DOWNLOAD) {
+        Download* d = byID(dlChosen.id);
+        if (!d || (d->r.state != PS5WK_DL_DONE && d->r.state != PS5WK_DL_ASKING) || d->r.jobState == PS5WK_JOB_RUNNING)
+            return FALSE;
+        MJ* peek = d->peek ? mj_parse(d->peek) : NULL;
+        clearFolders();
+        if (d->r.state == PS5WK_DL_ASKING)
+            askChoices(out, d, peek);
+        else
+            doneChoices(out, d, peek);
+        mj_free(peek);
+        return TRUE;
+    }
+    if (dlChosen.type == M_TASK) {
+        Task* t = taskByID(dlChosen.id);
+        if (!t || t->state == PS5WK_JOB_RUNNING)
+            return FALSE;
+        taskChoices(out, t);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void showInFiles(const char* path)
+{
+    char* folder = g_path_get_dirname(path);
+    char* name = g_path_get_basename(path);
+    ps5wk_files_open(folder, name);
+    g_free(folder);
+    g_free(name);
+}
+
+static int chooseForDownload(Download* d, int id)
+{
+    char idText[16];
+    snprintf(idText, sizeof idText, "%u", d->r.id);
+    if (d->r.state == PS5WK_DL_ASKING) {
+        if (id >= CD_SAVE && id < CD_SAVE_LAST && dlChosen.folders[id - CD_SAVE]) {
+            const char* dir = dlChosen.folders[id - CD_SAVE];
+            if (!folderAllowed(dir)) {
+                notice("That folder isn't one the browser can use");
+                return BUI_CHOSEN_STAY;
+            }
+            setString(&d->r.dir, strcmp(dir, PS5WK_DOWNLOADS_DIR) ? dir : NULL);
+            spike_log("[dl] %u: save to %s", d->r.id, folderOf(d));
+            ps5wk_files_pick_cancel(d->r.id);
+            notice("Download started: %s", d->r.file);
+            serviceStart(d, TRUE);
+            return BUI_CHOSEN_MENU_CLOSE;
+        }
+        if (id == CD_BROWSE) {
+            ps5wk_files_pick_folder(d->r.id, d->r.file);
+            return BUI_CHOSEN_FILES;
+        }
+        if (id == CD_DONT) {
+            removeEntry(d);
+            changed(TRUE);
+            return BUI_CHOSEN_MENU_CLOSE;
+        }
+        return BUI_CHOSEN_STAY;
+    }
+    char* path = pathIn(d, FALSE);
+    int result = BUI_CHOSEN_CLOSE;
+    const char* why = NULL;
+    switch (id) {
+    case CD_REPLACE:
+        why = startJob(d, "extract", "install", NULL, TRUE);
+        break;
+    case CD_INSTALL:
+        why = startJob(d, "extract", "install", NULL, dlChosen.replaceKnown);
+        break;
+    case CD_EXTRACT:
+        why = startJob(d, "extract", NULL, NULL, FALSE);
+        break;
+    case CD_IMAGE:
+        why = startJob(d, "extract", "image", NULL, FALSE);
+        break;
+    case CD_SHOW:
+        showInFiles(path);
+        result = BUI_CHOSEN_FILES;
+        break;
+    case CD_DETAILS:
+        result = BUI_CHOSEN_DETAILS;
+        break;
+    case CD_FORGET:
+        if (d->download || d->r.jobState == PS5WK_JOB_RUNNING)
+            why = "It is busy";
+        else {
+            g_ptr_array_remove(list, d);
+            changed(TRUE);
+        }
+        break;
+    case CD_DELETE:
+        removeEntry(d);
+        changed(TRUE);
+        break;
+    default:
+        result = BUI_CHOSEN_STAY;
+        break;
+    }
+    if (why)
+        notice("%s", why);
+    else if (id == CD_INSTALL || id == CD_REPLACE || id == CD_EXTRACT || id == CD_IMAGE) {
+        /* what was asked, for the notice when the job ends */
+        setString(&d->r.after, id == CD_EXTRACT ? "extract" : id == CD_IMAGE ? "extract-image" : "extract-install");
+    }
+    g_free(path);
+    return result;
+}
+
+int ps5wk_downloads_choose(int id)
+{
+    if (dlChosen.type == M_DOWNLOAD) {
+        Download* d = byID(dlChosen.id);
+        return d ? chooseForDownload(d, id) : BUI_CHOSEN_CLOSE;
+    }
+    if (dlChosen.type == M_TASK) {
+        Task* t = taskByID(dlChosen.id);
+        if (!t)
+            return BUI_CHOSEN_CLOSE;
+        if (id == CT_REPLACE) {
+            const char* kind = !strcmp(t->kind, "install") ? "install" : "extract-install";
+            char* src = g_strdup(t->src);
+            g_ptr_array_remove(tasks, t);
+            const char* why = inUse(src) ? "A download or a job is using it"
+                : !strcmp(kind, "install") ? startTask("install", NULL, src, NULL, TRUE) : startTask("extract", "install", src, NULL, TRUE);
+            if (why)
+                notice("%s", why);
+            g_free(src);
+            changed(FALSE);
+            return BUI_CHOSEN_CLOSE;
+        }
+        if (id == CT_SHOW) {
+            showInFiles(t->state == PS5WK_JOB_DONE && t->out ? t->out : t->src);
+            return BUI_CHOSEN_FILES;
+        }
+        if (id == CT_CLEAR) {
+            g_ptr_array_remove(tasks, t);
+            changed(FALSE);
+            return BUI_CHOSEN_CLOSE;
+        }
+    }
+    return BUI_CHOSEN_STAY;
+}
+
+/* Files: what downloads.c keeps. */
+char** ps5wk_downloads_favorites(void)
+{
+    return settings.favorites;
+}
+
+const char* ps5wk_downloads_default_folder(void)
+{
+    return settings.folder ? settings.folder : PS5WK_DOWNLOADS_DIR;
+}
+
 /* ---------------------------------------------------------------- API, settings, wind-down */
 
 void ps5wk_downloads_json(GString* out)
@@ -2794,10 +3717,11 @@ const char* ps5wk_downloads_action(const char* action, int index, const char* ur
         if (d->r.state != PS5WK_DL_PAUSED && d->r.state != PS5WK_DL_FAILED)
             return "not paused or failed";
         resumeDownload(d);
-    } else if (!strcmp(action, "x"))
-        ps5wk_downloads_primary((unsigned)index);
-    else if (!strcmp(action, "cancel") || !strcmp(action, "square") || !strcmp(action, "remove"))
-        ps5wk_downloads_square((unsigned)index);
+    } else if (!strcmp(action, "x")) {
+        if (downloadPrimary((unsigned)index))
+            ps5wk_browser_show_download_choices((unsigned)index);
+    } else if (!strcmp(action, "cancel") || !strcmp(action, "square") || !strcmp(action, "remove"))
+        downloadSquare((unsigned)index);
     else
         return "action=pause|resume|cancel|remove|x|square|start&url=...";
     return NULL;
@@ -2862,6 +3786,7 @@ void ps5wk_downloads_init(WPEDisplayPS5* d, WebKitNetworkSession* session)
         g_snprintf(userAgent, sizeof userAgent, "%s", webkit_settings_get_user_agent(webkit_web_view_get_settings(view)));
     list = g_ptr_array_new_with_free_func(downloadFree);
     loadSettings();
+    snapSettings();
     ps5wk_dlservice_init(onServiceEvent, NULL);
     GPtrArray* records = ps5wk_downloads_load();
     unsigned paused = 0, dropped = 0;

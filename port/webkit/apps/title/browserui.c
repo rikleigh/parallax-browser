@@ -29,9 +29,14 @@
  *     ends
  *   - Options: the menu. The bar becomes buttons (Back, Forward, Reload or
  *     Stop, Home, the address, the tab count (the Tabs list), Bookmark, Full screen, Gamepad mode, Private
- *     browsing, Safer browsing, New tab, Settings) over a panel with four
+ *     browsing, Safer browsing, New tab, Settings) over a panel with five
  *     lists: Tabs, Bookmarks, History, Downloads (downloads.c: X pauses,
- *     resumes or retries, Square cancels or deletes, R2 shows the details). The pad is in UI mode while it is
+ *     resumes or retries, Square cancels or deletes, R2 shows the details;
+ *     X on a finished download opens a dialog of what to do with it),
+ *     Files (files.c: the drives and folders; O goes up). A dialog over the
+ *     list (BUIChoices) belongs to downloads.c or files.c: up and down
+ *     move, X picks (a choice marked confirm on a second press), O closes
+ *     it. The pad is in UI mode while it is
  *     open (wpe_display_ps5_set_ui_mode): D-pad moves the focus, X
  *     picks, the left stick's pointer and X work too, the right stick
  *     scrolls the list, L1/R1 (or left/right in a list) switch lists,
@@ -49,6 +54,7 @@
 #include "profile.h"
 #include "browserdraw.h"
 #include "downloads.h"
+#include "files.h"
 #include "viewinvr.h"
 #include "../common/webmem.h"
 
@@ -1099,9 +1105,69 @@ static int listTop;
 static double scrollAccumulator;
 static gboolean clearArmed; /* "Clear history" pressed once */
 static int deleteArmed = -1; /* the download whose Square was pressed once (its file goes on the second) */
+static char* deleteArmedKey;  /* what that row was (rows come and go above it): armed only while it still is */
+
+static char* rowKey(int row)
+{
+    if (row < 0)
+        return NULL;
+    return section == SEC_DOWNLOADS ? ps5wk_downloads_row_key((unsigned)row) : section == SEC_FILES ? ps5wk_files_row_key((unsigned)row) : NULL;
+}
+
+static void armDelete(int row)
+{
+    deleteArmed = row;
+    g_free(deleteArmedKey);
+    deleteArmedKey = rowKey(row);
+}
+
+/* Square was pressed once on this row, and it is still the same file. */
+static gboolean deleteArmedAt(int row)
+{
+    if (row < 0 || row != deleteArmed)
+        return FALSE;
+    char* key = rowKey(row);
+    gboolean same = key && !g_strcmp0(key, deleteArmedKey);
+    g_free(key);
+    return same;
+}
 static gboolean detailsOpen; /* a download's details over the list */
 static int detailsIndex;
+static char* detailsKey; /* what that row is (downloads come and go above it) */
+
+static void openDetails(int row)
+{
+    detailsOpen = TRUE;
+    detailsIndex = row;
+    g_free(detailsKey);
+    detailsKey = rowKey(row);
+}
+
+/* Where the download whose details are open is now (-1: gone). */
+static int detailsRow(void)
+{
+    char* key = rowKey(detailsIndex);
+    gboolean same = key && !g_strcmp0(key, detailsKey);
+    g_free(key);
+    if (same)
+        return detailsIndex;
+    unsigned count = ps5wk_downloads_count();
+    for (unsigned i = 0; detailsKey && i < count; i++) {
+        key = ps5wk_downloads_row_key(i);
+        same = !g_strcmp0(key, detailsKey);
+        g_free(key);
+        if (same)
+            return detailsIndex = (int)i;
+    }
+    return -1;
+}
 static BUIDetails details;
+/* a dialog over the Downloads or Files list (downloads.c's or files.c's) */
+static gboolean choicesOpen;
+static int choicesSection;
+static int choicesFocusID = -1; /* the focused choice's id (the list may change under it) */
+static int choicesArmedID = -1; /* a choice that does it on a second press, pressed once */
+static BUIChoices choices;
 static guint downloadsRedrawTimer;
 static gint64 lastDownloadsRedraw;
 static int screenW = 1920, screenH = 1080;
@@ -1126,6 +1192,8 @@ static int rowCount(int sec)
         return ps5wk_history()->len ? (int)ps5wk_history()->len + 1 : 0; /* row 0: clear history */
     case SEC_DOWNLOADS:
         return (int)ps5wk_downloads_count();
+    case SEC_FILES:
+        return (int)ps5wk_files_count();
     }
     return 0;
 }
@@ -1182,9 +1250,12 @@ static void listRow(int row, BUIRow* r, void* data)
         PS5WKEntry* e = g_ptr_array_index(ps5wk_bookmarks(), row);
         r->title = *e->title ? e->title : e->url;
         r->url = e->url;
-    } else if (section == SEC_DOWNLOADS) {
-        ps5wk_downloads_row((unsigned)row, r);
-        if (row == deleteArmed) {
+    } else if (section == SEC_DOWNLOADS || section == SEC_FILES) {
+        if (section == SEC_DOWNLOADS)
+            ps5wk_downloads_row((unsigned)row, r);
+        else
+            ps5wk_files_row((unsigned)row, r);
+        if (deleteArmedAt(row)) {
             r->armed = TRUE;
             snprintf(r->state, sizeof r->state, "Press □ again to delete the file");
             r->tone = BUI_TONE_WARN;
@@ -1245,6 +1316,26 @@ static gboolean uiShown(void)
     return menuOpen || barShown || stripShown();
 }
 
+/* The dialog's choices from its owner, the focus and the armed one found
+ * again by id. FALSE: it is gone. */
+static gboolean fillChoices(void)
+{
+    gboolean ok = choicesSection == SEC_DOWNLOADS ? ps5wk_downloads_choices(&choices) : ps5wk_files_choices(&choices);
+    if (!ok)
+        return FALSE;
+    choices.focus = 0;
+    choices.armed = -1;
+    for (int i = 0; i < choices.count; i++) {
+        if (choices.choices[i].id == choicesFocusID)
+            choices.focus = i;
+        if (choices.choices[i].id == choicesArmedID && choicesArmedID >= 0)
+            choices.armed = i;
+    }
+    if (choices.count)
+        choicesFocusID = choices.choices[choices.focus].id;
+    return TRUE;
+}
+
 static void fillState(BUIState* s)
 {
     memset(s, 0, sizeof *s);
@@ -1277,13 +1368,24 @@ static void fillState(BUIState* s)
         int home = ps5wk_home_square(shownURI(), FALSE, NULL);
         s->homeSquare = home == PS5WK_HOME_SET ? "Make this the home page" : home == PS5WK_HOME_RESET ? "Use the start page" : NULL;
     }
-    if (section == SEC_DOWNLOADS && zone == ZONE_LIST && listFocus < (int)s->downloadCount)
-        ps5wk_downloads_hints((unsigned)listFocus, &s->downloadCross, &s->downloadSquare);
-    if (detailsOpen && section == SEC_DOWNLOADS && detailsIndex < (int)s->downloadCount) {
+    if (section == SEC_DOWNLOADS && zone == ZONE_LIST && listFocus < (int)ps5wk_downloads_count())
+        ps5wk_downloads_hints((unsigned)listFocus, &s->downloadCross, &s->downloadSquare, &s->listR2);
+    if (section == SEC_FILES && zone == ZONE_LIST && listFocus < (int)ps5wk_files_count())
+        ps5wk_files_hints((unsigned)listFocus, &s->downloadCross, &s->downloadSquare, &s->listR2, &s->listCircle);
+    if (section == SEC_FILES)
+        s->filesError = ps5wk_files_error();
+    if (detailsOpen && section == SEC_DOWNLOADS && detailsRow() >= 0) {
         ps5wk_downloads_details((unsigned)detailsIndex, &details);
-        s->details = &details;
+        if (details.count)
+            s->details = &details;
+        else
+            detailsOpen = FALSE;
     } else
         detailsOpen = FALSE;
+    if (choicesOpen && section == choicesSection && !detailsOpen && fillChoices())
+        s->choices = &choices;
+    else
+        choicesOpen = FALSE;
     s->rowCount = rowCount(section);
     s->listTop = listTop;
     s->listFocus = listFocus;
@@ -1547,6 +1649,7 @@ static void setMenu(gboolean open)
         clearArmed = FALSE;
         deleteArmed = -1;
         detailsOpen = FALSE;
+        choicesOpen = FALSE;
         section = SEC_TABS;
         listFocus = active;
         listTop = 0;
@@ -1733,6 +1836,51 @@ static const char* rowURL(int row)
     return NULL;
 }
 
+static void openChoices(int sec, int row)
+{
+    gboolean ok = sec == SEC_DOWNLOADS ? ps5wk_downloads_choices_open((unsigned)row) : ps5wk_files_choices_open((unsigned)row);
+    if (!ok)
+        return;
+    choicesOpen = TRUE;
+    choicesSection = sec;
+    choicesFocusID = -1;
+    choicesArmedID = -1;
+    detailsOpen = FALSE;
+}
+
+gboolean ps5wk_browser_show_download_choices(unsigned index)
+{
+    if (!tabs || ps5wk_vr_active() || ps5wk_browser_winding_down())
+        return FALSE;
+    if (menuOpen && (choicesOpen || detailsOpen)) {
+        wpe_display_ps5_show_message(display, "A download is waiting: Options, then R1: Downloads", 3);
+        return TRUE;
+    }
+    if (!menuOpen)
+        setMenu(TRUE);
+    setSection(SEC_DOWNLOADS);
+    zone = ZONE_LIST;
+    listFocus = (int)index;
+    keepFocusVisible();
+    openChoices(SEC_DOWNLOADS, (int)index);
+    redraw();
+    return TRUE;
+}
+
+void ps5wk_browser_files_changed(int focus)
+{
+    if (!menuOpen || section != SEC_FILES)
+        return;
+    if (focus >= 0) {
+        listFocus = focus;
+        deleteArmed = -1;
+        if (zone != ZONE_LIST && rowCount(SEC_FILES))
+            zone = ZONE_LIST;
+    }
+    keepFocusVisible();
+    redraw();
+}
+
 static void rowActivate(int row, gboolean newTab)
 {
     if (section == SEC_TABS) {
@@ -1750,17 +1898,33 @@ static void rowActivate(int row, gboolean newTab)
             return;
         const char* cross = NULL;
         const char* square = NULL;
-        ps5wk_downloads_hints((unsigned)row, &cross, &square);
+        const char* r2 = NULL;
+        ps5wk_downloads_hints((unsigned)row, &cross, &square, &r2);
         deleteArmed = -1;
-        if (newTab || (cross && !strcmp(cross, "Details"))) {
-            detailsOpen = TRUE;
-            detailsIndex = row;
-        } else {
-            /* a finished or waiting row opens the download manager's page:
-             * the menu closes so it shows (it stayed over the page) */
-            if (cross && (!strcmp(cross, "Manage") || !strcmp(cross, "Choose folder")) && menuOpen)
-                setMenu(FALSE);
-            ps5wk_downloads_primary((unsigned)row);
+        if (newTab) {
+            if (r2)
+                openDetails(row);
+        } else if (ps5wk_downloads_primary((unsigned)row))
+            openChoices(SEC_DOWNLOADS, row); /* a finished or waiting download: what to do */
+        redraw();
+        return;
+    }
+    if (section == SEC_FILES) {
+        if (row < 0 || row >= (int)ps5wk_files_count())
+            return;
+        deleteArmed = -1;
+        switch (ps5wk_files_activate((unsigned)row, newTab)) {
+        case PS5WK_FILES_CHOICES:
+            openChoices(SEC_FILES, row);
+            break;
+        case PS5WK_FILES_TO_DOWNLOADS:
+            setSection(SEC_DOWNLOADS);
+            zone = ZONE_LIST;
+            keepFocusVisible();
+            break;
+        case PS5WK_FILES_MENU_CLOSE:
+            setMenu(FALSE);
+            return;
         }
         redraw();
         return;
@@ -1804,11 +1968,20 @@ static void rowRemove(int row)
         }
     } else if (section == SEC_DOWNLOADS) {
         if (row < (int)ps5wk_downloads_count()) {
-            if (ps5wk_downloads_square_needs_confirm((unsigned)row) && deleteArmed != row)
-                deleteArmed = row; /* a finished file: deleted on the second press */
+            if (ps5wk_downloads_square_needs_confirm((unsigned)row) && !deleteArmedAt(row))
+                armDelete(row); /* a finished file: deleted on the second press */
             else {
                 deleteArmed = -1;
                 ps5wk_downloads_square((unsigned)row);
+            }
+        }
+    } else if (section == SEC_FILES) {
+        if (row < (int)ps5wk_files_count()) {
+            if (ps5wk_files_square_needs_confirm((unsigned)row) && !deleteArmedAt(row))
+                armDelete(row);
+            else {
+                deleteArmed = -1;
+                ps5wk_files_square((unsigned)row);
             }
         }
     } else if (row >= 1) {
@@ -1830,6 +2003,11 @@ static void setSection(int s)
     clearArmed = FALSE;
     deleteArmed = -1;
     detailsOpen = FALSE;
+    choicesOpen = FALSE;
+    if (section == SEC_DOWNLOADS)
+        ps5wk_downloads_shown();
+    else if (section == SEC_FILES)
+        ps5wk_files_shown();
     keepFocusVisible();
     if (zone == ZONE_LIST && !rowCount(section))
         zone = ZONE_TOOLBAR;
@@ -1851,10 +2029,14 @@ static gboolean focusHot(const BUIHot* hot)
         zone = ZONE_TOOLBAR;
         toolbarFocus = hot->index;
     } else if (hot->kind == HOT_ROW) {
-        if (zone == ZONE_LIST && listFocus == hot->index)
+        if (choicesOpen || (zone == ZONE_LIST && listFocus == hot->index))
             return FALSE;
         zone = ZONE_LIST;
         listFocus = hot->index;
+    } else if (hot->kind == HOT_CHOICE) {
+        if (!choicesOpen || hot->index >= choices.count || choices.choices[hot->index].id == choicesFocusID)
+            return FALSE;
+        choicesFocusID = choices.choices[hot->index].id;
     } else
         return FALSE;
     return TRUE;
@@ -1947,9 +2129,102 @@ static void onUIPointer(WPEDisplayPS5* d, double x, double y, double scrollY, gp
         redraw();
 }
 
+/* X on the dialog's focused choice. */
+static void choose(void)
+{
+    if (!choicesOpen || !choices.count)
+        return;
+    const BUIChoice* c = &choices.choices[choices.focus];
+    if (c->confirm && choicesArmedID != c->id) {
+        choicesArmedID = c->id;
+        redraw();
+        return;
+    }
+    choicesArmedID = -1;
+    int sec = choicesSection;
+    int result = sec == SEC_DOWNLOADS ? ps5wk_downloads_choose(c->id) : ps5wk_files_choose(c->id);
+    switch (result) {
+    case BUI_CHOSEN_STAY:
+        break;
+    case BUI_CHOSEN_FILES:
+        choicesOpen = FALSE;
+        setSection(SEC_FILES);
+        zone = ZONE_LIST;
+        keepFocusVisible();
+        break;
+    case BUI_CHOSEN_DOWNLOADS:
+        choicesOpen = FALSE;
+        setSection(SEC_DOWNLOADS);
+        break;
+    case BUI_CHOSEN_DETAILS: {
+        choicesOpen = FALSE;
+        unsigned row; /* the dialog's download, wherever it is now (not the focus: the list may have moved) */
+        if (choicesSection == SEC_DOWNLOADS && ps5wk_downloads_choices_index(&row)) {
+            listFocus = (int)row;
+            openDetails((int)row);
+        }
+        break;
+    }
+    case BUI_CHOSEN_MENU_CLOSE:
+        choicesOpen = FALSE;
+        setMenu(FALSE);
+        return;
+    default:
+        choicesOpen = FALSE;
+        break;
+    }
+    keepFocusVisible();
+    redraw();
+}
+
+/* The pad while a dialog is open. */
+static void choicesButtons(guint32 pressed)
+{
+    /* the choices as they are now (a draw may not have come since) */
+    if (!fillChoices()) {
+        choicesOpen = FALSE;
+        redraw();
+        return;
+    }
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS) {
+        setMenu(FALSE);
+        return;
+    }
+    if (pressed & (WPE_DISPLAY_PS5_BUTTON_CROSS | WPE_DISPLAY_PS5_BUTTON_TOUCHPAD)) {
+        double x, y;
+        if (wpe_display_ps5_get_pointer(display, &x, &y)) {
+            const BUIHot* hot = hotAt(x, y);
+            if (!hot || hot->kind != HOT_CHOICE)
+                return;
+            focusHot(hot);
+            fillChoices();
+        }
+        choose();
+        return;
+    }
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE) {
+        choicesOpen = FALSE;
+        redraw();
+        return;
+    }
+    int step = (pressed & WPE_DISPLAY_PS5_BUTTON_DOWN) ? 1 : (pressed & WPE_DISPLAY_PS5_BUTTON_UP) ? -1 : 0;
+    if (step && choices.count) {
+        int i = choices.focus + step;
+        if (i >= 0 && i < choices.count) {
+            choicesFocusID = choices.choices[i].id;
+            choicesArmedID = -1;
+            redraw();
+        }
+    }
+}
+
 /* The pad while the menu is open (UI mode: every press comes here). */
 static void menuButtons(guint32 pressed)
 {
+    if (choicesOpen) {
+        choicesButtons(pressed);
+        return;
+    }
     if (detailsOpen) {
         /* the details card: X, O or R2 closes it; Options closes the menu */
         if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS)
@@ -1977,6 +2252,17 @@ static void menuButtons(guint32 pressed)
             toolbarActivate(toolbarFocus);
         else
             rowActivate(listFocus, FALSE);
+        return;
+    }
+    /* a download just finished (its notice says Options opens it) */
+    unsigned recent;
+    if ((pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS) && ps5wk_downloads_take_recent(&recent)) {
+        ps5wk_browser_show_download_choices(recent);
+        return;
+    }
+    if ((pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE) && section == SEC_FILES && zone == ZONE_LIST && ps5wk_files_up()) {
+        deleteArmed = -1;
+        redraw();
         return;
     }
     if (pressed & (WPE_DISPLAY_PS5_BUTTON_CIRCLE | WPE_DISPLAY_PS5_BUTTON_OPTIONS)) {
@@ -2085,7 +2371,12 @@ static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
     if (ps5wk_vr_buttons(pressed))
         return TRUE;
     if (pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS) {
-        ps5wk_browser_toggle_menu();
+        /* just after a download finished (its notice says so): its dialog */
+        unsigned recent;
+        if (!ps5wk_vr_active() && ps5wk_downloads_take_recent(&recent))
+            ps5wk_browser_show_download_choices(recent);
+        else
+            ps5wk_browser_toggle_menu();
         return TRUE;
     }
     return FALSE;

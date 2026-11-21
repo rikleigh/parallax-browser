@@ -1,4 +1,4 @@
-/* Driver for install-test.sh: find <dir> [depth], install <dir> <user_app>. */
+/* Driver for install-test.sh: find <dir> [depth], count <dir> [depth], install <dir> <user_app>. */
 #include "../../../apps/common/ps5install.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +12,10 @@ int main(int argc, char** argv)
         int r = ps5install_find(argv[2], argc > 3 ? (unsigned)atoi(argv[3]) : 2, &t, error, sizeof error);
         if (r) { printf("ERR %d %s\n", r, error); return 0; }
         printf("OK %s|%s|%s|%s\n", t.title_id, t.name, t.version, t.dir);
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "count")) {
+        printf("COUNT %d\n", ps5install_count(argv[2], argc > 3 ? (unsigned)atoi(argv[3]) : 3));
         return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "install")) {

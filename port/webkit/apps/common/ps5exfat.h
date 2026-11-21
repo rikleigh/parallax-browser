@@ -53,6 +53,14 @@ int64_t ps5exfat_measure(const char* src, const PS5ExfatOptions* options, char* 
 int ps5exfat_build(const char* src, const char* image, const PS5ExfatOptions* options,
     ps5exfat_progress_fn progress, void* data, volatile int* cancel, char* error, size_t error_size);
 
+/* Reads image back as exFAT (the boot region and its checksum, the FAT
+ * chains, every entry set's checksum, the up-case table) and compares it
+ * with src: the same names, kinds and sizes both ways, and every file's
+ * bytes. 0 the same; -1 not (error says what); -3 cancelled. Progress:
+ * bytes compared. */
+int ps5exfat_verify(const char* image, const char* src, ps5exfat_progress_fn progress, void* data, volatile int* cancel, char* error,
+    size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

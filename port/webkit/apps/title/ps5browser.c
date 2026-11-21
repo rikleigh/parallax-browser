@@ -33,6 +33,7 @@
 #include "browser.h"
 #include "runtime.h"
 #include "downloads.h"
+#include "files.h"
 #include "dlm.h"
 #include "qrcode.h"
 #include "settings.h"
@@ -3557,6 +3558,7 @@ int main(int argc, char** argv)
     /* After View in VR: the browser's button handler chains it. */
     ps5wk_browser_init(display, webView);
     ps5wk_downloads_init(WPE_DISPLAY_PS5(display), session);
+    ps5wk_files_init(WPE_DISPLAY_PS5(display));
     ps5wk_adblock_init(webView);
     ps5wk_updates_init(WPE_DISPLAY_PS5(display));
     debugDialogsInit(webView);

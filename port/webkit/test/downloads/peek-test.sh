@@ -82,6 +82,11 @@ mkdir -p "$src/two"
 app "$src/two/First" PPSA00001 "First" 01.000.000
 app "$src/two/Second" PPSA00002 "Second" 01.000.000
 (cd "$src/two" && zip -qr "$files/two.zip" First Second)
+# an app inside another app's folder: one app (as when unpacked, see ps5install_count)
+mkdir -p "$src/nested"
+app "$src/nested/Outer" PPSA00003 "Outer" 01.000.000
+app "$src/nested/Outer/extras/Inner" PPSA00004 "Inner" 01.000.000
+(cd "$src/nested" && zip -qr "$files/nested.zip" Outer)
 # many files spread through the archive (a dump: no request per file),
 # and ZIP64 (over 65535 entries), both made with Python's zipfile
 python3 - "$src/one/Peek App" "$files/many.zip" "$files/zip64.zip" <<'PY'
@@ -167,6 +172,7 @@ out="$(peek solid.7z)"
 check "7-Zip, solid: the app is found (param.json if it fits)" "$out" "j['format']=='7-Zip' and j['titles']==1 and j['titleDir']=='Peek App'"
 check "ZIP: a param.json without a titleId: the ID from the folder's name" "$(peek guess.zip)" "j['titleId']=='PPSA05555' and j['guessed']"
 check "ZIP with two apps" "$(peek two.zip)" "j['titles']==2"
+check "ZIP with an app inside an app" "$(peek nested.zip)" "j['titles']==1 and j['titleId']=='PPSA00003'"
 check "ZIP without an app" "$(peek plain.zip)" "j['titles']==0 and j['titleId'] is None and j['entries']==2"
 check "encrypted ZIP: refused" "$(peek encrypted.zip)" "j['refused'] and 'ncrypted' in j['refused']"
 check "tar.gz: read through, over the limit" "$(peek app.tar.gz --max-bytes 4194304)" "ERR:More than"

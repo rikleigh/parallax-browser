@@ -558,6 +558,82 @@ static void onImageProgress(uint64_t done, uint64_t total, const char* current, 
     jobProgress(data, "image", done, total, current, FALSE);
 }
 
+static void onVerifyProgress(uint64_t done, uint64_t total, const char* current, void* data)
+{
+    jobProgress(data, "verify", done, total, current, FALSE);
+}
+
+static void autoImagePath(const char* source, const PS5TitleInfo* title, char* out, size_t size);
+
+/* An image is made of exactly one app (a folder with sce_sys/param.json
+ * and eboot.bin): anything else wouldn't mount as a game. FALSE with why
+ * in error. */
+static gboolean oneAppIn(const char* dir, char* error, size_t size)
+{
+    int n = ps5install_count(dir, 3);
+    if (n == 1)
+        return TRUE;
+    char param[1024], eboot[1024];
+    struct stat st;
+    snprintf(param, sizeof param, "%s/sce_sys/param.json", dir);
+    snprintf(eboot, sizeof eboot, "%s/eboot.bin", dir);
+    if (n == -1)
+        snprintf(error, size, "Out of memory");
+    else if (n < 0)
+        snprintf(error, size, "Too many folders to look through for the app: make the image of the app's own folder");
+    else if (!n && !stat(param, &st) && !stat(eboot, &st))
+        snprintf(error, size, "This app's sce_sys/param.json has no title ID that can be read, so it can't be made an image");
+    else if (!n)
+        snprintf(error, size, "No PS5 app here (a folder with sce_sys/param.json and eboot.bin): an image is only made of one");
+    else
+        snprintf(error, size, "%d apps here: make the image of one app's folder", n);
+    return FALSE;
+}
+
+/* The same for an archive, before it is unpacked (when it can be listed). */
+static gboolean archiveOneApp(const char* archive, char* error, size_t size)
+{
+    PS5ArchiveInfo info;
+    char why[256];
+    if (ps5archive_inspect(archive, NULL, &info, why, sizeof why))
+        return TRUE; /* not listed: checked once unpacked */
+    if (info.titles == 1)
+        return TRUE;
+    if (!info.titles)
+        snprintf(error, size, "It holds no PS5 app (sce_sys/param.json and eboot.bin): an image is only made of one; unpack it instead");
+    else
+        snprintf(error, size, "It holds %u apps: unpack it, then make an image of each app's folder from Files", info.titles);
+    return FALSE;
+}
+
+/* Builds image from the app at source and reads it back to compare
+ * (ps5exfat_verify); a bad image is deleted. TRUE: out says where. */
+static gboolean buildImage(Job* job, const char* source, const PS5TitleInfo* title, const char* where, char* out, size_t outSize,
+    char* error, size_t size)
+{
+    char image[1024];
+    if (!strcmp(where, "auto"))
+        autoImagePath(source, title, image, sizeof image);
+    else
+        snprintf(image, sizeof image, "%s", where);
+    PS5ExfatOptions o = { .label = title->title_id };
+    if (ps5exfat_build(source, image, &o, onImageProgress, job, &job->cancel, error, size))
+        return FALSE;
+    jobProgress(job, "verify", 0, 0, "", TRUE);
+    char why[512];
+    int v = ps5exfat_verify(image, source, onVerifyProgress, job, &job->cancel, why, sizeof why);
+    if (v) {
+        unlink(image);
+        if (v == -3)
+            snprintf(error, size, "Cancelled");
+        else
+            snprintf(error, size, "The image didn't match the folder when read back (%s): it was deleted", why);
+        return FALSE;
+    }
+    snprintf(out, outSize, "%s", image);
+    return TRUE;
+}
+
 static void onInstallLog(const char* line, void* data)
 {
     (void)data;
@@ -695,6 +771,8 @@ static gpointer jobThread(gpointer data)
     else if (!strcmp(job->kind, "extract") && job->then && !strcmp(job->then, "install") && !job->replace
         && archiveTitle(job->src, &title) && refuseReplace(job, &title, job->dest, error, sizeof error)) {
         haveTitle = TRUE; /* nothing unpacked */
+    } else if (!strcmp(job->kind, "extract") && job->then && !strcmp(job->then, "image") && !archiveOneApp(job->src, error, sizeof error)) {
+        /* nothing unpacked */
     } else if (!strcmp(job->kind, "extract")) {
         PS5ArchiveLimits limits = { 0 };
         if (exists(job->dest)) {
@@ -739,21 +817,17 @@ static gpointer jobThread(gpointer data)
                     ps5install_remove_tree(job->dest);
             }
         } else if (ok && job->then && !strcmp(job->then, "image") && job->image) {
-            /* the app's folder if there is one, else everything unpacked */
-            char found[256] = "";
-            const char* source = !ps5install_find(job->dest, 3, &title, found, sizeof found) ? title.dir : job->dest;
-            haveTitle = source == title.dir;
-            char image[1024];
-            if (!strcmp(job->image, "auto"))
-                autoImagePath(source, haveTitle ? &title : NULL, image, sizeof image);
-            else
-                snprintf(image, sizeof image, "%s", job->image);
-            PS5ExfatOptions o = { .label = haveTitle ? title.title_id : NULL };
-            int b = ps5exfat_build(source, image, &o, onImageProgress, job, &job->cancel, error, sizeof error);
-            ok = !b;
-            if (ok) {
-                snprintf(out, sizeof out, "%s", image);
-                ps5install_remove_tree(job->dest); /* the unpacked copy was only for the image */
+            /* exactly one app in what was unpacked; else it stays unpacked */
+            char found[256] = "", why[256] = "";
+            if (!oneAppIn(job->dest, why, sizeof why) || ps5install_find(job->dest, 3, &title, found, sizeof found)) {
+                ok = FALSE;
+                snprintf(error, sizeof error, "Unpacked to %s, but %s", job->dest, *why ? why : found);
+                snprintf(out, sizeof out, "%s", job->dest);
+            } else {
+                haveTitle = TRUE;
+                ok = buildImage(job, title.dir, &title, job->image, out, sizeof out, error, sizeof error);
+                if (ok)
+                    ps5install_remove_tree(job->dest); /* the unpacked copy was only for the image */
             }
         }
     } else if (!strcmp(job->kind, "install")) {
@@ -767,17 +841,11 @@ static gpointer jobThread(gpointer data)
             haveTitle = TRUE;
         }
     } else if (!strcmp(job->kind, "image")) {
-        char found[256] = "";
-        haveTitle = !ps5install_find(job->src, 3, &title, found, sizeof found);
-        char image[1024];
-        if (!strcmp(job->dest, "auto"))
-            autoImagePath(haveTitle ? title.dir : job->src, haveTitle ? &title : NULL, image, sizeof image);
-        else
-            snprintf(image, sizeof image, "%s", job->dest);
-        PS5ExfatOptions o = { .label = haveTitle ? title.title_id : NULL };
-        ok = !ps5exfat_build(haveTitle ? title.dir : job->src, image, &o, onImageProgress, job, &job->cancel, error, sizeof error);
-        if (ok)
-            snprintf(out, sizeof out, "%s", image);
+        /* exactly one app: its folder becomes the image */
+        if (oneAppIn(job->src, error, sizeof error) && !ps5install_find(job->src, 3, &title, error, sizeof error)) {
+            haveTitle = TRUE;
+            ok = buildImage(job, title.dir, &title, job->dest, out, sizeof out, error, sizeof error);
+        }
     } else if (!strcmp(job->kind, "delete")) {
         /* the file manager's Delete: a job, as a big folder takes a while */
         ok = !ps5install_remove_tree(job->src);

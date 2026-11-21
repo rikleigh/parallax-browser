@@ -606,17 +606,19 @@ static void drawHeader(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
 
     /* the lists, between L1 and R1 */
     x += keyCap(c, x, cy, "L1") + 22;
-    static const char* names[SEC_COUNT] = { "Tabs", "Bookmarks", "History", "Downloads" };
+    static const char* names[SEC_COUNT] = { "Tabs", "Bookmarks", "History", "Downloads", "Files" };
     for (int sec = 0; sec < SEC_COUNT; sec++) {
         char count[32];
         if (sec == SEC_TABS)
             snprintf(count, sizeof count, "%u/%u", s->tabCount, s->maxTabs);
+        else if (sec == SEC_FILES)
+            count[0] = 0;
         else
             snprintf(count, sizeof count, "%u", sec == SEC_BOOKMARKS ? s->bookmarkCount : sec == SEC_HISTORY ? s->historyCount : s->downloadCount);
         const gboolean on = sec == s->section;
         const int nw = wpe_display_ps5_canvas_text_width(c, T_SECTION, TRUE, names[sec]);
-        const int cw = wpe_display_ps5_canvas_text_width(c, 21, FALSE, count);
-        const int w = nw + 10 + cw;
+        const int cw = count[0] ? wpe_display_ps5_canvas_text_width(c, 21, FALSE, count) : 0;
+        const int w = nw + (cw ? 10 + cw : 0);
         const int baseline = cy + 9;
         wpe_display_ps5_canvas_text(c, x, baseline, 0, T_SECTION, TRUE, on ? PX_TEXT : PX_TEXT_2, names[sec]);
         wpe_display_ps5_canvas_text(c, x + nw + 10, baseline, 0, 21, FALSE, on ? PX_TEXT_2 : PX_TEXT_3, count);
@@ -652,6 +654,15 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         hint(c, x, cy, "Options", "Close the menu");
         return;
     }
+    if (s->choices) {
+        const BUIChoices* d = s->choices;
+        const gboolean armed = d->focus >= 0 && d->focus == d->armed;
+        if (d->count)
+            x += hint(c, x, cy, "✕", armed ? "Press again to do it" : "Choose") + 32;
+        x += hint(c, x, cy, "○", "Back") + 32;
+        hint(c, x, cy, "Options", "Close the menu");
+        return;
+    }
     if (!list && s->toolbarFocus == TB_GAMEPAD) {
         x += hint(c, x, cy, "✕", s->gamepadOn ? "Gamepad mode off" : "Gamepad mode on") + 32;
         x += hint(c, x, cy, "□", "Set up buttons") + 32;
@@ -675,22 +686,22 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
     else if (s->section == SEC_TABS) {
         x += hint(c, x, cy, "✕", list ? "Switch" : "Select") + 32;
         x += hint(c, x, cy, "□", "Close tab") + 32;
-    } else if (s->section == SEC_DOWNLOADS) {
+    } else if (s->section == SEC_DOWNLOADS || s->section == SEC_FILES) {
         if (!list)
             x += hint(c, x, cy, "✕", "Select") + 32;
         if (list && s->downloadCross)
             x += hint(c, x, cy, "✕", s->downloadCross) + 32;
         if (list && s->downloadSquare)
             x += hint(c, x, cy, "□", s->downloadSquare) + 32;
-        if (list && s->rowCount && !(s->downloadCross && !strcmp(s->downloadCross, "Details")))
-            x += hint(c, x, cy, "R2", "Details") + 32;
+        if (list && s->listR2)
+            x += hint(c, x, cy, "R2", s->listR2) + 32;
     } else {
         x += hint(c, x, cy, "✕", list ? "Open" : "Select") + 32;
         x += hint(c, x, cy, "R2", "New tab") + 32;
         x += hint(c, x, cy, "□", "Delete") + 32;
     }
     x += hint(c, x, cy, "△", "Address") + 32;
-    hint(c, x, cy, "○", "Close");
+    hint(c, x, cy, "○", list && s->listCircle ? s->listCircle : "Close");
 
     /* on the right: what the other buttons do from here */
     static const char* const keys[] = { "L3", "R3" };
@@ -843,9 +854,93 @@ static void drawDetails(WPEDisplayPS5Canvas* c, const BUIDetails* d, int px, int
     }
 }
 
+/* ---- a dialog: what X on a download or a file offers ---- */
+
+#define CHOICE_H 64
+#define CHOICE_GAP 8
+#define CHOICES_W 1180
+
+static int choicesHeaderHeight(const BUIChoices* d)
+{
+    return 100 + d->lineCount * 30 + (d->lineCount ? 14 : 0);
+}
+
+int bui_visible_choices(int screenH, const BUIChoices* d)
+{
+    const int room = listBottom(screenH) - LIST_TOP - 8 - choicesHeaderHeight(d) - 28;
+    const int n = (room + CHOICE_GAP) / (CHOICE_H + CHOICE_GAP);
+    return n < 1 ? 1 : n;
+}
+
+static guint32 choiceColor(int tone)
+{
+    return tone == BUI_TONE_WARN ? PX_PINK : PX_TEXT;
+}
+
+static void drawChoices(WPEDisplayPS5Canvas* c, const BUIChoices* d, int px, int pw, int screenH)
+{
+    const int visible = bui_visible_choices(screenH, d);
+    const int shown = d->count < visible ? d->count : visible;
+    const int w = pw - 128 < CHOICES_W ? pw - 128 : CHOICES_W, x = px + (pw - w) / 2, y = LIST_TOP + 4;
+    const int h = choicesHeaderHeight(d) + (shown ? shown * (CHOICE_H + CHOICE_GAP) - CHOICE_GAP : 0) + 28;
+    /* the list under it, dimmed */
+    wpe_display_ps5_canvas_fill(c, px + 8, LIST_TOP - 8, pw - 16, listBottom(screenH) - LIST_TOP + 16, 0, PX_A(PX_INK, 0xa0));
+    wpe_display_ps5_canvas_glow(c, x, y, w, h, PX_RADIUS_PANEL, PX_FOCUS_GLOW, PX_A(PX_FOCUS_FROM, 0x60), PX_A(PX_FOCUS_TO, 0x60));
+    wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_SURFACE, 0xff));
+    wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_RAISED, 0xc0));
+    wpe_display_ps5_canvas_stroke(c, x, y, w, h, PX_RADIUS_PANEL, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    wpe_display_ps5_canvas_text(c, x + 40, y + 56, w - 80, 30, TRUE, PX_TEXT, d->title);
+    wpe_display_ps5_canvas_fill_gradient(c, x + 40, y + 74, 96, 4, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+    for (int i = 0; i < d->lineCount && i < 3; i++)
+        wpe_display_ps5_canvas_text(c, x + 40, y + 114 + i * 30, w - 80, 21, FALSE, d->lineTones[i] == BUI_TONE_WARN ? PX_PINK
+            : d->lineTones[i] == BUI_TONE_ACTIVE ? PX_CYAN_TEXT : PX_TEXT_2, d->lines[i]);
+
+    int top = d->focus - visible + 1;
+    if (top > d->count - visible)
+        top = d->count - visible;
+    if (top < 0)
+        top = 0;
+    const int bx = x + 32, bw = w - 64;
+    int by = y + choicesHeaderHeight(d);
+    for (int i = top; i < d->count && i < top + shown; i++) {
+        const BUIChoice* o = &d->choices[i];
+        const gboolean focused = i == d->focus, armed = i == d->armed;
+        if (focused)
+            focusBox(c, bx, by, bw, CHOICE_H, PX_RADIUS);
+        else
+            wpe_display_ps5_canvas_fill(c, bx, by, bw, CHOICE_H, PX_RADIUS, PX_A(PX_RAISED_HI, 0x90));
+        /* on the right: "Suggested" */
+        int tagW = 0;
+        if (o->tone == BUI_TONE_ACTIVE && !armed) {
+            static const char tag[] = "Suggested";
+            tagW = wpe_display_ps5_canvas_text_width(c, 17, TRUE, tag) + 28;
+            const int tx = bx + bw - 20 - tagW, ty = by + (CHOICE_H - 30) / 2;
+            wpe_display_ps5_canvas_fill(c, tx, ty, tagW, 30, 15, PX_A(PX_CYAN, 0x26));
+            wpe_display_ps5_canvas_text(c, tx + 14, ty + 21, 0, 17, TRUE, PX_CYAN_TEXT, tag);
+            tagW += 20;
+        }
+        const int tw = bw - 48 - tagW;
+        char label[160];
+        snprintf(label, sizeof label, armed ? "Press ✕ again: %s" : "%s", o->label);
+        const guint32 color = armed ? PX_PINK : choiceColor(o->tone);
+        if (o->detail[0]) {
+            wpe_display_ps5_canvas_text(c, bx + 24, by + 29, tw, 23, TRUE, color, label);
+            wpe_display_ps5_canvas_text(c, bx + 24, by + 52, tw, 18, FALSE, o->tone == BUI_TONE_WARN ? PX_PINK : PX_TEXT_3, o->detail);
+        } else
+            wpe_display_ps5_canvas_text(c, bx + 24, by + CHOICE_H / 2 + 8, tw, 23, TRUE, color, label);
+        addHot(bx, by, bw, CHOICE_H, HOT_CHOICE, i);
+        by += CHOICE_H + CHOICE_GAP;
+    }
+    /* more above or below */
+    if (top > 0)
+        textCentred(c, x + w - 40, y + choicesHeaderHeight(d) - 14, 0, 18, FALSE, PX_TEXT_3, "▲");
+    if (top + shown < d->count)
+        textCentred(c, x + w - 40, y + h - 14, 0, 18, FALSE, PX_TEXT_3, "▼");
+}
+
 static void drawRow(WPEDisplayPS5Canvas* c, const BUIState* s, const BUIRow* r, int rx, int ry, int rw, gboolean focused)
 {
-    if (s->section == SEC_DOWNLOADS) {
+    if (s->section == SEC_DOWNLOADS || s->section == SEC_FILES) {
         drawDownloadRow(c, r, rx, ry, rw, focused);
         return;
     }
@@ -911,13 +1006,14 @@ void bui_draw_menu(WPEDisplayPS5Canvas* c, const BUIState* s)
     const int rows = s->rowCount, visible = bui_visible_rows(screenH);
     const int rx = px + 24, rw = pw - 48 - 16;
     if (!rows) {
-        const gboolean bookmarks = s->section == SEC_BOOKMARKS, downloads = s->section == SEC_DOWNLOADS;
+        const gboolean bookmarks = s->section == SEC_BOOKMARKS, downloads = s->section == SEC_DOWNLOADS, files = s->section == SEC_FILES;
         const int cx = px + pw / 2, cy = (LIST_TOP + listBottom(screenH)) / 2;
-        textCentred(c, cx, cy - 72, 0, 64, FALSE, PX_TEXT_3, bookmarks ? "☆" : downloads ? "↓" : "↺");
-        textCentred(c, cx, cy + 6, 0, 30, TRUE, PX_TEXT_2, bookmarks ? "No bookmarks yet" : downloads ? "No downloads yet" : "No history yet");
+        textCentred(c, cx, cy - 72, 0, 64, FALSE, PX_TEXT_3, bookmarks ? "☆" : downloads ? "↓" : files ? "…" : "↺");
+        textCentred(c, cx, cy + 6, 0, 30, TRUE, PX_TEXT_2, bookmarks ? "No bookmarks yet" : downloads ? "No downloads yet" : files ? (s->filesError ? "Couldn't list the drives" : "Looking for drives") : "No history yet");
         textCentred(c, cx, cy + 52, pw - 96, 22, FALSE, PX_TEXT_3,
             bookmarks ? "☆ in the bar (Options, then up and right) adds the page shown."
-            : downloads ? "Files a page can't show (archives, packages) are saved to your downloads folder." : "The pages you visit come here.");
+            : downloads ? "Files a page can't show (archives, packages) are saved to your downloads folder."
+            : files ? (s->filesError ? s->filesError : "The internal storage and USB drives show here.") : "The pages you visit come here.");
     }
     int ry = LIST_TOP;
     for (int row = s->listTop; row < rows && row < s->listTop + visible; row++) {
@@ -940,6 +1036,8 @@ void bui_draw_menu(WPEDisplayPS5Canvas* c, const BUIState* s)
     }
     if (s->details)
         drawDetails(c, s->details, px, pw, screenH);
+    else if (s->choices)
+        drawChoices(c, s->choices, px, pw, screenH);
     drawFooter(c, s, px, py, pw, ph);
 }
 
