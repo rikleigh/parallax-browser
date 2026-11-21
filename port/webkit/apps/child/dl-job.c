@@ -29,13 +29,15 @@
  *     fetch    id url orig ua ref cookies path conns chunk
  *     stop     id                      (pause: .part and .ps5dl stay)
  *     cancel   id                      (.part and .ps5dl deleted)
- *     job      id kind=extract|install|image|move|delete src dest [delete=1]
+ *     job      id kind=extract|install|image|move|copy|delete src dest [delete=1]
  *              [then=install|image] [image=<path>] [replace=1]
  *              (an install that would replace an installed app is refused
  *              without replace=1: jobend says installed=<version>)
  *     jobstop  id
  *     rm       path                    (a file or .part, and its .part.ps5dl)
- *     req      n op=roots|ls|mkdir|delete|rename|unique|saved path [to] [name]
+ *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials path [to] [name]
+ *              [dirs] (partials: the downloads with a .part.ps5dl in the
+ *              folders in dirs, one per line)
  *     peek     id (url size [ua] [ref] [cookies] | path)
  *              what an archive holds, on a server (Range requests for
  *              the parts that list its files) or on a drive
@@ -81,6 +83,7 @@
 #include "../common/ps5archive.h"
 #include "../common/ps5exfat.h"
 #include "../common/ps5fetch.h"
+#include "../common/ps5files.h"
 #include "../common/ps5install.h"
 #include "../common/ps5peek.h"
 
@@ -579,94 +582,10 @@ static void jobEnd(Job* job, gboolean ok, const char* error, const char* out, co
     sendLine(line);
 }
 
-/* 0 or -1 with error; copies src (a file) to dest, then deletes src. */
-static int moveFile(Job* job, const char* src, const char* dest, char* error, size_t size)
+static void onTransferProgress(uint64_t done, uint64_t total, const char* current, void* data)
 {
-    if (exists(dest)) {
-        char* base = g_path_get_basename(dest);
-        snprintf(error, size, "There is already something called %s there", base);
-        g_free(base);
-        return -1;
-    }
-    if (!rename(src, dest))
-        return 0;
-    if (errno != EXDEV) {
-        snprintf(error, size, "Couldn't move it (errno %d)", errno);
-        return -1;
-    }
-    struct stat st;
-    int in = open(src, O_RDONLY | O_NOFOLLOW);
-    if (in < 0 || fstat(in, &st) || !S_ISREG(st.st_mode)) {
-        if (in >= 0)
-            close(in);
-        snprintf(error, size, "Only files can be moved to another drive");
-        return -1;
-    }
-    struct statvfs vfs;
-    char* folder = g_path_get_dirname(dest);
-    if (!statvfs(folder, &vfs) && (uint64_t)vfs.f_bavail * vfs.f_frsize < (uint64_t)st.st_size + (64u << 20)) {
-        g_free(folder);
-        close(in);
-        snprintf(error, size, "Not enough space on the other drive");
-        return -1;
-    }
-    g_free(folder);
-    char* part = g_strdup_printf("%s.part", dest);
-    int out = open(part, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0777);
-    if (out < 0) {
-        close(in);
-        snprintf(error, size, "Couldn't write there (errno %d)", errno);
-        g_free(part);
-        return -1;
-    }
-    const size_t bufferSize = 4u << 20;
-    char* buffer = g_malloc(bufferSize);
-    uint64_t done = 0;
-    int r = 0;
-    while (!r) {
-        if (job->cancel) {
-            snprintf(error, size, "Cancelled");
-            r = -1;
-            break;
-        }
-        ssize_t n = read(in, buffer, bufferSize);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0) {
-            snprintf(error, size, "Couldn't read it (errno %d)", errno);
-            r = -1;
-        }
-        if (n <= 0)
-            break;
-        for (ssize_t w = 0; w < n && !r;) {
-            ssize_t m = write(out, buffer + w, (size_t)(n - w));
-            if (m < 0 && errno == EINTR)
-                continue;
-            if (m <= 0) {
-                snprintf(error, size, "Couldn't write it (errno %d)", errno);
-                r = -1;
-            } else
-                w += m;
-        }
-        done += (uint64_t)n;
-        jobProgress(job, "move", done, (uint64_t)st.st_size, src, FALSE);
-    }
-    g_free(buffer);
-    close(in);
-    if (close(out) && !r) {
-        snprintf(error, size, "Couldn't write it (errno %d)", errno);
-        r = -1;
-    }
-    if (!r && rename(part, dest)) {
-        snprintf(error, size, "Couldn't finish it (errno %d)", errno);
-        r = -1;
-    }
-    if (r)
-        unlink(part);
-    else
-        unlink(src);
-    g_free(part);
-    return r;
+    Job* job = data;
+    jobProgress(job, job->kind, done, total, current, FALSE);
 }
 
 static void deleteVolumes(const char* archive)
@@ -864,7 +783,13 @@ static gpointer jobThread(gpointer data)
         if (!ok)
             snprintf(error, sizeof error, "Couldn't delete all of it (errno %d)", errno);
     } else if (!strcmp(job->kind, "move")) {
-        ok = !moveFile(job, job->src, job->dest, error, sizeof error);
+        int r = ps5files_transfer(job->src, job->dest, TRUE, 0, onTransferProgress, job, &job->cancel, error, sizeof error);
+        ok = !r;
+        if (ok)
+            snprintf(out, sizeof out, "%s", job->dest);
+    } else if (!strcmp(job->kind, "copy")) {
+        int r = ps5files_transfer(job->src, job->dest, FALSE, 0, onTransferProgress, job, &job->cancel, error, sizeof error);
+        ok = !r;
         if (ok)
             snprintf(out, sizeof out, "%s", job->dest);
     } else
@@ -903,8 +828,8 @@ static void startJob(GHashTable* p)
         refused = "The job's destination isn't in a place the browser can use";
     else if (image && strcmp(image, "auto") && !writablePath(image))
         refused = "The image's place isn't one the browser can use";
-    else if (!strcmp(kind, "move") && !changeablePath(src))
-        refused = "That file can't be moved";
+    else if ((!strcmp(kind, "move") || !strcmp(kind, "copy")) && !changeablePath(src))
+        refused = !strcmp(kind, "move") ? "That can't be moved" : "That can't be copied";
     g_mutex_lock(&jobLock);
     if (!refused && g_hash_table_contains(jobs, id))
         refused = "A job is already running for it";
@@ -1132,6 +1057,65 @@ static gboolean validName(const char* name)
     return TRUE;
 }
 
+/* The unfinished downloads in dirs (one folder a line): each
+ * <name>.part.ps5dl whose <name> isn't there, with what it saved and the
+ * address it came from, so the title can offer to continue those its list
+ * has lost. */
+#define PARTIALS_DIRS_MAX 64
+#define PARTIALS_PER_DIR 5000
+static char* partialsJSON(const char* dirs)
+{
+    GString* out = g_string_new("[");
+    char** list = g_strsplit(dirs ? dirs : "", "\n", PARTIALS_DIRS_MAX + 1);
+    gboolean first = TRUE;
+    for (unsigned i = 0; list[i] && i < PARTIALS_DIRS_MAX; i++) {
+        const char* dir = list[i];
+        if (!*dir || !allowedPath(dir))
+            continue;
+        DIR* folder = opendir(dir);
+        if (!folder)
+            continue;
+        struct dirent* entry;
+        unsigned seen = 0;
+        while ((entry = readdir(folder)) && seen++ < PARTIALS_PER_DIR) {
+            const char* name = entry->d_name;
+            size_t length = strlen(name);
+            static const char tail[] = ".part.ps5dl";
+            if (length <= sizeof tail - 1 || strcmp(name + length - (sizeof tail - 1), tail))
+                continue;
+            char* base = g_strndup(name, length - (sizeof tail - 1));
+            char* file = g_build_filename(dir, base, NULL);
+            uint64_t received = 0;
+            int64_t total = -1;
+            char* url = NULL;
+            if (validName(base) && !exists(file) && ps5fetch_saved(file, &received, &total) && (url = ps5fetch_saved_url(file))) {
+                struct stat st;
+                char* state = g_strconcat(file, ".part.ps5dl", NULL);
+                long long mtime = !stat(state, &st) ? (long long)st.st_mtime : 0;
+                g_free(state);
+                g_string_append(out, first ? "{\"path\":" : ",{\"path\":");
+                first = FALSE;
+                jsonString(out, file);
+                g_string_append(out, ",\"dir\":");
+                jsonString(out, dir);
+                g_string_append(out, ",\"name\":");
+                jsonString(out, base);
+                g_string_append(out, ",\"url\":");
+                jsonString(out, url);
+                g_string_append_printf(out, ",\"received\":%llu,\"total\":%lld,\"mtime\":%lld}", (unsigned long long)received,
+                    (long long)total, mtime);
+            }
+            free(url);
+            g_free(file);
+            g_free(base);
+        }
+        closedir(folder);
+    }
+    g_strfreev(list);
+    g_string_append_c(out, ']');
+    return g_string_free(out, FALSE);
+}
+
 static void request(GHashTable* p)
 {
     const char* n = param(p, "n");
@@ -1143,6 +1127,8 @@ static void request(GHashTable* p)
         snprintf(error, sizeof error, "op missing");
     else if (!strcmp(op, "roots"))
         json = rootsJSON();
+    else if (!strcmp(op, "partials"))
+        json = partialsJSON(param(p, "dirs"));
     else if (!allowedPath(path))
         snprintf(error, sizeof error, "That place isn't one the browser can use");
     else if (!strcmp(op, "ls"))

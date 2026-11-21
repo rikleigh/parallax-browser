@@ -1093,6 +1093,24 @@ hundred megabytes, and because a title can't see every drive.
   before anything is unpacked. The card says *Installed already* and
   offers *Replace version X* (a second press). The download card warns
   beforehand when the installed version is known.
+- **Unfinished downloads the list lost** (`partials`): a service
+  download's `<name>.part.ps5dl` keeps the address it came from. The
+  service lists those in the download folders (the user's, the default
+  one, the favourites, the list's folders) whose `<name>` isn't there;
+  the page shows the ones not in the list (*Unfinished downloads not in
+  the list*, checked every 15 s) with *Continue* (a paused entry again,
+  resumed from the bytes saved, with the browser's cookies for the
+  address) and *Delete* (the `.part` and `.ps5dl`). The list can lose
+  one when it trims itself past 200 entries, or when `downloads.json` is
+  lost.
+- **Move and copy** (`apps/common/ps5files.c`): *Move…* and *Copy…* on
+  any file or folder in Files, then *Move here* / *Copy here* in the
+  folder it should go to. A move on the same drive is a rename;
+  otherwise the whole tree is listed first (links and special files
+  refused, the bytes checked against the free space), copied into
+  `<dest>.part`, renamed when complete, and the original deleted for a
+  move. Nothing is overwritten; a move into itself, out of the browser's
+  own data, or of a file a listed download uses is refused.
 - **The manager's page** (`apps/title/dlm.c`): `parallax://downloads` on
   the TV (it opens over the tab when a download waits for a folder; X on a
   finished or waiting row in the menu's Downloads list opens it), and
@@ -1152,12 +1170,24 @@ link server; the page's look through debug screenshots, not the pad):
   once went on downloading (in that run the pause had ended before the
   resume came, so the queued restart wasn't exercised); cancel deleted
   the files; the manager's data and actions without the PIN: 403.
+- Recovery and move/copy (2026-11-21), on the console: two partial
+  downloads made on the Mac (20 of 64 MB each) put in the Downloads
+  folder were listed with their bytes and addresses; *Continue* fetched
+  the other 45.9 MB (8 requests) and the file's SHA-256 was the
+  server's; continuing it again was refused (in the list already);
+  *Delete* removed the other one's files. Copies of a file and of a
+  folder (a copy of the copy had the original's SHA-256), a same-drive
+  move, and refusals: a name already there, a move into itself, a copy
+  out of `/data/ps5webkit`. No USB or M.2 drive was attached: moves
+  between drives were tested on the Mac only.
 - **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
   `--quick` 38), `archive-test.sh` (173), `exfat-test.sh` (66,
   `--no-big` 50), `install-test.sh` (12), `peek-test.sh` (25: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
   not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
-  a slow server, one sending 20 bytes a second, on the drive).
+  a slow server, one sending 20 bytes a second, on the drive),
+  `files-test.sh` (27: copies and moves on one drive and to a disk
+  image, no space, cancelled, links, FIFOs, names already there).
 
 **Test server:** `port/webkit/test/downloads/serve.py [--port 8781]`
 generates files of any size (each 4 KB block numbered, so a wrong join

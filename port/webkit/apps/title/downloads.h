@@ -55,8 +55,12 @@ void ps5wk_downloads_json(GString* out);
 /* The download manager's page (dlm.c, parallax://downloads): its state as
  * JSON (any thread), and its actions ("do=save|pause|resume|cancel|remove|
  * delete|forget|extract|extract-install|extract-image|jobstop|after|peek|
- * settings|favorite|task|taskstop|taskremove", main loop: NULL or why not). */
+ * settings|favorite|task|taskstop|taskremove|adopt|partial-delete", main
+ * loop: NULL or why not). */
 char* ps5wk_downloads_manager_json(void);
+/* Any thread: the folders an unfinished download may be in (one a line),
+ * for the service's "partials". */
+char* ps5wk_downloads_scan_dirs(void);
 const char* ps5wk_downloads_manage(GHashTable* params);
 
 /* Settings: the folder, its free space, the finished ones. */

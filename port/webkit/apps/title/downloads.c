@@ -111,6 +111,7 @@ static char* snapFinishedJSON;
 static char* snapSummaryJSON;
 static GPtrArray* snapFinishedNames; /* char* */
 static char* snapManagerJSON;
+static char* snapScanDirs; /* folders unfinished downloads may be in, one a line */
 
 /* Jobs on files that aren't downloads (the manager's file browser): an
  * archive or app folder already on a drive. Ids "t<n>" on the service. */
@@ -1142,7 +1143,7 @@ static void serviceProgress(Download* d, GHashTable* params)
 static const char* jobNoun(const char* job)
 {
     return !g_strcmp0(job, "extract") ? "Unpacking" : !g_strcmp0(job, "install") ? "Installing" : !g_strcmp0(job, "image") ? "Making the image"
-        : !g_strcmp0(job, "move") ? "Moving" : !g_strcmp0(job, "delete") ? "Deleting" : "Working";
+        : !g_strcmp0(job, "move") ? "Moving" : !g_strcmp0(job, "copy") ? "Copying" : !g_strcmp0(job, "delete") ? "Deleting" : "Working";
 }
 
 static void jobEnded(Download* d, GHashTable* params)
@@ -1746,6 +1747,26 @@ static void startAttempt(Download* d, gboolean fresh)
 
 /* Every download in the session: one the title asked for (a resume) is
  * already known; any other is new (a page's link). */
+/* d at the top of the list; over LIST_MAX, the oldest entry that isn't
+ * running goes (its files stay: a paused one is found again as an
+ * unfinished download). */
+static void addToList(Download* d)
+{
+    g_ptr_array_insert(list, 0, d);
+    while (list->len > LIST_MAX) {
+        gboolean dropped = FALSE;
+        for (unsigned i = list->len; i-- > 0 && !dropped;) {
+            Download* old = g_ptr_array_index(list, i);
+            if (!old->download && old->r.state != PS5WK_DL_RUNNING && old->r.jobState != PS5WK_JOB_RUNNING && !old->peeking) {
+                g_ptr_array_remove_index(list, i);
+                dropped = TRUE;
+            }
+        }
+        if (!dropped)
+            break;
+    }
+}
+
 static void onDownloadStarted(WebKitNetworkSession* session, WebKitDownload* download, gpointer data)
 {
     (void)session;
@@ -1776,20 +1797,7 @@ static void onDownloadStarted(WebKitNetworkSession* session, WebKitDownload* dow
         d->r.moveTo = g_strdup(settings.folder);
     WebKitURIRequest* request = webkit_download_get_request(download);
     spike_log("[dl] %u: download started: %s (request %s)", d->r.id, d->r.url, request ? webkit_uri_request_get_uri(request) : "?");
-    g_ptr_array_insert(list, 0, d);
-    while (list->len > LIST_MAX) {
-        /* the oldest finished entry (its file stays) */
-        gboolean dropped = FALSE;
-        for (unsigned i = list->len; i-- > 0 && !dropped;) {
-            Download* old = g_ptr_array_index(list, i);
-            if (!old->download && old->r.state != PS5WK_DL_RUNNING) {
-                g_ptr_array_remove_index(list, i);
-                dropped = TRUE;
-            }
-        }
-        if (!dropped)
-            break;
-    }
+    addToList(d);
     connectTransfer(d, g_object_ref(download));
     changed(TRUE);
 }
@@ -2301,10 +2309,41 @@ static void updateManagerSnapshot(void)
         g_string_append_c(out, '}');
     }
     g_string_append(out, "]}\n");
+    /* where an unfinished download the list lost may be: the user's
+     * folder, the default one, the favourites, the list's folders */
+    GPtrArray* dirs = g_ptr_array_new();
+    GHashTable* seen = g_hash_table_new(g_str_hash, g_str_equal);
+    const char* fixed[] = { PS5WK_DOWNLOADS_DIR, settings.folder };
+    for (unsigned i = 0; i < G_N_ELEMENTS(fixed); i++)
+        if (fixed[i] && g_hash_table_add(seen, (gpointer)fixed[i]))
+            g_ptr_array_add(dirs, (gpointer)fixed[i]);
+    for (unsigned i = 0; settings.favorites && settings.favorites[i]; i++)
+        if (g_hash_table_add(seen, settings.favorites[i]))
+            g_ptr_array_add(dirs, settings.favorites[i]);
+    for (unsigned i = 0; list && i < list->len; i++) {
+        const char* dir = folderOf(g_ptr_array_index(list, i));
+        if (dir && g_hash_table_add(seen, (gpointer)dir))
+            g_ptr_array_add(dirs, (gpointer)dir);
+    }
+    GString* scan = g_string_new(NULL);
+    for (unsigned i = 0; i < dirs->len && i < 64; i++)
+        g_string_append_printf(scan, "%s%s", i ? "\n" : "", (const char*)g_ptr_array_index(dirs, i));
+    g_ptr_array_free(dirs, TRUE);
+    g_hash_table_destroy(seen);
     g_mutex_lock(&snapLock);
     g_free(snapManagerJSON);
     snapManagerJSON = g_string_free(out, FALSE);
+    g_free(snapScanDirs);
+    snapScanDirs = g_string_free(scan, FALSE);
     g_mutex_unlock(&snapLock);
+}
+
+char* ps5wk_downloads_scan_dirs(void)
+{
+    g_mutex_lock(&snapLock);
+    char* dirs = g_strdup(snapScanDirs ? snapScanDirs : PS5WK_DOWNLOADS_DIR);
+    g_mutex_unlock(&snapLock);
+    return dirs;
 }
 
 char* ps5wk_downloads_manager_json(void)
@@ -2322,7 +2361,7 @@ static gboolean folderAllowed(const char* dir)
     return !strstr(dir, "/../") && !g_str_has_suffix(dir, "/..") && !strstr(dir, "/./") && !strstr(dir, "//") && strlen(dir) < 900;
 }
 
-static const char* startTask(const char* kind, const char* then, const char* src, gboolean replace)
+static const char* startTask(const char* kind, const char* then, const char* src, const char* destFolder, gboolean replace)
 {
     if (!folderAllowed(src))
         return "That file isn't in a place the browser can use";
@@ -2370,11 +2409,79 @@ static const char* startTask(const char* kind, const char* then, const char* src
             image = g_strdup("auto");
     } else if (!strcmp(kind, "image"))
         dest = g_strdup("auto");
+    else if (!strcmp(kind, "move") || !strcmp(kind, "copy")) {
+        char* base = g_path_get_basename(src);
+        dest = g_build_filename(destFolder, base, NULL);
+        g_free(base);
+    }
     ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "delete",
         !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
     spike_log("[dl] task %s: %s %s%s%s%s", id, kind, src, then ? " then " : "", then ? then : "", replace ? " (replacing)" : "");
     g_free(dest);
     g_free(image);
+    changed(TRUE);
+    return NULL;
+}
+
+/* Whether a download in the list is path (its file or its .part), or in
+ * it: a move or delete from Files would leave the entry pointing nowhere,
+ * or under a running transfer. */
+static gboolean inUse(const char* path)
+{
+    size_t length = path ? strlen(path) : 0;
+    for (unsigned i = 0; list && path && i < list->len; i++) {
+        Download* d = g_ptr_array_index(list, i);
+        if (!d->r.file || (d->r.state != PS5WK_DL_RUNNING && d->r.state != PS5WK_DL_PAUSED && d->r.state != PS5WK_DL_ASKING
+                && d->r.jobState != PS5WK_JOB_RUNNING))
+            continue;
+        char* file = pathIn(d, FALSE);
+        gboolean same = !strcmp(file, path) || (!strncmp(file, path, length) && file[length] == '/');
+        g_free(file);
+        if (same)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* An unfinished download the list lost (found by the service's
+ * "partials"): a paused entry again, continued at once. */
+static const char* adoptPartial(const char* path, const char* url, gint64 total, gint64 received)
+{
+    if (!folderAllowed(path))
+        return "That file isn't in a place the browser can use";
+    if (!url || (!g_str_has_prefix(url, "http://") && !g_str_has_prefix(url, "https://")))
+        return "No address to continue it from";
+    char* dir = g_path_get_dirname(path);
+    char* name = g_path_get_basename(path);
+    const char* why = NULL;
+    for (unsigned i = 0; list && i < list->len && !why; i++) {
+        Download* other = g_ptr_array_index(list, i);
+        if (other->r.file && !strcmp(other->r.file, name) && !strcmp(folderOf(other), dir))
+            why = "It is in the list already";
+    }
+    if (!why && (!*name || name[0] == '.' || strlen(name) > NAME_MAX_BYTES))
+        why = "Its name can't be used";
+    if (why) {
+        g_free(dir);
+        g_free(name);
+        return why;
+    }
+    Download* d = g_new0(Download, 1);
+    d->r.id = nextID++;
+    d->r.url = g_strdup(url);
+    d->r.file = name;
+    d->r.dir = strcmp(dir, PS5WK_DOWNLOADS_DIR) ? dir : NULL;
+    if (!d->r.dir)
+        g_free(dir);
+    d->r.size = total > 0 ? total : -1;
+    d->r.received = MAX(received, 0);
+    d->r.engine = PS5WK_DL_SERVICE;
+    d->r.state = PS5WK_DL_PAUSED;
+    d->r.started = nowSeconds();
+    addToList(d);
+    spike_log("[dl] %u: an unfinished download found again: %s (%s), %" G_GINT64_FORMAT " of %" G_GINT64_FORMAT " bytes", d->r.id, path,
+        url, d->r.received, d->r.size);
+    resumeDownload(d);
     changed(TRUE);
     return NULL;
 }
@@ -2440,15 +2547,40 @@ const char* ps5wk_downloads_manage(GHashTable* params)
         gboolean replace = replaceText && !strcmp(replaceText, "1");
         if (!kind || !path)
             return "kind and path";
+        if (!strcmp(kind, "delete") && inUse(path))
+            return "A download in the list uses it: pause, cancel or remove it first";
         if (!strcmp(kind, "extract") || !strcmp(kind, "image") || !strcmp(kind, "delete"))
-            return startTask(kind, NULL, path, FALSE);
+            return startTask(kind, NULL, path, NULL, FALSE);
         if (!strcmp(kind, "install"))
-            return startTask(kind, NULL, path, replace);
+            return startTask(kind, NULL, path, NULL, replace);
         if (!strcmp(kind, "extract-install"))
-            return startTask("extract", "install", path, replace);
+            return startTask("extract", "install", path, NULL, replace);
         if (!strcmp(kind, "extract-image"))
-            return startTask("extract", "image", path, FALSE);
-        return "kind=extract|extract-install|extract-image|install|image|delete";
+            return startTask("extract", "image", path, NULL, FALSE);
+        if (!strcmp(kind, "move") || !strcmp(kind, "copy")) {
+            /* dest: the folder it goes into */
+            const char* dest = textParam(params, "dest");
+            if (!folderAllowed(dest))
+                return "That folder isn't one the browser can use";
+            if (inUse(path))
+                return "A download in the list uses it: remove it from the list first";
+            return startTask(kind, NULL, path, dest, FALSE);
+        }
+        return "kind=extract|extract-install|extract-image|install|image|delete|move|copy";
+    }
+    if (!strcmp(action, "adopt"))
+        return adoptPartial(textParam(params, "path"), textParam(params, "url"), numberParam(params, "total", -1),
+            numberParam(params, "received", 0));
+    if (!strcmp(action, "partial-delete")) {
+        /* an unfinished download's .part and .ps5dl (the service checks the place) */
+        const char* path = textParam(params, "path");
+        if (!folderAllowed(path))
+            return "That file isn't in a place the browser can use";
+        if (inUse(path))
+            return "A download in the list uses it";
+        ps5wk_dlservice_send("rm", "path", path, NULL);
+        spike_log("[dl] an unfinished download deleted: %s", path);
+        return NULL;
     }
     if (!strcmp(action, "taskstop") || !strcmp(action, "taskremove")) {
         const char* id = textParam(params, "id");

@@ -117,6 +117,9 @@ void ps5fetch_free(PS5Fetch* fetch);
 /* What a later ps5fetch_start on path would continue from: the bytes on
  * disk and the total from <path>.part.ps5dl. false if there is none. */
 bool ps5fetch_saved(const char* path, uint64_t* received, int64_t* total);
+/* The address <path>.part.ps5dl was started from (the original one, not
+ * where it redirected), or NULL; free with free(). */
+char* ps5fetch_saved_url(const char* path);
 
 /* Pieces of a file on a server that answers Range, read on demand (the
  * download manager's look inside an archive before it is downloaded:

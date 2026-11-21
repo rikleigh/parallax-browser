@@ -94,7 +94,7 @@ add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUAR
     ${PS5_APPS_DIR}/common/watchdog.c ${PS5_LOCKS} ${PS5_APPS_DIR}/common/ps5malloc.c ${PS5_APPS_DIR}/common/ps5clock.c ${PS5_APPS_DIR}/child/adblock-job.c
     ${PS5_APPS_DIR}/child/update-job.c ${PS5_APPS_DIR}/common/ps5zip.c ${PS5_APPS_DIR}/common/ps5update.c
     ${PS5_APPS_DIR}/child/dl-job.c ${PS5_APPS_DIR}/common/ps5fetch.c ${PS5_APPS_DIR}/common/ps5archive.c
-    ${PS5_APPS_DIR}/common/ps5exfat.c ${PS5_APPS_DIR}/common/ps5install.c ${PS5_APPS_DIR}/common/ps5peek.c)
+    ${PS5_APPS_DIR}/common/ps5exfat.c ${PS5_APPS_DIR}/common/ps5install.c ${PS5_APPS_DIR}/common/ps5peek.c ${PS5_APPS_DIR}/common/ps5files.c)
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
 # adblock-job.c uses WebKit's public API (WebKitUserContentFilterStore, JSC).
 set_source_files_properties(${PS5_APPS_DIR}/child/adblock-job.c ${PS5_APPS_DIR}/child/update-job.c PROPERTIES INCLUDE_DIRECTORIES "${PS5_API_INCLUDE_DIRECTORIES}")

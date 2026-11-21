@@ -1387,6 +1387,22 @@ bool ps5fetch_saved(const char* path, uint64_t* received, int64_t* total)
     return found;
 }
 
+char* ps5fetch_saved_url(const char* path)
+{
+    if (!path)
+        return NULL;
+    char* statePath = g_strconcat(path, ".part.ps5dl", NULL);
+    GKeyFile* key = g_key_file_new();
+    char* url = NULL;
+    if (g_key_file_load_from_file(key, statePath, G_KEY_FILE_NONE, NULL))
+        url = g_key_file_get_string(key, STATE_GROUP, "url", NULL);
+    g_key_file_free(key);
+    g_free(statePath);
+    char* out = url && *url ? strdup(url) : NULL;
+    g_free(url);
+    return out;
+}
+
 /* ---- pieces of a file on demand (ps5fetch_ranges_*) ---- */
 
 #define RANGES_BLOCK (64u * 1024)
