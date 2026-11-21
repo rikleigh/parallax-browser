@@ -1085,7 +1085,13 @@ hundred megabytes, and because a title can't see every drive.
     back as exFAT (`ps5exfat_verify`: the boot region's checksum, the FAT
     chains, each entry set's checksum, the up-case table) and compared
     with the folder, names, sizes and every byte (the job's "Checking the
-    image" phase); one that differs is deleted. (2026-11-21, after
+    image" phase); one that differs is deleted. The app must have
+    `sce_sys/icon0.png`: ShadowMountPlus copies it when it installs an
+    image's app, and without it logs "Failed to copy staged icon", tries
+    once more and then skips that title ("retry limit reached (2/2)")
+    until it restarts, even for a new image. So the choice isn't offered
+    for an app without one (the dialog says why), and the service refuses
+    it. (2026-11-21, after
     comparing with Vibe-Code-Jesus's PS5Browser: the messages and
     settings help in its 01.000.010 package say it takes a folder with `sce_sys/param.json` at its root
     or one level down, refuses one holding several games, and checks the
@@ -1222,11 +1228,15 @@ link server; the page's look through debug screenshots, not the pad):
   finished ZIPs already in the list were looked at on the
   drive when the page opened (ProsperoWeb's: its app found; the data
   ZIP: files, no app).
-- Not checked yet: the menu's Downloads dialog and Files list on the
-  console (2026-11-21: drawn on the Mac with `uipreview`, built for the
-  console, not run there); ShadowMountPlus (1.7beta7 here) mounting such an image
-  (it logged nothing about it in the minutes watched), RAR archives on the
-  console, USB and M.2 drives (none attached), the pad on the TV.
+- ShadowMountPlus mounting an image made here (2026-11-21, on the
+  console): *Unpack and make an exFAT image* of a test app's ZIP gave
+  `/data/homebrew/PPSA99009.exfat` (70 MB); within a minute
+  ShadowMountPlus attached it as an LVD and mounted it as exfatfs
+  (64 KiB blocks, "optimized-1.7"). It didn't install the app: the test
+  app had no `sce_sys/icon0.png` (above).
+- Not checked yet: an image's app on the home screen (ShadowMountPlus
+  needs restarting after the attempts without an icon), RAR archives on
+  the console, USB and M.2 drives (none attached), the pad on the TV.
 - After a review (2026-11-21), on the console: an app archive installed
   (v1); v2 of it with *Unpack & install app* was refused before
   unpacking (*version 01.00.000 is already installed*), the file's entry
@@ -1249,7 +1259,7 @@ link server; the page's look through debug screenshots, not the pad):
 - **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
   `--quick` 38), `archive-test.sh` (173), `exfat-test.sh` (66,
   `--no-big` 50; with the read-back check, `--no-big` 65, the full run
-  not repeated), `install-test.sh` (18), `peek-test.sh` (26: ZIP,
+  not repeated), `install-test.sh` (18), `peek-test.sh` (28: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
   not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
   a slow server, one sending 20 bytes a second, on the drive),

@@ -48,6 +48,8 @@ typedef struct {
     bool has_title;
     char title_dir[512];
     unsigned titles;       /* how many such folders */
+    bool title_icon;       /* title_dir has sce_sys/icon0.png (ShadowMountPlus
+                            * won't install an image's app without one) */
 } PS5ArchiveInfo;
 
 /* An archive read through a function instead of from files (the download

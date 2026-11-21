@@ -47,6 +47,9 @@ void ps5wk_downloads_hints(unsigned index, const char** cross, const char** squa
  * dialog instead (a finished download, one waiting for a folder). */
 gboolean ps5wk_downloads_primary(unsigned index);
 /* Square: TRUE when it needs a second press (a file is deleted). */
+/* O on the dialog: BUI_CHOSEN_CLOSE (only the dialog closes), or
+ * BUI_CHOSEN_MENU_CLOSE when that cancelled a download waiting for a folder. */
+int ps5wk_downloads_choices_back(void);
 /* The row the open dialog is about, where it is now (FALSE: gone). */
 gboolean ps5wk_downloads_choices_index(unsigned* index);
 /* What a row is, kept while rows come and go above it (g_free; NULL: no row). */

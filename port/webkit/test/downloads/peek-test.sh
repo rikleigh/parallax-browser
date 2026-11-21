@@ -45,6 +45,7 @@ mkdir -p "$files" "$src"
 app() { # <folder> <title ID or ""> <name> <version>
     mkdir -p "$1/sce_sys"
     head -c 2000000 /dev/urandom > "$1/eboot.bin"
+    printf '\x89PNG\r\n\x1a\n' > "$1/sce_sys/icon0.png" # an icon (ShadowMountPlus needs one for an image)
     local id=""
     [ -z "$2" ] || id="\"titleId\": \"$2\","
     cat > "$1/sce_sys/param.json" <<JSON
@@ -87,6 +88,11 @@ mkdir -p "$src/nested"
 app "$src/nested/Outer" PPSA00003 "Outer" 01.000.000
 app "$src/nested/Outer/extras/Inner" PPSA00004 "Inner" 01.000.000
 (cd "$src/nested" && zip -qr "$files/nested.zip" Outer)
+# an app without sce_sys/icon0.png: no image of it
+mkdir -p "$src/noicon"
+app "$src/noicon/Plain" PPSA00005 "No icon" 01.000.000
+rm "$src/noicon/Plain/sce_sys/icon0.png"
+(cd "$src/noicon" && zip -qr "$files/noicon.zip" Plain)
 # many files spread through the archive (a dump: no request per file),
 # and ZIP64 (over 65535 entries), both made with Python's zipfile
 python3 - "$src/one/Peek App" "$files/many.zip" "$files/zip64.zip" <<'PY'
@@ -126,6 +132,9 @@ app "$work/user-app/PPSA01234" PPSA01234 "Peek Test App" 01.001.000
 mv "$work/user-app/PPSA01234/sce_sys" "$work/user-app/PPSA01234/sce_sys.tmp" && mkdir -p "$work/user-app/PPSA01234/sce_sys" \
     && mv "$work/user-app/PPSA01234/sce_sys.tmp/param.json" "$work/user-app/PPSA01234/sce_sys/" && rm -rf "$work/user-app/PPSA01234/sce_sys.tmp" \
     "$work/user-app/PPSA01234/eboot.bin"
+echo "/data/homebrew/PPSA01234" > "$work/user-app/PPSA01234/mount.lnk"
+# what a failed ShadowMountPlus install leaves: sce_sys/param.json alone (not installed)
+mkdir -p "$work/leftover/PPSA01234/sce_sys" && cp "$work/user-app/PPSA01234/sce_sys/param.json" "$work/leftover/PPSA01234/sce_sys/"
 
 python3 "$here/serve.py" --port "$port" --root "$files" >"$work/server.log" 2>&1 &
 server=$!
@@ -162,6 +171,8 @@ small='j["fetched"] < 1048576'
 check "ZIP (deflate): the app, read from a few requests" "$(peek app.zip)" \
     "j['format']=='ZIP' and j['titleId']=='PPSA01234' and j['name']=='Peek Test App' and j['version']=='01.002.000' and j['titles']==1 and j['titleDir']=='Peek App' and not j['guessed'] and $small and j['requests']<=4"
 check "ZIP: installed 01.001.000 is seen" "$(peek app.zip)" "j['installed']=='01.001.000'"
+check "ZIP: a failed install's leftover isn't installed" \
+    "$("$drive" --url "http://127.0.0.1:$port/real/app.zip" --size "$(size app.zip)" --user-app "$work/leftover")" "j['installed'] is None"
 check "ZIP: nothing installed (another user-app folder)" \
     "$("$drive" --url "http://127.0.0.1:$port/real/app.zip" --size "$(size app.zip)" --user-app "$work/none")" "j['installed'] is None"
 check "ZIP with 3000 files spread over 48 MB: no request per file" "$(peek many.zip)" "j['titleId']=='PPSA01234' and j['entries']==3002 and j['requests']<=3"
@@ -173,6 +184,8 @@ check "7-Zip, solid: the app is found (param.json if it fits)" "$out" "j['format
 check "ZIP: a param.json without a titleId: the ID from the folder's name" "$(peek guess.zip)" "j['titleId']=='PPSA05555' and j['guessed']"
 check "ZIP with two apps" "$(peek two.zip)" "j['titles']==2"
 check "ZIP with an app inside an app" "$(peek nested.zip)" "j['titles']==1 and j['titleId']=='PPSA00003'"
+check "ZIP: the app's icon is there" "$(peek app.zip)" "j['icon'] is True"
+check "ZIP: an app without an icon" "$(peek noicon.zip)" "j['titles']==1 and j['icon'] is False"
 check "ZIP without an app" "$(peek plain.zip)" "j['titles']==0 and j['titleId'] is None and j['entries']==2"
 check "encrypted ZIP: refused" "$(peek encrypted.zip)" "j['refused'] and 'ncrypted' in j['refused']"
 check "tar.gz: read through, over the limit" "$(peek app.tar.gz --max-bytes 4194304)" "ERR:More than"

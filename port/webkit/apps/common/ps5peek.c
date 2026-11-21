@@ -145,6 +145,7 @@ char* ps5peek_json(const PS5PeekOptions* options, char* error, size_t errorSize)
     g_string_append_printf(json, ",\"entries\":%u,\"unpacked\":%llu,\"sizesKnown\":%s,\"titles\":%u,\"titleDir\":", info.entries,
         (unsigned long long)info.unpacked, info.sizes_known ? "true" : "false", info.titles);
     jsonString(json, info.has_title ? info.title_dir : NULL);
+    g_string_append_printf(json, ",\"icon\":%s", info.has_title && info.title_icon ? "true" : "false");
     g_string_append(json, ",\"titleId\":");
     jsonString(json, *title.title_id ? title.title_id : NULL);
     g_string_append(json, ",\"name\":");

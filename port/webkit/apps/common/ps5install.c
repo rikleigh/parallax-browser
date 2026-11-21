@@ -189,6 +189,22 @@ int ps5install_parse_param(const char* text, PS5TitleInfo* out)
     return 0;
 }
 
+/* /user/app/<ID> holds an installed app, not what an install that failed
+ * left: ShadowMountPlus, refused at the icon, leaves sce_sys/param.json
+ * alone there (2026-11-21). An installed one has its mount link (etaHEN's
+ * mount.lnk, ShadowMountPlus's mount_img.lnk) or its icon. */
+static bool userAppComplete(const char* user_app, const char* title_id)
+{
+    static const char* const signs[] = { "mount.lnk", "mount_img.lnk", "icon0.png", "sce_sys/icon0.png" };
+    for (unsigned i = 0; i < sizeof signs / sizeof *signs; i++) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/%s/%s", user_app, title_id, signs[i]);
+        if (isFile(path))
+            return true;
+    }
+    return false;
+}
+
 bool ps5install_installed(const char* user_app, const char* title_id, PS5TitleInfo* out)
 {
     if (!title_id || !validTitleID(title_id))
@@ -203,9 +219,12 @@ bool ps5install_installed(const char* user_app, const char* title_id, PS5TitleIn
     snprintf(paths[n++], sizeof paths[0], "%s/%s/sce_sys/param.json", user_app ? user_app : "/user/app", title_id);
     if (!user_app)
         snprintf(paths[n++], sizeof paths[0], "/system_data/priv/appmeta/%s/param.json", title_id);
+    const unsigned userApp = user_app ? 0 : 1; /* paths[userApp] is in /user/app */
     for (unsigned i = 0; i < n; i++) {
         if (!isFile(paths[i]))
             continue;
+        if (i == userApp && !userAppComplete(user_app ? user_app : "/user/app", title_id))
+            continue; /* a failed install's leftover */
         char* text = readSmall(paths[i]);
         PS5TitleInfo found;
         int r = text ? ps5install_parse_param(text, &found) : -2;

@@ -1097,6 +1097,13 @@ static int finishInspect(PS5ArchiveInfo* info, EntryList* list, char* error, siz
     for (unsigned i = 0; i < titleCount; i++)
         free(titleDirs[i]);
     free(titleDirs);
+    if (info->has_title) {
+        char icon[MAX_PATH_LENGTH + 32];
+        snprintf(icon, sizeof icon, "%s%ssce_sys/icon0.png", info->title_dir, *info->title_dir ? "/" : "");
+        Entry key = { .path = icon };
+        const Entry* found = bsearch(&key, sorted, list->count, sizeof *sorted, compareEntries);
+        info->title_icon = found && !found->directory;
+    }
     if (oneTop)
         snprintf(info->top_folder, sizeof info->top_folder, "%.*s/", (int)topLength, first);
 done:

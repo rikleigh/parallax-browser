@@ -3402,6 +3402,7 @@ static void askChoices(BUIChoices* out, Download* d, const MJ* peek)
     }
     addChoice(out, CD_BROWSE, BUI_TONE_PLAIN, FALSE, "Choose another folder…", "In Files: open the folder, then X on the top row");
     addChoice(out, CD_DONT, BUI_TONE_WARN, FALSE, "Don't download", NULL);
+    snprintf(out->circle, sizeof out->circle, "Cancel the download"); /* ps5wk_downloads_choices_back */
 }
 
 static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
@@ -3472,8 +3473,11 @@ static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
                     titles > 1 ? "It holds several apps: unpack it, then install each from Files" : peek ? NULL : "You're asked before an installed app is replaced");
         }
         addChoice(out, CD_EXTRACT, !done && !suggestInstall && !d->replaceVersion && peek ? BUI_TONE_ACTIVE : BUI_TONE_PLAIN, FALSE, "Unpack", into);
-        /* an image only of exactly one app (it wouldn't mount otherwise) */
-        if (id && titles == 1) {
+        /* an image only of exactly one app (it wouldn't mount otherwise),
+         * with an icon (ShadowMountPlus won't install it without) */
+        if (id && titles == 1 && !mj_bool(peek, "icon"))
+            addLine(out, BUI_TONE_WARN, "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
+        else if (id && titles == 1) {
             char detail[160];
             snprintf(detail, sizeof detail, "%s.exfat in the drive's homebrew folder, for ShadowMountPlus; checked once made", id);
             addChoice(out, CD_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", detail);
@@ -3503,6 +3507,19 @@ static void taskChoices(BUIChoices* out, Task* t)
     if (strcmp(t->kind, "delete"))
         addChoice(out, CT_SHOW, BUI_TONE_PLAIN, FALSE, "Show in Files", NULL);
     addChoice(out, CT_CLEAR, BUI_TONE_PLAIN, FALSE, "Clear it from the list", NULL);
+}
+
+int ps5wk_downloads_choices_back(void)
+{
+    Download* d = dlChosen.type == M_DOWNLOAD ? byID(dlChosen.id) : NULL;
+    if (!d || d->r.state != PS5WK_DL_ASKING)
+        return BUI_CHOSEN_CLOSE;
+    /* O on "where to save it": the download isn't wanted (as Don't download) */
+    spike_log("[dl] %u: cancelled from the dialog", d->r.id);
+    notice("Download cancelled: %s", d->r.file ? d->r.file : "the file");
+    removeEntry(d);
+    changed(TRUE);
+    return BUI_CHOSEN_MENU_CLOSE;
 }
 
 gboolean ps5wk_downloads_choices(BUIChoices* out)

@@ -72,6 +72,7 @@ typedef struct {
     int count;
     int focus; /* index */
     int armed; /* index pressed once (confirm), -1 none */
+    char circle[48]; /* what O does, for the footer ("": Back) */
 } BUIChoices;
 
 /* What a choice did (the dialog's owner tells browserui.c). */

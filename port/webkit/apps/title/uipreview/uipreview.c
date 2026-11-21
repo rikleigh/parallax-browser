@@ -535,6 +535,7 @@ int main(int argc, char** argv)
         d.choices[0].tone = BUI_TONE_ACTIVE;
         d.count = G_N_ELEMENTS(f);
         d.armed = -1;
+        snprintf(d.circle, sizeof d.circle, "Cancel the download");
         menuShot("menu-downloads-ask", &s);
     }
 

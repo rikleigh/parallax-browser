@@ -2204,6 +2204,10 @@ static void choicesButtons(guint32 pressed)
     }
     if (pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE) {
         choicesOpen = FALSE;
+        if (choicesSection == SEC_DOWNLOADS && ps5wk_downloads_choices_back() == BUI_CHOSEN_MENU_CLOSE) {
+            setMenu(FALSE); /* the waiting download was cancelled: back to the page */
+            return;
+        }
         redraw();
         return;
     }

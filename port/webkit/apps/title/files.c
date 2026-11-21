@@ -54,6 +54,7 @@ static struct {
     char* path;
     char* name;
     gboolean dir, app, archive, used;
+    gboolean icon; /* an app folder: sce_sys/icon0.png is there */
     gint64 size;
     /* an archive: what it holds (the service's "peek" on the drive) */
     unsigned peekID;
@@ -810,6 +811,7 @@ gboolean ps5wk_files_choices_open(unsigned index)
     if (ref.type == R_ENTRY) {
         chosen.dir = mj_bool(ref.item, "dir");
         chosen.app = mj_bool(ref.item, "app");
+        chosen.icon = mj_bool(ref.item, "icon");
         chosen.archive = mj_bool(ref.item, "archive");
         chosen.size = (gint64)mj_number(ref.item, "size", -1);
         if (chosen.archive)
@@ -907,8 +909,13 @@ gboolean ps5wk_files_choices(BUIChoices* out)
     }
     if (chosen.app) {
         addChoice(out, CH_INSTALL, BUI_TONE_ACTIVE, FALSE, "Install the app", "You're asked before an installed version is replaced");
-        addChoice(out, CH_IMAGE, BUI_TONE_PLAIN, FALSE, "Make an exFAT image",
-            "<ID>.exfat in the drive's homebrew folder, for ShadowMountPlus; checked once made");
+        if (chosen.icon)
+            addChoice(out, CH_IMAGE, BUI_TONE_PLAIN, FALSE, "Make an exFAT image",
+                "<ID>.exfat in the drive's homebrew folder, for ShadowMountPlus; checked once made");
+        else if (out->lineCount < 3) {
+            out->lineTones[out->lineCount] = BUI_TONE_WARN;
+            snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
+        }
         addChoice(out, CH_OPEN, BUI_TONE_PLAIN, FALSE, "Open the folder", NULL);
     } else if (chosen.dir) {
         addChoice(out, CH_OPEN, BUI_TONE_PLAIN, FALSE, "Open", NULL);
@@ -957,7 +964,12 @@ gboolean ps5wk_files_choices(BUIChoices* out)
                         "You're asked before an installed version is replaced");
                 addChoice(out, CH_EXTRACT, several ? BUI_TONE_ACTIVE : BUI_TONE_PLAIN, FALSE, "Unpack", detail);
             }
-            if (app) {
+            if (app && !mj_bool(p, "icon")) {
+                if (out->lineCount < 3) {
+                    out->lineTones[out->lineCount] = BUI_TONE_WARN;
+                    snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
+                }
+            } else if (app) {
                 char image[160];
                 snprintf(image, sizeof image, "%s.exfat in the drive's homebrew folder; checked once made", id);
                 addChoice(out, CH_EXTRACT_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", image);

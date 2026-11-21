@@ -565,6 +565,11 @@ static void onVerifyProgress(uint64_t done, uint64_t total, const char* current,
 
 static void autoImagePath(const char* source, const PS5TitleInfo* title, char* out, size_t size);
 
+/* ShadowMountPlus copies sce_sys/icon0.png when it installs an image's app,
+ * and gives up on an app without one (seen 2026-11-21: "Failed to copy
+ * staged icon", then "retry limit reached (2/2)" until it restarts). */
+#define NO_ICON "The app has no icon (sce_sys/icon0.png): ShadowMountPlus won't install an image of it"
+
 /* An image is made of exactly one app (a folder with sce_sys/param.json
  * and eboot.bin): anything else wouldn't mount as a game. FALSE with why
  * in error. */
@@ -597,6 +602,10 @@ static gboolean archiveOneApp(const char* archive, char* error, size_t size)
     char why[256];
     if (ps5archive_inspect(archive, NULL, &info, why, sizeof why))
         return TRUE; /* not listed: checked once unpacked */
+    if (info.titles == 1 && !info.title_icon) {
+        snprintf(error, size, "%s", NO_ICON);
+        return FALSE;
+    }
     if (info.titles == 1)
         return TRUE;
     if (!info.titles)
@@ -616,6 +625,13 @@ static gboolean buildImage(Job* job, const char* source, const PS5TitleInfo* tit
         autoImagePath(source, title, image, sizeof image);
     else
         snprintf(image, sizeof image, "%s", where);
+    char icon[1024];
+    struct stat st;
+    snprintf(icon, sizeof icon, "%s/sce_sys/icon0.png", source);
+    if (stat(icon, &st) || !S_ISREG(st.st_mode)) {
+        snprintf(error, size, "%s", NO_ICON);
+        return FALSE;
+    }
     PS5ExfatOptions o = { .label = title->title_id };
     if (ps5exfat_build(source, image, &o, onImageProgress, job, &job->cancel, error, size))
         return FALSE;
@@ -1096,8 +1112,12 @@ static char* listJSON(const char* path, char* error, size_t size)
         jsonString(out, name);
         g_string_append_printf(out, ",\"dir\":%s,\"size\":%lld,\"mtime\":%lld", dir ? "true" : "false", dir ? 0LL : (long long)st.st_size,
             (long long)st.st_mtime);
-        if (dir && isTitleFolder(full))
-            g_string_append(out, ",\"app\":true");
+        if (dir && isTitleFolder(full)) {
+            char* icon = g_build_filename(full, "sce_sys", "icon0.png", NULL);
+            struct stat is;
+            g_string_append_printf(out, ",\"app\":true,\"icon\":%s", !stat(icon, &is) && S_ISREG(is.st_mode) ? "true" : "false");
+            g_free(icon);
+        }
         if (!dir && ps5archive_is_archive(name))
             g_string_append(out, ",\"archive\":true");
         if (!dir && g_str_has_suffix(name, ".ps5dl"))

@@ -659,7 +659,7 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         const gboolean armed = d->focus >= 0 && d->focus == d->armed;
         if (d->count)
             x += hint(c, x, cy, "✕", armed ? "Press again to do it" : "Choose") + 32;
-        x += hint(c, x, cy, "○", "Back") + 32;
+        x += hint(c, x, cy, "○", d->circle[0] ? d->circle : "Back") + 32;
         hint(c, x, cy, "Options", "Close the menu");
         return;
     }
