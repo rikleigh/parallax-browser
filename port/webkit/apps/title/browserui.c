@@ -1755,8 +1755,13 @@ static void rowActivate(int row, gboolean newTab)
         if (newTab || (cross && !strcmp(cross, "Details"))) {
             detailsOpen = TRUE;
             detailsIndex = row;
-        } else
+        } else {
+            /* a finished or waiting row opens the download manager's page:
+             * the menu closes so it shows (it stayed over the page) */
+            if (cross && (!strcmp(cross, "Manage") || !strcmp(cross, "Choose folder")) && menuOpen)
+                setMenu(FALSE);
             ps5wk_downloads_primary((unsigned)row);
+        }
         redraw();
         return;
     }
