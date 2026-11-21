@@ -12,8 +12,14 @@
  * files are refused before anything is written, the bytes are counted and
  * checked against the free space on dest's drive), then copied into
  * <dest>.part, which is renamed to dest once complete; a move then
- * deletes src. Files and folders are made 0777 (the console won't start
- * an app with less). dest inside src, or src itself, is refused.
+ * deletes src, but only if everything in src is in the copy (the same
+ * kinds and sizes: something written into src meanwhile keeps it), and
+ * after an fsync of each copied file. Files and folders are made 0777 (the
+ * console won't start an app with less). dest inside src (by identity, so
+ * another spelling on a drive that ignores case too), src itself, and a
+ * folder of another drive inside src are refused. Only a .part this call
+ * made is ever deleted, and a dest that appears during the copy is left
+ * alone (the copy fails).
  */
 #ifndef PS5FILES_H
 #define PS5FILES_H

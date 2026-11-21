@@ -35,7 +35,7 @@
  *              without replace=1: jobend says installed=<version>)
  *     jobstop  id
  *     rm       path                    (a file or .part, and its .part.ps5dl)
- *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials path [to] [name]
+ *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials|partial path [to] [name]
  *              [dirs] (partials: the downloads with a .part.ps5dl in the
  *              folders in dirs, one per line)
  *     peek     id (url size [ua] [ref] [cookies] | path)
@@ -417,7 +417,7 @@ static void startFetch(GHashTable* p)
     const char* dir = param(p, "dir");
     const char* given = param(p, "name");
     const char* fresh = param(p, "fresh");
-    if (!id || !url || !dir || !writableFolder(dir) || !validName(given)) {
+    if (!id || !url || !dir || !writableFolder(dir) || !validName(given) || g_str_has_suffix(given, ".part") || g_str_has_suffix(given, ".ps5dl")) {
         refuseFetch(id, "The download service refused the address or the folder");
         return;
     }
@@ -684,6 +684,7 @@ static gpointer jobThread(gpointer data)
     g_mutex_unlock(&jobLock);
 
     char error[512] = "";
+    char note[512] = ""; /* done, but something to say ("the original was kept") */
     char out[1024] = "";
     PS5TitleInfo title;
     gboolean haveTitle = FALSE;
@@ -785,8 +786,10 @@ static gpointer jobThread(gpointer data)
     } else if (!strcmp(job->kind, "move")) {
         int r = ps5files_transfer(job->src, job->dest, TRUE, 0, onTransferProgress, job, &job->cancel, error, sizeof error);
         ok = !r;
-        if (ok)
+        if (ok) {
             snprintf(out, sizeof out, "%s", job->dest);
+            snprintf(note, sizeof note, "%s", error); /* "Copied, but ..." */
+        }
     } else if (!strcmp(job->kind, "copy")) {
         int r = ps5files_transfer(job->src, job->dest, FALSE, 0, onTransferProgress, job, &job->cancel, error, sizeof error);
         ok = !r;
@@ -794,7 +797,9 @@ static gpointer jobThread(gpointer data)
             snprintf(out, sizeof out, "%s", job->dest);
     } else
         snprintf(error, sizeof error, "No such job: %s", job->kind);
-    jobEnd(job, ok, ok ? NULL : (*error ? error : "Failed"), *out ? out : NULL, haveTitle ? &title : NULL);
+    if (!ok && job->cancel && !*error)
+        snprintf(error, sizeof error, "Cancelled");
+    jobEnd(job, ok, ok ? (*note ? note : NULL) : (*error ? error : "Failed"), *out ? out : NULL, haveTitle ? &title : NULL);
 
     g_mutex_lock(&jobLock);
     jobsRunning--;
@@ -809,6 +814,47 @@ static gpointer jobThread(gpointer data)
     g_free(job->image);
     g_free(job);
     return NULL;
+}
+
+/* Whether a and b are the same path or one is inside the other. */
+static gboolean overlaps(const char* a, const char* b)
+{
+    if (!a || !b)
+        return FALSE;
+    size_t la = strlen(a), lb = strlen(b);
+    size_t n = la < lb ? la : lb;
+    return !strncmp(a, b, n) && (la == lb || (la < lb ? b[la] == '/' : a[lb] == '/'));
+}
+
+/* A running job or download using src or dest (moved, copied, deleted,
+ * unpacked or written to): a second job on the same files would race it.
+ * jobLock held. */
+static const char* busyWith(const char* src, const char* dest)
+{
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, jobs);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        const Job* other = value;
+        const char* theirs[] = { other->src, other->dest && strcmp(other->dest, "auto") ? other->dest : NULL };
+        for (unsigned i = 0; i < G_N_ELEMENTS(theirs); i++)
+            if (overlaps(theirs[i], src) || (dest && overlaps(theirs[i], dest)))
+                return "Another job is using it: wait for that one";
+    }
+    const char* why = NULL;
+    g_mutex_lock(&fetchLock);
+    g_hash_table_iter_init(&iter, fetches);
+    while (!why && g_hash_table_iter_next(&iter, &key, &value)) {
+        const Fetch* f = value;
+        if (f->ended || !f->path)
+            continue;
+        char* part = g_strconcat(f->path, ".part", NULL);
+        if (overlaps(f->path, src) || overlaps(part, src) || (dest && (overlaps(f->path, dest) || overlaps(part, dest))))
+            why = "A download is writing there";
+        g_free(part);
+    }
+    g_mutex_unlock(&fetchLock);
+    return why;
 }
 
 static void startJob(GHashTable* p)
@@ -833,6 +879,8 @@ static void startJob(GHashTable* p)
     g_mutex_lock(&jobLock);
     if (!refused && g_hash_table_contains(jobs, id))
         refused = "A job is already running for it";
+    if (!refused)
+        refused = busyWith(src, dest && strcmp(dest, "auto") ? dest : NULL);
     Job* job = NULL;
     if (!refused) {
         job = g_new0(Job, 1);
@@ -1057,6 +1105,43 @@ static gboolean validName(const char* name)
     return TRUE;
 }
 
+/* One unfinished download at file (its .part and .part.ps5dl beside it,
+ * file itself not there) as JSON into out: TRUE if it is one. A real
+ * download's: a regular .part and a small regular state file (a page
+ * can't plant one: downloads named *.part or *.ps5dl are refused). */
+static gboolean partialJSON(const char* file, GString* out)
+{
+    char* dir = g_path_get_dirname(file);
+    char* base = g_path_get_basename(file);
+    char* partFile = g_strconcat(file, ".part", NULL);
+    char* stateFile = g_strconcat(file, ".part.ps5dl", NULL);
+    struct stat ps, ss;
+    gboolean real = allowedPath(file) && validName(base) && !exists(file) && !lstat(partFile, &ps) && S_ISREG(ps.st_mode)
+        && !lstat(stateFile, &ss) && S_ISREG(ss.st_mode) && ss.st_size < 64 * 1024;
+    uint64_t received = 0;
+    int64_t total = -1;
+    char* url = NULL;
+    if (real && ps5fetch_saved(file, &received, &total) && (url = ps5fetch_saved_url(file))) {
+        g_string_append(out, "{\"path\":");
+        jsonString(out, file);
+        g_string_append(out, ",\"dir\":");
+        jsonString(out, dir);
+        g_string_append(out, ",\"name\":");
+        jsonString(out, base);
+        g_string_append(out, ",\"url\":");
+        jsonString(out, url);
+        g_string_append_printf(out, ",\"received\":%llu,\"total\":%lld,\"mtime\":%lld}", (unsigned long long)received, (long long)total,
+            (long long)ss.st_mtime);
+    } else
+        real = FALSE;
+    free(url);
+    g_free(partFile);
+    g_free(stateFile);
+    g_free(dir);
+    g_free(base);
+    return real;
+}
+
 /* The unfinished downloads in dirs (one folder a line): each
  * <name>.part.ps5dl whose <name> isn't there, with what it saved and the
  * address it came from, so the title can offer to continue those its list
@@ -1085,27 +1170,13 @@ static char* partialsJSON(const char* dirs)
                 continue;
             char* base = g_strndup(name, length - (sizeof tail - 1));
             char* file = g_build_filename(dir, base, NULL);
-            uint64_t received = 0;
-            int64_t total = -1;
-            char* url = NULL;
-            if (validName(base) && !exists(file) && ps5fetch_saved(file, &received, &total) && (url = ps5fetch_saved_url(file))) {
-                struct stat st;
-                char* state = g_strconcat(file, ".part.ps5dl", NULL);
-                long long mtime = !stat(state, &st) ? (long long)st.st_mtime : 0;
-                g_free(state);
-                g_string_append(out, first ? "{\"path\":" : ",{\"path\":");
+            GString* one = g_string_new(NULL);
+            if (partialJSON(file, one)) {
+                g_string_append(out, first ? "" : ",");
+                g_string_append(out, one->str);
                 first = FALSE;
-                jsonString(out, file);
-                g_string_append(out, ",\"dir\":");
-                jsonString(out, dir);
-                g_string_append(out, ",\"name\":");
-                jsonString(out, base);
-                g_string_append(out, ",\"url\":");
-                jsonString(out, url);
-                g_string_append_printf(out, ",\"received\":%llu,\"total\":%lld,\"mtime\":%lld}", (unsigned long long)received,
-                    (long long)total, mtime);
             }
-            free(url);
+            g_string_free(one, TRUE);
             g_free(file);
             g_free(base);
         }
@@ -1129,6 +1200,17 @@ static void request(GHashTable* p)
         json = rootsJSON();
     else if (!strcmp(op, "partials"))
         json = partialsJSON(param(p, "dirs"));
+    else if (!strcmp(op, "partial")) {
+        /* one, to continue it: what the title adopts comes from here, not
+         * from the page */
+        GString* one = g_string_new(NULL);
+        if (path && partialJSON(path, one))
+            json = g_string_free(one, FALSE);
+        else {
+            g_string_free(one, TRUE);
+            snprintf(error, sizeof error, "That isn't an unfinished download (any more)");
+        }
+    }
     else if (!allowedPath(path))
         snprintf(error, sizeof error, "That place isn't one the browser can use");
     else if (!strcmp(op, "ls"))

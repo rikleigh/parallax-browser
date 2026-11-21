@@ -82,6 +82,47 @@ static const char* value(GHashTable* params, const char* key)
     return v && *v ? v : NULL;
 }
 
+/* The string value of "key" in the service's JSON (its own escaping: \"
+ * \\ and \u00XX), or NULL. */
+static char* jsonStringField(const char* json, const char* key)
+{
+    char* quoted = g_strdup_printf("\"%s\":\"", key);
+    const char* p = json ? strstr(json, quoted) : NULL;
+    g_free(quoted);
+    if (!p)
+        return NULL;
+    p = strchr(p, ':') + 2;
+    GString* out = g_string_new(NULL);
+    for (; *p && *p != '"'; p++) {
+        if (*p == '\\' && p[1] == 'u' && g_ascii_isxdigit(p[2]) && g_ascii_isxdigit(p[3]) && g_ascii_isxdigit(p[4]) && g_ascii_isxdigit(p[5])) {
+            g_string_append_c(out, (char)(g_ascii_xdigit_value(p[4]) * 16 + g_ascii_xdigit_value(p[5])));
+            p += 5;
+        } else if (*p == '\\' && p[1]) {
+            g_string_append_c(out, *++p);
+        } else
+            g_string_append_c(out, *p);
+    }
+    if (*p != '"') {
+        g_string_free(out, TRUE);
+        return NULL;
+    }
+    return g_string_free(out, FALSE);
+}
+
+/* The number after "key": in the service's JSON, as text, or NULL. */
+static char* jsonNumberField(const char* json, const char* key)
+{
+    char* quoted = g_strdup_printf("\"%s\":", key);
+    const char* p = json ? strstr(json, quoted) : NULL;
+    size_t skip = strlen(quoted);
+    g_free(quoted);
+    if (!p)
+        return NULL;
+    p += skip;
+    size_t n = strspn(p, "-0123456789");
+    return n ? g_strndup(p, n) : NULL;
+}
+
 static char* serviceReply(char* json, char* error)
 {
     char* reply;
@@ -137,6 +178,37 @@ gboolean ps5wk_dlm_serve(const char* method, const char* path, const char* query
             g_hash_table_replace(params, g_strdup("do"), g_strdup("task"));
             g_hash_table_replace(params, g_strdup("kind"), g_strdup("delete"));
             action = value(params, "do");
+        }
+        if (action && !strcmp(action, "adopt")) {
+            /* the address and sizes come from the service's own look at the
+             * .part.ps5dl, not from the page */
+            char* error = NULL;
+            char* json = ps5wk_dlservice_request(8000, &error, "partial", "path", value(params, "path"), NULL);
+            char* url = jsonStringField(json, "url");
+            char* total = jsonNumberField(json, "total");
+            char* received = jsonNumberField(json, "received");
+            if (!json || !url) {
+                *status = 409;
+                *reply = replyJSON(FALSE, error ? error : "That isn't an unfinished download");
+                g_free(json);
+                g_free(error);
+                g_free(url);
+                g_free(total);
+                g_free(received);
+                g_hash_table_unref(params);
+                return TRUE;
+            }
+            g_hash_table_replace(params, g_strdup("url"), url);
+            g_hash_table_replace(params, g_strdup("total"), total ? total : g_strdup("-1"));
+            g_hash_table_replace(params, g_strdup("received"), received ? received : g_strdup("0"));
+            g_free(json);
+            g_free(error);
+        }
+        if (action && !strcmp(action, "rename") && ps5wk_downloads_in_use(value(params, "path"))) {
+            *status = 409;
+            *reply = replyJSON(FALSE, "A download or a job is using it");
+            g_hash_table_unref(params);
+            return TRUE;
         }
         if (action && (!strcmp(action, "mkdir") || !strcmp(action, "rename"))) {
             char* error = NULL;
@@ -291,12 +363,12 @@ const char ps5wk_dlm_page_html[] =
     "/* unfinished downloads the list lost (a .part.ps5dl in a download folder) */\n"
     "function partialsLost(){if(!partials||!S)return[];var mine={};(S.downloads||[]).forEach(function(d){if(d.file)mine[d.dir+'/'+d.file]=1});return partials.filter(function(x){return !mine[x.path]})}\n"
     "function loadPartials(){partialsAt=Date.now();getj('/dlm/fs?op=partials').then(function(j){partials=j.ok?j.result:[];render()}).catch(function(){})}\n"
-    "function partialCard(x){var k='pt'+x.path.length+'-'+x.name.length,host='';try{host=new URL(x.url).host}catch(e){}\n"
+    "function partialCard(x,i){var k='pt'+i+'-'+x.name.length,host='';try{host=new URL(x.url).host}catch(e){}\n"
     "  var pc=x.total>0?Math.min(100,x.received*100/x.total):-1;\n"
     "  var h='<div class=\"card\"><div class=\"row\"><div class=\"grow\"><div class=\"name\">'+esc(x.name)+'</div><div class=\"sub\">'+esc(short(x.dir))+(host?' \\u00b7 '+esc(host):'')+'</div></div><div class=\"state\">'+(pc>=0?Math.floor(pc)+'%':'')+'</div></div>';\n"
     "  if(pc>=0)h+='<div class=\"bar\"><div style=\"width:'+pc.toFixed(1)+'%\"></div></div>';\n"
     "  h+='<div class=\"sub\">'+size(x.received)+(x.total>0?' of '+size(x.total):'')+(x.mtime?' \\u00b7 last saved '+new Date(x.mtime*1000).toLocaleString():'')+'</div>';\n"
-    "  return h+buttons([btn(k+'-go','Continue',function(){post({do:'adopt',path:x.path,url:x.url,total:x.total,received:x.received}).then(loadPartials)},'primary'),\n"
+    "  return h+buttons([btn(k+'-go','Continue',function(){post({do:'adopt',path:x.path}).then(loadPartials)},'primary'),\n"
     "    btn(k+'-del','Delete',confirmFirst(k+'-del',function(){post({do:'partial-delete',path:x.path}).then(function(){setTimeout(loadPartials,500)})}))])+'</div>'}\n"
     "function dlCard(d){var pc=d.size>0?Math.min(100,d.received*100/d.size):-1,st='',cls='',detail='',b=[],k='d'+d.id;\n"
     "  if(d.state=='running'){if(d.retryIn>0){st='Retrying in '+Math.round(d.retryIn)+' s';cls='warn';detail=d.error||''}else if(d.connecting){st='Connecting\\u2026'}else{st=pc>=0?Math.floor(pc)+'%':'';\n"
@@ -325,7 +397,7 @@ const char ps5wk_dlm_page_html[] =
     "  return h+'<div class=\"sub '+(cls=='warn'?'warn':'')+'\">'+esc(detail)+'</div>'+buttons(b)+'</div>'}\n"
     "function taskCard(t){var k=t.id,base=t.src.split('/').pop(),st='',cls='',detail='',b=[];var what={extract:t.then=='install'?'Unpack & install':t.then=='image'?'Unpack & make image':'Unpack',install:'Install',image:'Make exFAT image','delete':'Delete',move:'Move',copy:'Copy'}[t.kind];\n"
     "  if(t.state==1){var p=t.total>0?Math.min(100,t.done*100/t.total):-1;st=(p>=0?Math.floor(p)+'%':'Working\\u2026');detail=what;if(t.kind!='delete')b.push(btn(k+'-stop','Stop',function(){post({do:'taskstop',id:t.id})}))}\n"
-    "  else{st=t.state==2?'Done':t.replaceVersion?'Installed already':'Failed';cls=t.state==2?'ok':'warn';detail=t.state==2?(t.titleName?'\\u201c'+t.titleName+'\\u201d is on the home screen':t.kind=='delete'?'Deleted':t.kind=='move'?'Moved to '+short(t.out||''):t.kind=='copy'?'Copied to '+short(t.out||''):'Made '+short(t.out||'')):(t.error||'');\n"
+    "  else{st=t.state==2?'Done':t.replaceVersion?'Installed already':'Failed';cls=t.state==2?'ok':'warn';detail=t.state==2?(t.titleName?'\\u201c'+t.titleName+'\\u201d is on the home screen':t.kind=='delete'?'Deleted':t.kind=='move'?'Moved to '+short(t.out||''):t.kind=='copy'?'Copied to '+short(t.out||''):'Made '+short(t.out||''))+(t.error?' \\u00b7 '+t.error:''):(t.error||'');\n"
     "    if(t.replaceVersion)b.push(btn(k+'-replace','Replace '+(t.replaceVersion=='?'?'the installed app':'version '+t.replaceVersion),confirmFirst(k+'-replace',function(){post({do:'task',kind:t.kind=='install'?'install':'extract-install',path:t.src,replace:1})}),'primary'));\n"
     "    b.push(btn(k+'-rm','Clear',function(){post({do:'taskremove',id:t.id})}))}\n"
     "  var h='<div class=\"card\"><div class=\"row\"><div class=\"grow\"><div class=\"name\">'+esc(what+': '+base)+'</div><div class=\"sub\">'+esc(short(t.src))+'</div></div><div class=\"state '+cls+'\">'+esc(st)+'</div></div>';\n"

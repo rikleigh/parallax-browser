@@ -109,5 +109,24 @@ check "a FIFO inside: refused" "REFUSED Special files aren't moved or copied: pi
 mkdir -p "$other/busy.part"
 check "a .part of that name there: refused" "REFUSED There is already something called busy.part there" copy "$src/App" "$other/busy"
 
+# races (the review of a0226d3): what appears once the checks are done
+tree "$work/race-src"
+cp -R "$work/race-src" "$work/race-ref"
+check "another's .part appears first: refused, theirs kept" "FAILED*" copy "$work/race-src" "$other/race" --margin 1048576 \
+    --create-at-start "$other/race.part/" && { [ -d "$other/race.part" ] && [ ! -e "$other/race" ] && pass "  their .part untouched" \
+    || failed "  their .part was deleted"; }
+rmdir "$other/race.part"
+check "dest appears during the copy: not replaced" "REFUSED Something called race appeared there meanwhile" copy "$work/race-src" "$other/race" \
+    --margin 1048576 --create-at-start "$other/race" && { [ "$(cat "$other/race")" = planted ] && [ ! -e "$other/race.part" ] \
+    && pass "  theirs kept, ours cleaned up" || failed "  dest replaced or .part left"; }
+rm -f "$other/race"
+check "a file written into a moved folder meanwhile: the original kept" "OK Copied, but the original changed meanwhile: it was kept" \
+    move "$work/race-src" "$other/race" --margin 1048576 --create-at-end "$work/race-src/late.txt" \
+    && { [ -f "$work/race-src/late.txt" ] && [ -d "$other/race" ] && pass "  nothing lost: the source and its new file are still there" \
+    || failed "  source deleted"; }
+rm -rf "$other/race"
+mkdir -p "$work/CaseApp/inner"
+check "into itself by another spelling (a drive that ignores case)" "REFUSED It can't go into itself" copy "$work/CaseApp" "$work/caseapp/inner/x"
+
 echo "files-test: $passes passed, $fails failed"
 [ "$fails" = 0 ]

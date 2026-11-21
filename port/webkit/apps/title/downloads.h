@@ -61,6 +61,9 @@ char* ps5wk_downloads_manager_json(void);
 /* Any thread: the folders an unfinished download may be in (one a line),
  * for the service's "partials". */
 char* ps5wk_downloads_scan_dirs(void);
+/* Any thread: whether a download, a job or a task uses path (or path is a
+ * folder holding what one uses): Files leaves it alone then. */
+gboolean ps5wk_downloads_in_use(const char* path);
 const char* ps5wk_downloads_manage(GHashTable* params);
 
 /* Settings: the folder, its free space, the finished ones. */

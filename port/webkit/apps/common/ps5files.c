@@ -24,6 +24,9 @@
 typedef struct {
     uint64_t done, total;
     unsigned entries;
+    dev_t device;      /* src's drive: a folder on another one inside it is refused */
+    int sync;          /* fsync each file (a move: the source goes after) */
+    int madeTop;       /* this call made <dest>.part: only then is it ours to delete */
     ps5files_progress_fn progress;
     void* data;
     volatile int* cancel;
@@ -94,8 +97,16 @@ int ps5files_remove_tree(const char* path)
 static int measure(Copy* c, const char* path)
 {
     struct stat st;
+    if (c->cancel && *c->cancel)
+        return -3;
     if (lstat(path, &st)) {
         fail(c->error, c->errorSize, "Couldn't read %s (errno %d)", baseName(path), errno);
+        return -1;
+    }
+    if (!c->entries)
+        c->device = st.st_dev;
+    else if (st.st_dev != c->device) {
+        fail(c->error, c->errorSize, "%s is another drive", baseName(path));
         return -1;
     }
     if (++c->entries > MAX_ENTRIES) {
@@ -146,7 +157,7 @@ static void report(Copy* c, const char* current, int force)
     c->progress(c->done, c->total, current, c->data);
 }
 
-static int copyFile(Copy* c, const char* from, const char* to)
+static int copyFile(Copy* c, const char* from, const char* to, int top)
 {
     int in = open(from, O_RDONLY | O_NOFOLLOW);
     if (in < 0) {
@@ -159,6 +170,8 @@ static int copyFile(Copy* c, const char* from, const char* to)
         close(in);
         return -2;
     }
+    if (top)
+        c->madeTop = 1;
     fchmod(out, 0777);
     int r = 0;
     for (;;) {
@@ -193,6 +206,10 @@ static int copyFile(Copy* c, const char* from, const char* to)
         report(c, baseName(from), 0);
     }
     close(in);
+    if (!r && c->sync && fsync(out)) {
+        fail(c->error, c->errorSize, "Couldn't write %s (errno %d)", baseName(to), errno);
+        r = -2;
+    }
     if (close(out) && !r) {
         fail(c->error, c->errorSize, "Couldn't write %s (errno %d)", baseName(to), errno);
         r = -2;
@@ -202,7 +219,7 @@ static int copyFile(Copy* c, const char* from, const char* to)
     return r;
 }
 
-static int copyTree(Copy* c, const char* from, const char* to)
+static int copyTree(Copy* c, const char* from, const char* to, int top)
 {
     struct stat st;
     if (lstat(from, &st)) {
@@ -210,7 +227,7 @@ static int copyTree(Copy* c, const char* from, const char* to)
         return -2;
     }
     if (S_ISREG(st.st_mode))
-        return copyFile(c, from, to);
+        return copyFile(c, from, to, top);
     if (!S_ISDIR(st.st_mode)) {
         /* it changed since it was listed */
         fail(c->error, c->errorSize, "%s changed while it was copied", baseName(from));
@@ -220,6 +237,8 @@ static int copyTree(Copy* c, const char* from, const char* to)
         fail(c->error, c->errorSize, "Couldn't make the folder %s (errno %d)", baseName(to), errno);
         return -2;
     }
+    if (top)
+        c->madeTop = 1;
     chmod(to, 0777);
     DIR* folder = opendir(from);
     if (!folder) {
@@ -236,10 +255,56 @@ static int copyTree(Copy* c, const char* from, const char* to)
             fail(c->error, c->errorSize, "A path is too long: %s", entry->d_name);
             r = -2;
         } else
-            r = copyTree(c, a, b);
+            r = copyTree(c, a, b, 0);
     }
     closedir(folder);
     return r;
+}
+
+/* Whether everything in src is in copy, the same kind and size (a move
+ * deletes src only then: something written into it during the copy stays). */
+static int sameTree(const char* src, const char* copy)
+{
+    struct stat a, b;
+    if (lstat(src, &a) || lstat(copy, &b))
+        return 0;
+    if (S_ISREG(a.st_mode))
+        return S_ISREG(b.st_mode) && a.st_size == b.st_size;
+    if (!S_ISDIR(a.st_mode) || !S_ISDIR(b.st_mode))
+        return 0;
+    DIR* folder = opendir(src);
+    if (!folder)
+        return 0;
+    int same = 1;
+    struct dirent* entry;
+    while (same && (entry = readdir(folder))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        char x[PATH_BYTES], y[PATH_BYTES];
+        same = !join(x, src, entry->d_name) && !join(y, copy, entry->d_name) && sameTree(x, y);
+    }
+    closedir(folder);
+    return same;
+}
+
+/* Whether dest's folder is src or inside it, by identity (another spelling
+ * of the name on a drive that ignores case is the same folder). */
+static int insideItself(const char* src, const char* dest)
+{
+    struct stat s;
+    if (stat(src, &s) || !S_ISDIR(s.st_mode))
+        return 0;
+    char path[PATH_BYTES];
+    snprintf(path, sizeof path, "%s", dest);
+    for (;;) {
+        char* slash = strrchr(path, '/');
+        if (!slash || slash == path)
+            return 0;
+        *slash = 0;
+        struct stat p;
+        if (!stat(path, &p) && p.st_dev == s.st_dev && p.st_ino == s.st_ino)
+            return 1;
+    }
 }
 
 /* Trailing slashes off, into out. */
@@ -273,6 +338,10 @@ int ps5files_transfer(const char* srcPath, const char* destPath, bool move, uint
         fail(error, errorSize, "%s isn't there", baseName(src));
         return -1;
     }
+    if (insideItself(src, dest)) {
+        fail(error, errorSize, "It can't go into itself");
+        return -1;
+    }
     if (!lstat(dest, &st)) {
         fail(error, errorSize, "There is already something called %s there", baseName(dest));
         return -1;
@@ -292,12 +361,18 @@ int ps5files_transfer(const char* srcPath, const char* destPath, bool move, uint
     }
 
     Copy c = { 0 };
+    c.sync = move;
     c.progress = progress;
     c.data = data;
     c.cancel = cancel;
     c.error = error;
     c.errorSize = errorSize;
-    if (measure(&c, src))
+    int measured = measure(&c, src);
+    if (measured == -3) {
+        fail(error, errorSize, "Cancelled");
+        return -3;
+    }
+    if (measured)
         return -1;
     char folder[PATH_BYTES];
     snprintf(folder, sizeof folder, "%s", dest);
@@ -319,18 +394,31 @@ int ps5files_transfer(const char* srcPath, const char* destPath, bool move, uint
         return -2;
     }
     report(&c, "", 1);
-    int r = copyTree(&c, src, part);
+    int r = copyTree(&c, src, part, 1);
     free(c.buffer);
+    if (r == -3)
+        fail(error, errorSize, "Cancelled");
+    /* something called dest that appeared meanwhile isn't replaced */
+    if (!r && !lstat(dest, &st)) {
+        fail(error, errorSize, "Something called %s appeared there meanwhile", baseName(dest));
+        r = -1;
+    }
     if (!r && rename(part, dest)) {
         fail(error, errorSize, "Couldn't finish %s (errno %d)", baseName(dest), errno);
         r = -2;
     }
     if (r) {
-        ps5files_remove_tree(part);
+        /* only a .part this call made (another's of the same name stays) */
+        if (c.madeTop)
+            ps5files_remove_tree(part);
         return r;
     }
     report(&c, "", 1);
-    if (move && ps5files_remove_tree(src))
-        fail(error, errorSize, "Copied, but the original couldn't all be deleted");
+    if (move) {
+        if (!sameTree(src, dest))
+            fail(error, errorSize, "Copied, but the original changed meanwhile: it was kept");
+        else if (ps5files_remove_tree(src))
+            fail(error, errorSize, "Copied, but the original couldn't all be deleted");
+    }
     return 0;
 }
