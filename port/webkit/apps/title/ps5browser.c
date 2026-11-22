@@ -1661,7 +1661,9 @@ static gboolean clearDataOnMain(gpointer data)
     if (!networkSession || windDownStart)
         return G_SOURCE_REMOVE;
     static const WebKitWebsiteDataTypes types[] = { WEBKIT_WEBSITE_DATA_COOKIES, WEBKIT_WEBSITE_DATA_ALL,
-        WEBKIT_WEBSITE_DATA_DISK_CACHE | WEBKIT_WEBSITE_DATA_MEMORY_CACHE };
+        /* the cache: the HTTP caches and what sites' service workers keep
+         * (CacheStorage, under the same folder Settings counts as the cache) */
+        WEBKIT_WEBSITE_DATA_DISK_CACHE | WEBKIT_WEBSITE_DATA_MEMORY_CACHE | WEBKIT_WEBSITE_DATA_DOM_CACHE };
     static const char* const names[] = { "Cookies", "All website data", "The webpage cache" };
     /* Timespan 0: everything, however old. */
     webkit_website_data_manager_clear(webkit_network_session_get_website_data_manager(networkSession),
