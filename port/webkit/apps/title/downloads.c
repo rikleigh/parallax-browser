@@ -98,6 +98,14 @@ typedef struct {
     /* the last install was refused: this version of the app is installed
      * ("?": not known); the page offers to replace it */
     char* replaceVersion;
+    /* the last job needed the archive's password: "needed", or "wrong" for
+     * the one given; what that job asked for, to send it again with one */
+    char* passwordAsk;
+    char* askKind;
+    char* askThen;
+    char* askDest;
+    gboolean askReplace;
+    gboolean askPhone; /* the phone page asked: it asks for the password there */
 } Download;
 
 static WPEDisplayPS5* display;
@@ -134,6 +142,11 @@ typedef struct {
     char* titleName;
     char* replaceVersion; /* as Download's */
     char* dest;           /* move, copy: where it goes */
+    char* passwordAsk;    /* as Download's, and what it asked for */
+    char* askKind;
+    char* askThen;
+    gboolean askReplace;
+    gboolean askPhone;
 } Task;
 static GPtrArray* tasks; /* Task*, newest first */
 static unsigned nextTask = 1;
@@ -146,6 +159,13 @@ static void serviceStart(Download* d, gboolean fresh);
 static void startAfter(Download* d);
 static void onServiceEvent(const char* verb, GHashTable* params, gpointer user);
 static void withCookies(Download* d, gboolean peek, gboolean fresh);
+static const char* startJob(Download* d, const char* kindAsked, const char* thenAsked, const char* destination, gboolean replace,
+    const char* password);
+static const char* startTask(const char* kindAsked, const char* thenAsked, const char* src, const char* destFolder, gboolean replace,
+    const char* password);
+static gboolean askPassword(gboolean task, unsigned id, const char* file, gboolean wrong);
+static gboolean managing; /* in ps5wk_downloads_manage: the phone page asked */
+static const char* askAction(const char* kind, const char* then);
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -162,6 +182,10 @@ static void downloadFree(gpointer data)
     g_free(d->peek);
     g_free(d->peekError);
     g_free(d->replaceVersion);
+    g_free(d->passwordAsk);
+    g_free(d->askKind);
+    g_free(d->askThen);
+    g_free(d->askDest);
     if (d->session)
         g_object_unref(d->session);
     ps5wk_download_record_clear(&d->r);
@@ -331,7 +355,19 @@ static Download* at(int index)
  * its dialog (ps5wk_downloads_take_recent). */
 #define RECENT_S 8
 static unsigned recentID;
+/* ... or what was just unpacked (ps5wk_downloads_take_recent_folder):
+ * Files at recentFolder, recentName focused, its dialog open if recentChoices */
+static char* recentFolder;
+static char* recentName;
+static gboolean recentChoices;
 static gint64 recentUntil; /* monotonic us */
+
+static void forgetRecent(void)
+{
+    recentID = 0;
+    g_clear_pointer(&recentFolder, g_free);
+    g_clear_pointer(&recentName, g_free);
+}
 
 static void notice(const char* format, ...) G_GNUC_PRINTF(1, 2);
 static void notice(const char* format, ...)
@@ -340,7 +376,7 @@ static void notice(const char* format, ...)
     va_start(args, format);
     char* text = g_strdup_vprintf(format, args);
     va_end(args);
-    recentID = 0; /* "Options: open it" is no longer what the notice says */
+    forgetRecent(); /* "Options: open it" is no longer what the notice says */
     if (display)
         wpe_display_ps5_show_message(display, text, 3);
     g_free(text);
@@ -354,6 +390,7 @@ static void announceDone(const char* file, unsigned id, gboolean jobFollows)
         notice("Downloaded %s", file);
         return;
     }
+    forgetRecent();
     recentID = id;
     recentUntil = g_get_monotonic_time() + RECENT_S * G_USEC_PER_SEC;
     if (display) {
@@ -361,6 +398,48 @@ static void announceDone(const char* file, unsigned id, gboolean jobFollows)
         wpe_display_ps5_show_message(display, text, RECENT_S);
         g_free(text);
     }
+}
+
+/* file was unpacked to out: say so, and let Options show it in Files for a
+ * few seconds; with app (the one app's folder in it) Files' dialog for
+ * that folder (install it, make an image). */
+static void announceUnpacked(const char* file, const char* out, const char* app)
+{
+    if (!out || !*out) {
+        notice("Unpacked %s", file);
+        return;
+    }
+    forgetRecent();
+    if (app && *app) {
+        recentFolder = g_path_get_dirname(app);
+        recentName = g_path_get_basename(app);
+        recentChoices = TRUE;
+    } else {
+        recentFolder = g_strdup(out);
+        recentChoices = FALSE;
+    }
+    recentUntil = g_get_monotonic_time() + RECENT_S * G_USEC_PER_SEC;
+    if (display) {
+        char* where = ps5wk_files_place_name(out);
+        char* text = app && *app ? g_strdup_printf("Unpacked %s\nIt holds an app · Options: install it or make an image", file)
+                                 : g_strdup_printf("Unpacked %s to %s\nOptions: open it in Files", file, where);
+        wpe_display_ps5_show_message(display, text, RECENT_S);
+        g_free(text);
+        g_free(where);
+    }
+}
+
+gboolean ps5wk_downloads_take_recent_folder(char** folder, char** name, gboolean* choices)
+{
+    if (!recentFolder || g_get_monotonic_time() > recentUntil) {
+        forgetRecent();
+        return FALSE;
+    }
+    *folder = g_steal_pointer(&recentFolder);
+    *name = g_steal_pointer(&recentName);
+    *choices = recentChoices;
+    forgetRecent();
+    return TRUE;
 }
 
 /* ---------------------------------------------------------------- an image's app reaching the home screen */
@@ -562,7 +641,7 @@ static void appInstalled(const char* folder, const char* title, const char* name
 
 static void watchApp(const char* image, const char* title, const char* shown, const char* by)
 {
-    recentID = 0;
+    forgetRecent();
     if (!imageWatches)
         imageWatches = g_ptr_array_new_with_free_func(imageWatchFree);
     ImageWatch* w = imageWatchOf(image);
@@ -1508,7 +1587,7 @@ static const char* jobNoun(const char* job)
 {
     return !g_strcmp0(job, "extract") ? "Unpacking" : !g_strcmp0(job, "install") ? "Installing" : !g_strcmp0(job, "image") ? "Making the image"
         : !g_strcmp0(job, "move") ? "Moving" : !g_strcmp0(job, "copy") ? "Copying" : !g_strcmp0(job, "delete") ? "Deleting"
-        : !g_strcmp0(job, "verify") ? "Checking the image" : "Working";
+        : !g_strcmp0(job, "verify") ? "Checking the image" : !g_strcmp0(job, "cleanup") ? "Deleting the unpacked copy" : "Working";
 }
 
 static void jobEnded(Download* d, GHashTable* params)
@@ -1522,6 +1601,9 @@ static void jobEnded(Download* d, GHashTable* params)
     gboolean success = ok && !strcmp(ok, "1");
     /* refused: the app is installed and replacing it wasn't asked for */
     setString(&d->replaceVersion, !success && installed && *installed ? installed : NULL);
+    /* the archive's password is needed, or the one given was wrong */
+    const char* password = g_hash_table_lookup(params, "password");
+    setString(&d->passwordAsk, !success && password && (!strcmp(password, "needed") || !strcmp(password, "wrong")) ? password : NULL);
     d->jobPhase[0] = 0;
     d->jobDone = d->jobTotal = 0;
     d->r.jobState = success ? PS5WK_JOB_DONE : PS5WK_JOB_FAILED;
@@ -1560,6 +1642,9 @@ static void jobEnded(Download* d, GHashTable* params)
         notice("%s %s: %s", jobNoun(d->r.job), d->r.file ? d->r.file : "", error);
     else if (d->replaceVersion)
         notice("%s\nReplace it from Downloads", d->r.jobError);
+    else if (d->passwordAsk && !d->askPhone
+        && askPassword(FALSE, d->r.id, d->r.file ? d->r.file : "the archive", !strcmp(d->passwordAsk, "wrong")))
+        ; /* the keyboard asks for it, and the job goes again */
     else if (!success)
         notice("%s %s failed\n%s", jobNoun(d->r.job), d->r.file ? d->r.file : "", d->r.jobError);
     else if (d->r.titleID && (!g_strcmp0(d->r.job, "install") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-install"))))
@@ -1567,7 +1652,7 @@ static void jobEnded(Download* d, GHashTable* params)
     else if (!g_strcmp0(d->r.job, "image") || (!g_strcmp0(d->r.job, "extract") && d->r.after && g_str_has_prefix(d->r.after, "extract-image")))
         imageMade(out, d->r.titleID, d->r.titleName);
     else if (!g_strcmp0(d->r.job, "extract"))
-        notice("Unpacked %s\nto %s", d->r.file ? d->r.file : "", out ? out : "");
+        announceUnpacked(d->r.file ? d->r.file : "it", out, g_hash_table_lookup(params, "app"));
     changed(TRUE);
     ps5wk_files_refresh();
     if (moved && success && d->r.after)
@@ -1609,6 +1694,8 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
     setString(&t->titleName, g_hash_table_lookup(params, "titlename"));
     const char* installed = g_hash_table_lookup(params, "installed");
     setString(&t->replaceVersion, !success && installed && *installed ? installed : NULL);
+    const char* password = g_hash_table_lookup(params, "password");
+    setString(&t->passwordAsk, !success && password && (!strcmp(password, "needed") || !strcmp(password, "wrong")) ? password : NULL);
     t->phase[0] = 0;
     ps5wk_appinfo_forget(t->src);
     if (t->out)
@@ -1616,12 +1703,16 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
     char* base = g_path_get_basename(t->src);
     if (t->replaceVersion)
         notice("%s\nReplace it from Downloads", t->error);
+    else if (t->passwordAsk && !t->askPhone && askPassword(TRUE, t->id, base, !strcmp(t->passwordAsk, "wrong")))
+        ; /* the keyboard asks for it, and the job goes again */
     else if (!success)
         notice("%s %s failed\n%s", jobNoun(t->kind), base, t->error);
     else if (t->titleName && (!strcmp(t->kind, "install") || !g_strcmp0(t->then, "install")))
         appInstalled(t->out, g_hash_table_lookup(params, "title"), t->titleName, params);
     else if (!strcmp(t->kind, "image") || !g_strcmp0(t->then, "image"))
         imageMade(t->out, g_hash_table_lookup(params, "title"), t->titleName);
+    else if (!strcmp(t->kind, "extract") && !t->then)
+        announceUnpacked(base, t->out, g_hash_table_lookup(params, "app"));
     else
         notice("%s %s: done\n%s", jobNoun(t->kind), base, t->out ? t->out : "");
     g_free(base);
@@ -1639,6 +1730,9 @@ static void taskFree(gpointer data)
     g_free(t->out);
     g_free(t->titleName);
     g_free(t->replaceVersion);
+    g_free(t->passwordAsk);
+    g_free(t->askKind);
+    g_free(t->askThen);
     g_free(t->dest);
     g_free(t);
 }
@@ -1733,7 +1827,8 @@ static const char* imageFormat(const char* what, char** plain)
 
 /* A job on d's finished file. kind: "extract", "install", "image",
  * "image-ffpkg", "move"; then: "install", "image", "image-ffpkg". */
-static const char* startJob(Download* d, const char* kindAsked, const char* thenAsked, const char* destination, gboolean replace)
+static const char* startJob(Download* d, const char* kindAsked, const char* thenAsked, const char* destination, gboolean replace,
+    const char* password)
 {
     if (d->r.state != PS5WK_DL_DONE || !d->r.file)
         return "not a finished download";
@@ -1781,12 +1876,19 @@ static const char* startJob(Download* d, const char* kindAsked, const char* then
     d->r.jobState = PS5WK_JOB_RUNNING;
     setString(&d->r.jobError, NULL);
     setString(&d->replaceVersion, NULL);
+    setString(&d->passwordAsk, NULL);
+    setString(&d->askKind, kindAsked);
+    setString(&d->askThen, thenAsked);
+    setString(&d->askDest, destination);
+    d->askReplace = replace;
+    d->askPhone = managing;
     snprintf(d->jobPhase, sizeof d->jobPhase, "%s", kind);
     d->jobDone = d->jobTotal = 0;
     ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "format", format, "delete",
-        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
-    spike_log("[dl] %u: %s %s -> %s%s%s%s%s", d->r.id, kind, src, dest ? dest : "-", then ? " then " : "", then ? then : "",
-        format ? " (.ffpkg)" : "", replace ? " (replacing)" : "");
+        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, "password",
+        password && *password ? password : NULL, NULL);
+    spike_log("[dl] %u: %s %s -> %s%s%s%s%s%s", d->r.id, kind, src, dest ? dest : "-", then ? " then " : "", then ? then : "",
+        format ? " (.ffpkg)" : "", replace ? " (replacing)" : "", password && *password ? " (with a password)" : "");
     g_free(src);
     g_free(dest);
     g_free(image);
@@ -1802,20 +1904,20 @@ static void startAfter(Download* d)
 {
     if (d->r.moveTo && titleSees(d) && strcmp(d->r.moveTo, PS5WK_DOWNLOADS_DIR)) {
         char* dest = g_strdup_printf("%s/%s", d->r.moveTo, d->r.file);
-        startJob(d, "move", NULL, dest, FALSE);
+        startJob(d, "move", NULL, dest, FALSE, NULL);
         g_free(dest);
         return;
     }
     if (!d->r.after)
         return;
     if (!strcmp(d->r.after, "extract"))
-        startJob(d, "extract", NULL, NULL, FALSE);
+        startJob(d, "extract", NULL, NULL, FALSE, NULL);
     else if (!strcmp(d->r.after, "extract-install"))
-        startJob(d, "extract", "install", NULL, FALSE);
+        startJob(d, "extract", "install", NULL, FALSE, NULL);
     else if (!strcmp(d->r.after, "extract-image"))
-        startJob(d, "extract", "image", NULL, FALSE);
+        startJob(d, "extract", "image", NULL, FALSE, NULL);
     else if (!strcmp(d->r.after, "extract-image-ffpkg"))
-        startJob(d, "extract", "image-ffpkg", NULL, FALSE);
+        startJob(d, "extract", "image-ffpkg", NULL, FALSE, NULL);
 }
 
 /* ---------------------------------------------------------------- a transfer's signals (WebKit's) */
@@ -2677,12 +2779,31 @@ unsigned ps5wk_downloads_active(double* progress)
     gboolean unknown = FALSE;
     for (unsigned i = 0; list && i < list->len; i++) {
         Download* d = g_ptr_array_index(list, i);
-        if (d->r.state != PS5WK_DL_RUNNING)
+        if (d->r.state == PS5WK_DL_RUNNING) {
+            active++;
+            if (d->r.size > 0) {
+                got += d->r.received;
+                total += d->r.size;
+            } else
+                unknown = TRUE;
+        } else if (d->r.state == PS5WK_DL_DONE && d->r.jobState == PS5WK_JOB_RUNNING) {
+            /* unpacking, making an image, installing: its step's bytes */
+            active++;
+            if (d->jobTotal > 0) {
+                got += MIN(d->jobDone, d->jobTotal);
+                total += d->jobTotal;
+            } else
+                unknown = TRUE;
+        }
+    }
+    for (unsigned i = 0; tasks && i < tasks->len; i++) {
+        Task* t = g_ptr_array_index(tasks, i);
+        if (t->state != PS5WK_JOB_RUNNING)
             continue;
         active++;
-        if (d->r.size > 0) {
-            got += d->r.received;
-            total += d->r.size;
+        if (t->total > 0) {
+            got += MIN(t->done, t->total);
+            total += t->total;
         } else
             unknown = TRUE;
     }
@@ -2759,6 +2880,8 @@ static void updateManagerSnapshot(void)
             d->peekedLocal ? "true" : "false", d->peek ? d->peek : "null");
         jsonKey(out, "peekError", d->peekError);
         jsonKey(out, "replaceVersion", d->replaceVersion);
+        jsonKey(out, "password", d->passwordAsk);
+        jsonKey(out, "passwordDo", d->passwordAsk ? askAction(d->askKind, d->askThen) : NULL);
         g_string_append_c(out, '}');
     }
     g_string_append(out, "],\"tasks\":[");
@@ -2774,6 +2897,8 @@ static void updateManagerSnapshot(void)
         jsonKey(out, "out", t->out);
         jsonKey(out, "titleName", t->titleName);
         jsonKey(out, "replaceVersion", t->replaceVersion);
+        jsonKey(out, "password", t->passwordAsk);
+        jsonKey(out, "passwordDo", t->passwordAsk ? askAction(t->askKind, t->askThen) : NULL);
         g_string_append_c(out, '}');
     }
     g_string_append(out, "]}\n");
@@ -2850,7 +2975,8 @@ static gboolean folderAllowed(const char* dir)
     return !strstr(dir, "/../") && !g_str_has_suffix(dir, "/..") && !strstr(dir, "/./") && !strstr(dir, "//") && strlen(dir) < 900;
 }
 
-static const char* startTask(const char* kindAsked, const char* thenAsked, const char* src, const char* destFolder, gboolean replace)
+static const char* startTask(const char* kindAsked, const char* thenAsked, const char* src, const char* destFolder, gboolean replace,
+    const char* password)
 {
     if (!folderAllowed(src))
         return "That file isn't in a place the browser can use";
@@ -2868,6 +2994,10 @@ static const char* startTask(const char* kindAsked, const char* thenAsked, const
     t->kind = g_strdup(kind);
     t->then = g_strdup(then);
     t->src = g_strdup(src);
+    t->askKind = g_strdup(kindAsked);
+    t->askThen = g_strdup(thenAsked);
+    t->askReplace = replace;
+    t->askPhone = managing;
     t->state = PS5WK_JOB_RUNNING;
     t->started = nowSeconds();
     snprintf(t->phase, sizeof t->phase, "%s", kind);
@@ -2912,15 +3042,99 @@ static const char* startTask(const char* kindAsked, const char* thenAsked, const
         t->dest = g_strdup(dest);
     }
     ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "format", format, "delete",
-        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
-    spike_log("[dl] task %s: %s %s%s%s%s%s", id, kind, src, then ? " then " : "", then ? then : "", format ? " (.ffpkg)" : "",
-        replace ? " (replacing)" : "");
+        !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, "password",
+        password && *password ? password : NULL, NULL);
+    spike_log("[dl] task %s: %s %s%s%s%s%s%s", id, kind, src, then ? " then " : "", then ? then : "", format ? " (.ffpkg)" : "",
+        replace ? " (replacing)" : "", password && *password ? " (with a password)" : "");
     g_free(dest);
     g_free(image);
     g_free(kindPlain);
     g_free(thenPlain);
     changed(TRUE);
     return NULL;
+}
+
+/* An archive's password, asked for on the TV when its job came back
+ * needing it (or the one given was wrong): the job goes again with it. */
+typedef struct {
+    gboolean task;
+    unsigned id;
+} PasswordAsk;
+
+static void onPassword(const char* text, gpointer data)
+{
+    PasswordAsk* a = data;
+    const char* why = NULL;
+    if (!text || !*text) {
+        /* cancelled: the entry says it needs it; its Unpack asks again */
+    } else if (a->task) {
+        Task* t = taskByID(a->id);
+        if (t && t->passwordAsk && t->state != PS5WK_JOB_RUNNING) {
+            char* kind = g_strdup(t->askKind);
+            char* then = g_strdup(t->askThen);
+            char* src = g_strdup(t->src);
+            gboolean replace = t->askReplace;
+            g_ptr_array_remove(tasks, t); /* its next try takes its place */
+            why = startTask(kind, then, src, NULL, replace, text);
+            g_free(kind);
+            g_free(then);
+            g_free(src);
+        }
+    } else {
+        Download* d = byID(a->id);
+        if (d && d->passwordAsk && d->r.jobState != PS5WK_JOB_RUNNING) {
+            char* kind = g_strdup(d->askKind);
+            char* then = g_strdup(d->askThen);
+            char* dest = g_strdup(d->askDest);
+            why = startJob(d, kind, then, dest, d->askReplace, text);
+            g_free(kind);
+            g_free(then);
+            g_free(dest);
+        }
+    }
+    if (why)
+        notice("Couldn't start it again: %s", why);
+    g_free(a);
+}
+
+/* Unpacking d from the TV's dialog: when its last try needed the
+ * password, the keyboard asks first. */
+static const char* unpackJob(Download* d, const char* then, gboolean replace)
+{
+    if (d->passwordAsk && d->r.state == PS5WK_DL_DONE && d->r.jobState != PS5WK_JOB_RUNNING) {
+        setString(&d->askKind, "extract");
+        setString(&d->askThen, then);
+        setString(&d->askDest, NULL);
+        d->askReplace = replace;
+        d->askPhone = FALSE;
+        if (askPassword(FALSE, d->r.id, d->r.file ? d->r.file : "the archive", FALSE))
+            return NULL;
+    }
+    return startJob(d, "extract", then, NULL, replace, NULL);
+}
+
+/* TRUE: the keyboard is open for it. */
+static gboolean askPassword(gboolean task, unsigned id, const char* file, gboolean wrong)
+{
+    char title[160];
+    snprintf(title, sizeof title, "%s %.100s", wrong ? "That wasn't its password. The password for" : "The password for", file);
+    PasswordAsk* a = g_new0(PasswordAsk, 1);
+    a->task = task;
+    a->id = id;
+    if (display && wpe_display_ps5_request_password(display, title, onPassword, a))
+        return TRUE;
+    g_free(a);
+    return FALSE;
+}
+
+/* What the phone page sends again with the password: its do= (a
+ * download's) or kind= (a task's). */
+static const char* askAction(const char* kind, const char* then)
+{
+    if (!g_strcmp0(kind, "extract"))
+        return !then ? "extract" : !strcmp(then, "install") ? "extract-install" : !strcmp(then, "image") ? "extract-image"
+            : !strcmp(then, "image-ffpkg") ? "extract-image-ffpkg" : "extract";
+    return kind;
 }
 
 /* Whether path is used by a download that isn't finished (its file, its
@@ -3025,7 +3239,19 @@ static const char* textParam(GHashTable* params, const char* key)
 }
 
 /* Main loop: one of the page's actions (do=...). NULL or why not. */
+static const char* manage(GHashTable* params);
+
+/* The phone page's actions. A job it starts that needs a password asks
+ * for it there (password= sends it), not on the TV. */
 const char* ps5wk_downloads_manage(GHashTable* params)
+{
+    managing = TRUE;
+    const char* why = manage(params);
+    managing = FALSE;
+    return why;
+}
+
+static const char* manage(GHashTable* params)
 {
     const char* action = textParam(params, "do");
     if (!action)
@@ -3080,22 +3306,25 @@ const char* ps5wk_downloads_manage(GHashTable* params)
     if (!strcmp(action, "task")) {
         const char* kind = textParam(params, "kind");
         const char* path = textParam(params, "path");
+        const char* pw = textParam(params, "password");
         const char* replaceText = textParam(params, "replace");
         gboolean replace = replaceText && !strcmp(replaceText, "1");
         if (!kind || !path)
             return "kind and path";
         if (inUse(path))
             return "A download or a job is using it: wait for it, or pause, cancel or remove the download first";
-        if (!strcmp(kind, "extract") || !strcmp(kind, "image") || !strcmp(kind, "image-ffpkg") || !strcmp(kind, "delete"))
-            return startTask(kind, NULL, path, NULL, FALSE);
+        if (!strcmp(kind, "extract"))
+            return startTask(kind, NULL, path, NULL, FALSE, pw);
+        if (!strcmp(kind, "image") || !strcmp(kind, "image-ffpkg") || !strcmp(kind, "delete"))
+            return startTask(kind, NULL, path, NULL, FALSE, NULL);
         if (!strcmp(kind, "install"))
-            return startTask(kind, NULL, path, NULL, replace);
+            return startTask(kind, NULL, path, NULL, replace, NULL);
         if (!strcmp(kind, "extract-install"))
-            return startTask("extract", "install", path, NULL, replace);
+            return startTask("extract", "install", path, NULL, replace, pw);
         if (!strcmp(kind, "extract-image"))
-            return startTask("extract", "image", path, NULL, FALSE);
+            return startTask("extract", "image", path, NULL, FALSE, pw);
         if (!strcmp(kind, "extract-image-ffpkg"))
-            return startTask("extract", "image-ffpkg", path, NULL, FALSE);
+            return startTask("extract", "image-ffpkg", path, NULL, FALSE, pw);
         if (!strcmp(kind, "move") || !strcmp(kind, "copy")) {
             /* dest: the folder it goes into */
             const char* dest = textParam(params, "dest");
@@ -3108,7 +3337,7 @@ const char* ps5wk_downloads_manage(GHashTable* params)
             g_free(full);
             if (busy)
                 return "A download or a job is using that name there";
-            return startTask(kind, NULL, path, dest, FALSE);
+            return startTask(kind, NULL, path, dest, FALSE, NULL);
         }
         return "kind=extract|extract-install|extract-image|extract-image-ffpkg|install|image|image-ffpkg|delete|move|copy";
     }
@@ -3201,19 +3430,20 @@ const char* ps5wk_downloads_manage(GHashTable* params)
     /* replace=1: the user agreed to replace the installed app */
     const char* replaceText = textParam(params, "replace");
     gboolean replace = replaceText && !strcmp(replaceText, "1");
+    const char* pw = textParam(params, "password"); /* an archive's */
     if (!strcmp(action, "extract"))
-        return startJob(d, "extract", NULL, NULL, FALSE);
+        return startJob(d, "extract", NULL, NULL, FALSE, pw);
     if (!strcmp(action, "extract-install"))
-        return startJob(d, "extract", "install", NULL, replace);
+        return startJob(d, "extract", "install", NULL, replace, pw);
     if (!strcmp(action, "extract-image"))
-        return startJob(d, "extract", "image", NULL, FALSE);
+        return startJob(d, "extract", "image", NULL, FALSE, pw);
     if (!strcmp(action, "extract-image-ffpkg"))
-        return startJob(d, "extract", "image-ffpkg", NULL, FALSE);
+        return startJob(d, "extract", "image-ffpkg", NULL, FALSE, pw);
     if (!strcmp(action, "install")) {
         /* a downloaded image or package */
         if (!isImageName(d->r.file) && !isPkgName(d->r.file))
             return "only images (.exfat, .ffpkg) and packages (.pkg) install as they are";
-        return startJob(d, "install", NULL, NULL, replace);
+        return startJob(d, "install", NULL, NULL, replace, NULL);
     }
     if (!strcmp(action, "jobstop")) {
         if (d->r.jobState != PS5WK_JOB_RUNNING)
@@ -3462,7 +3692,7 @@ void ps5wk_downloads_row(unsigned index, BUIRow* r)
             r->running = TRUE;
             r->progress = t->total > 0 ? CLAMP((double)t->done / t->total, 0, 1) : -1;
             if (r->progress >= 0)
-                snprintf(r->state, sizeof r->state, "%.0f%%", r->progress * 100);
+                snprintf(r->state, sizeof r->state, "%s %.0f%%", jobNoun(*t->phase ? t->phase : t->kind), r->progress * 100);
             else
                 snprintf(r->state, sizeof r->state, "%s…", jobNoun(*t->phase ? t->phase : t->kind));
             formatBytes(a, sizeof a, t->done);
@@ -3777,7 +4007,7 @@ static void peekLines(BUIChoices* out, const Download* d, const MJ* peek)
     else if (id)
         addLine(out, BUI_TONE_ACTIVE, "It holds an app: %s · %s%s%s%s", name ? name : id, id, version ? " · version " : "", version ? version : "",
             mj_bool(peek, "guessed") ? " (the ID from its name)" : "");
-    else {
+    else if (!mj_bool(peek, "namesHidden")) {
         char unpacked[32];
         formatBytes(unpacked, sizeof unpacked, (gint64)mj_number(peek, "unpacked", -1));
         int entries = (int)mj_number(peek, "entries", 0);
@@ -3794,6 +4024,9 @@ static void peekLines(BUIChoices* out, const Download* d, const MJ* peek)
     }
     if (refused)
         addLine(out, BUI_TONE_WARN, "It can't be unpacked: %s", refused);
+    else if (mj_bool(peek, "password"))
+        addLine(out, BUI_TONE_PLAIN, "%s: it's asked for when it's unpacked",
+            mj_bool(peek, "namesHidden") ? "It has a password, over its list of files too" : "It has a password");
 }
 
 static void askChoices(BUIChoices* out, Download* d, const MJ* peek)
@@ -3985,6 +4218,9 @@ static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
             addLine(out, BUI_TONE_WARN, "%s", PS5WK_NO_IMAGE_MOUNTER);
         else if (id && titles == 1) {
             char detail[160];
+            const char* empty = mj_string(peek, "emptyFolder");
+            if (empty && *empty)
+                addLine(out, BUI_TONE_WARN, PS5WK_EMPTY_FOLDER_WARNING, empty);
             snprintf(detail, sizeof detail, "%s.exfat in the drive's homebrew folder, for %s; checked once made", id, mounter ? mounter : "ShadowMountPlus");
             addChoice(out, CD_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", detail);
             snprintf(detail, sizeof detail, "%s.ffpkg in the drive's homebrew folder, for ShadowMountPlus 1.7 or later; checked once made", id);
@@ -4101,25 +4337,25 @@ static int chooseForDownload(Download* d, int id)
     const char* why = NULL;
     switch (id) {
     case CD_REPLACE:
-        why = startJob(d, "extract", "install", NULL, TRUE);
+        why = unpackJob(d, "install", TRUE);
         break;
     case CD_INSTALL:
-        why = startJob(d, "extract", "install", NULL, dlChosen.replaceKnown);
+        why = unpackJob(d, "install", dlChosen.replaceKnown);
         break;
     case CD_EXTRACT:
-        why = startJob(d, "extract", NULL, NULL, FALSE);
+        why = unpackJob(d, NULL, FALSE);
         break;
     case CD_IMAGE:
-        why = startJob(d, "extract", "image", NULL, FALSE);
+        why = unpackJob(d, "image", FALSE);
         break;
     case CD_IMAGE_FFPKG:
-        why = startJob(d, "extract", "image-ffpkg", NULL, FALSE);
+        why = unpackJob(d, "image-ffpkg", FALSE);
         break;
     case CD_INSTALL_FILE:
-        why = startJob(d, "install", NULL, NULL, dlChosen.replaceKnown);
+        why = startJob(d, "install", NULL, NULL, dlChosen.replaceKnown, NULL);
         break;
     case CD_REPLACE_FILE:
-        why = startJob(d, "install", NULL, NULL, TRUE);
+        why = startJob(d, "install", NULL, NULL, TRUE, NULL);
         break;
     case CD_SHOW:
         showInFiles(path);
@@ -4171,7 +4407,7 @@ int ps5wk_downloads_choose(int id)
             char* src = g_strdup(t->src);
             g_ptr_array_remove(tasks, t);
             const char* why = inUse(src) ? "A download or a job is using it"
-                : !strcmp(kind, "install") ? startTask("install", NULL, src, NULL, TRUE) : startTask("extract", "install", src, NULL, TRUE);
+                : !strcmp(kind, "install") ? startTask("install", NULL, src, NULL, TRUE, NULL) : startTask("extract", "install", src, NULL, TRUE, NULL);
             if (why)
                 notice("%s", why);
             g_free(src);

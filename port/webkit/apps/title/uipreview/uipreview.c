@@ -656,6 +656,10 @@ int main(int argc, char** argv)
     s.downloadsActive = 1;
     s.downloadsProgress = 0.37;
     menuShot("menu-tabs-downloading", &s);
+    /* the ring is a button: focused (X: the Downloads list) */
+    s.zone = ZONE_TOOLBAR;
+    s.toolbarFocus = TB_DOWNLOADS;
+    menuShot("menu-toolbar-downloads", &s);
 
     /* the bar above the page, menu closed */
     s = baseState();

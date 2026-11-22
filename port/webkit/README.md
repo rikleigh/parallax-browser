@@ -982,11 +982,18 @@ reason under the name, *Restarted from zero*, *✓ Done*, *Cancelled*).
 | Square | cancel (the `.part` goes); a finished file: delete the file and its entry (press twice); a failed or cancelled entry: remove it |
 | R2 | the details: the address, where it came from, the file's path, size, SHA-256, validator, times, state (O closes them) |
 
-The bar shows a ring left of the tab count while anything downloads (the
-received part of every running download together, from the top clockwise
-in the gradient; the number of downloads when more than one; a quarter arc
-when a size isn't known). Notices: *Download started: <name>*, *Downloaded
-<name>*, *Download failed: <name>* with the reason. The uipreview harness
+The bar shows a ring left of the tab count while anything downloads or a
+job runs: unpacking, making an image (and checking it, then deleting the
+unpacked copy), installing, Files' moves and copies. It fills with the
+received part of every running download, and a job's current step,
+together, from the top clockwise in the gradient. It shows how many when
+more than one, and a quarter arc when a size isn't known. The ring is a
+button: clicked, or X on it (the D-pad reaches it only while it shows), it
+opens the Downloads list on the first row running. Notices:
+*Download started: <name>*, *Downloaded <name>*, *Download failed: <name>*
+with the reason. After an unpack the notice offers Options for a few
+seconds: Files on the unpacked folder or, when it holds one app, Files'
+dialog for the app's folder (install it, make an image). The uipreview harness
 renders the list, the details, the empty list, the ring and the notices.
 
 **Getting files off the PS5.** The link server's page
@@ -1064,8 +1071,23 @@ hundred megabytes, and because a title can't see every drive.
     xz and zstd): ZIP, 7z, RAR4 and RAR5, tar and its compressed forms,
     split sets (`.7z.001`, `.zip.001`, `.part1.rar`, `.rar` + `.r00`).
     Hostile archives are refused before anything is written: absolute or
-    `..` paths, links, devices, encrypted entries, over 200000 entries or
-    512 GiB. The free space is checked first. It unpacks next to the
+    `..` paths, links, devices, over 200000 entries or 512 GiB. The free
+    space is checked first.
+  - Passwords: ZIP (PKWARE's and WinZip AES), RAR4 (RAR 3.x's AES) and
+    RAR5, with their names encrypted too (`rar -hp`). libarchive reads ZIP's
+    with OpenSSL; RAR's are our patches, `port/deps/patches/libarchive/`
+    (RAR5's PBKDF2 key and check value, RAR 3.x's SHA-1 key with its quirk,
+    one AES stream per file across its volumes). When a job needs the
+    password, or the one given is wrong, the service says so (`jobend
+    password=needed|wrong`) and the keyboard asks for it on the TV (typing
+    hidden); a job from the phone page asks there. The password goes to
+    the service with the job, and isn't logged or kept. With a password, a
+    wrong one is found before anything is written (RAR5's and ZIP's check
+    values; RAR4's header CRC with `-hp`); a RAR4 archive without `-hp`
+    has no check value, so a wrong one shows as a CRC error while it
+    unpacks, and what was written is removed. 7-Zip archives with a
+    password can't be read (libarchive has no 7-Zip decryption) and say
+    so. It unpacks next to the
     archive, into a folder named like it; the archive is kept unless
     Settings says to delete it (all its parts).
   - Installing (`apps/common/ps5install.c`): the shallowest folder with
@@ -1180,8 +1202,10 @@ hundred megabytes, and because a title can't see every drive.
   what the system registered, then `/user/app/<ID>/sce_sys`), the
   format, file count and unpacked size, and pre-selects: an app →
   *Unpack & install app*; several apps or other files → *Unpack*; an
-  archive that can't be unpacked (encrypted, unsafe paths) → only *Keep
-  the file*. Nothing is remembered and nothing is installed unless the
+  archive that can't be unpacked (a 7-Zip password, unsafe paths) → only
+  *Keep the file*. An archive with a password says so (its password is
+  asked for when it's unpacked); with `rar -hp` its names can't be seen
+  before that. Nothing is remembered and nothing is installed unless the
   user chose it for that file. Finished archives get the same suggestion
   as their first button.
 - **Replacing an installed app is always asked.** An install (after
@@ -1329,11 +1353,16 @@ link server; the page's look through debug screenshots, not the pad):
   out of `/data/ps5webkit`. No USB or M.2 drive was attached: moves
   between drives were tested on the Mac only.
 - **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
-  `--quick` 38), `archive-test.sh` (173), `exfat-test.sh` (66,
+  `--quick` 38), `archive-test.sh` (230: with libarchive 3.8.1 and our patches built
+  for the Mac by `mac-libarchive.sh`; passwords: PKWARE and AES ZIPs,
+  RAR4 and RAR5 made by RAR, and multivolume sets encrypted the way RAR
+  does by `archive/rar4enc.py` and `rar5enc.py`, their parts ending
+  inside AES blocks), `exfat-test.sh` (66,
   `--no-big` 50; with the read-back check, `--no-big` 65, the full run
-  not repeated), `install-test.sh` (21), `peek-test.sh` (28: ZIP,
+  not repeated), `install-test.sh` (21), `peek-test.sh` (30: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
-  not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
+  not, RAR4/RAR5, tar.gz over the limit, passwords (names hidden or
+  not), no ranges, cookies,
   a slow server, one sending 20 bytes a second, on the drive),
   `files-test.sh` (34: copies and moves on one drive and to a disk
   image, no space, cancelled, links, FIFOs, names already there),

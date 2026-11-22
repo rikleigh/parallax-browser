@@ -116,13 +116,15 @@ char* ps5peek_json(const PS5PeekOptions* options, char* error, size_t errorSize)
     PS5TitleInfo title;
     memset(&title, 0, sizeof title);
     gboolean guessed = FALSE;
-    if (!r && info.has_title) {
+    /* -4: a password (asked for when it's unpacked); the list was read
+     * unless the names have it too */
+    if ((!r || (r == -4 && !info.names_encrypted)) && info.has_title) {
         char name[600];
         snprintf(name, sizeof name, "%s%ssce_sys/param.json", info.title_dir, *info.title_dir ? "/" : "");
         char* text = g_malloc(PARAM_MAX);
         char problem[256] = "";
-        if (ps5archive_read_entry(options->url ? NULL : options->path, options->url ? &source : NULL, name, text, PARAM_MAX, NULL, problem,
-                sizeof problem)
+        if (ps5archive_read_entry(options->url ? NULL : options->path, options->url ? &source : NULL, NULL, name, text, PARAM_MAX, NULL,
+                problem, sizeof problem)
             || ps5install_parse_param(text, &title))
             memset(&title, 0, sizeof title);
         g_free(text);
@@ -146,6 +148,8 @@ char* ps5peek_json(const PS5PeekOptions* options, char* error, size_t errorSize)
         (unsigned long long)info.unpacked, info.sizes_known ? "true" : "false", info.titles);
     jsonString(json, info.has_title ? info.title_dir : NULL);
     g_string_append_printf(json, ",\"icon\":%s", info.has_title && info.title_icon ? "true" : "false");
+    g_string_append(json, ",\"emptyFolder\":");
+    jsonString(json, info.has_title && *info.empty_folder ? info.empty_folder : NULL);
     g_string_append(json, ",\"titleId\":");
     jsonString(json, *title.title_id ? title.title_id : NULL);
     g_string_append(json, ",\"name\":");
@@ -156,6 +160,8 @@ char* ps5peek_json(const PS5PeekOptions* options, char* error, size_t errorSize)
     jsonString(json, isInstalled ? (*installed.version ? installed.version : "?") : NULL);
     g_string_append(json, ",\"refused\":");
     jsonString(json, r == -1 ? why : NULL);
+    g_string_append_printf(json, ",\"password\":%s,\"namesHidden\":%s", r == -4 ? "true" : "false",
+        r == -4 && info.names_encrypted ? "true" : "false");
     g_string_append_printf(json, ",\"remote\":%s,\"requests\":%u,\"fetched\":%llu,\"ms\":%lld}", options->url ? "true" : "false", requests,
         (unsigned long long)fetched, (long long)((g_get_monotonic_time() - started) / 1000));
     char* out = strdup(json->str);

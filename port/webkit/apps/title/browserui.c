@@ -1364,6 +1364,8 @@ static void fillState(BUIState* s)
     s->historyCount = ps5wk_history()->len;
     s->downloadCount = ps5wk_downloads_count();
     s->downloadsActive = ps5wk_downloads_active(&s->downloadsProgress);
+    if (!s->downloadsActive && toolbarFocus == TB_DOWNLOADS) /* the ring went */
+        s->toolbarFocus = toolbarFocus = TB_TABS;
     if (menuOpen && zone == ZONE_TOOLBAR && toolbarFocus == TB_HOME) { /* reads home-url.txt: only then */
         int home = ps5wk_home_square(shownURI(), FALSE, NULL);
         s->homeSquare = home == PS5WK_HOME_SET ? "Make this the home page" : home == PS5WK_HOME_RESET ? "Use the start page" : NULL;
@@ -1763,6 +1765,26 @@ static void toolbarActivate(int index)
         if (openInNewTab(NULL))
             setMenu(FALSE);
         break;
+    case TB_DOWNLOADS: {
+        /* the ring: the Downloads list, on the first row running */
+        if (!menuOpen)
+            setMenu(TRUE);
+        setSection(SEC_DOWNLOADS);
+        unsigned rows = ps5wk_downloads_count();
+        for (unsigned i = 0; i < rows; i++) {
+            BUIRow row = { 0 };
+            ps5wk_downloads_row(i, &row);
+            if (row.running) {
+                listFocus = (int)i;
+                break;
+            }
+        }
+        if (rows)
+            zone = ZONE_LIST;
+        keepFocusVisible();
+        redraw();
+        break;
+    }
     case TB_TABS:
         /* the Tabs list, on the tab shown (the menu opens for it) */
         if (!menuOpen)
@@ -1848,6 +1870,20 @@ static void openChoices(int sec, int row)
     detailsOpen = FALSE;
 }
 
+/* Options just after an unpack: Files at what it made (and an app's
+ * dialog). FALSE: nothing was. */
+static gboolean showRecentUnpack(void)
+{
+    char *folder = NULL, *name = NULL;
+    gboolean choices = FALSE;
+    if (!ps5wk_downloads_take_recent_folder(&folder, &name, &choices))
+        return FALSE;
+    gboolean shown = ps5wk_browser_show_in_files(folder, name, choices);
+    g_free(folder);
+    g_free(name);
+    return shown;
+}
+
 gboolean ps5wk_browser_show_download_choices(unsigned index)
 {
     if (!tabs || ps5wk_vr_active() || ps5wk_browser_winding_down())
@@ -1881,6 +1917,36 @@ gboolean ps5wk_browser_pick_download_folder(void)
     keepFocusVisible();
     redraw();
     return TRUE;
+}
+
+gboolean ps5wk_browser_show_in_files(const char* folder, const char* name, gboolean choices)
+{
+    if (!tabs || ps5wk_vr_active() || ps5wk_browser_winding_down())
+        return FALSE;
+    choicesOpen = detailsOpen = FALSE;
+    if (!menuOpen)
+        setMenu(TRUE);
+    setSection(SEC_FILES);
+    if (choices)
+        ps5wk_files_open_choices(folder, name);
+    else
+        ps5wk_files_open(folder, name);
+    zone = ZONE_LIST;
+    listFocus = 0;
+    keepFocusVisible();
+    redraw();
+    return TRUE;
+}
+
+void ps5wk_browser_files_choices(int row)
+{
+    if (!menuOpen || section != SEC_FILES || choicesOpen || detailsOpen || row < 0 || row >= (int)rowCount(SEC_FILES))
+        return;
+    zone = ZONE_LIST;
+    listFocus = row;
+    keepFocusVisible();
+    openChoices(SEC_FILES, row);
+    redraw();
 }
 
 void ps5wk_browser_files_changed(int focus)
@@ -2280,6 +2346,9 @@ static void menuButtons(guint32 pressed)
         ps5wk_browser_show_download_choices(recent);
         return;
     }
+    /* something was just unpacked (its notice says Options shows it) */
+    if ((pressed & WPE_DISPLAY_PS5_BUTTON_OPTIONS) && showRecentUnpack())
+        return;
     if ((pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE) && section == SEC_FILES && zone == ZONE_LIST && ps5wk_files_up()) {
         deleteArmed = -1;
         redraw();
@@ -2325,10 +2394,17 @@ static void menuButtons(guint32 pressed)
         return;
     }
     if (zone == ZONE_TOOLBAR) {
-        if (pressed & WPE_DISPLAY_PS5_BUTTON_LEFT)
+        /* the ring is there only while something runs */
+        gboolean ring = ps5wk_downloads_active(NULL) > 0;
+        if (pressed & WPE_DISPLAY_PS5_BUTTON_LEFT) {
             toolbarFocus = toolbarFocus > 0 ? toolbarFocus - 1 : 0;
-        else if (pressed & WPE_DISPLAY_PS5_BUTTON_RIGHT)
+            if (toolbarFocus == TB_DOWNLOADS && !ring)
+                toolbarFocus--;
+        } else if (pressed & WPE_DISPLAY_PS5_BUTTON_RIGHT) {
             toolbarFocus = toolbarFocus < TB_COUNT - 1 ? toolbarFocus + 1 : TB_COUNT - 1;
+            if (toolbarFocus == TB_DOWNLOADS && !ring)
+                toolbarFocus++;
+        }
         else if ((pressed & WPE_DISPLAY_PS5_BUTTON_DOWN) && rowCount(section)) {
             zone = ZONE_LIST;
             keepFocusVisible();
@@ -2395,7 +2471,7 @@ static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
         unsigned recent;
         if (!ps5wk_vr_active() && ps5wk_downloads_take_recent(&recent))
             ps5wk_browser_show_download_choices(recent);
-        else
+        else if (ps5wk_vr_active() || !showRecentUnpack())
             ps5wk_browser_toggle_menu();
         return TRUE;
     }

@@ -55,6 +55,9 @@ int ps5wk_files_choose(int id);
 
 /* Files at folder with name focused (Show in Files). */
 void ps5wk_files_open(const char* folder, const char* name);
+/* The same, and the dialog for name opened once it is listed (an app
+ * folder's: install it, make an image). */
+void ps5wk_files_open_choices(const char* folder, const char* name);
 /* Files to choose the folder of the download waiting for one (its id). */
 void ps5wk_files_pick_folder(unsigned download, const char* fileName);
 /* Files to choose the folder new downloads go to (from Settings), at folder:

@@ -1,0 +1,1569 @@
+ps5webkit: decrypt RAR5 archives (data, and headers with rar -hp)
+
+libarchive 3.8.1 detects RAR5 encryption but can't read it. This adds:
+
+- archive_rar_crypto.c: AES-CBC, SHA-256 and HMAC-SHA256 through OpenSSL's
+  EVP (HAVE_LIBCRYPTO), the RAR5 key derivation (PBKDF2-HMAC-SHA256 with
+  its hash key and password check) and RAR 3.x's (2^18 rounds of SHA-1,
+  with the RAR 2.9/3.x quirk), which 0002 uses for RAR4.
+- The RAR5 reader decrypts through read_ahead()/consume(): a decrypted
+  header buffer, and a plain text view of a file's data, which is one
+  AES-256-CBC stream across its volumes (a volume can end inside a block).
+  Passphrases come from archive_read_add_passphrase or the callback and
+  are matched against the stored check value; checksums stored as HMACs
+  are compared as such. Without a passphrase, listing still works unless
+  the headers are encrypted ("Passphrase required for this entry"); a
+  wrong one is "Incorrect passphrase".
+- CMake: ENABLE_OPENSSL_DARWIN uses OpenSSL on macOS too (the Mac tests).
+
+The format follows RARLAB's technote and UnRAR's behaviour; no UnRAR code
+is used.
+
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-11-22 16:39:36
++++ b/CMakeLists.txt	2026-11-22 16:39:36
+@@ -841,7 +841,8 @@
+ # Find OpenSSL
+ # (Except on Mac, where OpenSSL is deprecated.)
+ #
+-IF(ENABLE_OPENSSL AND NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
++# ps5webkit: ENABLE_OPENSSL_DARWIN for its Mac tests of RAR decryption.
++IF(ENABLE_OPENSSL AND (NOT CMAKE_SYSTEM_NAME MATCHES "Darwin" OR ENABLE_OPENSSL_DARWIN))
+   FIND_PACKAGE(OpenSSL)
+   IF(OPENSSL_FOUND)
+     SET(HAVE_LIBCRYPTO 1)
+diff -ruN a/libarchive/CMakeLists.txt b/libarchive/CMakeLists.txt
+--- a/libarchive/CMakeLists.txt	2026-11-22 16:39:36
++++ b/libarchive/CMakeLists.txt	2026-11-22 16:39:36
+@@ -105,6 +105,8 @@
+   archive_read_support_format_iso9660.c
+   archive_read_support_format_lha.c
+   archive_read_support_format_mtree.c
++  archive_rar_crypto.c
++  archive_rar_crypto_private.h
+   archive_read_support_format_rar.c
+   archive_read_support_format_rar5.c
+   archive_read_support_format_raw.c
+diff -ruN a/libarchive/archive_rar_crypto.c b/libarchive/archive_rar_crypto.c
+--- a/libarchive/archive_rar_crypto.c	1970-01-01 01:00:00
++++ b/libarchive/archive_rar_crypto.c	2026-11-22 16:39:36
+@@ -0,0 +1,473 @@
++/*-
++ * Copyright (c) 2026 ps5webkit
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "archive_platform.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "archive_rar_crypto_private.h"
++
++#if defined(HAVE_LIBCRYPTO) && defined(HAVE_OPENSSL_EVP_H)
++#define RAR_CRYPTO_OPENSSL 1
++#include <openssl/evp.h>
++#endif
++
++void
++__archive_rar_wipe(void *p, size_t n)
++{
++	volatile uint8_t *v = (volatile uint8_t *)p;
++
++	while (n--)
++		*v++ = 0;
++}
++
++#ifdef RAR_CRYPTO_OPENSSL
++
++struct rar_aes {
++	EVP_CIPHER_CTX *ctx;
++};
++
++int
++__archive_rar_crypto_available(void)
++{
++	return 1;
++}
++
++struct rar_aes *
++__archive_rar_aes_new(void)
++{
++	struct rar_aes *c = calloc(1, sizeof(*c));
++
++	if (c == NULL)
++		return NULL;
++	c->ctx = EVP_CIPHER_CTX_new();
++	if (c->ctx == NULL) {
++		free(c);
++		return NULL;
++	}
++	return c;
++}
++
++void
++__archive_rar_aes_free(struct rar_aes *c)
++{
++	if (c == NULL)
++		return;
++	EVP_CIPHER_CTX_free(c->ctx);
++	free(c);
++}
++
++int
++__archive_rar_aes_init(struct rar_aes *c, const uint8_t *key,
++    unsigned key_bits, const uint8_t iv[RAR_AES_BLOCK])
++{
++	const EVP_CIPHER *cipher = key_bits == 256 ? EVP_aes_256_cbc()
++	    : key_bits == 128 ? EVP_aes_128_cbc() : NULL;
++
++	if (c == NULL || cipher == NULL ||
++	    EVP_CIPHER_CTX_reset(c->ctx) != 1 ||
++	    EVP_DecryptInit_ex(c->ctx, cipher, NULL, key, iv) != 1 ||
++	    EVP_CIPHER_CTX_set_padding(c->ctx, 0) != 1)
++		return -1;
++	return 0;
++}
++
++int
++__archive_rar_aes_decrypt(struct rar_aes *c, const uint8_t *in,
++    uint8_t *out, size_t length)
++{
++	if (length % RAR_AES_BLOCK)
++		return -1;
++	while (length) {
++		/* EVP takes an int; padding is off, so it returns every
++		 * whole block at once. */
++		int n = length > (1u << 30) ? (1 << 30) : (int)length, got = 0;
++
++		if (EVP_DecryptUpdate(c->ctx, out, &got, in, n) != 1 ||
++		    got != n)
++			return -1;
++		in += n;
++		out += n;
++		length -= n;
++	}
++	return 0;
++}
++
++int
++__archive_rar_sha256(const void *data, size_t length, uint8_t out[32])
++{
++	unsigned int n = 0;
++
++	return EVP_Digest(data, length, out, &n, EVP_sha256(), NULL) == 1 &&
++	    n == 32 ? 0 : -1;
++}
++
++/* HMAC-SHA256 with the key's padded blocks hashed once (PBKDF2 runs it
++ * 2^15 times and more with one key). */
++struct hmac {
++	EVP_MD_CTX *inner, *outer, *work;
++};
++
++static void
++hmac_free(struct hmac *h)
++{
++	EVP_MD_CTX_free(h->inner);
++	EVP_MD_CTX_free(h->outer);
++	EVP_MD_CTX_free(h->work);
++}
++
++static int
++hmac_init(struct hmac *h, const void *key, size_t key_length)
++{
++	uint8_t hashed[32], pad[64];
++	size_t i;
++	int ok;
++
++	h->inner = EVP_MD_CTX_new();
++	h->outer = EVP_MD_CTX_new();
++	h->work = EVP_MD_CTX_new();
++	if (h->inner == NULL || h->outer == NULL || h->work == NULL)
++		return -1;
++	if (key_length > 64) {
++		if (__archive_rar_sha256(key, key_length, hashed))
++			return -1;
++		key = hashed;
++		key_length = 32;
++	}
++	for (i = 0; i < 64; i++)
++		pad[i] = (i < key_length ? ((const uint8_t *)key)[i] : 0) ^ 0x36;
++	ok = EVP_DigestInit_ex(h->inner, EVP_sha256(), NULL) == 1 &&
++	    EVP_DigestUpdate(h->inner, pad, 64) == 1;
++	for (i = 0; i < 64; i++)
++		pad[i] ^= 0x36 ^ 0x5c;
++	ok = ok && EVP_DigestInit_ex(h->outer, EVP_sha256(), NULL) == 1 &&
++	    EVP_DigestUpdate(h->outer, pad, 64) == 1;
++	__archive_rar_wipe(pad, sizeof(pad));
++	__archive_rar_wipe(hashed, sizeof(hashed));
++	return ok ? 0 : -1;
++}
++
++static int
++hmac_run(struct hmac *h, const void *data, size_t length, uint8_t out[32])
++{
++	uint8_t inner[32];
++	unsigned int n = 0;
++	int ok;
++
++	ok = EVP_MD_CTX_copy_ex(h->work, h->inner) == 1 &&
++	    EVP_DigestUpdate(h->work, data, length) == 1 &&
++	    EVP_DigestFinal_ex(h->work, inner, &n) == 1 && n == 32 &&
++	    EVP_MD_CTX_copy_ex(h->work, h->outer) == 1 &&
++	    EVP_DigestUpdate(h->work, inner, 32) == 1 &&
++	    EVP_DigestFinal_ex(h->work, out, &n) == 1 && n == 32;
++	return ok ? 0 : -1;
++}
++
++int
++__archive_rar_hmac_sha256(const void *key, size_t key_length,
++    const void *data, size_t length, uint8_t out[32])
++{
++	struct hmac h;
++	int r;
++
++	memset(&h, 0, sizeof(h));
++	r = hmac_init(&h, key, key_length) || hmac_run(&h, data, length, out)
++	    ? -1 : 0;
++	hmac_free(&h);
++	return r;
++}
++
++int
++__archive_rar5_kdf(const char *password, size_t password_length,
++    const uint8_t salt[16], unsigned lg2, uint8_t key[32],
++    uint8_t hash_key[32], uint8_t check[8])
++{
++	/* One PBKDF2 chain: the key after 2^lg2 rounds, then 16 more for the
++	 * hash key and 16 more for the password check. */
++	uint8_t block[20], u[32], fn[32], extra[32];
++	uint8_t *out[3];
++	uint32_t rounds[3];
++	struct hmac h;
++	unsigned i, j, k;
++	int r = -1;
++
++	if (lg2 > RAR5_KDF_LG2_MAX)
++		return -1;
++	memset(&h, 0, sizeof(h));
++	out[0] = key;
++	out[1] = hash_key;
++	out[2] = extra;
++	rounds[0] = (1u << lg2) - 1;
++	rounds[1] = 16;
++	rounds[2] = 16;
++	memcpy(block, salt, 16);
++	block[16] = 0;
++	block[17] = 0;
++	block[18] = 0;
++	block[19] = 1;
++	if (hmac_init(&h, password, password_length) ||
++	    hmac_run(&h, block, sizeof(block), u))
++		goto done;
++	memcpy(fn, u, 32);
++	for (i = 0; i < 3; i++) {
++		for (j = 0; j < rounds[i]; j++) {
++			if (hmac_run(&h, u, 32, u))
++				goto done;
++			for (k = 0; k < 32; k++)
++				fn[k] ^= u[k];
++		}
++		memcpy(out[i], fn, 32);
++	}
++	memset(check, 0, 8);
++	for (k = 0; k < 32; k++)
++		check[k % 8] ^= extra[k];
++	r = 0;
++done:
++	hmac_free(&h);
++	__archive_rar_wipe(u, sizeof(u));
++	__archive_rar_wipe(fn, sizeof(fn));
++	__archive_rar_wipe(extra, sizeof(extra));
++	return r;
++}
++
++#else /* no crypto library */
++
++int
++__archive_rar_crypto_available(void)
++{
++	return 0;
++}
++
++struct rar_aes *
++__archive_rar_aes_new(void)
++{
++	return NULL;
++}
++
++void
++__archive_rar_aes_free(struct rar_aes *c)
++{
++	(void)c;
++}
++
++int
++__archive_rar_aes_init(struct rar_aes *c, const uint8_t *key,
++    unsigned key_bits, const uint8_t iv[RAR_AES_BLOCK])
++{
++	(void)c; (void)key; (void)key_bits; (void)iv;
++	return -1;
++}
++
++int
++__archive_rar_aes_decrypt(struct rar_aes *c, const uint8_t *in,
++    uint8_t *out, size_t length)
++{
++	(void)c; (void)in; (void)out; (void)length;
++	return -1;
++}
++
++int
++__archive_rar_sha256(const void *data, size_t length, uint8_t out[32])
++{
++	(void)data; (void)length; (void)out;
++	return -1;
++}
++
++int
++__archive_rar_hmac_sha256(const void *key, size_t key_length,
++    const void *data, size_t length, uint8_t out[32])
++{
++	(void)key; (void)key_length; (void)data; (void)length; (void)out;
++	return -1;
++}
++
++int
++__archive_rar5_kdf(const char *password, size_t password_length,
++    const uint8_t salt[16], unsigned lg2, uint8_t key[32],
++    uint8_t hash_key[32], uint8_t check[8])
++{
++	(void)password; (void)password_length; (void)salt; (void)lg2;
++	(void)key; (void)hash_key; (void)check;
++	return -1;
++}
++
++#endif
++
++/*
++ * SHA-1 as RAR 2.9 and 3.x compute it for their key: when a whole 64-byte
++ * block is hashed straight from the caller's data (not through the
++ * context's buffer), the block's final 16 message schedule words are
++ * written back over it, little-endian. The key derivation hashes the same
++ * buffer 2^18 times, so passwords of 29 characters and more depend on it.
++ */
++struct rar_sha1 {
++	uint32_t state[5];
++	uint64_t count;
++	uint8_t buffer[64];
++};
++
++#define ROL32(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
++
++static void
++sha1_block(uint32_t state[5], uint32_t w[16], const uint8_t *data)
++{
++	uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
++	uint32_t e = state[4], f, k, t;
++	unsigned i;
++
++	for (i = 0; i < 16; i++)
++		w[i] = (uint32_t)data[4 * i] << 24 |
++		    (uint32_t)data[4 * i + 1] << 16 |
++		    (uint32_t)data[4 * i + 2] << 8 | data[4 * i + 3];
++	for (i = 0; i < 80; i++) {
++		if (i >= 16)
++			w[i & 15] = ROL32(w[(i + 13) & 15] ^ w[(i + 8) & 15] ^
++			    w[(i + 2) & 15] ^ w[i & 15], 1);
++		if (i < 20) {
++			f = (b & (c ^ d)) ^ d;
++			k = 0x5A827999;
++		} else if (i < 40) {
++			f = b ^ c ^ d;
++			k = 0x6ED9EBA1;
++		} else if (i < 60) {
++			f = ((b | c) & d) | (b & c);
++			k = 0x8F1BBCDC;
++		} else {
++			f = b ^ c ^ d;
++			k = 0xCA62C1D6;
++		}
++		t = ROL32(a, 5) + f + e + k + w[i & 15];
++		e = d;
++		d = c;
++		c = ROL32(b, 30);
++		b = a;
++		a = t;
++	}
++	state[0] += a;
++	state[1] += b;
++	state[2] += c;
++	state[3] += d;
++	state[4] += e;
++}
++
++static void
++sha1_init(struct rar_sha1 *s)
++{
++	s->count = 0;
++	s->state[0] = 0x67452301;
++	s->state[1] = 0xEFCDAB89;
++	s->state[2] = 0x98BADCFE;
++	s->state[3] = 0x10325476;
++	s->state[4] = 0xC3D2E1F0;
++}
++
++/* quirk: write the schedule back into whole blocks taken from data. */
++static void
++sha1_update(struct rar_sha1 *s, uint8_t *data, size_t length, int quirk)
++{
++	size_t i = 0, j = (size_t)(s->count & 63), k;
++	uint32_t w[16];
++
++	s->count += length;
++	if (j + length > 63) {
++		i = 64 - j;
++		memcpy(s->buffer + j, data, i);
++		sha1_block(s->state, w, s->buffer);
++		for (; i + 63 < length; i += 64) {
++			sha1_block(s->state, w, data + i);
++			if (quirk)
++				for (k = 0; k < 16; k++) {
++					data[i + 4 * k] = (uint8_t)w[k];
++					data[i + 4 * k + 1] = (uint8_t)(w[k] >> 8);
++					data[i + 4 * k + 2] = (uint8_t)(w[k] >> 16);
++					data[i + 4 * k + 3] = (uint8_t)(w[k] >> 24);
++				}
++		}
++		j = 0;
++	}
++	if (length > i)
++		memcpy(s->buffer + j, data + i, length - i);
++	__archive_rar_wipe(w, sizeof(w));
++}
++
++static void
++sha1_final(const struct rar_sha1 *in, uint32_t digest[5])
++{
++	struct rar_sha1 s = *in;
++	uint8_t pad[72];
++	uint64_t bits = s.count * 8;
++	size_t n = 64 - (size_t)(s.count & 63), i;
++
++	if (n < 9)
++		n += 64;
++	memset(pad, 0, sizeof(pad));
++	pad[0] = 0x80;
++	for (i = 0; i < 8; i++)
++		pad[n - 1 - i] = (uint8_t)(bits >> (8 * i));
++	sha1_update(&s, pad, n, 0);
++	memcpy(digest, s.state, sizeof(s.state));
++	__archive_rar_wipe(&s, sizeof(s));
++}
++
++void
++__archive_rar3_kdf(const uint8_t *password_utf16le, size_t length,
++    const uint8_t *salt, uint8_t key[16], uint8_t iv[16])
++{
++	enum { ROUNDS = 0x40000 };
++	uint8_t raw[2 * 128 + 8], number[3];
++	uint32_t digest[5];
++	struct rar_sha1 s;
++	size_t n;
++	unsigned i, j;
++
++	if (length > 2 * 128)
++		length = 2 * 128;
++	memcpy(raw, password_utf16le, length);
++	n = length;
++	if (salt != NULL) {
++		memcpy(raw + n, salt, 8);
++		n += 8;
++	}
++	sha1_init(&s);
++	for (i = 0; i < ROUNDS; i++) {
++		sha1_update(&s, raw, n, 1);
++		number[0] = (uint8_t)i;
++		number[1] = (uint8_t)(i >> 8);
++		number[2] = (uint8_t)(i >> 16);
++		sha1_update(&s, number, 3, 0);
++		if (i % (ROUNDS / 16) == 0) {
++			sha1_final(&s, digest);
++			iv[i / (ROUNDS / 16)] = (uint8_t)digest[4];
++		}
++	}
++	sha1_final(&s, digest);
++	for (i = 0; i < 4; i++)
++		for (j = 0; j < 4; j++)
++			key[i * 4 + j] = (uint8_t)(digest[i] >> (j * 8));
++	__archive_rar_wipe(raw, sizeof(raw));
++	__archive_rar_wipe(digest, sizeof(digest));
++	__archive_rar_wipe(&s, sizeof(s));
++}
+diff -ruN a/libarchive/archive_rar_crypto_private.h b/libarchive/archive_rar_crypto_private.h
+--- a/libarchive/archive_rar_crypto_private.h	1970-01-01 01:00:00
++++ b/libarchive/archive_rar_crypto_private.h	2026-11-22 16:39:36
+@@ -0,0 +1,85 @@
++/*-
++ * Copyright (c) 2026 ps5webkit
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * Decryption for the RAR readers: AES in CBC mode, SHA-256 and HMAC-SHA256
++ * (OpenSSL's EVP), and the two RAR key derivations: RAR5's PBKDF2-HMAC-SHA256
++ * with its two extra values, and RAR 3.x's 2^18 rounds of SHA-1 (with the
++ * quirk of RAR 2.9/3.x's SHA-1, which writes its message schedule back into
++ * the data it hashes).
++ */
++
++#ifndef ARCHIVE_RAR_CRYPTO_PRIVATE_H_INCLUDED
++#define ARCHIVE_RAR_CRYPTO_PRIVATE_H_INCLUDED
++
++#ifndef __LIBARCHIVE_BUILD
++#error This header is only to be used internally to libarchive.
++#endif
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define RAR_AES_BLOCK 16
++#define RAR5_KDF_LG2_MAX 24
++
++struct rar_aes;
++
++/* 1 when this libarchive was built with a crypto library, else 0 (and
++ * every function below fails). */
++int __archive_rar_crypto_available(void);
++
++/* A decryptor; NULL without memory or crypto. */
++struct rar_aes *__archive_rar_aes_new(void);
++void __archive_rar_aes_free(struct rar_aes *);
++/* key_bits 128 or 256. 0, or -1. */
++int __archive_rar_aes_init(struct rar_aes *, const uint8_t *key,
++    unsigned key_bits, const uint8_t iv[RAR_AES_BLOCK]);
++/* length a multiple of 16; in and out the same or apart. Chains on from
++ * the last call. 0, or -1. */
++int __archive_rar_aes_decrypt(struct rar_aes *, const uint8_t *in,
++    uint8_t *out, size_t length);
++
++/* 0, or -1. */
++int __archive_rar_sha256(const void *data, size_t length, uint8_t out[32]);
++int __archive_rar_hmac_sha256(const void *key, size_t key_length,
++    const void *data, size_t length, uint8_t out[32]);
++
++/* RAR5: key from PBKDF2-HMAC-SHA256(password, salt, 2^lg2), hash_key the
++ * same after 16 more rounds, check the 8-byte password check folded from
++ * the value after 16 more. 0, or -1 (lg2 over RAR5_KDF_LG2_MAX, no
++ * crypto). */
++int __archive_rar5_kdf(const char *password, size_t password_length,
++    const uint8_t salt[16], unsigned lg2, uint8_t key[32],
++    uint8_t hash_key[32], uint8_t check[8]);
++
++/* RAR 3.x (RAR4 archives): AES-128 key and IV from the password as
++ * UTF-16LE and the 8-byte salt (NULL: none). */
++void __archive_rar3_kdf(const uint8_t *password_utf16le, size_t length,
++    const uint8_t *salt, uint8_t key[16], uint8_t iv[16]);
++
++/* Clears memory the compiler can't drop. */
++void __archive_rar_wipe(void *, size_t);
++
++#endif
+diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+--- a/libarchive/archive_read_support_format_rar5.c	2026-11-22 16:39:36
++++ b/libarchive/archive_read_support_format_rar5.c	2026-11-22 16:39:36
+@@ -47,6 +47,7 @@
+ #include "archive_ppmd7_private.h"
+ #include "archive_entry_private.h"
+ #include "archive_time_private.h"
++#include "archive_rar_crypto_private.h"
+ 
+ #ifdef HAVE_BLAKE2_H
+ #include <blake2.h>
+@@ -315,6 +316,63 @@
+ 	uint8_t* push_buf;
+ };
+ 
++/* Decryption (ps5webkit). With encrypted headers (rar -hp) each header after
++ * the archive encryption header is an IV and the header, AES-256-CBC, padded
++ * to 16 bytes; it is decrypted whole into `hbuf`, which read_ahead() and
++ * consume() then serve until the header is parsed. A file's data is one
++ * AES-256-CBC stream across all of its volumes (a volume can end inside a
++ * block); while it is read, read_ahead() and consume() serve the plain text
++ * from `dbuf`. Per volume, file.bytes_remaining counts the plain text that
++ * volume completes, so the rest of the reader sees an ordinary stream. */
++#define RAR5_KDF_CACHE 4
++struct rar5_kdf_cache {
++	uint8_t used;
++	uint8_t lg2;
++	uint8_t salt[16];
++	uint8_t password[32];  /* SHA-256 of the password */
++	uint8_t key[32];
++	uint8_t hash_key[32];
++	uint8_t check[8];
++};
++
++struct rar5_crypt {
++	/* The archive encryption header of this volume. */
++	uint8_t headers;          /* headers after it are encrypted */
++	uint8_t header_key[32];
++
++	/* The decrypted header being parsed. */
++	uint8_t hactive;
++	uint8_t* hbuf;
++	size_t hcap, hlen, hpos;
++
++	/* The current file's encryption record. */
++	uint8_t file;             /* its data is encrypted */
++	uint8_t has_check;
++	uint8_t mac;              /* its checksums are HMACs (hash_key) */
++	uint8_t keyed;            /* key and aes are set up */
++	uint8_t broken;           /* skipped without decrypting; no more */
++	uint8_t lg2;
++	uint8_t salt[16];
++	uint8_t iv[16];
++	uint8_t check[8];
++	uint8_t hash_key[32];
++	struct rar_aes* aes;
++	struct rar_aes* haes;     /* headers */
++	uint8_t service;          /* parsing a service header */
++
++	/* The plain text view of its data. */
++	uint8_t dactive;
++	uint64_t raw_left;        /* this volume's cipher text not read */
++	uint64_t raw_done;        /* cipher text read, all volumes */
++	uint8_t carry[16];        /* cipher text short of a whole block */
++	size_t carry_len;
++	uint8_t* dbuf;
++	size_t dcap, dlen, dpos;
++
++	struct rar5_kdf_cache kdf[RAR5_KDF_CACHE];
++	unsigned kdf_next;
++};
++
+ /* Main context structure. */
+ struct rar5 {
+ 	int header_initialized;
+@@ -365,6 +423,8 @@
+ 	 */
+ 	int has_encrypted_entries;
+ 	int headers_are_encrypted;
++
++	struct rar5_crypt crypt;
+ };
+ 
+ /* Forward function declarations. */
+@@ -898,7 +958,7 @@
+ 	return ARCHIVE_OK;
+ }
+ 
+-static int read_ahead(struct archive_read* a, size_t how_many,
++static int raw_read_ahead(struct archive_read* a, size_t how_many,
+     const uint8_t** ptr)
+ {
+ 	ssize_t avail = -1;
+@@ -913,7 +973,7 @@
+ 	return 1;
+ }
+ 
+-static int consume(struct archive_read* a, int64_t how_many) {
++static int raw_consume(struct archive_read* a, int64_t how_many) {
+ 	int ret;
+ 
+ 	ret = how_many == __archive_read_consume(a, how_many)
+@@ -923,6 +983,575 @@
+ 	return ret;
+ }
+ 
++static int read_var(struct archive_read* a, uint64_t* pvalue,
++    uint64_t* pvalue_len);
++
++/* Zero bytes kept after the end of decrypted text: read_var() and the bit
++ * reader look up to 8 bytes past what they use. */
++#define RAR5_SLACK 64
++#ifndef RAR5_CHUNK
++#define RAR5_CHUNK (64 * 1024) /* decrypted at a time */
++#endif
++
++/* Decrypts this volume's cipher text until want bytes of plain text are
++ * ready at dbuf + dpos (or the volume's part has ended: then zeros). 1, or
++ * 0 (not keyed, short read, decryption failed). */
++static int dview_fill(struct archive_read* a, struct rar5* rar, size_t want)
++{
++	struct rar5_crypt* c = &rar->crypt;
++	size_t have = c->dlen - c->dpos;
++
++	if(have >= want)
++		return 1;
++	if(!c->keyed || c->broken || want > SIZE_MAX - 2 * RAR5_CHUNK)
++		return 0;
++
++	if(c->dpos > 0) {
++		memmove(c->dbuf, c->dbuf + c->dpos, have);
++		c->dlen = have;
++		c->dpos = 0;
++	}
++
++	if(c->dcap < want + RAR5_CHUNK + RAR5_SLACK) {
++		size_t cap = want + RAR5_CHUNK + RAR5_SLACK;
++		uint8_t* d = realloc(c->dbuf, cap);
++		if(d == NULL)
++			return 0;
++		c->dbuf = d;
++		c->dcap = cap;
++	}
++
++	while(c->dlen < want && c->raw_left > 0) {
++		size_t space = ((c->dcap - RAR5_SLACK - c->dlen) / 16) * 16;
++		size_t t = space - c->carry_len, used = 0, whole;
++		ssize_t avail = 0;
++		const uint8_t* p;
++
++		if(t > c->raw_left)
++			t = (size_t) c->raw_left;
++		p = __archive_read_ahead(a, t, &avail);
++		if(p == NULL) {
++			/* Fewer bytes buffered than asked for: take those. */
++			if(avail <= 0)
++				return 0;
++			t = (size_t) avail;
++			p = __archive_read_ahead(a, t, &avail);
++			if(p == NULL)
++				return 0;
++		}
++
++		if(c->carry_len > 0) {
++			size_t n = 16 - c->carry_len;
++			if(n > t)
++				n = t;
++			memcpy(c->carry + c->carry_len, p, n);
++			c->carry_len += n;
++			used = n;
++			if(c->carry_len == 16) {
++				if(__archive_rar_aes_decrypt(c->aes, c->carry,
++				    c->dbuf + c->dlen, 16))
++					return 0;
++				c->dlen += 16;
++				c->carry_len = 0;
++			}
++		}
++
++		whole = ((t - used) / 16) * 16;
++		if(whole > 0) {
++			if(__archive_rar_aes_decrypt(c->aes, p + used,
++			    c->dbuf + c->dlen, whole))
++				return 0;
++			c->dlen += whole;
++			used += whole;
++		}
++
++		if(t > used) {
++			memcpy(c->carry + c->carry_len, p + used, t - used);
++			c->carry_len += t - used;
++		}
++
++		__archive_read_consume(a, t);
++		c->raw_left -= t;
++		c->raw_done += t;
++	}
++
++	memset(c->dbuf + c->dlen, 0, RAR5_SLACK);
++	if(c->dlen - c->dpos >= want)
++		return 1;
++
++	/* Past the end of this volume's part: the zeros. */
++	return c->raw_left == 0 && want - (c->dlen - c->dpos) <= RAR5_SLACK;
++}
++
++/* When no whole block is left in this volume's part, its last cipher text
++ * bytes go to carry (the next volume completes the block) and reads go
++ * back to the raw stream. */
++static int dview_settle(struct archive_read* a, struct rar5* rar)
++{
++	struct rar5_crypt* c = &rar->crypt;
++
++	if(!c->dactive || c->dpos < c->dlen ||
++	    (c->carry_len + c->raw_left) >= 16)
++		return ARCHIVE_OK;
++
++	if(c->raw_left > 0) {
++		const uint8_t* p = __archive_read_ahead(a,
++		    (size_t) c->raw_left, NULL);
++		if(p == NULL)
++			return ARCHIVE_FATAL;
++		memcpy(c->carry + c->carry_len, p, (size_t) c->raw_left);
++		c->carry_len += (size_t) c->raw_left;
++		__archive_read_consume(a, c->raw_left);
++		c->raw_done += c->raw_left;
++		c->raw_left = 0;
++	}
++
++	c->dactive = 0;
++	return ARCHIVE_OK;
++}
++
++static int dview_consume(struct archive_read* a, struct rar5* rar,
++    int64_t how_many)
++{
++	struct rar5_crypt* c = &rar->crypt;
++	uint64_t n = (uint64_t) how_many, have = c->dlen - c->dpos, rest;
++
++	if(how_many < 0)
++		return ARCHIVE_FATAL;
++
++	if(n <= have) {
++		c->dpos += (size_t) n;
++		return dview_settle(a, rar);
++	}
++
++	n -= have;
++	c->dpos = c->dlen;
++	rest = ((c->carry_len + c->raw_left) / 16) * 16;
++	if(n > rest)
++		return ARCHIVE_FATAL;
++
++	if(n == rest) {
++		/* All of it (skipping a file): drop the cipher text without
++		 * decrypting it. Its stream can't be decrypted after this. */
++		if(c->raw_left > 0 &&
++		    __archive_read_consume(a, c->raw_left) != c->raw_left)
++			return ARCHIVE_FATAL;
++		c->raw_done += c->raw_left;
++		c->carry_len = (size_t) ((c->carry_len + c->raw_left) % 16);
++		c->raw_left = 0;
++		c->broken = 1;
++		c->dactive = 0;
++		return ARCHIVE_OK;
++	}
++
++	while(n > 0) {
++		size_t step = n > RAR5_CHUNK ? RAR5_CHUNK : (size_t) n;
++		if(!dview_fill(a, rar, step))
++			return ARCHIVE_FATAL;
++		c->dpos += step;
++		n -= step;
++	}
++
++	return dview_settle(a, rar);
++}
++
++static int read_ahead(struct archive_read* a, size_t how_many,
++    const uint8_t** ptr)
++{
++	struct rar5* rar = get_context(a);
++
++	if(!ptr)
++		return 0;
++
++	if(rar->crypt.hactive) {
++		if(how_many > rar->crypt.hlen - rar->crypt.hpos + RAR5_SLACK)
++			return 0;
++		*ptr = rar->crypt.hbuf + rar->crypt.hpos;
++		return 1;
++	}
++
++	if(rar->crypt.dactive) {
++		if(!dview_fill(a, rar, how_many))
++			return 0;
++		*ptr = rar->crypt.dbuf + rar->crypt.dpos;
++		return 1;
++	}
++
++	return raw_read_ahead(a, how_many, ptr);
++}
++
++static int consume(struct archive_read* a, int64_t how_many) {
++	struct rar5* rar = get_context(a);
++
++	if(rar->crypt.hactive) {
++		if(how_many < 0 || (uint64_t) how_many >
++		    rar->crypt.hlen - rar->crypt.hpos)
++			return ARCHIVE_FATAL;
++		rar->crypt.hpos += (size_t) how_many;
++		return ARCHIVE_OK;
++	}
++
++	if(rar->crypt.dactive)
++		return dview_consume(a, rar, how_many);
++
++	return raw_consume(a, how_many);
++}
++
++/* The rest of a decrypted header (its padding) is dropped. */
++static void end_header(struct rar5* rar) {
++	rar->crypt.hactive = 0;
++}
++
++/* Key, hash key and check for a password, salt and count: derived once
++ * (RAR uses one salt for a whole archive). 0, or -1. */
++static int rar5_derive(struct rar5* rar, const char* password,
++    const uint8_t salt[16], unsigned lg2, uint8_t key[32],
++    uint8_t hash_key[32], uint8_t check[8])
++{
++	struct rar5_crypt* c = &rar->crypt;
++	struct rar5_kdf_cache* k;
++	uint8_t id[32];
++	size_t length = strlen(password);
++	int i;
++
++	if(__archive_rar_sha256(password, length, id))
++		return -1;
++
++	for(i = 0; i < RAR5_KDF_CACHE; i++) {
++		k = &c->kdf[i];
++		if(k->used && k->lg2 == lg2 && !memcmp(k->salt, salt, 16) &&
++		    !memcmp(k->password, id, 32)) {
++			memcpy(key, k->key, 32);
++			memcpy(hash_key, k->hash_key, 32);
++			memcpy(check, k->check, 8);
++			return 0;
++		}
++	}
++
++	if(__archive_rar5_kdf(password, length, salt, lg2, key, hash_key,
++	    check))
++		return -1;
++
++	k = &c->kdf[c->kdf_next++ % RAR5_KDF_CACHE];
++	k->used = 1;
++	k->lg2 = (uint8_t) lg2;
++	memcpy(k->salt, salt, 16);
++	memcpy(k->password, id, 32);
++	memcpy(k->key, key, 32);
++	memcpy(k->hash_key, hash_key, 32);
++	memcpy(k->check, check, 8);
++	return 0;
++}
++
++/* Tries the passphrases (archive_read_add_passphrase, or the callback)
++ * against a check value, or takes the first without one. ARCHIVE_OK with
++ * key and hash_key set; ARCHIVE_FAILED with the error set: none given, or
++ * none right; ARCHIVE_FATAL: no crypto, no memory. */
++static int rar5_find_key(struct archive_read* a, struct rar5* rar,
++    const uint8_t salt[16], unsigned lg2, int has_check,
++    const uint8_t want[8], uint8_t key[32], uint8_t hash_key[32])
++{
++	const char* password;
++	uint8_t check[8];
++	int tried = 0;
++
++	if(!__archive_rar_crypto_available()) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Decryption is not supported: this libarchive has no "
++		    "crypto library");
++		return ARCHIVE_FATAL;
++	}
++
++	__archive_read_reset_passphrase(a);
++	while((password = __archive_read_next_passphrase(a)) != NULL) {
++		tried++;
++		if(rar5_derive(rar, password, salt, lg2, key, hash_key,
++		    check)) {
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++			    "Can't derive the decryption key");
++			return ARCHIVE_FATAL;
++		}
++		if(!has_check || !memcmp(check, want, 8))
++			return ARCHIVE_OK;
++	}
++
++	archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC, tried
++	    ? "Incorrect passphrase" : "Passphrase required for this entry");
++	return ARCHIVE_FAILED;
++}
++
++/* Sets up decryption of the current file's data, before its first read. */
++static int rar5_file_key(struct archive_read* a, struct rar5* rar) {
++	struct rar5_crypt* c = &rar->crypt;
++	uint8_t key[32];
++	int ret;
++
++	if(c->keyed)
++		return ARCHIVE_OK;
++
++	ret = rar5_find_key(a, rar, c->salt, c->lg2, c->has_check, c->check,
++	    key, c->hash_key);
++	if(ret != ARCHIVE_OK)
++		return ret;
++
++	if(c->aes == NULL)
++		c->aes = __archive_rar_aes_new();
++	if(c->aes == NULL ||
++	    __archive_rar_aes_init(c->aes, key, 256, c->iv)) {
++		__archive_rar_wipe(key, sizeof(key));
++		archive_set_error(&a->archive, ENOMEM,
++		    "Can't set up decryption");
++		return ARCHIVE_FATAL;
++	}
++
++	__archive_rar_wipe(key, sizeof(key));
++	c->keyed = 1;
++	return ARCHIVE_OK;
++}
++
++/* A file header's encryption record. */
++static int parse_file_extra_crypt(struct archive_read* a, struct rar5* rar,
++    int64_t* extra_data_size, uint64_t field_size)
++{
++	struct rar5_crypt* c = &rar->crypt;
++	uint64_t version = 0, flags = 0, len = 0, used = 0;
++	uint8_t sum[32];
++	const uint8_t* p;
++	size_t need;
++
++	enum { CRYPT_PSWCHECK = 0x01, CRYPT_HASHMAC = 0x02 };
++
++	if(!read_var(a, &version, &len) || ARCHIVE_OK != consume(a, len))
++		return ARCHIVE_EOF;
++	used += len;
++	if(!read_var(a, &flags, &len) || ARCHIVE_OK != consume(a, len))
++		return ARCHIVE_EOF;
++	used += len;
++
++	if(version != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported encryption version (%ju)",
++		    (uintmax_t) version);
++		return ARCHIVE_FATAL;
++	}
++
++	need = 1 + 16 + 16 + ((flags & CRYPT_PSWCHECK) ? 12 : 0);
++	if(used + need > field_size) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Truncated encryption record");
++		return ARCHIVE_FATAL;
++	}
++	if(!read_ahead(a, need, &p))
++		return ARCHIVE_EOF;
++
++	if(!c->service) {
++		if(p[0] > RAR5_KDF_LG2_MAX) {
++			archive_set_error(&a->archive,
++			    ARCHIVE_ERRNO_FILE_FORMAT,
++			    "Unsupported key derivation count (2^%u)",
++			    (unsigned) p[0]);
++			return ARCHIVE_FATAL;
++		}
++		c->file = 1;
++		c->lg2 = p[0];
++		memcpy(c->salt, p + 1, 16);
++		memcpy(c->iv, p + 17, 16);
++		c->mac = (flags & CRYPT_HASHMAC) != 0;
++		c->has_check = 0;
++		if(flags & CRYPT_PSWCHECK) {
++			/* Use the check value only when its own checksum
++			 * holds (a damaged one would refuse a right
++			 * password). */
++			memcpy(c->check, p + 33, 8);
++			c->has_check =
++			    !__archive_rar_sha256(c->check, 8, sum) &&
++			    !memcmp(sum, p + 41, 4);
++		}
++	}
++
++	if(ARCHIVE_OK != consume(a, need))
++		return ARCHIVE_EOF;
++	used += need;
++
++	/* Anything a later version adds to the record. */
++	if(field_size > used && ARCHIVE_OK != consume(a, field_size - used))
++		return ARCHIVE_EOF;
++
++	*extra_data_size -= field_size;
++	return ARCHIVE_OK;
++}
++
++/* The archive encryption header (rar -hp): every header after it in this
++ * volume is encrypted. */
++static int process_head_crypt(struct archive_read* a, struct rar5* rar,
++    struct archive_entry* entry)
++{
++	struct rar5_crypt* c = &rar->crypt;
++	uint64_t version = 0, flags = 0;
++	uint8_t hash_key[32], salt[16], check[8], sum[32];
++	const uint8_t* p;
++	unsigned lg2;
++	int has_check = 0, ret;
++
++	archive_entry_set_is_metadata_encrypted(entry, 1);
++	archive_entry_set_is_data_encrypted(entry, 1);
++	rar->has_encrypted_entries = 1;
++	rar->headers_are_encrypted = 1;
++
++	if(!read_var(a, &version, NULL) || !read_var(a, &flags, NULL))
++		return ARCHIVE_EOF;
++	if(version != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported encryption version (%ju)",
++		    (uintmax_t) version);
++		return ARCHIVE_FATAL;
++	}
++
++	if(!read_ahead(a, 1 + 16 + ((flags & 1) ? 12 : 0), &p))
++		return ARCHIVE_EOF;
++	lg2 = p[0];
++	if(lg2 > RAR5_KDF_LG2_MAX) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported key derivation count (2^%u)", lg2);
++		return ARCHIVE_FATAL;
++	}
++	memcpy(salt, p + 1, 16);
++	if(flags & 1) {
++		memcpy(check, p + 17, 8);
++		has_check = !__archive_rar_sha256(check, 8, sum) &&
++		    !memcmp(sum, p + 25, 4);
++	}
++	if(ARCHIVE_OK != consume(a, 1 + 16 + ((flags & 1) ? 12 : 0)))
++		return ARCHIVE_EOF;
++
++	ret = rar5_find_key(a, rar, salt, lg2, has_check, check,
++	    c->header_key, hash_key);
++	__archive_rar_wipe(hash_key, sizeof(hash_key));
++	if(ret != ARCHIVE_OK)
++		return ARCHIVE_FATAL;
++
++	if(c->haes == NULL)
++		c->haes = __archive_rar_aes_new();
++	if(c->haes == NULL) {
++		archive_set_error(&a->archive, ENOMEM,
++		    "Can't set up decryption");
++		return ARCHIVE_FATAL;
++	}
++
++	c->headers = 1;
++	return ARCHIVE_OK;
++}
++
++/* With encrypted headers: decrypts the next one (IV, then the header
++ * padded to 16 bytes) into hbuf, which then serves read_ahead()/consume(). */
++static int read_encrypted_header(struct archive_read* a, struct rar5* rar) {
++	struct rar5_crypt* c = &rar->crypt;
++	uint8_t first[16];
++	uint64_t size = 0;
++	size_t total, i, shift;
++	const uint8_t* p;
++
++	p = __archive_read_ahead(a, 32, NULL);
++	if(p == NULL)
++		return ARCHIVE_EOF;
++	if(__archive_rar_aes_init(c->haes, c->header_key, 256, p) ||
++	    __archive_rar_aes_decrypt(c->haes, p + 16, first, 16)) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Can't decrypt a header");
++		return ARCHIVE_FATAL;
++	}
++
++	/* CRC32, then the header size (up to 2 MB: at most 3 bytes). */
++	for(i = 4, shift = 0; i < 16; i++, shift += 7) {
++		size |= (uint64_t) (first[i] & 0x7F) << shift;
++		if(!(first[i] & 0x80))
++			break;
++	}
++	if(i >= 8 || size == 0 || size > 2 * 1024 * 1024) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Header decryption failed: an incorrect passphrase, or "
++		    "a damaged archive");
++		return ARCHIVE_FATAL;
++	}
++	total = (size_t) ((i + 1 + size + 15) & ~(uint64_t) 15);
++
++	if(c->hcap < total + RAR5_SLACK) {
++		uint8_t* b = realloc(c->hbuf, total + RAR5_SLACK);
++		if(b == NULL) {
++			archive_set_error(&a->archive, ENOMEM,
++			    "Can't allocate a header buffer");
++			return ARCHIVE_FATAL;
++		}
++		c->hbuf = b;
++		c->hcap = total + RAR5_SLACK;
++	}
++
++	p = __archive_read_ahead(a, 16 + total, NULL);
++	if(p == NULL)
++		return ARCHIVE_EOF;
++	if(__archive_rar_aes_init(c->haes, c->header_key, 256, p) ||
++	    __archive_rar_aes_decrypt(c->haes, p + 16, c->hbuf, total)) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Can't decrypt a header");
++		return ARCHIVE_FATAL;
++	}
++	memset(c->hbuf + total, 0, RAR5_SLACK);
++	__archive_read_consume(a, 16 + total);
++
++	c->hlen = total;
++	c->hpos = 0;
++	c->hactive = 1;
++	return ARCHIVE_OK;
++}
++
++/* After a file header: its data is read through the plain text view. The
++ * view of this volume is as long as the whole blocks its cipher text
++ * completes. */
++static int start_file_data(struct archive_read* a, struct rar5* rar,
++    size_t data_size)
++{
++	struct rar5_crypt* c = &rar->crypt;
++	uint64_t end = (c->raw_done + data_size) & ~(uint64_t) 15;
++	uint64_t start = c->raw_done & ~(uint64_t) 15;
++
++	c->raw_left = data_size;
++	c->dlen = 0;
++	c->dpos = 0;
++	c->dactive = data_size > 0;
++	rar->file.bytes_remaining = (ssize_t) (end - start);
++	return dview_settle(a, rar);
++}
++
++/* A new file (not the next volume's part of this one). */
++static void reset_file_crypt(struct rar5* rar) {
++	struct rar5_crypt* c = &rar->crypt;
++
++	c->file = 0;
++	c->keyed = 0;
++	c->broken = 0;
++	c->dactive = 0;
++	c->raw_left = 0;
++	c->raw_done = 0;
++	c->carry_len = 0;
++	c->dlen = 0;
++	c->dpos = 0;
++	__archive_rar_wipe(c->hash_key, sizeof(c->hash_key));
++}
++
++/* A checksum stored as an HMAC (encrypted files, -htb or not). */
++static uint32_t crc_mac(const uint8_t hash_key[32], uint32_t crc) {
++	uint8_t raw[4], d[32];
++	uint32_t v = 0;
++	int i;
++
++	archive_le32enc(raw, crc);
++	if(__archive_rar_hmac_sha256(hash_key, 32, raw, 4, d))
++		return ~crc; /* fails the comparison */
++	for(i = 0; i < 32; i++)
++		v ^= (uint32_t) d[i] << ((i & 3) * 8);
++	return v;
++}
++
+ /**
+  * Read a RAR5 variable sized numeric value. This value will be stored in
+  * `pvalue`. The `pvalue_len` argument points to a variable that will receive
+@@ -1665,8 +2294,11 @@
+ 				/* Mark the entry as encrypted */
+ 				archive_entry_set_is_data_encrypted(e, 1);
+ 				rar->has_encrypted_entries = 1;
+-				rar->cstate.data_encrypted = 1;
+-				/* fallthrough */
++				ret = parse_file_extra_crypt(a, rar,
++				    &extra_data_size, extra_field_size);
++				if(ret != ARCHIVE_OK)
++					return ret;
++				break;
+ 			case EX_SUBDATA:
+ 				/* fallthrough */
+ 			default:
+@@ -1728,6 +2360,18 @@
+ 		reset_file_context(rar);
+ 	}
+ 
++	/* A service header leaves the current file's decryption alone (one
++	 * can come between the volumes of a file); a file's next volume
++	 * carries on its cipher stream. */
++	if(!rar->crypt.service) {
++		if(!rar->cstate.switch_multivolume &&
++		    !rar->generic.split_before)
++			reset_file_crypt(rar);
++		rar->crypt.file = 0;
++	}
++	if(rar->crypt.headers)
++		archive_entry_set_is_metadata_encrypted(entry, 1);
++
+ 	if(block_flags & HFL_EXTRA_DATA) {
+ 		uint64_t edata_size = 0;
+ 		if(!read_var(a, &edata_size, NULL))
+@@ -1999,6 +2643,16 @@
+ 		rar->cstate.initialized = 0;
+ 	}
+ 
++	/* The header is parsed; its data follows. */
++	end_header(rar);
++	if(!rar->crypt.service) {
++		if(rar->crypt.file) {
++			if(ARCHIVE_OK != start_file_data(a, rar, data_size))
++				return ARCHIVE_FATAL;
++		} else
++			rar->crypt.dactive = 0;
++	}
++
+ 	if(rar->generic.split_before > 0) {
+ 		/* If now we're standing on a header that has a 'split before'
+ 		 * mark, it means we're standing on a 'continuation' file
+@@ -2015,8 +2669,13 @@
+ static int process_head_service(struct archive_read* a, struct rar5* rar,
+     struct archive_entry* entry, size_t block_flags)
+ {
+-	/* Process this SERVICE block the same way as FILE blocks. */
+-	int ret = process_head_file(a, rar, entry, block_flags);
++	/* Process this SERVICE block the same way as FILE blocks. Its data,
++	 * encrypted or not, is skipped as it is. */
++	int ret;
++
++	rar->crypt.service = 1;
++	ret = process_head_file(a, rar, entry, block_flags);
++	rar->crypt.service = 0;
+ 	if(ret != ARCHIVE_OK)
+ 		return ret;
+ 
+@@ -2222,7 +2881,7 @@
+  * <FILE> block.
+  */
+ 
+-static int process_base_block(struct archive_read* a,
++static int process_base_block_parse(struct archive_read* a,
+     struct archive_entry* entry)
+ {
+ 	const size_t SMALLEST_RAR5_BLOCK_SIZE = 3;
+@@ -2246,6 +2905,12 @@
+ 	if(ret != ARCHIVE_OK)
+ 		return ret;
+ 
++	if(rar->crypt.headers) {
++		ret = read_encrypted_header(a, rar);
++		if(ret != ARCHIVE_OK)
++			return ret;
++	}
++
+ 	/* Read the expected CRC32 checksum. */
+ 	if(!read_u32(a, &hdr_crc)) {
+ 		return ARCHIVE_EOF;
+@@ -2288,7 +2953,8 @@
+ 	if(computed_crc != hdr_crc) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-		    "Header CRC error");
++		    rar->crypt.hactive ? "Header CRC error (an incorrect "
++		    "passphrase, or a damaged archive)" : "Header CRC error");
+ 
+ 		return ARCHIVE_FATAL;
+ #endif
+@@ -2330,17 +2996,18 @@
+ 			ret = process_head_file(a, rar, entry, header_flags);
+ 			return ret;
+ 		case HEAD_CRYPT:
+-			archive_entry_set_is_metadata_encrypted(entry, 1);
+-			archive_entry_set_is_data_encrypted(entry, 1);
+-			rar->has_encrypted_entries = 1;
+-			rar->headers_are_encrypted = 1;
+-			archive_set_error(&a->archive,
+-			    ARCHIVE_ERRNO_FILE_FORMAT,
+-			    "Encryption is not supported");
+-			return ARCHIVE_FATAL;
++			ret = process_head_crypt(a, rar, entry);
++			if(ret == ARCHIVE_OK)
++				return ARCHIVE_RETRY;
++			return ret;
+ 		case HEAD_ENDARC:
+ 			rar->main.endarc = 1;
+ 
++			/* The next volume starts with its own encryption
++			 * header, unencrypted. */
++			end_header(rar);
++			rar->crypt.headers = 0;
++
+ 			/* After encountering an end of file marker, we need
+ 			 * to take into consideration if this archive is
+ 			 * continued in another file (i.e. is it part01.rar:
+@@ -2392,6 +3059,17 @@
+ #endif
+ }
+ 
++static int process_base_block(struct archive_read* a,
++    struct archive_entry* entry)
++{
++	int ret = process_base_block_parse(a, entry);
++
++	/* Whatever is left of a decrypted header is padding (or a header
++	 * this reader doesn't parse to its end). */
++	end_header(get_context(a));
++	return ret;
++}
++
+ static int skip_base_block(struct archive_read* a) {
+ 	int ret;
+ 	struct rar5* rar = get_context(a);
+@@ -3951,6 +4629,15 @@
+ 	}
+ 
+ 	to_read = rar5_min(rar->file.bytes_remaining, 64 * 1024);
++	if(rar->crypt.file && !rar->file.service) {
++		/* The cipher text is padded to 16 bytes: stop at the size. */
++		int64_t left = rar->file.unpacked_size -
++		    rar->cstate.last_unstore_ptr;
++		if(left < 0)
++			left = 0;
++		if((int64_t) to_read > left)
++			to_read = (size_t) left;
++	}
+ 	if(to_read == 0) {
+ 		return ARCHIVE_EOF;
+ 	}
+@@ -3973,6 +4660,15 @@
+ 	rar->cstate.last_unstore_ptr += to_read;
+ 
+ 	update_crc(rar, p, to_read);
++
++	if(rar->crypt.file && !rar->file.service &&
++	    rar->cstate.last_unstore_ptr == rar->file.unpacked_size &&
++	    !rar->generic.split_after && rar->file.bytes_remaining > 0) {
++		/* The padding. */
++		if(ARCHIVE_OK != consume(a, rar->file.bytes_remaining))
++			return ARCHIVE_FATAL;
++		rar->file.bytes_remaining = 0;
++	}
+ 	return ARCHIVE_OK;
+ }
+ 
+@@ -4057,12 +4753,18 @@
+ 		 * process is already over and we can check if calculated
+ 		 * checksum (CRC32 or BLAKE2sp) is the same as what is stored
+ 		 * in the archive. */
++		int mac = rar->crypt.file && rar->crypt.mac &&
++		    !rar->file.service;
++
+ 		if(rar->file.stored_crc32 > 0) {
+ 			/* Check CRC32 only when the file contains a CRC32
+ 			 * value for this file. */
++			uint32_t crc = rar->file.calculated_crc32;
+ 
+-			if(rar->file.calculated_crc32 !=
+-			    rar->file.stored_crc32) {
++			if(mac)
++				crc = crc_mac(rar->crypt.hash_key, crc);
++
++			if(crc != rar->file.stored_crc32) {
+ 				/* Checksums do not match; the unpacked file
+ 				 * is corrupted. */
+ 
+@@ -4106,6 +4808,10 @@
+ 			uint8_t b2_buf[32];
+ 			(void) blake2sp_final(&rar->file.b2state, b2_buf, 32);
+ 
++			if(mac && __archive_rar_hmac_sha256(rar->crypt.hash_key,
++			    32, b2_buf, 32, b2_buf))
++				memset(b2_buf, 0, sizeof(b2_buf));
++
+ 			if(memcmp(&rar->file.blake2sp, b2_buf, 32) != 0) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+ 				archive_set_error(&a->archive,
+@@ -4150,9 +4856,22 @@
+ 		rar->has_encrypted_entries = 0;
+ 	}
+ 
+-	if (rar->headers_are_encrypted || rar->cstate.data_encrypted) {
+-		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-		    "Reading encrypted data is not currently supported");
++	if(!rar->file.service && rar->crypt.file) {
++		if(rar->crypt.broken) {
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++			    "Can't decrypt the rest of an entry that was "
++			    "skipped");
++			return ARCHIVE_FATAL;
++		}
++		ret = rar5_file_key(a, rar);
++		if(ret != ARCHIVE_OK)
++			return ret;
++	}
++
++	if(rar->file.solid > 0 && rar->cstate.data_encrypted) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Can't decompress this entry: an earlier entry of this "
++		    "solid archive couldn't be decrypted");
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+@@ -4186,6 +4905,17 @@
+ 		return ret;
+ 	}
+ 
++	if(rar->cstate.last_write_ptr == rar->file.unpacked_size &&
++	    rar->file.bytes_remaining > 0 && rar->file.bytes_remaining < 16 &&
++	    !rar->file.service && rar->crypt.file &&
++	    !rar->generic.split_after) {
++		/* All of it is out: what's left is the cipher text's padding
++		 * (the compressed stream doesn't end on a 16-byte block). */
++		if(ARCHIVE_OK != consume(a, rar->file.bytes_remaining))
++			return ARCHIVE_FATAL;
++		rar->file.bytes_remaining = 0;
++	}
++
+ 	if(rar->file.bytes_remaining == 0 &&
+ 			rar->cstate.last_write_ptr == rar->file.unpacked_size)
+ 	{
+@@ -4207,6 +4937,14 @@
+ static int rar5_read_data_skip(struct archive_read *a) {
+ 	struct rar5* rar = get_context(a);
+ 
++	if(rar->main.solid && rar->cstate.data_encrypted == 0 &&
++	    !rar->file.service && rar->crypt.file && !rar->crypt.keyed &&
++	    (rar->crypt.broken || rar5_file_key(a, rar) != ARCHIVE_OK)) {
++		/* Without its key it can only be jumped over, and the
++		 * entries after it in this solid stream can't be decoded. */
++		rar->cstate.data_encrypted = 1;
++	}
++
+ 	if(rar->main.solid && (rar->cstate.data_encrypted == 0)) {
+ 		/* In solid archives, instead of skipping the data, we need to
+ 		 * extract it, and dispose the result. The side effect of this
+@@ -4278,6 +5016,12 @@
+ 	clear_data_ready_stack(rar);
+ 
+ 	free(rar->vol.push_buf);
++
++	free(rar->crypt.hbuf);
++	free(rar->crypt.dbuf);
++	__archive_rar_aes_free(rar->crypt.aes);
++	__archive_rar_aes_free(rar->crypt.haes);
++	__archive_rar_wipe(&rar->crypt, sizeof(rar->crypt));
+ 
+ 	free_filters(rar);
+ 	cdeque_free(&rar->cstate.filters);

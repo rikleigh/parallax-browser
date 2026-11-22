@@ -7,7 +7,9 @@
  *   archive-test extract <path> <dest> [max_entries max_bytes margin [cancel]]
  *
  * inspect and extract print "OK ...", "REFUSED <why>" (-1), "FAILED <why>"
- * (-2) or "CANCELLED <why>" (-3). extract also checks the progress calls:
+ * (-2), "CANCELLED <why>" (-3) or "PASSWORD <why>" (-4, inspect adding
+ * "names" when the list has it, "wrong" for a wrong one). $PASSWORD is the
+ * archive's password. extract also checks the progress calls:
  * done never goes back and never passes total, and at most ~10 a second.
  * "cancel" sets *cancel at the first progress call. */
 #include <locale.h>
@@ -46,7 +48,7 @@ static void onProgress(uint64_t done, uint64_t total, const char* current, void*
 
 static const char* outcome(int r)
 {
-    return r == -1 ? "REFUSED" : r == -2 ? "FAILED" : r == -3 ? "CANCELLED" : "ERROR";
+    return r == -1 ? "REFUSED" : r == -2 ? "FAILED" : r == -3 ? "CANCELLED" : r == -4 ? "PASSWORD" : "ERROR";
 }
 
 int main(int argc, char** argv)
@@ -73,7 +75,7 @@ int main(int argc, char** argv)
         ps5archive_free_list(list);
         return 0;
     }
-    PS5ArchiveLimits limits = { 0 };
+    PS5ArchiveLimits limits = { .password = getenv("PASSWORD") };
     if (argc >= 3 && !strcmp(argv[1], "inspect")) {
         if (argc >= 5) {
             limits.max_entries = (unsigned)strtoul(argv[3], NULL, 10);
@@ -82,13 +84,20 @@ int main(int argc, char** argv)
         PS5ArchiveInfo info;
         int r = ps5archive_inspect(argv[2], &limits, &info, error, sizeof error);
         if (r) {
-            printf("%s %s\n", outcome(r), error);
+            printf("%s %s%s%s\n", outcome(r), error, r == -4 && info.names_encrypted ? " names" : "",
+                r == -4 && info.password_wrong ? " wrong" : "");
             return 1;
         }
-        printf("OK format=%s volumes=%u entries=%u unpacked=%llu sizes_known=%d top=%s title=%s\n", info.format, info.volumes,
+        printf("OK format=%s volumes=%u entries=%u unpacked=%llu sizes_known=%d top=%s title=%s%s\n", info.format, info.volumes,
             info.entries, (unsigned long long)info.unpacked, info.sizes_known, info.top_folder[0] ? info.top_folder : "-",
-            info.has_title ? (info.title_dir[0] ? info.title_dir : ".") : "-");
+            info.has_title ? (info.title_dir[0] ? info.title_dir : ".") : "-", info.encrypted ? " encrypted" : "");
         return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "emptyfolder")) {
+        PS5ArchiveInfo info;
+        int r = ps5archive_inspect(argv[2], &limits, &info, error, sizeof error);
+        printf("%s\n", r ? "ERROR" : *info.empty_folder ? info.empty_folder : "-");
+        return r ? 1 : 0;
     }
     if (argc >= 4 && !strcmp(argv[1], "extract")) {
         if (argc >= 7) {

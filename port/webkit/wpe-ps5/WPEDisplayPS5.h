@@ -50,6 +50,13 @@ WPE_API gboolean    wpe_display_ps5_request_text (WPEDisplayPS5            *disp
                                                   WPEDisplayPS5TextCallback callback,
                                                   gpointer                  user_data);
 
+/* The same keyboard for a password: what is typed is hidden and not
+ * learned, nothing is filled in or capitalized. */
+WPE_API gboolean    wpe_display_ps5_request_password (WPEDisplayPS5            *display,
+                                                      const char               *title,
+                                                      WPEDisplayPS5TextCallback callback,
+                                                      gpointer                  user_data);
+
 /* Path of the child payload ELF (WebProcess/NetworkProcess) the process
  * manager sends to elfldr, and the Mac log sink handed to children. */
 WPE_API void        wpe_display_ps5_set_child_elf (WPEDisplayPS5 *display,

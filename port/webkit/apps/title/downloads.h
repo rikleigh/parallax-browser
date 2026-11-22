@@ -39,6 +39,11 @@ void ps5wk_downloads_row(unsigned index, BUIRow* row);
 /* A download finished in the last few seconds (its notice says Options
  * opens it): its index, once. */
 gboolean ps5wk_downloads_take_recent(unsigned* index);
+/* Something unpacked in the last few seconds (its notice says Options
+ * opens it): Files at folder with name focused (g_free both; name may be
+ * NULL), and with choices its dialog open (an app: install it, make an
+ * image). Once. */
+gboolean ps5wk_downloads_take_recent_folder(char** folder, char** name, gboolean* choices);
 /* The list came into view (it looks for lost unfinished downloads). */
 void ps5wk_downloads_shown(void);
 /* What X, Square and R2 do for a row (footer hints): NULL = nothing. */
@@ -74,8 +79,14 @@ const char* ps5wk_downloads_default_folder(void);
  * "TITAN-CORE"), NULL if nothing does; known: whether the download service
  * has said yet (asked again when that is old). */
 const char* ps5wk_downloads_image_mounter(gboolean* known);
+/* An app with an empty folder (%s): files may be meant to go there (an
+ * Android game's APK in Hydroid's game/), which a read-only image can't
+ * take. */
+#define PS5WK_EMPTY_FOLDER_WARNING "Its folder %s/ is empty: if the app wants files put there, install it as a folder (an image is read-only)"
 #define PS5WK_NO_IMAGE_MOUNTER "No exFAT image: nothing running mounts them (ShadowMountPlus and TITAN-CORE do, Kraken Mount doesn't)"
-/* Receiving now, and their progress together (< 0: a size not known). */
+/* Downloads receiving now, and jobs running (unpacking, making an image,
+ * installing; Files' tasks), with their progress together: a job's
+ * current step's (< 0: a size not known). The toolbar's ring. */
 unsigned ps5wk_downloads_active(double* progress);
 
 /* The API (/browser/download) and tests. */

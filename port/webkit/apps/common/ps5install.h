@@ -47,6 +47,13 @@ int ps5install_find(const char* dir, unsigned depth, PS5TitleInfo* out, char* er
  * many folders on one level to search them all. */
 int ps5install_count(const char* dir, unsigned depth);
 
+/* The first empty folder in an app's folder dir, relative ("game"; the
+ * names on each level sorted): a folder the app may expect files added to
+ * (Hydroid's game/ for the APK), which an image (read-only) can't take.
+ * 1 found (in out), 0 none, -1 too many entries to look through or an
+ * error. */
+int ps5install_empty_folder(const char* dir, char* out, size_t size);
+
 /* Fills out from a param.json's text (out->dir left empty; a UTF-8 byte
  * order mark skipped). 0, or -2 without a valid titleId. */
 int ps5install_parse_param(const char* text, PS5TitleInfo* out);

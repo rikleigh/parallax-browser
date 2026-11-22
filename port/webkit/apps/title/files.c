@@ -35,6 +35,7 @@ static gboolean loading;
 static char* loadError;
 static unsigned generation;
 static char* focusName; /* the entry to focus once listed */
+static gboolean focusChoices; /* ... and its dialog opened (ps5wk_files_open_choices) */
 
 enum { MODE_NONE, MODE_MOVE, MODE_COPY, MODE_PICK, MODE_DEFAULT }; /* default: the folder new downloads go to */
 static int mode;
@@ -347,7 +348,11 @@ static void onListed(const char* json, const char* error, gpointer user)
         focus = indexOfName(focusName);
         g_clear_pointer(&focusName, g_free);
     }
+    gboolean choices = focusChoices && focus >= 0;
+    focusChoices = FALSE;
     ps5wk_browser_files_changed(focus);
+    if (choices)
+        ps5wk_browser_files_choices(focus);
 }
 
 static void load(void)
@@ -360,8 +365,9 @@ static void load(void)
         ps5wk_dlservice_request_async(8000, onListed, GUINT_TO_POINTER(generation), "roots", NULL);
 }
 
-/* Shows folder (NULL: the drives), name focused once listed. */
-static void navigate(const char* folder, const char* name)
+/* Shows folder (NULL: the drives), name focused once listed (with
+ * choices, its dialog opened too). */
+static void navigateTo(const char* folder, const char* name, gboolean choices)
 {
     char* copy = g_strdup(folder);
     g_free(place);
@@ -372,8 +378,14 @@ static void navigate(const char* folder, const char* name)
     g_clear_pointer(&loadError, g_free);
     g_free(focusName);
     focusName = g_strdup(name);
+    focusChoices = choices && name;
     load();
     ps5wk_browser_files_changed(0);
+}
+
+static void navigate(const char* folder, const char* name)
+{
+    navigateTo(folder, name, FALSE);
 }
 
 void ps5wk_files_shown(void)
@@ -392,6 +404,11 @@ void ps5wk_files_refresh(void)
 void ps5wk_files_open(const char* folder, const char* name)
 {
     navigate(folder, name);
+}
+
+void ps5wk_files_open_choices(const char* folder, const char* name)
+{
+    navigateTo(folder, name, TRUE);
 }
 
 static void clearMode(void)
@@ -1060,13 +1077,12 @@ gboolean ps5wk_files_choices(BUIChoices* out)
         snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "A download or a job is using it: it can't be moved, renamed or deleted now");
     }
     if (chosen.app) {
-        if (chosen.icon) {
-            const PS5WKAppInfo* a = ps5wk_appinfo(chosen.path, chosen.size, infoArrived);
-            if (a->icon) {
-                out->picture = a->icon;
-                out->pictureSize = PS5WK_APPINFO_ICON;
-            }
+        const PS5WKAppInfo* a = ps5wk_appinfo(chosen.path, chosen.size, infoArrived);
+        if (chosen.icon && a->icon) {
+            out->picture = a->icon;
+            out->pictureSize = PS5WK_APPINFO_ICON;
         }
+        const char* empty = a->info ? mj_string(a->info, "emptyFolder") : NULL;
         addChoice(out, CH_INSTALL, BUI_TONE_ACTIVE, FALSE, "Install the app", "You're asked before an installed version is replaced");
         gboolean known = FALSE;
         const char* mounter = ps5wk_downloads_image_mounter(&known);
@@ -1077,6 +1093,10 @@ gboolean ps5wk_files_choices(BUIChoices* out)
             }
         } else if (chosen.icon) {
             char detail[160];
+            if (empty && *empty && out->lineCount < 3) {
+                out->lineTones[out->lineCount] = BUI_TONE_WARN;
+                snprintf(out->lines[out->lineCount++], sizeof out->lines[0], PS5WK_EMPTY_FOLDER_WARNING, empty);
+            }
             snprintf(detail, sizeof detail, "<ID>.exfat in the drive's homebrew folder, for %s; checked once made", mounter ? mounter : "ShadowMountPlus");
             addChoice(out, CH_IMAGE, BUI_TONE_PLAIN, FALSE, "Make an exFAT image", detail);
             snprintf(detail, sizeof detail, "<ID>.ffpkg in the drive's homebrew folder, for ShadowMountPlus 1.7 or later; checked once made");
@@ -1150,6 +1170,11 @@ gboolean ps5wk_files_choices(BUIChoices* out)
                     }
                 } else {
                     char image[160];
+                    const char* empty = mj_string(p, "emptyFolder");
+                    if (empty && *empty && out->lineCount < 3) {
+                        out->lineTones[out->lineCount] = BUI_TONE_WARN;
+                        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], PS5WK_EMPTY_FOLDER_WARNING, empty);
+                    }
                     snprintf(image, sizeof image, "%s.exfat in the drive's homebrew folder, for %s; checked once made", id,
                         mounter ? mounter : "ShadowMountPlus");
                     addChoice(out, CH_EXTRACT_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", image);

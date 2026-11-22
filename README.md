@@ -45,8 +45,9 @@ first-class place for the modern web. It's built on WPE WebKit.
   one uses.
 - A download manager. Large files download over several connections at
   once, with pause, resume and SHA-256 checksums, and survive a browser
-  restart. Archives (ZIP, 7z, RAR, tar) can be unpacked, an app inside one
-  installed, or made into an image: exFAT (`.exfat`) or UFS2 (`.ffpkg`,
+  restart. Archives (ZIP, 7z, RAR, tar) can be unpacked, with their
+  password for ZIP and RAR ones, an app inside one installed, or made into
+  an image: exFAT (`.exfat`) or UFS2 (`.ffpkg`,
   for ShadowMountPlus 1.7 and later; the writer is ported from
   [PS5 Dump Forge](https://github.com/quer3q/ps5-dump-forge)). Installs
   work with ShadowMountPlus, Kraken Mount or TITAN-CORE, whichever is

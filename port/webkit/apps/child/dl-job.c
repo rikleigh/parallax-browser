@@ -34,9 +34,13 @@
  *     cancel   id                      (.part and .ps5dl deleted)
  *     job      id kind=extract|install|image|move|copy|delete src dest [delete=1]
  *              [then=install|image] [image=<path>] [format=exfat|ffpkg] [replace=1]
+ *              [password]
  *              (an install that would replace an installed app is refused
  *              without replace=1: jobend says installed=<version>; an
- *              install's src may be an image or a .pkg file: ps5image.h)
+ *              install's src may be an image or a .pkg file: ps5image.h;
+ *              an archive with a password needs password: jobend says
+ *              password=needed, or wrong for one that isn't it. Never
+ *              logged or kept.)
  *     jobstop  id
  *     rm       path                    (a file or .part, and its .part.ps5dl)
  *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials|partial|imageapp|titleinfo|icon
@@ -55,7 +59,7 @@
  *              (every PROGRESS_MS while it runs)
  *     fetchend id state recv total error retryable restarted status final etag lm type
  *     job      id phase done total current
- *     jobend   id ok error out [title titlename version] [installed] [by waits replaced]
+ *     jobend   id ok error out [title titlename version] [installed] [by waits replaced] [password]
  *              [registered] [pkg=1 code] (pkg: a package the console's installer
  *              took, code: its answer when it refused)
  *     rep      n ok json | error
@@ -544,6 +548,8 @@ typedef struct {
     char* format;     /* an image's: "exfat" (NULL too) or "ffpkg" */
     gboolean deleteSource;
     gboolean replace; /* an install may replace the app installed with the same ID */
+    char* password;   /* an archive's (wiped when the job ends) */
+    const char* passwordAsk; /* jobend: "needed" or "wrong" */
     char* launcher;   /* the setting: "auto", "smp", "kraken", "titan", "self" (ps5launchers_force) */
     char installed[32]; /* refused: the version installed ("?": not known) */
     char by[32];      /* installed: the launcher that registers it ("" the browser did) */
@@ -552,6 +558,7 @@ typedef struct {
     char registered[16]; /* the browser registered it: "kstuff" (mounted when kstuff next starts),
                           * "blocked" (/data/.kstuff_noautomount stops that), "setting" (a launcher runs) */
     gboolean package; /* a .pkg given to the console's installer */
+    char app[1024];   /* unpacked (nothing after): the one app's folder in it, to offer installing */
     unsigned code;    /* ... which refused it with this */
     volatile int cancel;
     gint64 lastProgress;
@@ -630,11 +637,12 @@ static gboolean oneAppIn(const char* dir, char* error, size_t size)
 }
 
 /* The same for an archive, before it is unpacked (when it can be listed). */
-static gboolean archiveOneApp(const char* archive, char* error, size_t size)
+static gboolean archiveOneApp(const char* archive, const char* password, char* error, size_t size)
 {
     PS5ArchiveInfo info;
     char why[256];
-    if (ps5archive_inspect(archive, NULL, &info, why, sizeof why))
+    PS5ArchiveLimits limits = { .password = password };
+    if (ps5archive_inspect(archive, &limits, &info, why, sizeof why))
         return TRUE; /* not listed: checked once unpacked */
     if (info.titles == 1 && !info.title_icon) {
         snprintf(error, size, "%s", NO_ICON);
@@ -735,6 +743,10 @@ static void jobEnd(Job* job, gboolean ok, const char* error, const char* out, co
     }
     if (ok && *job->registered)
         appendParam(line, "registered", job->registered);
+    if (ok && *job->app)
+        appendParam(line, "app", job->app);
+    if (!ok && job->passwordAsk)
+        appendParam(line, "password", job->passwordAsk);
     if (job->package) {
         appendNumber(line, "pkg", 1);
         if (job->code) {
@@ -810,15 +822,16 @@ static gboolean alreadyInstalled(const PS5TitleInfo* title, const char* drivePat
 }
 
 /* The app in an archive, from its param.json (before unpacking). */
-static gboolean archiveTitle(const char* archive, PS5TitleInfo* title)
+static gboolean archiveTitle(const char* archive, const char* password, PS5TitleInfo* title)
 {
     PS5ArchiveInfo info;
     char error[256];
-    if (ps5archive_inspect(archive, NULL, &info, error, sizeof error) || !info.has_title)
+    PS5ArchiveLimits limits = { .password = password };
+    if (ps5archive_inspect(archive, &limits, &info, error, sizeof error) || !info.has_title)
         return FALSE;
     char* name = g_strdup_printf("%s%ssce_sys/param.json", info.title_dir, *info.title_dir ? "/" : "");
     char* text = g_malloc(256 * 1024);
-    gboolean ok = !ps5archive_read_entry(archive, NULL, name, text, 256 * 1024, NULL, error, sizeof error)
+    gboolean ok = !ps5archive_read_entry(archive, NULL, password, name, text, 256 * 1024, NULL, error, sizeof error)
         && !ps5install_parse_param(text, title);
     g_free(name);
     g_free(text);
@@ -1098,12 +1111,13 @@ static gpointer jobThread(gpointer data)
     if (job->cancel)
         snprintf(error, sizeof error, "Cancelled");
     else if (!strcmp(job->kind, "extract") && job->then && !strcmp(job->then, "install") && !job->replace
-        && archiveTitle(job->src, &title) && refuseReplace(job, &title, job->dest, error, sizeof error)) {
+        && archiveTitle(job->src, job->password, &title) && refuseReplace(job, &title, job->dest, error, sizeof error)) {
         haveTitle = TRUE; /* nothing unpacked */
-    } else if (!strcmp(job->kind, "extract") && job->then && !strcmp(job->then, "image") && !archiveOneApp(job->src, error, sizeof error)) {
+    } else if (!strcmp(job->kind, "extract") && job->then && !strcmp(job->then, "image")
+        && !archiveOneApp(job->src, job->password, error, sizeof error)) {
         /* nothing unpacked */
     } else if (!strcmp(job->kind, "extract")) {
-        PS5ArchiveLimits limits = { 0 };
+        PS5ArchiveLimits limits = { .password = job->password };
         if (exists(job->dest)) {
             /* never into a folder that is there already: "name (1)" */
             char* parent = g_path_get_dirname(job->dest);
@@ -1119,6 +1133,8 @@ static gpointer jobThread(gpointer data)
         int r = ps5archive_extract(job->src, job->dest, &limits, onExtractProgress, job, &job->cancel, error, sizeof error);
         if (r && made && r != -1)
             ps5install_remove_tree(job->dest);
+        if (r == -4) /* the title asks for it, and sends the job again */
+            job->passwordAsk = job->password && *job->password ? "wrong" : "needed";
         ok = !r;
         if (ok) {
             snprintf(out, sizeof out, "%s", job->dest);
@@ -1144,6 +1160,12 @@ static gpointer jobThread(gpointer data)
                 if (ok && strcmp(job->dest, out) && strncmp(out, job->dest, strlen(job->dest)))
                     ps5install_remove_tree(job->dest);
             }
+        } else if (ok && !job->then) {
+            /* exactly one app in it: the title offers to install it */
+            char why[256] = "";
+            PS5TitleInfo app;
+            if (oneAppIn(job->dest, why, sizeof why) && !ps5install_find(job->dest, 3, &app, why, sizeof why))
+                snprintf(job->app, sizeof job->app, "%s", app.dir);
         } else if (ok && job->then && !strcmp(job->then, "image") && job->image) {
             /* exactly one app in what was unpacked; else it stays unpacked */
             char found[256] = "", why[256] = "";
@@ -1154,8 +1176,12 @@ static gpointer jobThread(gpointer data)
             } else {
                 haveTitle = TRUE;
                 ok = buildImage(job, title.dir, &title, job->image, out, sizeof out, error, sizeof error);
-                if (ok)
-                    ps5install_remove_tree(job->dest); /* the unpacked copy was only for the image */
+                if (ok) {
+                    /* the unpacked copy was only for the image (a big
+                     * one takes a while: a step of its own) */
+                    jobProgress(job, "cleanup", 0, 0, "", TRUE);
+                    ps5install_remove_tree(job->dest);
+                }
             }
         }
     } else if (!strcmp(job->kind, "install") && isRegularFile(job->src)) {
@@ -1213,6 +1239,10 @@ static gpointer jobThread(gpointer data)
     g_free(job->image);
     g_free(job->format);
     g_free(job->launcher);
+    if (job->password) {
+        memset(job->password, 0, strlen(job->password));
+        g_free(job->password);
+    }
     g_free(job);
     return NULL;
 }
@@ -1297,6 +1327,7 @@ static void startJob(GHashTable* p)
         job->format = g_strdup(format);
         job->deleteSource = param(p, "delete") && !strcmp(param(p, "delete"), "1");
         job->replace = param(p, "replace") && !strcmp(param(p, "replace"), "1");
+        job->password = param(p, "password") ? g_strdup(param(p, "password")) : NULL;
         job->launcher = g_strdup(param(p, "launcher"));
         g_hash_table_insert(jobs, job->id, job);
     }
@@ -1309,7 +1340,8 @@ static void startJob(GHashTable* p)
         sendLine(line);
         return;
     }
-    JOBLOG("job %s: %s %s -> %s%s%s", id, kind, src, dest ? dest : "-", job->then ? " then " : "", job->then ? job->then : "");
+    JOBLOG("job %s: %s %s -> %s%s%s%s", id, kind, src, dest ? dest : "-", job->then ? " then " : "", job->then ? job->then : "",
+        job->password ? " (with a password)" : "");
     GThread* thread = g_thread_try_new("dl-job", jobThread, job, NULL);
     if (thread)
         g_thread_unref(thread);
@@ -1708,6 +1740,12 @@ static char* titleInfoJSON(const char* path, char* error, size_t size)
     }
     GString* out = g_string_new_len(json, (gssize)strlen(json) - 1); /* without its '}' */
     free(json);
+    /* a folder the app expects files added to can't take them in an image */
+    char empty[512];
+    if (S_ISDIR(st.st_mode) && ps5install_empty_folder(path, empty, sizeof empty) == 1) {
+        g_string_append(out, ",\"emptyFolder\":");
+        jsonString(out, empty);
+    }
     PS5TitleInfo installed;
     if (*info.title_id && ps5install_installed(NULL, info.title_id, &installed)) {
         g_string_append(out, ",\"installed\":");

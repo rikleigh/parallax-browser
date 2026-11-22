@@ -327,6 +327,81 @@ int ps5install_find(const char* dir, unsigned depth, PS5TitleInfo* out, char* er
 /* Wider than find's: a count cut short would be wrong (-2 then). */
 #define COUNT_WIDTH 256
 
+#define EMPTY_MAX_ENTRIES 50000
+#define EMPTY_MAX_DEPTH 24
+
+static int compareNames(const void* a, const void* b)
+{
+    return strcmp(*(char* const*)a, *(char* const*)b);
+}
+
+/* rel: dir's path relative to the app ("" its root). *budget: entries left. */
+static int emptyIn(const char* dir, const char* rel, unsigned depth, long* budget, char* out, size_t size)
+{
+    DIR* d = opendir(dir);
+    if (!d)
+        return -1;
+    char** names = NULL;
+    size_t count = 0, cap = 0;
+    int r = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        if (--*budget < 0) {
+            r = -1;
+            break;
+        }
+        if (count == cap) {
+            size_t n = cap ? cap * 2 : 16;
+            char** grown = realloc(names, n * sizeof *names);
+            if (!grown) {
+                r = -1;
+                break;
+            }
+            names = grown;
+            cap = n;
+        }
+        if (!(names[count] = strdup(e->d_name))) {
+            r = -1;
+            break;
+        }
+        count++;
+    }
+    closedir(d);
+    if (!r && !count && *rel) {
+        snprintf(out, size, "%s", rel);
+        r = 1;
+    }
+    if (!r && count)
+        qsort(names, count, sizeof *names, compareNames);
+    for (size_t i = 0; i < count && !r; i++) {
+        char path[2048], sub[1024];
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        if (lstat(path, &st) || !S_ISDIR(st.st_mode))
+            continue;
+        if (depth >= EMPTY_MAX_DEPTH) {
+            r = -1;
+            break;
+        }
+        snprintf(sub, sizeof sub, "%s%s%s", rel, *rel ? "/" : "", names[i]);
+        r = emptyIn(path, sub, depth + 1, budget, out, size);
+    }
+    for (size_t i = 0; i < count; i++)
+        free(names[i]);
+    free(names);
+    return r;
+}
+
+int ps5install_empty_folder(const char* dir, char* out, size_t size)
+{
+    long budget = EMPTY_MAX_ENTRIES;
+    if (out && size)
+        out[0] = 0;
+    return emptyIn(dir, "", 0, &budget, out, size);
+}
+
 int ps5install_count(const char* dir, unsigned depth)
 {
     FindPath* level = calloc(COUNT_WIDTH, sizeof(FindPath));

@@ -1,0 +1,22 @@
+ps5webkit: RAR5 headers whose extra fields are all skipped are fine
+
+process_head_file_extra() started from ret = ARCHIVE_FATAL and only the
+fields it parses set it, so a header whose only extra field is one it
+skips failed with no error message. rar -rr writes such a header: the
+recovery record, a service header "RR" with just EX_SUBDATA. Every RAR5
+archive with a recovery record (password or not) stopped at it, after its
+last file, as "damaged". ret now starts at ARCHIVE_OK.
+
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -2248,7 +2248,9 @@
+ {
+ 	uint64_t extra_field_size;
+ 	uint64_t extra_field_id = 0;
+-	int ret = ARCHIVE_FATAL;
++	/* OK unless a field's parser fails: a header whose fields are all
++	 * skipped (a recovery record's EX_SUBDATA, say) is fine. */
++	int ret = ARCHIVE_OK;
+ 	uint64_t var_size;
+ 
+ 	while(extra_data_size > 0) {

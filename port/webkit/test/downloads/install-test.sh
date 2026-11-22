@@ -77,5 +77,16 @@ title "$work/drive/downloads/m/PPSA05555" PPSA05555 'Moved'
 check "OK $work/drive/homebrew/PPSA05555" "move only: moved" "$("$work/t" move "$work/drive/downloads/m" "$work/moveuser")"
 [[ -f "$work/drive/homebrew/PPSA05555/eboot.bin" && ! -e "$work/moveuser/PPSA05555" ]] && echo "PASS move only: nothing in /user/app" \
     || { echo "FAIL move only wrote /user/app"; fails=$((fails+1)); }
+# an empty folder in an app (Hydroid's game/, for the APK): the first, by name
+e="$work/emptyapp"
+mkdir -p "$e/sce_sys" "$e/b/c" "$e/game" "$e/assets/fonts"
+echo x >"$e/assets/fonts/f.ttf"
+echo x >"$e/b/c/x"
+echo '{}' >"$e/sce_sys/param.json"
+check "EMPTY 1 game" "an app's empty folder" "$("$work/t" empty "$e")"
+mkdir -p "$e/a/deep/er"
+check "EMPTY 1 a/deep/er" "an empty folder deeper down, first by name" "$("$work/t" empty "$e")"
+rm -r "$e/a" "$e/game"
+check "EMPTY 0 -" "no empty folder" "$("$work/t" empty "$e")"
 echo "$fails failure(s)"
 exit $((fails > 0))

@@ -3,15 +3,15 @@
 # with Range requests before it is downloaded, or from the drive after) on
 # the Mac, against serve.py's /real/ files:
 #   port/webkit/test/downloads/peek-test.sh
-# Needs libsoup 3 and libarchive (brew install libsoup libarchive), zip and
-# 7zz (brew install sevenzip). Makes an app folder (sce_sys/param.json,
+# Needs libsoup 3 (brew install libsoup), libarchive 3.8.1 with our patches
+# (mac-libarchive.sh builds it), zip and 7zz (brew install sevenzip). Makes an app folder (sce_sys/param.json,
 # eboot.bin) next to 48 MiB of incompressible data, archives it several
 # ways and checks what the peek finds and how few bytes it needed.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../../.." && pwd)"
 apps="$root/port/webkit/apps/common"
-LA="${LIBARCHIVE:-/opt/homebrew/opt/libarchive}"
+LA="${LIBARCHIVE:-$("$here/mac-libarchive.sh")}"
 SEVENZ="${SEVENZ:-/opt/homebrew/bin/7zz}"
 LA_TARBALL="$root/toolchain/wpe-deps/dl/libarchive-3.8.1.tar.xz"
 port="${PEEK_PORT:-8793}"
@@ -30,7 +30,7 @@ failed() { echo "FAIL $*"; fails=$((fails + 1)); }
 
 drive="$work/peek-drive"
 if cc -std=c11 -O2 -Wall -Wextra -Werror -I"$LA/include" -o "$drive" "$here/peek/peek-drive.c" "$apps/ps5peek.c" "$apps/ps5archive.c" \
-    "$apps/ps5fetch.c" "$apps/ps5install.c" -L"$LA/lib" -larchive -lz $(pkg-config --cflags --libs libsoup-3.0) 2>"$work/cc.log"; then
+    "$apps/ps5fetch.c" "$apps/ps5install.c" -L"$LA/lib" -Wl,-rpath,"$LA/lib" -larchive -lz $(pkg-config --cflags --libs libsoup-3.0) 2>"$work/cc.log"; then
     pass "builds without warnings (-Wall -Wextra)"
 else
     cat "$work/cc.log"
@@ -119,7 +119,8 @@ head -c 3000000 /dev/urandom > "$files/random.zip"
 if [ -f "$LA_TARBALL" ]; then
     mkdir -p "$work/uu"
     tar -xf "$LA_TARBALL" -C "$work/uu" --strip-components=3 libarchive-3.8.1/libarchive/test/test_read_format_rar5_multiple_files.rar.uu \
-        libarchive-3.8.1/libarchive/test/test_read_format_rar_windows.rar.uu 2>/dev/null || true
+        libarchive-3.8.1/libarchive/test/test_read_format_rar_windows.rar.uu \
+        libarchive-3.8.1/libarchive/test/test_read_format_rar5_encrypted_filenames.rar.uu 2>/dev/null || true
     for f in "$work"/uu/*.uu; do
         [ -f "$f" ] || continue
         n="$(basename "$f" .uu)"
@@ -187,7 +188,8 @@ check "ZIP with an app inside an app" "$(peek nested.zip)" "j['titles']==1 and j
 check "ZIP: the app's icon is there" "$(peek app.zip)" "j['icon'] is True"
 check "ZIP: an app without an icon" "$(peek noicon.zip)" "j['titles']==1 and j['icon'] is False"
 check "ZIP without an app" "$(peek plain.zip)" "j['titles']==0 and j['titleId'] is None and j['entries']==2"
-check "encrypted ZIP: refused" "$(peek encrypted.zip)" "j['refused'] and 'ncrypted' in j['refused']"
+# a password: asked for when it's unpacked; its names are still listed
+check "encrypted ZIP: has a password" "$(peek encrypted.zip)" "j['password'] and not j['namesHidden'] and not j['refused'] and j['titleDir'] == 'Peek App'"
 check "tar.gz: read through, over the limit" "$(peek app.tar.gz --max-bytes 4194304)" "ERR:More than"
 check "not an archive" "$(peek random.zip)" "ERR:"
 check "a server without ranges" "$(peek app.zip?noranges=1)" "ERR:answered 200"
@@ -208,7 +210,11 @@ done
 check "on the drive: ZIP" "$("$drive" --path "$files/app.zip" --user-app "$work/user-app")" "j['titleId']=='PPSA01234' and not j['remote'] and j['installed']=='01.001.000'"
 check "on the drive: solid 7-Zip (param.json read through)" "$("$drive" --path "$files/solid.7z" --user-app "$work/user-app")" \
     "j['titleId']=='PPSA01234' and j['name']=='Peek Test App' and not j['guessed']"
-check "on the drive: encrypted" "$("$drive" --path "$files/encrypted.zip" --user-app "$work/user-app")" "j['refused']"
+check "on the drive: encrypted" "$("$drive" --path "$files/encrypted.zip" --user-app "$work/user-app")" "j['password'] and j['titleDir'] == 'Peek App'"
+if [ -f "$files/rar5_encrypted_filenames.rar" ]; then
+    check "on the drive: RAR5 with its names encrypted too" "$("$drive" --path "$files/rar5_encrypted_filenames.rar" --user-app "$work/user-app")" \
+        "j['password'] and j['namesHidden'] and j['entries'] == 0 and j['format'] == 'RAR5'"
+fi
 
 echo "peek-test: $passes passed, $fails failed"
 [ "$fails" = 0 ]

@@ -412,6 +412,12 @@ gboolean wpe_display_ps5_request_text(WPEDisplayPS5* display, const char* title,
     return wpeDisplayPS5RequestText(display, title, initialText, url, url ? PS5_IME_ENTER_LABEL_GO : PS5_IME_ENTER_LABEL_DEFAULT, !url, false, false, 0, 0, callback, userData);
 }
 
+gboolean wpe_display_ps5_request_password(WPEDisplayPS5* display, const char* title, WPEDisplayPS5TextCallback callback, gpointer userData)
+{
+    g_return_val_if_fail(WPE_IS_DISPLAY_PS5(display), FALSE);
+    return wpeDisplayPS5RequestText(display, title, "", false, PS5_IME_ENTER_LABEL_DEFAULT, false, true, true, 0, 0, callback, userData);
+}
+
 // How far to draw the page higher so the field being typed into (its
 // caret line, in view coordinates) sits above the open keyboard. The view
 // fills the screen below the application's bar (PS5Renderer::pageTop) at

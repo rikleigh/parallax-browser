@@ -1001,8 +1001,8 @@ step_mime() {
 
 # ---- archive unpacking for downloads (ps5wk-child: apps/common/ps5archive.c)
 # libarchive reads ZIP, 7z, RAR4/RAR5 and tar; bzip2, xz and zstd are its
-# decompressors next to zlib. Readers only matter: no tools, no crypto (the
-# download service refuses encrypted archives).
+# decompressors next to zlib, OpenSSL (built above) its crypto for archives
+# with passwords. Readers only matter: no tools.
 
 # libbz2.a: tar.bz2, bzip2 ZIP entries and 7z BZip2 coders. Upstream has
 # only a Makefile that builds the tools too; the seven library sources are
@@ -1066,10 +1066,14 @@ step_zstd() {
 
 # libarchive.a: the reader for downloaded archives (ZIP incl. zip64,
 # 7z, RAR4/RAR5, tar and its compressed forms, multivolume through
-# archive_read_open_filenames). Static, no tools/tests, no crypto library
-# (ZIP/7z/RAR encryption stays unreadable; ps5archive.c refuses it first),
-# no xml (xar), lz4, libb2 (RAR5 uses the bundled BLAKE2s), acl, xattr or
-# iconv (names come out as UTF-8, see below).
+# archive_read_open_filenames). Static, no tools/tests, no xml (xar), lz4,
+# libb2 (RAR5 uses the bundled BLAKE2s), acl, xattr or iconv (names come out
+# as UTF-8, see below).
+#
+# Passwords: OpenSSL's libcrypto is libarchive's crypto (ZIP's WinZip AES
+# and PKWARE encryption are upstream's). patches/libarchive/ adds RAR5
+# decryption (data, and headers with rar -hp); 7-Zip's AES stays unreadable
+# (libarchive has no 7z decryption), and ps5archive.c says so.
 #
 # The console's nl_langinfo(CODESET) is always "US-ASCII" (the SDK libc has
 # no locales), so libarchive would turn every non-ASCII name (7z and RAR
@@ -1079,7 +1083,9 @@ step_zstd() {
 #
 # The SDK toolchain sets CMAKE_FIND_PACKAGE_PREFER_CONFIG, so find_package
 # (LibLZMA) takes xz's config file, which doesn't set the LIBLZMA_* variables
-# libarchive checks: they are given here.
+# libarchive checks: they are given here. The same for OpenSSL, whose config
+# file names its libraries as imported targets that libarchive's crypto
+# checks (try_compile) can't link.
 step_libarchive() {
     log "libarchive 3.8.1 (ps5archive.c: downloaded archives)"
     fetch https://www.libarchive.org/downloads/libarchive-3.8.1.tar.xz \
@@ -1091,7 +1097,10 @@ step_libarchive() {
         die "libarchive: the UTF-8 charset edit didn't apply (archive_string.c changed?)"
     cmake_pkg libarchive -DENABLE_INSTALL=ON -DENABLE_TEST=OFF -DENABLE_COVERAGE=OFF -DENABLE_WERROR=OFF \
         -DENABLE_TAR=OFF -DENABLE_CPIO=OFF -DENABLE_CAT=OFF -DENABLE_UNZIP=OFF \
-        -DENABLE_OPENSSL=OFF -DENABLE_MBEDTLS=OFF -DENABLE_NETTLE=OFF -DENABLE_CNG=OFF \
+        -DENABLE_OPENSSL=ON -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE -DOPENSSL_FOUND=TRUE \
+        -DOPENSSL_INCLUDE_DIR="$SYSROOT/include" -DOPENSSL_CRYPTO_LIBRARY="$SYSROOT/lib/libcrypto.a" \
+        -DOPENSSL_LIBRARIES="$SYSROOT/lib/libcrypto.a" \
+        -DENABLE_MBEDTLS=OFF -DENABLE_NETTLE=OFF -DENABLE_CNG=OFF \
         -DENABLE_LIBB2=OFF -DENABLE_LZ4=OFF -DENABLE_LZO=OFF -DENABLE_LIBXML2=OFF -DENABLE_EXPAT=OFF \
         -DENABLE_WIN32_XMLLITE=OFF -DENABLE_PCREPOSIX=OFF -DENABLE_PCRE2POSIX=OFF -DENABLE_LIBGCC=OFF \
         -DENABLE_ACL=OFF -DENABLE_XATTR=OFF -DENABLE_ICONV=OFF \
@@ -1099,6 +1108,8 @@ step_libarchive() {
         -DLIBLZMA_FOUND=ON -DLIBLZMA_INCLUDE_DIR="$SYSROOT/include" -DLIBLZMA_INCLUDE_DIRS="$SYSROOT/include" \
         -DLIBLZMA_LIBRARY="$SYSROOT/lib/liblzma.a" -DLIBLZMA_LIBRARIES="$SYSROOT/lib/liblzma.a"
     grep -E '/share/man/' "$BLD/install_manifest.txt" | while read -r f; do rm -f "$f"; done
+    grep -q '#define HAVE_LIBCRYPTO 1' "$BLD/config.h" && grep -q '#define HAVE_OPENSSL_EVP_H 1' "$BLD/config.h" ||
+        die "libarchive: OpenSSL not found (archives with passwords need it)"
     fix_sysroot; cleanup libarchive
 }
 

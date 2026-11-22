@@ -240,6 +240,12 @@ void ps5wk_updates_restart_failed(void);
 gboolean ps5wk_browser_winding_down(void);
 /* files.c: the Files list changed; focus: the row to focus (-1: keep). */
 void ps5wk_browser_files_changed(int focus);
+/* Files listed folder with row focused, its dialog wanted
+ * (ps5wk_files_open_choices): opened, if Files is still shown. */
+void ps5wk_browser_files_choices(int row);
+/* The menu on Files at folder, name focused; with choices name's dialog
+ * too (after an unpack: Options). FALSE: in VR, or winding down. */
+gboolean ps5wk_browser_show_in_files(const char* folder, const char* name, gboolean choices);
 /* downloads.c: the menu on the Downloads list with the dialog of the
  * download at index (one waiting for a folder, X on a finished one). */
 gboolean ps5wk_browser_show_download_choices(unsigned index);

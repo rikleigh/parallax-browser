@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # The download service's archive unpacker (apps/common/ps5archive.c) on the
-# Mac, against Homebrew's libarchive:
+# Mac, against libarchive 3.8.1 with our patches (mac-libarchive.sh):
 #   port/webkit/test/downloads/archive-test.sh
 # Makes ZIP, 7z and tar archives of a small tree (and the splits of each)
 # with zip, 7zz, tar and python3, unpacks them and compares the result file
 # by file; RAR4/RAR5 come from libarchive 3.8.1's own test files (decoded
 # from the tarball port/deps/build.sh libarchive downloads). Then checks
-# that unsafe, encrypted, incomplete and damaged archives are refused or
-# fail with the right message, and that ps5archive.c compiles for the PS5.
+# that unsafe, incomplete and damaged archives are refused or fail with the
+# right message, that ZIP and RAR5 archives with a password unpack with it
+# (and say when it's needed or wrong), and that ps5archive.c compiles for
+# the PS5.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../../.." && pwd)"
-LA="${LIBARCHIVE:-/opt/homebrew/opt/libarchive}"
+# libarchive 3.8.1 with port/deps/patches/libarchive (RAR5 passwords) and
+# OpenSSL, as on the PS5: built once by mac-libarchive.sh.
+LA="${LIBARCHIVE:-$("$here/mac-libarchive.sh")}"
 SEVENZ="${SEVENZ:-/opt/homebrew/bin/7zz}"
 LA_TARBALL="$root/toolchain/wpe-deps/dl/libarchive-3.8.1.tar.xz"
 LA_URL=https://www.libarchive.org/downloads/libarchive-3.8.1.tar.xz
@@ -20,19 +24,20 @@ work="$(mktemp -d)"
 trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
 at="$work/archive-test"
 cc -std=c11 -O2 -Wall -Wextra -Werror -I"$LA/include" -o "$at" "$here/archive/archive-test.c" \
-    "$root/port/webkit/apps/common/ps5archive.c" -L"$LA/lib" -larchive -lz
+    "$root/port/webkit/apps/common/ps5archive.c" -L"$LA/lib" -Wl,-rpath,"$LA/lib" -larchive -lz
 export COPYFILE_DISABLE=1 # no ._ files from tar
 fails=0
 passes=0
 pass() { echo "PASS $1"; passes=$((passes + 1)); }
 failed() { echo "FAIL $1"; fails=$((fails + 1)); }
 
-# check <expected (a glob)> <name> <archive-test args...>
+# check <expected (a glob)> <name> <archive-test args...>; PW=<password>
+# before it gives the archive's password.
 check() {
     local expect="$1" name="$2"
     shift 2
     local got
-    got="$("$at" "$@" 2>&1 || true)"
+    got="$(PASSWORD="${PW:-}" "$at" "$@" 2>&1 || true)"
     if [[ "$got" == $expect ]]; then pass "$name: $got"; else failed "$name: $got (expected $expect)"; fi
 }
 
@@ -95,6 +100,8 @@ a="$work/a"
     "$SEVENZ" a -bd -bso0 -tzip -mm=Deflate64 "$a/deflate64.zip" Game-1.0 &&
     "$SEVENZ" a -bd -bso0 -tzip -v1m "$a/bytes.zip" Game-1.0)
 check "OK format=ZIP volumes=1 entries=10 unpacked=* sizes_known=1 top=Game-1.0/ title=Game-1.0" "ZIP: inspect" inspect "$a/deflate.zip"
+# an empty folder in the app (an image can't take files added there later)
+check "data/empty" "ZIP: the app's empty folder" emptyfolder "$a/deflate.zip"
 extract "ZIP deflate" "$a/deflate.zip"
 extract "ZIP stored" "$a/stored.zip"
 extract "ZIP bzip2" "$a/bzip2.zip"
@@ -177,6 +184,7 @@ check "REFUSED A name in the archive has control characters" "ZIP with a control
 check "REFUSED The archive is empty" "empty ZIP" inspect "$a/empty.zip"
 check "FAILED This isn't an archive that can be unpacked" "not an archive" inspect "$a/notarchive.zip"
 check "OK *top=- title=." "title at the root (the shallowest wins)" inspect "$a/root-title.zip"
+check "-" "an app without an empty folder" emptyfolder "$a/root-title.zip"
 check "OK *top=pack/ title=pack/b" "title two folders down (shallowest, then by name)" inspect "$a/deep-title.zip"
 check "OK *top=pack/ title=-" "no title (no param.json)" inspect "$a/no-title.zip"
 check "REFUSED The archive unpacks to more than 1 MB" "over max_bytes" inspect "$a/big.zip" 100 1048576
@@ -194,10 +202,19 @@ check "OK progress=ok" "./ and // parts" extract "$a/dots.zip" "$work/out"
 [ "$(cat "$work/out/Game/a")$(cat "$work/out/Game/b")" = "dotsslashes" ] && pass "./ and // parts: dropped" || failed "./ and // parts"
 check "OK format=ZIP *" "bad CRC: inspect reads headers only" inspect "$a/crc.zip"
 check "FAILED The archive is damaged or incomplete (ZIP bad CRC*" "bad CRC: unpacking fails" extract "$a/crc.zip" "$work/crc"
+# passwords: PKWARE's (zip -P) and WinZip AES (7zz)
 (cd "$src" && zip -qr -X -P secret "$a/encrypted.zip" Game-1.0)
-check "REFUSED Encrypted archives aren't supported" "encrypted ZIP" inspect "$a/encrypted.zip"
-check "REFUSED Encrypted archives aren't supported" "encrypted ZIP: unpacking" extract "$a/encrypted.zip" "$work/enc"
-[ ! -e "$work/enc" ] && pass "encrypted ZIP: nothing written" || failed "encrypted ZIP: $work/enc was made"
+(cd "$src" && "$SEVENZ" a -bd -bso0 -tzip -mem=AES256 -psecret "$a/aes.zip" Game-1.0)
+for z in encrypted aes; do
+    check "PASSWORD It has a password: enter it to unpack it" "$z ZIP: its password is needed" inspect "$a/$z.zip"
+    check "PASSWORD It has a password: enter it to unpack it" "$z ZIP: unpacking without it" extract "$a/$z.zip" "$work/enc"
+    [ ! -e "$work/enc" ] && pass "$z ZIP: nothing written" || failed "$z ZIP: $work/enc was made"
+    PW=nope check "PASSWORD That isn't its password wrong" "$z ZIP: a wrong password" inspect "$a/$z.zip"
+    PW=nope check "PASSWORD That isn't its password" "$z ZIP: unpacking with a wrong password" extract "$a/$z.zip" "$work/enc"
+    [ ! -e "$work/enc" ] && pass "$z ZIP: nothing written for a wrong password" || failed "$z ZIP: $work/enc was made"
+    PW=secret check "OK format=ZIP volumes=1 entries=10 * encrypted" "$z ZIP: inspect with its password" inspect "$a/$z.zip"
+    PW=secret extract "$z ZIP with its password" "$a/$z.zip"
+done
 
 # ------------------------------------------------------------- 7z
 seven() { # <name> <7zz options...>
@@ -220,11 +237,15 @@ seven encrypted -psecret
 seven encrypted-names -psecret -mhe=on
 (cd "$src" && "$SEVENZ" a -bd -bso0 -v1m "$a/split.7z" Game-1.0)
 check "OK format=7-Zip volumes=1 entries=10 unpacked=* sizes_known=1 top=Game-1.0/ title=Game-1.0" "7z: inspect" inspect "$a/lzma2.7z"
+check "data/empty" "7z: the app's empty folder" emptyfolder "$a/lzma2.7z"
 for m in lzma2 lzma bcj arm arm64 bcj2 ppmd bzip2 deflate copy nonsolid; do
     extract "7z $m" "$a/$m.7z"
 done
-check "REFUSED Encrypted archives aren't supported" "encrypted 7z" inspect "$a/encrypted.7z"
-check "REFUSED Encrypted archives aren't supported" "7z with encrypted names" inspect "$a/encrypted-names.7z"
+# libarchive can't decrypt 7-Zip's AES: refused, even with the password
+for z in encrypted encrypted-names; do
+    check "REFUSED 7-Zip archives with a password can't be unpacked here" "7z $z" inspect "$a/$z.7z"
+    PW=secret check "REFUSED 7-Zip archives with a password can't be unpacked here" "7z $z, with its password" extract "$a/$z.7z" "$work/enc"
+done
 n7=$(parts 'split.7z.0*' | wc -w | tr -d ' ')
 check "$(parts 'split.7z.0*')" "7z split: the parts" volumes "$a/split.7z.002"
 extract "7z split (.7z.001)" "$a/split.7z.003"
@@ -334,9 +355,81 @@ if [ -s "$tarball" ] && echo "$LA_SHA  $tarball" | shasum -a 256 -c - >/dev/null
     check "REFUSED Links aren't supported: 表*よ/ファイル" "RAR4 Unicode names (and a link)" inspect "$rar/rar_unicode.rar"
     check "REFUSED Links aren't supported: symlink.txt" "RAR5 with a symbolic link" inspect "$rar/rar5_symlink.rar"
     check "REFUSED Links aren't supported: hardlink.txt" "RAR5 with a hard link" inspect "$rar/rar5_hardlink.rar"
-    for f in rar4_encrypted rar_encryption_data rar_encryption_header rar4_encrypted_filenames rar5_encrypted rar5_encrypted_filenames; do
-        check "REFUSED Encrypted archives aren't supported" "encrypted $f" inspect "$rar/$f.rar"
+    # Passwords (port/deps/patches/libarchive): libarchive's own files, made
+    # by RAR. a-d.txt hold "This is from <x>.txt"; their password is
+    # "password", except rar[45]_encrypted's d.txt: "password2". The
+    # rar_encryption_* files' is "12345678".
+    mkdir -p "$work/rar-want"
+    for x in a b c d; do printf 'This is from %s.txt' $x >"$work/rar-want/$x.txt"; done
+    # RAR4 (RAR 3.x's AES): no check value, so a wrong password shows when
+    # the file is unpacked, unless the names are encrypted (their CRC)
+    check "PASSWORD It has a password: enter it to unpack it" "RAR4 with a password: needed" inspect "$rar/rar4_encrypted.rar"
+    PW=password check "OK format=RAR volumes=1 entries=4 * encrypted" "RAR4 with a password: inspect" inspect "$rar/rar4_encrypted.rar"
+    PW=password check "PASSWORD That isn't its password, or the archive is damaged" "RAR4: a file with another password" \
+        extract "$rar/rar4_encrypted.rar" "$work/out"
+    check "PASSWORD It has a password: enter it to unpack it names" "RAR4 -hp (names too): needed" inspect "$rar/rar4_encrypted_filenames.rar"
+    PW=nope check "PASSWORD That isn't its password names wrong" "RAR4 -hp: a wrong one" inspect "$rar/rar4_encrypted_filenames.rar"
+    PW=password extract "RAR4 -hp with its password" "$rar/rar4_encrypted_filenames.rar" "$work/rar-want"
+    PW=12345678 check "OK format=RAR volumes=1 entries=2 * encrypted" "RAR4 -hp (12345678): inspect" inspect "$rar/rar_encryption_header.rar"
+    for f in rar_encryption_header rar_encryption_data rar_encryption_partially; do
+        rm -rf "$work/out"
+        PW=12345678 check "OK progress=ok" "RAR4 with a password: $f unpacks (CRCs checked)" extract "$rar/$f.rar" "$work/out"
     done
+    # RAR5
+    check "PASSWORD It has a password: enter it to unpack it" "RAR5 with a password: needed" inspect "$rar/rar5_encrypted.rar"
+    PW=nope check "PASSWORD That isn't its password wrong" "RAR5 with a password: a wrong one" inspect "$rar/rar5_encrypted.rar"
+    PW=password check "OK format=RAR5 volumes=1 entries=4 * encrypted" "RAR5 with a password: inspect" inspect "$rar/rar5_encrypted.rar"
+    PW=password check "PASSWORD That isn't its password" "RAR5: a file with another password" extract "$rar/rar5_encrypted.rar" "$work/out"
+    check "PASSWORD It has a password: enter it to unpack it names" "RAR5 -hp (names too): needed" inspect "$rar/rar5_encrypted_filenames.rar"
+    PW=nope check "PASSWORD That isn't its password names wrong" "RAR5 -hp: a wrong one" inspect "$rar/rar5_encrypted_filenames.rar"
+    for f in rar5_encrypted_filenames rar5_solid_encrypted rar5_solid_encrypted_filenames; do
+        PW=password extract "RAR5 with a password: $f" "$rar/$f.rar" "$work/rar-want"
+    done
+    # A recovery record (rar -rr: a service header "RR" whose only extra
+    # field is one libarchive skips) after the files: libarchive 3.8.1
+    # failed on it, with no message, once the files were read (0003).
+    mkdir -p "$work/ref-stored" "$work/rr"
+    "$at" extract "$rar/rar5_stored.rar" "$work/ref-stored" >/dev/null
+    python3 -I "$here/archive/rar5rr.py" "$rar/rar5_stored.rar" "$work/rr/rr.rar"
+    check "OK format=RAR5 volumes=1 entries=1 *" "RAR5 with a recovery record: inspect" inspect "$work/rr/rr.rar"
+    extract "RAR5 with a recovery record" "$work/rr/rr.rar" "$work/ref-stored"
+    if command -v openssl >/dev/null; then
+        python3 -I "$here/archive/rar5enc.py" --hp --password 'pässwörd' "$work/rr/enc" "$work/rr/rr.rar"
+        PW='pässwörd' check "OK format=RAR5 volumes=1 entries=1 * encrypted" "RAR5 -hp with a recovery record: inspect" inspect "$work/rr/enc/rr.rar"
+        PW='pässwörd' extract "RAR5 -hp with a recovery record" "$work/rr/enc/rr.rar" "$work/ref-stored"
+    fi
+    # Bigger ones: libarchive's multivolume sets encrypted the way RAR does
+    # (archive/rar5enc.py: one AES stream per file across the volumes,
+    # checksums as HMACs; --hp the headers too). Their parts end inside AES
+    # blocks.
+    if command -v openssl >/dev/null; then
+        mkdir -p "$work/ref-multi" "$work/ref-solid"
+        "$at" extract "$rar/rar5_multiarchive.part01.rar" "$work/ref-multi" >/dev/null
+        "$at" extract "$rar/rar5_multiarchive_solid.part01.rar" "$work/ref-solid" >/dev/null
+        for opts in "" "--hp"; do
+            for set in rar5_multiarchive rar5_multiarchive_solid; do
+                enc="$work/enc5-$set${opts:+-hp}"
+                python3 -I "$here/archive/rar5enc.py" $opts --password 'pässwörd' "$enc" "$rar/$set".part0*.rar
+                ref="$work/ref-multi"
+                [ "$set" = rar5_multiarchive_solid ] && ref="$work/ref-solid"
+                PW='pässwörd' extract "RAR5 $set encrypted${opts:+ (-hp)}" "$enc/$set.part01.rar" "$ref"
+            done
+        done
+        PW='passwörd' check "PASSWORD That isn't its password*" "RAR5 multivolume -hp: a wrong one" inspect "$work/enc5-rar5_multiarchive-hp/rar5_multiarchive.part03.rar"
+        # RAR4's 4-part set (a file across three parts, one across two),
+        # its link left out (archive/rar4enc.py); unpacking checks the CRCs
+        for opts in "" "--hp"; do
+            enc="$work/enc4${opts:+-hp}"
+            python3 -I "$here/archive/rar4enc.py" $opts --drop testlink "$enc" "$rar"/rar_multivolume.part000*.rar
+            rm -rf "$work/out"
+            PW=password check "OK progress=ok" "RAR4 multivolume encrypted${opts:+ (-hp)}: unpacks" extract "$enc/rar_multivolume.part0001.rar" "$work/out"
+            [ "$(find "$work/out" -type f -exec cat {} + | wc -c | tr -d ' ')" = 241688220 ] && pass "RAR4 multivolume encrypted${opts:+ (-hp)}: 241688220 bytes" \
+                || failed "RAR4 multivolume encrypted${opts:+ (-hp)}: wrong size"
+        done
+        PW=nope check "PASSWORD That isn't its password names wrong" "RAR4 multivolume -hp: a wrong one" inspect "$work/enc4-hp/rar_multivolume.part0002.rar"
+    else
+        echo "SKIP RAR5 encrypted multivolume: no openssl"
+    fi
 else
     echo "SKIP RAR: no libarchive-3.8.1.tar.xz (port/deps/build.sh libarchive downloads it)"
 fi

@@ -1,0 +1,955 @@
+ps5webkit: decrypt RAR4 archives (RAR 3.x AES-128: data, and headers with -hp)
+
+On top of 0001 (archive_rar_crypto.c: AES, and RAR 3.x's key derivation
+with its SHA-1 quirk). The RAR reader's reads all go through rar4_ahead()
+and rar4_consume(): after a main header with MHD_PASSWORD each header is a
+salt and the header padded to 16 bytes, decrypted whole (the passphrase is
+the one whose header CRC holds); a file's data (FHD_PASSWORD, version 2.9
+and later) is one AES-128-CBC stream across its volumes, read through a
+plain text view. RAR 3.x has no password check value: the data's key comes
+from the passphrase that opened the headers, else the first one given, and
+a wrong one shows as "Incorrect passphrase, or the archive is damaged
+(...)". Stored files stop at their size (not the padding); an encrypted
+link's target is read with the key, or left empty without one; RAR 1.5 and
+2.x encryption stays unsupported.
+
+The format follows UnRAR's behaviour; no UnRAR code is used.
+
+diff -ruN a/libarchive/archive_read_support_format_rar.c b/libarchive/archive_read_support_format_rar.c
+--- a/libarchive/archive_read_support_format_rar.c	2026-11-22 17:13:12
++++ b/libarchive/archive_read_support_format_rar.c	2026-11-22 17:13:12
+@@ -45,6 +45,7 @@
+ #include "archive_ppmd7_private.h"
+ #include "archive_private.h"
+ #include "archive_read_private.h"
++#include "archive_rar_crypto_private.h"
+ 
+ /* RAR signature, also known as the mark header */
+ #define RAR_SIGNATURE "\x52\x61\x72\x21\x1A\x07\x00"
+@@ -392,6 +393,37 @@
+    * Custom field to denote that this archive contains encrypted entries
+    */
+   int has_encrypted_entries;
++
++  /*
++   * Decryption (ps5webkit): RAR 3.x's AES-128. After a main header with
++   * MHD_PASSWORD each header is an 8-byte salt and the header, padded to 16
++   * bytes, decrypted whole into hbuf; the password is the one whose header
++   * CRC holds. A file's data is one stream across its volumes (a volume can
++   * end inside a block), read through dbuf; per volume, bytes_remaining
++   * counts the plain text that volume completes.
++   */
++  struct rar4_crypt {
++    char headers;             /* the headers are encrypted (this volume) */
++    char *password;           /* the one that decrypts them */
++    struct rar_aes *haes, *aes;
++    char hactive;
++    uint8_t *hbuf, *combo;
++    size_t hcap, combocap, hlen, hpos;
++    char file;                /* this file's data is encrypted */
++    char old;                 /* ... with RAR 1.5/2.0's cipher: not read */
++    char keyed, broken;
++    char dactive;
++    int64_t raw_left, raw_done;
++    uint8_t carry[16];
++    size_t carry_len;
++    uint8_t *dbuf;
++    size_t dcap, dlen, dpos;
++    struct rar4_kdf {
++      char used, salted;
++      uint8_t salt[8], password[32], key[16], iv[16];
++    } kdf[4];
++    unsigned kdf_next;
++  } crypt;
+ };
+ 
+ static int archive_read_support_format_rar_capabilities(struct archive_read *);
+@@ -455,6 +487,471 @@
+ static inline void vm_write_32(struct rar_virtual_machine*, size_t, uint32_t);
+ static inline uint32_t vm_read_32(struct rar_virtual_machine*, size_t);
+ 
++/* ---- decryption (ps5webkit) ---- */
++
++#define RAR4_SLACK 64
++#ifndef RAR4_CHUNK
++#define RAR4_CHUNK (64 * 1024) /* decrypted at a time */
++#endif
++
++static struct rar *
++rar4_state(struct archive_read *a)
++{
++  return a->format ? (struct rar *)a->format->data : NULL;
++}
++
++/* Decrypts this volume's cipher text until want bytes of plain text are
++ * in dbuf (or there is no more in this volume). 1, or 0. */
++static int
++rar4_fill(struct archive_read *a, struct rar *rar, size_t want)
++{
++  struct rar4_crypt *c = &rar->crypt;
++  size_t have = c->dlen - c->dpos;
++
++  if (have >= want)
++    return 1;
++  if (!c->keyed || c->broken || want > SIZE_MAX - 2 * RAR4_CHUNK)
++    return 0;
++  if (c->dpos > 0) {
++    memmove(c->dbuf, c->dbuf + c->dpos, have);
++    c->dlen = have;
++    c->dpos = 0;
++  }
++  if (c->dcap < want + RAR4_CHUNK + RAR4_SLACK) {
++    size_t cap = want + RAR4_CHUNK + RAR4_SLACK;
++    uint8_t *d = realloc(c->dbuf, cap);
++    if (d == NULL)
++      return 0;
++    c->dbuf = d;
++    c->dcap = cap;
++  }
++  while (c->dlen < want && c->raw_left > 0) {
++    size_t space = ((c->dcap - RAR4_SLACK - c->dlen) / 16) * 16;
++    size_t t = space - c->carry_len, used = 0, whole;
++    ssize_t avail = 0;
++    const uint8_t *p;
++
++    if ((int64_t)t > c->raw_left)
++      t = (size_t)c->raw_left;
++    p = __archive_read_ahead(a, t, &avail);
++    if (p == NULL) {
++      if (avail <= 0)
++        return 0;
++      t = (size_t)avail;
++      if ((p = __archive_read_ahead(a, t, &avail)) == NULL)
++        return 0;
++    }
++    if (c->carry_len > 0) {
++      size_t n = 16 - c->carry_len;
++      if (n > t)
++        n = t;
++      memcpy(c->carry + c->carry_len, p, n);
++      c->carry_len += n;
++      used = n;
++      if (c->carry_len == 16) {
++        if (__archive_rar_aes_decrypt(c->aes, c->carry, c->dbuf + c->dlen, 16))
++          return 0;
++        c->dlen += 16;
++        c->carry_len = 0;
++      }
++    }
++    whole = ((t - used) / 16) * 16;
++    if (whole > 0) {
++      if (__archive_rar_aes_decrypt(c->aes, p + used, c->dbuf + c->dlen, whole))
++        return 0;
++      c->dlen += whole;
++      used += whole;
++    }
++    if (t > used) {
++      memcpy(c->carry + c->carry_len, p + used, t - used);
++      c->carry_len += t - used;
++    }
++    __archive_read_consume(a, t);
++    c->raw_left -= t;
++    c->raw_done += t;
++  }
++  memset(c->dbuf + c->dlen, 0, RAR4_SLACK);
++  return c->dlen - c->dpos >= want;
++}
++
++/* No whole block left in this volume: its last bytes wait in carry for the
++ * next volume, and reads go back to the raw stream. */
++static int
++rar4_settle(struct archive_read *a, struct rar *rar)
++{
++  struct rar4_crypt *c = &rar->crypt;
++
++  if (!c->dactive || c->dpos < c->dlen || (int64_t)c->carry_len + c->raw_left >= 16)
++    return 0;
++  if (c->raw_left > 0) {
++    const uint8_t *p = __archive_read_ahead(a, (size_t)c->raw_left, NULL);
++    if (p == NULL)
++      return -1;
++    memcpy(c->carry + c->carry_len, p, (size_t)c->raw_left);
++    c->carry_len += (size_t)c->raw_left;
++    __archive_read_consume(a, c->raw_left);
++    c->raw_done += c->raw_left;
++    c->raw_left = 0;
++  }
++  c->dactive = 0;
++  return 0;
++}
++
++static const void *
++rar4_ahead(struct archive_read *a, size_t min, ssize_t *avail)
++{
++  struct rar *rar = rar4_state(a);
++  struct rar4_crypt *c;
++
++  if (rar == NULL || (!rar->crypt.hactive && !rar->crypt.dactive))
++    return __archive_read_ahead(a, min, avail);
++  c = &rar->crypt;
++  if (c->hactive) {
++    size_t have = c->hlen - c->hpos;
++    ssize_t ravail = 0;
++    const uint8_t *r;
++
++    if (min <= have) {
++      if (avail)
++        *avail = (ssize_t)have;
++      return c->hbuf + c->hpos;
++    }
++    /* Past the header: its data follows in the raw stream. */
++    r = __archive_read_ahead(a, min - have, &ravail);
++    if (r == NULL || c->combocap < min) {
++      uint8_t *b = r ? realloc(c->combo, min) : NULL;
++      if (b == NULL) {
++        if (avail)
++          *avail = (ssize_t)have + (ravail > 0 ? ravail : 0);
++        return NULL;
++      }
++      c->combo = b;
++      c->combocap = min;
++    }
++    memcpy(c->combo, c->hbuf + c->hpos, have);
++    memcpy(c->combo + have, r, min - have);
++    if (avail)
++      *avail = (ssize_t)min;
++    return c->combo;
++  }
++  if (!rar4_fill(a, rar, min ? min : 1) && c->dlen - c->dpos < min) {
++    if (avail)
++      *avail = (ssize_t)(c->dlen - c->dpos);
++    return NULL;
++  }
++  if (avail)
++    *avail = (ssize_t)(c->dlen - c->dpos);
++  return c->dbuf + c->dpos;
++}
++
++static int64_t
++rar4_consume(struct archive_read *a, int64_t n)
++{
++  struct rar *rar = rar4_state(a);
++  struct rar4_crypt *c;
++  int64_t r;
++
++  if (rar == NULL || (!rar->crypt.hactive && !rar->crypt.dactive) || n < 0)
++    return __archive_read_consume(a, n);
++  c = &rar->crypt;
++  if (c->hactive) {
++    size_t have = c->hlen - c->hpos;
++    if ((uint64_t)n <= have) {
++      c->hpos += (size_t)n;
++      if (c->hpos == c->hlen)
++        c->hactive = 0;
++      return n;
++    }
++    c->hpos = c->hlen;
++    c->hactive = 0;
++    r = __archive_read_consume(a, n - (int64_t)have);
++    return r < 0 ? r : (int64_t)have + r;
++  } else {
++    uint64_t have = c->dlen - c->dpos, left = (uint64_t)n, rest;
++
++    if (left <= have) {
++      c->dpos += (size_t)left;
++      return rar4_settle(a, rar) ? -1 : n;
++    }
++    left -= have;
++    c->dpos = c->dlen;
++    rest = (((uint64_t)c->carry_len + (uint64_t)c->raw_left) / 16) * 16;
++    if (left > rest)
++      return -1;
++    if (left == rest) {
++      /* All of it (skipping): the cipher text is dropped undecrypted,
++       * and its stream can't be decrypted after this. */
++      if (c->raw_left > 0 && __archive_read_consume(a, c->raw_left) != c->raw_left)
++        return -1;
++      c->raw_done += c->raw_left;
++      c->carry_len = (size_t)(((int64_t)c->carry_len + c->raw_left) % 16);
++      c->raw_left = 0;
++      c->broken = 1;
++      c->dactive = 0;
++      return n;
++    }
++    while (left > 0) {
++      size_t step = left > RAR4_CHUNK ? RAR4_CHUNK : (size_t)left;
++      if (!rar4_fill(a, rar, step))
++        return -1;
++      c->dpos += step;
++      left -= step;
++    }
++    return rar4_settle(a, rar) ? -1 : n;
++  }
++}
++
++/* The password as RAR 3.x hashes it: UTF-16LE, at most 128 characters. */
++static size_t
++rar4_utf16le(const char *s, uint8_t *out, size_t size)
++{
++  const unsigned char *u = (const unsigned char *)s;
++  size_t n = 0;
++
++  while (*u && n + 4 <= size) {
++    uint32_t cp;
++    int more;
++    if (*u < 0x80) { cp = *u++; more = 0; }
++    else if ((*u & 0xE0) == 0xC0) { cp = *u++ & 0x1F; more = 1; }
++    else if ((*u & 0xF0) == 0xE0) { cp = *u++ & 0x0F; more = 2; }
++    else if ((*u & 0xF8) == 0xF0) { cp = *u++ & 0x07; more = 3; }
++    else { u++; cp = 0xFFFD; more = 0; }
++    while (more-- > 0) {
++      if ((*u & 0xC0) != 0x80) { cp = 0xFFFD; break; }
++      cp = (cp << 6) | (*u++ & 0x3F);
++    }
++    if (cp >= 0x10000) {
++      cp -= 0x10000;
++      out[n++] = (uint8_t)(0xD800 + (cp >> 10));
++      out[n++] = (uint8_t)((0xD800 + (cp >> 10)) >> 8);
++      cp = 0xDC00 + (cp & 0x3FF);
++    }
++    out[n++] = (uint8_t)cp;
++    out[n++] = (uint8_t)(cp >> 8);
++  }
++  return n;
++}
++
++/* Key and IV for a password and salt (NULL: none), derived once. */
++static int
++rar4_derive(struct rar *rar, const char *password, const uint8_t *salt,
++    uint8_t key[16], uint8_t iv[16])
++{
++  struct rar4_crypt *c = &rar->crypt;
++  struct rar4_kdf *k;
++  uint8_t id[32], wide[2 * 128 + 4];
++  size_t n;
++  int i;
++
++  if (__archive_rar_sha256(password, strlen(password), id))
++    return -1;
++  for (i = 0; i < 4; i++) {
++    k = &c->kdf[i];
++    if (k->used && k->salted == (salt != NULL) &&
++        (!salt || !memcmp(k->salt, salt, 8)) && !memcmp(k->password, id, 32)) {
++      memcpy(key, k->key, 16);
++      memcpy(iv, k->iv, 16);
++      return 0;
++    }
++  }
++  n = rar4_utf16le(password, wide, 2 * 128);
++  __archive_rar3_kdf(wide, n, salt, key, iv);
++  __archive_rar_wipe(wide, sizeof(wide));
++  k = &c->kdf[c->kdf_next++ % 4];
++  k->used = 1;
++  k->salted = salt != NULL;
++  if (salt)
++    memcpy(k->salt, salt, 8);
++  memcpy(k->password, id, 32);
++  memcpy(k->key, key, 16);
++  memcpy(k->iv, iv, 16);
++  return 0;
++}
++
++/* One encrypted header with password: ARCHIVE_OK (in hbuf), ARCHIVE_FAILED
++ * (its CRC says it's the wrong one), ARCHIVE_EOF, ARCHIVE_FATAL. */
++static int
++rar4_try_header(struct archive_read *a, struct rar *rar, const char *password,
++    const uint8_t salt[8])
++{
++  struct rar4_crypt *c = &rar->crypt;
++  uint8_t key[16], iv[16], first[16];
++  const uint8_t *p;
++  size_t size, total;
++
++  if (rar4_derive(rar, password, salt, key, iv))
++    return ARCHIVE_FATAL;
++  if ((p = __archive_read_ahead(a, 8 + 16, NULL)) == NULL)
++    return ARCHIVE_EOF;
++  if (__archive_rar_aes_init(c->haes, key, 128, iv) ||
++      __archive_rar_aes_decrypt(c->haes, p + 8, first, 16))
++    return ARCHIVE_FATAL;
++  size = archive_le16dec(first + 5);
++  if (size < 7)
++    return ARCHIVE_FAILED;
++  total = (size + 15) & ~(size_t)15;
++  if (c->hcap < total + RAR4_SLACK) {
++    uint8_t *b = realloc(c->hbuf, total + RAR4_SLACK);
++    if (b == NULL)
++      return ARCHIVE_FATAL;
++    c->hbuf = b;
++    c->hcap = total + RAR4_SLACK;
++  }
++  if ((p = __archive_read_ahead(a, 8 + total, NULL)) == NULL)
++    return ARCHIVE_FAILED; /* a size past the end: most likely the wrong key */
++  if (__archive_rar_aes_init(c->haes, key, 128, iv) ||
++      __archive_rar_aes_decrypt(c->haes, p + 8, c->hbuf, total))
++    return ARCHIVE_FATAL;
++  __archive_rar_wipe(key, sizeof(key));
++  if ((crc32(0, c->hbuf + 2, (unsigned)size - 2) & 0xffff) !=
++      archive_le16dec(c->hbuf))
++    return ARCHIVE_FAILED;
++  memset(c->hbuf + total, 0, RAR4_SLACK);
++  __archive_read_consume(a, 8 + total);
++  c->hlen = size;
++  c->hpos = 0;
++  c->hactive = 1;
++  return ARCHIVE_OK;
++}
++
++/* Before each header of a volume whose headers are encrypted: decrypts it
++ * into hbuf (the next volume's signature ends that). */
++static int
++rar4_next_header(struct archive_read *a, struct rar *rar)
++{
++  struct rar4_crypt *c = &rar->crypt;
++  const char *password;
++  uint8_t salt[8];
++  const uint8_t *p;
++  int ret, tried = 0;
++
++  if (!c->headers || c->hactive)
++    return ARCHIVE_OK;
++  if ((p = __archive_read_ahead(a, 8 + 16, NULL)) == NULL)
++    return ARCHIVE_EOF;
++  if (!memcmp(p, RAR_SIGNATURE, 7)) {
++    c->headers = 0;
++    return ARCHIVE_OK;
++  }
++  memcpy(salt, p, 8);
++  if (c->haes == NULL && (c->haes = __archive_rar_aes_new()) == NULL) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC, __archive_rar_crypto_available()
++        ? "Can't set up decryption" : "Decryption is not supported: this libarchive has no crypto library");
++    return ARCHIVE_FATAL;
++  }
++  if (c->password) {
++    ret = rar4_try_header(a, rar, c->password, salt);
++    if (ret == ARCHIVE_FAILED) {
++      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++          "Header CRC error (an incorrect passphrase, or a damaged archive)");
++      return ARCHIVE_FATAL;
++    }
++    return ret;
++  }
++  __archive_read_reset_passphrase(a);
++  while ((password = __archive_read_next_passphrase(a)) != NULL) {
++    tried++;
++    ret = rar4_try_header(a, rar, password, salt);
++    if (ret == ARCHIVE_OK) {
++      if ((c->password = strdup(password)) == NULL) {
++        archive_set_error(&a->archive, ENOMEM, "Out of memory");
++        return ARCHIVE_FATAL;
++      }
++      return ARCHIVE_OK;
++    }
++    if (ret != ARCHIVE_FAILED)
++      return ret;
++  }
++  archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++      tried ? "Incorrect passphrase" : "Passphrase required for this entry");
++  return ARCHIVE_FATAL;
++}
++
++/* A file header is read: its data goes through the plain text view.
++ * continued: this is the next volume's part of the same file. */
++static int
++rar4_start_data(struct archive_read *a, struct rar *rar, int continued,
++    unsigned unp_ver)
++{
++  struct rar4_crypt *c = &rar->crypt;
++  int64_t end, start;
++
++  if (!continued) {
++    c->file = 0;
++    c->keyed = 0;
++    c->broken = 0;
++    c->raw_done = 0;
++    c->carry_len = 0;
++    c->old = 0;
++  }
++  c->dactive = 0;
++  c->dlen = 0;
++  c->dpos = 0;
++  if (!(rar->file_flags & FHD_PASSWORD))
++    return 0;
++  c->file = 1;
++  if (!continued)
++    c->old = unp_ver < 29;
++  end = (c->raw_done + rar->packed_size) & ~(int64_t)15;
++  start = c->raw_done & ~(int64_t)15;
++  c->raw_left = rar->packed_size;
++  c->dactive = rar->packed_size > 0;
++  rar->bytes_remaining = end - start;
++  return rar4_settle(a, rar);
++}
++
++/* Before the file's first read. No check value in RAR 3.x: the password
++ * that opened the headers, else the first one given; a wrong one shows as
++ * a CRC (or decompression) error. */
++static int
++rar4_file_key(struct archive_read *a, struct rar *rar)
++{
++  struct rar4_crypt *c = &rar->crypt;
++  const char *password = c->password;
++  uint8_t key[16], iv[16];
++
++  if (c->keyed)
++    return ARCHIVE_OK;
++  if (c->old) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "RAR 1.5 and 2.x encryption isn't supported");
++    return ARCHIVE_FATAL;
++  }
++  if (!__archive_rar_crypto_available()) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "Decryption is not supported: this libarchive has no crypto library");
++    return ARCHIVE_FATAL;
++  }
++  if (c->broken) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "Can't decrypt the rest of an entry that was skipped");
++    return ARCHIVE_FATAL;
++  }
++  if (password == NULL) {
++    __archive_read_reset_passphrase(a);
++    password = __archive_read_next_passphrase(a);
++  }
++  if (password == NULL) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "Passphrase required for this entry");
++    return ARCHIVE_FAILED;
++  }
++  if (rar4_derive(rar, password, (rar->file_flags & FHD_SALT) ?
++      (const uint8_t *)rar->salt : NULL, key, iv) ||
++      (c->aes == NULL && (c->aes = __archive_rar_aes_new()) == NULL) ||
++      __archive_rar_aes_init(c->aes, key, 128, iv)) {
++    __archive_rar_wipe(key, sizeof(key));
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC, "Can't set up decryption");
++    return ARCHIVE_FATAL;
++  }
++  __archive_rar_wipe(key, sizeof(key));
++  c->keyed = 1;
++  return ARCHIVE_OK;
++}
++
++#define RAR4_CRC_ERROR(rar, what) ((rar)->crypt.headers ? what \
++    " (an incorrect passphrase, or a damaged archive)" : what)
++
+ /*
+  * Bit stream reader.
+  */
+@@ -572,7 +1069,7 @@
+       if (rar->bytes_unconsumed > 0) {
+         /* Consume as much as the decompressor
+          * actually used. */
+-        __archive_read_consume(a, rar->bytes_unconsumed);
++        rar4_consume(a, rar->bytes_unconsumed);
+         rar->bytes_unconsumed = 0;
+       }
+       br->next_in = rar_read_ahead(a, 1, &(br->avail_in));
+@@ -795,7 +1292,7 @@
+   if (best_bid > 30)
+     return (-1);
+ 
+-  if ((p = __archive_read_ahead(a, 7, NULL)) == NULL)
++  if ((p = rar4_ahead(a, 7, NULL)) == NULL)
+     return (-1);
+ 
+   if (memcmp(p, RAR_SIGNATURE, 7) == 0)
+@@ -807,7 +1304,7 @@
+     ssize_t window = 4096;
+     ssize_t bytes_avail;
+     while (offset + window <= (1024 * 128)) {
+-      const char *buff = __archive_read_ahead(a, offset + window, &bytes_avail);
++      const char *buff = rar4_ahead(a, offset + window, &bytes_avail);
+       if (buff == NULL) {
+         /* Remaining bytes are less than window. */
+         window >>= 1;
+@@ -838,7 +1335,7 @@
+   total = 0;
+   window = 4096;
+   while (total + window <= (1024 * 128)) {
+-    h = __archive_read_ahead(a, window, &bytes);
++    h = rar4_ahead(a, window, &bytes);
+     if (h == NULL) {
+       /* Remaining bytes are less than window. */
+       window >>= 1;
+@@ -858,13 +1355,13 @@
+     while (p + 7 < q) {
+       if (memcmp(p, RAR_SIGNATURE, 7) == 0) {
+       	skip = p - (const char *)h;
+-      	__archive_read_consume(a, skip);
++      	rar4_consume(a, skip);
+       	return (ARCHIVE_OK);
+       }
+       p += 0x10;
+     }
+     skip = p - (const char *)h;
+-    __archive_read_consume(a, skip);
++    rar4_consume(a, skip);
+     total += skip;
+   }
+ fatal:
+@@ -936,7 +1433,7 @@
+   /* RAR files can be generated without EOF headers, so return ARCHIVE_EOF if
+   * this fails.
+   */
+-  if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
++  if ((h = rar4_ahead(a, 7, NULL)) == NULL)
+     return (ARCHIVE_EOF);
+ 
+   p = h;
+@@ -953,7 +1450,14 @@
+   {
+     unsigned long crc32_val;
+ 
+-    if ((h = __archive_read_ahead(a, 7, NULL)) == NULL) {
++    if ((ret = rar4_next_header(a, rar)) != ARCHIVE_OK) {
++      if (ret == ARCHIVE_EOF)
++        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++                          "Failed to read next header.");
++      return (ARCHIVE_FATAL);
++    }
++
++    if ((h = rar4_ahead(a, 7, NULL)) == NULL) {
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                         "Failed to read next header.");
+       return (ARCHIVE_FATAL);
+@@ -969,7 +1473,7 @@
+           "Invalid marker header");
+         return (ARCHIVE_FATAL);
+       }
+-      __archive_read_consume(a, 7);
++      rar4_consume(a, 7);
+       break;
+ 
+     case MAIN_HEAD:
+@@ -980,7 +1484,7 @@
+           "Invalid header size");
+         return (ARCHIVE_FATAL);
+       }
+-      if ((h = __archive_read_ahead(a, skip, NULL)) == NULL)
++      if ((h = rar4_ahead(a, skip, NULL)) == NULL)
+         return (ARCHIVE_FATAL);
+       p = h;
+       memcpy(rar->reserved1, p + 7, sizeof(rar->reserved1));
+@@ -997,27 +1501,26 @@
+                             sizeof(rar->reserved2));
+       }
+ 
+-      /* Main header is password encrypted, so we cannot read any
+-         file names or any other info about files from the header. */
++      /* Main header is password encrypted: the headers after it are
++         decrypted (rar4_next_header). */
+       if (rar->main_flags & MHD_PASSWORD)
+       {
+         archive_entry_set_is_metadata_encrypted(entry, 1);
+         archive_entry_set_is_data_encrypted(entry, 1);
+         rar->has_encrypted_entries = 1;
+-         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                          "RAR encryption support unavailable.");
+-        return (ARCHIVE_FATAL);
+       }
+ 
+       crc32_val = crc32(0, (const unsigned char *)p + 2, (unsigned)skip - 2);
+       if ((crc32_val & 0xffff) != archive_le16dec(p)) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-          "Header CRC error");
++          RAR4_CRC_ERROR(rar, "Header CRC error"));
+         return (ARCHIVE_FATAL);
+ #endif
+       }
+-      __archive_read_consume(a, skip);
++      rar4_consume(a, skip);
++      if (rar->main_flags & MHD_PASSWORD)
++        rar->crypt.headers = 1;
+       break;
+ 
+     case FILE_HEAD:
+@@ -1043,7 +1546,7 @@
+             "Invalid header size too small");
+           return (ARCHIVE_FATAL);
+         }
+-        if ((h = __archive_read_ahead(a, skip, NULL)) == NULL)
++        if ((h = rar4_ahead(a, skip, NULL)) == NULL)
+           return (ARCHIVE_FATAL);
+         p = h;
+         skip += archive_le32dec(p + 7);
+@@ -1051,7 +1554,7 @@
+ 
+       /* Skip over the 2-byte CRC at the beginning of the header. */
+       crc32_expected = archive_le16dec(p);
+-      __archive_read_consume(a, 2);
++      rar4_consume(a, 2);
+       skip -= 2;
+ 
+       /* Skim the entire header and compute the CRC. */
+@@ -1062,25 +1565,27 @@
+           to_read = 32 * 1024;
+         else
+           to_read = (unsigned)skip;
+-        if ((h = __archive_read_ahead(a, to_read, NULL)) == NULL) {
++        if ((h = rar4_ahead(a, to_read, NULL)) == NULL) {
+           archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+             "Bad RAR file");
+           return (ARCHIVE_FATAL);
+         }
+         p = h;
+         crc32_val = crc32(crc32_val, (const unsigned char *)p, to_read);
+-        __archive_read_consume(a, to_read);
++        rar4_consume(a, to_read);
+         skip -= to_read;
+       }
+       if ((crc32_val & 0xffff) != crc32_expected) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-          "Header CRC error");
++          RAR4_CRC_ERROR(rar, "Header CRC error"));
+         return (ARCHIVE_FATAL);
+ #endif
+       }
+-      if (head_type == ENDARC_HEAD)
++      if (head_type == ENDARC_HEAD) {
++        rar->crypt.headers = 0; /* the next volume says again */
+         return (ARCHIVE_EOF);
++      }
+       break;
+ 
+     case NEWSUB_HEAD:
+@@ -1109,7 +1614,7 @@
+ 
+   if (rar->bytes_unconsumed > 0) {
+       /* Consume as much as the decompressor actually used. */
+-      __archive_read_consume(a, rar->bytes_unconsumed);
++      rar4_consume(a, rar->bytes_unconsumed);
+       rar->bytes_unconsumed = 0;
+   }
+ 
+@@ -1122,6 +1627,9 @@
+     return (ARCHIVE_EOF);
+   }
+ 
++  if (rar->crypt.file && (ret = rar4_file_key(a, rar)) != ARCHIVE_OK)
++    return (ret);
++
+   switch (rar->compression_method)
+   {
+   case COMPRESS_METHOD_STORE:
+@@ -1147,6 +1655,15 @@
+     ret = ARCHIVE_FATAL;
+     break;
+   }
++  if (ret < ARCHIVE_WARN && rar->crypt.file && rar->crypt.keyed &&
++      archive_error_string(&a->archive) &&
++      !strstr(archive_error_string(&a->archive), "passphrase")) {
++    /* Without a check value a wrong password shows only here. */
++    char why[128];
++    snprintf(why, sizeof(why), "%s", archive_error_string(&a->archive));
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++        "Incorrect passphrase, or the archive is damaged (%s)", why);
++  }
+   return (ret);
+ }
+ 
+@@ -1161,12 +1678,12 @@
+ 
+   if (rar->bytes_unconsumed > 0) {
+       /* Consume as much as the decompressor actually used. */
+-      __archive_read_consume(a, rar->bytes_unconsumed);
++      rar4_consume(a, rar->bytes_unconsumed);
+       rar->bytes_unconsumed = 0;
+   }
+ 
+   if (rar->bytes_remaining > 0) {
+-    bytes_skipped = __archive_read_consume(a, rar->bytes_remaining);
++    bytes_skipped = rar4_consume(a, rar->bytes_remaining);
+     if (bytes_skipped < 0)
+       return (ARCHIVE_FATAL);
+   }
+@@ -1195,6 +1712,12 @@
+   size_t i;
+   struct rar *rar = (struct rar *)(a->format->data);
+ 
++  if (rar->crypt.file) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "Seeking in an encrypted entry isn't supported");
++    return (ARCHIVE_FAILED);
++  }
++
+   if (rar->compression_method == COMPRESS_METHOD_STORE)
+   {
+     /* Modify the offset for use with SEEK_SET */
+@@ -1355,6 +1878,15 @@
+   free(rar->unp_buffer);
+   free(rar->lzss.window);
+   __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
++  if (rar->crypt.password)
++    __archive_rar_wipe(rar->crypt.password, strlen(rar->crypt.password));
++  free(rar->crypt.password);
++  free(rar->crypt.hbuf);
++  free(rar->crypt.combo);
++  free(rar->crypt.dbuf);
++  __archive_rar_aes_free(rar->crypt.haes);
++  __archive_rar_aes_free(rar->crypt.aes);
++  __archive_rar_wipe(&rar->crypt, sizeof(rar->crypt));
+   free(rar);
+   (a->format->data) = NULL;
+   return (ARCHIVE_OK);
+@@ -1397,7 +1929,7 @@
+   }
+ 
+ 
+-  if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
++  if ((h = rar4_ahead(a, 7, NULL)) == NULL)
+     return (ARCHIVE_FATAL);
+   p = h;
+   memcpy(&rar_header, p, sizeof(rar_header));
+@@ -1409,7 +1941,7 @@
+     return (ARCHIVE_FATAL);
+   }
+   crc32_computed = crc32(0, (const unsigned char *)p + 2, 7 - 2);
+-  __archive_read_consume(a, 7);
++  rar4_consume(a, 7);
+ 
+   if (!(rar->file_flags & FHD_SOLID))
+   {
+@@ -1438,7 +1970,7 @@
+     return (ARCHIVE_FATAL);
+   }
+ 
+-  if ((h = __archive_read_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
++  if ((h = rar4_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Failed to read full header content.");
+@@ -1451,7 +1983,7 @@
+   if ((crc32_computed & 0xffff) != crc32_read) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-      "Header CRC error");
++      RAR4_CRC_ERROR(rar, "Header CRC error"));
+     return (ARCHIVE_FATAL);
+ #endif
+   }
+@@ -1472,13 +2004,9 @@
+   {
+     archive_entry_set_is_data_encrypted(entry, 1);
+     rar->has_encrypted_entries = 1;
+-    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                      "RAR encryption support unavailable.");
+-    /* Since it is only the data part itself that is encrypted we can at least
+-       extract information about the currently processed entry and don't need
+-       to return ARCHIVE_FATAL here. */
+-    /*return (ARCHIVE_FATAL);*/
+   }
++  if (rar->crypt.headers)
++    archive_entry_set_is_metadata_encrypted(entry, 1);
+ 
+   if (rar->file_flags & FHD_LARGE)
+   {
+@@ -1528,7 +2056,7 @@
+       return (ARCHIVE_FATAL);
+     }
+     /* Make sure we have the extended data. */
+-    if ((h = __archive_read_ahead(a, (size_t)header_size - 7, NULL)) == NULL) {
++    if ((h = rar4_ahead(a, (size_t)header_size - 7, NULL)) == NULL) {
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                         "Failed to read extended header data.");
+       return (ARCHIVE_FATAL);
+@@ -1692,9 +2220,11 @@
+     filename_size == rar->filename_save_size &&
+     !memcmp(rar->filename, rar->filename_save, filename_size + 1))
+   {
+-    __archive_read_consume(a, header_size - 7);
++    rar4_consume(a, header_size - 7);
+     rar->br.avail_in = 0;
+     rar->br.next_in = NULL;
++    if (head_type == FILE_HEAD && rar4_start_data(a, rar, 1, 0))
++      return (ARCHIVE_FATAL);
+     rar->cursor++;
+     if (rar->cursor >= rar->nodes)
+     {
+@@ -1775,7 +2305,10 @@
+     }
+   }
+ 
+-  __archive_read_consume(a, header_size - 7);
++  rar4_consume(a, header_size - 7);
++  if (head_type == FILE_HEAD &&
++      rar4_start_data(a, rar, 0, (unsigned char)file_header.unp_ver))
++    return (ARCHIVE_FATAL);
+   if (rar->packed_size > INT64_MAX - a->filter->position) {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Unable to store offsets.");
+@@ -1984,6 +2517,21 @@
+                       "Unable to read link.");
+     return (ARCHIVE_FATAL);
+   }
++  size_t length = (size_t)rar->packed_size;
++  if (rar->crypt.file)
++  {
++    /* The target is encrypted too: without the key the link is listed
++     * with no target. */
++    if (rar4_file_key(a, rar) != ARCHIVE_OK)
++    {
++      archive_clear_error(&a->archive);
++      if (rar4_consume(a, rar->packed_size) < 0)
++        return (ARCHIVE_FATAL);
++      return (ARCHIVE_OK);
++    }
++    if (rar->unp_size < rar->packed_size)
++      length = (size_t)rar->unp_size; /* not the padding */
++  }
+   if ((h = rar_read_ahead(a, (size_t)rar->packed_size, NULL)) == NULL)
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+@@ -1993,7 +2541,7 @@
+   p = h;
+ 
+   if (archive_entry_copy_symlink_l(entry,
+-      p, (size_t)rar->packed_size, sconv))
++      p, length, sconv))
+   {
+     if (errno == ENOMEM)
+     {
+@@ -2006,7 +2554,7 @@
+                       archive_string_conversion_charset_name(sconv));
+     ret = (ARCHIVE_WARN);
+   }
+-  __archive_read_consume(a, rar->packed_size);
++  rar4_consume(a, rar->packed_size);
+   return ret;
+ }
+ 
+@@ -2018,6 +2566,14 @@
+   ssize_t bytes_avail;
+ 
+   rar = (struct rar *)(a->format->data);
++  if (rar->crypt.file && rar->offset >= rar->unp_size && rar->bytes_remaining > 0 &&
++    !(rar->main_flags & MHD_VOLUME && rar->file_flags & FHD_SPLIT_AFTER))
++  {
++    /* The cipher text's padding. */
++    if (rar4_consume(a, rar->bytes_remaining) < 0)
++      return (ARCHIVE_FATAL);
++    rar->bytes_remaining = 0;
++  }
+   if (rar->bytes_remaining == 0 &&
+     !(rar->main_flags & MHD_VOLUME && rar->file_flags & FHD_SPLIT_AFTER))
+   {
+@@ -2042,6 +2598,8 @@
+                       "Truncated RAR file data");
+     return (ARCHIVE_FATAL);
+   }
++  if (rar->crypt.file && bytes_avail > rar->unp_size - rar->offset)
++    bytes_avail = (ssize_t)(rar->unp_size - rar->offset);
+ 
+   *size = bytes_avail;
+   *offset = rar->offset;
+@@ -3231,7 +3789,7 @@
+   int ret;
+ 
+ again:
+-  h = __archive_read_ahead(a, min, avail);
++  h = rar4_ahead(a, min, avail);
+ 
+   if (avail)
+   {

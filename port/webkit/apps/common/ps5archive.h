@@ -10,8 +10,15 @@
  * Safety: the archive is untrusted. Before anything is written the whole
  * directory of entries is read (ps5archive_inspect) and the archive is
  * refused if any entry has an absolute path, a ".." part, a link (symbolic
- * or hard), a device, FIFO or socket, or is encrypted; or if it holds more
- * than limits.max_entries entries or more than limits.max_bytes unpacked.
+ * or hard), a device, FIFO or socket; or if it holds more than
+ * limits.max_entries entries or more than limits.max_bytes unpacked.
+ *
+ * Passwords: ZIP (PKWARE and WinZip AES), RAR4 (RAR 3.x's AES) and RAR5
+ * archives with one are read with limits.password (libarchive with OpenSSL,
+ * and port/deps/patches/libarchive for RAR). Without it, or with a wrong
+ * one, the calls return -4; 7-Zip archives with a password are refused
+ * (-1). RAR4 has no password check value: unless its names are encrypted
+ * too, a wrong password shows only as the files are unpacked.
  * Entries are written with O_NOFOLLOW under dest only, files 0777 and
  * folders 0777 (the console won't start an app with less). Unpacked sizes
  * are checked against the free space first (statvfs).
@@ -31,6 +38,7 @@ typedef struct {
     unsigned max_entries; /* 0: 200000 */
     uint64_t max_bytes;   /* 0: 512 GiB */
     uint64_t free_margin; /* left free on dest's drive; 0: 64 MiB */
+    const char* password; /* UTF-8, for an archive with one; NULL: none */
 } PS5ArchiveLimits;
 
 typedef struct {
@@ -38,7 +46,9 @@ typedef struct {
     unsigned volumes;      /* parts in the set (1 for a single file) */
     unsigned entries;
     uint64_t unpacked;     /* bytes, the sum of the entries' sizes */
-    bool encrypted;        /* refused: passwords aren't supported */
+    bool encrypted;        /* it has a password */
+    bool names_encrypted;  /* ... over its list of files too (rar -hp) */
+    bool password_wrong;   /* -4: the password given isn't its password */
     bool sizes_known;      /* every entry had a size in its header */
     /* The one folder everything is in ("PPSA01234-app/"), else "". */
     char top_folder[256];
@@ -50,6 +60,9 @@ typedef struct {
     unsigned titles;       /* how many such folders */
     bool title_icon;       /* title_dir has sce_sys/icon0.png (ShadowMountPlus
                             * won't install an image's app without one) */
+    /* The first empty folder in title_dir, relative ("game"), else "": one
+     * the app may expect files added to, which an image can't take. */
+    char empty_folder[256];
 } PS5ArchiveInfo;
 
 /* An archive read through a function instead of from files (the download
@@ -79,8 +92,11 @@ char** ps5archive_volumes(const char* path, char* error, size_t error_size);
 void ps5archive_free_list(char** list);
 
 /* Reads every entry's header (no data written). 0; -1 refused (error says
- * why: encrypted, unsafe path, over the limits); -2 unreadable (not an
- * archive, a part missing, damaged). */
+ * why: unsafe path, over the limits, a password that can't be used); -2
+ * unreadable (not an archive, a part missing, damaged); -4 it has a
+ * password and limits has none (info filled as far as the names could be
+ * read), or the wrong one (info->password_wrong): with a password, the
+ * first encrypted file's first bytes are read to check it. */
 int ps5archive_inspect(const char* path, const PS5ArchiveLimits* limits, PS5ArchiveInfo* info, char* error,
     size_t error_size);
 /* The same for a source (read_at is asked only for the parts the format
@@ -91,16 +107,19 @@ int ps5archive_inspect_source(const PS5ArchiveSource* source, const PS5ArchiveLi
 
 /* The file called name (a path as inspect sees it: "PPSA01234/sce_sys/
  * param.json") read into buffer, at most size - 1 bytes, NUL-terminated;
- * from the set path belongs to, or from source if it isn't NULL. 0; -1 not
- * there, too big, encrypted; -2 unreadable. */
-int ps5archive_read_entry(const char* path, const PS5ArchiveSource* source, const char* name, char* buffer, size_t size,
-    size_t* length, char* error, size_t error_size);
+ * from the set path belongs to, or from source if it isn't NULL, with
+ * password if it has one (NULL: none). 0; -1 not there, too big, a password
+ * that can't be used; -2 unreadable; -4 the password is needed or wrong. */
+int ps5archive_read_entry(const char* path, const PS5ArchiveSource* source, const char* password, const char* name,
+    char* buffer, size_t size, size_t* length, char* error, size_t error_size);
 
 /* Unpacks the set path belongs to into dest (made if missing). Inspects
  * first (as above), then checks the free space. *cancel (if not NULL) set
  * to nonzero stops between blocks. 0; -1 refused; -2 failed (reading,
- * writing, no space); -3 cancelled. On -2 and -3 what was written stays
- * (the caller removes dest if it made it). */
+ * writing, no space); -3 cancelled; -4 the password is needed or wrong (as
+ * inspect, before anything is written; or later, for a file whose password
+ * differs). On -2, -3 and -4 what was written stays (the caller removes
+ * dest if it made it). */
 int ps5archive_extract(const char* path, const char* dest, const PS5ArchiveLimits* limits,
     ps5archive_progress_fn progress, void* data, volatile int* cancel, char* error, size_t error_size);
 

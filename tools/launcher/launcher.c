@@ -390,12 +390,14 @@ static void register_title(int fd, const char *tid, const char *src_arg)
  * titles, and not the browser (PPSA99207) either. PPSA99208 and PPSA99209
  * are the WebGPU and web-in-title test builds of the browser (Spike 14).
  * PPSA99016 is Spike 12's P0d, PPSA99017 and PPSA99018 Spike 13's and 14's,
- * PPSA99021 to PPSA99024 Spike 15's (15a, 15c, 15d, 15e). */
+ * PPSA99021 to PPSA99024 Spike 15's (15a, 15c, 15d, 15e). PPSA26371 is
+ * the Geometry Dash Lite .ffpkg made while testing images (the owner asked
+ * for it to go, 2026-11-22). */
 static const char *const uninstallable[] = {
     "PPSA99006", "PPSA99007", "PPSA99009", "PPSA99010", "PPSA99011",
     "PPSA99012", "PPSA99013", "PPSA99014", "PPSA99015", "PPSA99016",
     "PPSA99017", "PPSA99018", "PPSA99021", "PPSA99022", "PPSA99023",
-    "PPSA99024", "PPSA99208", "PPSA99209",
+    "PPSA99024", "PPSA99208", "PPSA99209", "PPSA26371",
 };
 
 static void uninstall_title(int fd, const char *tid)

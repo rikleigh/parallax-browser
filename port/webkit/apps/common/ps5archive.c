@@ -694,11 +694,16 @@ static void limitsOrDefaults(const PS5ArchiveLimits* in, PS5ArchiveLimits* out)
         out->free_margin = DEFAULT_FREE_MARGIN;
 }
 
-static struct archive* newReader(char* error, size_t errorSize)
+static struct archive* newReader(const char* password, char* error, size_t errorSize)
 {
     struct archive* a = archive_read_new();
     if (!a) {
         fail(error, errorSize, "Out of memory");
+        return NULL;
+    }
+    if (password && *password && archive_read_add_passphrase(a, password) != ARCHIVE_OK) {
+        fail(error, errorSize, "Out of memory");
+        archive_read_free(a);
         return NULL;
     }
     /* Only what downloads hold: fewer parsers facing hostile input. */
@@ -725,9 +730,9 @@ static void openFailed(struct archive* a, char* error, size_t errorSize)
     archive_read_free(a);
 }
 
-static struct archive* openSet(char** volumes, char* error, size_t errorSize)
+static struct archive* openSet(char** volumes, const char* password, char* error, size_t errorSize)
 {
-    struct archive* a = newReader(error, errorSize);
+    struct archive* a = newReader(password, error, errorSize);
     if (!a)
         return NULL;
     if (archive_read_open_filenames(a, (const char**)volumes, READ_BLOCK) != ARCHIVE_OK) {
@@ -788,7 +793,7 @@ static struct archive* openSource(const PS5ArchiveSource* source, SourceClient* 
     client->source = source;
     client->at = 0;
     client->buffer = malloc(READ_BLOCK);
-    struct archive* a = client->buffer ? newReader(error, errorSize) : NULL;
+    struct archive* a = client->buffer ? newReader(NULL, error, errorSize) : NULL;
     if (!a) {
         if (!client->buffer)
             fail(error, errorSize, "Out of memory");
@@ -809,22 +814,32 @@ static struct archive* openSource(const PS5ArchiveSource* source, SourceClient* 
     return a;
 }
 
-static int isEncryptionError(struct archive* a)
-{
-    if (archive_read_has_encrypted_entries(a) > 0)
-        return 1;
-    const char* why = archive_error_string(a);
-    return why && (strstr(why, "ncrypt") || strstr(why, "assword"));
-}
+#define NEEDS_PASSWORD "It has a password: enter it to unpack it"
+#define WRONG_PASSWORD "That isn't its password"
 
-/* A failed libarchive read: refused (-1) if it's encryption, else -2. */
-static int readFailure(struct archive* a, char* error, size_t errorSize)
+/* A failed libarchive read: -4 a password needed or wrong (*wrong says
+ * which, if not NULL), -1 encryption that can't be read, else -2. */
+static int readFailure(struct archive* a, bool* wrong, char* error, size_t errorSize)
 {
-    if (isEncryptionError(a)) {
-        fail(error, errorSize, "Encrypted archives aren't supported");
+    const char* why = archive_error_string(a);
+    /* libarchive's words (ZIP's, and the RAR5 patch's) */
+    if (why && strstr(why, "Passphrase required")) {
+        fail(error, errorSize, NEEDS_PASSWORD);
+        return -4;
+    }
+    if (why && (strstr(why, "Incorrect passphrase") || strstr(why, "incorrect passphrase"))) {
+        if (wrong)
+            *wrong = true;
+        fail(error, errorSize, strstr(why, "damaged") ? WRONG_PASSWORD ", or the archive is damaged" : WRONG_PASSWORD);
+        return -4;
+    }
+    if (why && (strstr(why, "ncrypt") || strstr(why, "ecrypt"))) {
+        if ((archive_format(a) & ARCHIVE_FORMAT_BASE_MASK) == ARCHIVE_FORMAT_7ZIP)
+            fail(error, errorSize, "7-Zip archives with a password can't be unpacked here");
+        else
+            fail(error, errorSize, "Its password protection isn't one that can be read (%s)", why);
         return -1;
     }
-    const char* why = archive_error_string(a);
     if (why && strstr(why, "nrecognized"))
         fail(error, errorSize, "This isn't an archive that can be unpacked");
     else if (why && strstr(why, "nsupported"))
@@ -956,21 +971,19 @@ static int inspectArchive(struct archive* a, const PS5ArchiveLimits* limits, PS5
 {
     info->sizes_known = true;
     Inspect s = { limits, info, list, 0, error, errorSize };
-    int result = 0;
+    const char* password = limits->password && *limits->password ? limits->password : NULL;
+    int result = 0, checked = 0;
     for (;;) {
         struct archive_entry* entry;
         int r = archive_read_next_header(a, &entry);
         if (r == ARCHIVE_EOF)
             break;
         if (r < ARCHIVE_WARN) {
-            result = readFailure(a, error, errorSize);
-            info->encrypted = result == -1;
-            break;
-        }
-        if (archive_entry_is_encrypted(entry) || archive_read_has_encrypted_entries(a) > 0) {
-            info->encrypted = true;
-            fail(error, errorSize, "Encrypted archives aren't supported");
-            result = -1;
+            result = readFailure(a, &info->password_wrong, error, errorSize);
+            if (result == -4) { /* the list itself has the password (rar -hp) */
+                info->encrypted = info->names_encrypted = true;
+                formatName(a, info->format, sizeof info->format);
+            }
             break;
         }
         const char* raw = archive_entry_pathname_utf8(entry);
@@ -980,10 +993,36 @@ static int inspectArchive(struct archive* a, const PS5ArchiveLimits* limits, PS5
         result = takeEntry(&s, raw, archive_entry_filetype(entry), archive_entry_hardlink(entry) || archive_entry_symlink(entry), size);
         if (result)
             break;
+        if (!archive_entry_is_encrypted(entry))
+            continue;
+        info->encrypted = true;
+        if (archive_entry_is_metadata_encrypted(entry))
+            info->names_encrypted = true;
+        if ((archive_format(a) & ARCHIVE_FORMAT_BASE_MASK) == ARCHIVE_FORMAT_7ZIP) {
+            /* libarchive has no 7-Zip decryption */
+            fail(error, errorSize, "7-Zip archives with a password can't be unpacked here");
+            result = -1;
+            break;
+        }
+        /* The password is checked on the first encrypted file's data
+         * (RAR4 has no check value: a wrong one may show only when the
+         * file is unpacked, as a CRC error). */
+        if (password && !checked && archive_entry_filetype(entry) == AE_IFREG && size != 0) {
+            char first;
+            if (archive_read_data(a, &first, 1) < 0) {
+                result = readFailure(a, &info->password_wrong, error, errorSize);
+                break;
+            }
+            checked = 1;
+        }
     }
     if (!result) {
         formatName(a, info->format, sizeof info->format);
         result = finishInspect(info, list, error, errorSize);
+    }
+    if (!result && info->encrypted && !password) {
+        fail(error, errorSize, NEEDS_PASSWORD);
+        result = -4;
     }
     archive_read_free(a);
     return result;
@@ -1103,6 +1142,27 @@ static int finishInspect(PS5ArchiveInfo* info, EntryList* list, char* error, siz
         Entry key = { .path = icon };
         const Entry* found = bsearch(&key, sorted, list->count, sizeof *sorted, compareEntries);
         info->title_icon = found && !found->directory;
+
+        /* An empty folder in the app ("game/" for a file the user adds):
+         * an image of it is read-only, so nothing can go there later. */
+        size_t tl = strlen(info->title_dir);
+        for (unsigned i = 0; i < list->count && !info->empty_folder[0]; i++) {
+            const Entry* e = &sorted[i];
+            if (!e->directory || (tl && (strncmp(e->path, info->title_dir, tl) || e->path[tl] != '/')))
+                continue;
+            size_t length = strlen(e->path);
+            unsigned lo = i + 1, hi = list->count;
+            while (lo < hi) {
+                unsigned mid = lo + (hi - lo) / 2;
+                int c = strncmp(sorted[mid].path, e->path, length);
+                if (c < 0 || (c == 0 && (unsigned char)sorted[mid].path[length] < '/'))
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            if (!(lo < list->count && !strncmp(sorted[lo].path, e->path, length) && sorted[lo].path[length] == '/'))
+                snprintf(info->empty_folder, sizeof info->empty_folder, "%s", e->path + (tl ? tl + 1 : 0));
+        }
     }
     if (oneTop)
         snprintf(info->top_folder, sizeof info->top_folder, "%.*s/", (int)topLength, first);
@@ -1117,7 +1177,7 @@ static int inspectSet(char** volumes, const PS5ArchiveLimits* limits, PS5Archive
     memset(info, 0, sizeof *info);
     for (char** v = volumes; *v; v++)
         info->volumes++;
-    struct archive* a = openSet(volumes, error, errorSize);
+    struct archive* a = openSet(volumes, limits->password, error, errorSize);
     if (!a)
         return -2;
     return inspectArchive(a, limits, info, list, error, errorSize);
@@ -1344,12 +1404,8 @@ static int zipInspect(const PS5ArchiveSource* src, const PS5ArchiveLimits* limit
             r = 1;
             break;
         }
-        if (e.encrypted) {
+        if (e.encrypted)
             info->encrypted = true;
-            fail(error, errorSize, "Encrypted archives aren't supported");
-            r = -1;
-            break;
-        }
         r = takeEntry(&s, e.name, e.filetype, 0, (int64_t)e.size);
     }
     free(dir);
@@ -1365,7 +1421,12 @@ static int zipInspect(const PS5ArchiveSource* src, const PS5ArchiveLimits* limit
     if (r)
         return r;
     snprintf(info->format, sizeof info->format, "ZIP");
-    return finishInspect(info, list, error, errorSize);
+    r = finishInspect(info, list, error, errorSize);
+    if (!r && info->encrypted) {
+        fail(error, errorSize, NEEDS_PASSWORD);
+        r = -4;
+    }
+    return r;
 }
 
 /* The file called name: 0, -1 not there or too big, -2 read failure, 1
@@ -1396,8 +1457,8 @@ static int zipReadEntry(const PS5ArchiveSource* src, const char* name, char* buf
         return -1;
     }
     if (e.encrypted) {
-        fail(error, errorSize, "Encrypted archives aren't supported");
-        return -1;
+        fail(error, errorSize, NEEDS_PASSWORD);
+        return -4;
     }
     if (e.size > size - 1 || e.compressed > ZIP_ENTRY_MAX) {
         fail(error, errorSize, "%s is too big", name);
@@ -1487,7 +1548,8 @@ int ps5archive_inspect_source(const PS5ArchiveSource* source, const PS5ArchiveLi
 }
 
 /* Reads entry name of an open archive into buffer (see ps5archive_read_entry). */
-static int readEntry(struct archive* a, const char* name, char* buffer, size_t size, size_t* length, char* error, size_t errorSize)
+static int readEntry(struct archive* a, int password, const char* name, char* buffer, size_t size, size_t* length, char* error,
+    size_t errorSize)
 {
     char path[MAX_PATH_LENGTH + 8];
     char scratch[256];
@@ -1499,11 +1561,7 @@ static int readEntry(struct archive* a, const char* name, char* buffer, size_t s
             return -1;
         }
         if (r < ARCHIVE_WARN)
-            return readFailure(a, error, errorSize);
-        if (archive_entry_is_encrypted(entry)) {
-            fail(error, errorSize, "Encrypted archives aren't supported");
-            return -1;
-        }
+            return readFailure(a, NULL, error, errorSize);
         const char* raw = archive_entry_pathname_utf8(entry);
         if (!raw)
             raw = archive_entry_pathname(entry);
@@ -1514,11 +1572,15 @@ static int readEntry(struct archive* a, const char* name, char* buffer, size_t s
             fail(error, errorSize, "%s is too big", name);
             return -1;
         }
+        if (archive_entry_is_encrypted(entry) && !password) {
+            fail(error, errorSize, NEEDS_PASSWORD);
+            return -4;
+        }
         size_t n = 0;
         for (;;) {
             la_ssize_t got = archive_read_data(a, buffer + n, size - 1 - n);
             if (got < 0)
-                return readFailure(a, error, errorSize);
+                return readFailure(a, NULL, error, errorSize);
             if (got == 0)
                 break;
             n += (size_t)got;
@@ -1538,9 +1600,11 @@ static int readEntry(struct archive* a, const char* name, char* buffer, size_t s
     }
 }
 
-int ps5archive_read_entry(const char* path, const PS5ArchiveSource* source, const char* name, char* buffer, size_t size,
-    size_t* length, char* error, size_t errorSize)
+int ps5archive_read_entry(const char* path, const PS5ArchiveSource* source, const char* password, const char* name,
+    char* buffer, size_t size, size_t* length, char* error, size_t errorSize)
 {
+    if (password && !*password)
+        password = NULL;
     if (!buffer || size < 2 || !name || (!path && !source)) {
         fail(error, errorSize, "Nothing to read");
         return -1;
@@ -1559,7 +1623,7 @@ int ps5archive_read_entry(const char* path, const PS5ArchiveSource* source, cons
         struct archive* a = openSource(source, &client, error, errorSize);
         if (!a)
             return -2;
-        r = readEntry(a, name, buffer, size, length, error, errorSize);
+        r = readEntry(a, 0, name, buffer, size, length, error, errorSize);
         archive_read_free(a);
         free(client.buffer);
         return r;
@@ -1567,11 +1631,11 @@ int ps5archive_read_entry(const char* path, const PS5ArchiveSource* source, cons
     char** volumes = ps5archive_volumes(path, error, errorSize);
     if (!volumes)
         return -2;
-    struct archive* a = openSet(volumes, error, errorSize);
+    struct archive* a = openSet(volumes, password, error, errorSize);
     ps5archive_free_list(volumes);
     if (!a)
         return -2;
-    int r = readEntry(a, name, buffer, size, length, error, errorSize);
+    int r = readEntry(a, password != NULL, name, buffer, size, length, error, errorSize);
     archive_read_free(a);
     return r;
 }
@@ -1735,7 +1799,7 @@ int ps5archive_extract(const char* path, const char* dest, const PS5ArchiveLimit
         fail(error, errorSize, "Out of memory");
         goto done;
     }
-    a = openSet(volumes, error, errorSize);
+    a = openSet(volumes, l.password, error, errorSize);
     if (!a)
         goto done;
 
@@ -1759,7 +1823,8 @@ int ps5archive_extract(const char* path, const char* dest, const PS5ArchiveLimit
         if (r == ARCHIVE_EOF)
             break;
         if (r < ARCHIVE_WARN) {
-            readFailure(a, error, errorSize);
+            if (readFailure(a, NULL, error, errorSize) == -4)
+                result = -4;
             goto done; /* -2: files may have been written */
         }
         const char* raw = archive_entry_pathname_utf8(entry);
@@ -1773,8 +1838,7 @@ int ps5archive_extract(const char* path, const char* dest, const PS5ArchiveLimit
         if (c < 0 || index >= list.count || strcmp(clean, list.entries[index].path)
             || checkKind(archive_entry_filetype(entry), archive_entry_hardlink(entry) || archive_entry_symlink(entry), clean, &directory, error,
                 errorSize)
-            || directory != list.entries[index].directory
-            || archive_entry_is_encrypted(entry)) {
+            || directory != list.entries[index].directory) {
             fail(error, errorSize, "The archive changed while it was unpacked");
             goto done;
         }
@@ -1810,7 +1874,8 @@ int ps5archive_extract(const char* path, const char* dest, const PS5ArchiveLimit
             if (got == 0)
                 break;
             if (got < 0) {
-                readFailure(a, error, errorSize);
+                if (readFailure(a, NULL, error, errorSize) == -4)
+                    result = -4; /* this file's password differs */
                 goto done;
             }
             written += (uint64_t)got;

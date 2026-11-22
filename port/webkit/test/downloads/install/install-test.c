@@ -27,6 +27,12 @@ int main(int argc, char** argv)
         printf("OK %s|%s|%s|%s|%s\n", t.title_id, t.name, t.version, t.content_id, t.category);
         return 0;
     }
+    if (argc >= 3 && !strcmp(argv[1], "empty")) {
+        char out[512];
+        int r = ps5install_empty_folder(argv[2], out, sizeof out);
+        printf("EMPTY %d %s\n", r, r == 1 ? out : "-");
+        return 0;
+    }
     if (argc >= 3 && !strcmp(argv[1], "count")) {
         printf("COUNT %d\n", ps5install_count(argv[2], argc > 3 ? (unsigned)atoi(argv[3]) : 3));
         return 0;
