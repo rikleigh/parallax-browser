@@ -57,6 +57,9 @@ int ps5wk_files_choose(int id);
 void ps5wk_files_open(const char* folder, const char* name);
 /* Files to choose the folder of the download waiting for one (its id). */
 void ps5wk_files_pick_folder(unsigned download, const char* fileName);
+/* Files to choose the folder new downloads go to (from Settings), at folder:
+ * X on a folder's top row saves it and closes the menu. */
+void ps5wk_files_pick_default(const char* folder);
 /* The download waiting for a folder went (saved elsewhere, removed). */
 void ps5wk_files_pick_cancel(unsigned download);
 

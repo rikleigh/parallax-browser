@@ -69,6 +69,12 @@ int ps5wk_downloads_choose(int id);
  * and the folder new downloads go to. */
 char** ps5wk_downloads_favorites(void);
 const char* ps5wk_downloads_default_folder(void);
+
+/* What mounts exFAT images in homebrew folders ("ShadowMountPlus",
+ * "TITAN-CORE"), NULL if nothing does; known: whether the download service
+ * has said yet (asked again when that is old). */
+const char* ps5wk_downloads_image_mounter(gboolean* known);
+#define PS5WK_NO_IMAGE_MOUNTER "No exFAT image: nothing running mounts them (ShadowMountPlus and TITAN-CORE do, Kraken Mount doesn't)"
 /* Receiving now, and their progress together (< 0: a size not known). */
 unsigned ps5wk_downloads_active(double* progress);
 

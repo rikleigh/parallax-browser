@@ -1867,6 +1867,22 @@ gboolean ps5wk_browser_show_download_choices(unsigned index)
     return TRUE;
 }
 
+gboolean ps5wk_browser_pick_download_folder(void)
+{
+    if (!tabs || ps5wk_vr_active() || ps5wk_browser_winding_down())
+        return FALSE;
+    choicesOpen = detailsOpen = FALSE;
+    if (!menuOpen)
+        setMenu(TRUE);
+    setSection(SEC_FILES);
+    ps5wk_files_pick_default(ps5wk_downloads_default_folder());
+    zone = ZONE_LIST;
+    listFocus = 0;
+    keepFocusVisible();
+    redraw();
+    return TRUE;
+}
+
 void ps5wk_browser_files_changed(int focus)
 {
     if (!menuOpen || section != SEC_FILES)

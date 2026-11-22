@@ -86,6 +86,7 @@
 #include "../common/ps5fetch.h"
 #include "../common/ps5files.h"
 #include "../common/ps5install.h"
+#include "../common/ps5launchers.h"
 #include "../common/ps5peek.h"
 
 int ps5wk_dl_job(const char* jobPath);
@@ -524,7 +525,13 @@ typedef struct {
     char* image;
     gboolean deleteSource;
     gboolean replace; /* an install may replace the app installed with the same ID */
+    char* launcher;   /* the setting: "auto", "smp", "kraken", "titan", "self" (ps5launchers_force) */
     char installed[32]; /* refused: the version installed ("?": not known) */
+    char by[32];      /* installed: the launcher that registers it ("" the browser did) */
+    gboolean waits;   /* ... Kraken Mount, which waits for the browser to close */
+    gboolean replaced; /* ... an installed copy was replaced */
+    char registered[16]; /* the browser registered it: "kstuff" (mounted when kstuff next starts),
+                          * "blocked" (/data/.kstuff_noautomount stops that), "setting" (a launcher runs) */
     volatile int cancel;
     gint64 lastProgress;
 } Job;
@@ -671,6 +678,15 @@ static void jobEnd(Job* job, gboolean ok, const char* error, const char* out, co
     }
     if (*job->installed)
         appendParam(line, "installed", job->installed); /* refused: replacing needs replace=1 */
+    if (ok && *job->by) {
+        appendParam(line, "by", job->by); /* that launcher registers it: "appready" says when */
+        if (job->waits)
+            appendNumber(line, "waits", 1);
+        if (job->replaced)
+            appendNumber(line, "replaced", 1);
+    }
+    if (ok && *job->registered)
+        appendParam(line, "registered", job->registered);
     JOBLOG("job %s (%s) %s%s%s", job->id, job->kind, ok ? "done" : "failed", error ? ": " : "", error ? error : "");
     sendLine(line);
 }
@@ -767,6 +783,54 @@ static gboolean refuseReplace(Job* job, const PS5TitleInfo* title, const char* d
     return TRUE;
 }
 
+/* Installs title (its folder title->dir). A homebrew launcher running
+ * (ps5launchers.h): the folder only goes to <drive>/homebrew/<ID>, and the
+ * launcher is asked to look (job->by says which); else it is registered
+ * here (job->registered says what mounts it). 0, or ps5install_title's
+ * -1/-2 (error says why). */
+static int installTitle(Job* job, const PS5TitleInfo* title, char* out, size_t outSize, char* error, size_t size)
+{
+    PS5Launchers* l = g_new0(PS5Launchers, 1); /* 8 KB: not on this thread's stack */
+    ps5launchers_detect(l, NULL);
+    ps5launchers_force(l, job->launcher);
+    const char* scanner = ps5launchers_scanner(l);
+    JOBLOG("install %s: launcher %s%s (found: %s)", title->title_id, scanner ? scanner : "none", l->forced ? " (the setting)" : "",
+        *l->found ? l->found : "none");
+    PS5InstallOptions o = { .do_register = true, .log = onInstallLog };
+    char target[1024], from[1024], why[256] = "";
+    int r = -1;
+    if (!scanner) {
+        r = ps5install_title(title, &o, out, outSize, error, size);
+        if (!r)
+            snprintf(job->registered, sizeof job->registered, "%s", l->forced && *l->found ? "setting" : !l->kstuff_automount ? "blocked" : "kstuff");
+    } else if (ps5install_target(title, target, sizeof target))
+        snprintf(error, size, "Apps can be installed from internal storage, M.2 or USB drives only");
+    else if (!ps5launchers_scans(l, target, why, sizeof why))
+        snprintf(error, size, "%s", why);
+    else if (ps5launchers_source(l, title->title_id, ps5install_installed(NULL, title->title_id, NULL), NULL, from, sizeof from)
+        && strcmp(from, target) && strcmp(from, title->dir) && exists(from)) {
+        /* another copy (another drive, an image) is in its library: the
+         * launcher would keep that one and ignore this */
+        snprintf(error, size, "Another copy of %s is at %s, and %s would keep using it: delete that copy first (in Files), then install this one",
+            title->name, from, scanner);
+    } else {
+        gboolean replacing = exists(target);
+        if (!replacing || !ps5launchers_before_replace(l, title->title_id, NULL, error, size)) {
+            o.move_only = true;
+            r = ps5install_title(title, &o, out, outSize, error, size);
+            if (!r) {
+                ps5launchers_announce(l, out, title->title_id, replacing, NULL, why, sizeof why);
+                JOBLOG("install %s: %s", title->title_id, *why ? why : "(not asked: it scans by itself)");
+                snprintf(job->by, sizeof job->by, "%s", scanner);
+                job->waits = ps5launchers_waits(l);
+                job->replaced = replacing;
+            }
+        }
+    }
+    g_free(l);
+    return r;
+}
+
 static gpointer jobThread(gpointer data)
 {
     Job* job = data;
@@ -826,8 +890,7 @@ static gpointer jobThread(gpointer data)
                 haveTitle = TRUE;
                 snprintf(out, sizeof out, "%s", job->dest);
             } else {
-                PS5InstallOptions o = { .do_register = true, .log = onInstallLog };
-                ok = !ps5install_title(&title, &o, out, sizeof out, error, sizeof error);
+                ok = !installTitle(job, &title, out, sizeof out, error, sizeof error);
                 haveTitle = TRUE;
                 /* the unpacked folder's rest (the title moved out of it) */
                 if (ok && strcmp(job->dest, out) && strncmp(out, job->dest, strlen(job->dest)))
@@ -853,8 +916,7 @@ static gpointer jobThread(gpointer data)
             ok = FALSE;
             haveTitle = TRUE;
         } else if (ok) {
-            PS5InstallOptions o = { .do_register = true, .log = onInstallLog };
-            ok = !ps5install_title(&title, &o, out, sizeof out, error, sizeof error);
+            ok = !installTitle(job, &title, out, sizeof out, error, sizeof error);
             haveTitle = TRUE;
         }
     } else if (!strcmp(job->kind, "image")) {
@@ -897,6 +959,7 @@ static gpointer jobThread(gpointer data)
     g_free(job->dest);
     g_free(job->then);
     g_free(job->image);
+    g_free(job->launcher);
     g_free(job);
     return NULL;
 }
@@ -977,6 +1040,7 @@ static void startJob(GHashTable* p)
         job->image = g_strdup(image);
         job->deleteSource = param(p, "delete") && !strcmp(param(p, "delete"), "1");
         job->replace = param(p, "replace") && !strcmp(param(p, "replace"), "1");
+        job->launcher = g_strdup(param(p, "launcher"));
         g_hash_table_insert(jobs, job->id, job);
     }
     g_mutex_unlock(&jobLock);
@@ -1301,6 +1365,44 @@ static char* imageAppJSON(const char* image, const char* title)
     return g_strdup_printf("{\"installed\":%s}", installed ? "true" : "false");
 }
 
+/* The launchers running (ps5launchers_json), with the setting's choice
+ * applied. */
+static char* launchersJSON(const char* setting)
+{
+    PS5Launchers* l = g_new0(PS5Launchers, 1);
+    ps5launchers_detect(l, NULL);
+    ps5launchers_force(l, setting);
+    char* json = ps5launchers_json(l);
+    g_free(l);
+    return json;
+}
+
+/* Whether the launcher has registered the app installed at folder (op
+ * "appready", after a jobend with "by"): {"installed":…,"error":…}. */
+static char* appReadyJSON(const char* folder, const char* title, const char* setting)
+{
+    gboolean validID = title && strlen(title) == 9;
+    for (int i = 0; validID && i < 9; i++)
+        validID = i < 4 ? g_ascii_isupper(title[i]) : g_ascii_isdigit(title[i]);
+    char error[256] = "";
+    int ready = 0;
+    if (validID) {
+        PS5Launchers* l = g_new0(PS5Launchers, 1);
+        ps5launchers_detect(l, NULL);
+        ps5launchers_force(l, setting);
+        ready = ps5launchers_app_ready(l, folder, title, NULL, error, sizeof error);
+        g_free(l);
+    }
+    GString* out = g_string_new(NULL);
+    g_string_append_printf(out, "{\"installed\":%s,\"error\":", ready > 0 ? "true" : "false");
+    if (ready < 0)
+        jsonString(out, error);
+    else
+        g_string_append(out, "null");
+    g_string_append_c(out, '}');
+    return g_string_free(out, FALSE);
+}
+
 static void request(GHashTable* p)
 {
     const char* n = param(p, "n");
@@ -1312,6 +1414,8 @@ static void request(GHashTable* p)
         snprintf(error, sizeof error, "op missing");
     else if (!strcmp(op, "roots"))
         json = rootsJSON();
+    else if (!strcmp(op, "launchers"))
+        json = launchersJSON(param(p, "launcher"));
     else if (!strcmp(op, "partials"))
         json = partialsJSON(param(p, "dirs"));
     else if (!strcmp(op, "partial")) {
@@ -1329,6 +1433,8 @@ static void request(GHashTable* p)
         snprintf(error, sizeof error, "That place isn't one the browser can use");
     else if (!strcmp(op, "imageapp"))
         json = imageAppJSON(path, param(p, "title"));
+    else if (!strcmp(op, "appready"))
+        json = appReadyJSON(path, param(p, "title"), param(p, "launcher"));
     else if (!strcmp(op, "ls"))
         json = listJSON(path, error, sizeof error);
     else if (!strcmp(op, "mkdir")) {

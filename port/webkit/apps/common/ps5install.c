@@ -191,7 +191,7 @@ int ps5install_parse_param(const char* text, PS5TitleInfo* out)
 
 /* /user/app/<ID> holds an installed app, not what an install that failed
  * left: ShadowMountPlus, refused at the icon, leaves sce_sys/param.json
- * alone there (2026-11-21). An installed one has its mount link (etaHEN's
+ * alone there (2026-11-21). An installed one has its mount link (kstuff's
  * mount.lnk, ShadowMountPlus's mount_img.lnk) or its icon. */
 static bool userAppComplete(const char* user_app, const char* title_id)
 {
@@ -211,7 +211,7 @@ bool ps5install_installed(const char* user_app, const char* title_id, PS5TitleIn
         return false;
     /* the system's copy of what it registered (the version the home screen
      * shows; on the console /user/app/<ID>/sce_sys can be older, and
-     * /system_data/priv/appmeta older still), then ours and etaHEN's */
+     * /system_data/priv/appmeta older still), then ours and the launchers' */
     char paths[3][1200];
     unsigned n = 0;
     if (!user_app)
@@ -536,6 +536,15 @@ static int registerTitle(const char* titleID, const char* folder, const PS5Insta
     return 0;
 }
 
+int ps5install_target(const PS5TitleInfo* title, char* out, size_t size)
+{
+    char drive[512];
+    if (!ps5install_drive_of(title->dir, drive, sizeof drive))
+        return -1;
+    snprintf(out, size, "%s/homebrew/%s", drive, title->title_id);
+    return 0;
+}
+
 int ps5install_title(const PS5TitleInfo* title, const PS5InstallOptions* options, char* installed, size_t installed_size,
     char* error, size_t error_size)
 {
@@ -575,6 +584,10 @@ int ps5install_title(const PS5TitleInfo* title, const PS5InstallOptions* options
     }
     if (installed && installed_size)
         snprintf(installed, installed_size, "%s", target);
+    if (options && options->move_only) {
+        say(options, "moved %s (%s %s) to %s, for the launcher to register", title->title_id, title->name, title->version, target);
+        return 0;
+    }
     int r = registerTitle(title->title_id, target, options, error, error_size);
     if (!r)
         say(options, "installed %s (%s %s) from %s", title->title_id, title->name, title->version, target);

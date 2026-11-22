@@ -247,8 +247,9 @@ The page has five sections, one shown at a time, picked from a list beside
 it on the TV (and a wide screen) or above it on a phone: **General** (home
 page, search engine, sound, gamepad mode, the phone link and its QR code),
 **Ads & privacy** (this site, ad blocking, allowed sites, filter lists,
-Safer browsing), **Cookies & storage** (clearing, sizes, downloads),
-**Advanced** (the engine settings, under Scripts, Graphics, Video, Memory
+Safer browsing), **Cookies & storage** (clearing, sizes), **Downloads**
+(where they go, asking, connections, after unpacking, the homebrew
+launcher), **Advanced** (the engine settings, under Scripts, Graphics, Video, Memory
 and Experimental and diagnostics) and **Update & restart** (its entry shows
 the new version when there is one). Each setting is a row: its name, the
 first sentence of its help (*More* shows the rest), what applies it, and

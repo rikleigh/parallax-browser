@@ -66,5 +66,11 @@ for i in $(seq 1 300); do mkdir "$work/count/wide/f$i"; done
 title "$work/count/wide/f7/game" PPSA00016 'Wide A'
 title "$work/count/wide/f299/game" PPSA00017 'Wide B'
 check "COUNT -2" "count: too many folders on a level (not a wrong count)" "$("$work/t" count "$work/count/wide")"
+# a launcher registers it (move_only): moved, /user/app left alone
+mkdir -p "$work/drive/downloads/m/PPSA05555" "$work/moveuser"
+title "$work/drive/downloads/m/PPSA05555" PPSA05555 'Moved'
+check "OK $work/drive/homebrew/PPSA05555" "move only: moved" "$("$work/t" move "$work/drive/downloads/m" "$work/moveuser")"
+[[ -f "$work/drive/homebrew/PPSA05555/eboot.bin" && ! -e "$work/moveuser/PPSA05555" ]] && echo "PASS move only: nothing in /user/app" \
+    || { echo "FAIL move only wrote /user/app"; fails=$((fails+1)); }
 echo "$fails failure(s)"
 exit $((fails > 0))

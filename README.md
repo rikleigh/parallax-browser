@@ -46,7 +46,10 @@ first-class place for the modern web. It's built on WPE WebKit.
 - A download manager. Large files download over several connections at
   once, with pause, resume and SHA-256 checksums, and survive a browser
   restart. Archives (ZIP, 7z, RAR, tar) can be unpacked, an app inside one
-  installed, or made into an exFAT image for ShadowMountPlus. The menu's
+  installed, or made into an exFAT image. Installs work with
+  ShadowMountPlus, Kraken Mount or TITAN-CORE, whichever is running (or
+  the one chosen in Settings), and exFAT images with ShadowMountPlus or
+  TITAN-CORE. The menu's
   Files list browses the internal storage and USB drives, to move, copy,
   rename and delete.
 - Ad blocking with the uBlock Origin Lite rule lists, which include network

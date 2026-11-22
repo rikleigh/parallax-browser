@@ -4,12 +4,16 @@
  * (apps/child/dl-job.c).
  *
  * The folder goes to <drive>/homebrew/<title ID> on the drive it is on
- * (a rename, so no copy), then it is registered the way tools/launcher
- * does it on 13.60 (read off PS5Upload): /user/app/<ID>/sce_sys gets the
- * title's param.json and pictures, /user/app/<ID>/mount.lnk names the
- * folder (etaHEN mounts it when the title starts), and
- * sceAppInstUtilAppInstallAll makes the system register it (13.60 has no
- * AppInstallTitleDir; it is used where it exists).
+ * (a rename, so no copy). When a homebrew launcher runs (ShadowMountPlus,
+ * Kraken Mount, TITAN-CORE: ps5launchers.h), that is all (move_only): it
+ * scans that folder and registers the app itself. Otherwise it is
+ * registered the way tools/launcher does it on 13.60: /user/app/<ID>/sce_sys
+ * gets the title's param.json and pictures, /user/app/<ID>/mount.lnk names
+ * the folder (no newline: kstuff-lite nullfs-mounts it on
+ * /system_ex/app/<ID> when kstuff starts or a USB drive is plugged in;
+ * etaHEN doesn't read it), and sceAppInstUtilAppInstallAll makes the
+ * system register it (AppInstallTitleDir where it exists: not from 12.00
+ * on, where ShadowMountPlus and Kraken Mount don't find it either).
  *
  * POSIX only; the registration only on the PS5 (__PROSPERO__), so the rest
  * builds and is tested on the Mac (port/webkit/test/downloads/install-test.sh).
@@ -56,17 +60,23 @@ typedef void (*ps5install_log_fn)(const char* line, void* data);
 typedef struct {
     const char* user_app;  /* NULL: "/user/app" (tests: a temporary folder) */
     bool do_register;      /* call sceAppInstUtil (PS5 only; ignored elsewhere) */
+    bool move_only;        /* only move it to <drive>/homebrew/<ID>: a launcher registers it */
     ps5install_log_fn log; /* NULL: none */
     void* data;
 } PS5InstallOptions;
 
 /* Moves title->dir to <drive>/homebrew/<ID> (an existing copy there is
  * replaced: renamed aside first, deleted once the new one is in place, put
- * back if the move fails) and registers it. installed gets the folder.
+ * back if the move fails) and registers it (not with move_only). installed
+ * gets the folder.
  * 0; -1 refused (error says why); -2 failed (files are in place, the
  * registration didn't work: error says so). */
 int ps5install_title(const PS5TitleInfo* title, const PS5InstallOptions* options, char* installed, size_t installed_size,
     char* error, size_t error_size);
+
+/* Where ps5install_title puts title (title->dir's drive's
+ * homebrew/<ID>): 0, or -1 (not on a drive apps install from). */
+int ps5install_target(const PS5TitleInfo* title, char* out, size_t size);
 
 /* The drive a path is on: "/data", "/mnt/usb0", "/mnt/ext1"..., or NULL. */
 const char* ps5install_drive_of(const char* path, char* out, size_t size);

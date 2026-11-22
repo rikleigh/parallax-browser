@@ -30,7 +30,7 @@ typedef struct {
     char note[64];    /* on the right: "kept live", the time of a visit */
     int number;       /* the tab's number (1-based), 0: none */
     gboolean current; /* the tab shown */
-    gboolean action;  /* "+ New tab", "Clear all history" */
+    gboolean action;  /* "+ New tab", "Clear all history"; in Files the folder to act on (its kind's glyph in a gradient tile) */
     gboolean armed;   /* "Clear all history" pressed once */
     /* the Downloads and Files lists: title = the file's name, url = the
      * address it came from (Files: NULL) */

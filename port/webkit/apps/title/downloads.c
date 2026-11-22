@@ -366,19 +366,28 @@ static void announceDone(const char* file, unsigned id, gboolean jobFollows)
 
 /* ShadowMountPlus installs the app of an image in a homebrew folder by
  * itself: it waits until the file has been unchanged for about 10 s and
- * looks every 15 s, so the app shows up 10-30 s after the image is made
- * (2026-11-21, 1.7beta7). The service says when it has (op "imageapp":
- * its mount_img.lnk names the image). */
-#define IMAGE_WATCH_S 90
+ * looks every 15 s, but not while the browser is in front, so the app shows
+ * up 10-30 s after the home screen is (2026-11-21, 1.7beta7 and beta10). The service says when it has (op "imageapp":
+ * its mount_img.lnk names the image). An app folder an install handed to
+ * a homebrew launcher (jobend "by": ps5launchers.h) is watched the same
+ * way (op "appready"). */
 #define IMAGE_POLL_S 3
+/* ShadowMountPlus holds its scans while the browser is in front (seen
+ * 2026-11-21): it adds the app once the home screen is. */
+#define HOME_WATCH_S (15 * 60)
+#define WAITS_FOR_HOME "adds it when you go to the home screen: it doesn't look while the browser is in front"
 
 typedef struct {
-    char* image;
+    char* image;  /* or the app's folder */
     char* title;
     char* name;
+    char* by;     /* an app folder: the launcher registering it; NULL: an image */
     gint64 until; /* monotonic us */
     gboolean asking;
 } ImageWatch;
+
+static const char* imageMounter(gboolean* known);
+static gint64 numberParam(GHashTable* params, const char* key, gint64 fallback);
 
 static GPtrArray* imageWatches;
 static guint imageWatchTimer;
@@ -389,6 +398,7 @@ static void imageWatchFree(gpointer data)
     g_free(w->image);
     g_free(w->title);
     g_free(w->name);
+    g_free(w->by);
     g_free(w);
 }
 
@@ -411,8 +421,13 @@ static void onImageApp(const char* json, const char* error, gpointer user)
         return;
     w->asking = FALSE;
     MJ* value = json ? mj_parse(json) : NULL;
-    if (mj_bool(value, "installed")) {
-        spike_log("[dl] %s: installed by ShadowMountPlus", w->image);
+    const char* failed = mj_string(value, "error");
+    if (failed && *failed && w->by) {
+        spike_log("[dl] %s: %s: %s", w->image, w->by, failed);
+        notice("%s couldn't add %s to the home screen\n%s", w->by, w->name, failed);
+        g_ptr_array_remove(imageWatches, w);
+    } else if (mj_bool(value, "installed")) {
+        spike_log("[dl] %s: installed by %s", w->image, w->by ? w->by : "the image's launcher");
         if (display) {
             char* text = g_strdup_printf("%s is on the home screen", w->name);
             wpe_display_ps5_show_message(display, text, 6);
@@ -433,18 +448,29 @@ static gboolean imageWatchTick(gpointer data)
         if (w->asking)
             continue;
         if (now > w->until) {
-            notice("%s isn't on the home screen yet\nShadowMountPlus adds the images in homebrew folders: is it running?", w->name);
+            if (w->by)
+                notice("%s isn't on the home screen yet\n%s hasn't added it: its own page may say why", w->name, w->by);
+            else {
+                const char* mounter = imageMounter(NULL);
+                notice("%s isn't on the home screen yet\n%s adds the images in homebrew folders: is it running?", w->name,
+                    mounter ? mounter : "ShadowMountPlus");
+            }
             g_ptr_array_remove_index(imageWatches, i);
             continue;
         }
         w->asking = TRUE;
-        ps5wk_dlservice_request_async(8000, onImageApp, g_strdup(w->image), "imageapp", "path", w->image, "title", w->title, NULL);
+        if (w->by)
+            ps5wk_dlservice_request_async(8000, onImageApp, g_strdup(w->image), "appready", "path", w->image, "title", w->title, NULL);
+        else
+            ps5wk_dlservice_request_async(8000, onImageApp, g_strdup(w->image), "imageapp", "path", w->image, "title", w->title, NULL);
     }
     if (imageWatches->len)
         return G_SOURCE_CONTINUE;
     imageWatchTimer = 0;
     return G_SOURCE_REMOVE;
 }
+
+static void watchApp(const char* path, const char* title, const char* shown, const char* by);
 
 /* An image was made at image (of title, called name): say so, and again
  * once its app is on the home screen. */
@@ -459,10 +485,50 @@ static void imageMade(const char* image, const char* title, const char* name)
     }
     const char* shown = name && *name ? name : title;
     if (display) {
-        char* text = g_strdup_printf("Image of %s made\nShadowMountPlus adds it to the home screen in about 30 s", shown);
+        const char* mounter = imageMounter(NULL);
+        char* text = g_strdup_printf("Image of %s made\n%s " WAITS_FOR_HOME, shown, mounter ? mounter : "ShadowMountPlus");
         wpe_display_ps5_show_message(display, text, 8);
         g_free(text);
     }
+    watchApp(image, title, shown, NULL);
+}
+
+/* An app installed into folder (title, called name), from a jobend's
+ * params: "by" a launcher registers it ("waits": Kraken Mount, after the
+ * browser closes; "replaced": an installed copy was), else "registered"
+ * says what mounts it. */
+static void appInstalled(const char* folder, const char* title, const char* name, GHashTable* params)
+{
+    const char* shown = name && *name ? name : title ? title : "The app";
+    const char* by = g_hash_table_lookup(params, "by");
+    const char* registered = g_hash_table_lookup(params, "registered");
+    gboolean waits = numberParam(params, "waits", 0) == 1, replaced = numberParam(params, "replaced", 0) == 1;
+    gboolean kraken = !g_strcmp0(by, "Kraken Mount");
+    if (by && *by && waits)
+        notice("%s moved to its homebrew folder\n%s adds it to the home screen once you close the browser: it waits while one of its apps is open",
+            shown, by);
+    else if (by && *by && replaced && kraken)
+        notice("%s replaced in its homebrew folder\nKraken Mount mounts the new version within half a minute", shown);
+    else if (by && *by && replaced)
+        notice("%s replaced in its homebrew folder\nIts next start uses the new version", shown); /* mounted at each start */
+    else if (by && *by && folder && title && *title) {
+        if (display) {
+            char* text = g_strdup_printf("%s moved to its homebrew folder\n%s " WAITS_FOR_HOME, shown, by);
+            wpe_display_ps5_show_message(display, text, 10);
+            g_free(text);
+        }
+        watchApp(folder, title, shown, by);
+    } else if (!g_strcmp0(registered, "blocked"))
+        notice("Installed %s\nkstuff won't mount it while /data/.kstuff_noautomount is there: start ShadowMountPlus, or delete that file", shown);
+    else if (!g_strcmp0(registered, "kstuff"))
+        notice("Installed %s\nNo homebrew launcher is running: kstuff mounts it the next time kstuff starts (after a reboot and the jailbreak)",
+            shown);
+    else
+        notice("Installed %s\nIt's on the home screen", shown);
+}
+
+static void watchApp(const char* image, const char* title, const char* shown, const char* by)
+{
     recentID = 0;
     if (!imageWatches)
         imageWatches = g_ptr_array_new_with_free_func(imageWatchFree);
@@ -474,9 +540,11 @@ static void imageMade(const char* image, const char* title, const char* name)
     }
     g_free(w->title);
     g_free(w->name);
+    g_free(w->by);
     w->title = g_strdup(title);
     w->name = g_strdup(shown);
-    w->until = g_get_monotonic_time() + IMAGE_WATCH_S * G_USEC_PER_SEC;
+    w->by = g_strdup(by);
+    w->until = g_get_monotonic_time() + HOME_WATCH_S * G_USEC_PER_SEC;
     if (!imageWatchTimer)
         imageWatchTimer = g_timeout_add_seconds(IMAGE_POLL_S, imageWatchTick, NULL);
 }
@@ -644,8 +712,20 @@ char* ps5wk_downloads_finished_json(void)
     return json;
 }
 
+static void refreshLaunchers(gboolean start);
+
+static gboolean askLaunchers(gpointer data)
+{
+    (void)data;
+    refreshLaunchers(TRUE);
+    return G_SOURCE_REMOVE;
+}
+
+/* (settings.json, a route thread: the settings page is open, so the
+ * launchers are asked about, the service started if need be) */
 char* ps5wk_downloads_summary_json(void)
 {
+    g_idle_add(askLaunchers, NULL);
     g_mutex_lock(&snapLock);
     char* counts = g_strdup(snapSummaryJSON ? snapSummaryJSON : "\"finished\":0,\"active\":0,\"total\":0");
     /* the free space now (any thread: a file read) */
@@ -888,6 +968,68 @@ static void saveSettings(void)
     g_key_file_unref(file);
 }
 
+/* ---------------------------------------------------------------- the homebrew launchers (the service's op "launchers") */
+
+#define LAUNCHERS_FRESH_S 15
+
+static struct {
+    gboolean known;
+    gboolean asking;
+    char* scanner;   /* registers app folders: "ShadowMountPlus", "Kraken Mount", "TITAN-CORE"; NULL none */
+    char* images;    /* mounts exFAT images; NULL none */
+    char* found;     /* the same, as detected (the service's "found") */
+    gint64 at;       /* monotonic us */
+} launchers;
+
+static void onLaunchers(const char* json, const char* error, gpointer user)
+{
+    (void)user;
+    launchers.asking = FALSE;
+    MJ* value = json ? mj_parse(json) : NULL;
+    if (value) {
+        launchers.known = TRUE;
+        launchers.at = g_get_monotonic_time();
+        g_free(launchers.scanner);
+        g_free(launchers.images);
+        g_free(launchers.found);
+        launchers.scanner = g_strdup(mj_string(value, "scanner"));
+        launchers.images = g_strdup(mj_string(value, "images"));
+        const char* found = mj_string(value, "found");
+        launchers.found = found && *found ? g_strdup(found) : NULL;
+        spike_log("[dl] launchers: %s (images: %s)", launchers.scanner ? launchers.scanner : "none", launchers.images ? launchers.images : "none");
+        snapSettings();
+        changed(FALSE);
+    } else
+        spike_log("[dl] launchers: %s", error ? error : "no answer");
+    mj_free(value);
+}
+
+/* Asks the service again (when it is running, or start: it will be), if
+ * what it said is older than LAUNCHERS_FRESH_S. */
+static void refreshLaunchers(gboolean start)
+{
+    if (launchers.asking || (!start && !ps5wk_dlservice_connected()))
+        return;
+    if (launchers.known && g_get_monotonic_time() - launchers.at < LAUNCHERS_FRESH_S * G_USEC_PER_SEC)
+        return;
+    launchers.asking = TRUE;
+    ps5wk_dlservice_request_async(8000, onLaunchers, NULL, "launchers", NULL);
+}
+
+/* What mounts exFAT images (known: whether the service has said). */
+static const char* imageMounter(gboolean* known)
+{
+    if (known)
+        *known = launchers.known;
+    return launchers.images;
+}
+
+const char* ps5wk_downloads_image_mounter(gboolean* known)
+{
+    refreshLaunchers(FALSE);
+    return imageMounter(known);
+}
+
 /* The settings for settings.json (", ..." members), for any thread. */
 static void snapSettings(void)
 {
@@ -900,6 +1042,14 @@ static void snapSettings(void)
     g_string_append(out, ",\"defaultName\":");
     ps5wk_json_string(out, name);
     g_free(name);
+    gboolean known = FALSE;
+    const char* images = imageMounter(&known);
+    g_string_append(out, ",\"launcherFound\":");
+    if (known && launchers.found)
+        ps5wk_json_string(out, launchers.found);
+    else
+        g_string_append(out, known ? "\"\"" : "null");
+    g_string_append_printf(out, ",\"imagesOK\":%s", !known || images ? "true" : "false");
     g_mutex_lock(&snapLock);
     g_free(snapSettingsJSON);
     snapSettingsJSON = g_string_free(out, FALSE);
@@ -1368,7 +1518,7 @@ static void jobEnded(Download* d, GHashTable* params)
     else if (!success)
         notice("%s %s failed\n%s", jobNoun(d->r.job), d->r.file ? d->r.file : "", d->r.jobError);
     else if (d->r.titleID && (!g_strcmp0(d->r.job, "install") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-install"))))
-        notice("Installed %s\nIt's on the home screen", d->r.titleName ? d->r.titleName : d->r.titleID);
+        appInstalled(out, d->r.titleID, d->r.titleName, params);
     else if (!g_strcmp0(d->r.job, "image") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-image")))
         imageMade(out, d->r.titleID, d->r.titleName);
     else if (!g_strcmp0(d->r.job, "extract"))
@@ -1421,7 +1571,7 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
     else if (!success)
         notice("%s %s failed\n%s", jobNoun(t->kind), base, t->error);
     else if (t->titleName && (!strcmp(t->kind, "install") || !g_strcmp0(t->then, "install")))
-        notice("Installed %s\nIt's on the home screen", t->titleName);
+        appInstalled(t->out, g_hash_table_lookup(params, "title"), t->titleName, params);
     else if (!strcmp(t->kind, "image") || !g_strcmp0(t->then, "image"))
         imageMade(t->out, g_hash_table_lookup(params, "title"), t->titleName);
     else
@@ -1450,6 +1600,8 @@ static void onServiceEvent(const char* verb, GHashTable* params, gpointer user)
     (void)user;
     if (!list)
         return;
+    if (strcmp(verb, "gone"))
+        refreshLaunchers(FALSE); /* the service runs: what it says is kept fresh (when old) */
     if (!strcmp(verb, "gone")) {
         /* the service ended: what ran there is retried (which starts it again) */
         for (unsigned i = 0; i < list->len; i++) {
@@ -2461,6 +2613,8 @@ static void updateManagerSnapshot(void)
         settings.deleteArchives ? "true" : "false");
     jsonKey(out, "folder", settings.folder ? settings.folder : PS5WK_DOWNLOADS_DIR);
     jsonKey(out, "userFolder", PS5WK_DOWNLOADS_DIR);
+    jsonKey(out, "imagesBy", launchers.images);
+    g_string_append_printf(out, ",\"imagesOK\":%s", !launchers.known || launchers.images ? "true" : "false");
     g_string_append(out, ",\"favorites\":[");
     for (unsigned i = 0; settings.favorites && settings.favorites[i]; i++) {
         if (i)
@@ -2778,6 +2932,11 @@ const char* ps5wk_downloads_manage(GHashTable* params)
         }
         saveSettings();
         changed(FALSE);
+        return NULL;
+    }
+    if (!strcmp(action, "pickfolder")) {
+        if (!ps5wk_browser_pick_download_folder())
+            return "The menu can't open now";
         return NULL;
     }
     if (!strcmp(action, "favorite")) {
@@ -3181,7 +3340,9 @@ void ps5wk_downloads_row(unsigned index, BUIRow* r)
             r->tone = BUI_TONE_DONE;
             snprintf(r->state, sizeof r->state, "Done");
             if (t->titleName)
-                snprintf(r->detail, sizeof r->detail, "“%s” is on the home screen%s%s", t->titleName, t->error ? " · " : "", t->error ? t->error : "");
+                snprintf(r->detail, sizeof r->detail, "“%s” %s%s%s", t->titleName,
+                    !strcmp(t->kind, "install") || !g_strcmp0(t->then, "install") ? "installed" : "made into an image", t->error ? " · " : "",
+                    t->error ? t->error : "");
             else {
                 char* out = t->out ? ps5wk_files_place_name(t->out) : NULL;
                 snprintf(r->detail, sizeof r->detail, "%s%s%s", !strcmp(t->kind, "delete") ? "Deleted" : out ? out : where, t->error ? " · " : "",
@@ -3536,7 +3697,8 @@ static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
     g_free(where);
     gboolean archive = isArchiveName(d->r.file);
     if (d->r.jobState == PS5WK_JOB_DONE && d->r.titleID)
-        addLine(out, BUI_TONE_DONE, "“%s” is on the home screen", d->r.titleName ? d->r.titleName : d->r.titleID);
+        addLine(out, BUI_TONE_DONE, "“%s” %s", d->r.titleName ? d->r.titleName : d->r.titleID,
+            !g_strcmp0(d->r.job, "image") || !g_strcmp0(d->r.after, "extract-image") ? "made into an image" : "installed");
     else if (d->r.jobState == PS5WK_JOB_FAILED && !d->replaceVersion)
         addLine(out, BUI_TONE_WARN, "%s failed: %s", jobNoun(d->r.job), d->r.jobError ? d->r.jobError : "?");
     if (archive)
@@ -3596,11 +3758,15 @@ static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
         addChoice(out, CD_EXTRACT, !done && !suggestInstall && !d->replaceVersion && peek ? BUI_TONE_ACTIVE : BUI_TONE_PLAIN, FALSE, "Unpack", into);
         /* an image only of exactly one app (it wouldn't mount otherwise),
          * with an icon (ShadowMountPlus won't install it without) */
+        gboolean known = FALSE;
+        const char* mounter = ps5wk_downloads_image_mounter(&known);
         if (id && titles == 1 && !mj_bool(peek, "icon"))
             addLine(out, BUI_TONE_WARN, "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
+        else if (id && titles == 1 && known && !mounter)
+            addLine(out, BUI_TONE_WARN, "%s", PS5WK_NO_IMAGE_MOUNTER);
         else if (id && titles == 1) {
             char detail[160];
-            snprintf(detail, sizeof detail, "%s.exfat in the drive's homebrew folder, for ShadowMountPlus; checked once made", id);
+            snprintf(detail, sizeof detail, "%s.exfat in the drive's homebrew folder, for %s; checked once made", id, mounter ? mounter : "ShadowMountPlus");
             addChoice(out, CD_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", detail);
         }
     }

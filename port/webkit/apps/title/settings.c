@@ -803,10 +803,10 @@ const char* ps5wk_settings_search_url(void)
 }
 
 /* The settings page: built from /settings.json by its script (no innerHTML:
- * every value is set as text). Five sections, one shown at a time, picked
+ * every value is set as text). Six sections, one shown at a time, picked
  * from a list of buttons (beside the section from 900 px wide, as on the TV;
- * above it on a phone): General, Ads & privacy, Cookies & storage, Advanced,
- * Update & restart. A setting is one row: its name, the first sentence of its
+ * above it on a phone): General, Ads & privacy, Cookies & storage,
+ * Downloads, Advanced, Update & restart. A setting is one row: its name, the first sentence of its
  * help (More shows the rest), what it needs to apply, and its buttons. The
  * status line and the restart banner stay in view (beside the section, or
  * stuck to the top).
@@ -902,6 +902,7 @@ const char ps5wk_settings_page[] =
     "<button id=\"n-general\">General</button>\n"
     "<button id=\"n-ads\">Ads &amp; privacy</button>\n"
     "<button id=\"n-storage\">Cookies &amp; storage</button>\n"
+    "<button id=\"n-downloads\">Downloads</button>\n"
     "<button id=\"n-advanced\">Advanced</button>\n"
     "<button id=\"n-system\">Update &amp; restart<span class=\"badge\" id=\"upBadge\" hidden></span></button>\n"
     "</nav>\n"
@@ -931,12 +932,17 @@ const char ps5wk_settings_page[] =
     "<div class=\"seg\"><button id=\"clearCache\">Clear cache</button><button id=\"clearCookies\" class=\"danger\">Clear cookies</button><button id=\"clearAll\" class=\"danger\">Clear all website data</button></div></div>\n"
     "<div class=\"pad\"><p class=\"help\">Each PS5 user has their own cookies, cache, history, bookmarks, tabs and downloads.</p>\n"
     "<table class=\"sizes\" id=\"stMine\"></table><p class=\"help\">On this PS5, shared by every user:</p><table class=\"sizes\" id=\"stShared\"></table></div></div>\n"
-    "<div id=\"dlCard\"><h2>Downloads</h2>\n"
-    "<div class=\"panel\"><div class=\"row\"><div class=\"txt\"><div class=\"name\">Where new downloads go<span class=\"badge\" id=\"dlFree\"></span></div><p class=\"help\"><b id=\"dlWhere\"></b> <code id=\"dlFolder\"></code></p><p class=\"help\">To choose another: Options, then R1 to Files, open the folder, X on its top row, then “Save new downloads here”.</p><p class=\"help\" id=\"dlCount\"></p></div>\n"
-    "<div class=\"seg\"><button id=\"dlUser\">Use this user’s Downloads</button><button id=\"dlClear\" class=\"danger\">Clear finished downloads</button></div></div>\n"
-    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Ask where to save each download</div><p class=\"help\">The menu asks which folder (or drive) each download goes to. Off: straight to the folder above.</p></div><div class=\"seg\" id=\"dlAsk\"></div></div>\n"
-    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Connections per download</div><p class=\"help\">More are faster from servers that limit each connection. Servers that allow fewer get fewer; servers that can’t resume get one.</p></div><div class=\"seg\" id=\"dlConns\"></div></div>\n"
-    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">After unpacking an archive</div><p class=\"help\">Deleting it frees the space; with several parts, all of them go.</p></div><div class=\"seg\" id=\"dlAfter\"></div></div></div></div>\n"
+    "</section>\n"
+    "<section id=\"t-downloads\" aria-labelledby=\"n-downloads\" hidden>\n"
+    "<div id=\"dlCard\"><div class=\"panel\">\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Download folder <span class=\"badge\" id=\"dlFree\"></span></div><p class=\"help\"><b id=\"dlWhere\"></b> <code id=\"dlFolder\"></code></p><p class=\"help\" id=\"dlPhone\" hidden>You can change it in Settings on the PS5.</p></div>\n"
+    "<div class=\"seg\"><button id=\"dlPick\">Change…</button><button id=\"dlUser\">Use my Downloads folder</button></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Ask where to save</div><p class=\"help\">Choose a folder each time you start a download.</p></div><div class=\"seg\" id=\"dlAsk\"></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Connections per download</div><p class=\"help\">More connections can make big downloads faster.</p></div><div class=\"seg\" id=\"dlConns\"></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">After unpacking</div><p class=\"help\">Keep the archive, or delete it to save space.</p></div><div class=\"seg\" id=\"dlAfter\"></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Homebrew launcher <span class=\"badge\" id=\"dlFound\"></span></div><p class=\"help\" id=\"dlLaunch\"></p></div></div>\n"
+    "<div class=\"row\"><div class=\"txt\"><div class=\"name\">Finished downloads</div><p class=\"help\" id=\"dlCount\"></p></div><div class=\"seg\"><button id=\"dlClear\" class=\"danger\">Delete finished downloads</button></div></div>\n"
+    "<div class=\"pad\"><p class=\"help\">Your downloads are in the menu: press Options, then R1.</p></div></div></div>\n"
     "</section>\n"
     "<section id=\"t-advanced\" aria-labelledby=\"n-advanced\" hidden>\n"
     "<p class=\"note\">For fixing a site that misbehaves, or tuning speed. The defaults suit almost every site.</p>\n"
@@ -956,7 +962,7 @@ const char ps5wk_settings_page[] =
     "try{pin=sessionStorage.getItem('ps5pin')||''}catch(e){}\n"
     "var query=new URLSearchParams(location.search);if(query.get('pin'))pin=query.get('pin');\n"
     "var onPS5=location.protocol=='parallax:'||location.hostname=='127.0.0.1'||location.hostname=='localhost';\n"
-    "var TABS=['general','ads','storage','advanced','system'];\n"
+    "var TABS=['general','ads','storage','downloads','advanced','system'];\n"
     "function $(id){return document.getElementById(id)}\n"
     "function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}\n"
     "/* The result of every press: beside the sections on a wide screen, stuck to the top on a narrow one. */\n"
@@ -1111,19 +1117,30 @@ const char ps5wk_settings_page[] =
     "var stPolls=0,stTimer=0;\n"
     "function pollStorage(){if(stTimer||++stPolls>20)return;stTimer=setTimeout(function(){stTimer=0;api('GET','/settings.json').then(function(j){if(!j.ok)return;S.storage=j.storage;if(!j.storage.counting)stPolls=0;renderStorage()})},1000)}\n"
     "function gb(b){return b>=1073741824?(b/1073741824).toFixed(1)+' GB':Math.round(b/1048576)+' MB'}\n"
-    "function dlSet(o,focus){var h={'Accept':'application/json','Content-Type':'application/x-www-form-urlencoded'};if(pin)h['X-PS5-PIN']=pin;o.do='settings';say('Saving…');\n"
+    "function dlPost(o,done){var h={'Accept':'application/json','Content-Type':'application/x-www-form-urlencoded'};if(pin)h['X-PS5-PIN']=pin;\n"
     "  fetch('/dlm',{method:'POST',headers:h,cache:'no-store',body:Object.keys(o).map(function(k){return k+'='+encodeURIComponent(o[k])}).join('&')})\n"
-    "    .then(function(r){return r.json()}).then(function(j){if(!j.ok){say(j.error||'That didn’t work');return}say('Saved.');api('GET','/settings.json').then(function(k){if(k.ok){S=k;renderDownloads();var f=focus&&$(focus);if(f)f.focus()}})},function(){say('The PS5 did not answer.')})}\n"
+    "    .then(function(r){return r.json()}).then(function(j){if(!j.ok){say(j.error||'That didn’t work');return}done()},function(){say('The PS5 did not answer.')})}\n"
+    "function dlReload(then){api('GET','/settings.json').then(function(k){if(k.ok){S=k;renderDownloads();if(then)then()}})}\n"
+    "function dlSet(o,focus){o.do='settings';say('Saving…');dlPost(o,function(){say('Saved.');dlReload(function(){var f=focus&&$(focus);if(f)f.focus()})})}\n"
     "function dlSeg(box,list,current,key){box.textContent='';list.forEach(function(o){var b=el('button',null,o[1]);b.id=box.id+'-'+o[0];b.setAttribute('aria-pressed',String(o[0]===current));\n"
     "  b.onclick=function(){var v={};v[key]=o[0]===true?1:o[0]===false?0:o[0];dlSet(v,b.id)};box.appendChild(b)})}\n"
+    "/* Change…: the menu's Files list chooses the folder; this page shows it once it's saved. */\n"
+    "$('dlPick').onclick=function(){var was=S.downloads&&S.downloads.defaultFolder,n=0;dlPost({do:'pickfolder'},function(){say('Open the folder in Files, then press X on its top row.');\n"
+    "  (function poll(){setTimeout(function(){api('GET','/settings.json').then(function(k){if(!k.ok)return;if(k.downloads&&k.downloads.defaultFolder!=was){S=k;renderDownloads();say('New downloads go to '+k.downloads.defaultName+'.')}else if(++n<90)poll()})},2000)})()})};\n"
+    "var LAUNCH={'ShadowMountPlus':'Apps you install appear on the home screen when you go back to it.','TITAN-CORE':'Apps you install appear on the home screen when you go back to it.',\n"
+    "  'Kraken Mount':'Apps you install appear on the home screen after you close the browser.'};\n"
     "function renderDownloads(){var d=S.downloads;$('dlCard').hidden=!d;if(!d)return;$('dlFolder').textContent=d.defaultFolder||d.folder;$('dlWhere').textContent=d.defaultName||'Downloads';\n"
-    "  $('dlUser').hidden=!d.defaultFolder||d.defaultFolder==d.folder;$('dlUser').onclick=function(){dlSet({folder:d.folder},'dlClear')};\n"
+    "  $('dlPick').hidden=!onPS5;$('dlPhone').hidden=onPS5;\n"
+    "  $('dlUser').hidden=!d.defaultFolder||d.defaultFolder==d.folder;$('dlUser').onclick=function(){dlSet({folder:d.folder},'dlPick')};\n"
     "  if(d.connections){dlSeg($('dlAsk'),[[true,'Ask'],[false,'Don’t ask']],d.ask,'ask');dlSeg($('dlConns'),[[1,'1'],[2,'2'],[4,'4'],[8,'8'],[12,'12'],[16,'16']],d.connections,'connections');\n"
     "    dlSeg($('dlAfter'),[[false,'Keep it'],[true,'Delete it']],d.deleteArchives,'deleteArchives')}\n"
-    "  $('dlFree').textContent=d.free>=0?gb(d.free)+' free':'free space unknown';\n"
-    "  $('dlCount').textContent=(d.finished?d.finished+' finished':'No finished downloads')+(d.active?', '+d.active+' in progress':'')+'. The Downloads and Files lists are in the menu (Options, then R1); a phone gets the files from the link server\\'s page.';\n"
-    "  var c=$('dlClear');c.disabled=!d.finished;c.textContent=d.finished?'Clear finished downloads ('+d.finished+')':'Clear finished downloads'}\n"
-    "$('dlClear').onclick=function(){var n=S.downloads.finished;arm(this,'Press again: delete '+n+' finished file'+(n==1?'':'s'),function(){action('/clear?what=downloads','Deleting the finished downloads…',function(){setTimeout(function(){load('dlClear')},1000)})})};\n"
+    "  var f=d.launcherFound;$('dlFound').textContent=f==null?'Looking…':f||'None';\n"
+    "  $('dlLaunch').textContent=f==null?'':f?(LAUNCH[f]||''):'Apps you install appear on the home screen, and start after you restart the PS5 and run the jailbreak.';\n"
+    "  if(f==null&&(window.lfTries=(window.lfTries||0)+1)<6)setTimeout(dlReload,1500);\n"
+    "  $('dlFree').textContent=d.free>=0?gb(d.free)+' free':'';\n"
+    "  $('dlCount').textContent=(d.finished?d.finished+' finished':'None')+(d.active?', '+d.active+' in progress':'')+'.';\n"
+    "  var c=$('dlClear');c.disabled=!d.finished;c.textContent=d.finished?'Delete finished downloads ('+d.finished+')':'Delete finished downloads'}\n"
+    "$('dlClear').onclick=function(){var n=S.downloads.finished;arm(this,'Press again: delete '+n+' file'+(n==1?'':'s'),function(){action('/clear?what=downloads','Deleting…',function(){setTimeout(function(){load('dlClear')},1000)})})};\n"
     "/* Closes this browser page tab, back to the page Settings was opened over; else back. */\n"
     "function goBack(){if(history.length>1)history.back();else if(S&&S.returnUri)location.href=S.returnUri}\n"
     "$('back').onclick=function(){var h={'Content-Type':'application/x-www-form-urlencoded'};if(pin)h['X-PS5-PIN']=pin;\n"

@@ -724,7 +724,8 @@ static void kindTile(WPEDisplayPS5Canvas* c, int x, int y, int size, const char*
     guint32 tint = tints[hash % G_N_ELEMENTS(tints)];
     wpe_display_ps5_canvas_fill(c, x, y, size, size, PX_RADIUS_CHIP + 2, PX_A(tint, 0x60));
     wpe_display_ps5_canvas_stroke(c, x, y, size, size, PX_RADIUS_CHIP + 2, 1, PX_A(tint, 0xe0), PX_A(tint, 0xe0), FALSE);
-    int textSize = strlen(kind) <= 3 ? 16 : 14;
+    /* a glyph (★, ↑) larger than a type's letters */
+    int textSize = (unsigned char)kind[0] >= 0x80 && strlen(kind) <= 4 ? 24 : strlen(kind) <= 3 ? 16 : 14;
     textCentred(c, x + size / 2, y + size / 2, size - 6, textSize, TRUE, PX_TEXT, kind);
 }
 
@@ -743,7 +744,14 @@ static void drawDownloadRow(WPEDisplayPS5Canvas* c, const BUIRow* r, int rx, int
         wpe_display_ps5_canvas_fill(c, rx, ry, rw, ROW_BOX, PX_RADIUS, PX_A(PX_RAISED, 0xb0));
     int x = rx + 20;
     const int tile = 48;
-    kindTile(c, x, ry + (ROW_BOX - tile) / 2, tile, r->kind[0] ? r->kind : "FILE");
+    if (r->action) {
+        /* a place to act on ("Use this folder…", "Move … here"): its glyph
+         * (↓, into here) in the brand's gradient, not a file-type tile */
+        const int ty = ry + (ROW_BOX - tile) / 2;
+        wpe_display_ps5_canvas_fill_gradient(c, x, ty, tile, tile, PX_RADIUS_CHIP + 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
+        textCentred(c, x + tile / 2, ty + tile / 2, tile - 6, 26, TRUE, PX_TEXT, r->kind[0] ? r->kind : "↓");
+    } else
+        kindTile(c, x, ry + (ROW_BOX - tile) / 2, tile, r->kind[0] ? r->kind : "FILE");
     x += tile + 20;
 
     /* on the right: the state ("Done" with a tick) */

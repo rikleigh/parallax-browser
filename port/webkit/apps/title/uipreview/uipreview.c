@@ -132,9 +132,10 @@ static const FileSample kDrives[] = {
 };
 static const FileSample kFolder[] = {
     { "USB drive 1 › homebrew", "DIR", "1.31 TB free · 6 items", "★ Favourite", BUI_TONE_PLAIN },
+    { "Up to USB drive 1", "↑", "/mnt/usb0", "", BUI_TONE_PLAIN },
     { "ItemzFlow", "APP", "App folder · 02 Nov 21:40", "", BUI_TONE_PLAIN },
     { "PS5-Xplorer", "APP", "App folder · 28 Oct 09:12", "", BUI_TONE_PLAIN },
-    { "payloads", "DIR", "Folder · 03 Nov 14:22", "", BUI_TONE_PLAIN },
+    { "payloads", "DIR", "Folder · 03 Nov 14:22", "Download folder", BUI_TONE_DONE },
     { "Big_Buck_Bunny_1080p.zip", "ZIP", "1.21 GB · 03 Nov 11:05", "", BUI_TONE_PLAIN },
     { "PPSA01234.exfat", "EXFAT", "4.00 GB · 01 Nov 19:30", "", BUI_TONE_PLAIN },
     { "notes.txt", "TXT", "2 KB · 30 Oct 08:00", "", BUI_TONE_PLAIN },
@@ -180,10 +181,23 @@ static void row(int index, BUIRow* r, void* user)
     } else if (s->section == SEC_FILES) {
         const FileSample* f = filesAtDrives ? &kDrives[index] : &kFolder[index];
         r->title = f->name;
+        if (!filesAtDrives && !index && filesMoving == 3) {
+            r->title = "New downloads go here";
+            snprintf(r->kind, sizeof r->kind, "DIR");
+            snprintf(r->detail, sizeof r->detail, "USB drive 1 › homebrew");
+            snprintf(r->state, sizeof r->state, "Download folder");
+            r->tone = BUI_TONE_DONE;
+            r->progress = -1;
+            return;
+        }
         if (!filesAtDrives && !index && filesMoving) {
-            r->title = "Move Big_Buck_Bunny_1080p.zip here";
-            snprintf(r->state, sizeof r->state, "□ Cancel");
+            r->title = filesMoving == 2 ? "Use this folder for new downloads" : "Move Big_Buck_Bunny_1080p.zip here";
+            r->action = TRUE;
+            snprintf(r->kind, sizeof r->kind, "↓");
             r->tone = BUI_TONE_ACTIVE;
+            snprintf(r->detail, sizeof r->detail, "USB drive 1 › homebrew");
+            r->progress = -1;
+            return;
         }
         snprintf(r->kind, sizeof r->kind, "%s", f->kind);
         snprintf(r->detail, sizeof r->detail, "%s", f->detail);
@@ -560,6 +574,13 @@ int main(int argc, char** argv)
     s.downloadCross = "Move here";
     s.downloadSquare = "Cancel the move";
     menuShot("menu-files-moving", &s);
+    filesMoving = 2;
+    s.downloadCross = "Use this folder";
+    s.downloadSquare = "Cancel";
+    menuShot("menu-files-default", &s);
+    filesMoving = 3;
+    s.downloadCross = NULL;
+    menuShot("menu-files-default-current", &s);
     filesMoving = 0;
     s.rowCount = 0;
     s.downloadCross = s.downloadSquare = s.listCircle = NULL;

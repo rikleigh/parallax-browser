@@ -35,13 +35,13 @@ static char* loadError;
 static unsigned generation;
 static char* focusName; /* the entry to focus once listed */
 
-enum { MODE_NONE, MODE_MOVE, MODE_COPY, MODE_PICK };
+enum { MODE_NONE, MODE_MOVE, MODE_COPY, MODE_PICK, MODE_DEFAULT }; /* default: the folder new downloads go to */
 static int mode;
 static char* modeSrc;   /* move, copy: what goes */
 static char* modeName;  /* its name, or the download's file name */
 static unsigned modeDownload; /* pick: the download's id */
 
-enum { R_NONE, R_DRIVE, R_FAVORITE, R_DOWNLOADS, R_PLACE, R_ENTRY };
+enum { R_NONE, R_DRIVE, R_FAVORITE, R_DOWNLOADS, R_PLACE, R_UP, R_ENTRY }; /* in a folder: R_PLACE, R_UP, then R_ENTRY */
 typedef struct {
     int type;
     const MJ* item; /* R_DRIVE, R_ENTRY */
@@ -257,7 +257,12 @@ static gboolean rowAt(unsigned index, RowRef* out)
         out->path = g_strdup(place);
         return TRUE;
     }
-    const MJ* item = mj_at(entries(), index - 1);
+    if (index == 1) {
+        out->type = R_UP;
+        out->path = g_strdup(place);
+        return TRUE;
+    }
+    const MJ* item = mj_at(entries(), index - 2);
     const char* name = mj_string(item, "name");
     if (!item || !name)
         return FALSE;
@@ -274,7 +279,7 @@ static int indexOfName(const char* name)
     const MJ* list = entries();
     for (unsigned i = 0; name && i < mj_length(list); i++) {
         if (!g_strcmp0(mj_string(mj_at(list, i), "name"), name))
-            return (int)i + 1;
+            return (int)i + 2;
     }
     return -1;
 }
@@ -404,6 +409,14 @@ void ps5wk_files_pick_folder(unsigned download, const char* fileName)
         ps5wk_browser_files_changed(0);
 }
 
+void ps5wk_files_pick_default(const char* folder)
+{
+    clearMode();
+    mode = MODE_DEFAULT;
+    modeName = g_strdup("new downloads");
+    navigate(folder, NULL);
+}
+
 void ps5wk_files_pick_cancel(unsigned download)
 {
     if (mode == MODE_PICK && modeDownload == download) {
@@ -417,6 +430,8 @@ static gboolean modeTarget(void)
 {
     if (!place || mode == MODE_NONE)
         return FALSE;
+    if (mode == MODE_DEFAULT)
+        return g_strcmp0(place, ps5wk_downloads_default_folder()) != 0;
     if (mode == MODE_PICK)
         return TRUE;
     char* parent = g_path_get_dirname(modeSrc);
@@ -432,7 +447,7 @@ unsigned ps5wk_files_count(void)
 {
     if (!place)
         return listed ? driveCount() + favoriteCount() + 1 : 0;
-    return 1 + mj_length(entries());
+    return 2 + mj_length(entries());
 }
 
 static void entryKind(const MJ* e, const char* name, char* out, size_t size)
@@ -485,26 +500,46 @@ void ps5wk_files_row(unsigned index, BUIRow* r)
         r->title = title;
         snprintf(r->detail, sizeof r->detail, "%s", ref.path);
         snprintf(r->state, sizeof r->state, "Favourite");
+        if (!g_strcmp0(ref.path, ps5wk_downloads_default_folder())) {
+            snprintf(r->state, sizeof r->state, "Download folder");
+            r->tone = BUI_TONE_DONE;
+        }
         break;
     }
     case R_DOWNLOADS:
         snprintf(r->kind, sizeof r->kind, "DL");
         r->title = "Downloads";
         snprintf(r->detail, sizeof r->detail, "This PS5 user's downloads folder");
+        if (!g_strcmp0(ref.path, ps5wk_downloads_default_folder())) {
+            snprintf(r->state, sizeof r->state, "Download folder");
+            r->tone = BUI_TONE_DONE;
+        }
         break;
     case R_PLACE: {
         char* name = ps5wk_files_place_name(place);
         if (mode != MODE_NONE) {
-            const char* verb = mode == MODE_MOVE ? "Move" : mode == MODE_COPY ? "Copy" : "Save";
-            snprintf(r->kind, sizeof r->kind, "HERE");
+            const char* verb = mode == MODE_MOVE ? "move" : mode == MODE_COPY ? "copy" : "save";
             if (modeTarget()) {
-                snprintf(title, sizeof title, "%s %s here", verb, modeName);
+                r->action = TRUE;
+                snprintf(r->kind, sizeof r->kind, "↓"); /* into here */
+                if (mode == MODE_DEFAULT)
+                    snprintf(title, sizeof title, "Use this folder for new downloads");
+                else
+                    snprintf(title, sizeof title, "%c%s %s here", g_ascii_toupper(verb[0]), verb + 1, modeName);
                 r->tone = BUI_TONE_ACTIVE;
-                snprintf(r->state, sizeof r->state, "%s", name);
+            } else if (mode == MODE_DEFAULT) {
+                /* already the download folder */
+                snprintf(r->kind, sizeof r->kind, "DIR");
+                snprintf(title, sizeof title, "New downloads go here");
+                snprintf(r->state, sizeof r->state, "Download folder");
+                r->tone = BUI_TONE_DONE;
             } else {
-                snprintf(title, sizeof title, "%s %s: open the folder it goes into", verb, modeName);
+                /* the folder it's in, or one inside it */
+                snprintf(r->kind, sizeof r->kind, "DIR");
+                snprintf(title, sizeof title, "Open another folder to %s %s into", verb, modeName);
                 r->tone = BUI_TONE_WARN;
             }
+            /* where: once */
             snprintf(r->detail, sizeof r->detail, "%s", loading && !listed ? "Reading the folder…" : name);
         } else {
             snprintf(r->kind, sizeof r->kind, "DIR");
@@ -522,13 +557,27 @@ void ps5wk_files_row(unsigned index, BUIRow* r)
             if (loadError)
                 r->tone = BUI_TONE_WARN;
             const char* folder = ps5wk_downloads_default_folder();
-            if (!g_strcmp0(folder, place))
-                snprintf(r->state, sizeof r->state, "Downloads go here");
-            else if (isFavorite(place))
+            if (!g_strcmp0(folder, place) && !loadError) {
+                snprintf(r->state, sizeof r->state, "Download folder");
+                r->tone = BUI_TONE_DONE;
+            } else if (isFavorite(place))
                 snprintf(r->state, sizeof r->state, "★ Favourite");
         }
         g_free(name);
         r->title = title;
+        break;
+    }
+    case R_UP: {
+        snprintf(r->kind, sizeof r->kind, "↑");
+        gboolean top = isDriveTop(place) || !strchr(place + 1, '/');
+        char* parent = top ? NULL : g_path_get_dirname(place);
+        char* name = top ? NULL : ps5wk_files_place_name(parent);
+        snprintf(title, sizeof title, "Up to %s", top ? "all drives" : name);
+        r->title = title;
+        if (parent)
+            snprintf(r->detail, sizeof r->detail, "%s", parent);
+        g_free(parent);
+        g_free(name);
         break;
     }
     case R_ENTRY: {
@@ -546,6 +595,9 @@ void ps5wk_files_row(unsigned index, BUIRow* r)
         if (ps5wk_downloads_in_use(ref.path)) {
             snprintf(r->state, sizeof r->state, "In use");
             r->tone = BUI_TONE_ACTIVE;
+        } else if (mj_bool(ref.item, "dir") && !g_strcmp0(ref.path, ps5wk_downloads_default_folder())) {
+            snprintf(r->state, sizeof r->state, "Download folder");
+            r->tone = BUI_TONE_DONE;
         } else if (mode == MODE_NONE && mj_bool(ref.item, "app"))
             snprintf(r->state, sizeof r->state, "Can be installed");
         break;
@@ -574,10 +626,13 @@ void ps5wk_files_hints(unsigned index, const char** cross, const char** square, 
     case R_PLACE:
         if (mode != MODE_NONE) {
             if (modeTarget())
-                *cross = mode == MODE_MOVE ? "Move here" : mode == MODE_COPY ? "Copy here" : "Save here";
+                *cross = mode == MODE_MOVE ? "Move here" : mode == MODE_COPY ? "Copy here" : mode == MODE_DEFAULT ? "Use this folder" : "Save here";
             *square = mode == MODE_PICK ? "Choose later" : "Cancel";
         } else
             *cross = "Folder options";
+        break;
+    case R_UP:
+        *cross = "Open";
         break;
     case R_ENTRY: {
         gboolean dir = mj_bool(ref.item, "dir"), app = mj_bool(ref.item, "app");
@@ -616,6 +671,16 @@ static int doMode(void)
         clearMode();
         return PS5WK_FILES_MENU_CLOSE;
     }
+    if (mode == MODE_DEFAULT) {
+        /* chosen from Settings: back to it */
+        if (manage("settings", "folder", place, NULL))
+            return PS5WK_FILES_NOTHING;
+        char* where = ps5wk_files_place_name(place);
+        say("New downloads go to %s", where);
+        g_free(where);
+        clearMode();
+        return PS5WK_FILES_MENU_CLOSE;
+    }
     const char* kind = mode == MODE_MOVE ? "move" : "copy";
     char* src = g_strdup(modeSrc);
     char* name = g_strdup(modeName);
@@ -645,6 +710,10 @@ int ps5wk_files_activate(unsigned index, gboolean alternative)
         break;
     case R_PLACE:
         result = mode != MODE_NONE ? doMode() : PS5WK_FILES_CHOICES;
+        break;
+    case R_UP:
+        ps5wk_files_up();
+        result = PS5WK_FILES_DONE;
         break;
     case R_ENTRY: {
         gboolean dir = mj_bool(ref.item, "dir"), app = mj_bool(ref.item, "app");
@@ -909,10 +978,18 @@ gboolean ps5wk_files_choices(BUIChoices* out)
     }
     if (chosen.app) {
         addChoice(out, CH_INSTALL, BUI_TONE_ACTIVE, FALSE, "Install the app", "You're asked before an installed version is replaced");
-        if (chosen.icon)
-            addChoice(out, CH_IMAGE, BUI_TONE_PLAIN, FALSE, "Make an exFAT image",
-                "<ID>.exfat in the drive's homebrew folder, for ShadowMountPlus; checked once made");
-        else if (out->lineCount < 3) {
+        gboolean known = FALSE;
+        const char* mounter = ps5wk_downloads_image_mounter(&known);
+        if (chosen.icon && known && !mounter) {
+            if (out->lineCount < 3) {
+                out->lineTones[out->lineCount] = BUI_TONE_WARN;
+                snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "%s", PS5WK_NO_IMAGE_MOUNTER);
+            }
+        } else if (chosen.icon) {
+            char detail[160];
+            snprintf(detail, sizeof detail, "<ID>.exfat in the drive's homebrew folder, for %s; checked once made", mounter ? mounter : "ShadowMountPlus");
+            addChoice(out, CH_IMAGE, BUI_TONE_PLAIN, FALSE, "Make an exFAT image", detail);
+        } else if (out->lineCount < 3) {
             out->lineTones[out->lineCount] = BUI_TONE_WARN;
             snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
         }
@@ -970,9 +1047,19 @@ gboolean ps5wk_files_choices(BUIChoices* out)
                     snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
                 }
             } else if (app) {
-                char image[160];
-                snprintf(image, sizeof image, "%s.exfat in the drive's homebrew folder; checked once made", id);
-                addChoice(out, CH_EXTRACT_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", image);
+                gboolean known = FALSE;
+                const char* mounter = ps5wk_downloads_image_mounter(&known);
+                if (known && !mounter) {
+                    if (out->lineCount < 3) {
+                        out->lineTones[out->lineCount] = BUI_TONE_WARN;
+                        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "%s", PS5WK_NO_IMAGE_MOUNTER);
+                    }
+                } else {
+                    char image[160];
+                    snprintf(image, sizeof image, "%s.exfat in the drive's homebrew folder, for %s; checked once made", id,
+                        mounter ? mounter : "ShadowMountPlus");
+                    addChoice(out, CH_EXTRACT_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", image);
+                }
             }
             g_free(into);
             g_free(intoName);

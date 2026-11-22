@@ -177,6 +177,9 @@ void ps5wk_browser_open_gamepad_page(void);
 /* Options: the menu (with the address field focused). */
 void ps5wk_browser_toggle_menu(void);
 gboolean ps5wk_browser_menu_open(void);
+/* The menu's Files list, to choose the folder new downloads go to
+ * (Settings' "Change"). FALSE: it can't open now (VR, winding down). */
+gboolean ps5wk_browser_pick_download_folder(void);
 /* Closes the menu (e.g. View in VR started, the browser winds down). */
 void ps5wk_browser_close_menu(void);
 /* Gamepad mode or View in VR changed: the address bar above the page, or
