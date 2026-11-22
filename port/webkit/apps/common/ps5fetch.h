@@ -23,6 +23,11 @@
  *   is never joined; on a resume the file starts over from zero instead
  *   (status.restarted).
  *
+ *   The end: when no chunk is left to take, a worker takes over the far
+ *   half of the request with the most still to come (at least 2 MiB): that
+ *   request stops at the middle (its connection is closed), so the last
+ *   chunks don't come over a few connections while the others sit idle.
+ *
  *   Data goes to <path>.part (pwrite at its offset); which bytes are on
  *   disk is kept in <path>.part.ps5dl (a GKeyFile: the address, the final
  *   address, the total, the validator, the chunk size and the finished
@@ -35,7 +40,20 @@
  *   408, 429) is tried again by its worker after 1, 2, 4, 8, 15 s; its
  *   chunk goes back to the queue meanwhile, keeping what it got. 429 or 503
  *   while other connections work lowers the number of connections by one
- *   (some hosts allow few at once). A 401/403/404/410 on the final address
+ *   (some hosts allow few at once).
+ *
+ *   More connections (max_connections above connections): some hosts hold
+ *   each connection to a fixed speed (akirabox: 0.75 MB/s), so the
+ *   download is only as fast as the number of connections. Once all of
+ *   them are receiving, the engine measures the speed for 5 s, adds half
+ *   as many again (at least 4: 8, 12, 18, 27, 32), and measures again; it
+ *   keeps going while the added ones each give at least 40% of what one
+ *   of the earlier ones gave, up to max_connections.
+ *   When they don't (the line or the host's limit for one address is
+ *   reached), it goes back to the earlier number: the extra workers end
+ *   after their chunk. Growing stops for good on a 429 or 503, on a
+ *   401/403 to a connection it added (it goes back too), and when fewer
+ *   chunks are left than connections. A 401/403/404/410 on the final address
  *   (a signed CDN address that expired) asks the original address once
  *   again (redirects followed, the new final address used from then on).
  *   The download fails when nothing has arrived on any connection for
@@ -67,7 +85,8 @@ typedef struct {
      * NULL: none. Kept in a SoupCookieJar per worker. */
     const char* cookies;
     const char* path;         /* the finished file; data in <path>.part */
-    unsigned connections;     /* 1..16 */
+    unsigned connections;     /* 1..32: to start with */
+    unsigned max_connections; /* up to 32; at or below connections: no more are added */
     uint64_t chunk;           /* bytes per request; 0: 8 MiB */
     unsigned stall_s;         /* 0: 45 */
     uint64_t free_margin;     /* left free on the drive; 0: 16 MiB */
@@ -87,6 +106,7 @@ typedef struct {
     uint64_t received;      /* bytes on disk */
     double speed;           /* bytes/s over the last ~2 s, all connections */
     unsigned connections;   /* receiving now */
+    unsigned allowed;       /* the connections it uses now (grown, or lowered) */
     bool ranges;            /* the server answers Range (known after the probe) */
     bool restarted;         /* a resume had to start over from zero */
     bool retryable;         /* FAILED: a network error or stall (worth a later retry) */

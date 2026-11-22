@@ -16,6 +16,8 @@ GET /file/<size>[/<name>]?options    the file (HEAD too)
     weak=1    a weak ETag (W/"...": no If-Range)
     novalidator=1  neither ETag nor Last-Modified
     rate=KB   at most KB KiB/s (the slow mode, for pausing)
+    totalrate=KB  all answers for this path together at most KB KiB/s (a
+              host's limit for one address, or the line's)
     drop=N[,M...]  close the connection when the file offset reaches N (each
               point once per server run and file: a resume goes past it)
     stall=N   stop sending at offset N and keep the connection open (once)
@@ -63,6 +65,7 @@ lock = threading.Lock()
 active = {}   # path: answers being sent (maxconn)
 stats = {}    # path: {"requests", "bytes", "busy"} (/stats)
 requests = {}  # path: GET requests so far (changeafter)
+paced = {}     # path: [bytes, first time] for totalrate
 
 
 def count(path, key, n=1):
@@ -281,6 +284,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if head:
             return
         rate = float(q.get("rate", "0")) * 1024
+        totalrate = float(q.get("totalrate", "0")) * 1024
         drops = [int(x) for x in q.get("drop", "").split(",") if x]
         stall = int(q.get("stall", "-1"))
         stallall = int(q.get("stallall", "-1"))
@@ -320,6 +324,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return
                     if rate:
                         ahead = sent / rate - (time.time() - t0)
+                        if ahead > 0:
+                            time.sleep(ahead)
+                    if totalrate:
+                        with lock:
+                            now = time.time()
+                            entry = paced.setdefault(u.path, [0, now])
+                            if now - entry[0] / totalrate - entry[1] > 1:
+                                entry[:] = [0, now - 0.0]  # idle a while: no saved-up burst
+                            entry[0] += n
+                            ahead = entry[0] / totalrate - (now - entry[1])
                         if ahead > 0:
                             time.sleep(ahead)
         except (BrokenPipeError, ConnectionResetError) as e:

@@ -1048,10 +1048,22 @@ because the console slows a title's own writes to about 2 MB/s after a few
 hundred megabytes, and because a title can't see every drive.
 
 - **Several connections** (`apps/common/ps5fetch.c`): the file is cut
-  into chunks (8 MiB); up to *Connections per download* workers (default
-  8, Settings 1-16) each take the lowest chunk no one has and ask for it
+  into chunks (8 MiB); up to *Connections per download* workers (Settings:
+  Auto, the default, or 1-16) each take the lowest chunk no one has and ask for it
   with `Range`, so writes stay near the front of the file (exFAT USB
-  drives can't hold sparse files). The first request (chunk 0 with a
+  drives can't hold sparse files). *Auto* starts with 8 and, once all of
+  them are receiving, measures 5 s, adds half as many again (8, 12, 18,
+  27, 32) and measures again; it keeps the added ones while each gives
+  at least 40% of what one of the earlier ones did, and otherwise goes back
+  to the earlier number (a full line, or a host's limit for one address).
+  Hosts that hold each connection to a fixed speed need it: akirabox gives
+  a free download 0.75 MB/s per connection and about 16 MB/s per address
+  (measured 2026-11-22 from the Mac: 8 connections 5.5 MB/s, 16 11.6,
+  24 and more 15.8). A 401/403 to an added connection goes back to the
+  number that worked; a `429`/`503` stops the growing too. At the end,
+  a worker with no chunk left takes over the far half of the request with
+  the most still to come (at least 2 MiB; that request stops at the
+  middle), so the last chunks don't come over a few connections. The first request (chunk 0 with a
   `Range`) decides: a `206` with a total starts the others, a `200` is
   read whole on one connection. A range of another file (start, total or
   validator differ) is never joined. `429`/`503` while others work lowers
@@ -1352,7 +1364,7 @@ link server; the page's look through debug screenshots, not the pad):
   move, and refusals: a name already there, a move into itself, a copy
   out of `/data/ps5webkit`. No USB or M.2 drive was attached: moves
   between drives were tested on the Mac only.
-- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
+- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (55 cases,
   `--quick` 38), `archive-test.sh` (230: with libarchive 3.8.1 and our patches built
   for the Mac by `mac-libarchive.sh`; passwords: PKWARE and AES ZIPs,
   RAR4 and RAR5 made by RAR, and multivolume sets encrypted the way RAR

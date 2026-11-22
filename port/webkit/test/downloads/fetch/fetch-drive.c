@@ -2,7 +2,7 @@
  * fetch-drive.c: runs one download through apps/common/ps5fetch.c on the
  * Mac, for fetch-test.sh.
  *
- *   fetch-drive [--conns N] [--chunk BYTES] [--stall S] [--margin BYTES]
+ *   fetch-drive [--conns N] [--max-conns N] [--chunk BYTES] [--stall S] [--margin BYTES]
  *               [--orig URL] [--cookies FILE] [--ua TEXT] [--referer URL]
  *               [--stop-at BYTES] [--cancel-at BYTES] [--timeout S] URL PATH
  *   fetch-drive --saved PATH
@@ -11,10 +11,11 @@
  * bytes are on disk. Progress goes to stderr every half second; the result
  * is one line on stdout, key=value separated by spaces (error last):
  *   state=done received=N total=N got=N secs=S speed=B/s maxconns=N
- *   lateconns=N ranges=0|1 restarted=0|1 retryable=0|1 status=N
+ *   lateconns=N allowed=N ranges=0|1 restarted=0|1 retryable=0|1 status=N
  *   final=URL error=TEXT
  * got: bytes that came on disk during this run; speed: got / secs;
- * lateconns: the most connections seen in the second half of the bytes.
+ * lateconns: the most connections seen in the second half of the bytes;
+ * allowed: the connections the engine used at the end (grown or lowered).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +75,8 @@ int main(int argc, char** argv)
             i++;
             if (!strcmp(a, "--conns"))
                 o.connections = (unsigned)atoi(v);
+            else if (!strcmp(a, "--max-conns"))
+                o.max_connections = (unsigned)atoi(v);
             else if (!strcmp(a, "--chunk"))
                 o.chunk = g_ascii_strtoull(v, NULL, 10);
             else if (!strcmp(a, "--stall"))
@@ -146,18 +149,18 @@ int main(int argc, char** argv)
         }
         if (now - shown >= 500000) {
             shown = now;
-            fprintf(stderr, "  %5.1f s  %llu/%lld  %.2f MB/s  %u conns  status %d\n", (now - t0) / 1e6, (unsigned long long)s.received,
-                (long long)s.total, s.speed / 1048576, s.connections, s.http_status);
+            fprintf(stderr, "  %5.1f s  %llu/%lld  %.2f MB/s  %u conns (of %u)  status %d\n", (now - t0) / 1e6, (unsigned long long)s.received,
+                (long long)s.total, s.speed / 1048576, s.connections, s.allowed, s.http_status);
         }
     }
     double secs = (g_get_monotonic_time() - t0) / 1e6;
     ps5fetch_status(fetch, &s);
     ps5fetch_free(fetch);
     guint64 got = s.received >= first ? s.received - first : s.received;
-    printf("state=%s received=%llu total=%lld got=%llu secs=%.2f speed=%.0f maxconns=%u lateconns=%u ranges=%d restarted=%d retryable=%d "
+    printf("state=%s received=%llu total=%lld got=%llu secs=%.2f speed=%.0f maxconns=%u lateconns=%u allowed=%u ranges=%d restarted=%d retryable=%d "
            "status=%d final=%s error=%s\n",
         stateName(s.state), (unsigned long long)s.received, (long long)s.total, (unsigned long long)got, secs, secs > 0 ? got / secs : 0,
-        maxConns, lateConns, s.ranges, s.restarted, s.retryable, s.http_status, s.final_url, s.error);
+        maxConns, lateConns, s.allowed, s.ranges, s.restarted, s.retryable, s.http_status, s.final_url, s.error);
     g_free(cookies);
     return 0;
 }

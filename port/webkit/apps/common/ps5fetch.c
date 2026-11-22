@@ -102,7 +102,15 @@
 #include <glib.h>
 #include <libsoup/soup.h>
 
-#define MAX_WORKERS 16
+#define MAX_WORKERS 32
+/* More connections (ps5fetch.h): wait after a change, measure, add. */
+#define GROW_SETTLE_US (2 * G_USEC_PER_SEC)
+#define GROW_WINDOW_US (5 * G_USEC_PER_SEC)
+#define GROW_STEP 4 /* at least; else half as many again */
+#define GROW_KEEP 0.4
+/* The end: a worker with nothing left takes over the far half of the
+ * request with the most still to come, if that is at least twice this. */
+#define STEAL_MIN (1ull << 20)
 #define MIN_CHUNK (1ull << 20)
 #define DEFAULT_CHUNK (8ull << 20)
 #define DEFAULT_STALL_S 45
@@ -122,7 +130,9 @@ typedef struct {
     guint64 start, end; /* [start, end) */
 } Span;
 
-enum { CHUNK_FREE, CHUNK_TAKEN, CHUNK_DONE };
+/* A chunk: free, done, or the number of workers holding it (a worker that
+ * takes over the end of another's request holds that chunk too). */
+enum { CHUNK_FREE = 0, CHUNK_DONE = 255 };
 enum { WORKER_NONE, WORKER_RUNNING, WORKER_EXITED };
 enum { ASK_NONE, ASK_PAUSE, ASK_CANCEL };
 
@@ -150,6 +160,10 @@ typedef struct {
     gint64 lastData;       /* monotonic µs: the request's start or its last data */
     gboolean stalled;      /* the engine cancelled the request: nothing for stall_s */
     gboolean receiving;
+    gboolean leaving; /* ends after its chunk: there are more workers than allowed */
+    /* The bytes its request still has to bring, [claimAt, claimEnd) (no
+     * claim: claimEnd 0); another worker may lower claimEnd (the end). */
+    guint64 claimAt, claimEnd;
     gint64 chunk; /* the chunk this worker holds, -1: none */
     unsigned failures; /* requests that failed in a row */
     unsigned retryAfter;
@@ -203,6 +217,16 @@ struct PS5Fetch {
     guint64 lowestFree;
     unsigned allowed;
     unsigned waiting; /* workers waiting to retry */
+    /* More connections: still trying; the most; the connections and speed
+     * (bytes/s, < 0: none yet) of the last measurement kept; when allowed
+     * last changed (0: not yet); the window's start (0: none) and bytes. */
+    gboolean growing;
+    unsigned growMax;
+    unsigned growBaseConns;
+    double growBase;
+    gint64 growChanged;
+    gint64 growFrom;
+    guint64 growBytes;
     Worker workers[MAX_WORKERS];
     int fd;
     guint64 arrived; /* from the network, for the speed */
@@ -556,7 +580,7 @@ static gint64 takeChunk(PS5Fetch* f)
 {
     for (guint64 k = f->lowestFree; k < f->chunkCount; k++) {
         if (f->chunks[k] == CHUNK_FREE) {
-            f->chunks[k] = CHUNK_TAKEN;
+            f->chunks[k] = 1;
             f->freeChunks--;
             f->lowestFree = k + 1;
             return (gint64)k;
@@ -568,8 +592,9 @@ static gint64 takeChunk(PS5Fetch* f)
 
 static void releaseChunk(PS5Fetch* f, Worker* w)
 {
-    if (w->chunk >= 0 && f->chunks && (guint64)w->chunk < f->chunkCount && f->chunks[w->chunk] == CHUNK_TAKEN) {
-        f->chunks[w->chunk] = CHUNK_FREE;
+    if (w->chunk >= 0 && f->chunks && (guint64)w->chunk < f->chunkCount && f->chunks[w->chunk] != CHUNK_FREE
+        && f->chunks[w->chunk] != CHUNK_DONE && !--f->chunks[w->chunk]) {
+        /* no one holds it now: back to the queue */
         f->freeChunks++;
         f->lowestFree = MIN(f->lowestFree, (guint64)w->chunk);
         g_cond_broadcast(&f->wake);
@@ -639,6 +664,65 @@ static gboolean openPart(PS5Fetch* f)
 
 /* ---- a request ---- */
 
+/* Under lock: more workers than allowed (some added that didn't help, or
+ * fewer asked for), not counting those already leaving. */
+static gboolean tooMany(PS5Fetch* f)
+{
+    unsigned staying = 0;
+    for (int i = 0; i < MAX_WORKERS; i++)
+        staying += f->workers[i].state == WORKER_RUNNING && !f->workers[i].leaving;
+    return staying > f->allowed;
+}
+
+/* Under lock: the first bytes in [low, high) that aren't on disk and that
+ * no other worker's request is bringing. */
+static gboolean unclaimedGap(PS5Fetch* f, Worker* w, guint64 low, guint64 high, guint64* start, guint64* end)
+{
+    for (;;) {
+        if (!firstGap(f->done, low, high, start, end))
+            return FALSE;
+        gboolean moved = FALSE;
+        for (int i = 0; i < MAX_WORKERS && !moved; i++) {
+            Worker* o = &f->workers[i];
+            if (o == w || o->state != WORKER_RUNNING || o->claimEnd <= o->claimAt)
+                continue;
+            if (o->claimAt <= *start && *start < o->claimEnd) {
+                low = o->claimEnd;
+                moved = TRUE;
+            } else if (*start < o->claimAt && o->claimAt < *end)
+                *end = o->claimAt;
+        }
+        if (!moved)
+            return TRUE;
+    }
+}
+
+/* Under lock, no chunk is free: take over the far half of the request with
+ * the most still to come (its worker stops at the middle), holding its
+ * chunk too. FALSE: nothing worth it. */
+static gboolean takeOver(PS5Fetch* f, Worker* w, Job* job)
+{
+    Worker* best = NULL;
+    guint64 most = 0;
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        Worker* o = &f->workers[i];
+        if (o == w || o->state != WORKER_RUNNING || o->chunk < 0 || o->claimEnd <= o->claimAt)
+            continue;
+        if (o->claimEnd - o->claimAt > most) {
+            most = o->claimEnd - o->claimAt;
+            best = o;
+        }
+    }
+    if (!best || most < 2 * STEAL_MIN)
+        return FALSE;
+    job->start = best->claimAt + most / 2;
+    job->end = best->claimEnd;
+    best->claimEnd = job->start;
+    w->chunk = best->chunk;
+    f->chunks[w->chunk]++;
+    return TRUE;
+}
+
 /* Under lock: what to ask next, or FALSE when this worker has nothing to do. */
 static gboolean nextJob(PS5Fetch* f, Worker* w, Job* job)
 {
@@ -654,20 +738,43 @@ static gboolean nextJob(PS5Fetch* f, Worker* w, Job* job)
         }
     } else if (f->ranges) {
         for (;;) {
-            if (w->chunk < 0 && (w->chunk = takeChunk(f)) < 0)
+            if (w->chunk < 0 && tooMany(f)) {
+                w->leaving = TRUE;
                 return FALSE;
-            guint64 low = (guint64)w->chunk * f->chunk;
-            if (firstGap(f->done, low, MIN(low + f->chunk, (guint64)f->total), &job->start, &job->end))
+            }
+            if (w->chunk < 0 && (w->chunk = takeChunk(f)) < 0) {
+                if (!takeOver(f, w, job))
+                    return FALSE;
                 break;
-            f->chunks[w->chunk] = CHUNK_DONE;
-            w->chunk = -1;
-            g_cond_broadcast(&f->wake);
+            }
+            guint64 low = (guint64)w->chunk * f->chunk, high = MIN(low + f->chunk, (guint64)f->total);
+            if (unclaimedGap(f, w, low, high, &job->start, &job->end))
+                break;
+            guint64 a, b;
+            if (firstGap(f->done, low, high, &a, &b))
+                releaseChunk(f, w); /* the rest is coming on others that hold it too */
+            else {
+                f->chunks[w->chunk] = CHUNK_DONE;
+                w->chunk = -1;
+                g_cond_broadcast(&f->wake);
+            }
         }
     } else
         job->whole = TRUE;
+    w->claimAt = job->whole ? 0 : job->start;
+    w->claimEnd = job->whole ? 0 : job->end;
     job->url = g_strdup(f->url);
     job->generation = f->urlGeneration;
     return TRUE;
+}
+
+/* Under lock: the other workers that aren't leaving. */
+static unsigned othersStaying(PS5Fetch* f, Worker* w)
+{
+    unsigned n = 0;
+    for (int i = 0; i < MAX_WORKERS; i++)
+        n += &f->workers[i] != w && f->workers[i].state == WORKER_RUNNING && !f->workers[i].leaving;
+    return n;
 }
 
 static gboolean othersReceiving(PS5Fetch* f, Worker* w)
@@ -694,9 +801,18 @@ static Next networkProblem(PS5Fetch* f, Worker* w, GError* error)
     return next;
 }
 
-/* Writes what the buffer holds (bytes before skipBelow are already there). */
-static gboolean flush(PS5Fetch* f, Worker* w, const char* buffer, size_t fill, guint64 at, guint64 skipBelow)
+/* Writes what the buffer holds (bytes before skipBelow are already there),
+ * but not past *limit, which it lowers when another worker has taken over
+ * the end of this request; *fill becomes what was written. */
+static gboolean flush(PS5Fetch* f, Worker* w, const char* buffer, size_t* fillp, guint64 at, guint64 skipBelow, guint64* limit)
 {
+    g_mutex_lock(&f->lock);
+    if (w->claimEnd && w->claimEnd < *limit)
+        *limit = w->claimEnd;
+    g_mutex_unlock(&f->lock);
+    if (at + *fillp > *limit)
+        *fillp = *limit > at ? (size_t)(*limit - at) : 0;
+    size_t fill = *fillp;
     size_t skip = at >= skipBelow ? 0 : (size_t)MIN(skipBelow - at, (guint64)fill);
     if (skip < fill && !writeAt(f->fd, buffer + skip, fill - skip, at + skip)) {
         int e = errno;
@@ -712,6 +828,8 @@ static gboolean flush(PS5Fetch* f, Worker* w, const char* buffer, size_t fill, g
     g_mutex_lock(&f->lock);
     if (skip < fill)
         f->received += addSpan(f->done, at + skip, at + fill);
+    if (w->claimEnd)
+        w->claimAt = at + fill;
     f->arrived += fill;
     f->lastByte = now;
     w->lastData = now;
@@ -729,7 +847,7 @@ static Next receive(PS5Fetch* f, Worker* w, GInputStream* stream, GCancellable* 
     size_t fill = 0;
     gint64 flushed = g_get_monotonic_time();
     for (;;) {
-        guint64 left = limit - (at + fill);
+        guint64 left = limit > at + fill ? limit - (at + fill) : 0;
         if (!left)
             break;
         size_t want = BUFFER_SIZE - fill;
@@ -740,8 +858,8 @@ static Next receive(PS5Fetch* f, Worker* w, GInputStream* stream, GCancellable* 
         if (n > 0)
             fill += (size_t)n;
         gint64 now = g_get_monotonic_time();
-        if (fill && (n <= 0 || fill == BUFFER_SIZE || now - flushed >= FLUSH_US || at + fill == limit)) {
-            if (!flush(f, w, buffer, fill, at, skipBelow)) {
+        if (fill && (n <= 0 || fill == BUFFER_SIZE || now - flushed >= FLUSH_US || at + fill >= limit)) {
+            if (!flush(f, w, buffer, &fill, at, skipBelow, &limit)) {
                 g_clear_error(&error);
                 return NEXT_END;
             }
@@ -788,6 +906,17 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
     if (f->ask || f->failed || f->complete)
         return NEXT_END;
 
+    if ((status == 401 || status == 403) && f->growMax > f->growBaseConns && othersStaying(f, w) >= f->growBaseConns
+        && othersReceiving(f, w)) {
+        /* a connection beyond the number known to work (more connections),
+         * refused: a host that refuses that many. Back to that number, no
+         * more tries. */
+        setProblem(f, "the server answered %u %s", status, reason ? reason : "");
+        f->allowed = f->growBaseConns;
+        f->growing = FALSE;
+        w->leaving = TRUE; /* not counted by others deciding whether to leave */
+        return NEXT_LOWER;
+    }
     if (status == 401 || status == 403 || status == 404 || status == 410) {
         if (job->generation != f->urlGeneration)
             return NEXT_AGAIN; /* another worker has gone back already */
@@ -809,6 +938,8 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
         w->retryAfter = after && g_ascii_isdigit(*after) ? (unsigned)MIN(g_ascii_strtoull(after, NULL, 10), RETRY_AFTER_MAX_S) : 0;
         if ((status == 429 || status == 503) && f->probed && f->ranges && f->allowed > 1 && othersReceiving(f, w)) {
             f->allowed--;
+            f->growing = FALSE;
+            w->leaving = TRUE;
             return NEXT_LOWER;
         }
         return NEXT_RETRY;
@@ -876,9 +1007,10 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
         if (f->ranges) {
             w->chunk = (gint64)(job->start / f->chunk);
             if (f->chunks[w->chunk] == CHUNK_FREE) {
-                f->chunks[w->chunk] = CHUNK_TAKEN;
+                f->chunks[w->chunk] = 1;
                 f->freeChunks--;
-            }
+            } else if (f->chunks[w->chunk] != CHUNK_DONE)
+                f->chunks[w->chunk]++;
         }
         f->probed = TRUE;
         f->dirty = TRUE;
@@ -913,8 +1045,11 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
     if (status == 206) {
         *start = job->start;
         *limit = MIN(job->end, (guint64)rangeEnd + 1);
+        if (w->claimEnd)
+            *limit = MIN(*limit, w->claimEnd); /* taken over while it waited */
         *skipBelow = 0;
     } else {
+        w->claimAt = w->claimEnd = 0; /* the whole file, not the range asked */
         *start = 0;
         *limit = f->total >= 0 ? (guint64)f->total : G_MAXUINT64;
         *skipBelow = f->done->len && !spans(f->done)[0].start ? spans(f->done)[0].end : 0;
@@ -974,6 +1109,7 @@ static Next request(PS5Fetch* f, Worker* w, SoupSession* session, char* buffer, 
     g_mutex_lock(&f->lock);
     g_clear_object(&w->request);
     w->receiving = FALSE;
+    w->claimAt = w->claimEnd = 0;
     g_mutex_unlock(&f->lock);
     g_object_unref(cancel);
     return next;
@@ -1052,6 +1188,8 @@ static gboolean startWorker(PS5Fetch* f)
         w->failures = 0;
         w->retryAfter = 0;
         w->receiving = FALSE;
+        w->leaving = FALSE;
+        w->claimAt = w->claimEnd = 0;
         char name[16];
         snprintf(name, sizeof name, "ps5fetch-%d", i);
         w->thread = g_thread_try_new(name, workerMain, w, NULL);
@@ -1134,6 +1272,50 @@ static PS5FetchState finish(PS5Fetch* f)
     return f->failed ? PS5FETCH_FAILED : PS5FETCH_PAUSED;
 }
 
+/* Under lock, each pass while ranged chunks are fetched: more connections
+ * (ps5fetch.h). alive: workers that haven't ended. */
+static void grow(PS5Fetch* f, gint64 now, unsigned alive)
+{
+    if (f->freeChunks < f->allowed) {
+        f->growing = FALSE; /* the end is near: connections are ending, not measurable */
+        return;
+    }
+    if (alive != f->allowed || f->waiting) {
+        f->growChanged = now; /* not all of them working: start again */
+        f->growFrom = 0;
+        return;
+    }
+    if (!f->growChanged)
+        f->growChanged = now;
+    if (!f->growFrom) {
+        if (now - f->growChanged >= GROW_SETTLE_US) {
+            f->growFrom = now;
+            f->growBytes = f->arrived;
+        }
+        return;
+    }
+    if (now - f->growFrom < GROW_WINDOW_US)
+        return;
+    double rate = (double)(f->arrived - f->growBytes) * G_USEC_PER_SEC / (double)(now - f->growFrom);
+    f->growFrom = 0;
+    f->growChanged = now;
+    if (f->growBase >= 0 && f->allowed > f->growBaseConns) {
+        double each = f->growBase / f->growBaseConns;
+        if (rate - f->growBase < GROW_KEEP * each * (f->allowed - f->growBaseConns)) {
+            f->allowed = f->growBaseConns; /* the extra workers end after their chunk */
+            f->growing = FALSE;
+            return;
+        }
+    }
+    f->growBase = rate;
+    f->growBaseConns = f->allowed;
+    if (f->allowed >= f->growMax) {
+        f->growing = FALSE;
+        return;
+    }
+    f->allowed = MIN(f->growMax, f->allowed + MAX(GROW_STEP, f->allowed / 2));
+}
+
 static gpointer engineMain(gpointer data)
 {
     PS5Fetch* f = data;
@@ -1186,6 +1368,8 @@ static gpointer engineMain(gpointer data)
             }
             if (!alive)
                 fail(f, TRUE, "The download couldn't start a connection");
+            else if (f->growing)
+                grow(f, g_get_monotonic_time(), alive);
         }
 
         now = g_get_monotonic_time();
@@ -1254,6 +1438,10 @@ PS5Fetch* ps5fetch_start(const PS5FetchOptions* options, ps5fetch_ended_fn ended
     f->chunk = options->chunk ? MAX(options->chunk, MIN_CHUNK) : DEFAULT_CHUNK;
     f->done = g_array_new(FALSE, FALSE, sizeof(Span));
     f->allowed = CLAMP(options->connections, 1, MAX_WORKERS);
+    f->growMax = MIN(options->max_connections, MAX_WORKERS);
+    f->growing = f->growMax > f->allowed;
+    f->growBaseConns = f->allowed;
+    f->growBase = -1;
     for (int i = 0; i < MAX_WORKERS; i++) {
         f->workers[i].fetch = f;
         f->workers[i].chunk = -1;
@@ -1298,6 +1486,7 @@ void ps5fetch_status(PS5Fetch* f, PS5FetchStatus* out)
     out->total = f->total;
     out->received = f->received;
     out->speed = f->speed;
+    out->allowed = f->allowed;
     for (int i = 0; i < MAX_WORKERS; i++)
         out->connections += f->workers[i].state == WORKER_RUNNING && f->workers[i].receiving;
     out->ranges = f->probed && f->ranges;

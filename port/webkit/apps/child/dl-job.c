@@ -304,6 +304,7 @@ static void appendStatus(GString* line, const PS5FetchStatus* s)
     appendNumber(line, "total", (long long)s->total);
     appendNumber(line, "speed", (long long)s->speed);
     appendNumber(line, "conns", s->connections);
+    appendNumber(line, "allowed", s->allowed);
     appendNumber(line, "ranges", s->ranges);
     appendNumber(line, "restarted", s->restarted);
     appendNumber(line, "status", s->http_status);
@@ -488,9 +489,12 @@ static void startFetch(GHashTable* p)
     o.path = f->path;
     const char* conns = param(p, "conns");
     o.connections = conns ? (unsigned)CLAMP(atoi(conns), 1, 16) : 8;
+    /* more while they make it faster, up to this (ps5fetch.h) */
+    const char* maxConns = param(p, "maxconns");
+    o.max_connections = maxConns ? (unsigned)CLAMP(atoi(maxConns), 0, 32) : 0;
     const char* chunk = param(p, "chunk");
     o.chunk = chunk ? g_ascii_strtoull(chunk, NULL, 10) : 0;
-    JOBLOG("download %s: %s to %s, %u connections", id, url, f->path, o.connections);
+    JOBLOG("download %s: %s to %s, %u connections (up to %u)", id, url, f->path, o.connections, MAX(o.connections, o.max_connections));
     PS5Fetch* fetch = ps5fetch_start(&o, fetchEnded, f);
     g_mutex_lock(&fetchLock);
     f->fetch = fetch;

@@ -1022,12 +1022,29 @@ static void endTransfer(Download* d)
 /* ---------------------------------------------------------------- the download manager's settings */
 
 static struct {
-    unsigned connections;   /* per download, 1..16 */
+    unsigned connections;   /* per download, 1..16; 0: automatic (8, more while they help, up to 32) */
     gboolean ask;           /* where to save each download: the menu (or the phone's page) asks */
     char* folder;           /* the default folder; NULL: the user's downloads folder */
     gboolean deleteArchives; /* after they were unpacked */
     char** favorites;       /* folders, NULL-terminated */
-} settings = { 8, TRUE, NULL, FALSE, NULL };
+} settings = { 0, TRUE, NULL, FALSE, NULL };
+
+/* Automatic: start with this many, add more while they make a download
+ * faster (hosts that hold each connection to a fixed speed), up to the
+ * most (ps5fetch.h, "More connections"). */
+#define AUTO_CONNECTIONS 8
+#define AUTO_MAX_CONNECTIONS 32
+
+/* For the log: "8" or "8-32 (automatic)". */
+static const char* connectionsText(void)
+{
+    static char text[32];
+    if (settings.connections)
+        snprintf(text, sizeof text, "%u", settings.connections);
+    else
+        snprintf(text, sizeof text, "%u-%u (automatic)", AUTO_CONNECTIONS, AUTO_MAX_CONNECTIONS);
+    return text;
+}
 
 static char* settingsPath(void)
 {
@@ -1041,9 +1058,15 @@ static void loadSettings(void)
     if (g_key_file_load_from_file(file, path, G_KEY_FILE_NONE, NULL)) {
         GError* error = NULL;
         int connections = g_key_file_get_integer(file, "downloads", "connections", &error);
-        if (!error)
-            settings.connections = (unsigned)CLAMP(connections, 1, 16);
+        gboolean known = !error;
         g_clear_error(&error);
+        /* no connections-auto (before 0.4.2): 8, the old default, becomes
+         * automatic; a number someone chose stays */
+        gboolean automatic = g_key_file_get_boolean(file, "downloads", "connections-auto", &error);
+        if (error)
+            automatic = !known || connections == AUTO_CONNECTIONS;
+        g_clear_error(&error);
+        settings.connections = automatic ? 0 : (unsigned)CLAMP(connections, 1, 16);
         gboolean ask = g_key_file_get_boolean(file, "downloads", "ask", &error);
         if (!error)
             settings.ask = ask;
@@ -1064,7 +1087,8 @@ static void loadSettings(void)
 static void saveSettings(void)
 {
     GKeyFile* file = g_key_file_new();
-    g_key_file_set_integer(file, "downloads", "connections", (int)settings.connections);
+    g_key_file_set_integer(file, "downloads", "connections", settings.connections ? (int)settings.connections : AUTO_CONNECTIONS);
+    g_key_file_set_boolean(file, "downloads", "connections-auto", !settings.connections);
     g_key_file_set_boolean(file, "downloads", "ask", settings.ask);
     g_key_file_set_boolean(file, "downloads", "delete-archives", settings.deleteArchives);
     g_key_file_set_string(file, "downloads", "folder", settings.folder ? settings.folder : "");
@@ -1334,7 +1358,7 @@ static void handOff(Download* d, WebKitDownload* download, WebKitURIResponse* re
     ps5wk_browser_download_started(view);
     char size[32];
     formatBytes(size, sizeof size, length);
-    spike_log("[dl] %u: %s, %s, ranges: to the download service (%u connections)%s", d->r.id, d->r.file, size, settings.connections,
+    spike_log("[dl] %u: %s, %s, ranges: to the download service (%s connections)%s", d->r.id, d->r.file, size, connectionsText(),
         settings.ask ? ", asking where to save it" : "");
     d->announced = TRUE;
     if (settings.ask) {
@@ -1389,13 +1413,15 @@ static void sendFetch(Download* d, const char* cookies, gboolean fresh)
 {
     if (d->r.state != PS5WK_DL_RUNNING || d->r.engine != PS5WK_DL_SERVICE)
         return;
-    char id[16], conns[8];
+    char id[16], conns[8], maxConns[8];
     snprintf(id, sizeof id, "%u", d->r.id);
-    snprintf(conns, sizeof conns, "%u", settings.connections);
+    snprintf(conns, sizeof conns, "%u", settings.connections ? settings.connections : AUTO_CONNECTIONS);
+    snprintf(maxConns, sizeof maxConns, "%u", settings.connections ? 0 : AUTO_MAX_CONNECTIONS);
     ps5wk_dlservice_send("fetch", "id", id, "url", d->r.url, "ua", *userAgent ? userAgent : NULL, "ref", d->r.referer, "cookies",
-        cookiesToSend(d, cookies), "dir", folderOf(d), "name", d->r.file, "fresh", fresh ? "1" : "0", "conns", conns, NULL);
-    spike_log("[dl] %u: %s %s to %s/%s (%u connections)", d->r.id, fresh ? "asking" : "continuing", d->r.url, folderOf(d), d->r.file,
-        settings.connections);
+        cookiesToSend(d, cookies), "dir", folderOf(d), "name", d->r.file, "fresh", fresh ? "1" : "0", "conns", conns, "maxconns", maxConns,
+        NULL);
+    spike_log("[dl] %u: %s %s to %s/%s (%s connections)", d->r.id, fresh ? "asking" : "continuing", d->r.url, folderOf(d), d->r.file,
+        connectionsText());
 }
 
 static void sendPeek(Download* d, const char* cookies)
@@ -3261,8 +3287,8 @@ static const char* manage(GHashTable* params)
 
     if (!strcmp(action, "settings")) {
         const char* connections = textParam(params, "connections");
-        if (connections)
-            settings.connections = (unsigned)CLAMP(atoi(connections), 1, 16);
+        if (connections) /* 0 or "auto": automatic */
+            settings.connections = !strcmp(connections, "auto") ? 0 : (unsigned)CLAMP(atoi(connections), 0, 16);
         const char* ask = textParam(params, "ask");
         if (ask)
             settings.ask = !strcmp(ask, "1") || !strcmp(ask, "true");

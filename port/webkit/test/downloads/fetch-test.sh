@@ -226,6 +226,56 @@ else
     failed "503 every time: $r"
 fi
 
+# 9b. more connections (max_connections) and the end taken over
+if [ "$quick" != --quick ]; then
+    # 1 MiB/s each, 12 MiB/s for all (a host's limit for one address): 8,
+    # then 12 (faster), then 18 (no faster): back to 12
+    f="$work/grow.bin"
+    r=$(drive --conns 8 --max-conns 32 --chunk $mib --timeout 90 "$base/file/268435456/grow.bin?rate=1024&totalrate=12288" "$f")
+    expect_done "1 MiB/s each, 12 MiB/s in all, 8 growing to 32" "$r" "$f" 268435456 && {
+        if [ "$(field allowed "$r")" = 12 ] && [ "$(field maxconns "$r")" -gt 12 ]; then
+            pass "grew to $(field maxconns "$r"), went back to 12 when that was no faster ($(($(field speed "$r") / 1048576)) MiB/s)"
+        else
+            failed "growing to the host's limit: allowed=$(field allowed "$r") maxconns=$(field maxconns "$r"), not 12 after more"
+        fi
+    }
+    # no limit per connection, 8 MiB/s in all (the line): more don't help
+    f="$work/line.bin"
+    r=$(drive --conns 8 --max-conns 32 --chunk $mib --timeout 90 "$base/file/167772160/line.bin?totalrate=8192" "$f")
+    expect_done "8 MiB/s in all (the line), 8 growing to 32" "$r" "$f" 167772160 && {
+        if [ "$(field allowed "$r")" = 8 ] && [ "$(field maxconns "$r")" -gt 8 ]; then
+            pass "tried $(field maxconns "$r"), stayed at 8 (the line was full)"
+        else
+            failed "the line: allowed=$(field allowed "$r") maxconns=$(field maxconns "$r"), not 8 after a try"
+        fi
+    }
+    # 403 beyond 10 at once: back to 8, the download goes on
+    f="$work/grow403.bin"
+    p="/file/134217728/grow403.bin"
+    r=$(drive --conns 8 --max-conns 32 --chunk $mib --timeout 90 "$base$p?rate=1024&maxconn=10&busy=403" "$f")
+    expect_done "403 beyond 10 connections, 8 growing to 32" "$r" "$f" 134217728 && {
+        if [ "$(field allowed "$r")" = 8 ] && [ "$(stat_of "$p" busy)" -ge 1 ]; then
+            pass "403 to an added connection: back to 8, $(stat_of "$p" busy) refusal(s)"
+        else
+            failed "403 while growing: allowed=$(field allowed "$r"), $(stat_of "$p" busy) refusals"
+        fi
+    }
+    # 5 chunks of 8 MiB on 4 connections at 1 MiB/s each: without taking
+    # over, the fifth comes alone (about 16 s); taken over, about 10 s
+    f="$work/end.bin"
+    p="/file/41943040/end.bin"
+    r=$(drive --conns 4 --chunk 8388608 --timeout 60 "$base$p?rate=1024" "$f")
+    expect_done "the end taken over (5 chunks, 4 connections)" "$r" "$f" 41943040 && {
+        secs=$(field secs "$r")
+        sent=$(stat_of "$p" bytes)
+        if python3 -c "import sys; sys.exit(not float(sys.argv[1]) < 13.5)" "$secs" && [ "$sent" -le $((41943040 + 4 * 1048576)) ]; then
+            pass "the end: $secs s (one connection alone would be ~16 s), $sent bytes sent for 41943040"
+        else
+            failed "the end: $secs s, $sent bytes sent for 41943040"
+        fi
+    }
+fi
+
 # 10. a signed final address that expires
 f="$work/release.bin"
 r=$(drive --conns 4 --chunk $mib "$base/release/33554432/release.bin?ttl=2&rate=2048" "$f")
