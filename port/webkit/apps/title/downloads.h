@@ -106,6 +106,8 @@ char* ps5wk_downloads_scan_dirs(void);
  * folder holding what one uses): Files leaves it alone then. */
 gboolean ps5wk_downloads_in_use(const char* path);
 const char* ps5wk_downloads_manage(GHashTable* params);
+/* The same from the TV (Files): a password is asked for with the keyboard. */
+const char* ps5wk_downloads_manage_tv(GHashTable* params);
 
 /* Settings: the folder, its free space, the finished ones. */
 void ps5wk_downloads_clear_finished(void);

@@ -13,15 +13,17 @@ libarchive 3.8.1 detects RAR5 encryption but can't read it. This adds:
   are matched against the stored check value; checksums stored as HMACs
   are compared as such. Without a passphrase, listing still works unless
   the headers are encrypted ("Passphrase required for this entry"); a
-  wrong one is "Incorrect passphrase".
+  wrong one is "Incorrect passphrase". The keys one archive derives cost
+  2^26 PBKDF2 rounds at most in all (RAR5_KDF_BUDGET): a salt for every
+  file at 2^24 would take hours.
 - CMake: ENABLE_OPENSSL_DARWIN uses OpenSSL on macOS too (the Mac tests).
 
 The format follows RARLAB's technote and UnRAR's behaviour; no UnRAR code
 is used.
 
 diff -ruN a/CMakeLists.txt b/CMakeLists.txt
---- a/CMakeLists.txt	2026-11-22 16:39:36
-+++ b/CMakeLists.txt	2026-11-22 16:39:36
+--- a/CMakeLists.txt	2025-06-01 20:27:30
++++ b/CMakeLists.txt	2026-11-22 22:53:09
 @@ -841,7 +841,8 @@
  # Find OpenSSL
  # (Except on Mac, where OpenSSL is deprecated.)
@@ -33,8 +35,8 @@ diff -ruN a/CMakeLists.txt b/CMakeLists.txt
    IF(OPENSSL_FOUND)
      SET(HAVE_LIBCRYPTO 1)
 diff -ruN a/libarchive/CMakeLists.txt b/libarchive/CMakeLists.txt
---- a/libarchive/CMakeLists.txt	2026-11-22 16:39:36
-+++ b/libarchive/CMakeLists.txt	2026-11-22 16:39:36
+--- a/libarchive/CMakeLists.txt	2025-06-01 20:27:30
++++ b/libarchive/CMakeLists.txt	2026-11-22 22:53:09
 @@ -105,6 +105,8 @@
    archive_read_support_format_iso9660.c
    archive_read_support_format_lha.c
@@ -46,7 +48,7 @@ diff -ruN a/libarchive/CMakeLists.txt b/libarchive/CMakeLists.txt
    archive_read_support_format_raw.c
 diff -ruN a/libarchive/archive_rar_crypto.c b/libarchive/archive_rar_crypto.c
 --- a/libarchive/archive_rar_crypto.c	1970-01-01 01:00:00
-+++ b/libarchive/archive_rar_crypto.c	2026-11-22 16:39:36
++++ b/libarchive/archive_rar_crypto.c	2026-11-22 22:53:09
 @@ -0,0 +1,473 @@
 +/*-
 + * Copyright (c) 2026 ps5webkit
@@ -523,7 +525,7 @@ diff -ruN a/libarchive/archive_rar_crypto.c b/libarchive/archive_rar_crypto.c
 +}
 diff -ruN a/libarchive/archive_rar_crypto_private.h b/libarchive/archive_rar_crypto_private.h
 --- a/libarchive/archive_rar_crypto_private.h	1970-01-01 01:00:00
-+++ b/libarchive/archive_rar_crypto_private.h	2026-11-22 16:39:36
++++ b/libarchive/archive_rar_crypto_private.h	2026-11-22 22:53:09
 @@ -0,0 +1,85 @@
 +/*-
 + * Copyright (c) 2026 ps5webkit
@@ -611,8 +613,8 @@ diff -ruN a/libarchive/archive_rar_crypto_private.h b/libarchive/archive_rar_cry
 +
 +#endif
 diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
---- a/libarchive/archive_read_support_format_rar5.c	2026-11-22 16:39:36
-+++ b/libarchive/archive_read_support_format_rar5.c	2026-11-22 16:39:36
+--- a/libarchive/archive_read_support_format_rar5.c	2025-06-01 20:27:30
++++ b/libarchive/archive_read_support_format_rar5.c	2026-11-22 22:57:49
 @@ -47,6 +47,7 @@
  #include "archive_ppmd7_private.h"
  #include "archive_entry_private.h"
@@ -621,10 +623,12 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  
  #ifdef HAVE_BLAKE2_H
  #include <blake2.h>
-@@ -315,6 +316,63 @@
+@@ -313,6 +314,70 @@
+ struct multivolume {
+ 	unsigned int expected_vol_no;
  	uint8_t* push_buf;
- };
- 
++};
++
 +/* Decryption (ps5webkit). With encrypted headers (rar -hp) each header after
 + * the archive encryption header is an IV and the header, AES-256-CBC, padded
 + * to 16 bytes; it is decrypted whole into `hbuf`, which read_ahead() and
@@ -634,6 +638,12 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 + * from `dbuf`. Per volume, file.bytes_remaining counts the plain text that
 + * volume completes, so the rest of the reader sees an ordinary stream. */
 +#define RAR5_KDF_CACHE 4
++/* PBKDF2 rounds for all the keys one archive derives: each new salt costs
++ * 2^count, and an archive whose files each have their own salt at 2^24
++ * would take hours. RAR writes one salt for an archive, at 2^15. */
++#ifndef RAR5_KDF_BUDGET
++#define RAR5_KDF_BUDGET (UINT64_C(1) << 26)
++#endif
 +struct rar5_kdf_cache {
 +	uint8_t used;
 +	uint8_t lg2;
@@ -680,12 +690,11 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +
 +	struct rar5_kdf_cache kdf[RAR5_KDF_CACHE];
 +	unsigned kdf_next;
-+};
-+
++	uint64_t kdf_spent;       /* rounds derived so far (RAR5_KDF_BUDGET) */
+ };
+ 
  /* Main context structure. */
- struct rar5 {
- 	int header_initialized;
-@@ -365,6 +423,8 @@
+@@ -365,6 +430,8 @@
  	 */
  	int has_encrypted_entries;
  	int headers_are_encrypted;
@@ -694,7 +703,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  };
  
  /* Forward function declarations. */
-@@ -898,7 +958,7 @@
+@@ -898,7 +965,7 @@
  	return ARCHIVE_OK;
  }
  
@@ -703,7 +712,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
      const uint8_t** ptr)
  {
  	ssize_t avail = -1;
-@@ -913,7 +973,7 @@
+@@ -913,7 +980,7 @@
  	return 1;
  }
  
@@ -712,10 +721,12 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	int ret;
  
  	ret = how_many == __archive_read_consume(a, how_many)
-@@ -923,6 +983,575 @@
- 	return ret;
- }
+@@ -921,8 +988,585 @@
+ 		: ARCHIVE_FATAL;
  
+ 	return ret;
++}
++
 +static int read_var(struct archive_read* a, uint64_t* pvalue,
 +    uint64_t* pvalue_len);
 +
@@ -886,8 +897,8 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +	}
 +
 +	return dview_settle(a, rar);
-+}
-+
+ }
+ 
 +static int read_ahead(struct archive_read* a, size_t how_many,
 +    const uint8_t** ptr)
 +{
@@ -936,7 +947,8 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +}
 +
 +/* Key, hash key and check for a password, salt and count: derived once
-+ * (RAR uses one salt for a whole archive). 0, or -1. */
++ * (RAR uses one salt for a whole archive). 0, -1, or -2 (over
++ * RAR5_KDF_BUDGET). */
 +static int rar5_derive(struct rar5* rar, const char* password,
 +    const uint8_t salt[16], unsigned lg2, uint8_t key[32],
 +    uint8_t hash_key[32], uint8_t check[8])
@@ -961,6 +973,10 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +		}
 +	}
 +
++	if(lg2 > RAR5_KDF_LG2_MAX ||
++	    c->kdf_spent + (UINT64_C(1) << lg2) > RAR5_KDF_BUDGET)
++		return -2;
++	c->kdf_spent += UINT64_C(1) << lg2;
 +	if(__archive_rar5_kdf(password, length, salt, lg2, key, hash_key,
 +	    check))
 +		return -1;
@@ -998,9 +1014,12 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +	__archive_read_reset_passphrase(a);
 +	while((password = __archive_read_next_passphrase(a)) != NULL) {
 +		tried++;
-+		if(rar5_derive(rar, password, salt, lg2, key, hash_key,
-+		    check)) {
++		int derived = rar5_derive(rar, password, salt, lg2, key,
++		    hash_key, check);
++		if(derived) {
 +			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++			    derived == -2 ? "Too many decryption keys to derive "
++			    "(a damaged or hostile archive)" :
 +			    "Can't derive the decryption key");
 +			return ARCHIVE_FATAL;
 +		}
@@ -1195,7 +1214,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +	}
 +
 +	/* CRC32, then the header size (up to 2 MB: at most 3 bytes). */
-+	for(i = 4, shift = 0; i < 16; i++, shift += 7) {
++	for(i = 4, shift = 0; i < 8; i++, shift += 7) {
 +		size |= (uint64_t) (first[i] & 0x7F) << shift;
 +		if(!(first[i] & 0x80))
 +			break;
@@ -1288,7 +1307,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  /**
   * Read a RAR5 variable sized numeric value. This value will be stored in
   * `pvalue`. The `pvalue_len` argument points to a variable that will receive
-@@ -1665,8 +2294,11 @@
+@@ -1665,8 +2309,11 @@
  				/* Mark the entry as encrypted */
  				archive_entry_set_is_data_encrypted(e, 1);
  				rar->has_encrypted_entries = 1;
@@ -1302,7 +1321,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  			case EX_SUBDATA:
  				/* fallthrough */
  			default:
-@@ -1728,6 +2360,18 @@
+@@ -1728,6 +2375,18 @@
  		reset_file_context(rar);
  	}
  
@@ -1321,10 +1340,12 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	if(block_flags & HFL_EXTRA_DATA) {
  		uint64_t edata_size = 0;
  		if(!read_var(a, &edata_size, NULL))
-@@ -1999,6 +2643,16 @@
+@@ -1997,6 +2656,16 @@
+ 		rar->cstate.block_parsing_finished = 1;
+ 		rar->cstate.all_filters_applied = 1;
  		rar->cstate.initialized = 0;
- 	}
- 
++	}
++
 +	/* The header is parsed; its data follows. */
 +	end_header(rar);
 +	if(!rar->crypt.service) {
@@ -1333,12 +1354,10 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +				return ARCHIVE_FATAL;
 +		} else
 +			rar->crypt.dactive = 0;
-+	}
-+
+ 	}
+ 
  	if(rar->generic.split_before > 0) {
- 		/* If now we're standing on a header that has a 'split before'
- 		 * mark, it means we're standing on a 'continuation' file
-@@ -2015,8 +2669,13 @@
+@@ -2015,8 +2684,13 @@
  static int process_head_service(struct archive_read* a, struct rar5* rar,
      struct archive_entry* entry, size_t block_flags)
  {
@@ -1354,7 +1373,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	if(ret != ARCHIVE_OK)
  		return ret;
  
-@@ -2222,7 +2881,7 @@
+@@ -2222,7 +2896,7 @@
   * <FILE> block.
   */
  
@@ -1363,20 +1382,20 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
      struct archive_entry* entry)
  {
  	const size_t SMALLEST_RAR5_BLOCK_SIZE = 3;
-@@ -2246,6 +2905,12 @@
+@@ -2245,6 +2919,12 @@
+ 	ret = skip_unprocessed_bytes(a);
  	if(ret != ARCHIVE_OK)
  		return ret;
- 
++
 +	if(rar->crypt.headers) {
 +		ret = read_encrypted_header(a, rar);
 +		if(ret != ARCHIVE_OK)
 +			return ret;
 +	}
-+
+ 
  	/* Read the expected CRC32 checksum. */
  	if(!read_u32(a, &hdr_crc)) {
- 		return ARCHIVE_EOF;
-@@ -2288,7 +2953,8 @@
+@@ -2288,7 +2968,8 @@
  	if(computed_crc != hdr_crc) {
  #ifndef DONT_FAIL_ON_CRC_ERROR
  		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
@@ -1386,7 +1405,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  
  		return ARCHIVE_FATAL;
  #endif
-@@ -2330,17 +2996,18 @@
+@@ -2330,16 +3011,17 @@
  			ret = process_head_file(a, rar, entry, header_flags);
  			return ret;
  		case HEAD_CRYPT:
@@ -1404,19 +1423,20 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +			return ret;
  		case HEAD_ENDARC:
  			rar->main.endarc = 1;
- 
++
 +			/* The next volume starts with its own encryption
 +			 * header, unencrypted. */
 +			end_header(rar);
 +			rar->crypt.headers = 0;
-+
+ 
  			/* After encountering an end of file marker, we need
  			 * to take into consideration if this archive is
- 			 * continued in another file (i.e. is it part01.rar:
-@@ -2392,6 +3059,17 @@
+@@ -2390,6 +3072,17 @@
+ 	    "Internal unpacker error");
+ 	return ARCHIVE_FATAL;
  #endif
- }
- 
++}
++
 +static int process_base_block(struct archive_read* a,
 +    struct archive_entry* entry)
 +{
@@ -1426,12 +1446,10 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
 +	 * this reader doesn't parse to its end). */
 +	end_header(get_context(a));
 +	return ret;
-+}
-+
+ }
+ 
  static int skip_base_block(struct archive_read* a) {
- 	int ret;
- 	struct rar5* rar = get_context(a);
-@@ -3951,6 +4629,15 @@
+@@ -3951,6 +4644,15 @@
  	}
  
  	to_read = rar5_min(rar->file.bytes_remaining, 64 * 1024);
@@ -1447,7 +1465,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	if(to_read == 0) {
  		return ARCHIVE_EOF;
  	}
-@@ -3973,6 +4660,15 @@
+@@ -3973,6 +4675,15 @@
  	rar->cstate.last_unstore_ptr += to_read;
  
  	update_crc(rar, p, to_read);
@@ -1463,7 +1481,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	return ARCHIVE_OK;
  }
  
-@@ -4057,12 +4753,18 @@
+@@ -4057,12 +4768,18 @@
  		 * process is already over and we can check if calculated
  		 * checksum (CRC32 or BLAKE2sp) is the same as what is stored
  		 * in the archive. */
@@ -1484,7 +1502,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  				/* Checksums do not match; the unpacked file
  				 * is corrupted. */
  
-@@ -4106,6 +4808,10 @@
+@@ -4106,6 +4823,10 @@
  			uint8_t b2_buf[32];
  			(void) blake2sp_final(&rar->file.b2state, b2_buf, 32);
  
@@ -1495,7 +1513,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  			if(memcmp(&rar->file.blake2sp, b2_buf, 32) != 0) {
  #ifndef DONT_FAIL_ON_CRC_ERROR
  				archive_set_error(&a->archive,
-@@ -4150,9 +4856,22 @@
+@@ -4150,9 +4871,22 @@
  		rar->has_encrypted_entries = 0;
  	}
  
@@ -1521,7 +1539,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  		return ARCHIVE_FATAL;
  	}
  
-@@ -4186,6 +4905,17 @@
+@@ -4186,6 +4920,17 @@
  		return ret;
  	}
  
@@ -1539,7 +1557,7 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	if(rar->file.bytes_remaining == 0 &&
  			rar->cstate.last_write_ptr == rar->file.unpacked_size)
  	{
-@@ -4207,6 +4937,14 @@
+@@ -4207,6 +4952,14 @@
  static int rar5_read_data_skip(struct archive_read *a) {
  	struct rar5* rar = get_context(a);
  
@@ -1554,16 +1572,16 @@ diff -ruN a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_r
  	if(rar->main.solid && (rar->cstate.data_encrypted == 0)) {
  		/* In solid archives, instead of skipping the data, we need to
  		 * extract it, and dispose the result. The side effect of this
-@@ -4278,6 +5016,12 @@
- 	clear_data_ready_stack(rar);
+@@ -4279,6 +5032,12 @@
  
  	free(rar->vol.push_buf);
-+
+ 
 +	free(rar->crypt.hbuf);
 +	free(rar->crypt.dbuf);
 +	__archive_rar_aes_free(rar->crypt.aes);
 +	__archive_rar_aes_free(rar->crypt.haes);
 +	__archive_rar_wipe(&rar->crypt, sizeof(rar->crypt));
- 
++
  	free_filters(rar);
  	cdeque_free(&rar->cstate.filters);
+ 

@@ -208,6 +208,9 @@ mkdir -p "$work/fifo" && mkfifo "$work/fifo/pipe"
 refuse "a fifo" "$work/fifo" "$work/o2.ffpkg" "special"
 refuse "an image that is there already" "$small" "$work/small.ffpkg" "already exists"
 refuse "the image inside its folder" "$small" "$small/self.ffpkg" "inside"
+echo paused >"$work/paused.ffpkg.part" # a paused download of that name
+refuse "a .part that is there (a paused download)" "$small" "$work/paused.ffpkg" "there already"
+[ "$(cat "$work/paused.ffpkg.part")" = paused ] && pass "the paused download's .part is untouched" || failed "the .part was changed"
 refuse "not a folder" "$work/small.ffpkg" "$work/o3.ffpkg" "isn't a folder"
 
 # -- what images hold

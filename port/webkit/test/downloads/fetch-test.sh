@@ -260,6 +260,18 @@ if [ "$quick" != --quick ]; then
             failed "403 while growing: allowed=$(field allowed "$r"), $(stat_of "$p" busy) refusals"
         fi
     }
+    # a signed address that expires while it grows (403 to all of them):
+    # asked again, not taken as a host refusing that many
+    f="$work/growexp.bin"
+    p="/release/201326592/growexp.bin"
+    r=$(drive --conns 8 --max-conns 32 --chunk $mib --timeout 90 "$base$p?rate=1024&ttl=9" "$f")
+    expect_done "a signed address expiring while growing" "$r" "$f" 201326592 && {
+        if [ "$(field allowed "$r")" -gt 8 ] && [ "$(stat_of "$p" requests)" -ge 2 ]; then
+            pass "expired while growing: asked again ($(stat_of "$p" requests) times), allowed=$(field allowed "$r")"
+        else
+            failed "expired while growing: allowed=$(field allowed "$r"), the link asked $(stat_of "$p" requests) times"
+        fi
+    }
     # 5 chunks of 8 MiB on 4 connections at 1 MiB/s each: without taking
     # over, the fifth comes alone (about 16 s); taken over, about 10 s
     f="$work/end.bin"

@@ -188,7 +188,7 @@ static const char* manageV(const char* action, va_list args)
         if (value)
             g_hash_table_insert(params, g_strdup(key), g_strdup(value));
     }
-    const char* error = ps5wk_downloads_manage(params);
+    const char* error = ps5wk_downloads_manage_tv(params);
     g_hash_table_unref(params);
     return error;
 }

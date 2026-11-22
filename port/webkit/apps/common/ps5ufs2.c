@@ -1392,7 +1392,13 @@ int ps5ufs2_build(const char* src, const char* image, const PS5Ufs2Options* opti
             (unsigned long long)(l.imageSize >> 20), (unsigned long long)(margin >> 20), (unsigned long long)(space >> 20));
         goto done;
     }
-    w.out.fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    /* never over a .part that is there (a paused download of that name) */
+    w.out.fd = open(part, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (w.out.fd < 0 && errno == EEXIST) {
+        fail(&l, 0, "%s is there already (a paused download, or an image that wasn't finished): delete it first", part);
+        result = -1;
+        goto done;
+    }
     if (w.out.fd < 0) {
         fail(&l, 1, "%s couldn't be made (errno %d)", part, errno);
         goto done;
@@ -1520,9 +1526,9 @@ static int ufsOpen(Ufs* u, const char* image)
         || u->frag != u->bsize / u->fsize || u->inopb != u->bsize / 256 || u->nindir != u->bsize / 8 || !u->ipg || !u->fpg || !u->ncg
         || u->ipg % u->inopb || (uint64_t)u->ncg * u->ipg > (1ull << 32))
         return ufsFail(u, "a UFS2 superblock with an unexpected geometry");
-    if (u->size * u->fsize > u->fileSize)
-        return ufsFail(u, "the image is shorter than its filesystem (%llu of %llu bytes)", (unsigned long long)u->fileSize,
-            (unsigned long long)(u->size * u->fsize));
+    if (u->size > u->fileSize / u->fsize) /* not size * fsize: a hostile size wraps */
+        return ufsFail(u, "the image is shorter than its filesystem (%llu bytes for %llu blocks of %u)", (unsigned long long)u->fileSize,
+            (unsigned long long)u->size, (unsigned)u->fsize);
     for (int i = 0; i < 3; i++) {
         u->cached[i] = 0;
         if (!(u->cache[i] = malloc(u->bsize)))

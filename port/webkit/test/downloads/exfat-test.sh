@@ -266,6 +266,10 @@ mkdir -p "$r/ok" && echo x >"$r/ok/a"
 echo existing >"$r/exists.exfat"
 refuse REFUSED "an image that already exists" "$r/ok" "$r/exists.exfat"
 [ "$(cat "$r/exists.exfat")" = existing ] && pass "the existing image is untouched" || failed "the existing image was changed"
+echo paused >"$r/paused.exfat.part" # a paused download of that name
+got="$("$tool" build "$r/ok" "$r/paused.exfat" 0 "" "" || true)"
+[[ $got == REFUSED*"there already"* ]] && pass "a .part that is there (a paused download): $got" || failed "a .part that is there: $got"
+[ "$(cat "$r/paused.exfat.part")" = paused ] && [ ! -e "$r/paused.exfat" ] && pass "the paused download's .part is untouched" || failed "the .part was changed"
 refuse REFUSED "a source that isn't a folder" "$r/ok/a" "$r/out5.exfat"
 refuse REFUSED "a source that doesn't exist" "$r/nothing" "$r/out6.exfat"
 refuse REFUSED "a cluster size that isn't a power of two" "$r/ok" "$r/out7.exfat" 3000

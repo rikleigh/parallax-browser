@@ -6,7 +6,9 @@ in each of its headers; checksums become HMACs unless --no-mac; --hp also
 encrypts the headers (an archive encryption header in each volume, then an
 IV and the padded header for every block). AES through openssl.
   rar5enc.py [--hp] [--no-mac] [--no-check] [--lg2 N] [--password P]
-             [--pad-random] out_dir volume...
+             [--pad-random] [--salt-per-file] out_dir volume...
+--salt-per-file: each file its own salt (and key), as archives added to
+in several sessions have.
 """
 import argparse, hashlib, hmac, os, subprocess, zlib
 
@@ -127,6 +129,7 @@ def main():
     ap.add_argument("--lg2", type=int, default=15)
     ap.add_argument("--password", default="password")
     ap.add_argument("--pad-random", action="store_true")
+    ap.add_argument("--salt-per-file", action="store_true")
     ap.add_argument("out")
     ap.add_argument("volumes", nargs="+")
     a = ap.parse_args()
@@ -147,7 +150,12 @@ def main():
             cur.append(b)
             if not (b.flags & 0x10):
                 cur = None
+    archive_keys = (salt, key, hashkey, check)
     for g in groups:
+        salt, key, hashkey, check = archive_keys
+        if a.salt_per_file:
+            salt = os.urandom(16)
+            key, hashkey, check = kdf(pw, salt, a.lg2)
         iv = os.urandom(16)
         plain = b"".join(b.data for b in g)
         pad = (-len(plain)) % 16
@@ -181,6 +189,7 @@ def main():
                 c = int.from_bytes(b.fields[off:off + 4], "little") if last else zlib.crc32(b.enc)
                 b.fields = b.fields[:off] + crc_mac(hashkey, c).to_bytes(4, "little") + b.fields[off + 4:]
 
+    salt, key, hashkey, check = archive_keys
     os.makedirs(a.out, exist_ok=True)
     for path, blocks in zip(a.volumes, vols):
         out = bytearray(SIG)

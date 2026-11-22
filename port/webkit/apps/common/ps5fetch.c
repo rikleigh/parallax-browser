@@ -161,6 +161,7 @@ typedef struct {
     gboolean stalled;      /* the engine cancelled the request: nothing for stall_s */
     gboolean receiving;
     gboolean leaving; /* ends after its chunk: there are more workers than allowed */
+    gboolean served;  /* the server has answered it with the file (2xx) */
     /* The bytes its request still has to bring, [claimAt, claimEnd) (no
      * claim: claimEnd 0); another worker may lower claimEnd (the end). */
     guint64 claimAt, claimEnd;
@@ -907,10 +908,11 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
         return NEXT_END;
 
     if ((status == 401 || status == 403) && f->growMax > f->growBaseConns && othersStaying(f, w) >= f->growBaseConns
-        && othersReceiving(f, w)) {
+        && othersReceiving(f, w) && job->generation == f->urlGeneration && !(w->served && strcmp(job->url, f->originalUrl))) {
         /* a connection beyond the number known to work (more connections),
          * refused: a host that refuses that many. Back to that number, no
-         * more tries. */
+         * more tries. Not when it was served before at an address it was
+         * sent to: that address has expired (asked again below). */
         setProblem(f, "the server answered %u %s", status, reason ? reason : "");
         f->allowed = f->growBaseConns;
         f->growing = FALSE;
@@ -1041,6 +1043,7 @@ static Next checkAnswer(PS5Fetch* f, Worker* w, SoupMessage* message, const Job*
     if (type)
         replaceString(&f->contentType, type);
 
+    w->served = TRUE;
     *body = TRUE;
     if (status == 206) {
         *start = job->start;
@@ -1189,6 +1192,7 @@ static gboolean startWorker(PS5Fetch* f)
         w->retryAfter = 0;
         w->receiving = FALSE;
         w->leaving = FALSE;
+        w->served = FALSE;
         w->claimAt = w->claimEnd = 0;
         char name[16];
         snprintf(name, sizeof name, "ps5fetch-%d", i);

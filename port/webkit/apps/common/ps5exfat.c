@@ -1376,7 +1376,13 @@ int ps5exfat_build(const char* src, const char* image, const PS5ExfatOptions* op
             (unsigned long long)(l.imageSize >> 20), (unsigned long long)(margin >> 20), (unsigned long long)(space >> 20));
         goto done;
     }
-    out.fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    /* never over a .part that is there (a paused download of that name) */
+    out.fd = open(part, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (out.fd < 0 && errno == EEXIST) {
+        fail(&l, 0, "%s is there already (a paused download, or an image that wasn't finished): delete it first", part);
+        result = -1;
+        goto done;
+    }
     if (out.fd < 0) {
         fail(&l, 1, "%s couldn't be made (errno %d)", part, errno);
         goto done;

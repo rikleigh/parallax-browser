@@ -1364,13 +1364,13 @@ link server; the page's look through debug screenshots, not the pad):
   move, and refusals: a name already there, a move into itself, a copy
   out of `/data/ps5webkit`. No USB or M.2 drive was attached: moves
   between drives were tested on the Mac only.
-- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (55 cases,
-  `--quick` 38), `archive-test.sh` (230: with libarchive 3.8.1 and our patches built
+- **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (57 cases,
+  `--quick` 38), `archive-test.sh` (232: with libarchive 3.8.1 and our patches built
   for the Mac by `mac-libarchive.sh`; passwords: PKWARE and AES ZIPs,
   RAR4 and RAR5 made by RAR, and multivolume sets encrypted the way RAR
   does by `archive/rar4enc.py` and `rar5enc.py`, their parts ending
-  inside AES blocks), `exfat-test.sh` (66,
-  `--no-big` 50; with the read-back check, `--no-big` 65, the full run
+  inside AES blocks), `exfat-test.sh` (85,
+  `--no-big` 67; with the read-back check, `--no-big` 65, the full run
   not repeated), `install-test.sh` (21), `peek-test.sh` (30: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
   not, RAR4/RAR5, tar.gz over the limit, passwords (names hidden or
@@ -1378,7 +1378,7 @@ link server; the page's look through debug screenshots, not the pad):
   a slow server, one sending 20 bytes a second, on the drive),
   `files-test.sh` (34: copies and moves on one drive and to a disk
   image, no space, cancelled, links, FIFOs, names already there),
-  `image-test.sh` (85, `--no-big` 71: `.ffpkg` images of made-up apps
+  `image-test.sh` (87, `--no-big` 73: `.ffpkg` images of made-up apps
   checked by `image/check_ufs2.py`, an fsck-style walk written from
   FreeBSD's headers, and read back; refusals and cancelling; the details
   of `.ffpkg` and `.exfat` images and of synthetic PS4 and PS5 packages

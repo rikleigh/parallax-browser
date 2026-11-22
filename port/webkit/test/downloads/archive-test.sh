@@ -416,6 +416,12 @@ if [ -s "$tarball" ] && echo "$LA_SHA  $tarball" | shasum -a 256 -c - >/dev/null
             done
         done
         PW='passwörd' check "PASSWORD That isn't its password*" "RAR5 multivolume -hp: a wrong one" inspect "$work/enc5-rar5_multiarchive-hp/rar5_multiarchive.part03.rar"
+        # each file its own salt (an archive added to several times): each
+        # key derived, within the archive's budget (0001's RAR5_KDF_BUDGET)
+        mkdir -p "$work/ref-many"
+        "$LA/bin/bsdtar" -xf "$rar/rar5_stored_manyfiles.rar" -C "$work/ref-many"
+        python3 -I "$here/archive/rar5enc.py" --salt-per-file --password 'pässwörd' "$work/enc5-salts" "$rar/rar5_stored_manyfiles.rar"
+        PW='pässwörd' extract "RAR5 with a salt for each file" "$work/enc5-salts/rar5_stored_manyfiles.rar" "$work/ref-many"
         # RAR4's 4-part set (a file across three parts, one across two),
         # its link left out (archive/rar4enc.py); unpacking checks the CRCs
         for opts in "" "--hp"; do

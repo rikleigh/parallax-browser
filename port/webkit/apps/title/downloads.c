@@ -3277,6 +3277,12 @@ const char* ps5wk_downloads_manage(GHashTable* params)
     return why;
 }
 
+/* The same actions from the TV (Files): the keyboard asks for a password. */
+const char* ps5wk_downloads_manage_tv(GHashTable* params)
+{
+    return manage(params);
+}
+
 static const char* manage(GHashTable* params)
 {
     const char* action = textParam(params, "do");
@@ -3339,6 +3345,14 @@ static const char* manage(GHashTable* params)
             return "kind and path";
         if (inUse(path))
             return "A download or a job is using it: wait for it, or pause, cancel or remove the download first";
+        if (pw && !replace) {
+            /* the password for a try that was replacing an installed app
+             * (the page's Enter the password doesn't send replace) */
+            for (unsigned i = 0; tasks && i < tasks->len && !replace; i++) {
+                Task* t = g_ptr_array_index(tasks, i);
+                replace = t->passwordAsk && t->askReplace && !strcmp(t->src, path);
+            }
+        }
         if (!strcmp(kind, "extract"))
             return startTask(kind, NULL, path, NULL, FALSE, pw);
         if (!strcmp(kind, "image") || !strcmp(kind, "image-ffpkg") || !strcmp(kind, "delete"))
@@ -3457,6 +3471,8 @@ static const char* manage(GHashTable* params)
     const char* replaceText = textParam(params, "replace");
     gboolean replace = replaceText && !strcmp(replaceText, "1");
     const char* pw = textParam(params, "password"); /* an archive's */
+    if (pw && d->passwordAsk && d->askReplace)
+        replace = TRUE; /* the password for a try that was replacing an installed app */
     if (!strcmp(action, "extract"))
         return startJob(d, "extract", NULL, NULL, FALSE, pw);
     if (!strcmp(action, "extract-install"))
@@ -3899,6 +3915,7 @@ enum {
     CD_FORGET,
     CD_DELETE,
     CT_REPLACE,
+    CT_PASSWORD,
     CT_SHOW,
     CT_CLEAR,
 };
@@ -4275,6 +4292,8 @@ static void taskChoices(BUIChoices* out, Task* t)
             strcmp(t->replaceVersion, "?") ? t->replaceVersion : "(not known)");
         addChoice(out, CT_REPLACE, BUI_TONE_WARN, TRUE, "Replace the installed app", detail);
     }
+    if (t->passwordAsk && t->state != PS5WK_JOB_DONE)
+        addChoice(out, CT_PASSWORD, BUI_TONE_PLAIN, FALSE, "Enter the password", NULL);
     if (strcmp(t->kind, "delete"))
         addChoice(out, CT_SHOW, BUI_TONE_PLAIN, FALSE, "Show in Files", NULL);
     addChoice(out, CT_CLEAR, BUI_TONE_PLAIN, FALSE, "Clear it from the list", NULL);
@@ -4438,6 +4457,14 @@ int ps5wk_downloads_choose(int id)
                 notice("%s", why);
             g_free(src);
             changed(FALSE);
+            return BUI_CHOSEN_CLOSE;
+        }
+        if (id == CT_PASSWORD) {
+            char* base = g_path_get_basename(t->src);
+            gboolean asked = t->passwordAsk && askPassword(TRUE, t->id, base, FALSE);
+            g_free(base);
+            if (!asked)
+                notice("The keyboard couldn't open");
             return BUI_CHOSEN_CLOSE;
         }
         if (id == CT_SHOW) {
