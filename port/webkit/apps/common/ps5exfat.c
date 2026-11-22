@@ -1900,3 +1900,301 @@ done:
     free(root.bytes);
     return result ? (cancel && *cancel ? -3 : -1) : 0;
 }
+
+/* ---------------------------------------------------------------- one file out of an image (ps5exfat_read_file) */
+
+/* Any exFAT volume, also other builders' (512..4096-byte sectors, any
+ * cluster size). A cluster whose FAT entry is 0 counts as followed by the
+ * next one: some builders write contiguous files with NoFatChain clear and
+ * leave the FAT zeroed.
+ *
+ * The image is a download, so it may be hostile: a directory is walked
+ * once, front to back (its chain is never re-walked from the start), no
+ * chain is followed for more steps than the volume has clusters, and a
+ * lookup reads at most LOOKUP_MAX of a directory. */
+#define LOOKUP_MAX (16u * 1024 * 1024)
+#define WINDOW 65536 /* the image is read through two windows this big: the FAT's and the data's */
+
+typedef struct {
+    uint64_t at;
+    uint32_t length; /* 0: empty */
+    unsigned char bytes[WINDOW];
+} Window;
+
+typedef struct {
+    int fd;
+    uint64_t fileSize;
+    uint32_t sectorSize, clusterSize, clusterCount, heapOffset, fatOffset, root;
+    char* error;
+    size_t errorSize;
+    Window* fat;
+    Window* data;
+} Reader;
+
+/* length bytes at offset, through w. -1 past the end or unreadable. */
+static int windowRead(Reader* r, Window* w, void* out, size_t length, uint64_t offset)
+{
+    if (!w || length > WINDOW)
+        return readAt(r->fd, out, length, offset);
+    if (!w->length || offset < w->at || offset + length > w->at + w->length) {
+        uint64_t at = offset - offset % 4096;
+        if (offset + length > at + WINDOW)
+            at = offset;
+        uint64_t n = r->fileSize > at ? r->fileSize - at : 0;
+        if (n > WINDOW)
+            n = WINDOW;
+        w->length = 0;
+        if (n < length || offset + length > at + n || readAt(r->fd, w->bytes, (size_t)n, at))
+            return -1;
+        w->at = at;
+        w->length = (uint32_t)n;
+    }
+    memcpy(out, w->bytes + (offset - w->at), length);
+    return 0;
+}
+
+static int readerFail(Reader* r, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    if (r->error && r->errorSize)
+        vsnprintf(r->error, r->errorSize, format, args);
+    va_end(args);
+    return -1;
+}
+
+/* The cluster after cluster in a stream; 0 at its end or on a bad entry. */
+static uint32_t nextCluster(Reader* r, uint32_t cluster, int noChain)
+{
+    if (noChain)
+        return cluster + 1;
+    unsigned char entry[4];
+    if (windowRead(r, r->fat, entry, 4, (uint64_t)r->fatOffset * r->sectorSize + (uint64_t)cluster * 4))
+        return 0;
+    uint32_t next = get32(entry);
+    if (!next)
+        return cluster + 1; /* a zeroed FAT: contiguous */
+    return next;
+}
+
+static int readerCluster(const Reader* r, uint32_t cluster)
+{
+    return cluster >= 2 && cluster - 2 < r->clusterCount;
+}
+
+/* length bytes of a stream from its start (a file's: read once). -1 damaged. */
+static int readStream(Reader* r, uint32_t first, int noChain, unsigned char* out, size_t length)
+{
+    uint32_t cluster = first;
+    uint64_t in = 0;
+    while (length) {
+        if (!readerCluster(r, cluster))
+            return readerFail(r, "a stream points outside the volume");
+        uint64_t at = (uint64_t)r->heapOffset * r->sectorSize + (uint64_t)(cluster - 2) * r->clusterSize + in;
+        size_t n = r->clusterSize - in < length ? (size_t)(r->clusterSize - in) : length;
+        if (at + n > r->fileSize || readAt(r->fd, out, n, at))
+            return readerFail(r, "a stream is past the image's end");
+        out += n;
+        length -= n;
+        in = 0;
+        if (length)
+            cluster = nextCluster(r, cluster, noChain);
+    }
+    return 0;
+}
+
+/* Whether the UTF-16 name (units) is name (UTF-8), ASCII letters in either case. */
+static int sameName(const unsigned char* set, unsigned units, const char* name, size_t length)
+{
+    uint16_t wanted[255];
+    unsigned count = 0;
+    char* copy = malloc(length + 1);
+    if (!copy)
+        return 0;
+    memcpy(copy, name, length);
+    copy[length] = 0;
+    int r = toUtf16(copy, wanted, 255, &count, 0);
+    free(copy);
+    if (r || count != units)
+        return 0;
+    for (unsigned i = 0; i < units; i++) {
+        uint16_t u = get16(set + 64 + 32 * (i / 15) + 2 + 2 * (i % 15)), w = wanted[i];
+        if (u >= 'a' && u <= 'z')
+            u -= 32;
+        if (w >= 'a' && w <= 'z')
+            w -= 32;
+        if (u != w)
+            return 0;
+    }
+    return 1;
+}
+
+/* A directory read front to back: the cluster holding byte `start` of it. */
+typedef struct {
+    uint32_t cluster;
+    uint64_t start; /* the directory offset cluster begins at */
+    uint64_t steps; /* clusters followed */
+    int noChain;
+} Walk;
+
+/* Moves w forward to the cluster holding at (never back). -1 damaged. */
+static int walkTo(Reader* r, Walk* w, uint64_t at)
+{
+    while (at >= w->start + r->clusterSize) {
+        if (!readerCluster(r, w->cluster) || ++w->steps > r->clusterCount)
+            return readerFail(r, "a folder's chain runs past the volume's clusters");
+        w->cluster = nextCluster(r, w->cluster, w->noChain);
+        w->start += r->clusterSize;
+    }
+    return 0;
+}
+
+/* length bytes of the directory from at (at at or after the last one asked). */
+static int walkRead(Reader* r, Walk* w, uint64_t at, unsigned char* out, size_t length)
+{
+    if (walkTo(r, w, at))
+        return -1;
+    Walk ahead = *w; /* a set may run into the next clusters: w stays */
+    while (length) {
+        if (walkTo(r, &ahead, at) || !readerCluster(r, ahead.cluster))
+            return readerFail(r, "a stream points outside the volume");
+        uint64_t in = at - ahead.start;
+        size_t n = r->clusterSize - in < length ? (size_t)(r->clusterSize - in) : length;
+        uint64_t from = (uint64_t)r->heapOffset * r->sectorSize + (uint64_t)(ahead.cluster - 2) * r->clusterSize + in;
+        if (from + n > r->fileSize || windowRead(r, r->data, out, n, from))
+            return readerFail(r, "a stream is past the image's end");
+        out += n;
+        at += n;
+        length -= n;
+    }
+    return 0;
+}
+
+/* In the directory (first, noChain, length; length 0: the root, read to
+ * its end entry), the entry set called name: its stream's first cluster,
+ * flags and length, whether a folder. 1 found, 0 not, -1 damaged. */
+static int findEntry(Reader* r, uint32_t first, int noChain, uint64_t length, const char* name, size_t nameLength, uint32_t* outFirst,
+    int* outNoChain, uint64_t* outLength, int* outDirectory)
+{
+    uint64_t limit = length ? length : MAX_DIRECTORY;
+    const uint64_t volume = (uint64_t)r->clusterCount * r->clusterSize;
+    if (limit > volume)
+        limit = volume;
+    if (limit > LOOKUP_MAX)
+        limit = LOOKUP_MAX;
+    Walk w = { .cluster = first, .noChain = noChain };
+    unsigned char set[19 * 32];
+    for (uint64_t at = 0; at + 32 <= limit; at += 32) {
+        if (walkRead(r, &w, at, set, 32))
+            return !length && at ? 0 : -1; /* the root's chain ended without an end entry */
+        unsigned char type = set[0];
+        if (!type)
+            return 0;
+        if (type != 0x85)
+            continue;
+        unsigned n = 1u + set[1];
+        if (n < 3 || n > 19 || at + 32 * n > limit)
+            return readerFail(r, "a file entry set is cut short");
+        if (walkRead(r, &w, at, set, 32 * n))
+            return -1;
+        const unsigned char* stream = set + 32;
+        unsigned units = stream[3];
+        if (stream[0] != 0xc0 || !units || n < 2 + (units + 14) / 15)
+            return readerFail(r, "a file entry without its stream entry");
+        if (sameName(set, units, name, nameLength)) {
+            *outDirectory = (get16(set + 4) & 0x10) != 0;
+            *outNoChain = (stream[1] & 0x02) != 0;
+            *outFirst = get32(stream + 20);
+            *outLength = get64(stream + 24);
+            return 1;
+        }
+        at += 32 * (n - 1);
+    }
+    return 0;
+}
+
+int ps5exfat_read_file(const char* image, const char* path, void* buffer, size_t size, uint64_t* length, char* error, size_t error_size)
+{
+    Reader r = { .fd = -1, .error = error, .errorSize = error_size };
+    if (error && error_size)
+        error[0] = 0;
+    int result = -1;
+    r.fat = calloc(1, sizeof *r.fat);
+    r.data = calloc(1, sizeof *r.data);
+    if (!r.fat || !r.data) {
+        readerFail(&r, "Out of memory");
+        goto done;
+    }
+    unsigned char b[SECTOR];
+    r.fd = open(image, O_RDONLY);
+    struct stat st;
+    if (r.fd < 0 || fstat(r.fd, &st)) {
+        readerFail(&r, "%s couldn't be opened (errno %d)", image, errno);
+        goto done;
+    }
+    r.fileSize = (uint64_t)st.st_size;
+    if (readAt(r.fd, b, sizeof b, 0) || memcmp(b + 3, "EXFAT   ", 8) || b[510] != 0x55 || b[511] != 0xaa) {
+        readerFail(&r, "not an exFAT image");
+        goto done;
+    }
+    unsigned sectorShift = b[108], clusterShift = b[109];
+    if (sectorShift < 9 || sectorShift > 12 || sectorShift + clusterShift > 25) {
+        readerFail(&r, "an exFAT volume with an unexpected geometry");
+        goto done;
+    }
+    r.sectorSize = 1u << sectorShift;
+    r.clusterSize = r.sectorSize << clusterShift;
+    r.fatOffset = get32(b + 80);
+    r.heapOffset = get32(b + 88);
+    r.clusterCount = get32(b + 92);
+    r.root = get32(b + 96);
+    uint32_t dir = r.root;
+    int noChain = 0, directory = 1;
+    uint64_t dirLength = 0, fileLength = 0;
+    for (const char* p = path; *p;) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        size_t n = strcspn(p, "/");
+        if (!directory) {
+            readerFail(&r, "%s isn't in the image", path);
+            goto done;
+        }
+        uint32_t first;
+        int found = findEntry(&r, dir, noChain, dirLength, p, n, &first, &noChain, &fileLength, &directory);
+        if (found < 0) {
+            result = -2;
+            goto done;
+        }
+        if (!found) {
+            readerFail(&r, "%s isn't in the image", path);
+            goto done;
+        }
+        dir = first;
+        dirLength = fileLength;
+        if (directory && !dirLength) {
+            readerFail(&r, "%s: an empty folder entry", path);
+            goto done;
+        }
+        p += n;
+    }
+    if (directory) {
+        readerFail(&r, "%s isn't a file in the image", path);
+        goto done;
+    }
+    if (length)
+        *length = fileLength;
+    size_t want = fileLength < size ? (size_t)fileLength : size;
+    if (want && readStream(&r, dir, noChain, buffer, want)) {
+        result = -2;
+        goto done;
+    }
+    result = 0;
+done:
+    if (r.fd >= 0)
+        close(r.fd);
+    free(r.fat);
+    free(r.data);
+    return result;
+}

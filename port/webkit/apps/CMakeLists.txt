@@ -95,7 +95,8 @@ add_executable(ps5wk-child ${PS5_APPS_DIR}/child/ps5wk-child.cpp ${PS5_CRASHGUAR
     ${PS5_APPS_DIR}/child/update-job.c ${PS5_APPS_DIR}/common/ps5zip.c ${PS5_APPS_DIR}/common/ps5update.c
     ${PS5_APPS_DIR}/child/dl-job.c ${PS5_APPS_DIR}/common/ps5fetch.c ${PS5_APPS_DIR}/common/ps5archive.c
     ${PS5_APPS_DIR}/common/ps5exfat.c ${PS5_APPS_DIR}/common/ps5install.c ${PS5_APPS_DIR}/common/ps5peek.c ${PS5_APPS_DIR}/common/ps5files.c
-    ${PS5_APPS_DIR}/common/ps5launchers.c ${PS5_APPS_DIR}/title/minijson.c)
+    ${PS5_APPS_DIR}/common/ps5launchers.c ${PS5_APPS_DIR}/common/ps5ufs2.c ${PS5_APPS_DIR}/common/ps5image.c
+    ${PS5_APPS_DIR}/common/ps5pkginstall.c ${PS5_APPS_DIR}/title/minijson.c)
 target_include_directories(ps5wk-child PRIVATE ${PS5_WPE_DIR})
 # adblock-job.c uses WebKit's public API (WebKitUserContentFilterStore, JSC).
 set_source_files_properties(${PS5_APPS_DIR}/child/adblock-job.c ${PS5_APPS_DIR}/child/update-job.c PROPERTIES INCLUDE_DIRECTORIES "${PS5_API_INCLUDE_DIRECTORIES}")
@@ -121,7 +122,7 @@ set(PS5WK_LOG_PORT "9999" CACHE STRING "Port of tools/logserver.sh")
 # The title gets ps5locks too: package.sh relinks these objects and copies
 # the --wrap options from this link line (its heap, Spike 10's dlmalloc
 # arenas, locks with pthread mutexes).
-add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/adblock.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/title/vrlayout.c ${PS5_APPS_DIR}/title/browserui.c ${PS5_APPS_DIR}/title/browserdraw.c ${PS5_APPS_DIR}/title/browserdata.c ${PS5_APPS_DIR}/title/gamepad.c ${PS5_APPS_DIR}/title/profile.c ${PS5_APPS_DIR}/title/runtime.c ${PS5_APPS_DIR}/title/downloads.c ${PS5_APPS_DIR}/title/dlservice.c ${PS5_APPS_DIR}/title/dlm.c ${PS5_APPS_DIR}/title/files.c ${PS5_APPS_DIR}/title/minijson.c ${PS5_APPS_DIR}/title/qrcode.c ${PS5_APPS_DIR}/title/updates.c ${PS5_APPS_DIR}/common/ps5update.c ${PS5_APPS_DIR}/common/ps5audioserver.c
+add_executable(ps5browser ${PS5_APPS_DIR}/title/ps5browser.c ${PS5_APPS_DIR}/title/settings.c ${PS5_APPS_DIR}/title/adblock.c ${PS5_APPS_DIR}/title/viewinvr.c ${PS5_APPS_DIR}/title/vrlayout.c ${PS5_APPS_DIR}/title/browserui.c ${PS5_APPS_DIR}/title/browserdraw.c ${PS5_APPS_DIR}/title/browserdata.c ${PS5_APPS_DIR}/title/gamepad.c ${PS5_APPS_DIR}/title/profile.c ${PS5_APPS_DIR}/title/runtime.c ${PS5_APPS_DIR}/title/downloads.c ${PS5_APPS_DIR}/title/dlservice.c ${PS5_APPS_DIR}/title/dlm.c ${PS5_APPS_DIR}/title/files.c ${PS5_APPS_DIR}/title/appinfo.c ${PS5_APPS_DIR}/title/minijson.c ${PS5_APPS_DIR}/title/qrcode.c ${PS5_APPS_DIR}/title/updates.c ${PS5_APPS_DIR}/common/ps5update.c ${PS5_APPS_DIR}/common/ps5audioserver.c
     ${PS5_APPS_DIR}/title/ps5locks-title.c ${PS5_APPS_DIR}/title/titlelog.c)
 # The ad blocker's per-site cosmetic filters and scriptlets (ADBLOCK.md, phase 2).
 target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/title/adblock-scripting.c)

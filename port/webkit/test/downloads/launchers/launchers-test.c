@@ -5,6 +5,9 @@
  *   t ready ROOT SMPPORT KPORT FOLDER ID [FORCE]
  *   t source ROOT SMPPORT KPORT ID
  *   t unmount ROOT SMPPORT KPORT ID
+ *   t ufs2 ROOT SMPPORT KPORT            (ps5launchers_mounts_ufs2)
+ *   t itself ROOT SMPPORT KPORT PATH     (ps5launchers_scans_itself)
+ *   t manual ROOT SMPPORT KPORT PATH     (ps5launchers_manual_list_add)
  */
 #include "../../../apps/common/ps5launchers.h"
 
@@ -49,6 +52,14 @@ int main(int argc, char** argv)
         printf("%s\n", found ? from : "-");
     } else if (!strcmp(cmd, "unmount") && argc > 5) {
         int r = ps5launchers_before_replace(&l, argv[5], &o, why, sizeof why);
+        printf("%d %s\n", r, why);
+    } else if (!strcmp(cmd, "ufs2")) {
+        int r = ps5launchers_mounts_ufs2(&l, why, sizeof why);
+        printf("%d %s\n", r, why);
+    } else if (!strcmp(cmd, "itself") && argc > 5) {
+        printf("%s\n", ps5launchers_scans_itself(&l, argv[5]) ? "YES" : "NO");
+    } else if (!strcmp(cmd, "manual") && argc > 5) {
+        int r = ps5launchers_manual_list_add(&o, argv[5], why, sizeof why);
         printf("%d %s\n", r, why);
     } else
         return 2;

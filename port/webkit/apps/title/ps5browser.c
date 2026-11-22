@@ -2302,7 +2302,7 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
     gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
         || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad") || !strcmp(path, "/update") || !strcmp(path, "/update.json");
     gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
-    gboolean dlmPath = !strcmp(path, "/dlm") || !strcmp(path, "/dlm.json") || !strcmp(path, "/dlm/fs");
+    gboolean dlmPath = !strcmp(path, "/dlm") || !strcmp(path, "/dlm.json") || !strcmp(path, "/dlm/fs") || !strcmp(path, "/dlm/icon");
 
     /* Every request from the network: the Host must be this PS5 by address
      * or a local name (not a site's name that DNS rebinding points here), and
@@ -2357,7 +2357,15 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
             settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
         else if (windDownStart && post)
             settingsReplyJSON(client, 503, FALSE, "the browser is closing");
-        else if (ps5wk_dlm_serve(method, path, query, body, &code, &replyType, &reply)) {
+        else if (!strcmp(path, "/dlm/icon")) {
+            char* data = NULL;
+            gsize length = 0;
+            if (get && ps5wk_dlm_icon(query, &data, &length))
+                pushReplyBytes(client, "image/png", data, length);
+            else
+                pushReply(client, 404, "text/plain", "ERR no icon\n");
+            g_free(data);
+        } else if (ps5wk_dlm_serve(method, path, query, body, &code, &replyType, &reply)) {
             if (post)
                 spike_log("downloads page from %s: %s %s", from, method, path);
             pushReply(client, code, replyType, reply);

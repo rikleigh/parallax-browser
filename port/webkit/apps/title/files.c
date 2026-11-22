@@ -20,6 +20,7 @@
 #include "browser.h"
 #include "dlservice.h"
 #include "downloads.h"
+#include "appinfo.h"
 #include "minijson.h"
 #include "profile.h"
 
@@ -54,6 +55,7 @@ static struct {
     char* path;
     char* name;
     gboolean dir, app, archive, used;
+    gboolean image, pkg; /* an .exfat/.ffpkg image, a .pkg: what it holds from op "titleinfo" (appinfo.c) */
     gboolean icon; /* an app folder: sce_sys/icon0.png is there */
     gint64 size;
     /* an archive: what it holds (the service's "peek" on the drive) */
@@ -80,9 +82,12 @@ enum {
     CH_OPEN = 1,
     CH_INSTALL,
     CH_IMAGE,
+    CH_IMAGE_FFPKG,
     CH_EXTRACT,
     CH_EXTRACT_INSTALL,
     CH_EXTRACT_IMAGE,
+    CH_EXTRACT_IMAGE_FFPKG,
+    CH_INSTALL_FILE, /* an image or a package, as it is */
     CH_MOVE,
     CH_COPY,
     CH_RENAME,
@@ -461,8 +466,10 @@ static void entryKind(const MJ* e, const char* name, char* out, size_t size)
         snprintf(out, size, "FILE");
         return;
     }
-    if (!g_ascii_strcasecmp(dot + 1, "exfat"))
+    if (!g_ascii_strcasecmp(dot + 1, "exfat") || !g_ascii_strcasecmp(dot + 1, "ffpkg"))
         snprintf(out, size, "IMG");
+    else if (!g_ascii_strcasecmp(dot + 1, "pkg"))
+        snprintf(out, size, "PKG");
     else {
         char* upper = g_ascii_strup(dot + 1, -1);
         snprintf(out, size, "%.4s", upper);
@@ -835,6 +842,12 @@ void ps5wk_files_peek_ended(const char* id, GHashTable* params)
     ps5wk_browser_files_changed(-1);
 }
 
+/* appinfo.c has more for the dialog. */
+static void infoArrived(void)
+{
+    ps5wk_browser_files_changed(-1);
+}
+
 /* Look inside chosen's archive, or take what the last look at it found. */
 static void peekChosen(void)
 {
@@ -882,9 +895,13 @@ gboolean ps5wk_files_choices_open(unsigned index)
         chosen.app = mj_bool(ref.item, "app");
         chosen.icon = mj_bool(ref.item, "icon");
         chosen.archive = mj_bool(ref.item, "archive");
+        chosen.image = mj_bool(ref.item, "image");
+        chosen.pkg = mj_bool(ref.item, "pkg");
         chosen.size = (gint64)mj_number(ref.item, "size", -1);
         if (chosen.archive)
             peekChosen(); /* what it holds decides what's offered */
+        if (chosen.image || chosen.pkg || (chosen.app && chosen.icon))
+            ps5wk_appinfo(chosen.path, chosen.size, infoArrived); /* name, ID, icon */
     }
     return TRUE;
 }
@@ -925,6 +942,72 @@ static char* unpackFolder(const char* path)
             break;
     }
     return stem;
+}
+
+/* An image or a package: what it holds (appinfo.c), and Install. */
+static void imageChoices(BUIChoices* out)
+{
+    const PS5WKAppInfo* a = ps5wk_appinfo(chosen.path, chosen.size, infoArrived);
+    const MJ* info = a->info;
+    if (a->pending) {
+        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "Looking inside…");
+        return;
+    }
+    if (!info) {
+        out->lineTones[out->lineCount] = BUI_TONE_WARN;
+        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "What it holds isn't known: %s", a->error ? a->error : "?");
+        return;
+    }
+    const char* id = mj_string(info, "id");
+    const char* label = mj_string(info, "label");
+    const char* installed = mj_string(info, "installed");
+    const char* version = mj_string(info, "version");
+    gboolean package = mj_bool(info, "package"), fake = mj_bool(info, "fake"), encrypted = mj_bool(info, "encrypted");
+    gboolean app = package ? id && *id : mj_bool(info, "appAtRoot");
+    char* summary = ps5wk_appinfo_summary(info);
+    if (app && out->lineCount < 3) {
+        out->lineTones[out->lineCount] = BUI_TONE_ACTIVE;
+        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "%s: %s", label ? label : "It holds an app", summary);
+    } else if (out->lineCount < 3)
+        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "%s%s", label ? label : "", package ? "" : ", without an app at its root");
+    g_free(summary);
+    if (installed && out->lineCount < 3) {
+        out->lineTones[out->lineCount] = BUI_TONE_WARN;
+        snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "%s",
+            strcmp(installed, "?") ? (version && !strcmp(installed, version) ? "This version is installed already" : "Another version is installed")
+                                   : "A version of it is installed");
+    }
+    if (a->icon) {
+        out->picture = a->icon;
+        out->pictureSize = PS5WK_APPINFO_ICON;
+    }
+    if (package && !fake && !g_strcmp0(mj_string(info, "platform"), "PS5")) {
+        if (out->lineCount < 3) {
+            out->lineTones[out->lineCount] = BUI_TONE_WARN;
+            snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "A retail package%s: only fake packages (fPKG) install from here",
+                encrypted ? " (encrypted)" : "");
+        }
+        return;
+    }
+    if (package)
+        addChoice(out, CH_INSTALL_FILE, BUI_TONE_ACTIVE, FALSE, "Install the package",
+            fake ? "The console's installer copies it; fake packages need its fPKG patches on. Keep the browser open till it's copied"
+                 : "The console's installer copies it. Keep the browser open till it's copied");
+    else if (app) {
+        gboolean known = FALSE;
+        const char* mounter = ps5wk_downloads_image_mounter(&known);
+        if (known && !mounter) {
+            if (out->lineCount < 3) {
+                out->lineTones[out->lineCount] = BUI_TONE_WARN;
+                snprintf(out->lines[out->lineCount++], sizeof out->lines[0],
+                    "It can't be installed now: nothing running mounts images (ShadowMountPlus and TITAN-CORE do, Kraken Mount doesn't)");
+            }
+        } else {
+            char detail[160];
+            snprintf(detail, sizeof detail, "For %s: into the drive's homebrew folder, or given to it where it is", mounter ? mounter : "ShadowMountPlus");
+            addChoice(out, CH_INSTALL_FILE, BUI_TONE_ACTIVE, FALSE, "Install the app", detail);
+        }
+    }
 }
 
 gboolean ps5wk_files_choices(BUIChoices* out)
@@ -977,6 +1060,13 @@ gboolean ps5wk_files_choices(BUIChoices* out)
         snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "A download or a job is using it: it can't be moved, renamed or deleted now");
     }
     if (chosen.app) {
+        if (chosen.icon) {
+            const PS5WKAppInfo* a = ps5wk_appinfo(chosen.path, chosen.size, infoArrived);
+            if (a->icon) {
+                out->picture = a->icon;
+                out->pictureSize = PS5WK_APPINFO_ICON;
+            }
+        }
         addChoice(out, CH_INSTALL, BUI_TONE_ACTIVE, FALSE, "Install the app", "You're asked before an installed version is replaced");
         gboolean known = FALSE;
         const char* mounter = ps5wk_downloads_image_mounter(&known);
@@ -989,11 +1079,15 @@ gboolean ps5wk_files_choices(BUIChoices* out)
             char detail[160];
             snprintf(detail, sizeof detail, "<ID>.exfat in the drive's homebrew folder, for %s; checked once made", mounter ? mounter : "ShadowMountPlus");
             addChoice(out, CH_IMAGE, BUI_TONE_PLAIN, FALSE, "Make an exFAT image", detail);
+            snprintf(detail, sizeof detail, "<ID>.ffpkg in the drive's homebrew folder, for ShadowMountPlus 1.7 or later; checked once made");
+            addChoice(out, CH_IMAGE_FFPKG, BUI_TONE_PLAIN, FALSE, "Make a UFS2 image (.ffpkg)", detail);
         } else if (out->lineCount < 3) {
             out->lineTones[out->lineCount] = BUI_TONE_WARN;
             snprintf(out->lines[out->lineCount++], sizeof out->lines[0], "No icon (sce_sys/icon0.png), so no exFAT image: ShadowMountPlus won't install an app without one");
         }
         addChoice(out, CH_OPEN, BUI_TONE_PLAIN, FALSE, "Open the folder", NULL);
+    } else if (chosen.image || chosen.pkg) {
+        imageChoices(out);
     } else if (chosen.dir) {
         addChoice(out, CH_OPEN, BUI_TONE_PLAIN, FALSE, "Open", NULL);
     } else if (chosen.archive) {
@@ -1059,6 +1153,8 @@ gboolean ps5wk_files_choices(BUIChoices* out)
                     snprintf(image, sizeof image, "%s.exfat in the drive's homebrew folder, for %s; checked once made", id,
                         mounter ? mounter : "ShadowMountPlus");
                     addChoice(out, CH_EXTRACT_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", image);
+                    snprintf(image, sizeof image, "%s.ffpkg in the drive's homebrew folder, for ShadowMountPlus 1.7 or later", id);
+                    addChoice(out, CH_EXTRACT_IMAGE_FFPKG, BUI_TONE_PLAIN, FALSE, "Unpack and make a UFS2 image (.ffpkg)", image);
                 }
             }
             g_free(into);
@@ -1146,6 +1242,15 @@ int ps5wk_files_choose(int id)
     case CH_IMAGE:
         kind = "image";
         break;
+    case CH_IMAGE_FFPKG:
+        kind = "image-ffpkg";
+        break;
+    case CH_INSTALL_FILE:
+        kind = "install";
+        break;
+    case CH_EXTRACT_IMAGE_FFPKG:
+        kind = "extract-image-ffpkg";
+        break;
     case CH_EXTRACT:
         kind = "extract";
         break;
@@ -1205,7 +1310,8 @@ int ps5wk_files_choose(int id)
     }
     if (kind && !manage("task", "kind", kind, "path", path, NULL)) {
         static const struct { const char *kind, *what; } words[] = { { "install", "Installing" }, { "image", "Making an image of" },
-            { "extract", "Unpacking" }, { "extract-install", "Unpacking and installing" }, { "extract-image", "Unpacking" } };
+            { "image-ffpkg", "Making a UFS2 image of" }, { "extract", "Unpacking" }, { "extract-install", "Unpacking and installing" },
+            { "extract-image", "Unpacking" }, { "extract-image-ffpkg", "Unpacking" } };
         const char* what = "Working on";
         for (unsigned i = 0; i < G_N_ELEMENTS(words); i++) {
             if (!strcmp(words[i].kind, kind))

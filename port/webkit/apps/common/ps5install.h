@@ -32,6 +32,8 @@ typedef struct {
     char title_id[16]; /* "PPSA01234" */
     char name[256];    /* the default language's titleName, else the ID */
     char version[32];  /* contentVersion ("01.000.000"), else "" */
+    char content_id[48]; /* contentId ("UP9000-PPSA01234_00-..."), else "" */
+    char category[16]; /* applicationCategoryType as text ("0" a game, "65536" an app), else "" */
     char dir[1024];    /* the folder with sce_sys/param.json and eboot.bin */
 } PS5TitleInfo;
 
@@ -45,9 +47,12 @@ int ps5install_find(const char* dir, unsigned depth, PS5TitleInfo* out, char* er
  * many folders on one level to search them all. */
 int ps5install_count(const char* dir, unsigned depth);
 
-/* Fills out from a param.json's text (out->dir left empty). 0, or -2
- * without a valid titleId. */
+/* Fills out from a param.json's text (out->dir left empty; a UTF-8 byte
+ * order mark skipped). 0, or -2 without a valid titleId. */
 int ps5install_parse_param(const char* text, PS5TitleInfo* out);
+
+/* Whether id is a title ID ("PPSA01234", "CUSA01234": 4 capitals, 5 digits). */
+bool ps5install_valid_id(const char* id);
 
 /* Whether title_id is installed: its param.json in /user/appmeta (what the
  * system registered), /user/app/<ID>/sce_sys, /system_data/priv/appmeta;
@@ -80,6 +85,16 @@ int ps5install_target(const PS5TitleInfo* title, char* out, size_t size);
 
 /* The drive a path is on: "/data", "/mnt/usb0", "/mnt/ext1"..., or NULL. */
 const char* ps5install_drive_of(const char* path, char* out, size_t size);
+
+/* Held around every call into the system's installer (sceAppInstUtil):
+ * registrations here and package installs (ps5pkginstall.c). */
+void ps5install_appinst_lock(void);
+void ps5install_appinst_unlock(void);
+
+/* Lock held: sceAppInstUtilInitialize (init) once for the whole service,
+ * whichever caller comes first. 0 when it has been initialized (now or
+ * before), else what init returned; a failure is tried again next time. */
+int ps5install_appinst_initialize(int (*init)(void));
 
 /* Deletes a folder and everything in it (no links followed). 0 or -1. */
 int ps5install_remove_tree(const char* path);

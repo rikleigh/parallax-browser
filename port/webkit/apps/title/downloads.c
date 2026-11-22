@@ -36,6 +36,7 @@
 #include "dlservice.h"
 #include "downloads.h"
 #include "files.h"
+#include "appinfo.h"
 #include "minijson.h"
 
 #include <errno.h>
@@ -472,13 +473,33 @@ static gboolean imageWatchTick(gpointer data)
 
 static void watchApp(const char* path, const char* title, const char* shown, const char* by);
 
+/* Whether name is an image the console's mounters know (.exfat, .ffpkg). */
+static gboolean isImageName(const char* name)
+{
+    char* lower = name ? g_ascii_strdown(name, -1) : NULL;
+    gboolean image = lower && (g_str_has_suffix(lower, ".exfat") || g_str_has_suffix(lower, ".ffpkg"));
+    g_free(lower);
+    return image;
+}
+
+static void dlInfoArrived(void);
+
+static gboolean isPkgName(const char* name)
+{
+    char* lower = name ? g_ascii_strdown(name, -1) : NULL;
+    gboolean pkg = lower && g_str_has_suffix(lower, ".pkg");
+    g_free(lower);
+    return pkg;
+}
+
 /* An image was made at image (of title, called name): say so, and again
- * once its app is on the home screen. */
+ * once its app is on the home screen (ShadowMountPlus finds it: in a
+ * homebrew folder, or given to it by path). */
 static void imageMade(const char* image, const char* title, const char* name)
 {
     if (!image)
         return;
-    gboolean watched = title && *title && strstr(image, "/homebrew/") && g_str_has_suffix(image, ".exfat");
+    gboolean watched = title && *title && strstr(image, "/homebrew/") && isImageName(image);
     if (!watched) {
         notice("Made the image %s", image);
         return;
@@ -504,7 +525,19 @@ static void appInstalled(const char* folder, const char* title, const char* name
     const char* registered = g_hash_table_lookup(params, "registered");
     gboolean waits = numberParam(params, "waits", 0) == 1, replaced = numberParam(params, "replaced", 0) == 1;
     gboolean kraken = !g_strcmp0(by, "Kraken Mount");
-    if (by && *by && waits)
+    if (numberParam(params, "pkg", 0) == 1)
+        notice("The console is installing %s\nIt's in the console's downloads (Notifications)", shown);
+    else if (by && *by && folder && isImageName(folder) && title && *title) {
+        /* a downloaded image: in a homebrew folder, or given by path */
+        if (display) {
+            char* text = g_strdup_printf("%s handed to %s\nIt %s", shown, by, replaced ? "uses the new image from the app's next start"
+                                                                                       : WAITS_FOR_HOME);
+            wpe_display_ps5_show_message(display, text, 10);
+            g_free(text);
+        }
+        if (!replaced)
+            watchApp(folder, title, shown, NULL); /* NULL: an image, op "imageapp" */
+    } else if (by && *by && waits)
         notice("%s moved to its homebrew folder\n%s adds it to the home screen once you close the browser: it waits while one of its apps is open",
             shown, by);
     else if (by && *by && replaced && kraken)
@@ -1498,8 +1531,18 @@ static void jobEnded(Download* d, GHashTable* params)
         setString(&d->r.titleID, titleID);
         setString(&d->r.titleName, name);
     }
+    /* what it said about the file is old now (installed, moved, replaced) */
+    char* source = pathIn(d, FALSE);
+    ps5wk_appinfo_forget(source);
+    if (out)
+        ps5wk_appinfo_forget(out);
     gboolean moved = !g_strcmp0(d->r.job, "move");
-    if (moved && success && out) {
+    /* a downloaded image installed by moving it into a homebrew folder:
+     * the entry follows it, as after a move (it stays where it was when
+     * handed over by path) */
+    gboolean imageMoved = !g_strcmp0(d->r.job, "install") && success && out && isImageName(out) && g_strcmp0(source, out);
+    g_free(source);
+    if ((moved || imageMoved) && success && out) {
         /* the file is in its folder now */
         char* folder = g_path_get_dirname(out);
         char* base = g_path_get_basename(out);
@@ -1511,7 +1554,9 @@ static void jobEnded(Download* d, GHashTable* params)
     }
     spike_log("[dl] %u: %s %s%s%s", d->r.id, d->r.job ? d->r.job : "job", success ? "done" : "failed: ", success ? (out ? out : "") : "",
         success ? "" : d->r.jobError);
-    if (success && error && *error)
+    if (success && numberParam(params, "pkg", 0) == 1)
+        appInstalled(out, d->r.titleID, d->r.titleName, params); /* handed to the console's installer */
+    else if (success && error && *error)
         notice("%s %s: %s", jobNoun(d->r.job), d->r.file ? d->r.file : "", error);
     else if (d->replaceVersion)
         notice("%s\nReplace it from Downloads", d->r.jobError);
@@ -1519,7 +1564,7 @@ static void jobEnded(Download* d, GHashTable* params)
         notice("%s %s failed\n%s", jobNoun(d->r.job), d->r.file ? d->r.file : "", d->r.jobError);
     else if (d->r.titleID && (!g_strcmp0(d->r.job, "install") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-install"))))
         appInstalled(out, d->r.titleID, d->r.titleName, params);
-    else if (!g_strcmp0(d->r.job, "image") || (!g_strcmp0(d->r.job, "extract") && !g_strcmp0(d->r.after, "extract-image")))
+    else if (!g_strcmp0(d->r.job, "image") || (!g_strcmp0(d->r.job, "extract") && d->r.after && g_str_has_prefix(d->r.after, "extract-image")))
         imageMade(out, d->r.titleID, d->r.titleName);
     else if (!g_strcmp0(d->r.job, "extract"))
         notice("Unpacked %s\nto %s", d->r.file ? d->r.file : "", out ? out : "");
@@ -1565,6 +1610,9 @@ static void taskEvent(unsigned id, const char* verb, GHashTable* params)
     const char* installed = g_hash_table_lookup(params, "installed");
     setString(&t->replaceVersion, !success && installed && *installed ? installed : NULL);
     t->phase[0] = 0;
+    ps5wk_appinfo_forget(t->src);
+    if (t->out)
+        ps5wk_appinfo_forget(t->out);
     char* base = g_path_get_basename(t->src);
     if (t->replaceVersion)
         notice("%s\nReplace it from Downloads", t->error);
@@ -1671,13 +1719,31 @@ static void onServiceEvent(const char* verb, GHashTable* params, gpointer user)
         peekEnded(d, params);
 }
 
-/* A job on d's finished file. kind: "extract", "install", "image", "move". */
-static const char* startJob(Download* d, const char* kind, const char* then, const char* destination, gboolean replace)
+/* kind or then "image-ffpkg": an image, UFS2 (.ffpkg) instead of exFAT.
+ * Cuts the suffix off (a copy in *plain) and says the format. */
+static const char* imageFormat(const char* what, char** plain)
+{
+    *plain = what ? g_strdup(what) : NULL;
+    if (*plain && g_str_has_suffix(*plain, "-ffpkg")) {
+        (*plain)[strlen(*plain) - 6] = 0;
+        return "ffpkg";
+    }
+    return NULL;
+}
+
+/* A job on d's finished file. kind: "extract", "install", "image",
+ * "image-ffpkg", "move"; then: "install", "image", "image-ffpkg". */
+static const char* startJob(Download* d, const char* kindAsked, const char* thenAsked, const char* destination, gboolean replace)
 {
     if (d->r.state != PS5WK_DL_DONE || !d->r.file)
         return "not a finished download";
     if (d->r.jobState == PS5WK_JOB_RUNNING)
         return "a job is already running for it";
+    char *kind, *then;
+    const char* format = imageFormat(kindAsked, &kind);
+    const char* thenFormat = imageFormat(thenAsked, &then);
+    if (thenFormat)
+        format = thenFormat;
     char id[16];
     snprintf(id, sizeof id, "%u", d->r.id);
     char* src = pathIn(d, FALSE);
@@ -1717,13 +1783,15 @@ static const char* startJob(Download* d, const char* kind, const char* then, con
     setString(&d->replaceVersion, NULL);
     snprintf(d->jobPhase, sizeof d->jobPhase, "%s", kind);
     d->jobDone = d->jobTotal = 0;
-    ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "delete",
+    ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "format", format, "delete",
         !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
-    spike_log("[dl] %u: %s %s -> %s%s%s%s", d->r.id, kind, src, dest ? dest : "-", then ? " then " : "", then ? then : "",
-        replace ? " (replacing)" : "");
+    spike_log("[dl] %u: %s %s -> %s%s%s%s%s", d->r.id, kind, src, dest ? dest : "-", then ? " then " : "", then ? then : "",
+        format ? " (.ffpkg)" : "", replace ? " (replacing)" : "");
     g_free(src);
     g_free(dest);
     g_free(image);
+    g_free(kind);
+    g_free(then);
     changed(TRUE);
     return NULL;
 }
@@ -1746,6 +1814,8 @@ static void startAfter(Download* d)
         startJob(d, "extract", "install", NULL, FALSE);
     else if (!strcmp(d->r.after, "extract-image"))
         startJob(d, "extract", "image", NULL, FALSE);
+    else if (!strcmp(d->r.after, "extract-image-ffpkg"))
+        startJob(d, "extract", "image-ffpkg", NULL, FALSE);
 }
 
 /* ---------------------------------------------------------------- a transfer's signals (WebKit's) */
@@ -2212,6 +2282,10 @@ gboolean ps5wk_downloads_response_policy(WebKitWebView* view, WebKitResponsePoli
 static const char* kindOf(const Download* d, char* out, size_t size)
 {
     const char* file = d->r.file ? d->r.file : "";
+    if (isImageName(file)) {
+        snprintf(out, size, "IMG");
+        return out;
+    }
     const char* dot = strrchr(file, '.');
     if (dot && dot != file && strlen(dot + 1) >= 1 && strlen(dot + 1) <= 4) {
         size_t n = 0;
@@ -2558,6 +2632,41 @@ static void downloadDetails(unsigned index, BUIDetails* out)
     state[0] = g_ascii_toupper(state[0]);
     out->labels[n] = "State";
     out->values[n++] = state;
+    /* an image or a package: the app in it, and its icon */
+    static char app[400], kindText[120], content[64];
+    if (d->r.state == PS5WK_DL_DONE && (isImageName(d->r.file) || isPkgName(d->r.file))) {
+        char* file = pathIn(d, FALSE);
+        const PS5WKAppInfo* a = ps5wk_appinfo(file, d->r.size, dlInfoArrived);
+        g_free(file);
+        const MJ* info = a->info;
+        if (a->icon) {
+            out->picture = a->icon;
+            out->pictureSize = PS5WK_APPINFO_ICON;
+        }
+        if (info && n + 3 <= 10) {
+            char* summary = ps5wk_appinfo_summary(info);
+            snprintf(app, sizeof app, "%s", *summary ? summary : "none found");
+            g_free(summary);
+            const char* platform = mj_string(info, "platform");
+            snprintf(kindText, sizeof kindText, "%s%s%s%s", mj_string(info, "label") ? mj_string(info, "label") : "?",
+                platform && *platform && !strstr(mj_string(info, "label") ? mj_string(info, "label") : "", platform) ? " · " : "",
+                platform && *platform && !strstr(mj_string(info, "label") ? mj_string(info, "label") : "", platform) ? platform : "",
+                mj_bool(info, "encrypted") ? " · encrypted" : "");
+            out->labels[n] = "Holds";
+            out->values[n++] = kindText;
+            out->labels[n] = "App";
+            out->values[n++] = app;
+            const char* cid = mj_string(info, "contentId");
+            if (cid && *cid) {
+                snprintf(content, sizeof content, "%s", cid);
+                out->labels[n] = "Content ID";
+                out->values[n++] = content;
+            }
+        } else if (a->pending && n < 10) {
+            out->labels[n] = "App";
+            out->values[n++] = "looking inside…";
+        }
+    }
     out->count = n;
 }
 
@@ -2741,10 +2850,17 @@ static gboolean folderAllowed(const char* dir)
     return !strstr(dir, "/../") && !g_str_has_suffix(dir, "/..") && !strstr(dir, "/./") && !strstr(dir, "//") && strlen(dir) < 900;
 }
 
-static const char* startTask(const char* kind, const char* then, const char* src, const char* destFolder, gboolean replace)
+static const char* startTask(const char* kindAsked, const char* thenAsked, const char* src, const char* destFolder, gboolean replace)
 {
     if (!folderAllowed(src))
         return "That file isn't in a place the browser can use";
+    char *kindPlain, *thenPlain;
+    const char* format = imageFormat(kindAsked, &kindPlain);
+    const char* thenFormat = imageFormat(thenAsked, &thenPlain);
+    if (thenFormat)
+        format = thenFormat;
+    const char* kind = kindPlain;
+    const char* then = thenPlain;
     if (!tasks)
         tasks = g_ptr_array_new_with_free_func(taskFree);
     Task* t = g_new0(Task, 1);
@@ -2795,11 +2911,14 @@ static const char* startTask(const char* kind, const char* then, const char* src
         g_free(base);
         t->dest = g_strdup(dest);
     }
-    ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "delete",
+    ps5wk_dlservice_send("job", "id", id, "kind", kind, "src", src, "dest", dest, "then", then, "image", image, "format", format, "delete",
         !strcmp(kind, "extract") && settings.deleteArchives ? "1" : NULL, "replace", replace ? "1" : NULL, NULL);
-    spike_log("[dl] task %s: %s %s%s%s%s", id, kind, src, then ? " then " : "", then ? then : "", replace ? " (replacing)" : "");
+    spike_log("[dl] task %s: %s %s%s%s%s%s", id, kind, src, then ? " then " : "", then ? then : "", format ? " (.ffpkg)" : "",
+        replace ? " (replacing)" : "");
     g_free(dest);
     g_free(image);
+    g_free(kindPlain);
+    g_free(thenPlain);
     changed(TRUE);
     return NULL;
 }
@@ -2967,7 +3086,7 @@ const char* ps5wk_downloads_manage(GHashTable* params)
             return "kind and path";
         if (inUse(path))
             return "A download or a job is using it: wait for it, or pause, cancel or remove the download first";
-        if (!strcmp(kind, "extract") || !strcmp(kind, "image") || !strcmp(kind, "delete"))
+        if (!strcmp(kind, "extract") || !strcmp(kind, "image") || !strcmp(kind, "image-ffpkg") || !strcmp(kind, "delete"))
             return startTask(kind, NULL, path, NULL, FALSE);
         if (!strcmp(kind, "install"))
             return startTask(kind, NULL, path, NULL, replace);
@@ -2975,6 +3094,8 @@ const char* ps5wk_downloads_manage(GHashTable* params)
             return startTask("extract", "install", path, NULL, replace);
         if (!strcmp(kind, "extract-image"))
             return startTask("extract", "image", path, NULL, FALSE);
+        if (!strcmp(kind, "extract-image-ffpkg"))
+            return startTask("extract", "image-ffpkg", path, NULL, FALSE);
         if (!strcmp(kind, "move") || !strcmp(kind, "copy")) {
             /* dest: the folder it goes into */
             const char* dest = textParam(params, "dest");
@@ -2989,7 +3110,7 @@ const char* ps5wk_downloads_manage(GHashTable* params)
                 return "A download or a job is using that name there";
             return startTask(kind, NULL, path, dest, FALSE);
         }
-        return "kind=extract|extract-install|extract-image|install|image|delete|move|copy";
+        return "kind=extract|extract-install|extract-image|extract-image-ffpkg|install|image|image-ffpkg|delete|move|copy";
     }
     if (!strcmp(action, "adopt"))
         return adoptPartial(textParam(params, "path"), textParam(params, "url"), numberParam(params, "total", -1),
@@ -3086,6 +3207,14 @@ const char* ps5wk_downloads_manage(GHashTable* params)
         return startJob(d, "extract", "install", NULL, replace);
     if (!strcmp(action, "extract-image"))
         return startJob(d, "extract", "image", NULL, FALSE);
+    if (!strcmp(action, "extract-image-ffpkg"))
+        return startJob(d, "extract", "image-ffpkg", NULL, FALSE);
+    if (!strcmp(action, "install")) {
+        /* a downloaded image or package */
+        if (!isImageName(d->r.file) && !isPkgName(d->r.file))
+            return "only images (.exfat, .ffpkg) and packages (.pkg) install as they are";
+        return startJob(d, "install", NULL, NULL, replace);
+    }
     if (!strcmp(action, "jobstop")) {
         if (d->r.jobState != PS5WK_JOB_RUNNING)
             return "no job is running";
@@ -3288,12 +3417,16 @@ static const char* taskWhat(const Task* t)
 {
     if (!strcmp(t->kind, "extract"))
         return !g_strcmp0(t->then, "install") ? "Unpack and install" : !g_strcmp0(t->then, "image") ? "Unpack and make an image" : "Unpack";
-    return !strcmp(t->kind, "install") ? "Install" : !strcmp(t->kind, "image") ? "Make an exFAT image" : !strcmp(t->kind, "delete") ? "Delete"
+    return !strcmp(t->kind, "install") ? "Install" : !strcmp(t->kind, "image") ? "Make an image" : !strcmp(t->kind, "delete") ? "Delete"
         : !strcmp(t->kind, "move") ? "Move" : !strcmp(t->kind, "copy") ? "Copy" : "Job";
 }
 
 static void fileKind(const char* name, char* out, size_t size)
 {
+    if (isImageName(name)) {
+        snprintf(out, size, "IMG");
+        return;
+    }
     const char* dot = name ? strrchr(name, '.') : NULL;
     size_t n = 0;
     if (dot && dot != name && strlen(dot + 1) <= 4) {
@@ -3502,6 +3635,9 @@ enum {
     CD_REPLACE,
     CD_EXTRACT,
     CD_IMAGE,
+    CD_IMAGE_FFPKG,
+    CD_INSTALL_FILE,  /* an image or a package, as it is */
+    CD_REPLACE_FILE,
     CD_SHOW,
     CD_DETAILS,
     CD_FORGET,
@@ -3524,6 +3660,12 @@ static void clearFolders(void)
         g_clear_pointer(&dlChosen.folders[i], g_free);
 }
 
+/* appinfo.c has more for the dialog or the details card. */
+static void dlInfoArrived(void)
+{
+    changed(FALSE);
+}
+
 gboolean ps5wk_downloads_choices_open(unsigned index)
 {
     Download* d;
@@ -3539,7 +3681,11 @@ gboolean ps5wk_downloads_choices_open(unsigned index)
         dlChosen.id = d->r.id;
         if (d->r.state == PS5WK_DL_ASKING)
             requestRoots();
-        else if (!d->peek && !d->peeking && !d->peekedLocal)
+        else if (isImageName(d->r.file) || isPkgName(d->r.file)) {
+            char* path = pathIn(d, FALSE);
+            ps5wk_appinfo(path, d->r.size, dlInfoArrived); /* name, ID, icon */
+            g_free(path);
+        } else if (!d->peek && !d->peeking && !d->peekedLocal)
             startPeek(d, TRUE); /* a finished archive: what it holds */
         return TRUE;
     case M_TASK:
@@ -3687,6 +3833,77 @@ static void askChoices(BUIChoices* out, Download* d, const MJ* peek)
     snprintf(out->circle, sizeof out->circle, "Cancel the download"); /* ps5wk_downloads_choices_back */
 }
 
+/* A finished image or package: what it holds (appinfo.c), its icon, and
+ * Install (or Replace, when the install was refused for an installed
+ * copy). */
+static void fileChoices(BUIChoices* out, Download* d)
+{
+    char* path = pathIn(d, FALSE);
+    const PS5WKAppInfo* a = ps5wk_appinfo(path, d->r.size, dlInfoArrived);
+    g_free(path);
+    const MJ* info = a->info;
+    if (a->icon) {
+        out->picture = a->icon;
+        out->pictureSize = PS5WK_APPINFO_ICON;
+    }
+    if (a->pending) {
+        addLine(out, BUI_TONE_PLAIN, "Looking inside…");
+        return;
+    }
+    if (!info) {
+        addLine(out, BUI_TONE_WARN, "What it holds isn't known: %s", a->error ? a->error : "?");
+        return;
+    }
+    const char* id = mj_string(info, "id");
+    const char* label = mj_string(info, "label");
+    const char* installed = mj_string(info, "installed");
+    const char* version = mj_string(info, "version");
+    gboolean package = mj_bool(info, "package"), fake = mj_bool(info, "fake"), encrypted = mj_bool(info, "encrypted");
+    gboolean app = package ? id && *id : mj_bool(info, "appAtRoot");
+    char* summary = ps5wk_appinfo_summary(info);
+    if (app)
+        addLine(out, BUI_TONE_ACTIVE, "%s: %s", label ? label : "It holds an app", summary);
+    else
+        addLine(out, BUI_TONE_PLAIN, "%s%s", label ? label : "", package ? "" : ", without an app at its root");
+    g_free(summary);
+    gboolean done = d->r.jobState == PS5WK_JOB_DONE && !g_strcmp0(d->r.job, "install");
+    if (package && !fake && !g_strcmp0(mj_string(info, "platform"), "PS5")) {
+        addLine(out, BUI_TONE_WARN, "A retail package%s: only fake packages (fPKG) install from here", encrypted ? " (encrypted)" : "");
+        return;
+    }
+    if (d->replaceVersion) {
+        char detail[160];
+        snprintf(detail, sizeof detail, "Version %s is installed: this installs the downloaded one over it",
+            strcmp(d->replaceVersion, "?") ? d->replaceVersion : "(not known)");
+        addChoice(out, CD_REPLACE_FILE, BUI_TONE_WARN, TRUE, "Replace the installed app", detail);
+        return;
+    }
+    if (package) {
+        addChoice(out, CD_INSTALL_FILE, done ? BUI_TONE_PLAIN : BUI_TONE_ACTIVE, FALSE, "Install the package",
+            fake ? "The console's installer copies it; fake packages need its fPKG patches on. Keep the browser open till it's copied"
+                 : "The console's installer copies it. Keep the browser open till it's copied");
+        return;
+    }
+    if (!app)
+        return;
+    gboolean known = FALSE;
+    const char* mounter = ps5wk_downloads_image_mounter(&known);
+    if (known && !mounter) {
+        addLine(out, BUI_TONE_WARN, "It can't be installed now: nothing running mounts images (ShadowMountPlus and TITAN-CORE do, Kraken Mount doesn't)");
+        return;
+    }
+    char detail[160];
+    if (installed) {
+        snprintf(detail, sizeof detail, "%s is installed: this installs the downloaded one over it",
+            strcmp(installed, "?") ? (version && !strcmp(installed, version) ? "This version" : "Another version") : "A version");
+        addChoice(out, CD_INSTALL_FILE, BUI_TONE_WARN, TRUE, "Install, replacing the installed app", detail);
+        dlChosen.replaceKnown = TRUE;
+    } else {
+        snprintf(detail, sizeof detail, "For %s: into the drive's homebrew folder, or given to it where it is", mounter ? mounter : "ShadowMountPlus");
+        addChoice(out, CD_INSTALL_FILE, done ? BUI_TONE_PLAIN : BUI_TONE_ACTIVE, FALSE, "Install the app", detail);
+    }
+}
+
 static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
 {
     char size[32], host[128];
@@ -3698,12 +3915,14 @@ static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
     gboolean archive = isArchiveName(d->r.file);
     if (d->r.jobState == PS5WK_JOB_DONE && d->r.titleID)
         addLine(out, BUI_TONE_DONE, "“%s” %s", d->r.titleName ? d->r.titleName : d->r.titleID,
-            !g_strcmp0(d->r.job, "image") || !g_strcmp0(d->r.after, "extract-image") ? "made into an image" : "installed");
+            !g_strcmp0(d->r.job, "image") || (d->r.after && g_str_has_prefix(d->r.after, "extract-image")) ? "made into an image" : "installed");
     else if (d->r.jobState == PS5WK_JOB_FAILED && !d->replaceVersion)
         addLine(out, BUI_TONE_WARN, "%s failed: %s", jobNoun(d->r.job), d->r.jobError ? d->r.jobError : "?");
     if (archive)
         peekLines(out, d, peek);
     dlChosen.replaceKnown = FALSE;
+    if (isImageName(d->r.file) || isPkgName(d->r.file))
+        fileChoices(out, d);
     if (archive && !(peek && mj_string(peek, "refused"))) {
         const char* id = mj_string(peek, "titleId");
         const char* installed = mj_string(peek, "installed");
@@ -3768,10 +3987,13 @@ static void doneChoices(BUIChoices* out, Download* d, const MJ* peek)
             char detail[160];
             snprintf(detail, sizeof detail, "%s.exfat in the drive's homebrew folder, for %s; checked once made", id, mounter ? mounter : "ShadowMountPlus");
             addChoice(out, CD_IMAGE, BUI_TONE_PLAIN, FALSE, "Unpack and make an exFAT image", detail);
+            snprintf(detail, sizeof detail, "%s.ffpkg in the drive's homebrew folder, for ShadowMountPlus 1.7 or later; checked once made", id);
+            addChoice(out, CD_IMAGE_FFPKG, BUI_TONE_PLAIN, FALSE, "Unpack and make a UFS2 image (.ffpkg)", detail);
         }
     }
     addChoice(out, CD_SHOW, BUI_TONE_PLAIN, FALSE, "Show in Files", NULL);
-    addChoice(out, CD_DETAILS, BUI_TONE_PLAIN, FALSE, "Details", "Address, size, SHA-256");
+    addChoice(out, CD_DETAILS, BUI_TONE_PLAIN, FALSE, "Details",
+        isImageName(d->r.file) || isPkgName(d->r.file) ? "The app in it, address, size, SHA-256" : "Address, size, SHA-256");
     addChoice(out, CD_FORGET, BUI_TONE_PLAIN, FALSE, "Remove from the list", "The file stays");
     addChoice(out, CD_DELETE, BUI_TONE_WARN, TRUE, "Delete the file", NULL);
 }
@@ -3890,6 +4112,15 @@ static int chooseForDownload(Download* d, int id)
     case CD_IMAGE:
         why = startJob(d, "extract", "image", NULL, FALSE);
         break;
+    case CD_IMAGE_FFPKG:
+        why = startJob(d, "extract", "image-ffpkg", NULL, FALSE);
+        break;
+    case CD_INSTALL_FILE:
+        why = startJob(d, "install", NULL, NULL, dlChosen.replaceKnown);
+        break;
+    case CD_REPLACE_FILE:
+        why = startJob(d, "install", NULL, NULL, TRUE);
+        break;
     case CD_SHOW:
         showInFiles(path);
         result = BUI_CHOSEN_FILES;
@@ -3915,10 +4146,12 @@ static int chooseForDownload(Download* d, int id)
     }
     if (why)
         notice("%s", why);
-    else if (id == CD_INSTALL || id == CD_REPLACE || id == CD_EXTRACT || id == CD_IMAGE) {
+    else if (id == CD_INSTALL || id == CD_REPLACE || id == CD_EXTRACT || id == CD_IMAGE || id == CD_IMAGE_FFPKG) {
         /* what was asked, for the notice when the job ends */
-        setString(&d->r.after, id == CD_EXTRACT ? "extract" : id == CD_IMAGE ? "extract-image" : "extract-install");
-    }
+        setString(&d->r.after, id == CD_EXTRACT ? "extract" : id == CD_IMAGE ? "extract-image" : id == CD_IMAGE_FFPKG ? "extract-image-ffpkg"
+                                                                                                                    : "extract-install");
+    } else if (id == CD_INSTALL_FILE || id == CD_REPLACE_FILE)
+        setString(&d->r.after, NULL);
     g_free(path);
     return result;
 }

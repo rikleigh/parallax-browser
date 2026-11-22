@@ -17,8 +17,11 @@
  *   - downloads over several connections (apps/common/ps5fetch.c), to any
  *     drive;
  *   - jobs on finished files: unpacking archives (ps5archive.c), installing
- *     homebrew apps (ps5install.c), exFAT images of folders (ps5exfat.c),
- *     moving files between drives;
+ *     homebrew apps (ps5install.c), images (an app's folder as exFAT,
+ *     ps5exfat.c, or UFS2 .ffpkg, ps5ufs2.c), installing a downloaded
+ *     image (moved to the drive's homebrew folder or given to
+ *     ShadowMountPlus by path) or package (.pkg, served to the console's
+ *     installer: ps5pkginstall.c), moving files between drives;
  *   - file operations for the download manager's page: the drives, a
  *     folder's entries, new folders, deleting, renaming, a free name.
  *
@@ -30,15 +33,19 @@
  *     stop     id                      (pause: .part and .ps5dl stay)
  *     cancel   id                      (.part and .ps5dl deleted)
  *     job      id kind=extract|install|image|move|copy|delete src dest [delete=1]
- *              [then=install|image] [image=<path>] [replace=1]
+ *              [then=install|image] [image=<path>] [format=exfat|ffpkg] [replace=1]
  *              (an install that would replace an installed app is refused
- *              without replace=1: jobend says installed=<version>)
+ *              without replace=1: jobend says installed=<version>; an
+ *              install's src may be an image or a .pkg file: ps5image.h)
  *     jobstop  id
  *     rm       path                    (a file or .part, and its .part.ps5dl)
- *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials|partial|imageapp path [to] [name]
- *              [dirs] [title] (partials: the downloads with a .part.ps5dl in the
- *              folders in dirs, one per line; imageapp: {installed} for the
- *              image at path, whether ShadowMountPlus has installed title from it)
+ *     req      n op=roots|ls|mkdir|delete|rename|unique|saved|partials|partial|imageapp|titleinfo|icon
+ *              path [to] [name] [dirs] [title] (partials: the downloads with a
+ *              .part.ps5dl in the folders in dirs, one per line; imageapp:
+ *              {installed} for the image at path, whether ShadowMountPlus has
+ *              installed title from it; titleinfo: what the image, package
+ *              or app folder at path holds (ps5image_json); icon: its
+ *              icon0.png copied to {path} in the service's icon cache)
  *     peek     id (url size [ua] [ref] [cookies] | path)
  *              what an archive holds, on a server (Range requests for
  *              the parts that list its files) or on a drive
@@ -48,7 +55,9 @@
  *              (every PROGRESS_MS while it runs)
  *     fetchend id state recv total error retryable restarted status final etag lm type
  *     job      id phase done total current
- *     jobend   id ok error out [title titlename version] [installed]
+ *     jobend   id ok error out [title titlename version] [installed] [by waits replaced]
+ *              [registered] [pkg=1 code] (pkg: a package the console's installer
+ *              took, code: its answer when it refused)
  *     rep      n ok json | error
  *     peekend  id ok json | error
  *              json: {format, entries, unpacked, sizesKnown, titles,
@@ -85,9 +94,12 @@
 #include "../common/ps5exfat.h"
 #include "../common/ps5fetch.h"
 #include "../common/ps5files.h"
+#include "../common/ps5image.h"
 #include "../common/ps5install.h"
 #include "../common/ps5launchers.h"
 #include "../common/ps5peek.h"
+#include "../common/ps5pkginstall.h"
+#include "../common/ps5ufs2.h"
 
 int ps5wk_dl_job(const char* jobPath);
 
@@ -247,6 +259,12 @@ static gboolean writablePath(const char* path)
     gboolean ok = writableFolder(folder);
     g_free(folder);
     return ok;
+}
+
+static gboolean isRegularFile(const char* path)
+{
+    struct stat st;
+    return !lstat(path, &st) && S_ISREG(st.st_mode);
 }
 
 static gboolean exists(const char* path)
@@ -523,6 +541,7 @@ typedef struct {
     char* dest;
     char* then;
     char* image;
+    char* format;     /* an image's: "exfat" (NULL too) or "ffpkg" */
     gboolean deleteSource;
     gboolean replace; /* an install may replace the app installed with the same ID */
     char* launcher;   /* the setting: "auto", "smp", "kraken", "titan", "self" (ps5launchers_force) */
@@ -532,6 +551,8 @@ typedef struct {
     gboolean replaced; /* ... an installed copy was replaced */
     char registered[16]; /* the browser registered it: "kstuff" (mounted when kstuff next starts),
                           * "blocked" (/data/.kstuff_noautomount stops that), "setting" (a launcher runs) */
+    gboolean package; /* a .pkg given to the console's installer */
+    unsigned code;    /* ... which refused it with this */
     volatile int cancel;
     gint64 lastProgress;
 } Job;
@@ -571,7 +592,12 @@ static void onVerifyProgress(uint64_t done, uint64_t total, const char* current,
     jobProgress(data, "verify", done, total, current, FALSE);
 }
 
-static void autoImagePath(const char* source, const PS5TitleInfo* title, char* out, size_t size);
+static void autoImagePath(const char* source, const PS5TitleInfo* title, const char* format, char* out, size_t size);
+
+static gboolean isUfs2(const Job* job)
+{
+    return job->format && !strcmp(job->format, "ffpkg");
+}
 
 /* ShadowMountPlus copies sce_sys/icon0.png when it installs an image's app,
  * and gives up on an app without one (seen 2026-11-21: "Failed to copy
@@ -623,16 +649,30 @@ static gboolean archiveOneApp(const char* archive, char* error, size_t size)
     return FALSE;
 }
 
-/* Builds image from the app at source and reads it back to compare
- * (ps5exfat_verify); a bad image is deleted. TRUE: out says where. */
+/* Builds image (exFAT, or UFS2 for format=ffpkg) from the app at source
+ * and reads it back to compare (ps5exfat_verify, ps5ufs2_verify); a bad
+ * image is deleted. TRUE: out says where. */
 static gboolean buildImage(Job* job, const char* source, const PS5TitleInfo* title, const char* where, char* out, size_t outSize,
     char* error, size_t size)
 {
     char image[1024];
     if (!strcmp(where, "auto"))
-        autoImagePath(source, title, image, sizeof image);
+        autoImagePath(source, title, job->format, image, sizeof image);
     else
         snprintf(image, sizeof image, "%s", where);
+    if (isUfs2(job)) {
+        /* refused only when a ShadowMountPlus that runs is known to be too
+         * old: the image may be meant for another console, or a later one */
+        PS5Launchers* l = g_new0(PS5Launchers, 1);
+        ps5launchers_detect(l, NULL);
+        char why[256] = "";
+        int mounts = ps5launchers_mounts_ufs2(l, why, sizeof why);
+        g_free(l);
+        if (!mounts) {
+            snprintf(error, size, "%s", why);
+            return FALSE;
+        }
+    }
     char icon[1024];
     struct stat st;
     snprintf(icon, sizeof icon, "%s/sce_sys/icon0.png", source);
@@ -640,12 +680,20 @@ static gboolean buildImage(Job* job, const char* source, const PS5TitleInfo* tit
         snprintf(error, size, "%s", NO_ICON);
         return FALSE;
     }
-    PS5ExfatOptions o = { .label = title->title_id };
-    if (ps5exfat_build(source, image, &o, onImageProgress, job, &job->cancel, error, size))
-        return FALSE;
-    jobProgress(job, "verify", 0, 0, "", TRUE);
+    int v;
     char why[512];
-    int v = ps5exfat_verify(image, source, onVerifyProgress, job, &job->cancel, why, sizeof why);
+    if (isUfs2(job)) {
+        if (ps5ufs2_build(source, image, NULL, onImageProgress, job, &job->cancel, error, size))
+            return FALSE;
+        jobProgress(job, "verify", 0, 0, "", TRUE);
+        v = ps5ufs2_verify(image, source, onVerifyProgress, job, &job->cancel, why, sizeof why);
+    } else {
+        PS5ExfatOptions o = { .label = title->title_id };
+        if (ps5exfat_build(source, image, &o, onImageProgress, job, &job->cancel, error, size))
+            return FALSE;
+        jobProgress(job, "verify", 0, 0, "", TRUE);
+        v = ps5exfat_verify(image, source, onVerifyProgress, job, &job->cancel, why, sizeof why);
+    }
     if (v) {
         unlink(image);
         if (v == -3)
@@ -687,6 +735,14 @@ static void jobEnd(Job* job, gboolean ok, const char* error, const char* out, co
     }
     if (ok && *job->registered)
         appendParam(line, "registered", job->registered);
+    if (job->package) {
+        appendNumber(line, "pkg", 1);
+        if (job->code) {
+            char code[16];
+            snprintf(code, sizeof code, "0x%08X", job->code);
+            appendParam(line, "code", code);
+        }
+    }
     JOBLOG("job %s (%s) %s%s%s", job->id, job->kind, ok ? "done" : "failed", error ? ": " : "", error ? error : "");
     sendLine(line);
 }
@@ -709,22 +765,23 @@ static void deleteVolumes(const char* archive)
 }
 
 /* Where an image goes when the title says "auto": ShadowMountPlus scans
- * <drive>/homebrew for <TITLE_ID>.exfat (ps5exfat.h); without a title, next
- * to the source as <name>.exfat. */
-static void autoImagePath(const char* source, const PS5TitleInfo* title, char* out, size_t size)
+ * <drive>/homebrew for <TITLE_ID>.exfat (ps5exfat.h) and .ffpkg
+ * (ps5ufs2.h); without a title, next to the source as <name>.exfat. */
+static void autoImagePath(const char* source, const PS5TitleInfo* title, const char* format, char* out, size_t size)
 {
+    const char* extension = format && !strcmp(format, "ffpkg") ? "ffpkg" : "exfat";
     char drive[64];
     if (title && ps5install_drive_of(source, drive, sizeof drive)) {
         char folder[128];
         snprintf(folder, sizeof folder, "%s/homebrew", drive);
         mkdir(folder, 0777);
-        snprintf(out, size, "%s/%s.exfat", folder, title->title_id);
+        snprintf(out, size, "%s/%s.%s", folder, title->title_id, extension);
         return;
     }
     char* trimmed = g_strdup(source);
     while (strlen(trimmed) > 1 && trimmed[strlen(trimmed) - 1] == '/')
         trimmed[strlen(trimmed) - 1] = 0;
-    snprintf(out, size, "%s.exfat", trimmed);
+    snprintf(out, size, "%s.%s", trimmed, extension);
     g_free(trimmed);
 }
 
@@ -831,6 +888,197 @@ static int installTitle(Job* job, const PS5TitleInfo* title, char* out, size_t o
     return r;
 }
 
+/* Installs a downloaded image (.exfat, .ffpkg) holding one app at its
+ * root (info: ps5image_info's). The image mounter (ShadowMountPlus, also
+ * TITAN-CORE's) is needed: Kraken Mount and kstuff don't mount images.
+ * When ShadowMountPlus scans the image's drive's homebrew folder, the image
+ * is renamed to <drive>/homebrew/<ID>.<ext> (the same device only: a
+ * rename across devices is a copy, and on the console a rename between
+ * mounts can panic the kernel); otherwise it stays where it is and is given
+ * to ShadowMountPlus by path (its API's manual list, else manual.lst).
+ * 0, -1 refused, -2 failed (error says why); out: where the image is. */
+static int installImage(Job* job, const PS5ImageInfo* info, PS5TitleInfo* title, char* out, size_t outSize, char* error, size_t size)
+{
+    if (!info->app_at_root || !*info->title_id) {
+        snprintf(error, size, "%s", *info->title_id ? "The image's app isn't at its root (eboot.bin and sce_sys/param.json there): ShadowMountPlus wouldn't find it"
+                                                     : "No app in the image (sce_sys/param.json with a title ID, and eboot.bin, at its root)");
+        return -1;
+    }
+    if (!info->has_icon) {
+        snprintf(error, size, "The image's app has no icon (sce_sys/icon0.png): ShadowMountPlus won't install it");
+        return -1;
+    }
+    PS5Launchers* l = g_new0(PS5Launchers, 1);
+    ps5launchers_detect(l, NULL);
+    ps5launchers_force(l, job->launcher);
+    const char* mounter = ps5launchers_image_mounter(l);
+    char why[512] = "", from[1024] = "", drive[64];
+    int r = -1;
+    gboolean ufs2 = info->kind == PS5IMAGE_UFS2;
+    const char* extension = ufs2 ? "ffpkg" : "exfat";
+    if (!mounter) {
+        snprintf(error, size, "Nothing that mounts images is running: start ShadowMountPlus (or TITAN-CORE, which starts it). Kraken Mount can't mount images");
+        goto done;
+    }
+    if (ufs2 && !ps5launchers_mounts_ufs2(l, why, sizeof why)) {
+        snprintf(error, size, "%s", why);
+        goto done;
+    }
+    if (ps5launchers_source(l, title->title_id, ps5install_installed(NULL, title->title_id, NULL), NULL, from, sizeof from)
+        && strcmp(from, job->src) && exists(from)) {
+        char target[1100] = "";
+        if (ps5install_drive_of(job->src, drive, sizeof drive))
+            snprintf(target, sizeof target, "%s/homebrew/%s.%s", drive, title->title_id, extension);
+        /* the copy it would replace is fine: that's what replace=1 says */
+        if (!job->replace || strcmp(from, target)) {
+            snprintf(error, size, "Another copy of %s is at %s, and %s would keep using it: delete that copy first (in Files), then install this one",
+                title->name, from, mounter);
+            goto done;
+        }
+    }
+    snprintf(out, outSize, "%s", job->src);
+    gboolean moved = FALSE, replacing = FALSE;
+    if (ps5install_drive_of(job->src, drive, sizeof drive)) {
+        char folder[128], target[1100];
+        snprintf(folder, sizeof folder, "%s/homebrew", drive);
+        snprintf(target, sizeof target, "%s/%s.%s", folder, title->title_id, extension);
+        mkdir(folder, 0777);
+        struct stat a, b;
+        char* srcFolder = g_path_get_dirname(job->src);
+        gboolean sameDevice = !stat(srcFolder, &a) && !stat(folder, &b) && a.st_dev == b.st_dev;
+        g_free(srcFolder);
+        if (!strcmp(target, job->src))
+            moved = TRUE; /* already there */
+        else if (sameDevice && ps5launchers_scans_itself(l, target)) {
+            replacing = exists(target);
+            if (replacing && !job->replace) {
+                /* not registered (refuseReplace didn't see it), but there */
+                snprintf(job->installed, sizeof job->installed, "?");
+                snprintf(error, size, "An image of %s (%s) is in the homebrew folder already", title->name, title->title_id);
+                goto done;
+            }
+            char aside[1200] = "";
+            if (replacing && ps5launchers_before_replace(l, title->title_id, NULL, error, size))
+                goto done;
+            if (replacing) {
+                snprintf(aside, sizeof aside, "%s.old-%lld", target, (long long)time(NULL));
+                if (rename(target, aside)) {
+                    snprintf(error, size, "Couldn't move the installed image aside (errno %d)", errno);
+                    goto done;
+                }
+            }
+            if (rename(job->src, target)) {
+                snprintf(error, size, "Couldn't move the image to %s (errno %d)", folder, errno);
+                if (*aside)
+                    rename(aside, target);
+                goto done;
+            }
+            if (*aside && unlink(aside))
+                JOBLOG("install %s: couldn't delete %s (errno %d)", title->title_id, aside, errno);
+            snprintf(out, outSize, "%s", target);
+            moved = TRUE;
+        }
+    }
+    if (!moved && !g_str_has_suffix(job->src, ufs2 ? ".ffpkg" : ".exfat")) {
+        /* left in place: its name is what tells ShadowMountPlus the format */
+        snprintf(error, size, "This is a%s image, but its name doesn't end in .%s: rename it, then install it", ufs2 ? " UFS2" : "n exFAT",
+            extension);
+        r = -1;
+        goto done;
+    }
+    if (l->smp_api || moved) {
+        /* in its folders: asked to scan; elsewhere: added to its list */
+        r = ps5launchers_announce(l, out, title->title_id, replacing, NULL, why, sizeof why);
+        if (r && !moved) {
+            snprintf(error, size, "%s", why);
+            r = -2;
+            goto done;
+        }
+        r = 0;
+    } else {
+        r = ps5launchers_manual_list_add(NULL, out, error, size) ? -2 : 0;
+        snprintf(why, sizeof why, "added to /data/shadowmount/manual.lst (its API is off)");
+    }
+    JOBLOG("install %s: image at %s, %s: %s", title->title_id, out, moved ? "moved" : "left in place", *why ? why : "-");
+    snprintf(job->by, sizeof job->by, "%s", mounter);
+    job->replaced = replacing;
+    snprintf(title->dir, sizeof title->dir, "%s", out);
+done:
+    g_free(l);
+    return r;
+}
+
+static void onPackageProgress(uint64_t served, uint64_t total, void* data)
+{
+    jobProgress(data, "install", served, total, "", FALSE);
+}
+
+static void onPackageLog(const char* line, void* data)
+{
+    (void)data;
+    JOBLOG("%s", line);
+}
+
+/* Hands a package (.pkg) to the console's installer (ps5pkginstall.h):
+ * PS4 packages and PS5 fake packages; a retail PS5 one is refused. The job
+ * lasts while the console copies it (progress: the bytes it has asked for).
+ * 0, -1 refused, -2 failed (error says why). */
+static int installPackage(Job* job, const PS5ImageInfo* info, char* note, size_t noteSize, char* error, size_t size)
+{
+    if (info->kind == PS5IMAGE_PKG_PS5 && !info->fake) {
+        snprintf(error, size, "This is a retail PS5 package (%s): only fake packages (fPKG) can be installed from here",
+            info->encrypted ? "encrypted" : "signed by Sony");
+        return -1;
+    }
+    job->package = TRUE;
+    char name[300];
+    snprintf(name, sizeof name, "%s", *info->name ? info->name : *info->title_id ? info->title_id : "Package");
+    PS5PkgInstallOptions o = { 0 };
+    o.path = job->src;
+    o.name = name;
+    o.progress = onPackageProgress;
+    o.log = onPackageLog;
+    o.data = job;
+    o.cancel = &job->cancel;
+    jobProgress(job, "install", 0, info->size, "", TRUE);
+    int r = ps5pkginstall_run(&o, &job->code, error, size);
+    if (r == -1 && info->fake && job->code && !ps5pkginstall_hint(job->code)) {
+        size_t n = strlen(error);
+        snprintf(error + n, size - n, ". A fake package installs only with the console's fPKG patches on (kstuff with fpkg enabled)");
+    }
+    if (!r)
+        snprintf(note, noteSize, "The console has the package: it installs it from its downloads (see Notifications)");
+    return r == -3 ? -2 : r;
+}
+
+/* An install whose src is a file: an image or a package. */
+static int installFile(Job* job, PS5TitleInfo* title, gboolean* haveTitle, char* out, size_t outSize, char* note, size_t noteSize,
+    char* error, size_t size)
+{
+    PS5ImageInfo info;
+    char why[256] = "";
+    if (ps5image_info(job->src, &info, why, sizeof why)) {
+        snprintf(error, size, "Not an app, image or package that can be installed (%s)", why);
+        return -1;
+    }
+    memset(title, 0, sizeof *title);
+    snprintf(title->title_id, sizeof title->title_id, "%s", info.title_id);
+    snprintf(title->name, sizeof title->name, "%s", *info.name ? info.name : info.title_id);
+    snprintf(title->version, sizeof title->version, "%s", info.version);
+    snprintf(title->content_id, sizeof title->content_id, "%s", info.content_id);
+    snprintf(title->dir, sizeof title->dir, "%s", job->src);
+    *haveTitle = *info.title_id != 0;
+    if (info.package)
+        return installPackage(job, &info, note, noteSize, error, size);
+    if (info.kind != PS5IMAGE_EXFAT && info.kind != PS5IMAGE_UFS2) {
+        snprintf(error, size, "A %s can't be installed from here: only exFAT and UFS2 (.ffpkg) images, and packages", info.label);
+        return -1;
+    }
+    if (refuseReplace(job, title, job->src, error, size))
+        return -1;
+    return installImage(job, &info, title, out, outSize, error, size);
+}
+
 static gpointer jobThread(gpointer data)
 {
     Job* job = data;
@@ -910,6 +1158,10 @@ static gpointer jobThread(gpointer data)
                     ps5install_remove_tree(job->dest); /* the unpacked copy was only for the image */
             }
         }
+    } else if (!strcmp(job->kind, "install") && isRegularFile(job->src)) {
+        ok = !installFile(job, &title, &haveTitle, out, sizeof out, note, sizeof note, error, sizeof error);
+        if (ok && !*out)
+            snprintf(out, sizeof out, "%s", job->src);
     } else if (!strcmp(job->kind, "install")) {
         ok = !ps5install_find(job->src, 3, &title, error, sizeof error);
         if (ok && refuseReplace(job, &title, title.dir, error, sizeof error)) {
@@ -959,6 +1211,7 @@ static gpointer jobThread(gpointer data)
     g_free(job->dest);
     g_free(job->then);
     g_free(job->image);
+    g_free(job->format);
     g_free(job->launcher);
     g_free(job);
     return NULL;
@@ -1012,9 +1265,12 @@ static void startJob(GHashTable* p)
     const char* src = param(p, "src");
     const char* dest = param(p, "dest");
     const char* image = param(p, "image");
+    const char* format = param(p, "format");
     const char* refused = NULL;
     if (!id || !kind || !src || !allowedPath(src))
         refused = "The job's file isn't in a place the browser can use";
+    else if (format && strcmp(format, "exfat") && strcmp(format, "ffpkg"))
+        refused = "Images are exFAT or UFS2 (.ffpkg)";
     else if (!strcmp(kind, "delete") && !changeablePath(src))
         refused = "That can't be deleted from here";
     else if (strcmp(kind, "install") && strcmp(kind, "delete")
@@ -1038,6 +1294,7 @@ static void startJob(GHashTable* p)
         job->dest = g_strdup(dest);
         job->then = g_strdup(param(p, "then"));
         job->image = g_strdup(image);
+        job->format = g_strdup(format);
         job->deleteSource = param(p, "delete") && !strcmp(param(p, "delete"), "1");
         job->replace = param(p, "replace") && !strcmp(param(p, "replace"), "1");
         job->launcher = g_strdup(param(p, "launcher"));
@@ -1185,6 +1442,10 @@ static char* listJSON(const char* path, char* error, size_t size)
         }
         if (!dir && ps5archive_is_archive(name))
             g_string_append(out, ",\"archive\":true");
+        if (!dir && ps5image_is_image_name(name))
+            g_string_append(out, ",\"image\":true");
+        if (!dir && ps5image_is_pkg_name(name))
+            g_string_append(out, ",\"pkg\":true");
         if (!dir && g_str_has_suffix(name, ".ps5dl"))
             g_string_append(out, ",\"state\":true");
         g_string_append_c(out, '}');
@@ -1403,6 +1664,102 @@ static char* appReadyJSON(const char* folder, const char* title, const char* set
     return g_string_free(out, FALSE);
 }
 
+/* Where op "icon" puts the icons it copies out (the title reads them). */
+#define ICON_CACHE "/data/ps5webkit/dl/icons"
+#define ICON_MAX (4 * 1024 * 1024)
+
+/* What the image, package or app folder at path holds (op "titleinfo"):
+ * ps5image_json, plus "installed": the version installed with that ID
+ * ("?" not known), or null. */
+static char* titleInfoJSON(const char* path, char* error, size_t size)
+{
+    struct stat st;
+    if (stat(path, &st)) {
+        snprintf(error, size, "It isn't there");
+        return NULL;
+    }
+    PS5ImageInfo info;
+    memset(&info, 0, sizeof info);
+    if (S_ISDIR(st.st_mode)) {
+        PS5TitleInfo t;
+        char why[256];
+        if (!isTitleFolder(path) || ps5install_find(path, 0, &t, why, sizeof why)) {
+            snprintf(error, size, "No app in this folder (sce_sys/param.json and eboot.bin)");
+            return NULL;
+        }
+        info.format = "folder";
+        info.label = "App folder";
+        snprintf(info.platform, sizeof info.platform, "PS5");
+        snprintf(info.title_id, sizeof info.title_id, "%s", t.title_id);
+        snprintf(info.name, sizeof info.name, "%s", strcmp(t.name, t.title_id) ? t.name : "");
+        snprintf(info.version, sizeof info.version, "%s", t.version);
+        snprintf(info.content_id, sizeof info.content_id, "%s", t.content_id);
+        snprintf(info.category, sizeof info.category, "%s", t.category);
+        info.app_at_root = true;
+        char* icon = g_build_filename(path, "sce_sys", "icon0.png", NULL);
+        info.has_icon = isRegularFile(icon);
+        g_free(icon);
+    } else if (ps5image_info(path, &info, error, size))
+        return NULL;
+    char* json = ps5image_json(&info);
+    if (!json) {
+        snprintf(error, size, "Out of memory");
+        return NULL;
+    }
+    GString* out = g_string_new_len(json, (gssize)strlen(json) - 1); /* without its '}' */
+    free(json);
+    PS5TitleInfo installed;
+    if (*info.title_id && ps5install_installed(NULL, info.title_id, &installed)) {
+        g_string_append(out, ",\"installed\":");
+        jsonString(out, *installed.version ? installed.version : "?");
+    } else
+        g_string_append(out, ",\"installed\":null");
+    g_string_append_c(out, '}');
+    return g_string_free(out, FALSE);
+}
+
+/* The icon of the image, package or app folder at path, copied to the
+ * icon cache (op "icon"): {"path": the PNG}. Named after the file and its
+ * size and time, so a changed file gets a new one. */
+static char* iconJSON(const char* path, char* error, size_t size)
+{
+    struct stat st;
+    if (stat(path, &st)) {
+        snprintf(error, size, "It isn't there");
+        return NULL;
+    }
+    char* key = g_strdup_printf("%s\n%lld\n%lld", path, (long long)st.st_size, (long long)st.st_mtime);
+    char* hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, key, -1);
+    g_free(key);
+    char out[256];
+    snprintf(out, sizeof out, "%s/%.24s.png", ICON_CACHE, hash);
+    g_free(hash);
+    g_mkdir_with_parents(ICON_CACHE, 0777);
+    if (!isRegularFile(out)) {
+        if (S_ISDIR(st.st_mode)) {
+            char* icon = g_build_filename(path, "sce_sys", "icon0.png", NULL);
+            char* bytes = NULL;
+            gsize length = 0;
+            struct stat is;
+            /* its size first: a huge file isn't read in to be refused */
+            gboolean ok = !stat(icon, &is) && S_ISREG(is.st_mode) && is.st_size > 8 && is.st_size <= ICON_MAX
+                && g_file_get_contents(icon, &bytes, &length, NULL) && length > 8 && length <= ICON_MAX
+                && !memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) && g_file_set_contents(out, bytes, (gssize)length, NULL);
+            g_free(icon);
+            g_free(bytes);
+            if (!ok) {
+                snprintf(error, size, "No icon0.png that can be read in the app's sce_sys");
+                return NULL;
+            }
+        } else if (ps5image_icon(path, out, error, size))
+            return NULL;
+    }
+    GString* json = g_string_new("{\"path\":");
+    jsonString(json, out);
+    g_string_append_c(json, '}');
+    return g_string_free(json, FALSE);
+}
+
 static void request(GHashTable* p)
 {
     const char* n = param(p, "n");
@@ -1433,6 +1790,10 @@ static void request(GHashTable* p)
         snprintf(error, sizeof error, "That place isn't one the browser can use");
     else if (!strcmp(op, "imageapp"))
         json = imageAppJSON(path, param(p, "title"));
+    else if (!strcmp(op, "titleinfo"))
+        json = titleInfoJSON(path, error, sizeof error);
+    else if (!strcmp(op, "icon"))
+        json = iconJSON(path, error, sizeof error);
     else if (!strcmp(op, "appready"))
         json = appReadyJSON(path, param(p, "title"), param(p, "launcher"));
     else if (!strcmp(op, "ls"))

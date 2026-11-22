@@ -1097,6 +1097,71 @@ hundred megabytes, and because a title can't see every drive.
     settings help in its 01.000.010 package say it takes a folder with `sce_sys/param.json` at its root
     or one level down, refuses one holding several games, and checks the
     image after building it.)
+  - UFS2 images (`.ffpkg`, `apps/common/ps5ufs2.c`, 2026-11-22): the
+    same choices as exFAT with format `ffpkg` (job `kind=image
+    format=ffpkg`, `then=image format=ffpkg`; the title's `image-ffpkg`
+    and `extract-image-ffpkg`). A port of PS5 Dump Forge's
+    `ps5-dump-forge-ufs2` crate (GPL-3.0): the geometry ShadowMountPlus
+    recommends (`newfs -O 2 -b 65536 -f 65536 -m 0 -S 4096 -i
+    <density>`, density = data / (entries + 2048) in 64..256 KiB), every
+    file one contiguous run with its indirect blocks in front, inodes
+    depth first, 1024 blocks and 2048 inodes left free for `image_rw=`
+    mounts, fixed times (the same folder gives the same bytes as
+    dump-forge's writer), written front to back once (`.part`, renamed).
+    Read back (`ps5ufs2_verify`: the superblock, inodes, block maps and
+    directories from the on-disk format) and compared with the folder,
+    as for exFAT. ShadowMountPlus mounts `.ffpkg` from 1.7: an older one
+    that is running is refused with the reason
+    (`ps5launchers_mounts_ufs2`).
+- **Downloaded images and packages** (2026-11-22): a finished `.exfat`,
+  `.ffpkg` or `.pkg` (in Downloads or in Files) gets *Install* and the
+  app's details instead of the archive look. `apps/common/ps5image.c`
+  tells the format from the file's first bytes, never its name (`\x7FCNT`
+  a PS4 package, `\x7FFIH` a PS5 one with its CNT at the u64 at 0x58,
+  `EXFAT   ` at 3, the UFS2 magic at 64 KiB + 1372, PFS known but not
+  read), and reads the name, title ID, content ID, version, category and
+  icon: from a package's entries (0x1000 `param.sfo`, 0x2000
+  `param.json`, 0x1200 `icon0.png`, else by name from the 0x0200 name
+  table; layout from pkg-viewer), or from an image's
+  `sce_sys/param.json` (`ps5exfat_read_file`, `ps5ufs2_read_file`; a
+  zeroed FAT, as some builders write, is read as contiguous). The
+  service answers `req op=titleinfo` (with the installed version) and
+  `op=icon` (the PNG, at most 4 MiB, copied to `/data/ps5webkit/dl/icons/`),
+  which the title decodes with libpng (`apps/title/appinfo.c`) for the
+  dialogs and the details card, and the phone page shows through
+  `/dlm/icon?path=`.
+  - An image (`kind=install` with a file `src`): exactly one app at its
+    root with a title ID and an icon, and an image mounter running
+    (ShadowMountPlus, or TITAN-CORE's; Kraken Mount can't mount images).
+    When ShadowMountPlus scans the drive's homebrew folder, the image is
+    renamed to `<drive>/homebrew/<ID>.<ext>` (the same device only; a
+    copy there is replaced, as for folders); otherwise it stays where it
+    is and is given to ShadowMountPlus by path (`/api/v1/manual/add`,
+    which takes image files: `sm_scan.c`'s manual sources; without its
+    API, a line in `/data/shadowmount/manual.lst`). A refused
+    `manual/add` fails the install with ShadowMountPlus's reason, and an
+    image left in place must be named for its format (`.exfat` or
+    `.ffpkg`: the name tells ShadowMountPlus which it is). The download's
+    entry follows an image that was moved. The title watches for its
+    `mount_img.lnk` as for a made image.
+  - A package (`apps/common/ps5pkginstall.c`): refused if it is a retail
+    PS5 one. The service serves it on `127.0.0.1:<port>/<token>/<name>.pkg`
+    (HEAD, one range a request, keep-alive, at most 16 connections, the
+    `.crc` sidecar 404; non-blocking sockets, so a console that stops
+    reading can't hold the job past Stop or the stall limit; only
+    requests with the token count as the console's activity, and others
+    are closed) and calls `sceAppInstUtilInstallByPackage` as
+    dump-forge does (the SYSTEM authid with every capability, ShellCore's
+    on 0x80B22404, the MetaInfo zeroed but for the URL and the name;
+    `sceAppInstUtilInitialize` once for the service, shared with
+    registrations: `ps5install_appinst_initialize`). The
+    job lasts until every byte has been fetched once and 2 s pass quietly
+    (its progress: the bytes fetched), or 5 minutes without a request
+    (stalled); the browser has to stay open till then. The installer's
+    known codes are said in words (0x80A3000F another game's ID,
+    0x80A3000D a newer system software needed, 0x80020016 no license...);
+    a fake package's unknown refusal adds that it needs the console's
+    fPKG patches.
 - **What's inside, and a suggestion** (`apps/common/ps5peek.c`, the
   service's `peek`): when an archive is handed off, the service looks
   inside it on the server before it is downloaded, with `Range` requests
@@ -1266,12 +1331,27 @@ link server; the page's look through debug screenshots, not the pad):
 - **Mac tests:** `port/webkit/test/downloads/fetch-test.sh` (47 cases,
   `--quick` 38), `archive-test.sh` (173), `exfat-test.sh` (66,
   `--no-big` 50; with the read-back check, `--no-big` 65, the full run
-  not repeated), `install-test.sh` (18), `peek-test.sh` (28: ZIP,
+  not repeated), `install-test.sh` (21), `peek-test.sh` (28: ZIP,
   ZIP64, 3000 files spread over 48 MB in 3 requests, 7-Zip solid and
   not, RAR4/RAR5, tar.gz over the limit, encrypted, no ranges, cookies,
   a slow server, one sending 20 bytes a second, on the drive),
   `files-test.sh` (34: copies and moves on one drive and to a disk
-  image, no space, cancelled, links, FIFOs, names already there).
+  image, no space, cancelled, links, FIFOs, names already there),
+  `image-test.sh` (85, `--no-big` 71: `.ffpkg` images of made-up apps
+  checked by `image/check_ufs2.py`, an fsck-style walk written from
+  FreeBSD's headers, and read back; refusals and cancelling; the details
+  of `.ffpkg` and `.exfat` images and of synthetic PS4 and PS5 packages
+  from `image/make_pkg.py`, also truncated and hostile ones; hostile
+  exFAT and UFS2 images (chains that loop, a folder claiming 2^60 bytes,
+  cut entries) under AddressSanitizer, each answered within 10 s; with
+  `DUMP_FORGE=<checkout>` and a working cargo, a byte-for-byte comparison
+  with dump-forge's own writer), `pkginstall-test.sh` (29: the package
+  server against curl: HEAD, ranges, 8 parallel parts, the `.crc`, wrong
+  tokens and paths, 17 connections, refused, cancelled, stalled, a client
+  that stops reading, wrong-token requests not counted as the console's,
+  the file changed), `launchers-test.sh` (76, with the `.ffpkg` version
+  check, ShadowMountPlus's own folders, a refused `manual/add`, and
+  `manual.lst`).
 
 **Test server:** `port/webkit/test/downloads/serve.py [--port 8781]`
 generates files of any size (each 4 KB block numbered, so a wrong join

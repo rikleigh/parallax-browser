@@ -128,6 +128,8 @@ int ps5launchers_before_replace(const PS5Launchers* l, const char* title_id, con
  * gets folder added to its own list when it is outside its scan folders.
  * 0 (error says what it answered, for the log); -1 (error says why: it
  * won't find it). */
+/* folder may also be an image file (.exfat, .ffpkg): ShadowMountPlus
+ * takes those by path too. */
 int ps5launchers_announce(const PS5Launchers* l, const char* folder, const char* title_id, bool replaced,
     const PS5LaunchersOptions* options, char* error, size_t error_size);
 
@@ -135,6 +137,19 @@ int ps5launchers_announce(const PS5Launchers* l, const char* folder, const char*
  * 0 not yet, -1 it failed (error: the launcher's reason). */
 int ps5launchers_app_ready(const PS5Launchers* l, const char* folder, const char* title_id, const PS5LaunchersOptions* options,
     char* error, size_t error_size);
+
+/* Whether the image mounter takes .ffpkg (UFS2) images: ShadowMountPlus
+ * 1.7 and later. 1 yes; 0 no (why says so); -1 not known (not running, or
+ * its version unknown; why says so when it isn't running). */
+int ps5launchers_mounts_ufs2(const PS5Launchers* l, char* why, size_t why_size);
+
+/* Whether ShadowMountPlus finds path (an image or an app folder) in one of
+ * its own scan folders, without being given it. */
+bool ps5launchers_scans_itself(const PS5Launchers* l, const char* path);
+
+/* Adds path to /data/shadowmount/manual.lst (once), which ShadowMountPlus
+ * reads at its next scan: for when its API is off. 0 or -1. */
+int ps5launchers_manual_list_add(const PS5LaunchersOptions* options, const char* path, char* error, size_t error_size);
 
 /* {"scanner":"…"|null (the setting applied),"found":"…" (detected),
  * "images":"…"|null,"smp":…,"smpApi":…,"kraken":…,"titan":…,"waits":…,

@@ -8,7 +8,7 @@ manual/add, games, games/mount, games/unmount: 409 with "busy"); kraken
 and titan answer Kraken
 Mount's GET /kraken.appcache (titan also /titan.appcache), /api/settings,
 /api/state and POST /api/rescan, /api/rebuild/<ID>. STATE, a JSON file,
-holds "scan_paths", "games", "busy" (smp) or "scanpath", "games",
+holds "scan_paths", "games", "busy", "smp_version" (smp) or "scanpath", "games",
 "paused" (kraken, titan); any answers 200 with HTML to everything. Read on
 each request. Every request is appended to LOG as "METHOD PATH BODY".
 """
@@ -79,13 +79,15 @@ class Handler(BaseHTTPRequestHandler):
         if mode == "smp":
             s = state()
             if self.path == "/api/v1/version":
-                return self.reply(200, json.dumps({"status": 0, "api_version": 1, "shadowmount_version": "1.7"}).encode())
+                return self.reply(200, json.dumps({"status": 0, "api_version": 1, "shadowmount_version": s.get("smp_version", "1.7")}).encode())
             if self.path == "/api/v1/settings":
                 return self.reply(200, json.dumps({"status": 0, "scan_paths": s.get("scan_paths", [])}).encode())
             if self.path == "/api/v1/games":
                 return self.reply(200, json.dumps({"status": 0, "count": len(s.get("games", [])), "games": s.get("games", [])}).encode())
             if self.path == "/api/v1/games/unmount" and s.get("busy"):
                 return self.reply(409, json.dumps({"status": 16, "error": "the title is running"}).encode())
+            if self.path == "/api/v1/manual/add" and s.get("manual_refuse"):
+                return self.reply(400, json.dumps({"status": 22, "error": "not a game source"}).encode())
             if self.path in ("/api/v1/scan", "/api/v1/manual/add", "/api/v1/games/mount", "/api/v1/games/unmount"):
                 return self.reply(200, json.dumps({"status": 0, "scan_queued": True}).encode())
             return self.reply(404, json.dumps({"status": 2, "error": "no route"}).encode())

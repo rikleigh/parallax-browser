@@ -141,6 +141,41 @@ check '{"scanner":"ShadowMountPlus","found":"ShadowMountPlus"' "both answer (Kra
 check "YES" "... and its folders count, not Kraken's" "$(t scans $H)"
 stop
 
+# images: what takes .ffpkg, what ShadowMountPlus finds by itself, its list
+echo '{"scan_paths":[],"smp_version":"1.7"}' > "$work/smp.json"
+start smp "$smp" "$work/smp.log" "$work/smp.json"
+check "1 " "ShadowMountPlus 1.7 mounts .ffpkg" "$(t ufs2)"
+echo '{"scan_paths":[],"smp_version":"1.7beta12"}' > "$work/smp.json"
+check "1 " "... 1.7beta12 too" "$(t ufs2)"
+echo '{"scan_paths":[],"smp_version":"1.6.3"}' > "$work/smp.json"
+check "0 ShadowMountPlus 1.6.3 doesn't mount .ffpkg" "1.6.3 doesn't" "$(t ufs2)"
+echo '{"scan_paths":[],"smp_version":""}' > "$work/smp.json"
+check "-1 " "its version not known: not known" "$(t ufs2)"
+echo '{"scan_paths":[]}' > "$work/smp.json"
+check "YES" "an image in /data/homebrew: found by its scan" "$(t itself /data/homebrew/PPSA01234.ffpkg)"
+check "YES" "... in /mnt/usb2/homebrew" "$(t itself /mnt/usb2/homebrew/PPSA01234.exfat)"
+check "NO" "... elsewhere: not" "$(t itself /data/ps5webkit/downloads/PPSA01234.ffpkg)"
+: > "$work/smp.log"
+check "0 " "an image elsewhere announced" "$(t announce /data/dl/PPSA01234.ffpkg PPSA01234 0)"
+has 'POST /api/v1/manual/add {"path":"/data/dl/PPSA01234.ffpkg"}' "... added to its list by path" "$work/smp.log"
+echo '{"scan_paths":[],"manual_refuse":true}' > "$work/smp.json"
+check "-1 ShadowMountPlus didn't add /data/dl/PPSA01234.ffpkg to its list (it refused: not a game source)" "... refused: says so" \
+    "$(t announce /data/dl/PPSA01234.ffpkg PPSA01234 0)"
+echo '{"scan_paths":[]}' > "$work/smp.json"
+: > "$work/smp.log"
+t announce /data/homebrew/PPSA01234.exfat PPSA01234 0 > /dev/null
+has 'POST /api/v1/scan' "an image in its folders: a scan" "$work/smp.log"
+echo '{"scan_paths":["/mnt/usb0/games"]}' > "$work/smp.json"
+check "NO" "its own scan folders: /data/homebrew isn't one then" "$(t itself /data/homebrew/PPSA01234.ffpkg)"
+check "YES" "... /mnt/usb0/games is" "$(t itself /mnt/usb0/games/PPSA01234.ffpkg)"
+stop
+check "-1 ShadowMountPlus isn't running" "nothing running: .ffpkg not known" "$(t ufs2)"
+printf '/data/a.exfat' > "$con/data/shadowmount/manual.lst"
+check "0" "manual.lst: added" "$(t manual /data/dl/PPSA01234.ffpkg)"
+check "0" "manual.lst: added again" "$(t manual /data/dl/PPSA01234.ffpkg)"
+[ "$(cat "$con/data/shadowmount/manual.lst")" = "$(printf '/data/a.exfat\n/data/dl/PPSA01234.ffpkg')" ] && echo "PASS manual.lst: once, on a line of its own" \
+    || { echo "FAIL manual.lst: $(cat "$con/data/shadowmount/manual.lst" | tr '\n' '|')"; fails=$((fails + 1)); }
+
 # TITAN-CORE (Kraken Mount's fork) with its ShadowMountPlus
 : > "$con/data/.kstuff_noautomount"
 echo '{"scanpath":["/mnt/usb0/games"],"games":[]}' > "$work/k.json"

@@ -50,6 +50,10 @@ typedef struct {
     const char* labels[10];
     const char* values[10];
     int count;
+    /* at the card's head on the right (an app's icon): premultiplied
+     * 0xAARRGGBB, pictureSize square; NULL none */
+    const guint32* picture;
+    int pictureSize;
 } BUIDetails;
 
 /* A dialog over the list: what X on a download or a file offers (its
@@ -73,6 +77,9 @@ typedef struct {
     int focus; /* index */
     int armed; /* index pressed once (confirm), -1 none */
     char circle[48]; /* what O does, for the footer ("": Back) */
+    /* at the dialog's head on the right (an app's icon), as BUIDetails' */
+    const guint32* picture;
+    int pictureSize;
 } BUIChoices;
 
 /* What a choice did (the dialog's owner tells browserui.c). */

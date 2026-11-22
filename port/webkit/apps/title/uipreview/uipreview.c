@@ -528,6 +528,63 @@ int main(int argc, char** argv)
         d.armed = -1;
         menuShot("menu-downloads-choices-scrolled", &s);
 
+        /* a finished image: what it holds, with the app's icon */
+        static uint32_t picture[112 * 112];
+        {
+            uint32_t* full = NULL;
+            int pw = 0, ph = 0;
+            if (loadPNG(TITLE_DIR "/sce_sys/icon0.png", &full, &pw, &ph)) {
+                for (int y = 0; y < 112; y++)
+                    for (int x = 0; x < 112; x++)
+                        picture[y * 112 + x] = full[(y * ph / 112) * pw + x * pw / 112] | 0xff000000u;
+                free(full);
+            }
+        }
+        memset(&d, 0, sizeof d);
+        snprintf(d.title, sizeof d.title, "PPSA01234-ItemzFlow.ffpkg");
+        snprintf(d.lines[0], sizeof d.lines[0], "1.38 GB · Downloads · cdn.example.org");
+        snprintf(d.lines[1], sizeof d.lines[1], "UFS2 image: ItemzFlow · PPSA01234 · version 01.020.000");
+        d.lineTones[1] = BUI_TONE_ACTIVE;
+        d.lineCount = 2;
+        d.picture = picture;
+        d.pictureSize = 112;
+        const struct { const char *label, *detail; int tone; } im[] = {
+            { "Install the app", "For ShadowMountPlus: into the drive's homebrew folder, or given to it where it is", BUI_TONE_ACTIVE },
+            { "Show in Files", "", 0 },
+            { "Details", "The app in it, address, size, SHA-256", 0 },
+            { "Remove from the list", "The file stays", 0 },
+            { "Delete the file", "", BUI_TONE_WARN },
+        };
+        for (unsigned i = 0; i < G_N_ELEMENTS(im); i++) {
+            snprintf(d.choices[i].label, sizeof d.choices[i].label, "%s", im[i].label);
+            snprintf(d.choices[i].detail, sizeof d.choices[i].detail, "%s", im[i].detail);
+            d.choices[i].tone = im[i].tone;
+        }
+        d.count = G_N_ELEMENTS(im);
+        d.armed = -1;
+        menuShot("menu-downloads-image-choices", &s);
+        {
+            BUIDetails c;
+            memset(&c, 0, sizeof c);
+            c.title = "PPSA01234-ItemzFlow.ffpkg";
+            const char* labels[] = { "Address", "File", "Size", "SHA-256", "State", "Holds", "App", "Content ID" };
+            const char* values[] = { "https://cdn.example.org/PPSA01234-ItemzFlow.ffpkg", "/data/ps5webkit/users/1/downloads/PPSA01234-ItemzFlow.ffpkg",
+                "1.38 GB (1481637888 bytes)", "9f2c…", "Done", "UFS2 image · PS5", "ItemzFlow · PPSA01234 · version 01.020.000",
+                "UP9000-PPSA01234_00-ITEMZFLOW0000000" };
+            for (int i = 0; i < 8; i++) {
+                c.labels[i] = labels[i];
+                c.values[i] = values[i];
+            }
+            c.count = 8;
+            c.picture = picture;
+            c.pictureSize = 112;
+            s.choices = NULL;
+            s.details = &c;
+            menuShot("menu-downloads-image-details", &s);
+            s.details = NULL;
+            s.choices = &d;
+        }
+
         /* a download waiting for a folder */
         memset(&d, 0, sizeof d);
         snprintf(d.title, sizeof d.title, "Where should this download go?");

@@ -23,6 +23,11 @@ title() { # dir id name
 J
 }
 export PS5INSTALL_DRIVE="$work/drive"
+# param.json's other fields, and a byte order mark
+printf '{"titleId":"PPSA07777","contentId":"UP9000-PPSA07777_00-ABCDEFGHIJKLMNOP","applicationCategoryType" : 65536,"contentVersion":"01.000.000"}' > "$work/p1.json"
+check "OK PPSA07777|PPSA07777|01.000.000|UP9000-PPSA07777_00-ABCDEFGHIJKLMNOP|65536" "param.json: contentId and applicationCategoryType" "$("$work/t" param "$work/p1.json")"
+printf '\xef\xbb\xbf{"titleId":"PPSA07778","localizedParameters":{"defaultLanguage":"en-US","en-US":{"titleName":"BOM"}}}' > "$work/p2.json"
+check "OK PPSA07778|BOM|||" "param.json with a UTF-8 byte order mark" "$("$work/t" param "$work/p2.json")"
 mkdir -p "$work/drive/downloads/My App v1.2/PPSA01234-app" "$work/user"
 title "$work/drive/downloads/My App v1.2/PPSA01234-app" PPSA01234 'Cool \"App\"'
 check "OK PPSA01234|Cool \"App\"|01.002.000|$work/drive/downloads/My App v1.2/PPSA01234-app" "nested two deep, default language's name" \

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -147,14 +148,41 @@ static int probe(const char* dir, PS5TitleInfo* out)
     return r;
 }
 
+/* The number value after "key" (applicationCategoryType: 0 a game, 65536
+ * an app...), as text; "" if none. */
+static void numberAfter(const char* from, const char* key, char* out, size_t size)
+{
+    char quoted[80];
+    snprintf(quoted, sizeof quoted, "\"%s\"", key);
+    out[0] = 0;
+    for (const char* p = strstr(from, quoted); p; p = strstr(p + 1, quoted)) {
+        const char* q = p + strlen(quoted);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
+            q++;
+        if (*q++ != ':')
+            continue;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
+            q++;
+        size_t n = 0;
+        while ((*q == '-' || (*q >= '0' && *q <= '9')) && n + 1 < size)
+            out[n++] = *q++;
+        out[n] = 0;
+        return;
+    }
+}
+
 int ps5install_parse_param(const char* text, PS5TitleInfo* out)
 {
     memset(out, 0, sizeof *out);
+    if (text && (unsigned char)text[0] == 0xef && (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf)
+        text += 3; /* a UTF-8 byte order mark (some packaging tools write one) */
     if (!text || !stringAfter(text, "titleId", out->title_id, sizeof out->title_id) || !validTitleID(out->title_id)) {
         out->title_id[0] = 0;
         return -2;
     }
     stringAfter(text, "contentVersion", out->version, sizeof out->version);
+    stringAfter(text, "contentId", out->content_id, sizeof out->content_id);
+    numberAfter(text, "applicationCategoryType", out->category, sizeof out->category);
     char language[32] = "";
     stringAfter(text, "defaultLanguage", language, sizeof language);
     if (*language) {
@@ -454,11 +482,15 @@ static int (*appInstInit)(void);
 static int (*appInstTitleDir)(const char* titleID, const char* installPath, void* reserved);
 static int (*appInstAll)(void* reserved);
 
+/* appInstLock held. 0, -1 not there, or Initialize's error (tried again
+ * next time). */
 static int loadAppInstUtil(const PS5InstallOptions* options)
 {
-    static int loaded = 1; /* 1: not tried */
-    if (loaded <= 0)
+    static int loaded = 1; /* 1: not tried, 0 loaded, -1 not there */
+    if (loaded < 0)
         return loaded;
+    if (!loaded)
+        return ps5install_appinst_initialize(appInstInit);
     static const char* const paths[] = { "/system/common/lib/libSceAppInstUtil.sprx", "/system/priv/lib/libSceAppInstUtil.sprx" };
     for (size_t i = 0; i < sizeof paths / sizeof *paths && !appInstTitleDir && !appInstAll; i++) {
         int res = 0;
@@ -481,10 +513,10 @@ static int loadAppInstUtil(const PS5InstallOptions* options)
         loaded = -1;
         return loaded;
     }
-    int r = appInstInit();
+    loaded = 0;
+    int r = ps5install_appinst_initialize(appInstInit);
     say(options, "sceAppInstUtilInitialize: 0x%08x", (unsigned)r);
-    loaded = r ? r : 0;
-    return loaded;
+    return r;
 }
 #endif
 
@@ -519,13 +551,16 @@ static int registerTitle(const char* titleID, const char* folder, const PS5Insta
     }
 #if defined(__PROSPERO__)
     if (options && options->do_register) {
+        ps5install_appinst_lock();
         int r = loadAppInstUtil(options);
         if (r) {
+            ps5install_appinst_unlock();
             fail(error, error_size, "The system's installer couldn't be loaded (0x%08x)", (unsigned)r);
             return -2;
         }
         const char* how = appInstTitleDir ? "AppInstallTitleDir" : "AppInstallAll";
         r = appInstTitleDir ? appInstTitleDir(titleID, "/user/app/", NULL) : appInstAll(NULL);
+        ps5install_appinst_unlock();
         say(options, "sceAppInstUtil%s(%s): 0x%08x", how, titleID, (unsigned)r);
         if (r) {
             fail(error, error_size, "The system's installer refused it (sceAppInstUtil%s 0x%08x)", how, (unsigned)r);
@@ -591,5 +626,34 @@ int ps5install_title(const PS5TitleInfo* title, const PS5InstallOptions* options
     int r = registerTitle(title->title_id, target, options, error, error_size);
     if (!r)
         say(options, "installed %s (%s %s) from %s", title->title_id, title->name, title->version, target);
+    return r;
+}
+
+bool ps5install_valid_id(const char* id)
+{
+    return id && validTitleID(id);
+}
+
+/* Every sceAppInstUtil caller in the service (a registration here, a
+ * package install in ps5pkginstall.c) runs between these, one at a time. */
+static pthread_mutex_t appInstLock = PTHREAD_MUTEX_INITIALIZER;
+
+void ps5install_appinst_lock(void)
+{
+    pthread_mutex_lock(&appInstLock);
+}
+
+void ps5install_appinst_unlock(void)
+{
+    pthread_mutex_unlock(&appInstLock);
+}
+
+int ps5install_appinst_initialize(int (*init)(void))
+{
+    static int initialized; /* under appInstLock */
+    if (initialized)
+        return 0;
+    int r = init();
+    initialized = r == 0;
     return r;
 }

@@ -843,6 +843,13 @@ static int drawWrapped(WPEDisplayPS5Canvas* c, int x, int baseline, int width, i
     return lines;
 }
 
+/* An app's icon at a dialog's or card's head: a rounded tile behind it. */
+static void drawPicture(WPEDisplayPS5Canvas* c, int x, int y, const guint32* pixels, int size)
+{
+    wpe_display_ps5_canvas_fill(c, x - 6, y - 6, size + 12, size + 12, PX_RADIUS, PX_A(PX_RAISED_HI, 0xc0));
+    wpe_display_ps5_canvas_image(c, x, y, size, size, pixels, 255);
+}
+
 /* A download's details: a card over the list. */
 static void drawDetails(WPEDisplayPS5Canvas* c, const BUIDetails* d, int px, int pw, int screenH)
 {
@@ -851,9 +858,12 @@ static void drawDetails(WPEDisplayPS5Canvas* c, const BUIDetails* d, int px, int
     wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_SURFACE, 0xff));
     wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_RAISED, 0xc0));
     wpe_display_ps5_canvas_stroke(c, x, y, w, h, PX_RADIUS_PANEL, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
-    wpe_display_ps5_canvas_text(c, x + 40, y + 60, w - 80, 30, TRUE, PX_TEXT, d->title ? d->title : "");
+    const int pictureW = d->picture ? d->pictureSize + 40 : 0;
+    if (d->picture)
+        drawPicture(c, x + w - 40 - d->pictureSize, y + 28, d->picture, d->pictureSize);
+    wpe_display_ps5_canvas_text(c, x + 40, y + 60, w - 80 - pictureW, 30, TRUE, PX_TEXT, d->title ? d->title : "");
     wpe_display_ps5_canvas_fill_gradient(c, x + 40, y + 78, 96, 4, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
-    int ly = y + 130;
+    int ly = y + (d->picture && 28 + d->pictureSize + 24 > 130 ? 28 + d->pictureSize + 24 : 130);
     const int labelW = 170, vx = x + 40 + labelW, vw = w - 80 - labelW, lineH = 30;
     for (int i = 0; i < d->count && ly < y + h - 20; i++) {
         wpe_display_ps5_canvas_text(c, x + 40, ly, labelW - 16, T_URL, TRUE, PX_TEXT_3, d->labels[i]);
@@ -870,8 +880,11 @@ static void drawDetails(WPEDisplayPS5Canvas* c, const BUIDetails* d, int px, int
 
 static int choicesHeaderHeight(const BUIChoices* d)
 {
-    return 100 + d->lineCount * 30 + (d->lineCount ? 14 : 0);
+    const int text = 100 + d->lineCount * 30 + (d->lineCount ? 14 : 0);
+    const int picture = d->picture ? 28 + d->pictureSize + 20 : 0;
+    return text > picture ? text : picture;
 }
+
 
 int bui_visible_choices(int screenH, const BUIChoices* d)
 {
@@ -897,10 +910,13 @@ static void drawChoices(WPEDisplayPS5Canvas* c, const BUIChoices* d, int px, int
     wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_SURFACE, 0xff));
     wpe_display_ps5_canvas_fill(c, x, y, w, h, PX_RADIUS_PANEL, PX_A(PX_RAISED, 0xc0));
     wpe_display_ps5_canvas_stroke(c, x, y, w, h, PX_RADIUS_PANEL, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
-    wpe_display_ps5_canvas_text(c, x + 40, y + 56, w - 80, 30, TRUE, PX_TEXT, d->title);
+    const int pictureW = d->picture ? d->pictureSize + 40 : 0;
+    if (d->picture)
+        drawPicture(c, x + w - 40 - d->pictureSize, y + 28, d->picture, d->pictureSize);
+    wpe_display_ps5_canvas_text(c, x + 40, y + 56, w - 80 - pictureW, 30, TRUE, PX_TEXT, d->title);
     wpe_display_ps5_canvas_fill_gradient(c, x + 40, y + 74, 96, 4, 2, PX_FOCUS_FROM, PX_FOCUS_TO, FALSE);
     for (int i = 0; i < d->lineCount && i < 3; i++)
-        wpe_display_ps5_canvas_text(c, x + 40, y + 114 + i * 30, w - 80, 21, FALSE, d->lineTones[i] == BUI_TONE_WARN ? PX_PINK
+        wpe_display_ps5_canvas_text(c, x + 40, y + 114 + i * 30, w - 80 - pictureW, 21, FALSE, d->lineTones[i] == BUI_TONE_WARN ? PX_PINK
             : d->lineTones[i] == BUI_TONE_ACTIVE ? PX_CYAN_TEXT : PX_TEXT_2, d->lines[i]);
 
     int top = d->focus - visible + 1;

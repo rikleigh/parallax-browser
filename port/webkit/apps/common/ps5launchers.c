@@ -620,6 +620,7 @@ int ps5launchers_announce(const PS5Launchers* l, const char* folder, const char*
     if (l->smp_api) {
         char* json;
         const char* route;
+        bool manual = false;
         if (inRoots(parent, l->smp_roots, l->smp_root_count)) {
             route = "/api/v1/scan";
             json = g_strdup("{\"reset_attempts\":true}");
@@ -628,8 +629,29 @@ int ps5launchers_announce(const PS5Launchers* l, const char* folder, const char*
             route = "/api/v1/manual/add";
             json = g_strdup_printf("{\"path\":%s}", quoted);
             g_free(quoted);
+            manual = true;
         }
-        MJ* r = postJSON(l->smp_port, route, json, timeout);
+        MJ* r;
+        int answered = 1;
+        if (manual) {
+            /* its error replies (4xx, with "error") say why: kept */
+            char* body = NULL;
+            int status = httpRequest(l->smp_port, "POST", route, json, timeout, &body);
+            answered = status > 0;
+            r = body ? mj_parse(body) : NULL;
+            g_free(body);
+        } else
+            r = postJSON(l->smp_port, route, json, timeout);
+        if (manual && (!r || mj_number(r, "status", -1) != 0)) {
+            /* not in a folder it scans: if it didn't add it, nothing finds it */
+            const char* message = mj_string(r, "error");
+            snprintf(error, size, "ShadowMountPlus didn't add %s to its list (%s%s%s)", folder, !answered ? "no answer" : "it refused",
+                message && *message ? ": " : "", message && *message ? message : "");
+            mj_free(r);
+            g_free(json);
+            g_free(parent);
+            return -1;
+        }
         /* for the log: whether it queued a scan, or holds it (scan_deferred_reason) */
         const char* reason = mj_string(r, "scan_deferred_reason");
         snprintf(error, size, "ShadowMountPlus %s: %s%s%s%s", route + 8, !r ? "no answer" : mj_bool(r, "scan_queued") ? "scan queued" : "no scan queued",
@@ -705,4 +727,63 @@ char* ps5launchers_json(const PS5Launchers* l)
         ps5launchers_waits(l) ? "true" : "false", l->kstuff_automount ? "true" : "false", l->etahen ? "true" : "false",
         l->forced ? "true" : "false");
     return g_string_free(out, FALSE);
+}
+
+int ps5launchers_mounts_ufs2(const PS5Launchers* l, char* why, size_t size)
+{
+    if (!l->smp) {
+        snprintf(why, size, "ShadowMountPlus isn't running: it (or TITAN-CORE, which starts it) mounts .ffpkg images");
+        return -1;
+    }
+    /* "1.7", "1.7beta12", "v1.6-3-gabc123": the first two numbers */
+    const char* v = l->smp_version;
+    while (*v && !(*v >= '0' && *v <= '9'))
+        v++;
+    if (!*v)
+        return -1; /* not known */
+    unsigned major = 0, minor = 0;
+    if (sscanf(v, "%u.%u", &major, &minor) < 1)
+        return -1;
+    if (major > 1 || (major == 1 && minor >= 7))
+        return 1;
+    snprintf(why, size, "ShadowMountPlus %s doesn't mount .ffpkg images: they need 1.7 or later (or make an exFAT image)", l->smp_version);
+    return 0;
+}
+
+bool ps5launchers_scans_itself(const PS5Launchers* l, const char* path)
+{
+    char* parent = parentOf(path);
+    bool ok = l->smp && inRoots(parent, l->smp_roots, l->smp_root_count);
+    g_free(parent);
+    return ok;
+}
+
+int ps5launchers_manual_list_add(const PS5LaunchersOptions* o, const char* path, char* error, size_t size)
+{
+    char list[1024];
+    prefixed(o, "/data/shadowmount/manual.lst", list, sizeof list);
+    char* text = NULL;
+    g_file_get_contents(list, &text, NULL, NULL);
+    bool there = false;
+    char** lines = g_strsplit(text ? text : "", "\n", -1);
+    for (char** line = lines; *line && !there; line++) {
+        g_strstrip(*line);
+        there = !strcmp(*line, path);
+    }
+    g_strfreev(lines);
+    int r = 0;
+    if (!there) {
+        FILE* f = fopen(list, "a");
+        bool newline = text && *text && text[strlen(text) - 1] != '\n';
+        if (!f || (newline && fputc('\n', f) == EOF) || fprintf(f, "%s\n", path) < 0) {
+            snprintf(error, size, "Couldn't add it to ShadowMountPlus's list (%s, errno %d)", list, errno);
+            r = -1;
+        }
+        if (f && fclose(f) && !r) {
+            snprintf(error, size, "Couldn't add it to ShadowMountPlus's list (%s, errno %d)", list, errno);
+            r = -1;
+        }
+    }
+    g_free(text);
+    return r;
 }

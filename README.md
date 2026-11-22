@@ -46,12 +46,17 @@ first-class place for the modern web. It's built on WPE WebKit.
 - A download manager. Large files download over several connections at
   once, with pause, resume and SHA-256 checksums, and survive a browser
   restart. Archives (ZIP, 7z, RAR, tar) can be unpacked, an app inside one
-  installed, or made into an exFAT image. Installs work with
-  ShadowMountPlus, Kraken Mount or TITAN-CORE, whichever is running (or
-  the one chosen in Settings), and exFAT images with ShadowMountPlus or
-  TITAN-CORE. The menu's
-  Files list browses the internal storage and USB drives, to move, copy,
-  rename and delete.
+  installed, or made into an image: exFAT (`.exfat`) or UFS2 (`.ffpkg`,
+  for ShadowMountPlus 1.7 and later; the writer is ported from
+  [PS5 Dump Forge](https://github.com/quer3q/ps5-dump-forge)). Installs
+  work with ShadowMountPlus, Kraken Mount or TITAN-CORE, whichever is
+  running (or the one chosen in Settings), and images with ShadowMountPlus
+  or TITAN-CORE. A downloaded `.exfat` or `.ffpkg` image installs as it
+  is, and a downloaded `.pkg` (a PS4 package, or a PS5 fake package, which
+  needs the console's fPKG patches) goes to the console's own installer.
+  The download and Files dialogs show the app's name, title ID, version
+  and icon. The menu's Files list browses the internal storage and USB
+  drives, to move, copy, rename and delete.
 - Ad blocking with the uBlock Origin Lite rule lists, which include network
   rules, cosmetic filters and scriptlets. It has no code for particular
   sites, and you can turn it off for each site.

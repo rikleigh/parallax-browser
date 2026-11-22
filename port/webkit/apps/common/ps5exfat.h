@@ -61,6 +61,14 @@ int ps5exfat_build(const char* src, const char* image, const PS5ExfatOptions* op
 int ps5exfat_verify(const char* image, const char* src, ps5exfat_progress_fn progress, void* data, volatile int* cancel, char* error,
     size_t error_size);
 
+/* One file of image ("sce_sys/param.json": from the root; ASCII letters
+ * match in either case, as exFAT names do): its first size bytes into
+ * buffer (buffer may be NULL with size 0: only whether it is there), its
+ * length into *length. Takes other builders' images too: any sector and
+ * cluster size, and a zeroed FAT read as contiguous. 0; -1 not there, not
+ * a file, or not exFAT (error says which); -2 the image is damaged. */
+int ps5exfat_read_file(const char* image, const char* path, void* buffer, size_t size, uint64_t* length, char* error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif
