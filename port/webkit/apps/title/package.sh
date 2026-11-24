@@ -85,6 +85,8 @@ D10="$ROOT/spikes/10-title-dmem"
 # was a SIGBUS (code 3, pc = addr) in the title's first JavaScript (adblock.c).
 prospero-clang -std=gnu11 -O2 "${TF[@]}" -DMALLOC_ALIGNMENT=32 -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
+# The heap profiler (off unless /data/ps5webkit/heap-profile exists).
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/heapprof.c" -o "$W/obj/heapprof.o"
 # The system keyboard: libSceImeDialog's imports, bound once titleime.c
 # loads the module, and a link-only libSceCommonDialog stub for
 # sceCommonDialogInitialize, which the SDK's stubs lack (commondialog-stub.c).

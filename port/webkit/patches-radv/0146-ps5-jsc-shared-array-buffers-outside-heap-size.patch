@@ -1,0 +1,57 @@
+diff --git a/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h b/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h
+index 1bd8c6f472..c63fc14f0b 100644
+--- a/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h
++++ b/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h
+@@ -30,6 +30,21 @@
+ 
+ namespace JSC {
+ 
++// PS5: what an object adds to this heap's extra memory. A shared buffer (a SharedArrayBuffer, or a
++// shared WebAssembly memory's buffer) is referenced from every worker it is posted to, and counting
++// its whole length in each of their heaps made a game's 2 GB shared memory a 2 GB "allocation" in
++// each of ~20 workers: each then collected only after close to 1 GB of its own garbage (nfsu2.xyz,
++// 2026-11-24). No one heap's collection can free it, so it counts as its object only.
++template<typename T>
++inline size_t gcIncomingSizeEstimateInBytes(const T* object)
++{
++    if constexpr (requires { object->isShared(); }) {
++        if (object->isShared())
++            return sizeof(T);
++    }
++    return object->gcSizeEstimateInBytes();
++}
++
+ template<typename T>
+ GCIncomingRefCountedSet<T>::GCIncomingRefCountedSet()
+     : m_bytes(0)
+@@ -57,7 +72,7 @@ bool GCIncomingRefCountedSet<T>::addReference(JSCell* cell, T* object)
+     }
+     object->m_needsFilteringIncomingReferences = true;
+     m_vector.append(object);
+-    m_bytes += object->gcSizeEstimateInBytes();
++    m_bytes += gcIncomingSizeEstimateInBytes(object);
+     ASSERT(object->isDeferred());
+     ASSERT(object->numberOfIncomingReferences());
+     return true;
+@@ -84,7 +99,7 @@ void GCIncomingRefCountedSet<T>::sweep(VM& vm, CollectionScope collectionScope)
+ 
+     size_t preciseBytes = 0;
+     m_vector.removeAllMatching([&](T* object) {
+-        size_t size = object->gcSizeEstimateInBytes();
++        size_t size = gcIncomingSizeEstimateInBytes(object);
+         ASSERT(object->isDeferred());
+         ASSERT(object->numberOfIncomingReferences());
+         if (!filter(object)) {
+diff --git a/Source/JavaScriptCore/heap/Heap.cpp b/Source/JavaScriptCore/heap/Heap.cpp
+index f1b51e2d7f..b4a5d2db9e 100644
+--- a/Source/JavaScriptCore/heap/Heap.cpp
++++ b/Source/JavaScriptCore/heap/Heap.cpp
+@@ -666,7 +666,7 @@ void Heap::addReference(JSCell* cell, ArrayBuffer* buffer)
+     ASSERT(cell->heap() == this);
+     if (m_arrayBuffers.addReference(cell, buffer)) {
+         collectIfNecessaryOrDefer();
+-        didAllocate(buffer->gcSizeEstimateInBytes());
++        didAllocate(gcIncomingSizeEstimateInBytes(buffer)); // PS5: shared buffers as their object (GCIncomingRefCountedSetInlines.h)
+     }
+ }
+ 

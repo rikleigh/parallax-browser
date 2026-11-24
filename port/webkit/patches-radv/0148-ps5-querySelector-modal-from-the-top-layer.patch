@@ -1,0 +1,53 @@
+diff --git a/Source/WebCore/dom/SelectorQuery.cpp b/Source/WebCore/dom/SelectorQuery.cpp
+index e17ebeb006..0cdd537386 100644
+--- a/Source/WebCore/dom/SelectorQuery.cpp
++++ b/Source/WebCore/dom/SelectorQuery.cpp
+@@ -648,9 +648,48 @@ bool SelectorDataList::compileSelector(const SelectorData& selectorData)
+ 
+ #endif // ENABLE(CSS_SELECTOR_JIT)
+ 
++// PS5: a selector whose rightmost compound has :modal can match only a modal dialog or a fullscreen
++// element (matchesModalPseudoClass), and both are in the top layer while they match: a dialog is
++// added to it in showModal() and loses isModal() when it leaves (close(), removal), and the
++// fullscreen flag is set just before an element enters the top layer and cleared before it
++// leaves. So for a connected root, the document's top layer is the whole candidate set, instead of
++// every element under the root. A page asking for "dialog[open]:modal" 900 times a second spent
++// 40% of the title's main thread walking its 6000 elements (nfsu2.xyz, 2026-11-24). A
++// disconnected root keeps the walk: a disconnected element can keep the fullscreen flag until
++// fullscreen is exited.
++static bool rightmostCompoundHasModal(const CSSSelector& rightmost)
++{
++    for (const CSSSelector* selector = &rightmost; selector; selector = selector->followingInCompound()) {
++        if (selector->match() == CSSSelector::Match::PseudoClass && selector->pseudoClass() == CSSSelector::PseudoClass::Modal)
++            return true;
++    }
++    return false;
++}
++
+ template<typename OutputType>
+ ALWAYS_INLINE void SelectorDataList::execute(ContainerNode& rootNode, OutputType& output) const
+ {
++    if (m_selectors.size() == 1 && rootNode.isConnected() && rightmostCompoundHasModal(m_selectors.first().selector)) [[unlikely]] {
++        Ref document = rootNode.document();
++        if (!document->hasTopLayerElement())
++            return;
++        Vector<Ref<Element>> matches;
++        for (Ref element : document->topLayerElements()) {
++            if (element->isConnected() && element->isDescendantOf(rootNode) && selectorMatches(m_selectors.first(), element.get(), rootNode))
++                matches.append(WTF::move(element));
++        }
++        // The top layer is in the order elements entered it; the result is in tree order.
++        std::ranges::sort(matches, [](auto& a, auto& b) {
++            return a->compareDocumentPosition(b.get()) & Node::DOCUMENT_POSITION_FOLLOWING;
++        });
++        for (auto& element : matches) {
++            appendOutputForElement(output, element);
++            if constexpr (std::is_same_v<OutputType, Element*>)
++                return;
++        }
++        return;
++    }
++
+     RefPtr<ContainerNode> searchRootNode = &rootNode;
+     switch (m_matchType) {
+     case MatchType::RightMostWithIdMatch:

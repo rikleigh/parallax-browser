@@ -1,0 +1,36 @@
+diff --git a/Source/WebCore/dom/Document.cpp b/Source/WebCore/dom/Document.cpp
+index eb3860c0a2..a5b138478a 100644
+--- a/Source/WebCore/dom/Document.cpp
++++ b/Source/WebCore/dom/Document.cpp
+@@ -4824,6 +4824,31 @@ Seconds Document::domTimerAlignmentInterval(bool hasReachedMaxNestingLevel) cons
+     if (!protect(topOrigin())->isSameOriginDomain(protect(securityOrigin())) && !hasHadUserInteraction())
+         alignmentInterval = std::max(alignmentInterval, DOMTimer::nonInteractedCrossOriginFrameAlignmentInterval());
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: say when nested timers get pushed to coarse steps, and why (a frame scrolled out of
++    // view, or the page taken for hidden), at most every 10 s.
++    if (alignmentInterval >= 25_ms) {
++        static unsigned s_frameOffscreen, s_pageThrottled, s_other;
++        static MonotonicTime s_since;
++        if (m_isTimerThrottlingEnabled)
++            s_frameOffscreen++;
++        else if (auto* page = this->page(); page && page->domTimerAlignmentInterval() >= 25_ms)
++            s_pageThrottled++;
++        else
++            s_other++;
++        auto now = MonotonicTime::now();
++        if (!s_since)
++            s_since = now;
++        else if (now - s_since >= 10_s) {
++            WTFLogAlways("[timers] %.0f s: %u nested timer(s) put on coarse steps (frame out of view %u, page throttled as hidden %u, other %u); the last in %s%s, step %.0f ms",
++                (now - s_since).seconds(), s_frameOffscreen + s_pageThrottled + s_other, s_frameOffscreen, s_pageThrottled, s_other,
++                url().string().left(80).utf8().data(), frame() && frame()->isMainFrame() ? " (main frame)" : " (a subframe)", alignmentInterval.milliseconds());
++            s_frameOffscreen = s_pageThrottled = s_other = 0;
++            s_since = now;
++        }
++    }
++#endif
++
+     return alignmentInterval;
+ }
+ 

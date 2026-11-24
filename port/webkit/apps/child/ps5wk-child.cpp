@@ -224,6 +224,35 @@ static int rendezvous(const char* path, unsigned long long processIdentifier)
 // tmpfs: after ~14 launches the title's bind failed with ENOSPC. The title
 // itself can't list the directory (EPERM), so each new payload removes the
 // files of UIProcesses whose ui socket no longer has a listener.
+// A FileSystemWritableStream's temporary file (WebKit's FileSystemStorageHandle) outlives a
+// NetworkProcess that was killed while a page was writing. Only a NetworkProcess makes them, and
+// the one starting with a title run is the only one (reportStalePayloads warns otherwise), so at
+// its start every one left in either temporary directory is an orphan: /system_tmp/ps5wk from
+// builds before TMPDIR moved to /data, /data/ps5webkit/home/tmp since.
+static void removeStaleWritableStreams()
+{
+    static const char* const directories[] = { PS5WK_LAUNCH_DIR, "/data/ps5webkit/home/tmp" };
+    unsigned removed = 0, failed = 0;
+    for (const char* directory : directories) {
+        DIR* dir = opendir(directory);
+        if (!dir)
+            continue;
+        while (struct dirent* entry = readdir(dir)) {
+            if (strncmp(entry->d_name, "FileSystemWritableStream", strlen("FileSystemWritableStream")))
+                continue;
+            std::string path = std::string(directory) + "/" + entry->d_name;
+            if (!unlink(path.c_str()))
+                removed++;
+            else
+                failed++;
+        }
+        closedir(dir);
+    }
+    if (removed || failed)
+        LOG("stale files: %u unfinished FileSystemWritableStream file(s) of an earlier NetworkProcess removed%s", removed,
+            failed ? " (some could not be)" : "");
+}
+
 static void removeStaleRuntimeFiles(int uiPid)
 {
     DIR* dir = opendir(PS5WK_LAUNCH_DIR);
@@ -339,7 +368,14 @@ static void setupEnvironment(const char* launchPath, bool network = false)
     setenv("XDG_DATA_HOME", "/data/ps5webkit/home/data", 0);
     setenv("XDG_CONFIG_HOME", "/data/ps5webkit/home/config", 0);
     setenv("XDG_RUNTIME_DIR", "/system_tmp/ps5wk", 0);
-    setenv("TMPDIR", "/system_tmp/ps5wk", 0);
+    // Temporary files on /data, as the title's (ps5browser.c): /system_tmp is a 0.3 MB tmpfs for
+    // the sockets. The NetworkProcess writes every FileSystemWritableStream (a page's OPFS
+    // createWritable()) to a temporary file first, so one over ~0.2 MB failed there, and each
+    // one a killed title left behind stayed until a reboot: after a dozen kills the title could
+    // not bind its sockets and hung at start (nfsu2.xyz, 2026-11-24). On /data, the final move
+    // into the origin's OPFS folder is also a rename on the same file system.
+    mkdir("/data/ps5webkit/home/tmp", 0777);
+    setenv("TMPDIR", "/data/ps5webkit/home/tmp", 0);
     setenv("GIO_USE_VFS", "local", 0);
     setenv("GSETTINGS_BACKEND", "memory", 0);
     setenv("TZ", "UTC", 0);
@@ -387,8 +423,10 @@ static void setupEnvironment(const char* launchPath, bool network = false)
         snprintf(file, sizeof(file), "/data/ps5webkit/child-%d.env", uiPid);
         readEnvFile(file);
         removeStaleRuntimeFiles(uiPid);
-        if (network)
+        if (network) {
+            removeStaleWritableStreams();
             reportStalePayloads(uiPid);
+        }
     }
 }
 

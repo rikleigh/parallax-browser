@@ -676,6 +676,39 @@ unsigned ps5wk_backtrace_context(const void* ucontext, uintptr_t* out)
     return contextUnwind(ucontext, findThread((uintptr_t)pthread_self()), out);
 }
 
+// The calling thread's own stack, starting in this function (out[0]). No
+// allocation and no lock: the heap profiler calls it from inside malloc
+// (apps/title/heapprof.c). The thread's stack bounds come from the thread
+// table (titlemem.c's pthread_create wrapper, or ps5wk_profiler_register_self);
+// without them the walk stays in the current page of the stack.
+__attribute__((noinline)) unsigned ps5wk_backtrace_here(uintptr_t* out, unsigned max)
+{
+    uintptr_t pc, sp, fp;
+    __asm__ volatile("lea 0(%%rip), %0\n\tmov %%rsp, %1\n\tmov %%rbp, %2" : "=r"(pc), "=r"(sp), "=r"(fp));
+    uintptr_t lo = sp, hi = (sp + 4096) & ~(uintptr_t)4095;
+    thread_t* t = findThread((uintptr_t)pthread_self());
+    if (t && atomic_load_explicit(&t->ready, memory_order_acquire) && sp >= t->lo && sp < t->hi)
+        hi = t->hi;
+    uintptr_t frames[MAX_FRAMES];
+    unsigned n = unwind(pc, sp, fp, lo, hi, frames);
+    if (n > max)
+        n = max;
+    memcpy(out, frames, n * sizeof *out);
+    return n;
+}
+
+// One pc as the .prof files write it: an offset in the executable, j<tier>
+// for JIT code, x<address> for other modules.
+size_t ps5wk_backtrace_format_pc(char* buffer, size_t size, uintptr_t pc)
+{
+    uintptr_t js = atomic_load(&jitStart), je = atomic_load(&jitEnd);
+    if (pc >= textStart && pc < textEnd)
+        return (size_t)snprintf(buffer, size, "%lx", (unsigned long)(pc - base));
+    if (pc >= js && pc < je)
+        return (size_t)snprintf(buffer, size, "j:%lx", (unsigned long)pc);
+    return (size_t)snprintf(buffer, size, "x%lx", (unsigned long)pc);
+}
+
 void ps5wk_backtrace_refresh_jit(void)
 {
     if (ps5wk_jit_memory) {

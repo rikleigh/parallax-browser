@@ -77,6 +77,10 @@ void g_io_openssl_load(void*);
  * file has no direct-memory heap): weak, NULL there. */
 void ps5wk_title_mem_log(const char* milestone) __attribute__((weak));
 size_t ps5wk_title_flexible_free(void) __attribute__((weak));
+/* heapprof.c: which code holds the title's malloc memory (on while
+ * /data/ps5webkit/heap-profile exists). */
+void ps5wk_heapprof_start(void) __attribute__((weak));
+void ps5wk_heapprof_snapshot(const char* why) __attribute__((weak));
 unsigned ps5wk_title_check_imports(char* out, size_t size, unsigned* total) __attribute__((weak));
 const char* ps5wk_title_build_id(void) __attribute__((weak));
 static double flexibleMB(void)
@@ -123,6 +127,8 @@ static gboolean windDownStep(gpointer data)
     if (streams && ms < 2000)
         return G_SOURCE_CONTINUE;
     spike_log("wind-down: %d audio stream(s) left after %.0f ms; ending the WebProcess and the audio server", streams, ms);
+    if (ps5wk_heapprof_snapshot)
+        ps5wk_heapprof_snapshot("wind-down"); /* before the WebProcess's pages go */
     if (webView)
         webkit_web_view_terminate_web_process(webView);
     ps5wk_audio_server_stop();
@@ -1464,9 +1470,29 @@ static void toggleSettings(void)
         webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
 }
 
+/* "Leave this page?" (a page's beforeunload handler): WPE's default
+ * script-dialog handler shows nothing, and the dialog closes with its
+ * default answer, "stay". A game that sets the handler once played
+ * (nfsu2.xyz, 2026-11-24) then kept Reload, Home, Back, links and the
+ * wind-down's about:blank from ever leaving it, with no word on screen. The
+ * question comes only for a navigation the user asked for (WebKit asks it
+ * only after the page had a user gesture), and the browser has no dialog to
+ * put it in, so the answer is "leave". alert/confirm/prompt keep the
+ * default (they return at once: alert done, confirm false, prompt null). */
+static gboolean onScriptDialog(WebKitWebView* view, WebKitScriptDialog* dialog, gpointer data)
+{
+    (void)data;
+    if (webkit_script_dialog_get_dialog_type(dialog) != WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM)
+        return FALSE;
+    webkit_script_dialog_confirm_set_confirmed(dialog, TRUE);
+    spike_log("browser: %s asked to stay (beforeunload); leaving it", webkit_web_view_get_uri(view) ? webkit_web_view_get_uri(view) : "the page");
+    return TRUE;
+}
+
 /* Every tab's view gets these (browserui.c makes the views of live tabs). */
 void ps5wk_connect_web_view(WebKitWebView* view)
 {
+    g_signal_connect(view, "script-dialog", G_CALLBACK(onScriptDialog), NULL);
     g_signal_connect(webkit_web_view_get_wpe_view(view), "event", G_CALLBACK(onViewEvent), NULL);
     g_signal_connect(view, "load-changed", G_CALLBACK(onLoadChanged), NULL);
     g_signal_connect(view, "load-failed", G_CALLBACK(onLoadFailed), NULL);
@@ -3408,6 +3434,8 @@ int main(int argc, char** argv)
     }
     memLog("main");
     startTitleProfiler();
+    if (ps5wk_heapprof_start)
+        ps5wk_heapprof_start();
     if (ps5wk_title_check_imports) {
         static char names[1024];
         unsigned total = 0;

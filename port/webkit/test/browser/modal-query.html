@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- Patch 0148 (querySelector :modal from the top layer): the fast path must return what a full
+     walk does. Each case compares querySelectorAll / querySelector with a walk that calls
+     element.matches(); the page title and a console line say PASS or FAIL. -->
+<meta charset="utf-8">
+<title>modal-query: running</title>
+<body>
+<div id="a"><dialog id="d1">one</dialog><section id="s"><dialog id="d2">two</dialog><p class="x">p</p></section></div>
+<dialog id="d3">three</dialog>
+<div id="host"></div>
+<pre id="out"></pre>
+<script>
+const out = document.getElementById('out');
+let failures = 0, checks = 0;
+function walk(root, selector) {
+    const found = [];
+    const it = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    for (let n = it.nextNode(); n; n = it.nextNode())
+        if (n.matches(selector)) found.push(n);
+    return found;
+}
+function ids(list) { return Array.from(list, e => e.id || e.tagName).join(','); }
+function check(label, root, selector) {
+    checks++;
+    const want = walk(root, selector);
+    const all = root.querySelectorAll(selector);
+    const first = root.querySelector(selector);
+    const ok = ids(all) === ids(want) && (first || null) === (want[0] || null);
+    if (!ok) failures++;
+    out.textContent += (ok ? 'ok   ' : 'FAIL ') + label + ' [' + selector + ']: got ' + ids(all) + ' / first ' + (first ? first.id : '-') + ', want ' + ids(want) + '\n';
+}
+const sels = ['dialog[open]:modal', ':modal', 'dialog:modal', '#a :modal', 'section > :modal', ':modal:not(#d2)', 'dialog:not(:modal)'];
+function all(label) {
+    for (const s of sels) {
+        check(label + ' / document', document, s);
+        check(label + ' / #a', document.getElementById('a'), s);
+        check(label + ' / #s', document.getElementById('s'), s);
+    }
+}
+all('nothing open');
+document.getElementById('d1').show();
+all('d1 open, not modal');
+document.getElementById('d2').showModal();
+all('d2 modal');
+document.getElementById('d3').showModal();
+all('d2 and d3 modal (d3 last in the top layer)');
+document.getElementById('d2').showModal(); // already open: no change
+all('d2 asked again');
+document.getElementById('d3').close();
+all('d3 closed');
+const d2 = document.getElementById('d2');
+d2.remove();
+all('d2 removed while modal');
+document.getElementById('s').append(d2);
+all('d2 put back (closed? open attribute kept)');
+d2.close(); d2.showModal();
+all('d2 modal again');
+const shadow = document.getElementById('host').attachShadow({ mode: 'open' });
+shadow.innerHTML = '<dialog id="sd">shadow</dialog>';
+shadow.getElementById('sd').showModal();
+all('a modal dialog in a shadow root');
+check('shadow root', shadow, ':modal');
+check('shadow root', shadow, 'dialog[open]:modal');
+const frag = document.createElement('div');
+frag.innerHTML = '<dialog id="fd" open>detached</dialog>';
+check('a detached tree', frag, ':modal');
+check('a detached tree', frag, 'dialog[open]');
+const verdict = failures ? 'FAIL' : 'PASS';
+document.title = 'modal-query: ' + verdict;
+out.textContent = verdict + ': ' + (checks - failures) + ' of ' + checks + ' checks\n' + out.textContent;
+console.log('MODALQUERY ' + verdict + ' ' + (checks - failures) + '/' + checks + (failures ? ' ' + out.textContent.split('\n').filter(l => l.startsWith('FAIL')).join(' | ') : ''));
+</script>

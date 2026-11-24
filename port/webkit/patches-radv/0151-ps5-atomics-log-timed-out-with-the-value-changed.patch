@@ -1,0 +1,64 @@
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.cpp b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+index 0bf418c4cd..1e11d624c8 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.cpp
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+@@ -78,7 +78,10 @@ struct Histogram {
+         dataLogLn("[atomics] ", name, ": ", n, " in ", static_cast<uint64_t>(seconds), " s, ", total / n, " us avg, ", static_cast<uint64_t>(total / seconds / 1000), " ms/s; under 50 us ", b[0], ", 200 us ", b[1], ", 1 ms ", b[2], ", 5 ms ", b[3], ", 20 ms ", b[4], ", 100 ms ", b[5], ", 500 ms ", b[6], ", 950 ms ", b[7], ", 1050 ms ", b[8], ", more ", b[9]);
+     }
+ };
+-static Histogram syncWaitNotified, syncWaitTimedOut, asyncNotifyToTask, asyncTimedOut, asyncNotified;
++// "...changed": timed out though the value no longer equalled the expected one, i.e. the value
++// changed during the wait and no notify woke the waiter (a lost wake-up, or a writer that does not
++// notify).
++static Histogram syncWaitNotified, syncWaitTimedOut, syncWaitTimedOutChanged, asyncNotifyToTask, asyncTimedOut, asyncTimedOutChanged, asyncNotified;
+ static std::atomic<uint64_t> syncNotEqual { 0 };
+ static std::atomic<double> lastDump { 0 };
+ static bool enabled()
+@@ -101,9 +104,11 @@ static void maybeDump()
+     double seconds = now - last;
+     syncWaitNotified.dumpAndReset("wait, notified", seconds);
+     syncWaitTimedOut.dumpAndReset("wait, timed out", seconds);
++    syncWaitTimedOutChanged.dumpAndReset("wait, timed out with the value changed", seconds);
+     asyncNotifyToTask.dumpAndReset("waitAsync, notify to task", seconds);
+     asyncNotified.dumpAndReset("waitAsync, notified (call to notify)", seconds);
+     asyncTimedOut.dumpAndReset("waitAsync, timed out (its timeout)", seconds);
++    asyncTimedOutChanged.dumpAndReset("waitAsync, timed out with the value changed (its timeout)", seconds);
+     if (uint64_t n = syncNotEqual.exchange(0))
+         dataLogLn("[atomics] wait, not-equal at once: ", static_cast<uint64_t>(n / seconds), "/s");
+ }
+@@ -198,6 +203,8 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+ 
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+         ps5TimedOut = true;
++        if (PS5AtomicsLog::enabled() && WTF::atomicLoad(ptr) != expectedValue)
++            PS5AtomicsLog::syncWaitTimedOutChanged.add(MonotonicTime::now() - ps5WaitStart);
+ #endif
+         didGetDequeued = list->findAndRemove(listLocker, syncWaiter);
+         ASSERT(didGetDequeued);
+@@ -229,19 +236,23 @@ JSValue WaiterListManager::waitAsyncImpl(JSGlobalObject* globalObject, VM& vm, V
+ 
+             Ref<Waiter> waiter = adoptRef(*new Waiter(promise));
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+-            waiter->ps5Started = MonotonicTime::now();
++            if (PS5AtomicsLog::enabled())
++                waiter->ps5Started = MonotonicTime::now();
+ #endif
+             list->addLast(listLocker, waiter);
+ 
+             if (timeout != Seconds::infinity()) {
+                 Ref<RunLoop::DispatchTimer> timer = RunLoop::currentSingleton().scheduleTimer(timeout, [this, ptr, waiter = waiter.copyRef()
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+-                    , timeout
++                    , timeout, expectedValue
+ #endif
+                     ]() mutable {
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+-                    if (PS5AtomicsLog::enabled() && waiter->isOnList())
++                    if (PS5AtomicsLog::enabled() && waiter->isOnList()) {
+                         PS5AtomicsLog::asyncTimedOut.add(timeout);
++                        if (WTF::atomicLoad(ptr) != expectedValue)
++                            PS5AtomicsLog::asyncTimedOutChanged.add(timeout);
++                    }
+ #endif
+                     timeoutAsyncWaiter(ptr, WTF::move(waiter));
+                 });

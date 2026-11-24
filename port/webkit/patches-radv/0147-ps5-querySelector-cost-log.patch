@@ -1,0 +1,121 @@
+diff --git a/Source/WebCore/dom/SelectorQuery.cpp b/Source/WebCore/dom/SelectorQuery.cpp
+index 647c5ade50..e17ebeb006 100644
+--- a/Source/WebCore/dom/SelectorQuery.cpp
++++ b/Source/WebCore/dom/SelectorQuery.cpp
+@@ -41,7 +41,12 @@
+ #include "StyledElement.h"
+ #include "TreeScopeInlines.h"
+ #include "TypedElementDescendantIteratorInlines.h"
++#include <wtf/HashMap.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/NeverDestroyed.h>
+ #include <wtf/TZoneMallocInlines.h>
++#include <wtf/text/MakeString.h>
++#include <stdio.h>
+ 
+ namespace WebCore {
+ 
+@@ -204,9 +209,89 @@ RefPtr<Element> SelectorDataList::closest(Element& targetElement) const
+     return nullptr;
+ }
+ 
++// PS5: querySelector(All) costs per selector, logged every 10 s while PS5WK_QSA_STATS is set (a
++// page that spent 40% of the title's main thread in querySelectorAll, nfsu2.xyz, 2026-11-24).
++// Main thread only, as the DOM is.
++namespace {
++struct PS5QueryStats {
++    String text;
++    unsigned matchType { 0 };
++    uint64_t calls { 0 };
++    uint64_t results { 0 };
++    Seconds time;
++    uint64_t walked { 0 }; // elements under the root of the call that was measured last
++};
++}
++
++static bool ps5QueryStatsOn()
++{
++    static int on = -1;
++    if (on < 0)
++        on = getenv("PS5WK_QSA_STATS") ? 1 : 0;
++    return on;
++}
++
++static void ps5RecordQuery(const SelectorDataList& list, const CSSSelector& first, unsigned matchType, ContainerNode& rootNode, Seconds elapsed, size_t results, bool all)
++{
++    static NeverDestroyed<HashMap<const void*, PS5QueryStats>> stats;
++    static MonotonicTime lastReport = MonotonicTime::now();
++    static uint64_t calls;
++    auto& entry = stats->ensure(&list, [&] {
++        PS5QueryStats s;
++        s.text = makeString(all ? "all "_s : "first "_s, first.selectorText());
++        s.matchType = matchType;
++        return s;
++    }).iterator->value;
++    entry.calls++;
++    entry.results += results;
++    entry.time += elapsed;
++    calls++;
++    if (!(entry.calls & 63)) {
++        uint64_t n = 0;
++        for (auto& element : descendantsOfType<Element>(rootNode)) {
++            UNUSED_PARAM(element);
++            n++;
++        }
++        entry.walked = n;
++    }
++    auto now = MonotonicTime::now();
++    if (now - lastReport < 10_s)
++        return;
++    Vector<PS5QueryStats*> sorted;
++    Seconds total;
++    for (auto& value : stats->values()) {
++        sorted.append(&value);
++        total += value.time;
++    }
++    std::ranges::sort(sorted, [](auto* a, auto* b) { return a->time > b->time; });
++    fprintf(stderr, "[qsa] %.1f s: %llu calls, %.0f ms in all, %u selectors\n", (now - lastReport).seconds(), static_cast<unsigned long long>(calls), total.milliseconds(), sorted.size());
++    for (size_t i = 0; i < sorted.size() && i < 8; i++) {
++        auto* e = sorted[i];
++        if (!e->calls)
++            break;
++        fprintf(stderr, "[qsa]   %.0f ms, %llu calls (%.1f us each), %.1f results each, ~%llu elements under the root, match type %u: %s\n", e->time.milliseconds(),
++            static_cast<unsigned long long>(e->calls), e->time.microseconds() / e->calls, static_cast<double>(e->results) / e->calls,
++            static_cast<unsigned long long>(e->walked), e->matchType, e->text.utf8().data());
++    }
++    for (auto& value : stats->values()) {
++        value.calls = 0;
++        value.results = 0;
++        value.time = { };
++    }
++    calls = 0;
++    lastReport = now;
++}
++
+ Ref<NodeList> SelectorDataList::queryAll(ContainerNode& rootNode) const
+ {
+     Vector<Ref<Element>> result;
++    if (ps5QueryStatsOn()) [[unlikely]] {
++        unsigned matchType = static_cast<unsigned>(m_matchType);
++        auto start = MonotonicTime::now();
++        execute(rootNode, result);
++        ps5RecordQuery(*this, m_selectors.first().selector, matchType, rootNode, MonotonicTime::now() - start, result.size(), true);
++        return StaticElementList::create(WTF::move(result));
++    }
+     execute(rootNode, result);
+     return StaticElementList::create(WTF::move(result));
+ }
+@@ -214,6 +299,13 @@ Ref<NodeList> SelectorDataList::queryAll(ContainerNode& rootNode) const
+ Element* SelectorDataList::queryFirst(ContainerNode& rootNode) const
+ {
+     Element* result = nullptr;
++    if (ps5QueryStatsOn()) [[unlikely]] {
++        unsigned matchType = static_cast<unsigned>(m_matchType);
++        auto start = MonotonicTime::now();
++        execute(rootNode, result);
++        ps5RecordQuery(*this, m_selectors.first().selector, matchType, rootNode, MonotonicTime::now() - start, result ? 1 : 0, false);
++        return result;
++    }
+     execute(rootNode, result);
+     return result;
+ }

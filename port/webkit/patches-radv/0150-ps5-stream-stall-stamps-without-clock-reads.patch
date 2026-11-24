@@ -1,0 +1,89 @@
+diff --git a/Source/WebKit/Platform/IPC/StreamServerConnection.cpp b/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
+index 0f4233d791..515828a718 100644
+--- a/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
++++ b/Source/WebKit/Platform/IPC/StreamServerConnection.cpp
+@@ -48,15 +48,25 @@ namespace {
+ struct PS5StreamThread {
+     std::atomic<uintptr_t> thread { 0 };
+     std::atomic<uint16_t> message { 0 };
+-    std::atomic<double> since { 0 };
++    std::atomic<uint64_t> since { 0 }; // time stamp counter (ps5TimeStamp)
+     std::atomic<uint16_t> lastMessage { 0 };
+-    std::atomic<double> lastEnd { 0 };
++    std::atomic<uint64_t> lastEnd { 0 };
+ };
+ PS5StreamThread s_ps5StreamThreads[4];
+ std::atomic<unsigned> s_ps5StreamThreadCount;
+-// Two clock reads per stream message (each WebGL call is one; the title has no
+-// fast clock): only when the title asks, with pages in the browser process.
++// Two time stamps per stream message (each WebGL or WebGPU call is one): only when the title asks,
++// with pages in the browser process. They were clock reads, a system call each on the console:
++// 40% of the WebGPU work queue's CPU for a WebGPU game (nfsu2.xyz, 2026-11-24). The time stamp
++// counter costs a few cycles; the report, which runs only for a stall, converts it to seconds
++// against the clock it read when watching began.
+ std::atomic<bool> s_ps5StreamThreadsOn;
++uint64_t s_ps5StartStamp;
++double s_ps5StartSeconds;
++
++inline uint64_t ps5TimeStamp()
++{
++    return __builtin_ia32_rdtsc();
++}
+ 
+ PS5StreamThread* ps5StreamThread()
+ {
+@@ -345,7 +355,7 @@ bool StreamServerConnection::dispatchStreamMessage(Decoder& message, StreamMessa
+ #if defined(PS5_PAYLOAD_SDK)
+     PS5StreamThread* ps5Thread = ps5StreamThread();
+     if (ps5Thread) {
+-        ps5Thread->since = MonotonicTime::now().secondsSinceEpoch().value();
++        ps5Thread->since = ps5TimeStamp();
+         ps5Thread->message = static_cast<uint16_t>(message.messageName());
+     }
+ #endif
+@@ -353,7 +363,7 @@ bool StreamServerConnection::dispatchStreamMessage(Decoder& message, StreamMessa
+ #if defined(PS5_PAYLOAD_SDK)
+     if (ps5Thread) {
+         ps5Thread->lastMessage = ps5Thread->message.load();
+-        ps5Thread->lastEnd = MonotonicTime::now().secondsSinceEpoch().value();
++        ps5Thread->lastEnd = ps5TimeStamp();
+         ps5Thread->message = 0;
+     }
+ #endif
+@@ -405,6 +415,8 @@ void StreamServerConnection::markCurrentlyDispatchedMessageAsInvalid(const Strin
+ #if defined(PS5_PAYLOAD_SDK)
+ extern "C" void ps5wk_stream_threads_watch(void)
+ {
++    IPC::s_ps5StartSeconds = MonotonicTime::now().secondsSinceEpoch().value();
++    IPC::s_ps5StartStamp = IPC::ps5TimeStamp();
+     IPC::s_ps5StreamThreadsOn = true;
+ }
+ 
+@@ -418,7 +430,14 @@ extern "C" size_t ps5wk_stream_threads_report(char* out, size_t size)
+     }
+     size_t used = 0;
+     out[0] = 0;
+-    double now = MonotonicTime::now().secondsSinceEpoch().value();
++    double nowSeconds = MonotonicTime::now().secondsSinceEpoch().value();
++    uint64_t nowStamp = IPC::ps5TimeStamp();
++    // Counts per second since watching began (an invariant counter; the first report comes well
++    // after, so the error is small).
++    double perSecond = nowSeconds > IPC::s_ps5StartSeconds ? (nowStamp - IPC::s_ps5StartStamp) / (nowSeconds - IPC::s_ps5StartSeconds) : 0;
++    auto secondsSince = [&](uint64_t stamp) {
++        return perSecond > 0 && stamp && stamp <= nowStamp ? (nowStamp - stamp) / perSecond : 0.0;
++    };
+     unsigned count = std::min<unsigned>(IPC::s_ps5StreamThreadCount.load(), std::size(IPC::s_ps5StreamThreads));
+     for (unsigned i = 0; i < count && used + 1 < size; i++) {
+         auto& t = IPC::s_ps5StreamThreads[i];
+@@ -426,9 +445,9 @@ extern "C" size_t ps5wk_stream_threads_report(char* out, size_t size)
+         uint16_t last = t.lastMessage.load();
+         int n = message
+             ? snprintf(out + used, size - used, "%sstream thread %#lx: in %s for %.1f s", used ? "; " : "", static_cast<unsigned long>(t.thread.load()),
+-                IPC::description(static_cast<IPC::MessageName>(message)).characters(), now - t.since.load())
++                IPC::description(static_cast<IPC::MessageName>(message)).characters(), secondsSince(t.since.load()))
+             : snprintf(out + used, size - used, "%sstream thread %#lx: idle for %.1f s (last %s)", used ? "; " : "", static_cast<unsigned long>(t.thread.load()),
+-                t.lastEnd.load() > 0 ? now - t.lastEnd.load() : 0.0, last ? IPC::description(static_cast<IPC::MessageName>(last)).characters() : "none");
++                secondsSince(t.lastEnd.load()), last ? IPC::description(static_cast<IPC::MessageName>(last)).characters() : "none");
+         if (n < 0)
+             break;
+         used = std::min(size - 1, used + static_cast<size_t>(n));

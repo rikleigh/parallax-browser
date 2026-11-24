@@ -1,0 +1,52 @@
+diff --git a/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp b/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp
+index 9f38559bea..422d721646 100644
+--- a/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp
++++ b/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp
+@@ -274,6 +274,18 @@ JSObject* JSWebAssemblyMemory::type(JSGlobalObject* globalObject)
+ }
+ 
+ 
++// PS5: a shared memory (WebAssembly threads) is wrapped by a JSWebAssemblyMemory in every worker
++// it is posted to, and each wrapper counted the whole memory as its heap's extra memory: a game's
++// 2 GB shared memory made each of its ~20 workers' heaps look 2-4 GB, so each collected only after
++// close to 1 GB of its own garbage (MarkedBlocks), and the title's heap grew ~400 MB a minute
++// (nfsu2.xyz, 2026-11-24). No one heap's collection can free a shared memory (every worker holding
++// it keeps it alive), so it is left out of the GC's accounting. Non-shared memories are counted
++// as before.
++static bool countsAsExtraMemory(const Wasm::Memory& memory)
++{
++    return memory.sharingMode() != MemorySharingMode::Shared;
++}
++
+ void JSWebAssemblyMemory::growSuccessCallback(VM& vm, PageCount oldPageCount, PageCount newPageCount)
+ {
+     if (m_buffer) {
+@@ -296,14 +308,16 @@ void JSWebAssemblyMemory::growSuccessCallback(VM& vm, PageCount oldPageCount, Pa
+         }
+     }
+ 
+-    vm.heap.reportExtraMemoryAllocated(this, newPageCount.bytes() - oldPageCount.bytes());
++    if (countsAsExtraMemory(memory()))
++        vm.heap.reportExtraMemoryAllocated(this, newPageCount.bytes() - oldPageCount.bytes());
+ }
+ 
+ void JSWebAssemblyMemory::finishCreation(VM& vm)
+ {
+     Base::finishCreation(vm);
+     ASSERT(inherits(info()));
+-    vm.heap.reportExtraMemoryAllocated(this, memory().size());
++    if (countsAsExtraMemory(memory()))
++        vm.heap.reportExtraMemoryAllocated(this, memory().size());
+ }
+ 
+ void JSWebAssemblyMemory::destroy(JSCell* cell)
+@@ -320,7 +334,8 @@ void JSWebAssemblyMemory::visitChildrenImpl(JSCell* cell, Visitor& visitor)
+ 
+     Base::visitChildren(thisObject, visitor);
+     visitor.append(thisObject->m_bufferWrapper);
+-    visitor.reportExtraMemoryVisited(thisObject->memory().size());
++    if (countsAsExtraMemory(thisObject->memory()))
++        visitor.reportExtraMemoryVisited(thisObject->memory().size());
+ }
+ 
+ DEFINE_VISIT_CHILDREN(JSWebAssemblyMemory);

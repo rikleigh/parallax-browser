@@ -1,0 +1,86 @@
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.cpp b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+index 90222bc88d..0bf418c4cd 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.cpp
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+@@ -50,8 +50,9 @@ namespace JSC {
+ // Atomics.waitAsync takes to run its task, every 5 s. An Emscripten pthreads page proxies calls
+ // to its main thread with this pair, and the round trips are what such a page waits for.
+ namespace PS5AtomicsLog {
+-static constexpr unsigned bucketCount = 8;
+-static constexpr double bucketLimitsUS[bucketCount] = { 50, 100, 200, 500, 1000, 2000, 5000, 1e18 };
++// Up past a second: a waiter that wakes only at its timeout (nfsu2.xyz's ~1 s reads, 2026-11-24).
++static constexpr unsigned bucketCount = 10;
++static constexpr double bucketLimitsUS[bucketCount] = { 50, 200, 1000, 5000, 20000, 100000, 500000, 950000, 1050000, 1e18 };
+ struct Histogram {
+     std::atomic<uint64_t> count { 0 };
+     std::atomic<uint64_t> totalUS { 0 };
+@@ -74,10 +75,10 @@ struct Histogram {
+             b[i] = buckets[i].exchange(0);
+         if (!n)
+             return;
+-        dataLogLn("[atomics] ", name, ": ", static_cast<uint64_t>(n / seconds), "/s, ", total / n, " us avg, ", static_cast<uint64_t>(total / seconds / 1000), " ms/s; under 50 us ", b[0], ", 100 ", b[1], ", 200 ", b[2], ", 500 ", b[3], ", 1 ms ", b[4], ", 2 ms ", b[5], ", 5 ms ", b[6], ", more ", b[7]);
++        dataLogLn("[atomics] ", name, ": ", n, " in ", static_cast<uint64_t>(seconds), " s, ", total / n, " us avg, ", static_cast<uint64_t>(total / seconds / 1000), " ms/s; under 50 us ", b[0], ", 200 us ", b[1], ", 1 ms ", b[2], ", 5 ms ", b[3], ", 20 ms ", b[4], ", 100 ms ", b[5], ", 500 ms ", b[6], ", 950 ms ", b[7], ", 1050 ms ", b[8], ", more ", b[9]);
+     }
+ };
+-static Histogram syncWaitNotified, syncWaitTimedOut, asyncNotifyToTask;
++static Histogram syncWaitNotified, syncWaitTimedOut, asyncNotifyToTask, asyncTimedOut, asyncNotified;
+ static std::atomic<uint64_t> syncNotEqual { 0 };
+ static std::atomic<double> lastDump { 0 };
+ static bool enabled()
+@@ -101,6 +102,8 @@ static void maybeDump()
+     syncWaitNotified.dumpAndReset("wait, notified", seconds);
+     syncWaitTimedOut.dumpAndReset("wait, timed out", seconds);
+     asyncNotifyToTask.dumpAndReset("waitAsync, notify to task", seconds);
++    asyncNotified.dumpAndReset("waitAsync, notified (call to notify)", seconds);
++    asyncTimedOut.dumpAndReset("waitAsync, timed out (its timeout)", seconds);
+     if (uint64_t n = syncNotEqual.exchange(0))
+         dataLogLn("[atomics] wait, not-equal at once: ", static_cast<uint64_t>(n / seconds), "/s");
+ }
+@@ -225,10 +228,21 @@ JSValue WaiterListManager::waitAsyncImpl(JSGlobalObject* globalObject, VM& vm, V
+             isAsync = true;
+ 
+             Ref<Waiter> waiter = adoptRef(*new Waiter(promise));
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++            waiter->ps5Started = MonotonicTime::now();
++#endif
+             list->addLast(listLocker, waiter);
+ 
+             if (timeout != Seconds::infinity()) {
+-                Ref<RunLoop::DispatchTimer> timer = RunLoop::currentSingleton().scheduleTimer(timeout, [this, ptr, waiter = waiter.copyRef()]() mutable {
++                Ref<RunLoop::DispatchTimer> timer = RunLoop::currentSingleton().scheduleTimer(timeout, [this, ptr, waiter = waiter.copyRef()
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++                    , timeout
++#endif
++                    ]() mutable {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++                    if (PS5AtomicsLog::enabled() && waiter->isOnList())
++                        PS5AtomicsLog::asyncTimedOut.add(timeout);
++#endif
+                     timeoutAsyncWaiter(ptr, WTF::move(waiter));
+                 });
+                 waiter->setTimer(listLocker, WTF::move(timer));
+@@ -305,6 +319,10 @@ void WaiterListManager::notifyWaiterImpl(const AbstractLocker& listLocker, Ref<W
+     if (waiter->isAsync()) {
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+         MonotonicTime ps5Notified = MonotonicTime::now();
++        if (PS5AtomicsLog::enabled() && resolveResult == ResolveResult::Ok) {
++            PS5AtomicsLog::asyncNotified.add(ps5Notified - waiter->ps5Started);
++            PS5AtomicsLog::maybeDump();
++        }
+         waiter->scheduleWorkAndClear(listLocker, [resolveResult, ps5Notified](DeferredWorkTimer::Ticket& ticket) {
+             if (PS5AtomicsLog::enabled() && resolveResult == ResolveResult::Ok)
+                 PS5AtomicsLog::asyncNotifyToTask.add(MonotonicTime::now() - ps5Notified);
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.h b/Source/JavaScriptCore/runtime/WaiterListManager.h
+index 66a953d6b2..56e3ad1da2 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.h
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.h
+@@ -41,6 +41,9 @@ class Waiter final : public WTF::BasicRawSentinelNode<Waiter>, public ThreadSafe
+     WTF_MAKE_TZONE_ALLOCATED(Waiter);
+ 
+ public:
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    MonotonicTime ps5Started; // PS5: when an async waiter began (PS5WK_ATOMICS_LOG)
++#endif
+     Waiter(VM*);
+     Waiter(JSPromise*);
+ 

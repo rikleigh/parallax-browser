@@ -290,6 +290,41 @@ void dheap_trim(void)
 
 /* -- the wrapped family ------------------------------------------------------- */
 
+/* Bytes in the heap's live blocks (their usable sizes): with S.mapped it
+ * tells live data from free space the segments keep. */
+static atomic_size_t in_use;
+
+size_t dheap_in_use(void)
+{
+    return atomic_load_explicit(&in_use, memory_order_relaxed);
+}
+
+/* The heap profiler's hooks (apps/title/heapprof.c): unset, nothing is
+ * called. Only for blocks of this heap, never libc's fallbacks. */
+void (*volatile dheap_hook_alloc)(void *p, size_t usable);
+void (*volatile dheap_hook_free)(void *p, size_t usable);
+
+static void *note_alloc(void *p)
+{
+    if (p && dheap_owns(p)) {
+        const size_t usable = mspace_usable_size(p);
+        atomic_fetch_add_explicit(&in_use, usable, memory_order_relaxed);
+        void (*hook)(void *, size_t) = dheap_hook_alloc;
+        if (hook)
+            hook(p, usable);
+    }
+    return p;
+}
+
+static void note_free(void *p)
+{
+    const size_t usable = mspace_usable_size(p);
+    atomic_fetch_sub_explicit(&in_use, usable, memory_order_relaxed);
+    void (*hook)(void *, size_t) = dheap_hook_free;
+    if (hook)
+        hook(p, usable);
+}
+
 void *__real_calloc(size_t n, size_t size);
 void *__real_realloc(void *p, size_t size);
 int __real_posix_memalign(void **out, size_t align, size_t size);
@@ -308,22 +343,24 @@ void *__wrap_malloc(size_t size)
 {
     mspace m = arena();
     void *p = m ? mspace_malloc(m, size) : NULL;
-    return p ? p : fallback(__real_malloc(size));
+    return p ? note_alloc(p) : fallback(__real_malloc(size));
 }
 
 void *__wrap_calloc(size_t n, size_t size)
 {
     mspace m = arena();
     void *p = m ? mspace_calloc(m, n, size) : NULL;
-    return p ? p : fallback(__real_calloc(n, size));
+    return p ? note_alloc(p) : fallback(__real_calloc(n, size));
 }
 
 void __wrap_free(void *p)
 {
     if (!p)
         return;
-    if (dheap_owns(p))
+    if (dheap_owns(p)) {
+        note_free(p);
         mspace_free(arenas[0], p); /* FOOTERS: the block's own arena */
+    }
     else
         __real_free(p);
 }
@@ -338,9 +375,17 @@ void *__wrap_realloc(void *p, size_t size)
         __wrap_free(p);
         return NULL;
     }
+    /* As a free and a new allocation. The hook hears of the free first,
+     * while no other thread can have the address yet. */
+    const size_t before = mspace_usable_size(p);
+    void (*hook)(void *, size_t) = dheap_hook_free;
+    if (hook)
+        hook(p, before);
     void *q = mspace_realloc(arenas[0], p, size); /* FOOTERS: the block's own arena */
-    if (q)
-        return q;
+    if (q) {
+        atomic_fetch_sub_explicit(&in_use, before, memory_order_relaxed);
+        return note_alloc(q);
+    }
     /* Heap exhausted: move the block to libc. */
     q = fallback(__real_malloc(size));
     if (q) {
@@ -354,7 +399,7 @@ void *__wrap_realloc(void *p, size_t size)
 static void *aligned(size_t align, size_t size)
 {
     mspace m = arena();
-    return m ? mspace_memalign(m, align, size) : NULL;
+    return m ? note_alloc(mspace_memalign(m, align, size)) : NULL;
 }
 
 int __wrap_posix_memalign(void **out, size_t align, size_t size)

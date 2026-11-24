@@ -69,6 +69,8 @@ void dheap_stats(dheap_stats_t *st);
 int dheap_owns(const void *p);
 /* Give fully free segments back (mspace_trim on every arena). */
 void dheap_trim(void);
+/* Bytes in live blocks (usable sizes), kept by the wrappers. */
+size_t dheap_in_use(void);
 
 /* The real libc allocator, for the throughput comparison. */
 void *__real_malloc(size_t size);

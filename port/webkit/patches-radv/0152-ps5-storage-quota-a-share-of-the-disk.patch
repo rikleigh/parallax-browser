@@ -1,0 +1,48 @@
+diff --git a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
+index 107a034c98..32ec695031 100644
+--- a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
++++ b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
+@@ -783,6 +783,10 @@ OriginQuotaManager::Parameters NetworkStorageManager::originQuotaManagerParamete
+     // Use std::ceil instead of implicit conversion to make result more definitive.
+     uint64_t roundedQuota = std::ceil(quota);
+     uint64_t roundedStandardReportedQuota = std::ceil(standardReportedQuota);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    WTFLogAlways("[storage] quota for %s: %.1f MB (%s)", origin.clientOrigin.toString().utf8().data(), roundedQuota / 1048576.0,
++        increaseQuotaFunction ? "the fixed default: no ratio, or the volume size unknown" : "a share of the volume");
++#endif
+     return { roundedQuota, roundedStandardReportedQuota, WTF::move(increaseQuotaFunction), WTF::move(notifySpaceGrantedFunction) };
+ }
+ 
+diff --git a/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp b/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp
+index f7f2e3886a..f28f248efa 100644
+--- a/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp
++++ b/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp
+@@ -2726,6 +2726,20 @@ void WebsiteDataStore::removeRecentSearches(WallTime, CompletionHandler<void()>&
+     completionHandler();
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: a share of /data, as Safari gives a browser app, instead of the fixed 1 GiB per site.
++// Web games keep their data in OPFS/IndexedDB (nfsu2.xyz's preload needs about 1.7 GB), and
++// /data holds hundreds of GB. Past the total share WebKit evicts the least recently used sites.
++std::optional<double> WebsiteDataStore::defaultOriginQuotaRatio()
++{
++    return 0.6;
++}
++
++std::optional<double> WebsiteDataStore::defaultTotalQuotaRatio()
++{
++    return 0.8;
++}
++#else
+ std::optional<double> WebsiteDataStore::defaultOriginQuotaRatio()
+ {
+     return std::nullopt;
+@@ -2735,6 +2749,7 @@ std::optional<double> WebsiteDataStore::defaultTotalQuotaRatio()
+ {
+     return std::nullopt;
+ }
++#endif
+ 
+ #endif // !PLATFORM(COCOA)
+ 
