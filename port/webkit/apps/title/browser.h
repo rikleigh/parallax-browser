@@ -146,6 +146,9 @@ void ps5wk_entries_json(GString* out, GPtrArray* entries, unsigned max);
  * ps5browser.c's handlers. */
 void ps5wk_set_active_web_view(WebKitWebView* view);
 void ps5wk_connect_web_view(WebKitWebView* view);
+/* ps5browser.c: the http(s) link under the pointer in the page shown (any
+ * frame of it), NULL for none. */
+const char* ps5wk_hover_link(void);
 
 /* After the web view is made (and View in VR's button handler installed:
  * the browser chains it). */

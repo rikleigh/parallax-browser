@@ -100,6 +100,11 @@ typedef enum {
     /* Not a button: Triangle held for 1 s on a page outside gamepad mode
      * (the press itself went to the page). Only the button handler sees it. */
     WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD = 0x02000000,
+    /* Not a button: Cross held for 0.6 s with the pointer over a link
+     * (wpe_display_ps5_set_pointer_over_link). The page saw nothing of the
+     * press; a handler that takes this (TRUE) leaves it that way, otherwise
+     * the click goes to the page now. Only the button handler sees it. */
+    WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD = 0x04000000,
 } WPEDisplayPS5Button;
 
 /* Called on the main thread with the buttons that went down, before the
@@ -137,6 +142,14 @@ WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
  * reopen it. Until this is called, any click counts. */
 WPE_API void        wpe_display_ps5_set_pointer_over_editable (WPEDisplayPS5 *display,
                                                                gboolean       editable);
+/* Whether the pointer is over a link the application can open itself, from
+ * the same hit tests. Over one, Cross with the pointer shown clicks when it
+ * comes back up instead of when it goes down, so that held for 0.6 s it is
+ * WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD (the application opens the link in a
+ * new tab) and the page gets no click. The touchpad's press is not held
+ * back. */
+WPE_API void        wpe_display_ps5_set_pointer_over_link (WPEDisplayPS5 *display,
+                                                           gboolean       link);
 
 /* ---- Gamepad mode and the Gamepad API (README: "Gamepad mode") ---- */
 

@@ -626,13 +626,29 @@ static gboolean memRestart(gpointer data)
  * (wpe_display_ps5_set_pointer_over_editable). WebKit hit tests on every
  * pointer move, and the display sends one at the pointer before each click,
  * so the latest result is what the click lands on. */
+#define HOVER_LINK_KEY "ps5wk-hover-link"
+
+/* The http(s) link under the pointer in the page shown (in any of its
+ * frames), NULL for none: what X held opens in a new tab (browserui.c).
+ * Kept with each view, since a view coming back reports nothing until what
+ * is under the pointer changes. */
+const char* ps5wk_hover_link(void)
+{
+    return webView ? g_object_get_data(G_OBJECT(webView), HOVER_LINK_KEY) : NULL;
+}
+
 static void onMouseTargetChanged(WebKitWebView* view, WebKitHitTestResult* hit, guint modifiers, gpointer data)
 {
     (void)modifiers;
     (void)data;
+    const char* link = webkit_hit_test_result_context_is_link(hit) ? webkit_hit_test_result_get_link_uri(hit) : NULL;
+    if (link && strncmp(link, "http://", 7) && strncmp(link, "https://", 8))
+        link = NULL; /* javascript:, mailto:, ...: only a click means anything */
+    g_object_set_data_full(G_OBJECT(view), HOVER_LINK_KEY, g_strdup(link), g_free);
     if (view != webView)
         return;
     wpe_display_ps5_set_pointer_over_editable(WPE_DISPLAY_PS5(display), webkit_hit_test_result_context_is_editable(hit));
+    wpe_display_ps5_set_pointer_over_link(WPE_DISPLAY_PS5(display), link != NULL);
 }
 
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
@@ -1560,6 +1576,7 @@ void ps5wk_connect_web_view(WebKitWebView* view)
 void ps5wk_set_active_web_view(WebKitWebView* view)
 {
     webView = view;
+    wpe_display_ps5_set_pointer_over_link(WPE_DISPLAY_PS5(display), ps5wk_hover_link() != NULL);
     ps5wk_adblock_set_web_view(view);
     ps5wk_vr_set_web_view(view);
     setShownURI(webkit_web_view_get_uri(view));

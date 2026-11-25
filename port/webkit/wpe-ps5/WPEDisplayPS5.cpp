@@ -52,7 +52,10 @@
  *
  * Pad mapping:
  *   D-pad            arrow keys (auto-repeat)
- *   Cross (X)        click at the pointer when it is shown, else Return
+ *   Cross (X)        click at the pointer when it is shown, else Return;
+ *                    over a link the application can open, the click is
+ *                    sent at the release, and held 0.6 s it is the
+ *                    application's instead (the link in a new tab)
  *   Circle (O)       Back (XF86Back; the browser goes back)
  *   Triangle         on-screen keyboard for the focused field (it also
  *                    opens by itself when a click on a field, or the D-pad
@@ -82,6 +85,7 @@ static constexpr double pointerShownFor = 8.0; // seconds after the last stick m
 static constexpr int stickDeadZone = 14; // of 127
 static constexpr double optionsHoldFor = 1.0; // gamepad mode: Options held this long is the browser's
 static constexpr double triangleHoldFor = 1.0; // a page outside gamepad mode: Triangle held this long is the browser's
+static constexpr double crossHoldFor = 0.6; // the pointer over a link: Cross held this long is the browser's (a new tab)
 // The touchpad: a press or release shifts the finger a little; no pointer
 // moves for this long after one, so a click lands where the pointer was.
 static constexpr double touchClickStill = 0.10; // seconds
@@ -160,6 +164,13 @@ struct _WPEDisplayPS5Private {
     // reports one, any click counts as a click on a field.
     bool pointerOverEditable { false };
     bool pointerTargetReported { false };
+    // Whether the pointer is over a link the application can open
+    // (wpe_display_ps5_set_pointer_over_link), and when Cross went down
+    // over one (-1: not waiting). Until Cross comes back up (a click, sent
+    // whole then) or crossHoldFor passes (the application's: the link in a
+    // new tab), the page has seen nothing of the press.
+    bool pointerOverLink { false };
+    double crossLinkDownAt { -1 };
 
     GRefPtr<GSource> redrawSource;
 
@@ -1301,6 +1312,7 @@ static void padTick(WPEDisplayPS5* display)
         priv->ignoredButtons = data.buttons;
         priv->repeatingKey = 0;
         priv->triangleDownAt = -1;
+        priv->crossLinkDownAt = -1;
         return;
     }
 
@@ -1344,8 +1356,10 @@ static void padTick(WPEDisplayPS5* display)
     if (!pageHasPad && (priv->gamepadKeysDown || priv->stickKeysDown[0] || priv->stickKeysDown[1]))
         releaseGamepadInput(display, view);
 
-    if (!pageHasPad || priv->gamepadMode)
+    if (!pageHasPad || priv->gamepadMode) {
         priv->triangleDownAt = -1;
+        priv->crossLinkDownAt = -1;
+    }
 
     if (priv->padCaptured) {
         priv->repeatingKey = 0;
@@ -1391,7 +1405,11 @@ static void padTick(WPEDisplayPS5* display)
     // touchpad's press: always a click at the pointer. Whichever went down
     // first holds the click; the other is ignored until it comes back up.
     constexpr uint32_t clickButtons = PS5_PAD_CROSS | PS5_PAD_TOUCHPAD;
-    if (uint32_t extra = priv->pointerDown ? pressed & clickButtons : 0) {
+    // Cross waiting over a link (below) no longer held and not released
+    // here: the pad changed hands meanwhile, and the press is nobody's.
+    if (priv->crossLinkDownAt >= 0 && !((now | released) & PS5_PAD_CROSS))
+        priv->crossLinkDownAt = -1;
+    if (uint32_t extra = (priv->pointerDown || priv->crossLinkDownAt >= 0) ? pressed & clickButtons : 0) {
         priv->ignoredButtons |= extra;
         priv->buttons &= ~extra;
         pressed &= ~extra;
@@ -1404,11 +1422,44 @@ static void padTick(WPEDisplayPS5* display)
     if (pressed & PS5_PAD_TOUCHPAD)
         pointerClickDown(display, view, PS5_PAD_TOUCHPAD, t);
     else if (pressed & PS5_PAD_CROSS) {
-        if (pointerVisible)
+        if (pointerVisible && priv->pointerOverLink && priv->buttonHandler) {
+            // Over a link: the click waits for Cross to come back up, so
+            // that held it can be the application's (the link in a new
+            // tab). A move to where the pointer is, as before a click: the
+            // application hears what is under it now.
+            priv->crossLinkDownAt = t;
+            priv->pointerMovedAt = t;
+            GRefPtr<WPEEvent> move = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE,
+                eventTime(), static_cast<WPEModifiers>(0), priv->pointerX, priv->pointerY, 0, 0));
+            wpe_view_event(view, move.get());
+        } else if (pointerVisible)
             pointerClickDown(display, view, PS5_PAD_CROSS, t);
         else {
             sendKey(view, WPE_KEY_Return, 36, static_cast<WPEModifiers>(0), true);
             priv->returnDown = true;
+        }
+    }
+    if (priv->crossLinkDownAt >= 0) {
+        if (released & PS5_PAD_CROSS) {
+            // A short press: the click, whole (its release follows below).
+            priv->crossLinkDownAt = -1;
+            pointerClickDown(display, view, PS5_PAD_CROSS, t);
+        } else if (!priv->pointerOverLink) {
+            // The pointer left the link, or it was none after all: an
+            // ordinary press from here on (it can drag).
+            priv->crossLinkDownAt = -1;
+            pointerClickDown(display, view, PS5_PAD_CROSS, t);
+        } else if (t - priv->crossLinkDownAt >= crossHoldFor) {
+            priv->crossLinkDownAt = -1;
+            PS5_LOG("pad: Cross held over a link");
+            bool wasUI = priv->uiMode, wasCaptured = priv->padCaptured, wasGamepadMode = priv->gamepadMode;
+            bool taken = priv->buttonHandler && priv->buttonHandler(display, WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD, priv->buttonHandlerData);
+            if (priv->uiMode != wasUI || priv->padCaptured != wasCaptured || priv->activeView != view || priv->gamepadMode != wasGamepadMode)
+                return;
+            // Taken: the page never hears of this press (Cross's release
+            // finds nothing down). Not taken: the click after all.
+            if (!taken)
+                pointerClickDown(display, view, PS5_PAD_CROSS, t);
         }
     }
     if (priv->pointerDown && (released & priv->pointerDownBy)) {
@@ -1962,6 +2013,12 @@ void wpe_display_ps5_set_pointer_over_editable(WPEDisplayPS5* display, gboolean 
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
     display->priv->pointerTargetReported = true;
     display->priv->pointerOverEditable = editable;
+}
+
+void wpe_display_ps5_set_pointer_over_link(WPEDisplayPS5* display, gboolean link)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->pointerOverLink = link;
 }
 
 void wpe_display_ps5_set_perf_counter(WPEDisplayPS5*, const char* name, guint64 value)

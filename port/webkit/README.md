@@ -619,6 +619,20 @@ in a new tab; pop-ups without a click are dropped (`browser: pop-up without
 a click blocked`). Links sent from another device (`/open`, ps5open) load in
 the tab shown.
 
+**X held on a link** (0.6 s, the pointer over it): the link in a new tab,
+as Cmd-click in a desktop browser. The browser opens the address itself
+(`browser: X held on a link: new tab for ...`): the page gets no click and
+is not asked, so it also opens what a click cannot. A page that shows
+another site in `<iframe sandbox>` without `allow-popups` makes every
+`target=_blank` link in it dead (WebKit drops the click's new window before
+the browser hears of it and logs nothing; Chrome does the same), and without
+`allow-downloads` nothing in the frame can start a download. The new tab is
+no sandboxed frame, so both work there. Only http(s) links, only with the
+pointer shown (a link focused with the D-pad is not known to the browser
+when it is in another site's frame), and no `Referer` is sent. The link is
+the one WebKit's hit test reports (`mouse-target-changed`, frames included),
+kept with each tab's view. Test page: `test/input/hold-link.html`.
+
 **Session restore.** The tabs, the one shown, their scroll positions and
 back/forward lists are saved 2 s after a change and at the wind-down
 (before the `about:blank` of the wind-down), and come back at the next
@@ -3840,7 +3854,10 @@ later. Console log: `port/webkit/test/date.js`, results below.
 
 Pad map: D-pad = arrow keys (spatial navigation between links in the
 browser); X = click at the pointer when it is shown (it shows for 8 s after
-the left stick moves), otherwise Enter; O = Back; left stick = pointer;
+the left stick moves), otherwise Enter; X held 0.6 s with the pointer over a
+link = the link in a new tab (over a link the click goes to the page when X
+comes back up instead of when it goes down, and not at all once held: see
+*Tabs, bookmarks, history*); O = Back; left stick = pointer;
 right stick = scroll under the pointer; Options = the browser menu (address
 bar, tabs, bookmarks, history; see *Tabs, bookmarks, history*);
 Triangle = keyboard for the focused field (it also opens by itself when X

@@ -2432,11 +2432,32 @@ static void menuButtons(guint32 pressed)
     redraw();
 }
 
+/* X held with the pointer over a link: the link in a new tab, opened by the
+ * browser itself. The page gets no click and is not asked, so this also
+ * opens what a click cannot: a target=_blank link in a frame whose sandbox
+ * has no allow-popups (WebKit drops that click without a word), and the new
+ * tab is no sandboxed frame, so a download from it starts. FALSE: no link
+ * after all (the display sends the click). */
+static gboolean openHoveredLink(void)
+{
+    const char* link = ps5wk_hover_link();
+    if (!link || menuOpen)
+        return FALSE;
+    char* uri = g_strdup(link); /* the view's own copy goes with its next hit test */
+    spike_log("browser: X held on a link: new tab for %s", uri);
+    if (openInNewTab(uri))
+        wpe_display_ps5_show_message(display, "Opened in a new tab (Options: tabs)", 2);
+    g_free(uri);
+    return TRUE;
+}
+
 /* The display's button handler: the menu, then View in VR, then Options. */
 static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
 {
     (void)d;
     (void)data;
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD)
+        return openHoveredLink();
     /* △ held on the page: gamepad mode on (never by itself). */
     if (pressed & WPE_DISPLAY_PS5_BUTTON_TRIANGLE_HOLD) {
         if (!menuOpen)

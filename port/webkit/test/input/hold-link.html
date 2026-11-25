@@ -1,0 +1,57 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>X held on a link</title>
+<!-- X held 0.6 s with the pointer over a link: the link in a new tab, opened
+     by the browser (wpe-ps5/WPEDisplayPS5.cpp: WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD;
+     apps/title/browserui.c: openHoveredLink). Over a link the click is sent
+     when X comes back up, not when it goes down.
+     Upload to the console, e.g. /data/ps5webkit/hold-link.html, and open
+     file:///data/ps5webkit/hold-link.html
+     What to check on the TV (left stick + X):
+       1. A short X on "plain link": example.com loads in this tab (O: back).
+          The log line here says "click", after "mousedown" and "mouseup".
+       2. X held on "plain link": after about half a second a new tab opens on
+          example.com ("Opened in a new tab"); this page logged no mousedown
+          and no click. The title log says "pad: Cross held over a link" and
+          "browser: X held on a link: new tab for https://example.com/".
+       3. A short X on the framed "new-window link": nothing happens (the
+          frame's sandbox has no allow-popups, and WebKit drops the click's new
+          window without a word; Chrome does the same).
+       4. X held on the framed "new-window link": a new tab on example.org.
+       5. X held on "script link": no new tab; at 0.6 s nothing either, and the
+          count goes up when X comes back up (a javascript: link is not one the
+          browser opens: the press is an ordinary one, sent at once).
+       6. X held on the button: "mousedown" at once (not over a link, nothing
+          waits), "click" at the release.
+       7. X down on "plain link", then the left stick off it within 0.6 s:
+          "mousedown" where the pointer is now (an ordinary press from there).
+       8. With 12 tabs open, X held on "plain link": "12 tabs is the most",
+          no click either.
+       9. The touchpad's press on "plain link": "mousedown" at once (only X
+          waits).
+     Logs (console.log, the title log): HOLDLINK <event> <target> -->
+<style>
+body { font: 28px sans-serif; background: #01001a; color: #f4f2ff; margin: 48px; }
+a { color: #9db7ff; }
+a, button { display: inline-block; padding: 18px 28px; margin: 12px 0; font: inherit; }
+iframe { display: block; width: 900px; height: 130px; border: 2px solid #44407a; background: #fff; margin: 12px 0; }
+#log { font: 22px monospace; color: #b9b5e0; white-space: pre; }
+</style></head>
+<body>
+<h1>X held on a link</h1>
+<p><a id="plain" href="https://example.com/">plain link</a></p>
+<p>In a frame with <code>sandbox="allow-scripts"</code>:</p>
+<iframe sandbox="allow-scripts" srcdoc="<body style='font:28px sans-serif;margin:24px'><a href='https://example.org/' target='_blank'>new-window link</a></body>"></iframe>
+<p><a id="script" href="javascript:void(document.getElementById('count').textContent=++n)">script link</a> ran <span id="count">0</span> times</p>
+<p><button id="button">button</button></p>
+<div id="log"></div>
+<script>
+var n = 0, lines = [];
+function note(event) {
+    var target = event.target.id || event.target.tagName.toLowerCase();
+    console.log('HOLDLINK ' + event.type + ' ' + target);
+    lines.push(event.type + ' ' + target);
+    document.getElementById('log').textContent = lines.slice(-6).join('\n');
+}
+['mousedown', 'mouseup', 'click'].forEach(function (type) { document.addEventListener(type, note, true); });
+</script>
+</body></html>
