@@ -633,6 +633,29 @@ when it is in another site's frame), and no `Referer` is sent. The link is
 the one WebKit's hit test reports (`mouse-target-changed`, frames included),
 kept with each tab's view. Test page: `test/input/hold-link.html`.
 
+**O held closes the browser.** After 0.4 s a message comes up where the
+notices go, "Keep holding to close Parallax Browser", with a bar that fills
+over the next 1.5 s; when it is full the browser closes, and letting go
+before that takes the message down with nothing done. The display times it
+(`wpe_display_ps5_set_close_hold_text`,
+`WPE_DISPLAY_PS5_BUTTON_CIRCLE_HOLD`; `pad: Circle held: the close message
+is up`, then `pad: Circle held for 1.90 s` or `pad: Circle let go after
+...`) from the button itself, so it counts on a page and in the menu (there
+O's press closed the menu or went up a folder, and the hold goes on), and
+not in gamepad mode, View in VR or the system keyboard, where O is
+somebody else's. Only time the pad was seen held counts: a main loop that
+stalls with O down closes nothing. On a page O's Back is now sent when O
+comes back up, and not at all once the message was up. Closing
+(`ps5wk_close_browser`) is *Restart browser* without the start: the restart
+helper is sent with the type `close`, the title winds down (the session and
+the downloads saved, as above), and the helper's SIGKILL ends it with
+nothing on screen (`/data/ps5webkit/relaunch.log`: `PPSA99207 closed: gone
+after N ms`). Meanwhile the message is "Closing Parallax Browser…" with the
+bar full. Without the helper it is the launcher payload's SIGKILL; with
+neither the browser says it can't close itself and stays. The menu's
+footer names it on the right ("○ Hold to close browser", left out when the
+hints on the left need the room; O's own hint there now reads "Close menu").
+
 **Session restore.** The tabs, the one shown, their scroll positions and
 back/forward lists are saved 2 s after a change and at the wind-down
 (before the `about:blank` of the wind-down), and come back at the next
@@ -3857,7 +3880,10 @@ browser); X = click at the pointer when it is shown (it shows for 8 s after
 the left stick moves), otherwise Enter; X held 0.6 s with the pointer over a
 link = the link in a new tab (over a link the click goes to the page when X
 comes back up instead of when it goes down, and not at all once held: see
-*Tabs, bookmarks, history*); O = Back; left stick = pointer;
+*Tabs, bookmarks, history*); O = Back, held 1.9 s = the application
+closes, under a message with a progress bar (where the application asked for
+that: then Back is sent when O comes back up; see *Tabs, bookmarks,
+history*); left stick = pointer;
 right stick = scroll under the pointer; Options = the browser menu (address
 bar, tabs, bookmarks, history; see *Tabs, bookmarks, history*);
 Triangle = keyboard for the focused field (it also opens by itself when X

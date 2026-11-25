@@ -33,6 +33,10 @@
  * undone if one fails), and refreshes the system's copies of sce_sys. The
  * outcome goes to /data/ps5webkit/update/last-install.txt for the title.
  *
+ * Closing (O held in the browser): the header's type is "close", its
+ * argument as for a restart. Steps 1 to 4 without the start: the title has
+ * wound down and is SIGKILLed, which closes it with nothing on screen.
+ *
  * A repair (GitHub issue 3): the header's type is "repair" and its argument
  * /data/ps5webkit (nothing else is accepted). The title runs as uid 1 and
  * the payloads as uid 0; a folder a payload made at the default umask is
@@ -516,12 +520,12 @@ int main(void)
     char title[16] = "";
     int pid = 0;
     char go[256] = "", staging[256] = "";
-    int update = 0;
+    int update = 0, closeOnly = 0;
     if (sscanf(line, "%31s %d %15s %llu %299s", magic, &version, type, &processIdentifier, argument) == 5
         && !strcmp(magic, "PS5WK-LAUNCH") && !strcmp(type, "repair"))
         return repair(argument);
     if (sscanf(line, "%31s %d %15s %llu %299s", magic, &version, type, &processIdentifier, argument) != 5
-        || strcmp(magic, "PS5WK-LAUNCH") || (strcmp(type, "relaunch") && strcmp(type, "update"))
+        || strcmp(magic, "PS5WK-LAUNCH") || (strcmp(type, "relaunch") && strcmp(type, "update") && strcmp(type, "close"))
         || ((update = !strcmp(type, "update"))
                 ? sscanf(argument, "%9[A-Z0-9]:%d:%255[^:]:%255s", title, &pid, go, staging) != 4 || staging[0] != '/'
                 : sscanf(argument, "%9[A-Z0-9]:%d:%255s", title, &pid, go) != 3)
@@ -529,14 +533,16 @@ int main(void)
         say("bad launch header: \"%.*s\"", (int)strcspn(line, "\n"), line);
         return 1;
     }
+    closeOnly = !strcmp(type, "close");
     sceUserServiceInitialize(NULL);
     uint32_t app = appOf(pid, title);
     if (!app) {
-        say("%s is not pid %d: nothing to restart", title, pid);
+        say("%s is not pid %d: nothing to %s", title, pid, closeOnly ? "close" : "restart");
         return 1;
     }
     unlink(go);
-    say("ready: %s pid %d (app 0x%x); waiting for %s%s%s", title, pid, app, go, update ? "; then the update in " : "", update ? staging : "");
+    say("ready: %s pid %d (app 0x%x); waiting for %s%s%s", title, pid, app, go,
+        update ? "; then the update in " : closeOnly ? "; then it is closed, not started again" : "", update ? staging : "");
 
     struct stat st;
     int waited = 0;
@@ -544,13 +550,13 @@ int main(void)
         if (!stat(go, &st))
             break;
         if (!appOf(pid, title)) {
-            say("%s went by itself after %d ms: not starting it again", title, waited);
+            say("%s went by itself after %d ms: %s", title, waited, closeOnly ? "nothing to close" : "not starting it again");
             return 0;
         }
         usleep(50 * 1000);
     }
     if (waited >= 60000) {
-        say("%s didn't ask within 60 s: not restarting it", title);
+        say("%s didn't ask within 60 s: not %s it", title, closeOnly ? "closing" : "restarting");
         return 1;
     }
     unlink(go);
@@ -581,6 +587,10 @@ int main(void)
     if (gone < 0) {
         say("%s pid %d still there 10 s after SIGKILL", title, pid);
         return 1;
+    }
+    if (closeOnly) {
+        say("%s closed: gone after %d ms, no app in front after %d ms (big app:%s)", title, gone, noApp, o ? trail : " unchanged");
+        return 0;
     }
     /* Starting it straight after the kill showed "Cannot start the game or
      * app" while the system still dealt with the old one (it started all

@@ -105,6 +105,11 @@ typedef enum {
      * press; a handler that takes this (TRUE) leaves it that way, otherwise
      * the click goes to the page now. Only the button handler sees it. */
     WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD = 0x04000000,
+    /* Not a button: Circle held for 1.9 s, the last 1.5 s of it under the
+     * progress message of wpe_display_ps5_set_close_hold_text (which turns
+     * this on). The application closes itself. Only the button handler
+     * sees it. */
+    WPE_DISPLAY_PS5_BUTTON_CIRCLE_HOLD = 0x08000000,
 } WPEDisplayPS5Button;
 
 /* Called on the main thread with the buttons that went down, before the
@@ -133,6 +138,29 @@ WPE_API void        wpe_display_ps5_set_captured_pad_callback (WPEDisplayPS5    
 WPE_API void        wpe_display_ps5_show_message (WPEDisplayPS5 *display,
                                                   const char    *text,
                                                   double         seconds);
+
+/* A message with a progress bar under its text (@fraction: 0 empty to 1
+ * full), where the short messages go and instead of one. It stays for
+ * @seconds unless shown again first (each call sets the bar and the time
+ * anew). NULL: down now. */
+WPE_API void        wpe_display_ps5_show_progress (WPEDisplayPS5 *display,
+                                                   const char    *text,
+                                                   double         fraction,
+                                                   double         seconds);
+
+/* Circle held closes the application: with @text (e.g. "Keep holding to
+ * close ...") Circle held for 0.4 s shows it with a progress bar that fills
+ * while Circle stays down, and when it is full (1.5 s later) the button
+ * handler gets WPE_DISPLAY_PS5_BUTTON_CIRCLE_HOLD; released before that,
+ * the message goes and nothing happened. It counts wherever Circle is the
+ * browser's own: on a page outside gamepad mode and in the application's
+ * UI (there its press did what it does, e.g. closed a menu, and the hold
+ * goes on), not in gamepad mode, View in VR or the system keyboard. On a
+ * page, Circle's Back key is then sent when Circle comes back up, and not
+ * at all once the message was up. NULL (the default): off, Back at the
+ * press. */
+WPE_API void        wpe_display_ps5_set_close_hold_text (WPEDisplayPS5 *display,
+                                                         const char    *text);
 
 /* What is under the pointer, from the application's hit tests (e.g.
  * WebKitWebView::mouse-target-changed and

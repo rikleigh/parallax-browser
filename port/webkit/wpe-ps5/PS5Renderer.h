@@ -156,6 +156,11 @@ public:
     void setVRSimLook(float yawDegrees, float pitchDegrees);
     // A short message over the page on the TV (e.g. "No headset").
     void showMessage(const char* text, double seconds);
+    // A message with a progress bar under its text (fraction: 0..1 full), in
+    // the message's place and instead of it. It stays for seconds unless it
+    // is renewed first: a held button renews it at each poll of the pad, and
+    // it goes by itself when the polls stop. No text: down now.
+    void showProgress(const char* text, double fraction, double seconds);
     // Main thread: the application's own UI (the browser's address bar and
     // menu) over the page and under the pointer: premultiplied BGRA rows
     // (row 0 = top, stride width * 4) at (x, y) in TV pixels; copied, so
@@ -190,6 +195,8 @@ private:
     void writeCapture(char* path);
     void drawPanel(unsigned texture, int width, int height, double centerX, double centerY, double scale);
     void updateMessage(int64_t now);
+    void updateProgress(int64_t now);
+    void drawProgress();
     void applyUILayer();
     void drawUILayer();
 
@@ -319,6 +326,20 @@ private:
     unsigned m_messageTexture { 0 };
     int m_messageWidth { 0 }, m_messageHeight { 0 };
     int64_t m_messageUntilUS { 0 };
+    // The message with a progress bar (guarded by m_lock: m_progressText/
+    // m_progressFraction/m_progressSeconds/m_progressChanged; render thread:
+    // the rest). Its panel is rasterized when the text changes, not for
+    // each step of the bar.
+    std::string m_progressText;
+    double m_progressFraction { 0 };
+    double m_progressSeconds { 0 };
+    bool m_progressChanged { false };
+    std::string m_progressPanelText;
+    unsigned m_progressTexture { 0 }, m_progressBarTexture { 0 };
+    int m_progressWidth { 0 }, m_progressHeight { 0 };
+    int m_progressBarX { 0 }, m_progressBarY { 0 }, m_progressBarWidth { 0 }, m_progressBarHeight { 0 };
+    double m_progressShown { 0 };
+    int64_t m_progressUntilUS { 0 };
 
     // The application's UI layer: the latest image (guarded by m_lock), and
     // on the render thread a persistent GL buffer the page shader reads (a

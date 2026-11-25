@@ -241,6 +241,9 @@ const char* ps5wk_restart_for_update(const char* staging, const char* from);
 void ps5wk_updates_restart_failed(void);
 /* ps5browser.c: TRUE once the browser has begun to close. */
 gboolean ps5wk_browser_winding_down(void);
+/* ps5browser.c: the browser closes itself (O held): it winds down and the
+ * restart helper ends it, with nothing started after. NULL, or why not. */
+const char* ps5wk_close_browser(const char* from);
 /* files.c: the Files list changed; focus: the row to focus (-1: keep). */
 void ps5wk_browser_files_changed(int focus);
 /* Files listed folder with row focused, its dialog wanted

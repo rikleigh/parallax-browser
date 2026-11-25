@@ -1805,10 +1805,19 @@ static gboolean launcherAsk(const char* command, char* reply, size_t size)
 #define PS5WK_RELAUNCH_ELF "/app0/ps5wk-relaunch.elf"
 static gint relaunchState;
 static char relaunchGoFile[96];
+/* The helper was sent to close the browser, not to start it again
+ * (ps5wk_close_browser). Main thread. */
+static gboolean relaunchClosing;
 
 static gboolean relaunchFailedOnMain(gpointer data)
 {
     (void)data;
+    if (relaunchClosing) {
+        relaunchClosing = FALSE;
+        wpe_display_ps5_show_progress(WPE_DISPLAY_PS5(display), NULL, 0, 0);
+        wpe_display_ps5_show_message(WPE_DISPLAY_PS5(display), "Parallax Browser couldn't close itself: close it from the home screen", 5);
+        return G_SOURCE_REMOVE;
+    }
     unlink(PS5WK_PENDING_URL);
     ps5wk_updates_restart_failed();
     ps5wk_settings_set_status("The browser couldn't restart itself. Close it and start it again from the home screen.");
@@ -1848,7 +1857,7 @@ int spike_title_exit_helper(void)
         return -1;
     }
     close(fd);
-    spike_log("closing the title through the restart helper (SIGKILL, then it starts the title again)");
+    spike_log("closing the title through the restart helper (SIGKILL%s)", relaunchClosing ? "" : ", then it starts the title again");
     return 0;
 }
 
@@ -1928,6 +1937,42 @@ static const char* restartBrowserWith(const char* from, const char* staging)
     spike_log("settings: browser restart asked by %s; launcher says \"%s\"; coming back to %s", from, reply, uri ? uri : "the home page");
     g_free(uri);
     snprintf(spike_title_relaunch, sizeof spike_title_relaunch, "%s", title);
+    g_main_context_invoke(NULL, beginWindDown, NULL);
+    return NULL;
+}
+
+/* O held (browserui.c): the browser closes itself, as Restart browser does
+ * with nothing started after. The restart helper (its type "close")
+ * SIGKILLs the title once it has wound down: tabs saved, media stopped,
+ * downloads paused. A title that just ends itself gets the system's error
+ * screen (title_exit.c), so without the helper it is the launcher payload's
+ * SIGKILL (developers), and with neither the browser stays open. NULL (also
+ * when it is closing already), or why not. Main thread. */
+const char* ps5wk_close_browser(const char* from)
+{
+    if (!spike_title_relaunch)
+        return "only the PS5 title can close itself";
+    if (windDownStart || g_atomic_int_get(&relaunchState))
+        return NULL;
+    if (fileExists(PS5WK_RELAUNCH_ELF) && wpe_process_manager_get_default()) {
+        snprintf(relaunchGoFile, sizeof relaunchGoFile, "/data/ps5webkit/home/tmp/relaunch-go-%d", (int)getpid());
+        char argument[300];
+        snprintf(argument, sizeof argument, "%s:%d:%s", ownTitleId(), (int)getpid(), relaunchGoFile);
+        relaunchClosing = TRUE;
+        g_atomic_int_set(&relaunchState, 1);
+        if (!wpe_process_manager_ps5_run_task_elf(wpe_process_manager_get_default(), PS5WK_RELAUNCH_ELF, "close", argument, relaunchOutput,
+                relaunchEnded, NULL)) {
+            g_atomic_int_set(&relaunchState, 0);
+            relaunchClosing = FALSE;
+            return "the helper that closes it couldn't be started";
+        }
+        spike_log("browser: close asked by %s, through the restart helper", from);
+        return NULL; /* the wind-down starts when the helper is ready */
+    }
+    char reply[160] = "";
+    if (!launcherAsk("status\n", reply, sizeof reply))
+        return "the restart helper is missing and the launcher payload isn't running";
+    spike_log("browser: close asked by %s; the launcher's SIGKILL once main has returned (it says \"%s\")", from, reply);
     g_main_context_invoke(NULL, beginWindDown, NULL);
     return NULL;
 }

@@ -93,9 +93,22 @@ static int lineWidth(Line& line)
     return width;
 }
 
-bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
+// How far inside a width x height rectangle with rounded corners the middle
+// of pixel (x, y) is: its distance to the edge, negative outside.
+static float insideRounded(int x, int y, int width, int height, float radius)
+{
+    float dx = std::max({ radius - x - 0.5f, x + 0.5f - (width - radius), 0.0f });
+    float dy = std::max({ radius - y - 0.5f, y + 0.5f - (height - radius), 0.0f });
+    if (!dx && !dy) // the straight parts
+        return std::min({ x + 0.5f, width - x - 0.5f, y + 0.5f, height - y - 0.5f });
+    return radius - std::sqrt(dx * dx + dy * dy);
+}
+
+bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out, PS5TextBar* bar)
 {
     out = { };
+    if (bar)
+        *bar = { };
     if (!text || !*text || !loadFonts())
         return false;
 
@@ -120,7 +133,14 @@ bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
         height += line.size * 13 / 10;
     }
     width += 2 * pad + pixelSize / 2;
-    height += pad - pixelSize / 5;
+    // The progress bar: a quarter of the text's height, under its last line.
+    const int barHeight = bar ? std::max(6, pixelSize / 4) : 0;
+    const int barTop = height + (bar ? pixelSize / 6 : 0);
+    if (bar) {
+        width = std::max(width, pixelSize * 12);
+        height = barTop + barHeight + pad * 9 / 10;
+    } else
+        height += pad - pixelSize / 5;
     width = std::min(width, 4096);
     height = std::min(height, 2048);
     out.width = width;
@@ -137,11 +157,7 @@ bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
     static const float magenta[3] = { 0xfc / 255.0f, 0x0e / 255.0f, 0xc6 / 255.0f };
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            float dx = std::max({ radius - x - 0.5f, x + 0.5f - (width - radius), 0.0f });
-            float dy = std::max({ radius - y - 0.5f, y + 0.5f - (height - radius), 0.0f });
-            float inside = radius - std::sqrt(dx * dx + dy * dy); // distance to the edge, > 0 inside
-            if (!dx && !dy) // the straight parts
-                inside = std::min({ x + 0.5f, width - x - 0.5f, y + 0.5f, height - y - 0.5f });
+            float inside = insideRounded(x, y, width, height, radius);
             float coverage = std::clamp(inside + 0.5f, 0.0f, 1.0f);
             float ring = coverage - std::clamp(inside - edge + 0.5f, 0.0f, 1.0f);
             float t = width > 1 ? static_cast<float>(x) / (width - 1) : 0;
@@ -152,6 +168,34 @@ bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out)
                 p[k] = static_cast<uint8_t>(std::lround(255 * (edgeColor * e + surface[k] * a * (1 - e))));
             }
             p[3] = static_cast<uint8_t>(std::lround(255 * (e + a * (1 - e))));
+        }
+    }
+
+    // The progress bar's track (the text's lavender, faint) and the bar when
+    // full (the edge's violet to magenta), both with round ends.
+    if (bar && height <= 2048) {
+        const int barWidth = width - 2 * (pad + pixelSize / 4);
+        bar->x = (width - barWidth) / 2;
+        bar->y = barTop;
+        bar->full.width = barWidth;
+        bar->full.height = barHeight;
+        bar->full.rgba.assign(static_cast<size_t>(barWidth) * barHeight * 4, 0);
+        static const float track[3] = { 0xb9 / 255.0f, 0xb5 / 255.0f, 0xe0 / 255.0f };
+        const float trackAlpha = 0.22f;
+        for (int y = 0; y < barHeight; y++) {
+            for (int x = 0; x < barWidth; x++) {
+                float coverage = std::clamp(insideRounded(x, y, barWidth, barHeight, barHeight / 2.0f) + 0.5f, 0.0f, 1.0f);
+                float t = barWidth > 1 ? static_cast<float>(x) / (barWidth - 1) : 0;
+                uint8_t* full = &bar->full.rgba[(static_cast<size_t>(y) * barWidth + x) * 4];
+                uint8_t* p = &out.rgba[(static_cast<size_t>(bar->y + y) * width + bar->x + x) * 4];
+                float a = coverage * trackAlpha;
+                for (int k = 0; k < 3; k++) {
+                    full[k] = static_cast<uint8_t>(std::lround(255 * (violet[k] + (magenta[k] - violet[k]) * t) * coverage));
+                    p[k] = static_cast<uint8_t>(std::lround(255 * track[k] * a + p[k] * (1 - a)));
+                }
+                full[3] = static_cast<uint8_t>(std::lround(255 * coverage));
+                p[3] = static_cast<uint8_t>(std::lround(255 * a + p[3] * (1 - a)));
+            }
         }
     }
 

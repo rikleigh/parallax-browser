@@ -871,10 +871,10 @@ void PS5Renderer::threadMain()
         for (;;) {
             if (m_pageJob.pending || m_frameRequested || m_compositorRequested || m_capturePath || !m_bufferRequests.empty() || !m_bufferFrees.empty())
                 break;
-            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged || m_thumbnailRequest.pending || m_perfWanted != m_perfOn)
+            if (m_vrRequest.start || m_vrRequest.stop || m_messageChanged || m_progressChanged || m_thumbnailRequest.pending || m_perfWanted != m_perfOn)
                 break;
             int64_t now = nowUS();
-            if (m_messageUntilUS && now >= m_messageUntilUS)
+            if ((m_messageUntilUS && now >= m_messageUntilUS) || (m_progressUntilUS && now >= m_progressUntilUS))
                 break; // take the message down
             if (m_videoActive || m_uiFadeStartUS) {
                 // Video: a frame every vsync. The swap returns at once and
@@ -900,6 +900,8 @@ void PS5Renderer::threadMain()
                 deadline = std::min(deadline, m_splashDeadlineUS + 2000);
             if (m_messageUntilUS)
                 deadline = std::min(deadline, m_messageUntilUS + 2000);
+            if (m_progressUntilUS)
+                deadline = std::min(deadline, m_progressUntilUS + 2000);
             if (m_perfOn && m_perf) // the overlay's next text update
                 deadline = std::min(deadline, m_perf->nextUpdateUS() + 2000);
             if (m_thumbnails.active) // a paused video: answer at the deadline with what was taken
@@ -985,6 +987,7 @@ void PS5Renderer::threadMain()
         serviceBufferRequests();
         int64_t start = nowUS();
         updateMessage(start);
+        updateProgress(start);
         applyUILayer();
         bool commitGeometry = m_job.pending;
         double uploadMS = 0;
@@ -1702,8 +1705,11 @@ void PS5Renderer::drawScene()
     // The application's UI (address bar, menu) over the page.
     drawUILayer();
 
-    // A message over the page (bottom centre), e.g. "No headset".
-    if (m_messageTexture && m_messageUntilUS)
+    // A message over the page (bottom centre), e.g. "No headset"; the one
+    // with a progress bar instead while it is up.
+    if (m_progressTexture && m_progressUntilUS)
+        drawProgress();
+    else if (m_messageTexture && m_messageUntilUS)
         drawPanel(m_messageTexture, m_messageWidth, m_messageHeight, m_width / 2.0, m_height - m_messageHeight / 2.0 - 60, 1.0);
 
     if (m_drawPointer) {
@@ -1982,6 +1988,72 @@ void PS5Renderer::updateMessage(int64_t now)
     }
     if (m_messageUntilUS && now >= m_messageUntilUS)
         m_messageUntilUS = 0;
+}
+
+void PS5Renderer::showProgress(const char* text, double fraction, double seconds)
+{
+    g_mutex_lock(&m_lock);
+    m_progressText = text ? text : "";
+    m_progressFraction = std::clamp(fraction, 0.0, 1.0);
+    m_progressSeconds = seconds;
+    m_progressChanged = true;
+    g_cond_broadcast(&m_cond);
+    g_mutex_unlock(&m_lock);
+}
+
+// Render thread: the panel for a new text, how full its bar is now, and
+// down when it was not renewed in time.
+void PS5Renderer::updateProgress(int64_t now)
+{
+    g_mutex_lock(&m_lock);
+    bool changed = m_progressChanged;
+    std::string text = m_progressText;
+    double fraction = m_progressFraction, seconds = m_progressSeconds;
+    m_progressChanged = false;
+    g_mutex_unlock(&m_lock);
+    if (changed) {
+        if (text.empty() || seconds <= 0)
+            m_progressUntilUS = 0;
+        else {
+            if (text != m_progressPanelText || !m_progressTexture) {
+                PS5TextImage image;
+                PS5TextBar bar;
+                m_progressPanelText = text;
+                if (ps5RenderTextPanel(text.c_str(), 40, image, &bar) && bar.full.width > 0) {
+                    uploadPanel(m_progressTexture, image);
+                    uploadPanel(m_progressBarTexture, bar.full);
+                    m_progressWidth = image.width;
+                    m_progressHeight = image.height;
+                    m_progressBarX = bar.x;
+                    m_progressBarY = bar.y;
+                    m_progressBarWidth = bar.full.width;
+                    m_progressBarHeight = bar.full.height;
+                } else
+                    m_progressWidth = 0; // no fonts: nothing is drawn
+            }
+            m_progressShown = fraction;
+            m_progressUntilUS = m_progressWidth ? now + static_cast<int64_t>(seconds * 1e6) : 0;
+        }
+    }
+    if (m_progressUntilUS && now >= m_progressUntilUS)
+        m_progressUntilUS = 0;
+}
+
+// The progress message where messages go: its panel (with the bar's empty
+// track), then the full bar over the track, cut off at the progress.
+void PS5Renderer::drawProgress()
+{
+    // Whole pixels: the bar's cut is a scissor rectangle.
+    const int left = (m_width - m_progressWidth) / 2, top = m_height - m_progressHeight - 60;
+    drawPanel(m_progressTexture, m_progressWidth, m_progressHeight, left + m_progressWidth / 2.0, top + m_progressHeight / 2.0, 1.0);
+    const int filled = static_cast<int>(std::lround(m_progressBarWidth * m_progressShown));
+    if (filled <= 0)
+        return;
+    const int barLeft = left + m_progressBarX, barTop = top + m_progressBarY;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(barLeft, m_height - (barTop + m_progressBarHeight), filled, m_progressBarHeight);
+    drawPanel(m_progressBarTexture, m_progressBarWidth, m_progressBarHeight, barLeft + m_progressBarWidth / 2.0, barTop + m_progressBarHeight / 2.0, 1.0);
+    glDisable(GL_SCISSOR_TEST);
 }
 
 void PS5Renderer::writeCapture(char* path)

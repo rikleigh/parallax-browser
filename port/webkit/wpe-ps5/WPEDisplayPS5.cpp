@@ -56,7 +56,11 @@
  *                    over a link the application can open, the click is
  *                    sent at the release, and held 0.6 s it is the
  *                    application's instead (the link in a new tab)
- *   Circle (O)       Back (XF86Back; the browser goes back)
+ *   Circle (O)       Back (XF86Back; the browser goes back); where the
+ *                    application closes on Circle held
+ *                    (wpe_display_ps5_set_close_hold_text), Back is sent
+ *                    at the release, and held 1.9 s under a message with a
+ *                    progress bar it is the application's instead
  *   Triangle         on-screen keyboard for the focused field (it also
  *                    opens by itself when a click on a field, or the D-pad
  *                    or L1/R1, focuses one)
@@ -86,6 +90,8 @@ static constexpr int stickDeadZone = 14; // of 127
 static constexpr double optionsHoldFor = 1.0; // gamepad mode: Options held this long is the browser's
 static constexpr double triangleHoldFor = 1.0; // a page outside gamepad mode: Triangle held this long is the browser's
 static constexpr double crossHoldFor = 0.6; // the pointer over a link: Cross held this long is the browser's (a new tab)
+static constexpr double circleHoldShows = 0.4; // Circle held this long: the "keep holding to close" message, its bar empty
+static constexpr double circleHoldFor = 1.9; // and this long: the bar is full, the application closes
 // The touchpad: a press or release shifts the finger a little; no pointer
 // moves for this long after one, so a click lands where the pointer was.
 static constexpr double touchClickStill = 0.10; // seconds
@@ -233,6 +239,20 @@ struct _WPEDisplayPS5Private {
     // Outside gamepad mode: Triangle held on the page (it turns gamepad mode on).
     double triangleDownAt { -1 };
     bool triangleHoldSent { false };
+    // Circle held closes the application (wpe_display_ps5_set_close_hold_text;
+    // circleHoldTick): the message's text (empty: off), the raw button at
+    // the last poll, when a press that counts went down (-1: none), for how
+    // long it was seen held (polls that came late count as one: a stalled
+    // main loop closes nothing behind a message nobody saw), and whether
+    // the message came up during the last press. On a page Circle's
+    // Back then waits for the release (circleBackWaits: a press whose Back
+    // was not sent yet).
+    std::string closeHoldText;
+    bool circleWasDown { false };
+    double circleDownAt { -1 };
+    double circleHeldFor { 0 }, circlePolledAt { 0 };
+    bool circleHoldShown { false };
+    bool circleBackWaits { false };
 
     GRefPtr<WPEProcessManager> processManager;
     std::string childELF;
@@ -1251,6 +1271,56 @@ static void padSystemState(WPEDisplayPS5* display, int readResult, const PS5PadD
     }
 }
 
+// Circle held closes the application (wpe_display_ps5_set_close_hold_text).
+// Counted from the button itself, whoever its press went to: a press that
+// closed the application's menu goes on as the hold. A press counts when it
+// goes down while Circle is the browser's own (browsers: not the system
+// keyboard's; not View in VR's or gamepad mode's), and for as long as it
+// stays so. True: the hold is complete and the handler was told.
+static bool circleHoldTick(WPEDisplayPS5* display, bool circle, bool browsers, double t)
+{
+    auto* priv = display->priv;
+    const bool counts = browsers && !priv->closeHoldText.empty() && priv->buttonHandler && !priv->padCaptured && (priv->uiMode || !priv->gamepadMode);
+    if (circle && !priv->circleWasDown && counts) {
+        priv->circleDownAt = t;
+        priv->circleHeldFor = 0;
+        priv->circlePolledAt = t;
+        priv->circleHoldShown = false;
+    }
+    priv->circleWasDown = circle;
+    if (priv->circleDownAt < 0)
+        return false;
+    priv->circleHeldFor += std::fmin(t - priv->circlePolledAt, 4 * padIntervalMS / 1000.0);
+    priv->circlePolledAt = t;
+    const double held = priv->circleHeldFor;
+    if (!circle || !counts) {
+        priv->circleDownAt = -1;
+        if (priv->circleHoldShown) {
+            PS5Renderer::singleton().showProgress(nullptr, 0, 0);
+            PS5_LOG("pad: Circle let go after %.2f s: the application stays open", held);
+        }
+        return false;
+    }
+    if (held < circleHoldShows)
+        return false;
+    if (held < circleHoldFor) {
+        if (!priv->circleHoldShown)
+            PS5_LOG("pad: Circle held: the close message is up");
+        priv->circleHoldShown = true;
+        // 0.3 s: it goes by itself should the polls stop.
+        PS5Renderer::singleton().showProgress(priv->closeHoldText.c_str(), (held - circleHoldShows) / (circleHoldFor - circleHoldShows), 0.3);
+        return false;
+    }
+    priv->circleDownAt = -1;
+    priv->circleHoldShown = true; // no Back at the release, also after a stall that skipped the message
+    PS5_LOG("pad: Circle held for %.2f s: the application's to close", held);
+    // The bar full; the handler's own message (it is closing) replaces it.
+    PS5Renderer::singleton().showProgress(priv->closeHoldText.c_str(), 1, 0.3);
+    if (!priv->buttonHandler(display, WPE_DISPLAY_PS5_BUTTON_CIRCLE_HOLD, priv->buttonHandlerData))
+        PS5Renderer::singleton().showProgress(nullptr, 0, 0);
+    return true;
+}
+
 static void padTick(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
@@ -1275,6 +1345,7 @@ static void padTick(WPEDisplayPS5* display)
 
     // While the on-screen keyboard is up, the pad belongs to it.
     if (priv->pendingText) {
+        circleHoldTick(display, data.buttons & PS5_PAD_CIRCLE, false, nowSeconds());
         if (priv->gamepad)
             wpeGamepadPS5SetState(priv->gamepad, 0, nullptr);
         if (priv->gamepadMode) {
@@ -1290,6 +1361,8 @@ static void padTick(WPEDisplayPS5* display)
         // held when the keyboard closes stay ignored until released.
         if (priv->buttons || priv->pointerDown) {
             uint32_t held = priv->buttons & ~priv->swallowedButtons;
+            if (priv->circleBackWaits)
+                held &= ~PS5_PAD_CIRCLE; // its Back never went down
             if (priv->pointerDown) {
                 priv->pointerDown = false;
                 GRefPtr<WPEEvent> event = adoptGRef(wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
@@ -1313,8 +1386,11 @@ static void padTick(WPEDisplayPS5* display)
         priv->repeatingKey = 0;
         priv->triangleDownAt = -1;
         priv->crossLinkDownAt = -1;
+        priv->circleBackWaits = false;
         return;
     }
+    if (circleHoldTick(display, data.buttons & PS5_PAD_CIRCLE, true, nowSeconds()))
+        return;
 
     uint32_t now = data.buttons;
     priv->ignoredButtons &= now;
@@ -1359,6 +1435,7 @@ static void padTick(WPEDisplayPS5* display)
     if (!pageHasPad || priv->gamepadMode) {
         priv->triangleDownAt = -1;
         priv->crossLinkDownAt = -1;
+        priv->circleBackWaits = false;
     }
 
     if (priv->padCaptured) {
@@ -1507,6 +1584,19 @@ static void padTick(WPEDisplayPS5* display)
     constexpr uint32_t focusMoveButtons = PS5_PAD_UP | PS5_PAD_DOWN | PS5_PAD_LEFT | PS5_PAD_RIGHT | PS5_PAD_L1 | PS5_PAD_R1;
     if ((pressed & focusMoveButtons) && priv->lastPressKind == _WPEDisplayPS5Private::PressKind::Other)
         priv->lastPressKind = _WPEDisplayPS5Private::PressKind::FocusMove;
+
+    // Circle held closes the application (circleHoldTick): its Back goes
+    // out when Circle comes back up, and not once the close message was up.
+    if ((pressed & PS5_PAD_CIRCLE) && !priv->closeHoldText.empty() && priv->buttonHandler) {
+        priv->circleBackWaits = true;
+        pressed &= ~PS5_PAD_CIRCLE;
+    }
+    if ((released & PS5_PAD_CIRCLE) && priv->circleBackWaits) {
+        priv->circleBackWaits = false;
+        released &= ~PS5_PAD_CIRCLE;
+        if (!priv->circleHoldShown)
+            tapKey(view, WPE_KEY_Back, 166);
+    }
 
     for (const auto& mapping : keyMappings) {
         if (pressed & mapping.button) {
@@ -2030,6 +2120,18 @@ void wpe_display_ps5_show_message(WPEDisplayPS5* display, const char* text, doub
 {
     g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
     PS5Renderer::singleton().showMessage(text, seconds);
+}
+
+void wpe_display_ps5_show_progress(WPEDisplayPS5* display, const char* text, double fraction, double seconds)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    PS5Renderer::singleton().showProgress(text, fraction, seconds);
+}
+
+void wpe_display_ps5_set_close_hold_text(WPEDisplayPS5* display, const char* text)
+{
+    g_return_if_fail(WPE_IS_DISPLAY_PS5(display));
+    display->priv->closeHoldText = text ? text : "";
 }
 
 void wpe_display_ps5_vr_start(WPEDisplayPS5* display, WPEDisplayPS5VRProjection projection, double fisheyeDegrees,

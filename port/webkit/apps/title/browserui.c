@@ -2451,11 +2451,34 @@ static gboolean openHoveredLink(void)
     return TRUE;
 }
 
+/* O held: the display shows this with a progress bar that fills while O
+ * stays down (wpe_display_ps5_set_close_hold_text), and tells onButtons
+ * when it is full. */
+#define CLOSE_HOLD_TEXT "Keep holding to close Parallax Browser"
+
+/* O was held until the bar was full: the browser closes (tabs saved, as
+ * when it restarts). The bar stays full under "Closing" until the title is
+ * gone, a second or two. FALSE: it can't close itself here. */
+static gboolean closeHeld(void)
+{
+    const char* error = ps5wk_close_browser("O held");
+    if (error) {
+        spike_log("browser: O held, but the browser stays: %s", error);
+        wpe_display_ps5_show_message(display, "Parallax Browser can't close itself here: close it from the home screen", 4);
+        return FALSE;
+    }
+    spike_log("browser: O held: closing");
+    wpe_display_ps5_show_progress(display, "Closing Parallax Browser\xE2\x80\xA6", 1, 30);
+    return TRUE;
+}
+
 /* The display's button handler: the menu, then View in VR, then Options. */
 static gboolean onButtons(WPEDisplayPS5* d, guint32 pressed, gpointer data)
 {
     (void)d;
     (void)data;
+    if (pressed & WPE_DISPLAY_PS5_BUTTON_CIRCLE_HOLD)
+        return closeHeld();
     if (pressed & WPE_DISPLAY_PS5_BUTTON_CROSS_HOLD)
         return openHoveredLink();
     /* △ held on the page: gamepad mode on (never by itself). */
@@ -2889,6 +2912,7 @@ void ps5wk_browser_init(WPEDisplay* d, WebKitWebView* view)
         screenH = wpe_view_get_height(wpeView) + wpe_display_ps5_get_page_top(display);
     }
     wpe_display_ps5_set_button_handler(display, onButtons, NULL);
+    wpe_display_ps5_set_close_hold_text(display, CLOSE_HOLD_TEXT);
     wpe_display_ps5_set_ui_pointer_callback(display, onUIPointer, NULL);
     connectView(view);
     updateLayout();

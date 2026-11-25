@@ -35,4 +35,14 @@ struct PS5TextImage {
 // UTF-8 text, '\n' between lines; the first line is drawn at pixelSize,
 // the others at 0.62 of it, all centred, white and lavender on a rounded
 // navy glass panel with a violet-to-magenta edge (Parallax's palette). False (and an empty image) when the fonts are missing.
-bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out);
+//
+// With a bar the panel also has a progress bar under its text: its empty
+// track is drawn in the panel at (bar->x, bar->y), and bar->full is the bar
+// when full (the track's size), to be drawn over the track from its left,
+// as much of it as the progress.
+struct PS5TextBar {
+    int x { 0 };
+    int y { 0 };
+    PS5TextImage full;
+};
+bool ps5RenderTextPanel(const char* text, int pixelSize, PS5TextImage& out, PS5TextBar* bar = nullptr);

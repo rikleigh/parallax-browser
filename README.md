@@ -89,6 +89,7 @@ first-class place for the modern web. It's built on WPE WebKit.
 | Touchpad | Works like a laptop's. One finger moves the pointer, two fingers scroll, and a press clicks. Press and hold to drag. |
 | X | Click, or Enter when the pointer is hidden |
 | O | Back |
+| O, held | Close the browser. A message with a bar appears; keep holding until the bar is full, or let go to stay. |
 | D-pad | Move between links |
 | L1 | Previous form field |
 | R1 | Next form field |

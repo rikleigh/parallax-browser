@@ -708,16 +708,24 @@ static void drawFooter(WPEDisplayPS5Canvas* c, const BUIState* s, int px, int py
         x += hint(c, x, cy, "□", "Delete") + 32;
     }
     x += hint(c, x, cy, "△", "Address") + 32;
-    hint(c, x, cy, "○", list && s->listCircle ? s->listCircle : "Close");
+    x += hint(c, x, cy, "○", list && s->listCircle ? s->listCircle : "Close menu");
 
-    /* on the right: what the other buttons do from here */
-    static const char* const keys[] = { "L3", "R3" };
-    static const char* const labels[] = { "Home", "View in VR" };
-    int right = px + pw - 32, w = 0;
+    /* on the right: what the other buttons do from here. O held closes the
+     * browser (browserui.c: closeHeld); its hint is the one left out when
+     * the hints on the left are long. */
+    static const char* const keys[] = { "○", "L3", "R3" };
+    static const char* const labels[] = { "Hold to close browser", "Home", "View in VR" };
+    const int right = px + pw - 32;
+    unsigned first = 0;
+    int w = 0;
     for (unsigned i = 0; i < G_N_ELEMENTS(keys); i++)
         w += hintWidth(c, keys[i], labels[i]) + (i ? 28 : 0);
+    if (right - w < x + 16) {
+        w -= hintWidth(c, keys[0], labels[0]) + 28;
+        first = 1;
+    }
     x = right - w;
-    for (unsigned i = 0; i < G_N_ELEMENTS(keys); i++)
+    for (unsigned i = first; i < G_N_ELEMENTS(keys); i++)
         x += hint(c, x, cy, keys[i], labels[i]) + 28;
 }
 

@@ -18,6 +18,7 @@ extern const uint8_t* uipreview_layer;
 extern int uipreview_layer_rect[4];
 /* PS5Text.cpp through uipreview-glue.cpp: premultiplied RGBA. */
 int uipreview_text_panel(const char* text, int pixelSize, uint8_t** rgba, int* width, int* height);
+int uipreview_progress_panel(const char* text, int pixelSize, double fraction, uint8_t** rgba, int* width, int* height);
 
 #define W 1920
 #define H 1080
@@ -297,13 +298,14 @@ static void menuShot(const char* name, BUIState* s)
     wpe_display_ps5_canvas_free(canvas);
 }
 
-static void noticeShot(const char* name, const char* text, int size, int centred)
+/* fraction < 0: a plain notice; otherwise one with a progress bar that full. */
+static void noticeShot(const char* name, const char* text, int size, int centred, double fraction)
 {
     uint32_t* frame = malloc((size_t)W * H * 4);
     memcpy(frame, background, (size_t)W * H * 4);
     uint8_t* rgba;
     int w, h;
-    if (uipreview_text_panel(text, size, &rgba, &w, &h)) {
+    if (fraction < 0 ? uipreview_text_panel(text, size, &rgba, &w, &h) : uipreview_progress_panel(text, size, fraction, &rgba, &w, &h)) {
         /* as PS5Renderer draws messages: centred, 60 px above the bottom */
         over(frame, W, H, rgba, (W - w) / 2, centred ? (H - h) / 2 : H - h - 60, w, h, 1);
         free(rgba);
@@ -706,16 +708,21 @@ int main(int argc, char** argv)
     s.downloadsActive = 0;
     wpe_display_ps5_canvas_free(bar);
 
-    noticeShot("notice-bookmarked", "Bookmarked", 40, 0);
-    noticeShot("notice-download-started", "Download started: ftpsrv-ps5.elf\n(Options, then R1: Downloads)", 40, 0);
-    noticeShot("notice-downloaded", "Downloaded ftpsrv-ps5.elf", 40, 0);
-    noticeShot("notice-download-failed", "Download failed: firmware-notes.txt\nNot enough space: needs 2.00 GB, 1.10 GB free", 40, 0);
-    noticeShot("notice-vr", "PS VR2 not connected\nConnect the headset and press R3 again", 40, 0);
+    noticeShot("notice-bookmarked", "Bookmarked", 40, 0, -1);
+    noticeShot("notice-download-started", "Download started: ftpsrv-ps5.elf\n(Options, then R1: Downloads)", 40, 0, -1);
+    noticeShot("notice-downloaded", "Downloaded ftpsrv-ps5.elf", 40, 0, -1);
+    noticeShot("notice-download-failed", "Download failed: firmware-notes.txt\nNot enough space: needs 2.00 GB, 1.10 GB free", 40, 0, -1);
+    noticeShot("notice-vr", "PS VR2 not connected\nConnect the headset and press R3 again", 40, 0, -1);
     noticeShot("notice-tv-vr",
         "Playing in the PS VR2 headset\nBig Buck Bunny 60fps 4K\n180\xC2\xB0 3D side by side  \xC2\xB7  The guess\n"
         "\xE2\x9C\x95 play/pause   \xE2\x97\x80 \xE2\x96\xB6 seek 10 s   \xE2\x96\xB3 projection   \xE2\x96\xA1 recentre\n"
         "Back to the TV: \xE2\x97\x8B, Options or R3",
-        52, 1);
+        52, 1, -1);
+    /* O held (browserui.c: CLOSE_HOLD_TEXT, closeHeld) */
+    noticeShot("notice-close-hold-0", "Keep holding to close Parallax Browser", 40, 0, 0);
+    noticeShot("notice-close-hold-1", "Keep holding to close Parallax Browser", 40, 0, 0.4);
+    noticeShot("notice-close-hold-2", "Keep holding to close Parallax Browser", 40, 0, 0.85);
+    noticeShot("notice-closing", "Closing Parallax Browser\xE2\x80\xA6", 40, 0, 1);
 
     /* View in VR: the headset's panel (over the page picture, as a stand-in
      * for the video, where the headset shows it: below the centre), and
