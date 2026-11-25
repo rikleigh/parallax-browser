@@ -29,10 +29,18 @@ export PATH="$VENV/bin:$BREW/opt/bison/bin:$PATH"
 
 if [[ ${1:-} == --clean ]]; then rm -rf "$SRC" "$BLD" "$CLC" "$W/sdkfork"; fi
 mkdir -p "$W"
-if [[ ! -f $SRC/.revision || $(<"$SRC/.revision") != "$MESA_REV" ]]; then
+# The fork at its pinned revision, then port/deps/patches/radv/*.patch on top.
+# The stamp holds both: a new or changed patch extracts the source again.
+PATCHES="$ROOT/port/deps/patches/radv"
+STAMP="$MESA_REV $(cat "$PATCHES"/*.patch 2>/dev/null | shasum | cut -c1-12)"
+if [[ ! -f $SRC/.revision || $(<"$SRC/.revision") != "$STAMP" ]]; then
     rm -rf "$SRC"; mkdir -p "$SRC"
     git -C "$MESA_FORK" archive "$MESA_REV" | tar -x -C "$SRC"
-    echo "$MESA_REV" > "$SRC/.revision"
+    for p in "$PATCHES"/*.patch; do
+        [[ -f $p ]] || continue
+        patch -s -d "$SRC" -p1 < "$p" || { echo "radv: $p does not apply" >&2; exit 1; }
+    done
+    echo "$STAMP" > "$SRC/.revision"
 fi
 if [[ ! -f $W/sdkfork/.revision ]]; then
     rm -rf "$W/sdkfork"; mkdir -p "$W/sdkfork"

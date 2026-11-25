@@ -1,0 +1,102 @@
+<!doctype html>
+<!-- How long one round trip through the GPU takes when a page waits for it
+     before it goes on, as an emulator's renderer does several times a frame
+     (a PS2 emulator: 7 to 13 read-backs a frame in its heavy scenes). Each
+     case runs its step 400 times, one after the other, and logs the time per
+     step; every value read back is checked. Cases: work-done: an empty
+     submit, then await onSubmittedWorkDone(); read-back: writeBuffer a
+     counter, copyBufferToBuffer, submit, await mapAsync(READ),
+     getMappedRange, unmap; compute-read-back: the same with a small compute
+     pass in front (the counter doubled by a shader); write-map: await
+     mapAsync(WRITE), write, unmap, then a read-back of it. The times are
+     logged, not judged: only a wrong value fails a case. The clock may be
+     coarse (1 ms without cross-origin isolation), so each figure is a total
+     divided. Log lines: RESULT webgpu-readback-latency <case> PASS|FAIL
+     <why>, then the summary. Upload the directory to /data/ps5webkit/webgpu/
+     and open file:///data/ps5webkit/webgpu/readback-latency.html. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU read-back latency</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fail { color: #f66; } .skip { color: #fc6; } .info { color: #999; }
+</style>
+</head>
+<body>
+<h1>WebGPU read-back latency</h1>
+<div id="out"></div>
+<script src="webgpu-test.js"></script>
+<script>
+'use strict';
+T.run('readback-latency', async () => {
+  const made = await T.getDevice();
+  if (!made) return;
+  const { device } = made;
+  const ROUNDS = 400;
+  const source = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE });
+  const result = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE });
+  const readable = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const writable = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC });
+  const word = new Uint32Array(1);
+
+  async function timed(step) {
+    for (let i = 0; i < 20; i++) await step(1000000 + i);   // pipelines and paths warm
+    const started = performance.now();
+    for (let i = 0; i < ROUNDS; i++) await step(i);
+    const each = (performance.now() - started) / ROUNDS;
+    return `${each.toFixed(3)} ms a round trip (${Math.round(1000 / each)} a second)`;
+  }
+
+  async function readBack(from, expected) {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(from, 0, readable, 0, 256);
+    device.queue.submit([encoder.finish()]);
+    await readable.mapAsync(GPUMapMode.READ);
+    const got = new Uint32Array(readable.getMappedRange(0, 256))[0];
+    readable.unmap();
+    if (got !== expected) throw new Error(`read ${got}, expected ${expected}`);
+  }
+
+  await T.test('work-done', () => timed(async () => {
+    device.queue.submit([]);
+    await device.queue.onSubmittedWorkDone();
+  }));
+
+  await T.test('read-back', () => timed(async (i) => {
+    word[0] = i;
+    device.queue.writeBuffer(source, 0, word);
+    await readBack(source, i);
+  }));
+
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> input: array<u32>;
+    @group(0) @binding(1) var<storage, read_write> output: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) { output[id.x] = input[id.x] * 2u; }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+  const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: source } }, { binding: 1, resource: { buffer: result } }] });
+  await T.test('compute-read-back', () => timed(async (i) => {
+    word[0] = i;
+    device.queue.writeBuffer(source, 0, word);
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    await readBack(result, i * 2);
+  }));
+
+  await T.test('write-map', () => timed(async (i) => {
+    await writable.mapAsync(GPUMapMode.WRITE);
+    new Uint32Array(writable.getMappedRange(0, 256))[0] = i + 7;
+    writable.unmap();
+    await readBack(writable, i + 7);
+  }));
+});
+</script>
+</body>
+</html>

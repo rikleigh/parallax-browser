@@ -36,6 +36,7 @@
 <li><a href="video-texture.html">video-texture.html</a>: a playing video as an external texture (needs ../media/sync-1080p30-h264.mp4 or ?src=)</li>
 <li><a href="video-scaled.html">video-scaled.html</a>: video decoded at another size than the page sees (anamorphic, size switches), copied and imported (needs ../media/anamorphic-1440x1080-sar4x3-h264.mp4 and switch-h264.mp4)</li>
 <li><a href="buffer-map.html">buffer-map.html</a>: buffer mapping as ML libraries use it, up to 64 MiB</li>
+<li><a href="readback-latency.html">readback-latency.html</a>: how long a page waits for one round trip through the GPU (work done, read-back, compute and read-back, write map)</li>
 <li><a href="ml-transformers.html">ml-transformers.html</a>: a sentence-embedding model on WebAssembly and on WebGPU (needs the network, or ?models=http://host:8765/)</li>
 </ol>
 <div class="note">Every page runs on load and ends with a "summary" line; failures are red.</div>

@@ -1,0 +1,147 @@
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.cpp b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.cpp
+index 9e015e4c16..7e0ce61e67 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.cpp
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.cpp
+@@ -64,28 +64,41 @@ void RemoteBuffer::stopListeningForIPC()
+     protect(m_streamConnection)->stopReceivingMessages(Messages::RemoteBuffer::messageReceiverName(), m_identifier.toUInt64());
+ }
+ 
+-void RemoteBuffer::mapAsync(OptionSet<::WebGPU::MapMode> mapModeFlags, uint64_t offset, std::optional<uint64_t> size, CompletionHandler<void(bool)>&& callback)
++// PS5: the reply carries the bytes of the mapped range (up to maximumMappedRangeInReply), and the
++// WebProcess answers getMappedRange() from them. Without them every getMappedRange() is a
++// synchronous message, and it waits behind whatever this thread is doing: a page that maps a
++// buffer every frame and has already submitted the next frame's work waited there for as long as
++// the GPU took (a PS2 emulator's drawing thread: 38% of its time, 2026-11-25). The contents cannot
++// change between here and unmap(): a mapped buffer is not used by the GPU.
++static constexpr size_t maximumMappedRangeInReply = 4 * 1024 * 1024;
++
++void RemoteBuffer::mapAsync(OptionSet<::WebGPU::MapMode> mapModeFlags, uint64_t offset, std::optional<uint64_t> size, CompletionHandler<void(bool, std::optional<Vector<uint8_t>>&&)>&& callback)
+ {
+     if (m_pendingMap) {
+-        callback(false);
++        callback(false, std::nullopt);
+         return;
+     }
+ 
+     m_pendingMap = true;
+ 
+-    protect(m_backing)->mapAsync(mapModeFlags, offset, size, [protectedThis = Ref<RemoteBuffer>(*this), callback = WTF::move(callback), mapModeFlags] (bool success) mutable {
++    protect(m_backing)->mapAsync(mapModeFlags, offset, size, [protectedThis = Ref<RemoteBuffer>(*this), callback = WTF::move(callback), mapModeFlags, offset, size] (bool success) mutable {
+         bool mapWasPending = protectedThis->m_pendingMap;
+         protectedThis->m_pendingMap = false;
+         if (!success) {
+-            callback(false);
++            callback(false, std::nullopt);
+             return;
+         }
+ 
++        std::optional<Vector<uint8_t>> data;
+         if (mapWasPending) {
+             protectedThis->m_isMapped = true;
+             protectedThis->m_mapModeFlags = mapModeFlags;
++            protect(protectedThis->m_backing)->getMappedRange(offset, size, [&data] (auto mappedRange) {
++                if (mappedRange.data() && !mappedRange.empty() && mappedRange.size() <= maximumMappedRangeInReply)
++                    data = Vector<uint8_t>(mappedRange);
++            });
+         }
+-        callback(true);
++        callback(true, WTF::move(data));
+     });
+ }
+ 
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.h b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.h
+index 6dc95c5265..36412203c9 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.h
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.h
+@@ -81,7 +81,7 @@ private:
+     void didReceiveStreamMessage(IPC::StreamServerConnection&, IPC::Decoder&) final;
+ 
+     void getMappedRange(uint64_t offset, std::optional<uint64_t> sizeForMap, CompletionHandler<void(std::optional<Vector<uint8_t>>&&)>&&);
+-    void mapAsync(OptionSet<::WebGPU::MapMode>, uint64_t offset, std::optional<uint64_t> sizeForMap, CompletionHandler<void(bool)>&&);
++    void mapAsync(OptionSet<::WebGPU::MapMode>, uint64_t offset, std::optional<uint64_t> sizeForMap, CompletionHandler<void(bool, std::optional<Vector<uint8_t>>&&)>&&);
+     void copy(std::optional<WebCore::SharedMemoryHandle>&&, uint64_t offset, CompletionHandler<void(bool)>&&);
+     void copyWithCopy(Vector<uint8_t>&&, uint64_t offset);
+     void unmap();
+diff --git a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.messages.in b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.messages.in
+index 41fac511f3..52e2794c70 100644
+--- a/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.messages.in
++++ b/Source/WebKit/GPUProcess/graphics/WebGPU/RemoteBuffer.messages.in
+@@ -30,7 +30,7 @@
+ ]
+ messages -> RemoteBuffer Stream {
+     void GetMappedRange(uint64_t offset, std::optional<uint64_t> size) -> (std::optional<Vector<uint8_t>> data) Synchronous
+-    void MapAsync(OptionSet<::WebGPU::MapMode> mapModeFlags, uint64_t offset, std::optional<uint64_t> size) -> (bool success)
++    void MapAsync(OptionSet<::WebGPU::MapMode> mapModeFlags, uint64_t offset, std::optional<uint64_t> size) -> (bool success, std::optional<Vector<uint8_t>> data)
+     void Copy(std::optional<WebCore::SharedMemory::Handle> data, uint64_t offset) -> (bool success) NotStreamEncodable
+     void CopyWithCopy(Vector<uint8_t> data, uint64_t offset)
+     void Unmap()
+diff --git a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+index 090cfa6ea1..839e724e9d 100644
+--- a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
++++ b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+@@ -232,6 +232,7 @@
+     [Legacy] MessageParamReply WebProcessProxy.SerializeAndWrapCryptoKey wrappedKey
+     [Legacy] MessageParamReply WebProcessProxy.UnwrapCryptoKey key
+     [Legacy] MessageParamReply RemoteBuffer.GetMappedRange data
++    [Legacy] MessageParamReply RemoteBuffer.MapAsync data
+     [Legacy] StructureParam WebCore::CryptoKeyData.key
+     [Legacy] StructureParam WebKit::FrameState.stateObjectData
+     [Legacy] StructureParam WebKit::WebPushMessage.pushData
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.cpp b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.cpp
+index aace70a5fc..b3d9fc37a2 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.cpp
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.cpp
+@@ -53,10 +53,13 @@ RemoteBufferProxy::~RemoteBufferProxy()
+ 
+ void RemoteBufferProxy::mapAsync(OptionSet<::WebGPU::MapMode> mapModeFlags, uint64_t offset, std::optional<uint64_t> size, CompletionHandler<void(bool)>&& callback)
+ {
+-    auto sendResult = sendWithAsyncReply(Messages::RemoteBuffer::MapAsync(mapModeFlags, offset, size), [callback = WTF::move(callback), mapModeFlags, protectedThis = protect(*this)](auto success) mutable {
++    m_mappedData = std::nullopt;
++    auto sendResult = sendWithAsyncReply(Messages::RemoteBuffer::MapAsync(mapModeFlags, offset, size), [callback = WTF::move(callback), mapModeFlags, offset, protectedThis = protect(*this)](auto success, auto&& data) mutable {
+         if (!success)
+             return callback(false);
+         protectedThis->m_mapModeFlags = mapModeFlags;
++        protectedThis->m_mappedData = WTF::move(data);
++        protectedThis->m_mappedDataOffset = offset;
+         callback(true);
+     });
+     UNUSED_PARAM(sendResult);
+@@ -69,6 +72,15 @@ static bool LEGACY_NODELETE offsetOrSizeExceedsBounds(size_t dataSize, uint64_t
+ 
+ void RemoteBufferProxy::getMappedRange(uint64_t offset, std::optional<uint64_t> size, NOESCAPE const Function<void(std::span<uint8_t>)>& callback)
+ {
++    if (m_mappedData && size && offset >= m_mappedDataOffset) {
++        // Within what the reply to mapAsync() brought: no message.
++        uint64_t start = offset - m_mappedDataOffset;
++        if (start <= m_mappedData->size() && *size <= m_mappedData->size() - start) {
++            callback(m_mappedData->mutableSpan().subspan(static_cast<size_t>(start)));
++            return;
++        }
++    }
++
+     // FIXME: Implement error handling.
+     auto sendResult = sendSync(Messages::RemoteBuffer::GetMappedRange(offset, size));
+     auto [data] = sendResult.takeReplyOr(std::nullopt);
+@@ -109,6 +121,7 @@ void RemoteBufferProxy::unmap()
+     UNUSED_VARIABLE(sendResult);
+ 
+     m_mapModeFlags = { };
++    m_mappedData = std::nullopt;
+ }
+ 
+ void RemoteBufferProxy::destroy()
+diff --git a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.h b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.h
+index d6d8c5d64e..2efd5db561 100644
+--- a/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.h
++++ b/Source/WebKit/WebProcess/GPU/graphics/WebGPU/RemoteBufferProxy.h
+@@ -94,6 +94,10 @@ private:
+     const Ref<ConvertToBackingContext> m_convertToBackingContext;
+     const Ref<RemoteDeviceProxy> m_parent;
+     OptionSet<::WebGPU::MapMode> m_mapModeFlags;
++    // The bytes of the mapped range, from the reply to mapAsync(): getMappedRange() is answered
++    // from them, with no synchronous message (RemoteBuffer.cpp says why). Gone at unmap().
++    std::optional<Vector<uint8_t>> m_mappedData;
++    uint64_t m_mappedDataOffset { 0 };
+ };
+ 
+ } // namespace WebKit::WebGPU

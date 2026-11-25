@@ -1,0 +1,95 @@
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+@@ -640,6 +640,72 @@
+    if (memory->physical >= 0)
+       sceKernelReleaseDirectMemory(memory->physical, memory->bytes);
+    *memory = (struct radv_ps5_memory){.physical = -1};
++}
++
++/* /data/ps5webkit/radv-submit-log (a file, any contents): every 5 s, how many
++ * AGC submissions there were and how long sceAgcDriverSubmitDcb and
++ * sceAgcSuspendPoint took, for all queues together. */
++static int64_t
++radv_ps5_now_us(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++}
++
++static bool
++radv_ps5_submit_stats_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      FILE *file = fopen("/data/ps5webkit/radv-submit-log", "r");
++      on = file != NULL;
++      if (file)
++         fclose(file);
++      fprintf(stderr, "radv/ps5: submit log %s (/data/ps5webkit/radv-submit-log)\n", on ? "on" : "off");
++   }
++   return on;
++}
++
++static void
++radv_ps5_submit_stats_add(int64_t submit_us, int64_t suspend_us, uint32_t words)
++{
++   static const int64_t limits[8] = {50, 200, 500, 1000, 2000, 4000, 8000, INT64_MAX};
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++   static uint64_t calls, submit_total, suspend_total, word_total, buckets[8];
++   static int64_t submit_max, suspend_max, last;
++   simple_mtx_lock(&lock);
++   calls++;
++   submit_total += submit_us;
++   suspend_total += suspend_us;
++   word_total += words;
++   if (submit_us > submit_max)
++      submit_max = submit_us;
++   if (suspend_us > suspend_max)
++      suspend_max = suspend_us;
++   unsigned bucket = 0;
++   while (suspend_us >= limits[bucket])
++      bucket++;
++   buckets[bucket]++;
++   const int64_t now = radv_ps5_now_us();
++   if (!last)
++      last = now;
++   if (now - last >= 5000000) {
++      const double seconds = (now - last) / 1e6;
++      fprintf(stderr,
++              "radv/ps5: submit: %.0f/s, %.0f words each; sceAgcDriverSubmitDcb %.0f us avg, %lld max; sceAgcSuspendPoint %.0f us avg, %lld max, "
++              "%.0f ms/s; suspend point under 50 us %llu, 200 %llu, 500 %llu, 1 ms %llu, 2 ms %llu, 4 ms %llu, 8 ms %llu, more %llu\n",
++              calls / seconds, (double)word_total / calls, (double)submit_total / calls, (long long)submit_max,
++              (double)suspend_total / calls, (long long)suspend_max, suspend_total / seconds / 1000.0,
++              (unsigned long long)buckets[0], (unsigned long long)buckets[1], (unsigned long long)buckets[2],
++              (unsigned long long)buckets[3], (unsigned long long)buckets[4], (unsigned long long)buckets[5],
++              (unsigned long long)buckets[6], (unsigned long long)buckets[7]);
++      calls = submit_total = suspend_total = word_total = 0;
++      submit_max = suspend_max = 0;
++      memset(buckets, 0, sizeof buckets);
++      last = now;
++   }
++   simple_mtx_unlock(&lock);
+ }
+ 
+ int
+@@ -652,12 +718,18 @@
+       .words = words,
+       .word_count = count,
+    };
++   const bool timed = radv_ps5_submit_stats_on();
++   const int64_t t0 = timed ? radv_ps5_now_us() : 0;
+    int32_t result = sceAgcDriverSubmitDcb(&description);
+    if (result != 0)
+       return result;
++   const int64_t t1 = timed ? radv_ps5_now_us() : 0;
+    /* Without the suspend point the console starts a submission up to a
+     * refresh late (PS5_Vulkan R68). */
+-   return sceAgcSuspendPoint();
++   result = sceAgcSuspendPoint();
++   if (timed)
++      radv_ps5_submit_stats_add(t1 - t0, radv_ps5_now_us() - t1, count);
++   return result;
+ }
+ 
+ int
