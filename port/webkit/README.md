@@ -4226,6 +4226,15 @@ verbose).
   of the home page, each with RESULT lines (load time, flexible memory) and
   screenshots, 12 s apart; 60 s timeout per URL.
 - `[mem]` lines at main, display, web view, every load and every 60 s.
+- The system's splash screen (GPU=radv; `PS5Renderer::hideSplashWhenDue`)
+  stays up until the first frame with a page in it has been shown (the
+  compositor's scene once the page shown has a layer tree, or the CPU
+  page), a message, or the menu; 8 s at most. Until 2026-11-25 it went when
+  the window surface was made, and the TV showed the renderer's black first
+  frame for the 1 to 2.5 s until the first page painted. The log says
+  `splash screen hidden N ms after the surface was made (<why>)`.
+  `/data/ps5webkit/splash-hide-early` (a file): hidden at the surface, as
+  before.
 - Crash triage: `toolchain/wpe-webkit/titles/ps5browser-symbols.elf`
   (refreshed by `package.sh`), `llvm-addr2line -f -C -i -e ... <rip - 0x400000>`.
   `TITLE_LDFLAGS="--trace-symbol=x" package.sh` traces the title link.

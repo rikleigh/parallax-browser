@@ -432,6 +432,54 @@ void* PS5Renderer::threadEntry(void* data)
     return nullptr;
 }
 
+// ps5-opengl hides the system's splash screen when its window surface is
+// made (ps5_egl.c); with ANGLE nothing else does, and the splash stays over
+// the title's picture. Hidden when the surface was made, the TV showed the
+// first frame's black until the first page was painted (1 to 2.5 s: fonts,
+// the WebProcess, the network process, the page). It stays up now until a
+// frame with something in it has been shown (hideSplashWhenDue), or for
+// splashTimeoutUS when none comes (a page that never paints must not leave
+// the splash over the browser).
+extern "C" int sceSystemServiceHideSplashScreen(void) __attribute__((weak));
+static constexpr int64_t splashTimeoutUS = 8000000;
+
+void PS5Renderer::hideSplash(const char* why)
+{
+    if (!m_splashUp)
+        return;
+    m_splashUp = false;
+    int splash = sceSystemServiceHideSplashScreen ? sceSystemServiceHideSplashScreen() : -1;
+    if (splash)
+        g_message("[wpe-ps5] PS5Renderer: hiding the splash screen failed (0x%08x)", static_cast<unsigned>(splash));
+    g_message("[wpe-ps5] PS5Renderer: splash screen hidden %.0f ms after the surface was made (%s)",
+        (nowUS() - (m_splashDeadlineUS - splashTimeoutUS)) / 1000.0, why);
+}
+
+// After a frame's swap, while the splash is up. Something to show: the page
+// (the compositor's scene, which it hands over once the page shown has a
+// layer tree, or the CPU page), a message, or the application's UI when it
+// is more than a strip (its bar above a black page area is not it; a menu
+// or a dialog is).
+void PS5Renderer::hideSplashWhenDue()
+{
+    const char* why = nullptr;
+    if (m_sceneTexture || m_pageWidth > 0)
+        why = "the first page frame";
+    else if (m_messageTexture && m_messageUntilUS)
+        why = "a message";
+    else if (m_uiRect[2] > 0 && m_uiRect[3] > m_height / 4)
+        why = "the application's UI";
+    else if (nowUS() >= m_splashDeadlineUS)
+        why = "nothing to show yet";
+    if (!why)
+        return;
+    // The swap returned when the frame was queued: it is on screen a vsync
+    // or two later, and the splash must not go before it (once, at start).
+    if (nowUS() < m_splashDeadlineUS)
+        g_usleep(static_cast<gulong>(2 * m_periodUS));
+    hideSplash(why);
+}
+
 #if PS5WK_GPU_RADV
 // GPU=radv: ANGLE's Vulkan backend on RADV, on ANGLE's "simple" display
 // (VK_KHR_display, which PS5_Mesa's RADV puts on VideoOut), an ES 3.1
@@ -450,10 +498,6 @@ void* PS5Renderer::threadEntry(void* data)
 #ifndef EGL_PLATFORM_VULKAN_DISPLAY_MODE_SIMPLE_ANGLE
 #define EGL_PLATFORM_VULKAN_DISPLAY_MODE_SIMPLE_ANGLE 0x34A4
 #endif
-// ps5-opengl hides the system's splash screen when its window surface is
-// made (ps5_egl.c); with ANGLE nothing else does, and the splash stays over
-// the title's picture.
-extern "C" int sceSystemServiceHideSplashScreen(void) __attribute__((weak));
 bool PS5Renderer::initializeANGLE(void*& display, void*& config, void*& surface, void*& context, char* error, unsigned errorSize)
 {
     typedef EGLDisplay (*GetPlatformDisplayEXT)(EGLenum, void*, const EGLint*);
@@ -506,9 +550,12 @@ bool PS5Renderer::initializeANGLE(void*& display, void*& config, void*& surface,
         snprintf(error, errorSize, "ANGLE window surface: 0x%04x on all %d 8888 window configs (of %d)", lastError, tried, count);
         return false;
     }
-    int splash = sceSystemServiceHideSplashScreen ? sceSystemServiceHideSplashScreen() : -1;
-    if (splash)
-        g_message("[wpe-ps5] PS5Renderer: hiding the splash screen failed (0x%08x)", static_cast<unsigned>(splash));
+    // The splash goes with the first frame that has something in it
+    // (hideSplashWhenDue); /data/ps5webkit/splash-hide-early: now, as before.
+    m_splashUp = true;
+    m_splashDeadlineUS = nowUS() + splashTimeoutUS;
+    if (!access("/data/ps5webkit/splash-hide-early", F_OK))
+        hideSplash("splash-hide-early");
     static const EGLint contextAttributes[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE };
     context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttributes);
     if (context == EGL_NO_CONTEXT || !eglMakeCurrent(display, surface, surface, context)) {
@@ -789,6 +836,8 @@ void PS5Renderer::threadMain()
 {
     char error[512] = { };
     bool ok = initializeGL(error, sizeof(error));
+    if (!ok)
+        hideSplash("the renderer did not start"); // no frame will ever take it down
     g_mutex_lock(&m_lock);
     m_initOK = ok;
     snprintf(m_initError, sizeof(m_initError), "%s", error);
@@ -847,6 +896,8 @@ void PS5Renderer::threadMain()
             }
             // Idle: sleep until a frame or geometry change is due.
             int64_t deadline = PS5VideoServer::nextDeadline();
+            if (m_splashUp) // a frame at the splash's deadline takes it down
+                deadline = std::min(deadline, m_splashDeadlineUS + 2000);
             if (m_messageUntilUS)
                 deadline = std::min(deadline, m_messageUntilUS + 2000);
             if (m_perfOn && m_perf) // the overlay's next text update
@@ -991,6 +1042,8 @@ void PS5Renderer::threadMain()
         PS5VideoServer::presented();
         if (m_compositorReady)
             m_compositor->didPresent();
+        if (m_splashUp)
+            hideSplashWhenDue();
 
         // vsync grid: follow swap returns within a quarter period, else reset.
         if (m_lastSwapEnd) {

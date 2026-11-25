@@ -387,6 +387,14 @@ private:
     } m_thumbnails;
     PS5VRState* m_vr { nullptr }; // render thread
 
+    // The system's splash screen (GPU=radv: ps5-opengl hides its own): up
+    // until a frame with a page or the application's picture in it has been
+    // shown, or the deadline (hideSplashWhenDue). Render thread.
+    bool m_splashUp { false };
+    int64_t m_splashDeadlineUS { 0 };
+    void hideSplash(const char* why);
+    void hideSplashWhenDue();
+
     // vsync estimate (CLOCK_MONOTONIC us)
     int64_t m_lastSwapEnd { 0 };
     int64_t m_vsyncGrid { 0 };
