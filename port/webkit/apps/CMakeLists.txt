@@ -139,7 +139,16 @@ endif ()
 # The crash guard (fatal signals reported to the log and crash-title.txt),
 # without its pthread_create wrapper (titlecrash.c).
 target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/title/titlecrash.c)
-target_link_options(ps5browser PRIVATE ${PS5_LOCK_WRAPS})
+# ps5clock in the title too: pages run in it (the WebProcess in the title), and
+# an emulator page reads the clock tens of thousands of times a second.
+target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/common/ps5clock.c)
+# ps5mem: memcpy, memmove and memset with AVX2 in both executables, in place of
+# libkernel's rep-move loops (ps5mem.c). -fno-builtin: no loop there may
+# become a call to the function it is in.
+set_source_files_properties(${PS5_APPS_DIR}/common/ps5mem.c PROPERTIES COMPILE_OPTIONS "-mavx2;-fno-builtin;-O2")
+target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/common/ps5mem.c)
+target_sources(ps5wk-child PRIVATE ${PS5_APPS_DIR}/common/ps5mem.c)
+target_link_options(ps5browser PRIVATE -Wl,--wrap=clock_gettime ${PS5_LOCK_WRAPS})
 target_link_libraries(ps5browser PRIVATE WebKit ${PS5_OBJECTS_ARCHIVE} ${PS5_DEPS_LINK} GLib::Gio)
 add_dependencies(ps5browser ps5wk-objects)
 add_dependencies(ps5browser WebKit)

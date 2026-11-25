@@ -1,0 +1,51 @@
+diff --git a/Source/WebCore/page/Performance.cpp b/Source/WebCore/page/Performance.cpp
+index 0ece9c2b81..9cfea89a8f 100644
+--- a/Source/WebCore/page/Performance.cpp
++++ b/Source/WebCore/page/Performance.cpp
+@@ -89,6 +89,9 @@ Performance::Performance(ScriptExecutionContext* context, MonotonicTime timeOrig
+     , m_resourceTimingBufferFullTimer(*this, &Performance::resourceTimingBufferFullTimerFired) // FIXME: Migrate this to the event loop as well. https://bugs.webkit.org/show_bug.cgi?id=229044
+     , m_timeOrigin(timeOrigin)
+     , m_continuousTimeOrigin(timeOrigin.approximate<ContinuousTime>())
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    , m_wallTimeOrigin(timeOrigin.approximate<WallTime>())
++#endif
+ {
+     ASSERT(m_timeOrigin);
+     initializeEntryBufferMap();
+@@ -163,7 +166,11 @@ DOMHighResTimeStamp Performance::now() const
+ 
+ DOMHighResTimeStamp Performance::timeOrigin() const
+ {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    return reduceTimeResolution(m_wallTimeOrigin.secondsSinceEpoch()).milliseconds();
++#else
+     return reduceTimeResolution(m_timeOrigin.approximate<WallTime>().secondsSinceEpoch()).milliseconds();
++#endif
+ }
+ 
+ ReducedResolutionSeconds Performance::nowInReducedResolutionSeconds() const
+diff --git a/Source/WebCore/page/Performance.h b/Source/WebCore/page/Performance.h
+index c9a7184dec..e543050f07 100644
+--- a/Source/WebCore/page/Performance.h
++++ b/Source/WebCore/page/Performance.h
+@@ -46,6 +46,7 @@
+ #include <wtf/Forward.h>
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/OrderedHashSet.h>
++#include <wtf/WallTime.h>
+ 
+ namespace JSC {
+ class JSGlobalObject;
+@@ -189,6 +190,12 @@ private:
+ 
+     MonotonicTime m_timeOrigin;
+     ContinuousTime m_continuousTimeOrigin;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // The time origin as wall time, taken once: timeOrigin is a constant, and working it out again
++    // on every read costs two clock readings (an Emscripten page reads it with every
++    // emscripten_get_now(), thousands of times a second).
++    WallTime m_wallTimeOrigin;
++#endif
+ 
+     RefPtr<PerformanceNavigationTiming> m_navigationTiming;
+     const std::unique_ptr<PerformanceUserTiming> m_userTiming;
