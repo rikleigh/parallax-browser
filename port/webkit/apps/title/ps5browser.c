@@ -1713,7 +1713,7 @@ void ps5wk_safer_browsing_toggle(void)
     applyWebContentSettings();
     /* Safer browsing also decides where pages run (main): with pages in the
      * browser process (or about to be), the browser restarts. */
-    const gboolean browserRestart = inTitleWeb || flagFile("/data/ps5webkit/pages-in-browser");
+    const gboolean browserRestart = inTitleWeb || !flagFile("/data/ps5webkit/no-pages-in-browser");
     const char* error = browserRestart ? restartBrowser("Safer browsing (the menu)") : NULL;
     if (error)
         spike_log("settings: Safer browsing: no browser restart: %s", error);
@@ -3579,10 +3579,12 @@ int main(int argc, char** argv)
      * (adblock.c) and nothing else: no JIT in a title. Read when WebKit
      * initializes JSC (the web context below); the WebProcesses do not see
      * this environment. */
-    /* Pages in the browser process (spikes/14-webprocess-in-title):
-     * experimental, off unless Settings turned it on (pages-in-browser), and
-     * never with Safer browsing, which keeps pages apart from the browser. */
-    inTitleWeb = fileExists("/data/ps5webkit/pages-in-browser") && !fileExists("/data/ps5webkit/safer-browsing");
+    /* Pages in the browser process (spikes/14-webprocess-in-title): on
+     * unless Settings turned it off (no-pages-in-browser), and never with
+     * Safer browsing, which keeps pages apart from the browser. The
+     * pages-in-browser file that turned it on while it was off by default
+     * is no longer read. */
+    inTitleWeb = !fileExists("/data/ps5webkit/no-pages-in-browser") && !fileExists("/data/ps5webkit/safer-browsing");
     if (inTitleWeb) {
         setUpInTitleWeb();
         /* Which stream message each WebGL/WebGPU thread is in, for the

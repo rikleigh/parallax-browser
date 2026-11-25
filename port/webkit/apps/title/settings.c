@@ -8,11 +8,11 @@
  *     WEBKIT_DEBUG...) kept as it was; a setting back at its default loses
  *     its line. Written to child.env.tmp, then renamed over child.env.
  *   flag files (no-hwdec, audio-silent, push-off, adblock-off,
- *     no-compositing, no-webgl, no-webgpu): present = that feature off; the title
+ *     no-compositing, no-webgl, no-webgpu, no-pages-in-browser): present = that feature off; the title
  *     reads them when it starts (no-compositing: WebKit in the title reads
  *     it whenever a page gets a new WebProcess; no-webgl: applied at once,
  *     and no-webgpu likewise, ps5browser.c applyWebContentSettings). Opt-in flag files
- *     (perf-overlay, safer-browsing, pages-in-browser): present = that feature on.
+ *     (perf-overlay, safer-browsing): present = that feature on.
  *     safer-browsing overrides jit, wasm, webgl, webgpu and web_in_title while present (each
  *     WebProcess reads it at start, ps5wk-child.cpp configureJIT; the title
  *     for WebGL) and leaves their own values alone for when it goes.
@@ -69,6 +69,7 @@ static const struct {
     { "graphics", "Graphics" },
     { "video", "Video" },
     { "memory", "Memory" },
+    { "processes", "Processes" },
     { "experimental", "Experimental and diagnostics" },
 };
 
@@ -136,8 +137,8 @@ static const Setting settings[] = {
     { "pas_decommit", "memory", KIND_ENV, TYPE_BOOL, "PS5WK_PAS_DECOMMIT", "1", PS5WK_SETTINGS_PAGE, "Give back freed memory",
         "Returns memory that pages no longer use to the system. Off keeps it (the old behaviour). The network process picks it up at the next browser start.",
         NULL, 0, 0 },
-    { "web_in_title", "experimental", KIND_FLAG_ON, TYPE_BOOL, "pages-in-browser", "0", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
-        "Runs pages inside the browser itself instead of in a separate process. Faster: pages get more of the PS5's CPU, and games and heavy pages run up to twice as fast. But a page's work shares the browser's own thread, so on busy pages (feeds that keep adding posts) the menu, the pointer and clicks pause for up to a second now and then. Also, a page that crashes closes the whole browser, and pages are not kept apart from the browser. Settings that need a page restart then need a browser restart. Safer browsing always keeps pages in their own process.",
+    { "web_in_title", "processes", KIND_FLAG, TYPE_BOOL, "no-pages-in-browser", "1", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
+        "Runs pages inside the browser itself, which gets more of the PS5's CPU: games and heavy pages run up to twice as fast. The price: a page's work shares the browser's own thread, so on busy pages (feeds that keep adding posts) the menu, the pointer and clicks pause for up to a second now and then; a page that crashes closes the whole browser; and pages are not kept apart from the browser. Off runs each page in a separate process: slower, and without those three. While it is on, settings that need a page restart need a browser restart. Safer browsing always keeps pages in their own process.",
         NULL, 0, 0 },
     { "perf_overlay", "experimental", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
         "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",

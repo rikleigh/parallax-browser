@@ -249,8 +249,8 @@ page, search engine, sound, gamepad mode, the phone link and its QR code),
 **Ads & privacy** (this site, ad blocking, allowed sites, filter lists,
 Safer browsing), **Cookies & storage** (clearing, sizes), **Downloads**
 (where they go, asking, connections, after unpacking, the homebrew
-launcher), **Advanced** (the engine settings, under Scripts, Graphics, Video, Memory
-and Experimental and diagnostics) and **Update & restart** (its entry shows
+launcher), **Advanced** (the engine settings, under Scripts, Graphics, Video, Memory,
+Processes and Experimental and diagnostics) and **Update & restart** (its entry shows
 the new version when there is one). Each setting is a row: its name, the
 first sentence of its help (*More* shows the rest), what applies it, and
 badges only for state (*Default: X* when it isn't at the default, *Changed:
@@ -260,7 +260,7 @@ stuck to the top). Changes are saved as soon as you press a button. On the
 PS5 the page moves Up and Down from row to row itself, and Left from a
 row's first button to the section list; the rest is WebKit's spatial
 navigation. In `/settings.json` each setting has its `group` (general, link,
-ads, security, scripts, graphics, video, memory, experimental) and `groups`
+ads, security, scripts, graphics, video, memory, processes, experimental) and `groups`
 names them; a group the page doesn't know becomes a heading under Advanced.
 
 | Setting | Stored as | Applies |
@@ -279,6 +279,7 @@ names them; a group the page doesn't know becomes a heading under Advanced.
 | Offer VP9 video (default on; off makes YouTube send H.264) | `PS5WK_MEDIA_VP9=0` when off | page restart |
 | GPU compositing (default on; includes async scrolling) | `/data/ps5webkit/no-compositing` when off | page restart |
 | Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
+| Pages in the browser process (default on since 2026-11-25; never with Safer browsing): the first WebProcess runs in the title, which gets more CPU (games up to twice as fast), at the price of pauses in the browser's UI on busy pages, a page crash ending the browser, and pages not kept apart from it (`spikes/14-webprocess-in-title/stage3.md`). The page settings above are then browser-restart settings | `/data/ps5webkit/no-pages-in-browser` when off (`pages-in-browser`, which turned it on while it was off by default, is no longer read) | browser restart |
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
 | Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |

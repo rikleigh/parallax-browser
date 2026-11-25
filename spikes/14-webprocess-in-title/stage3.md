@@ -1,9 +1,15 @@
 # Spike 14, stage 3: pages in the browser process by default (2026-11-16)
 
-**Later the same day: experimental, off by default.** Pages run in payload
-WebProcesses unless Settings' "Pages in the browser process (experimental)"
-is on (`/data/ps5webkit/pages-in-browser`). Safer browsing always uses
-payloads. `/data/ps5webkit/no-inprocess-web` is gone.
+**2026-11-25: the default again.** Pages run in the browser process unless
+Settings' "Pages in the browser process" is off
+(`/data/ps5webkit/no-pages-in-browser`). Safer browsing always uses
+payloads. `pages-in-browser`, which turned it on in between, is no longer
+read. The pros and cons below stand.
+
+**Later on 2026-11-16: experimental, off by default** (until 2026-11-25).
+Pages ran in payload WebProcesses unless Settings' "Pages in the browser
+process (experimental)" was on (`/data/ps5webkit/pages-in-browser`).
+`/data/ps5webkit/no-inprocess-web` is gone.
 
 - Pro: pages get more CPU, so games and heavy pages run up to twice as fast
   (48 against 25 frames/s in a fighting game).
