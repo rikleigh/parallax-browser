@@ -2,7 +2,7 @@
  * The PS5 user's own browser data (profile.c; README: "Users and storage"):
  * /data/ps5webkit/users/<user id>/ holds what is theirs (cookies and site
  * data, the cache, history, bookmarks, tabs, downloads, the home page, the
- * sites where ads are allowed). Everything else in /data/ps5webkit (fonts,
+ * sites where ads or pop-ups are allowed). Everything else in /data/ps5webkit (fonts,
  * the ad-block lists, child.env and the other switches) is shared.
  */
 #pragma once

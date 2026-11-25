@@ -40,3 +40,6 @@ void ps5wk_adblock_connect_view(WebKitWebView* view);
 
 /* The host of an http(s) URI without "www.", or NULL (free it). */
 char* ps5wk_adblock_site_for_uri(const char* uri);
+/* A site as the allow lists keep it (this one, and popups.c's): text as a
+ * lowercase host without "www.", or NULL when it is none (free it). */
+char* ps5wk_adblock_clean_site(const char* text);

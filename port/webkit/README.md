@@ -247,7 +247,7 @@ The page has five sections, one shown at a time, picked from a list beside
 it on the TV (and a wide screen) or above it on a phone: **General** (home
 page, search engine, sound, gamepad mode, the phone link and its QR code),
 **Ads & privacy** (this site, ad blocking, allowed sites, filter lists,
-Safer browsing), **Cookies & storage** (clearing, sizes), **Downloads**
+pop-ups, Safer browsing), **Cookies & storage** (clearing, sizes), **Downloads**
 (where they go, asking, connections, after unpacking, the homebrew
 launcher), **Advanced** (the engine settings, under Scripts, Graphics, Video, Memory,
 Processes and Experimental and diagnostics) and **Update & restart** (its entry shows
@@ -434,7 +434,7 @@ as cookies).
 
 Each PS5 user has their own browser data: cookies and site data, the
 webpage cache, history, bookmarks, open tabs, downloads, the Home page and
-the sites where ads are allowed. The title asks the system who started it
+the sites where ads or pop-ups are allowed. The title asks the system who started it
 (`sceUserServiceGetInitialUser`, `sceUserServiceGetUserName`; profile.c)
 before it reads any of that, and uses that user's folder for the whole run.
 The menu shows the name on the right of its header ("PS5 user"). The
@@ -447,7 +447,7 @@ runtime files, the ad-block lists, `child.env` and the other switches in
 | `…/name.txt` | the user's name, for someone looking over FTP |
 | `…/bookmarks.json`, `history.json`, `session.json`, `downloads.json`, `downloads/` | see *Tabs, bookmarks, history* and *Downloads* |
 | `…/browser/data/`, `…/browser/cache/` | WebKit's website data (`cookies.sqlite`, local storage, IndexedDB, HSTS) and its HTTP cache |
-| `…/home-url.txt`, `…/search.txt`, `…/adblock-allow.txt` | the Home page and Search engine settings; the sites where ads are allowed |
+| `…/home-url.txt`, `…/search.txt`, `…/adblock-allow.txt`, `…/popups-allow.txt` | the Home page and Search engine settings; the sites where ads are allowed; the sites where pop-ups are allowed |
 | `/data/ps5webkit/start-data.js` | the start page's bookmarks and most visited, rewritten at every start for the user who started the browser (next to `start.html`, which loads it) |
 
 **Moving to users.** Before this, all of it was in `/data/ps5webkit` itself,
@@ -616,8 +616,8 @@ the session file. O with nothing to go back to, or *Back
 to the page* (`POST /browser/page action=close`) closes it and shows the
 tab it was opened over. A browser page tab that goes on to a web page
 becomes an ordinary tab. Links with `target=_blank` and `window.open()` after a click open
-in a new tab; pop-ups without a click are dropped (`browser: pop-up without
-a click blocked`). Links sent from another device (`/open`, ps5open) load in
+in a new tab; pop-ups without a click are blocked with a notice (*Pop-ups*
+below). Links sent from another device (`/open`, ps5open) load in
 the tab shown.
 
 **X held on a link** (0.6 s, the pointer over it): the link in a new tab,
@@ -633,6 +633,56 @@ pointer shown (a link focused with the D-pad is not known to the browser
 when it is in another site's frame), and no `Referer` is sent. The link is
 the one WebKit's hit test reports (`mouse-target-changed`, frames included),
 kept with each tab's view. Test page: `test/input/hold-link.html`.
+
+**Pop-ups** (2026-11-25). A page that opens
+a new window by itself, without a press (`window.open()` from a timer or at
+load, a scripted click on a `target=_blank` link, a form sent to a new
+window by script), gets none, and a notice says so: "Pop-up blocked", and
+under it "To allow pop-ups on example.com: Options, then Settings". The
+notice comes once for a page, then at most every 30 s; the log has the
+first five and every 100th (`browser: pop-up without a press blocked (N on
+this page): <address>`). While that page is shown, Settings (the menu's ⚙)
+opens on **Ads & privacy** with *Allow pop-ups on example.com* focused
+(`parallax://settings#ads/popSiteButton`); the row shows how many were
+blocked and the last address. An allowed site's pop-ups open in a new tab
+like a pressed link's (`browser: pop-up without a press, allowed on this
+site: new tab for ...`), up to the 12 tabs. *Sites where pop-ups are
+allowed* lists every entry with a *Remove* button. Nothing reloads: try
+again on the page.
+
+- The site is the page's, the tab's address without `www.`, and covers its
+  subdomains, whichever frame asked (as the ad blocker's allowed sites).
+  The list is `popups-allow.txt` in the PS5 user's folder, one site per
+  line, read at start (`popups: blocked without a press, allowed on N
+  sites`). In private browsing the list is a copy: a site allowed there is
+  allowed until private browsing ends and is never written.
+- How: `javascript-can-open-windows-automatically` is on in the WebKitSettings
+  (`ps5browser.c`), so WebKit asks the browser for every new window (the web
+  view's `create` signal, `browserui.c` onCreate) and the browser decides by
+  `webkit_navigation_action_is_user_gesture` and the list (`popups.c`).
+  With the setting off, as it was, WebKit dropped those windows inside the
+  WebProcess and the browser never heard of them, so there was nothing to
+  show. The press WebKit reports is the same one its own check used
+  (`UserGestureIndicator::processingUserGesture`).
+- Not changed: a window without an address or for `about:blank` and one for
+  an address that isn't http(s) are ignored without a notice, pressed or
+  not (allowing the site would not open them either); a tab that isn't the
+  one shown opens nothing. A new tab is a fresh load with no `window.opener`,
+  so a login window that reports back to the page that opened it still
+  doesn't finish there. A pressed link that opens a tab while the page
+  itself goes elsewhere (a "tab-under") is not blocked.
+- `POST /popups?do=allow|block&site=<host>` (link server, PIN as for
+  Settings) changes the list; `/settings.json` has `"popups"`: `site`,
+  `siteAllowedBy`, `blocked`, `last`, `sites`. From another device the row
+  is for the page the PS5 shows; during private browsing another device
+  gets no site and the list as saved.
+- Test page: `test/input/popups.html` (serve it over http: the site needs a
+  host name or address). Checked on the console 2026-11-25 through the link
+  server: the pop-up at load blocked with the notice, the Settings row
+  (opened from the menu, the button focused, "1 pop-up blocked" and the
+  address), allowed and reloaded (a new tab), blocked again. Not tried: the
+  page's buttons with the pad (a scripted click, a form, a late
+  `window.open`), and private browsing's copy of the list.
 
 **O held closes the browser.** After 0.4 s a message comes up where the
 notices go, "Keep holding to close Parallax Browser", with a bar that fills
@@ -940,8 +990,8 @@ Leaving (the same button) closes the private tabs, their WebProcess and the
 session with its data, and brings the normal tabs back where they were.
 Bookmarks work as usual (a bookmark added in private browsing is kept).
 Downloads are kept, as in Safari: the file and its line in the Downloads
-list stay. Button mappings changed while private last only until it
-ends. `POST /browser/private on=1|0` (link server, PIN) does the same as
+list stay. Button mappings changed while private, and sites allowed their
+pop-ups there, last only until it ends. `POST /browser/private on=1|0` (link server, PIN) does the same as
 the button; `GET` says whether it is on.
 
 ## Downloads

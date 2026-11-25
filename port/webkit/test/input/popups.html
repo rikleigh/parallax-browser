@@ -1,0 +1,72 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Pop-ups</title>
+<!-- Pop-ups without a press are blocked with a notice, unless the page's site
+     is on the allow list (apps/title/popups.c, browserui.c onCreate; README
+     "Pop-ups"). The site must be a host with a dot in it, so serve this page
+     over http (python3 -m http.server on the Mac) rather than from file:.
+     What to check on the TV:
+       1. 1.5 s after the page loads it asks for a window by itself: the
+          notice "Pop-up blocked / To allow pop-ups on <site>: Options, then
+          Settings", no new tab, and "timer: window.open gave null" here.
+          The title log: "browser: pop-up without a press blocked (1 on this
+          page): https://example.com/?popup=load".
+       2. X on "Pop-up with a press": a new tab on example.com ("Opened in a
+          new tab"), as before.
+       3. X on "Pop-up 3 s after a press": blocked (the press is long over);
+          no second notice within 30 s, but the log has the line (2 on this
+          page).
+       4. X on "Scripted click on a new-window link, in 3 s" and "Form to a
+          new window, in 3 s": blocked the same way.
+       5. X on "Window without an address, in 3 s": nothing, and no notice
+          (the log: "new window without an address: ignored").
+       6. Options, then Settings (⚙): Ads & privacy is shown with "Allow
+          pop-ups on <site>" focused, the badge says how many were blocked
+          and the help names the last address. X on it: "Pop-ups allowed on
+          <site>. Try again on the page."
+       7. O back to the page, Square to reload: 1.5 s later example.com opens
+          in a new tab by itself ("pop-up without a press, allowed on this
+          site").
+       8. Settings again: "Block pop-ups on <site> again", and the site under
+          "Sites where pop-ups are allowed" with Remove. After either, step 1
+          again.
+       9. Private browsing: allow the site there, leave private browsing: it
+          is blocked again, and popups-allow.txt was not written.
+     Logs (console.log, the title log): POPUPS <what> -->
+<style>
+body { font: 28px sans-serif; background: #01001a; color: #f4f2ff; margin: 48px; }
+a { color: #9db7ff; }
+a, button { display: inline-block; padding: 18px 28px; margin: 10px 12px 10px 0; font: inherit; }
+#log { font: 22px monospace; color: #b9b5e0; white-space: pre; }
+[hidden] { display: none; }
+</style></head>
+<body>
+<h1>Pop-ups</h1>
+<p>This page asks for a window by itself 1.5 s after it loads.</p>
+<p><button id="press">Pop-up with a press</button>
+<button id="late">Pop-up 3 s after a press</button></p>
+<p><button id="click">Scripted click on a new-window link, in 3 s</button>
+<button id="form">Form to a new window, in 3 s</button>
+<button id="blank">Window without an address, in 3 s</button></p>
+<a id="link" href="https://example.org/?popup=scripted-click" target="_blank" hidden>link</a>
+<form id="f" action="https://example.org/" target="_blank" hidden><input name="popup" value="form"></form>
+<div id="log"></div>
+<script>
+function say(text) {
+    console.log('POPUPS ' + text);
+    var log = document.getElementById('log');
+    log.textContent = (text + '\n' + log.textContent).slice(0, 1200);
+}
+function ask(what, url) {
+    var w = null;
+    try { w = window.open(url); } catch (e) { say(what + ': window.open threw ' + e); return; }
+    say(what + ': window.open gave ' + (w ? 'a window' : 'null'));
+}
+function later(run) { setTimeout(function () { setTimeout(run, 1500); }, 1500); }
+setTimeout(function () { ask('timer', 'https://example.com/?popup=load'); }, 1500);
+document.getElementById('press').onclick = function () { ask('press', 'https://example.com/?popup=press'); };
+document.getElementById('late').onclick = function () { say('late: in 3 s'); later(function () { ask('late', 'https://example.com/?popup=late'); }); };
+document.getElementById('click').onclick = function () { say('scripted click: in 3 s'); later(function () { document.getElementById('link').click(); say('scripted click: done'); }); };
+document.getElementById('form').onclick = function () { say('form: in 3 s'); later(function () { document.getElementById('f').submit(); say('form: sent'); }); };
+document.getElementById('blank').onclick = function () { say('no address: in 3 s'); later(function () { ask('no address', ''); }); };
+</script>
+</body></html>

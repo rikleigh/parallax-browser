@@ -712,6 +712,7 @@ int main(int argc, char** argv)
     noticeShot("notice-download-started", "Download started: ftpsrv-ps5.elf\n(Options, then R1: Downloads)", 40, 0, -1);
     noticeShot("notice-downloaded", "Downloaded ftpsrv-ps5.elf", 40, 0, -1);
     noticeShot("notice-download-failed", "Download failed: firmware-notes.txt\nNot enough space: needs 2.00 GB, 1.10 GB free", 40, 0, -1);
+    noticeShot("notice-popup-blocked", "Pop-up blocked\nTo allow pop-ups on example.com: Options, then Settings", 40, 0, -1);
     noticeShot("notice-vr", "PS VR2 not connected\nConnect the headset and press R3 again", 40, 0, -1);
     noticeShot("notice-tv-vr",
         "Playing in the PS VR2 headset\nBig Buck Bunny 60fps 4K\n180\xC2\xB0 3D side by side  \xC2\xB7  The guess\n"

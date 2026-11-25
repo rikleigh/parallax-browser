@@ -272,6 +272,11 @@ static char* cleanSite(const char* text)
     return site;
 }
 
+char* ps5wk_adblock_clean_site(const char* text)
+{
+    return cleanSite(text);
+}
+
 char* ps5wk_adblock_site_for_uri(const char* uri)
 {
     if (!uri || (g_ascii_strncasecmp(uri, "http://", 7) && g_ascii_strncasecmp(uri, "https://", 8)))

@@ -19,8 +19,9 @@
  *   L3 (press the left stick): home page,
  *   touchpad: a laptop's touchpad (one finger: the pointer, two: scroll,
  *   press: click).
- * (every button is taken: Settings, and the ad blocker's per-site switch on
- * it, are in the browser menu, Options, adblock.c)
+ * (every button is taken: Settings, and the ad blocker's and the pop-ups'
+ * per-site switches on it, are in the browser menu, Options: adblock.c,
+ * popups.c)
  *
  * Logs go to the Mac's tools/logserver.sh (LOG_HOST:LOG_PORT) and to
  * /data/ps5webkit/ps5browser.log.
@@ -35,6 +36,7 @@
 #include "downloads.h"
 #include "files.h"
 #include "dlm.h"
+#include "popups.h"
 #include "qrcode.h"
 #include "settings.h"
 #include "profile.h"
@@ -667,6 +669,9 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
     /* The ad blocker's filter on or off for this page (allowed sites). */
     if (event != WEBKIT_LOAD_FINISHED)
         ps5wk_adblock_navigation(webkit_web_view_get_uri(view));
+    /* A new page: no pop-up blocked on it yet (popups.c). */
+    if (event == WEBKIT_LOAD_COMMITTED)
+        ps5wk_popups_page(webkit_web_view_get_uri(view));
     int webPid = 0;
     double committed = 0, limit = 0;
     if (event == WEBKIT_LOAD_STARTED && !memRestartURI && !memRestarting && !windDownStart && webkit_web_view_get_uri(view)
@@ -1467,6 +1472,9 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  *   POST /adblock?do=allow|block&site=<host>   ads allowed on a site (and
  *       its subdomains) or blocked there again; the page reloads if it is
  *       on that site
+ *   POST /popups?do=allow|block&site=<host>   pop-ups without a press
+ *       allowed on a site (and its subdomains) or blocked there again
+ *       (popups.c); the page stays as it is
  * The PIN applies as for /open, except to the PS5's own parallax://settings.
  * No CORS headers, and requests with an Origin header must come from the
  * address they were sent to, by IP or a local name: other web pages
@@ -1534,10 +1542,13 @@ static void toggleSettings(void)
         settingsReturnURI = g_strdup(current && *current ? current : "");
         g_mutex_unlock(&shownLock);
     }
-    spike_log("settings: opening %s%s", PS5WK_SETTINGS_URL, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
+    /* A pop-up was blocked on this page: Settings opens where its site is
+     * allowed them (the notice says "Options, then Settings"). */
+    const char* page = ps5wk_popups_blocked_on(current) ? PS5WK_SETTINGS_URL "#ads/popSiteButton" : PS5WK_SETTINGS_URL;
+    spike_log("settings: opening %s%s", page, pushLocalOnly ? " (link server on 127.0.0.1 only)" : "");
     loadStart = g_get_monotonic_time();
-    if (!ps5wk_browser_open_page(PS5WK_SETTINGS_URL))
-        webkit_web_view_load_uri(webView, PS5WK_SETTINGS_URL);
+    if (!ps5wk_browser_open_page(page))
+        webkit_web_view_load_uri(webView, page);
 }
 
 /* "Leave this page?" (a page's beforeunload handler): WPE's default
@@ -2013,15 +2024,19 @@ static char* settingsState(const char* message, gboolean trusted)
     /* The ad blocker's site buttons are for the page Settings was opened
      * from (R3), or the page shown (another device). */
     char* adblock = ps5wk_adblock_json(isSettingsURI(shown) ? back : shown);
+    /* The same page for the pop-ups row. Another device during private
+     * browsing (no page told): the list as saved, not that session's. */
+    char* popups = ps5wk_popups_json(isSettingsURI(shown) ? back : shown, hide);
     /* For the "Send from your phone" card (on the PS5 only). */
     char* link = linkJSON();
     char* downloads = ps5wk_downloads_summary_json();
     char* storage = ps5wk_profile_storage_json();
     char* update = ps5wk_updates_json();
     char* extra = g_strdup_printf("\"started\":%lld,\"uri\":%s,\"returnUri\":%s,\"pin\":%s,\"localOnly\":%s,\"link\":%s,\"downloads\":%s,"
-        "\"storage\":%s,\"update\":%s,%s%s%s%s",
+        "\"storage\":%s,\"update\":%s,%s%s%s%s%s",
         (long long)startedAt, shownJSON, backJSON, pushPIN ? "true" : "false", pushLocalOnly ? "true" : "false", link, downloads, storage, update,
-        message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock);
+        message ? "\"message\":" : "", message ? messageJSON : "", message ? "," : "", adblock, popups);
+    g_free(popups);
     g_free(update);
     g_free(storage);
     g_free(downloads);
@@ -2058,10 +2073,10 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
     }
     gboolean known = ((!strcmp(path, "/settings.json") || !strcmp(path, "/update.json")) && get)
         || (post && (!strcmp(path, "/settings") || !strcmp(path, "/restart") || !strcmp(path, "/clear") || !strcmp(path, "/adblock")
-            || !strcmp(path, "/update")));
+            || !strcmp(path, "/popups") || !strcmp(path, "/update")));
     if (!known) {
         settingsReplyJSON(client, !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
-            || !strcmp(path, "/settings") || !strcmp(path, "/adblock") || !strcmp(path, "/update") || !strcmp(path, "/update.json") ? 405 : 404,
+            || !strcmp(path, "/settings") || !strcmp(path, "/adblock") || !strcmp(path, "/popups") || !strcmp(path, "/update") || !strcmp(path, "/update.json") ? 405 : 404,
             FALSE, "method not allowed or no such page");
         return;
     }
@@ -2133,6 +2148,32 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
         } else
             error = "do=update, do=allow&site=<host> or do=block&site=<host>";
         spike_log("settings: adblock %s%s%s from %s: %s", action ? action : "?", site ? " " : "", site ? site : "", from, error ? error : "ok");
+        if (error)
+            settingsReplyJSON(client, 400, FALSE, error);
+        else {
+            char* state = settingsState(done, trusted);
+            pushReply(client, 200, "application/json", state);
+            g_free(state);
+        }
+        g_free(done);
+        g_free(action);
+        g_free(site);
+    } else if (!strcmp(path, "/popups")) {
+        char* action = query ? formValue(query, "do") : NULL;
+        if (!action)
+            action = formValue(body, "do");
+        char* site = query ? formValue(query, "site") : NULL;
+        if (!site)
+            site = formValue(body, "site");
+        const char* error = NULL;
+        char* done = NULL;
+        if (action && (!strcmp(action, "allow") || !strcmp(action, "block"))) {
+            gboolean allow = !strcmp(action, "allow");
+            error = site ? ps5wk_popups_set_allowed(site, allow) : "site=<host> missing";
+            done = g_strdup_printf(allow ? "Pop-ups allowed on %s. Try again on the page." : "Pop-ups blocked on %s again.", site ? site : "");
+        } else
+            error = "do=allow&site=<host> or do=block&site=<host>";
+        spike_log("settings: popups %s%s%s from %s: %s", action ? action : "?", site ? " " : "", site ? site : "", from, error ? error : "ok");
         if (error)
             settingsReplyJSON(client, 400, FALSE, error);
         else {
@@ -2442,7 +2483,7 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
         *query++ = 0;
     const char* path = target;
     gboolean settingsPath = !strcmp(path, "/settings") || !strcmp(path, "/settings.json") || !strcmp(path, "/restart") || !strcmp(path, "/clear")
-        || !strcmp(path, "/adblock") || !strcmp(path, "/gamepad") || !strcmp(path, "/update") || !strcmp(path, "/update.json");
+        || !strcmp(path, "/adblock") || !strcmp(path, "/popups") || !strcmp(path, "/gamepad") || !strcmp(path, "/update") || !strcmp(path, "/update.json");
     gboolean browserPath = !strcmp(path, "/browser") || g_str_has_prefix(path, "/browser/");
     gboolean dlmPath = !strcmp(path, "/dlm") || !strcmp(path, "/dlm.json") || !strcmp(path, "/dlm/fs") || !strcmp(path, "/dlm/icon");
 
@@ -3661,6 +3702,12 @@ int main(int argc, char** argv)
     WebKitSettings* settings = webkit_settings_new_with_settings(
         "enable-page-cache", FALSE,
         "enable-spatial-navigation", TRUE,
+        /* Script may ask for a window at any time: WebKit then asks the
+         * browser about every one (browserui.c onCreate), which blocks those
+         * without a press and says so, or lets an allowed site have them
+         * (popups.c). Left off, WebKit drops them in the WebProcess and the
+         * browser never hears of them. */
+        "javascript-can-open-windows-automatically", TRUE,
         /* Page console messages and uncaught exceptions go to the WebProcess
          * stdout, which the title relays to its log ([webN] lines). */
         "enable-write-console-messages-to-stdout", TRUE,
@@ -3716,6 +3763,7 @@ int main(int argc, char** argv)
     ps5wk_downloads_init(WPE_DISPLAY_PS5(display), session);
     ps5wk_files_init(WPE_DISPLAY_PS5(display));
     ps5wk_adblock_init(webView);
+    ps5wk_popups_init();
     ps5wk_updates_init(WPE_DISPLAY_PS5(display));
     debugDialogsInit(webView);
     siteQuirksInit(webView);

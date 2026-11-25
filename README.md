@@ -61,6 +61,8 @@ first-class place for the modern web. It's built on WPE WebKit.
 - Ad blocking with the uBlock Origin Lite rule lists, which include network
   rules, cosmetic filters and scriptlets. It has no code for particular
   sites, and you can turn it off for each site.
+- Pop-up blocking. A page that opens a new tab by itself is blocked and a
+  notice says so; Settings can allow a site its pop-ups.
 - A link server. Open `http://<ps5-ip>:9040/` on a phone or computer, or
   scan the QR code on the start page or in Settings, to send links to the
   PS5, change settings and fetch downloads. See [Security](#security).

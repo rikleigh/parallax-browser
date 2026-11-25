@@ -50,7 +50,9 @@
  */
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
+#include "adblock.h"
 #include "browser.h"
+#include "popups.h"
 #include "profile.h"
 #include "browserdraw.h"
 #include "downloads.h"
@@ -900,6 +902,7 @@ static gboolean setPrivate(gboolean on)
         privateSession = webkit_network_session_new_ephemeral();
         ps5wk_downloads_watch_session(privateSession);
         ps5wk_sites_set_private(TRUE);
+        ps5wk_popups_set_private(TRUE);
         WebKitWebView* view = sessionView(privateSession);
         normalTabs = tabs;
         normalActive = active;
@@ -920,6 +923,7 @@ static gboolean setPrivate(gboolean on)
         normalTabs = NULL;
         privateMode = FALSE;
         ps5wk_sites_set_private(FALSE);
+        ps5wk_popups_set_private(FALSE);
         if (!tabs->len)
             g_ptr_array_add(tabs, tabNew(home, ""));
         active = normalActive >= 0 && normalActive < (int)tabs->len ? normalActive : 0;
@@ -2716,8 +2720,34 @@ static void onProgress(GObject* object, GParamSpec* pspec, gpointer data)
         progressRedraw();
 }
 
-/* target=_blank links and window.open: a new tab (a page's own pop-ups,
- * without a click, are dropped). */
+/* A pop-up of the page at page was blocked: the notice, with how to allow
+ * them on its site (Settings opens on that row while the page is shown,
+ * ps5browser.c toggleSettings). Once for a page, then at most every 30 s;
+ * the log has the first few and every 100th (a page can ask in a loop). */
+#define POPUP_NOTICE_EVERY_US (30 * G_USEC_PER_SEC)
+static void popupBlocked(const char* page, const char* uri)
+{
+    static gint64 noticeAt;
+    unsigned count = ps5wk_popups_blocked(page, uri);
+    if (count <= 5 || !(count % 100))
+        spike_log("browser: pop-up without a press blocked (%u on this page): %s", count, uri);
+    gint64 now = g_get_monotonic_time();
+    if (count > 1 && noticeAt && now - noticeAt < POPUP_NOTICE_EVERY_US)
+        return;
+    noticeAt = now;
+    char* site = ps5wk_adblock_site_for_uri(page);
+    if (site && strlen(site) > 40) /* ASCII (adblock.c cleanSite) */
+        strcpy(site + 37, "...");
+    char* text = site ? g_strdup_printf("Pop-up blocked\nTo allow pop-ups on %s: Options, then Settings", site) : g_strdup("Pop-up blocked");
+    wpe_display_ps5_show_message(display, text, 5);
+    g_free(text);
+    g_free(site);
+}
+
+/* target=_blank links and window.open: a new tab. A page's own pop-ups,
+ * without a press, are blocked with a notice unless its site is allowed
+ * them (popups.c; WebKit asks here for those too, as ps5browser.c set
+ * javascript-can-open-windows-automatically). */
 static WebKitWebView* onCreate(WebKitWebView* view, WebKitNavigationAction* action, gpointer data)
 {
     (void)data;
@@ -2729,15 +2759,19 @@ static WebKitWebView* onCreate(WebKitWebView* view, WebKitNavigationAction* acti
         spike_log("browser: new window without an address: ignored");
         return NULL;
     }
-    if (!webkit_navigation_action_is_user_gesture(action)) {
-        spike_log("browser: pop-up without a click blocked: %s", uri);
-        return NULL;
-    }
     if (strncmp(uri, "http://", 7) && strncmp(uri, "https://", 8)) {
         spike_log("browser: new window for %s: not http(s), ignored", uri);
         return NULL;
     }
-    spike_log("browser: link for a new window: new tab for %s", uri);
+    if (!webkit_navigation_action_is_user_gesture(action)) {
+        const char* page = webkit_web_view_get_uri(view);
+        if (!ps5wk_popups_allowed(page)) {
+            popupBlocked(page, uri);
+            return NULL;
+        }
+        spike_log("browser: pop-up without a press, allowed on this site: new tab for %s", uri);
+    } else
+        spike_log("browser: link for a new window: new tab for %s", uri);
     if (openInNewTab(uri))
         wpe_display_ps5_show_message(display, "Opened in a new tab (Options: tabs)", 2);
     return NULL;
