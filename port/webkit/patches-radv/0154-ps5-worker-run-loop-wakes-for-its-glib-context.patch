@@ -1,0 +1,145 @@
+diff --git a/Source/WTF/wtf/glib/RunLoopGLib.cpp b/Source/WTF/wtf/glib/RunLoopGLib.cpp
+index 892eed01be..03cc233984 100644
+--- a/Source/WTF/wtf/glib/RunLoopGLib.cpp
++++ b/Source/WTF/wtf/glib/RunLoopGLib.cpp
+@@ -32,7 +32,10 @@
+ #include <glib.h>
+ #include <wtf/BubbleSort.h>
+ #include <wtf/MainThread.h>
++#include <wtf/NeverDestroyed.h>
+ #include <wtf/SafeStrerror.h>
++#include <wtf/SharedTask.h>
++#include <wtf/Vector.h>
+ #include <wtf/glib/RunLoopSourcePriority.h>
+ 
+ #if OS(LINUX) || OS(FREEBSD)
+@@ -138,6 +141,47 @@ GSourceFuncs RunLoop::s_runLoopSourceFunctions = {
+     nullptr, // closure_marshall
+ };
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: a thread that waits outside its GMainContext is told when its run loop gets something to run.
++// A worker's run loop (WebCore's WorkerDedicatedRunLoop) waits on its message queue, not in the
++// context, so a wakeUp() or a timer started from another thread reached it only when the next
++// message or DOM timer came (a 20 ms Atomics.waitAsync timeout in a worker took 1 to 2 s beside a
++// 1 s interval: nfsu2.xyz's reads, 2026-11-25). Kept out of RunLoop.h, which everything includes.
++static Lock ps5WakeUpObserversLock;
++static std::atomic<unsigned> ps5WakeUpObserverCount { 0 };
++struct PS5WakeUpObserver {
++    RunLoop* runLoop;
++    RefPtr<SharedTask<void()>> task;
++};
++static Vector<PS5WakeUpObserver>& ps5WakeUpObservers() WTF_REQUIRES_LOCK(ps5WakeUpObserversLock)
++{
++    static NeverDestroyed<Vector<PS5WakeUpObserver>> observers;
++    return observers;
++}
++
++WTF_EXPORT_PRIVATE void ps5SetRunLoopWakeUpObserver(RunLoop&, RefPtr<SharedTask<void()>>&&);
++void ps5SetRunLoopWakeUpObserver(RunLoop& runLoop, RefPtr<SharedTask<void()>>&& task)
++{
++    Locker locker { ps5WakeUpObserversLock };
++    auto& observers = ps5WakeUpObservers();
++    observers.removeAllMatching([&](auto& observer) { return observer.runLoop == &runLoop; });
++    if (task)
++        observers.append({ &runLoop, WTF::move(task) });
++    ps5WakeUpObserverCount.store(observers.size());
++}
++
++static void ps5NotifyWakeUpObserver(RunLoop& runLoop)
++{
++    Locker locker { ps5WakeUpObserversLock };
++    for (auto& observer : ps5WakeUpObservers()) {
++        if (observer.runLoop == &runLoop) {
++            observer.task->run();
++            return;
++        }
++    }
++}
++#endif
++
+ RunLoop::RunLoop()
+ {
+     m_mainContext = g_main_context_get_thread_default();
+@@ -268,6 +312,10 @@ void RunLoop::stop()
+ void RunLoop::wakeUp()
+ {
+     g_source_set_ready_time(m_source.get(), 0);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    if (ps5WakeUpObserverCount.load()) [[unlikely]]
++        ps5NotifyWakeUpObserver(*this);
++#endif
+ }
+ 
+ RunLoop::CycleResult RunLoop::cycle(RunLoopMode)
+@@ -423,6 +471,10 @@ void RunLoop::TimerBase::start(Seconds interval, bool repeat)
+     m_interval = interval;
+     m_isRepeating = repeat;
+     updateReadyTime();
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    if (ps5WakeUpObserverCount.load()) [[unlikely]]
++        ps5NotifyWakeUpObserver(m_runLoop.get());
++#endif
+ }
+ 
+ void RunLoop::TimerBase::stop()
+diff --git a/Source/WebCore/workers/WorkerRunLoop.cpp b/Source/WebCore/workers/WorkerRunLoop.cpp
+index a29215534d..f249500f2a 100644
+--- a/Source/WebCore/workers/WorkerRunLoop.cpp
++++ b/Source/WebCore/workers/WorkerRunLoop.cpp
+@@ -62,6 +62,15 @@
+ #include <glib.h>
+ #endif
+ 
++#if USE(GLIB) && OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include <wtf/RunLoop.h>
++#include <wtf/SharedTask.h>
++namespace WTF {
++// RunLoopGLib.cpp: the task runs when another thread wakes the run loop or starts one of its timers.
++void ps5SetRunLoopWakeUpObserver(RunLoop&, RefPtr<SharedTask<void()>>&&);
++}
++#endif
++
+ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(WorkerRunLoop);
+@@ -283,6 +292,29 @@ WorkerDedicatedRunLoop::RunInModeResult WorkerDedicatedRunLoop::runInMode(Worker
+ 
+     Seconds timeoutDelay = Seconds::infinity();
+ 
++#if USE(GLIB) && OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the wait below is on the message queue, not in this thread's GMainContext, so what the
++    // context has to run must end it: a source that is due later (the timeout of Atomics.waitAsync,
++    // a RunLoop timer) bounds the wait, and another thread's wakeUp() or timer start posts the
++    // empty task. Without this a worker's 20 ms waitAsync timeout fired only when the next message
++    // or DOM timer came: 1 to 2 s beside a 1 s interval, 6 s beside a 3 s ping, never alone
++    // (test/browser/worker-waits.html; nfsu2.xyz's section reads, 2026-11-25).
++    Ref threadRunLoop = RunLoop::currentSingleton();
++    WTF::ps5SetRunLoopWakeUpObserver(threadRunLoop.get(), timerAddedTask.copyRef());
++    if (g_main_context_acquire(mainContext)) {
++        gint maxPriority = 0;
++        gint contextTimeoutMS = -1;
++        GPollFD unusedFDs[1];
++        bool sourceReady = g_main_context_prepare(mainContext, &maxPriority);
++        g_main_context_query(mainContext, maxPriority, &contextTimeoutMS, unusedFDs, 0);
++        g_main_context_release(mainContext);
++        if (sourceReady)
++            timeoutDelay = 0_s;
++        else if (contextTimeoutMS >= 0)
++            timeoutDelay = Seconds::fromMilliseconds(contextTimeoutMS);
++    }
++#endif
++
+ #if USE(CF)
+     CFAbsoluteTime nextCFRunLoopTimerFireDate = CFRunLoopGetNextTimerFireDate(RetainPtr { CFRunLoopGetCurrent() }.get(), kCFRunLoopDefaultMode);
+     double timeUntilNextCFRunLoopTimerInSeconds = nextCFRunLoopTimerFireDate - CFAbsoluteTimeGetCurrent();
+@@ -316,6 +348,9 @@ WorkerDedicatedRunLoop::RunInModeResult WorkerDedicatedRunLoop::runInMode(Worker
+     }
+     MessageQueueWaitResult result;
+     auto task = m_messageQueue.waitForMessageFilteredWithTimeout(result, predicate, timeoutDelay);
++#if USE(GLIB) && OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    WTF::ps5SetRunLoopWakeUpObserver(threadRunLoop.get(), nullptr);
++#endif
+     if (script) {
+         script->acquireHeapAccess();
+         script->removeTimerSetNotification(timerAddedTask);

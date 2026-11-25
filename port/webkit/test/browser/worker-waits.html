@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>worker waits</title>
+<pre id="out">running…</pre>
+<script>
+// How long timed waits really take in a worker and on the main thread: Atomics.waitAsync with a
+// timeout, Atomics.wait with a timeout, setTimeout. A worker whose waitAsync timeout only fires when
+// something else wakes its run loop shows here as waits of the ping period instead of 20 ms.
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); out.textContent = lines.join('\n'); console.log('WORKERWAITS ' + s); }
+function stats(r) { const s = [...r].sort((a, b) => a - b); return `min ${s[0]} median ${s[s.length >> 1]} max ${s[s.length - 1]} ms  [${r.join(' ')}]`; }
+
+const workerSource = `
+let ia;
+try { ia = new Int32Array(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }).buffer); }
+catch (e) { postMessage({ label: 'no shared memory: ' + e, r: [0] }); }
+const now = () => performance.now();
+async function waitAsyncRun(label, n, ms) {
+    const r = [];
+    for (let i = 0; i < n; i++) { const t = now(); await Atomics.waitAsync(ia, 0, 0, ms).value; r.push(Math.round(now() - t)); }
+    postMessage({ label, r });
+}
+function waitRun(label, n, ms) {
+    const r = [];
+    for (let i = 0; i < n; i++) { const t = now(); Atomics.wait(ia, 0, 0, ms); r.push(Math.round((now() - t) * 10) / 10); }
+    postMessage({ label, r });
+}
+async function timeoutRun(label, n, ms) {
+    const r = [];
+    for (let i = 0; i < n; i++) { const t = now(); await new Promise(f => setTimeout(f, ms)); r.push(Math.round(now() - t)); }
+    postMessage({ label, r });
+}
+onmessage = async e => {
+    if (e.data !== 'go') return;
+    waitRun('worker: Atomics.wait 1 ms', 20, 1);
+    waitRun('worker: Atomics.wait 20 ms', 10, 20);
+    await timeoutRun('worker: setTimeout 20 ms', 10, 20);
+    await waitAsyncRun('worker: waitAsync 20 ms, nothing else pending (the page pings every 3 s)', 6, 20);
+    let id = setInterval(() => { }, 1000);
+    await waitAsyncRun('worker: waitAsync 20 ms, beside a 1 s interval', 8, 20);
+    clearInterval(id);
+    id = setInterval(() => { }, 250);
+    await waitAsyncRun('worker: waitAsync 20 ms, beside a 250 ms interval', 8, 20);
+    clearInterval(id);
+    postMessage('done');
+};
+`;
+async function mainRun() {
+    let ia;
+    try { ia = new Int32Array(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }).buffer); }
+    catch (e) { say('main: no shared memory: ' + e); return; }
+    const r = [];
+    for (let i = 0; i < 10; i++) { const t = performance.now(); await Atomics.waitAsync(ia, 0, 0, 20).value; r.push(Math.round(performance.now() - t)); }
+    say('main: waitAsync 20 ms: ' + stats(r));
+}
+(async () => {
+    say(`crossOriginIsolated ${self.crossOriginIsolated}, waitAsync ${typeof Atomics.waitAsync}`);
+    await mainRun();
+    const w = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+    const ping = setInterval(() => w.postMessage('ping'), 3000);
+    w.onerror = e => say('worker error: ' + e.message);
+    w.onmessage = e => {
+        if (e.data === 'done') { clearInterval(ping); say('WORKERWAITS DONE'); return; }
+        say(e.data.label + ': ' + stats(e.data.r));
+    };
+    w.postMessage('go');
+})();
+</script>

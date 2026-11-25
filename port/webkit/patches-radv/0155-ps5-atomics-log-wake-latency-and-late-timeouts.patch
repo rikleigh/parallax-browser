@@ -1,0 +1,109 @@
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.cpp b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+index 1e11d624c8..1da622c231 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.cpp
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+@@ -34,6 +34,7 @@
+ #include "VMManager.h"
+ #include "VMTrapsInlines.h"
+ #include <wtf/DataLog.h>
++#include <wtf/MainThread.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/RawPointer.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -82,6 +83,10 @@ struct Histogram {
+ // changed during the wait and no notify woke the waiter (a lost wake-up, or a writer that does not
+ // notify).
+ static Histogram syncWaitNotified, syncWaitTimedOut, syncWaitTimedOutChanged, asyncNotifyToTask, asyncTimedOut, asyncTimedOutChanged, asyncNotified;
++// The notifier's call to the waiter running again, the same for an async waiter by the thread that
++// runs its task, and how long after its timeout an async waiter's timeout ran (2026-11-25: a worker's
++// ran when its run loop next woke, 1 to 2 s late; patch 0154).
++static Histogram syncNotifyToRunning, asyncNotifyToTaskMain, asyncNotifyToTaskWorker, asyncTimeoutLate;
+ static std::atomic<uint64_t> syncNotEqual { 0 };
+ static std::atomic<double> lastDump { 0 };
+ static bool enabled()
+@@ -106,6 +111,10 @@ static void maybeDump()
+     syncWaitTimedOut.dumpAndReset("wait, timed out", seconds);
+     syncWaitTimedOutChanged.dumpAndReset("wait, timed out with the value changed", seconds);
+     asyncNotifyToTask.dumpAndReset("waitAsync, notify to task", seconds);
++    asyncNotifyToTaskMain.dumpAndReset("waitAsync, notify to task on the main thread", seconds);
++    asyncNotifyToTaskWorker.dumpAndReset("waitAsync, notify to task on a worker", seconds);
++    asyncTimeoutLate.dumpAndReset("waitAsync, timeout late by", seconds);
++    syncNotifyToRunning.dumpAndReset("wait, notify to running again", seconds);
+     asyncNotified.dumpAndReset("waitAsync, notified (call to notify)", seconds);
+     asyncTimedOut.dumpAndReset("waitAsync, timed out (its timeout)", seconds);
+     asyncTimedOutChanged.dumpAndReset("waitAsync, timed out with the value changed (its timeout)", seconds);
+@@ -172,7 +181,7 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+             return WaitSyncResult::NotEqual;
+         }
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+-        MonotonicTime ps5WaitStart = MonotonicTime::now();
++        MonotonicTime ps5WaitStart = PS5AtomicsLog::enabled() ? MonotonicTime::now() : MonotonicTime { };
+         bool ps5TimedOut = false;
+         auto ps5Logged = makeScopeExit([&] {
+             if (!PS5AtomicsLog::enabled())
+@@ -182,6 +191,9 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+         });
+ #endif
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        syncWaiter->ps5Started = MonotonicTime { };
++#endif
+         list->addLast(listLocker, syncWaiter);
+         dataLogLnIf(WaiterListsManagerInternal::verbose, "<WaiterListManager> <Thread:", Thread::currentSingleton(), "> added a new SyncWaiter=", syncWaiter.get(), " to a waiterList for ptr ", RawPointer(ptr));
+ 
+@@ -198,8 +210,13 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+ 
+         // At this point, syncWaiter should be either notified (dequeued) or timeout (not dequeued).
+         bool didGetDequeued = !syncWaiter->isOnList();
+-        if (didGetDequeued)
++        if (didGetDequeued) {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++            if (PS5AtomicsLog::enabled() && syncWaiter->ps5Started)
++                PS5AtomicsLog::syncNotifyToRunning.add(MonotonicTime::now() - syncWaiter->ps5Started);
++#endif
+             return WaitSyncResult::OK;
++        }
+ 
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+         ps5TimedOut = true;
+@@ -250,6 +267,8 @@ JSValue WaiterListManager::waitAsyncImpl(JSGlobalObject* globalObject, VM& vm, V
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+                     if (PS5AtomicsLog::enabled() && waiter->isOnList()) {
+                         PS5AtomicsLog::asyncTimedOut.add(timeout);
++                        if (waiter->ps5Started)
++                            PS5AtomicsLog::asyncTimeoutLate.add(std::max(0_s, MonotonicTime::now() - waiter->ps5Started - timeout));
+                         if (WTF::atomicLoad(ptr) != expectedValue)
+                             PS5AtomicsLog::asyncTimedOutChanged.add(timeout);
+                     }
+@@ -329,14 +348,17 @@ void WaiterListManager::notifyWaiterImpl(const AbstractLocker& listLocker, Ref<W
+ 
+     if (waiter->isAsync()) {
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
+-        MonotonicTime ps5Notified = MonotonicTime::now();
++        MonotonicTime ps5Notified = PS5AtomicsLog::enabled() ? MonotonicTime::now() : MonotonicTime { };
+         if (PS5AtomicsLog::enabled() && resolveResult == ResolveResult::Ok) {
+             PS5AtomicsLog::asyncNotified.add(ps5Notified - waiter->ps5Started);
+             PS5AtomicsLog::maybeDump();
+         }
+         waiter->scheduleWorkAndClear(listLocker, [resolveResult, ps5Notified](DeferredWorkTimer::Ticket& ticket) {
+-            if (PS5AtomicsLog::enabled() && resolveResult == ResolveResult::Ok)
+-                PS5AtomicsLog::asyncNotifyToTask.add(MonotonicTime::now() - ps5Notified);
++            if (PS5AtomicsLog::enabled() && resolveResult == ResolveResult::Ok) {
++                Seconds ps5Took = MonotonicTime::now() - ps5Notified;
++                PS5AtomicsLog::asyncNotifyToTask.add(ps5Took);
++                (isMainThread() ? PS5AtomicsLog::asyncNotifyToTaskMain : PS5AtomicsLog::asyncNotifyToTaskWorker).add(ps5Took);
++            }
+ #else
+         waiter->scheduleWorkAndClear(listLocker, [resolveResult](DeferredWorkTimer::Ticket& ticket) {
+ #endif
+@@ -349,6 +371,10 @@ void WaiterListManager::notifyWaiterImpl(const AbstractLocker& listLocker, Ref<W
+         return;
+     }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    if (PS5AtomicsLog::enabled())
++        waiter->ps5Started = MonotonicTime::now();
++#endif
+     waiter->condition().notifyOne();
+ }
+ 
