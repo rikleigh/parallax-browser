@@ -360,16 +360,33 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
          * 0 zero fills inside the table, ~200 passed through in a few
          * minutes of video). Whole 16 KiB pages up to 64 MB get direct
          * memory at the address instead, like WebAssembly's commits (the
-         * ranges seen were 16 KiB aligned: 1 MB and 64 MB less 16 KiB). */
+         * ranges seen were 16 KiB aligned: 1 MB and 64 MB less 16 KiB).
+         * Larger ones go in 64 MB pieces: a zeroed 512 MB ArrayBuffer
+         * (nfsu2.xyz given Chrome's user agent) took flexible memory whole
+         * and the next one ended the browser (2026-11-25, the same assert).
+         * A piece that cannot be committed leaves the rest to mmap. */
         const uintptr_t a = (uintptr_t)addr;
-        if (ps5wk_title_mem_exec && !(a & (PAGE - 1)) && !(len & (PAGE - 1)) && len <= ((size_t)64 << 20)) {
-            pthread_mutex_lock(&dmap_lock);
-            if (dmap_overlaps(a, len))
-                dmap_release_range(a, len);
-            pthread_mutex_unlock(&dmap_lock);
-            if (commit_direct_at(addr, len, "fixed mmap", 0) > 0) {
+        if (ps5wk_title_mem_exec && !(a & (PAGE - 1)) && !(len & (PAGE - 1))) {
+            const size_t piece = (size_t)64 << 20;
+            size_t done = 0;
+            while (done < len) {
+                const size_t n = len - done < piece ? len - done : piece;
+                pthread_mutex_lock(&dmap_lock);
+                if (dmap_overlaps(a + done, n))
+                    dmap_release_range(a + done, n);
+                pthread_mutex_unlock(&dmap_lock);
+                if (commit_direct_at((char*)addr + done, n, "fixed mmap", 0) <= 0)
+                    break;
+                done += n;
+            }
+            if (done == len) {
                 __atomic_fetch_add(&fixed_direct, 1, __ATOMIC_RELAXED);
                 return addr;
+            }
+            if (done) {
+                spike_log("[mem] fixed mmap of %.1f MB at %p: %.1f MB in direct memory, the rest to mmap", len / 1048576.0, addr, done / 1048576.0);
+                void* rest = __real_mmap((char*)addr + done, len - done, prot, flags, fd, off);
+                return rest == MAP_FAILED ? MAP_FAILED : addr;
             }
         }
         unsigned long long n = __atomic_add_fetch(&fixed_passthrough, 1, __ATOMIC_RELAXED);
