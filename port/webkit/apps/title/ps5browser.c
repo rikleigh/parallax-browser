@@ -466,6 +466,60 @@ static void debugDialogsInit(WebKitWebView* view)
     spike_log("debug dialogs: alert/confirm/prompt calls are logged with their stack (/data/ps5webkit/debug-dialogs)");
 }
 
+/* Site quirks: what one site has to be told for it to serve this browser the
+ * page it can run best. A script per quirk, run at document start in every
+ * frame of the sites listed with it and nowhere else.
+ *
+ * navigator.vendor "Google Inc." on ssx3.gamingretro.online (2026-11-25): the
+ * site's PS2 engine comes in three builds, and anything whose vendor starts
+ * with "Apple" gets the legacy one (no WebAssembly tail calls, no JSPI),
+ * because of a crash in Apple's iOS WebKit. That build only advances its
+ * renderer in requestAnimationFrame, and a race ran at 4 to 8 frames a second
+ * here where the other build runs at 16 to 50. This JSC has both features and
+ * runs the modern build (a whole race, no crash). Only this game was tried;
+ * the site's other games are not listed.
+ * /data/ps5webkit/no-site-quirks (a file, any contents; read at startup)
+ * turns the quirks off. */
+static const char vendorQuirkSource[] =
+    "(function(){try{Object.defineProperty(Navigator.prototype,'vendor',{configurable:true,enumerable:true,"
+    "get:function(){return 'Google Inc.';}});}catch(e){}})();";
+
+static void siteQuirksInit(WebKitWebView* view)
+{
+    int flag = open("/data/ps5webkit/no-site-quirks", O_RDONLY);
+    if (flag >= 0) {
+        close(flag);
+        spike_log("site quirks: off (/data/ps5webkit/no-site-quirks)");
+        return;
+    }
+    static const char* const vendorSites[] = { "https://ssx3.gamingretro.online/*", NULL };
+    WebKitUserScript* script = webkit_user_script_new(vendorQuirkSource, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, vendorSites, NULL);
+    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(view), script);
+    webkit_user_script_unref(script);
+}
+
+/* /data/ps5webkit/debug-userscript.js (read at startup): a script that runs
+ * in every frame of every page at document start, in the page's own world,
+ * before any of the page's scripts. For trying a change to what a page sees
+ * (e.g. another navigator.vendor for one host, to learn which of a site's
+ * builds this engine can run) before it becomes a quirk in the engine. The
+ * script should check location.host itself. */
+static void debugUserScriptInit(WebKitWebView* view)
+{
+    gchar* source = NULL;
+    gsize length = 0;
+    if (!g_file_get_contents("/data/ps5webkit/debug-userscript.js", &source, &length, NULL))
+        return;
+    static const char* const allow[] = { "http://*/*", "https://*/*", "file://*/*", NULL };
+    WebKitUserScript* script = webkit_user_script_new(source, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, allow, NULL);
+    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(view), script);
+    webkit_user_script_unref(script);
+    spike_log("debug user script: %zu bytes run at document start in every frame (/data/ps5webkit/debug-userscript.js)", (size_t)length);
+    g_free(source);
+}
+
 static void testURLFinished(gboolean ok, const char* uri, const char* detail)
 {
     if (!testWaitingForLoad)
@@ -3600,6 +3654,8 @@ int main(int argc, char** argv)
     ps5wk_adblock_init(webView);
     ps5wk_updates_init(WPE_DISPLAY_PS5(display));
     debugDialogsInit(webView);
+    siteQuirksInit(webView);
+    debugUserScriptInit(webView);
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 
     memLog("web view created");

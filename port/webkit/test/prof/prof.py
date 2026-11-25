@@ -246,6 +246,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap.add_argument('--elf', default=os.path.join(here, '../../../../toolchain/wpe-webkit/build/bin/ps5wk-child'))
     ap.add_argument('--folded')
+    ap.add_argument('--thread-ids', action='store_true', help='in --folded, add each thread\'s number to its name (threads that share a name stay apart)')
     ap.add_argument('--top', type=int, default=15)
     ap.add_argument('--from', dest='lo', type=float)
     ap.add_argument('--to', dest='hi', type=float)
@@ -435,7 +436,7 @@ def main():
         if folded:
             for idx, fc in per_thread.items():
                 for frames, c in fc.items():
-                    folded.write('%s;%s;%s %d\n' % (header.get('tag', '?'), labels[idx].replace(';', ','),
+                    folded.write('%s;%s;%s %d\n' % (header.get('tag', '?'), labels[idx].replace(';', ',') + ('#%s' % idx if args.thread_ids else ''),
                                                    ';'.join(f.replace(';', ',') for f in reversed(frames)), round(c * 1000)))
     if folded:
         folded.close()

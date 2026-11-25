@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>worker short waits</title>
+<pre id="out">running…</pre>
+<script>
+// How long an Atomics.wait with a timeout under a millisecond really takes in a worker. An
+// emulator's threads sleep and poll each other in steps this short (usleep and timed futex waits
+// both end in a timed Atomics.wait), so a wait that takes a scheduler tick instead of 100 us makes
+// such a page many times slower while every thread looks idle. The clock here may be coarse
+// (1 ms without cross-origin isolation): each figure is the total over many waits, divided.
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); out.textContent = lines.join('\n'); console.log('SHORTWAITS ' + s); }
+
+const workerSource = `
+const ia = new Int32Array(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }).buffer);
+function run(ms, n) {
+    const t = performance.now();
+    for (let i = 0; i < n; i++) Atomics.wait(ia, 0, 0, ms);
+    const each = (performance.now() - t) / n;
+    postMessage('Atomics.wait ' + ms + ' ms x ' + n + ': ' + each.toFixed(3) + ' ms each (' + (each / ms).toFixed(1) + 'x)');
+}
+onmessage = () => {
+    for (const round of [1, 2]) {
+        for (const ms of [0.01, 0.05, 0.1, 0.2, 0.39, 0.5, 1, 2, 5]) run(ms, ms < 1 ? 1000 : 200);
+    }
+    postMessage('done');
+};
+`;
+say(`crossOriginIsolated ${self.crossOriginIsolated}`);
+const w = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+w.onerror = e => say('worker error: ' + e.message);
+w.onmessage = e => say(e.data === 'done' ? 'DONE' : 'worker: ' + e.data);
+w.postMessage('go');
+</script>
