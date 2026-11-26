@@ -89,6 +89,9 @@ void ps5wk_heapprof_start(void) __attribute__((weak));
 void ps5wk_heapprof_snapshot(const char* why) __attribute__((weak));
 unsigned ps5wk_title_check_imports(char* out, size_t size, unsigned* total) __attribute__((weak));
 const char* ps5wk_title_build_id(void) __attribute__((weak));
+/* WebKit's DrawingAreaProxyWCPS5.cpp (WC builds): 1 = GPU compositing on
+ * whatever /data/ps5webkit/no-compositing says, 0 = off, -1 = the file. */
+void ps5wk_compositing_set_override(int mode) __attribute__((weak));
 #ifdef PS5WK_DEBUG_BUILD
 static double flexibleMB(void) /* the test URL list's lines */
 {
@@ -3912,12 +3915,36 @@ int main(int argc, char** argv)
      * initializes JSC (the web context below); the WebProcesses do not see
      * this environment. */
     /* Pages in the browser process (spikes/14-webprocess-in-title): on
-     * unless Settings turned it off (no-pages-in-browser), and never with
-     * Safer browsing, which keeps pages apart from the browser. The
-     * pages-in-browser file that turned it on while it was off by default
-     * is no longer read. */
-    inTitleWeb = !fileExists("/data/ps5webkit/no-pages-in-browser") && !fileExists("/data/ps5webkit/safer-browsing");
+     * unless Settings turned it off (no-pages-in-browser), never with
+     * Safer browsing, which keeps pages apart from the browser, and never
+     * with GPU compositing off (no-compositing). The CPU path's renderer
+     * (WebKit's NonCompositedFrameRenderer) schedules each rendering update
+     * with a WebCore RunLoopObserver, which only WTF's own RunLoop::run()
+     * fires: a payload WebProcess runs that loop, the title runs
+     * g_main_loop_run, so in the title nothing was ever painted and every
+     * page stayed black (2026-11-26). The CPU path is also what one turns
+     * to when the GPU path misbehaves, so it runs the way it always has.
+     * The pages-in-browser file that turned it on while it was off by
+     * default is no longer read. */
+    const gboolean pagesInBrowserOff = fileExists("/data/ps5webkit/no-pages-in-browser");
+    const gboolean saferBrowsingOn = fileExists("/data/ps5webkit/safer-browsing");
+    const gboolean compositingOff = fileExists("/data/ps5webkit/no-compositing");
+    inTitleWeb = !pagesInBrowserOff && !saferBrowsingOn && !compositingOff;
+    if (!inTitleWeb)
+        spike_log("[web-in-title] off: pages run in payload WebProcesses, because%s%s%s%s%s",
+            pagesInBrowserOff ? " Settings has Pages in the browser process off (no-pages-in-browser)" : "",
+            pagesInBrowserOff && (saferBrowsingOn || compositingOff) ? ";" : "",
+            saferBrowsingOn ? " Safer browsing is on (pages are kept apart from the browser)" : "",
+            saferBrowsingOn && compositingOff ? ";" : "",
+            compositingOff ? " GPU compositing is off (no-compositing: pages drawn on the CPU need a process of their own)" : "");
     if (inTitleWeb) {
+        /* WebKit reads no-compositing each time a page gets a drawing area,
+         * and the in-title WebProcess lasts the whole run: a tab opened after
+         * Settings wrote the file would take the CPU path here, in the title,
+         * and stay black. The change waits for the browser restart, as
+         * Settings says: compositing stays on for this run. */
+        if (ps5wk_compositing_set_override)
+            ps5wk_compositing_set_override(1);
         setUpInTitleWeb();
         /* Which stream message each WebGL/WebGPU thread is in, for the
          * stall report: two clock reads a message, so only in this mode. */

@@ -1,0 +1,180 @@
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp b/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp
+index 579aee4fa2..ee2481893a 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp
+@@ -76,6 +76,16 @@
+ #include <xf86drm.h>
+ #endif
+ 
++#if defined(PS5_PAYLOAD_SDK)
++#include "DrawingAreaProxy.h"
++#include "WebPreferences.h"
++#include <unistd.h>
++#include <wpe/ps5/PS5Compositor.h>
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
++#include "DrawingAreaProxyWCPS5.h"
++#endif
++#endif
++
+ #if USE(LIBEPOXY)
+ #include <epoxy/egl.h>
+ #endif
+@@ -554,6 +564,22 @@ static unsigned refreshParameter(const URL& url)
+     return 0;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// PS5WebProcessInTitle.cpp: the in-title WebProcess (this process) holds the page.
++bool ps5PageRunsInTitle(WebCore::PageIdentifier);
++
++// A flag file of the browser's settings (apps/title/settings.c). open(), not
++// access(): access() reports existing files as missing in a title.
++static bool ps5FlagFile(const char* path)
++{
++    int fd = open(path, O_RDONLY);
++    if (fd < 0)
++        return false;
++    close(fd);
++    return true;
++}
++#endif
++
+ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderProcessInfo&& info)
+ {
+     URL requestURL = URL(String::fromLatin1(webkit_uri_scheme_request_get_uri(request)));
+@@ -733,6 +759,109 @@ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderPro
+     stopTable();
+     jsonObject->setObject("View Information"_s, WTF::move(viewObject));
+ 
++#if defined(PS5_PAYLOAD_SDK)
++    // PS5: upstream's rows describe a WebProcess that renders with GL, from
++    // the hardware-acceleration preference. That preference is off here for
++    // good (WebPreferencesWPE.cpp) while pages are composited on the GPU by
++    // the WC compositor in the UI process, so "Policy: never" and "2D
++    // canvas: Accelerated" were both wrong. These rows say what this page
++    // gets; the JSON copy takes the same rows.
++    UNUSED_PARAM(info);
++    UNUSED_VARIABLE(policy);
++    UNUSED_VARIABLE(addEGLInfo);
++    UNUSED_VARIABLE(usingWPEPlatformAPI);
++    // Upstream's helpers for the rows these replace: still compiled, not called.
++    UNUSED_VARIABLE(&canvasAccelerationEnabled);
++    UNUSED_VARIABLE(&uiProcessContextIsEGL);
++    UNUSED_VARIABLE(&openGLAPI);
++    UNUSED_VARIABLE(&dmabufRendererWithSupportedBuffers);
++    UNUSED_VARIABLE(&threadedRenderingInfo);
++    {
++        auto graphicsObject = JSON::Object::create();
++        startTable("Hardware Acceleration Information"_s);
++
++        auto* webView = webkit_uri_scheme_request_get_web_view(request);
++        Ref preferences = *webkitSettingsGetPreferences(webkit_web_view_get_settings(webView));
++        const bool saferBrowsing = ps5FlagFile("/data/ps5webkit/safer-browsing");
++        const bool compositingOffInSettings = ps5FlagFile("/data/ps5webkit/no-compositing");
++
++        bool composited = false;
++        bool hostAvailable = false;
++#if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
++        if (RefPtr drawingArea = page->drawingArea())
++            composited = is<DrawingAreaProxyWCPS5>(*drawingArea);
++        hostAvailable = DrawingAreaProxyWCPS5::hostAvailable();
++#endif
++        String compositing;
++        if (composited) {
++            compositing = preferences->threadedScrollingEnabled()
++                ? "On: the WC compositor in the browser process puts this page's layers together and scrolls them on the GPU"_s
++                : "On: the WC compositor in the browser process puts this page's layers together on the GPU; the page's process scrolls"_s;
++            if (compositingOffInSettings)
++                compositing = makeString(compositing, ". Settings has it off: that applies after a restart"_s);
++        } else if (compositingOffInSettings)
++            compositing = "Off (Settings: GPU compositing): this page is drawn whole on the CPU and sent to the browser one image a frame"_s;
++        else if (!hostAvailable)
++            compositing = "Off: the GPU compositor is not running in this browser; this page is drawn whole on the CPU"_s;
++        else
++            compositing = "Off for this page's process (its pages went over the GPU texture limit, or Settings turned it on since): drawn whole on the CPU"_s;
++        addTableRow(graphicsObject, "GPU compositing"_s, compositing);
++
++        addTableRow(graphicsObject, "Page painting"_s, composited
++            ? "CPU (Skia) in the page's process, in tiles that the compositor uploads to the GPU"_s
++            : "CPU (Skia) in the page's process"_s);
++        addTableRow(graphicsObject, "2D canvas"_s, "CPU (Skia)"_s);
++
++#if ENABLE(WEBGL)
++        String webGL;
++        if (!webGLEnabled(request))
++            webGL = saferBrowsing ? "Off (Safer browsing)"_s : ps5FlagFile("/data/ps5webkit/no-webgl") ? "Off (Settings: WebGL)"_s : "Off"_s;
++        else if (!composited)
++            webGL = "Off: WebGL needs GPU compositing, which this page does not have"_s;
++        else
++            webGL = "On (on the GPU, in the browser process)"_s;
++        addTableRow(graphicsObject, "WebGL"_s, webGL);
++#endif
++#if ENABLE(WEBGPU)
++        addTableRow(graphicsObject, "WebGPU"_s, preferences->webGPUEnabled() ? "On (on the GPU, in the browser process)"_s
++            : saferBrowsing ? "Off (Safer browsing)"_s : ps5FlagFile("/data/ps5webkit/no-webgpu") ? "Off (Settings: WebGPU)"_s : "Off"_s);
++#else
++        addTableRow(graphicsObject, "WebGPU"_s, "Not in this build"_s);
++#endif
++
++        String where;
++        if (ps5PageRunsInTitle(page->webPageIDInMainFrameProcess()))
++            where = "In the browser process"_s;
++        else if (ps5FlagFile("/data/ps5webkit/no-pages-in-browser"))
++            where = "In a process of their own (Settings: Pages in the browser process is off)"_s;
++        else if (saferBrowsing)
++            where = "In a process of their own (Safer browsing)"_s;
++        else if (compositingOffInSettings)
++            where = "In a process of their own (GPU compositing is off)"_s;
++        else
++            where = "In a process of their own"_s;
++        addTableRow(graphicsObject, "Pages run"_s, where);
++
++        // The browser's GL context (wpe-ps5 PS5Renderer): the compositor's,
++        // and what draws a CPU-painted page, video and the browser's own UI.
++        PS5RendererGLInfo gl { };
++        if (ps5RendererGLInfo(gl)) {
++            addTableRow(graphicsObject, "Browser's renderer"_s, composited
++                ? "OpenGL ES in the browser process: the compositor's scene, video and the browser's own interface"_s
++                : "OpenGL ES in the browser process: the CPU-painted page, video and the browser's own interface"_s);
++            addTableRow(graphicsObject, "GL_RENDERER"_s, String::fromUTF8(gl.renderer));
++            addTableRow(graphicsObject, "GL_VENDOR"_s, String::fromUTF8(gl.vendor));
++            addTableRow(graphicsObject, "GL_VERSION"_s, String::fromUTF8(gl.version));
++            addTableRow(graphicsObject, "GL_SHADING_LANGUAGE_VERSION"_s, String::fromUTF8(gl.shadingLanguageVersion));
++            addTableRow(graphicsObject, "EGL_VERSION"_s, String::fromUTF8(gl.eglVersion));
++            addTableRow(graphicsObject, "EGL_VENDOR"_s, String::fromUTF8(gl.eglVendor));
++        } else
++            addTableRow(graphicsObject, "Browser's renderer"_s, "Not available (no renderer in this process)"_s);
++
++        stopTable();
++        jsonObject->setObject("Hardware Acceleration Information"_s, WTF::move(graphicsObject));
++    }
++#else
+     auto hardwareAccelerationObject = JSON::Object::create();
+     startTable("Hardware Acceleration Information"_s);
+     addTableRow(hardwareAccelerationObject, "Policy"_s, policy);
+@@ -819,6 +948,7 @@ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderPro
+         stopTable();
+         jsonObject->setObject("Hardware Acceleration Information (Render process)"_s, WTF::move(hardwareAccelerationObject));
+     }
++#endif // defined(PS5_PAYLOAD_SDK)
+ 
+     auto infoAsString = jsonObject->toJSONString();
+     htmlBuilder.append("<script>function copyAsJSON() { "
+diff --git a/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp b/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
+index 9f19544234..0af3b8211d 100644
+--- a/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
++++ b/Source/WebKit/WebProcess/wpe/ps5/PS5WebProcessInTitle.cpp
+@@ -147,6 +147,13 @@ void ps5InTitlePageRemoved(WebCore::PageIdentifier identifier)
+     inTitlePages().remove(identifier);
+ }
+ 
++// For the UI process side of this same process (webkit://gpu): does the
++// in-title WebProcess hold this page? Main thread.
++bool ps5PageRunsInTitle(WebCore::PageIdentifier identifier)
++{
++    return inTitlePages().contains(identifier);
++}
++
+ void ps5InTitleWebProcessConnectionClosed()
+ {
+     auto pages = copyToVector(inTitlePages());

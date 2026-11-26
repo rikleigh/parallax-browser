@@ -37,6 +37,33 @@
 #include <time.h>
 #include <unistd.h>
 
+// webkit://gpu's rows about this context (PS5Compositor.h ps5RendererGLInfo):
+// read once on the render thread, then never changed.
+static char* s_glInfoStrings[6];
+static std::atomic<bool> s_glInfoReady { false };
+
+static void rememberGLInfo(EGLDisplay display)
+{
+    if (s_glInfoReady.load())
+        return;
+    const char* values[6] = {
+        reinterpret_cast<const char*>(glGetString(GL_RENDERER)), reinterpret_cast<const char*>(glGetString(GL_VENDOR)),
+        reinterpret_cast<const char*>(glGetString(GL_VERSION)), reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION)),
+        eglQueryString(display, EGL_VERSION), eglQueryString(display, EGL_VENDOR),
+    };
+    for (unsigned i = 0; i < 6; i++)
+        s_glInfoStrings[i] = g_strdup(values[i] ? values[i] : "");
+    s_glInfoReady.store(true);
+}
+
+bool ps5RendererGLInfo(PS5RendererGLInfo& info)
+{
+    if (!s_glInfoReady.load())
+        return false;
+    info = { s_glInfoStrings[0], s_glInfoStrings[1], s_glInfoStrings[2], s_glInfoStrings[3], s_glInfoStrings[4], s_glInfoStrings[5] };
+    return true;
+}
+
 // The title's GPU submission lock (apps/title/titleradv.c; WebGPU builds only):
 // held around this thread's GL work so that RADV's submissions never fall
 // between two of ps5-opengl's, or the other way round.
@@ -655,6 +682,7 @@ bool PS5Renderer::initializeGL(char* error, unsigned errorSize)
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     eglSwapBuffers(display, surface);
+    rememberGLInfo(display);
     g_message("[wpe-ps5] PS5Renderer: EGL %s, GL %s, %dx%d, render thread; page %s", eglQueryString(display, EGL_VERSION),
         reinterpret_cast<const char*>(glGetString(GL_VERSION)), m_width, m_height,
         m_pageAsTexture ? "as a texture (glTexSubImage2D)" : "in a persistent GL buffer");

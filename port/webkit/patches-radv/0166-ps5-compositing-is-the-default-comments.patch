@@ -1,0 +1,49 @@
+diff --git a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+index 00cd55b551..155f8dab08 100644
+--- a/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPreferencesWPE.cpp
+@@ -35,14 +35,21 @@ namespace WebKit {
+ void WebPreferences::platformInitializeStore()
+ {
+ #if defined(PS5_PAYLOAD_SDK)
+-    // PS5 Milestone 1: no GL in the WebProcess (an elfldr payload). Pages are
+-    // painted with Skia on the CPU and sent as shared memory
+-    // (NonCompositedFrameRenderer + RenderTargetSHMImage).
++    // PS5: no GL in the WebProcess (an elfldr payload has none), so this
++    // preference stays off: page content and 2D canvases are painted with
++    // Skia on the CPU. On, the CPU fallback would make an EGL display in the
++    // WebProcess (DrawingAreaCoordinatedGraphics::updatePreferences), which a
++    // payload aborts in. It says nothing about the compositor: webkit://gpu
++    // reports that itself (WebKitProtocolHandler.cpp).
+     setHardwareAccelerationEnabled(false);
+ #if USE(GRAPHICS_LAYER_WC) && !ENABLE(WC_GPU_PROCESS)
+-    // Or composited by the WC compositor in the title (GL in the UI process
+-    // only) when the compositing switch is on (opt-in). This is the first
+-    // guess; PageClientImpl::createDrawingAreaProxy settles it for each new
++    // Pages are composited on the GPU by the WC compositor in the title (GL
++    // in the UI process only), by default since 0067: on unless
++    // /data/ps5webkit/no-compositing exists (Settings: GPU compositing) or
++    // the embedder overrode it. Off, they take the CPU path
++    // (NonCompositedFrameRenderer + RenderTargetSHMImage: one image per
++    // frame, sent as shared memory). This is the first guess;
++    // PageClientImpl::createDrawingAreaProxy settles it for each new
+     // WebProcess, with the scene host's availability.
+     bool compositing = DrawingAreaProxyWCPS5::compositingRequested();
+     setAcceleratedCompositingEnabled(compositing);
+diff --git a/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp b/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp
+index 026883617c..558d17097b 100644
+--- a/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp
++++ b/Source/WebKit/WebProcess/WebPage/DrawingArea.cpp
+@@ -79,8 +79,10 @@ RefPtr<DrawingArea> DrawingArea::create(WebPage& webPage, const WebPageCreationP
+ #elif PLATFORM(IOS_FAMILY)
+     return RemoteLayerTreeDrawingArea::create(webPage, parameters);
+ #elif USE(GRAPHICS_LAYER_WC) && USE(COORDINATED_GRAPHICS)
+-    // WPE (PS5): the WC compositor only with accelerated compositing on (off
+-    // by default on PS5, WebPreferencesWPE.cpp); otherwise the CPU path.
++    // WPE (PS5): the WC compositor when accelerated compositing is on, which
++    // it is by default (WebPreferencesWPE.cpp; the UI process settles it for
++    // each new WebProcess, DrawingAreaProxyWCPS5::configurePreferencesForNewPage);
++    // otherwise the CPU path.
+     if (parameters.store.getBoolValueForKey(WebPreferencesKey::acceleratedCompositingEnabledKey()))
+         return DrawingAreaWC::create(webPage, parameters);
+     return DrawingAreaCoordinatedGraphics::create(webPage, parameters);

@@ -66,7 +66,7 @@ struct PS5CompositorPerf {
     uint64_t updateApplyUS;
     uint64_t paints; // scene paints
     uint64_t paintUS;
-    uint64_t presents; // frames that presented updates (replies went out)
+    uint64_t presents; // frames that reached the TV with the page's scene in them
     uint64_t tileUploads, tileUploadBytes, tileUploadUS;
     uint64_t scrollFrames; // presented frames that moved the shown page
     uint64_t scrollLatencies, scrollLatencyUS; // pad wheel event -> the frame that moved the page
@@ -113,3 +113,18 @@ public:
 // The WC build's compositor (PS5WCHost.cpp). Main thread, once.
 PS5CompositorClient* ps5wkWCCompositorClient();
 #endif
+
+// The title's own GL: PS5Renderer's context, which draws the compositor's
+// scene, the CPU page, video and the browser's UI. The strings as read on
+// the render thread when the context was made, for webkit://gpu (WebKit's
+// WebKitProtocolHandler.cpp). Any thread; the strings stay valid. False
+// until the renderer is up and where there is none (ps5wk-shot).
+struct PS5RendererGLInfo {
+    const char* renderer; // GL_RENDERER
+    const char* vendor; // GL_VENDOR
+    const char* version; // GL_VERSION
+    const char* shadingLanguageVersion; // GL_SHADING_LANGUAGE_VERSION
+    const char* eglVersion; // EGL_VERSION
+    const char* eglVendor; // EGL_VENDOR
+};
+bool ps5RendererGLInfo(PS5RendererGLInfo&);

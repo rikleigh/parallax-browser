@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """title-scroll-summary.py <title run log>...: per test URL, the scroll window
 (PAINT-SCROLL-START..END): rendering updates ([render1]), Mpx painted per
-update, main-thread ms per update, presents/s ([wc] presents or CPU
-[present] page uploads), rAF/s (RAF-RATE lines).
+update, main-thread ms per update, frames on the TV per second (the
+renderer's [present] lines: every swap) with the compositor's scene paints
+and updates ([wc] lines) or the CPU path's page uploads, rAF/s (RAF-RATE
+lines). The [wc] line's own "presents" is not read: until patch 0165 it
+counted only frames that carried held update replies, which is none with
+async scrolling.
 
 The log: the log server's lines of one PPSA99207 run with test-urls.txt,
 test-onload.js = scroll-raf.js and PS5WK_RENDER_LOG=2 in child.env
@@ -10,7 +14,7 @@ test-onload.js = scroll-raf.js and PS5WK_RENDER_LOG=2 in child.env
 import re, sys
 
 R1 = re.compile(r"\[render1\] ([\d.]+) ms: update ([\d.]+), paint ([\d.]+) \(([\d.]+) Mpx")
-WC = re.compile(r"\[wc\] ([\d.]+) s: (\d+) updates .*?, (\d+) presents")
+WC = re.compile(r"\[wc\] ([\d.]+) s: (\d+) updates .*?(\d+) paints \(")
 PRES = re.compile(r"\[present\] (\d+) frames \(([\d.]+)/s\).*?; (\d+) page uploads")
 RAF = re.compile(r"RAF-RATE ([\d.]+)/s( scrolling)?")
 URL = re.compile(r"^test URL (\d+)/\d+: (\S+)")
@@ -63,12 +67,16 @@ for path in sys.argv[1:]:
         n = len(up)
         tot = [u[0] for u in up]; paint = [u[2] for u in up]; mpx = [u[3] for u in up]
         zero = sum(1 for x in mpx if x < 0.005)
+        # The [present] windows: frames and the seconds they cover (frames / rate).
+        fr = sum(p[0] for p in d["pres"]); upl = sum(p[2] for p in d["pres"])
+        secs = sum(p[0] / p[1] for p in d["pres"] if p[1]) or 1.0
         pres = ""
         if d["wcs"]:
-            pres = "wc presents %.1f/s (updates %.1f/s)" % (d["wcp"] / d["wcs"], d["wcu"] / d["wcs"])
+            pres = "wc scene paints %.1f/s (updates %.1f/s)" % (d["wcp"] / d["wcs"], d["wcu"] / d["wcs"])
+            if d["pres"]:
+                pres += ", %.1f frames/s on the TV" % (fr / secs)
         elif d["pres"]:
-            fr = sum(p[0] for p in d["pres"]); upl = sum(p[2] for p in d["pres"])
-            pres = "cpu page uploads %.1f/s of %.1f frames/s" % (upl / (5.0 * len(d["pres"])), fr / (5.0 * len(d["pres"])))
+            pres = "cpu page uploads %.1f/s of %.1f frames/s" % (upl / secs, fr / secs)
         raf = "rAF %.1f/s avg %.1f max (idle %.1f)" % (sum(d["raf"]) / len(d["raf"]) if d["raf"] else 0, max(d["raf"] or [0]),
                                                      sum(d["rafidle"]) / len(d["rafidle"]) if d["rafidle"] else 0)
         print("  %s: %d updates (%.1f/s); main thread %.1f ms avg p50 %.1f p95 %.1f max %.0f; paint %.1f avg p95 %.1f; Mpx/update %.3f avg p95 %.2f max %.2f, %d of %d painted nothing, %d tiles; %s; %s" % (

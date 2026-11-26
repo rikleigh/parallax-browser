@@ -2,7 +2,8 @@
 
 WebKit 15486a0178, `PORT=WPE`, built with ps5-payload-sdk for a jailbroken PS5
 on 13.60. Goal of Milestone 1 (FEASIBILITY §1a, §4.8): browse on the TV with
-pages painted on the CPU.
+pages painted on the CPU. Since 2026-11-02 pages are composited on the GPU by
+default (below); the CPU path of Milestone 1 is the fallback.
 
 - **Title PPSA99207 = UIProcess** (`apps/title/ps5browser.c`) with the PS5 WPE
   Platform backend (`wpe-ps5/`): the page on the TV through ps5-opengl's EGL
@@ -10,9 +11,14 @@ pages painted on the CPU.
 - **Payload `ps5wk-child.elf` = WebProcess and NetworkProcess** (one
   multi-call ELF, `apps/child/ps5wk-child.cpp`), started by the title through
   the local elfldr with Spike 8's reversed rendezvous (`wpe-ps5/PS5LaunchProtocol.h`).
-  8 GB of flexible memory, JavaScriptCore with the JIT (patch 0030, *JIT* below), Skia on the CPU, frames sent
-  to the UIProcess as shared memory (WebKit's `RenderTargetSHMImage` path
-  with `hardware-acceleration-policy = never`, no GL in payloads).
+  8 GB of flexible memory, JavaScriptCore with the JIT (patch 0030, *JIT* below), Skia on the CPU
+  (no GL in payloads, so WebKit's hardware-acceleration preference is off:
+  page content and 2D canvases are always painted on the CPU). By default
+  the paint goes out as layer tiles for the GPU compositor in the title
+  (below); with GPU compositing off, as whole frames in shared memory
+  (WebKit's `RenderTargetSHMImage` path). Since 2026-11-25 the first
+  WebProcess runs in the title instead by default (*Settings*: Pages in the
+  browser process), except with Safer browsing or GPU compositing off.
 - **Payload `ps5wk-shot.elf`**: a UIProcess on WPE's headless display, for
   payload-only first light (loads a URL, reports a checksum and a thumbnail).
 
@@ -25,7 +31,10 @@ decoded frames under the page (see *Hole-punch video* below). Step 2b
 GPU compositing (2026-11-01/02, on by default since 2026-11-02): pages are
 composited on the GPU by WebKit's WC compositor in the title, with
 title-side (async) scrolling; the CPU path stays as the fallback and the
-Settings switch (see *Settings* and COMPOSITING-PLAN.md).
+Settings switch (see *Settings* and COMPOSITING-PLAN.md). `webkit://gpu`
+says which of the two a page has, where pages run, and whether WebGL and
+WebGPU are on (patch 0164; before, it said "Policy: never", which is
+WebKit's hardware-acceleration preference and not the compositor).
 
 The default tree (WEBGL=1, build-webgl) has WebGL (through a GPU process
 hosted in the title) and Web Audio (AudioContext in the WebProcess, out
@@ -277,9 +286,9 @@ names them; a group the page doesn't know becomes a heading under Advanced.
 | Give back freed memory (default on) | `PS5WK_PAS_DECOMMIT=0` when off | page restart (the NetworkProcess at the next browser start) |
 | Video under the page, i.e. hole punch (default on) | `PS5WK_HOLEPUNCH=0` when off | page restart |
 | Offer VP9 video (default on; off makes YouTube send H.264) | `PS5WK_MEDIA_VP9=0` when off | page restart |
-| GPU compositing (default on; includes async scrolling) | `/data/ps5webkit/no-compositing` when off | page restart |
+| GPU compositing (default on; includes async scrolling). Off also runs pages in payloads, whatever *Pages in the browser process* says, and WebGL stops working (it needs the compositor) | `/data/ps5webkit/no-compositing` when off | browser restart; a page restart when pages run in payloads anyway (*Pages in the browser process* off, or Safer browsing) |
 | Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
-| Pages in the browser process (default on since 2026-11-25; never with Safer browsing): the first WebProcess runs in the title, which gets more CPU (games up to twice as fast), at the price of a page crash ending the browser and pages not kept apart from it (`spikes/14-webprocess-in-title/stage3.md`). The page settings above are then browser-restart settings | `/data/ps5webkit/no-pages-in-browser` when off (`pages-in-browser`, which turned it on while it was off by default, is no longer read) | browser restart |
+| Pages in the browser process (default on since 2026-11-25; never with Safer browsing or with GPU compositing off): the first WebProcess runs in the title, which gets more CPU (games up to twice as fast), at the price of a page crash ending the browser and pages not kept apart from it (`spikes/14-webprocess-in-title/stage3.md`). The page settings above are then browser-restart settings | `/data/ps5webkit/no-pages-in-browser` when off (`pages-in-browser`, which turned it on while it was off by default, is no longer read) | browser restart |
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
 | Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |
@@ -287,6 +296,10 @@ names them; a group the page doesn't know becomes a heading under Advanced.
 
 While Safer browsing is on, the JIT, WebAssembly, WebGL and WebGPU rows say *Off
 while Safer browsing is on* and their buttons dim (they can still be changed).
+While GPU compositing is off, the WebGL and *Pages in the browser process*
+rows say *Off while GPU compositing is off* in the same way
+(`"overridden":true` with `"overriddenBy":"safer"` or `"compositing"` in
+`/settings.json`).
 The menu's shield button (between Private browsing and New tab; filled in
 cyan with a tick while on) toggles the flag through the same settings code,
 applies WebGL at once, says so on the TV and restarts the page shown in a
@@ -340,7 +353,22 @@ second press.
   N: async scrolling (... stick frame, overflow off, sync on; defaults)`.
   Off (`no-compositing`) paints on the CPU as before, and the CPU-only
   settings (painting threads, fast scrolling, video under the page) apply
-  again. The title falls back to the CPU by itself when the GL scene host
+  again. Off also keeps pages out of the browser process: the title reads
+  the file when it starts and runs every WebProcess as a payload, as with
+  Safer browsing (`[web-in-title] off: pages run in payload WebProcesses,
+  because GPU compositing is off ...`). The CPU path's renderer schedules
+  its updates with a WebCore `RunLoopObserver`, which only WTF's own
+  `RunLoop::run()` fires; the title runs `g_main_loop_run`, so in the title
+  nothing was painted and every page was black (found 2026-11-26, in
+  0.5.0's development build). So the setting needs a browser restart
+  wherever it moves pages (Settings says so), and while pages run in the
+  title the title holds compositing on for the whole run
+  (`ps5wk_compositing_set_override(1)`): WebKit reads the file for every
+  new drawing area, and a tab opened between the change and the restart was
+  black too. WebGL needs the compositor: without it a page's context is
+  lost (`[webgl] title: no GPU compositor: WebGL canvases stay blank`);
+  WebGPU works, and video too, under the page (not a turned or translucent
+  one, which only the compositor draws). The title falls back to the CPU by itself when the GL scene host
   can't start (`[wc] compositing is on but the scene host is not
   available`), in a `WC=0` build, and for a page whose GL textures stay over
   the 160 MB cap (that page gets a new WebProcess that paints on the CPU;

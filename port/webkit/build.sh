@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# WPE WebKit for the PS5 (Milestone 1: browse on the TV, pages painted on the
-# CPU). Builds WebKit 15486a0178 with PORT=WPE and the PS5 WPE Platform
+# WPE WebKit for the PS5: browse on the TV. Pages are painted on the CPU
+# (Skia) and, by default, composited on the GPU by the WC compositor in the
+# title (WC=1 below; the CPU-only path of Milestone 1 is the run-time
+# fallback). Builds WebKit 15486a0178 with PORT=WPE and the PS5 WPE Platform
 # backend (wpe-ps5/) against ps5-payload-sdk, libc++ 19 and the dependency
 # sysroot from port/deps (toolchain/wpe-sysroot).
 #
@@ -184,8 +186,10 @@ step_shim() {
 # Everything optional is off. JIT on (Baseline, DFG, FTL, YARR; patches 0030+;
 # JIT=0 builds the asm LLInt only, as Spike 4). WebAssembly is compiled with
 # the JIT because B3 (FTL) does not build without it upstream, but it is off
-# at run time on PS5 (patch 0030: JSC_useWasm=true turns it on). No WebGL, no
-# GPU process, Skia on the CPU. Media (Milestone 2): <video>/<audio> and MSE on
+# at run time on PS5 (patch 0030: JSC_useWasm=true turns it on). In this base
+# list: no WebGL, no GPU process (WEBGL=1, WEBGPU=1 and GPU=radv below add
+# them), Skia on the CPU for page content and 2D canvases in every build
+# (the compositor comes with WC=1 at the end). Media (Milestone 2): <video>/<audio> and MSE on
 # the static GStreamer from port/deps (gstreamer-full, GL off), software
 # decoders in the WebProcess, audio through ps5audiosink (sceAudioOut). WPE Platform API only; headless kept
 # for the payload-side test harness.

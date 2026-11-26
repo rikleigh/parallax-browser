@@ -1,0 +1,60 @@
+diff --git a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+index 71cd36e29d..47dd7e78a9 100644
+--- a/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
++++ b/Source/WebKit/UIProcess/wpe/ps5/PS5WCHost.cpp
+@@ -412,7 +412,13 @@ private:
+ 
+     struct {
+         MonotonicTime start;
+-        unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, presents { 0 }, animationPaints { 0 }, lateUpdates { 0 };
++        unsigned updates { 0 }, unchanged { 0 }, paints { 0 }, animationPaints { 0 }, lateUpdates { 0 };
++        // Frames that reached the TV with the page's scene in them (painted
++        // again or not). Until 0165 this counted only the frames that carried
++        // update replies held for the swap, which async scrolling's early
++        // replies left at 0 while the screen updated 60 times a second.
++        unsigned presents { 0 };
++        unsigned heldReplyFrames { 0 }; // frames whose swap update replies waited for
+         unsigned videoPaints { 0 }; // for new video frames only
+         unsigned earlyReplies { 0 }; // async scrolling: replied when applied
+         double applyMS { 0 }, applyMaxMS { 0 }, paintMS { 0 }, paintMaxMS { 0 }, paintGapMaxMS { 0 };
+@@ -427,6 +433,7 @@ private:
+     // The performance overlay's totals (PS5Compositor.h; render thread) and
+     // the tile uploads taken from the uploader since the last [wc] line.
+     PS5CompositorPerf m_perf { };
++    bool m_sceneInFrame { false }; // paint() gave this frame a scene texture
+     double m_perfLatencyMaxMS { 0 };
+     BitmapTextureUploaderPS5::Stats m_uploadWindow;
+     bool m_frameLog { false }; // /data/ps5webkit/wc-frame-log: a [frame] line per presented update
+@@ -960,6 +967,7 @@ unsigned SceneHost::paint(int64_t displayUS, int* width, int* height)
+     }
+     *width = size.width();
+     *height = size.height();
++    m_sceneInFrame = true;
+     return m_surface->id();
+ }
+ 
+@@ -1109,9 +1117,14 @@ void SceneHost::didPresent()
+     // Replies going out now: the WebProcess will likely send its next update soon.
+     m_expectingUpdate = !m_frameCompletions.isEmpty();
+     m_appliedThisFrame = false;
+-    if (!m_frameCompletions.isEmpty()) {
++    // The swap returned: a frame with the page's scene went to the TV (not
++    // View in VR's frames, which paint no scene).
++    if (std::exchange(m_sceneInFrame, false)) {
+         m_perf.presents++;
+         m_stats.presents++;
++    }
++    if (!m_frameCompletions.isEmpty()) {
++        m_stats.heldReplyFrames++;
+         auto now = MonotonicTime::now();
+         double present = (now - m_frameFirstAppliedAt).milliseconds();
+         m_stats.presentMS += present;
+@@ -1196,7 +1209,7 @@ void SceneHost::maybeLog()
+             uploads.uploads ? uploads.milliseconds / uploads.uploads : 0.0, uploads.fenceWaits, uploads.finishes,
+             m_stats.paints, m_stats.paints ? m_stats.paintMS / m_stats.paints : 0.0, m_stats.paintMaxMS, m_stats.animationPaints, m_stats.paintGapMaxMS, m_stats.lateUpdates,
+             BitmapTextureUploaderPS5::textureBytes() / 1048576.0, BitmapTexturePool::singleton().sizeInBytes() / 1048576.0, programs.programs, programs.milliseconds, programs.failures, programs.glslVersion,
+-            m_stats.latencies ? m_stats.queuedMS / m_stats.latencies : 0.0, m_stats.queuedMaxMS, m_stats.presents ? m_stats.presentMS / m_stats.presents : 0.0,
++            m_stats.latencies ? m_stats.queuedMS / m_stats.latencies : 0.0, m_stats.queuedMaxMS, m_stats.heldReplyFrames ? m_stats.presentMS / m_stats.heldReplyFrames : 0.0,
+             m_stats.presentMaxMS, hops ? hopUS / 1000.0 / hops : 0.0, hopMaxUS / 1000.0);
+         unsigned videoLayers = 0;
+         for (auto& entry : m_scenes)

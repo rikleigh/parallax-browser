@@ -16,6 +16,10 @@
  *     safer-browsing overrides jit, wasm, webgl, webgpu and web_in_title while present (each
  *     WebProcess reads it at start, ps5wk-child.cpp configureJIT; the title
  *     for WebGL) and leaves their own values alone for when it goes.
+ *     no-compositing likewise overrides web_in_title (ps5browser.c main:
+ *     pages drawn on the CPU run in payloads) and webgl (WebGL needs the
+ *     compositor), so the compositing setting waits for a browser restart
+ *     wherever it moves pages between the browser and payloads.
  *   home-url.txt: the page the browser opens when it starts, in the PS5
  *     user's own folder (profile.c), as KIND_FILE settings are.
  * Each setting says what applies it: a page restart (a new WebProcess), a
@@ -118,7 +122,7 @@ static const Setting settings[] = {
         "The newer 3D and GPU computing interface for pages and games, on the PS5's GPU. Off: sites fall back to WebGL where they can; try it if a site's 3D or video effects misbehave. Applies to pages loaded from now on.",
         NULL, 0, 0 },
     { "compositing", "graphics", KIND_FLAG, TYPE_BOOL, "no-compositing", "1", PS5WK_SETTINGS_PAGE, "GPU compositing",
-        "Puts pages together on the GPU, in layers, and scrolls them on the GPU. Off draws pages on the CPU, as before; try it if a page looks wrong.",
+        "Puts pages together on the GPU, in layers, and scrolls them on the GPU. Off draws pages on the CPU; try it if a page looks wrong. Off also runs pages in a process of their own, whatever Pages in the browser process says, so they run slower, and WebGL stops working: it needs the compositor.",
         NULL, 0, 0 },
     { "paint_threads", "graphics", KIND_ENV, TYPE_NUMBER, "PS5WK_PAINT_THREADS", "4", PS5WK_SETTINGS_PAGE, "Painting threads",
         "CPU threads that draw the page. More is smoother on busy pages; 1 draws on one thread, as before.",
@@ -138,7 +142,7 @@ static const Setting settings[] = {
         "Returns memory that pages no longer use to the system. Off keeps it (the old behaviour). The network process picks it up at the next browser start.",
         NULL, 0, 0 },
     { "web_in_title", "processes", KIND_FLAG, TYPE_BOOL, "no-pages-in-browser", "1", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
-        "Runs pages inside the browser itself, which gets more of the PS5's CPU: games and heavy pages run up to twice as fast. The price: a page that crashes closes the whole browser, and pages are not kept apart from the browser. Off runs each page in a separate process: slower, and without those two. While it is on, settings that need a page restart need a browser restart. Safer browsing always keeps pages in their own process.",
+        "Runs pages inside the browser itself, which gets more of the PS5's CPU: games and heavy pages run up to twice as fast. The price: a page that crashes closes the whole browser, and pages are not kept apart from the browser. Off runs each page in a separate process: slower, and without those two. While it is on, settings that need a page restart need a browser restart. It doesn't apply while Safer browsing is on or GPU compositing is off: pages then run in their own process whatever this says.",
         NULL, 0, 0 },
     { "perf_overlay", "experimental", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
         "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",
@@ -264,11 +268,16 @@ static char* readEnv(void)
     return contents;
 }
 
+static gboolean compositingMovesPages(void);
+
 static void recordApplied(int scopes)
 {
     char* env = readEnv();
     for (size_t i = 0; i < SETTING_COUNT; i++) {
-        if (!(settings[i].scope & scopes))
+        /* GPU compositing: a new WebProcess alone doesn't apply it where
+         * it also decides whether pages run in the browser (effectiveScope). */
+        int scope = !strcmp(settings[i].id, "compositing") && compositingMovesPages() ? PS5WK_SETTINGS_BROWSER : settings[i].scope;
+        if (!(scope & scopes))
             continue;
         g_free(applied[i]);
         applied[i] = currentValue(&settings[i], env);
@@ -300,8 +309,29 @@ void ps5wk_settings_set_pages_in_browser(gboolean on)
     g_mutex_unlock(&lock);
 }
 
+/* A flag file of dataDir, whatever setting it belongs to. */
+static gboolean flagOnDisk(const char* name)
+{
+    char* path = pathFor(name);
+    gboolean present = fileExists(path);
+    g_free(path);
+    return present;
+}
+
+/* GPU compositing off also takes pages out of the browser process
+ * (ps5browser.c main: the CPU path needs a WebProcess of its own), and on
+ * puts them back, both when the browser starts. Not when something else
+ * keeps them in payloads anyway: then WebKit's own reading of no-compositing
+ * for each new WebProcess is all there is to it. */
+static gboolean compositingMovesPages(void)
+{
+    return !flagOnDisk("no-pages-in-browser") && !flagOnDisk("safer-browsing");
+}
+
 static int effectiveScope(const Setting* s)
 {
+    if (!strcmp(s->id, "compositing") && compositingMovesPages())
+        return PS5WK_SETTINGS_BROWSER;
     return pagesInBrowser && s->scope == PS5WK_SETTINGS_PAGE ? PS5WK_SETTINGS_BROWSER : s->scope;
 }
 
@@ -346,6 +376,13 @@ static gboolean isOverriddenBySafer(const Setting* s)
         || !strcmp(s->id, "web_in_title");
 }
 
+/* What GPU compositing off turns off: pages in the browser process
+ * (ps5browser.c main) and WebGL, whose canvases only the compositor shows. */
+static gboolean isOverriddenByNoCompositing(const Setting* s)
+{
+    return !strcmp(s->id, "web_in_title") || !strcmp(s->id, "webgl");
+}
+
 static const char* scopeName(int scope)
 {
     return scope == PS5WK_SETTINGS_PAGE ? "page" : scope == PS5WK_SETTINGS_BROWSER ? "browser" : "none";
@@ -360,12 +397,16 @@ char* ps5wk_settings_json(const char* extra)
     g_mutex_lock(&lock);
     char* env = readEnv();
     gboolean pending[3] = { FALSE, FALSE, FALSE };
-    gboolean saferOn = FALSE;
+    gboolean saferOn = FALSE, compositingOff = FALSE;
     for (size_t i = 0; i < SETTING_COUNT; i++) {
         if (!strcmp(settings[i].id, "safer")) {
             char* safer = currentValue(&settings[i], env);
             saferOn = !strcmp(safer, "1");
             g_free(safer);
+        } else if (!strcmp(settings[i].id, "compositing")) {
+            char* compositing = currentValue(&settings[i], env);
+            compositingOff = !strcmp(compositing, "0");
+            g_free(compositing);
         }
     }
     g_string_append(out, "\"settings\":[");
@@ -387,7 +428,9 @@ char* ps5wk_settings_json(const char* extra)
         /* Safer browsing on (on disk): these say they are off whatever
          * their own value is. */
         if (saferOn && isOverriddenBySafer(s))
-            g_string_append(out, ",\"overridden\":true");
+            g_string_append(out, ",\"overridden\":true,\"overriddenBy\":\"safer\"");
+        else if (compositingOff && isOverriddenByNoCompositing(s))
+            g_string_append(out, ",\"overridden\":true,\"overriddenBy\":\"compositing\"");
         g_string_append(out, ",\"key\":");
         appendJSONString(out, s->name);
         g_string_append(out, ",\"label\":");
@@ -733,7 +776,7 @@ gboolean ps5wk_settings_update(const char* body, gboolean json, char** message, 
         }
         g_free(path);
         if (ok)
-            *changed |= s->scope ? s->scope : 0;
+            *changed |= !strcmp(s->id, "compositing") ? effectiveScope(s) : s->scope ? s->scope : 0;
         g_string_append_printf(ok ? done : failed, "%s%s", (ok ? done : failed)->len ? ", " : "", s->label);
     }
     if (envDone->len) {
@@ -1033,7 +1076,7 @@ const char ps5wk_settings_page[] =
     "function row(s){\n"
     "  var r=el('div','row'+(s.overridden?' overridden':'')),t=el('div','txt'),n=el('div','name',s.label),h=sentences(s.help),p=el('p','help',h[0]);\n"
     "  r.id='row-'+s.id;\n"
-    "  if(s.overridden)n.appendChild(el('span','badge','Off while Safer browsing is on'));\n"
+    "  if(s.overridden)n.appendChild(el('span','badge',s.overriddenBy=='compositing'?'Off while GPU compositing is off':'Off while Safer browsing is on'));\n"
     "  if(s.pending)n.appendChild(el('span','badge wait','Changed: '+applies(s).toLowerCase()));\n"
     "  else if(s.restart!='none')p.appendChild(el('span',null,s.restart=='page'?' Needs a page restart.':' Needs a browser restart.'));\n"
     "  if(s.type!='text'&&s.value!=s['default'])n.appendChild(el('span','badge','Default: '+(options(s).filter(function(c){return c.value==s['default']})[0]||{label:s['default']}).label));\n"
