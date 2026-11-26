@@ -566,11 +566,16 @@ int main(void)
         return 1;
     }
     /* Gone: the process, and the system's idea of the app in front. What
-     * the system reports meanwhile goes to the log ("big app" ids). */
+     * the system reports meanwhile goes to the log ("big app" ids). A
+     * SIGKILLed title can take a while to go: a worker stuck in an OPFS
+     * write kept it more than 10 s (2026-11-26), and giving up then left
+     * nothing running. So up to GONE_MAX_MS for the process, then up to
+     * 10 s more for no app in front. */
+#define GONE_MAX_MS 60000
     int gone = -1, last = (int)app, noApp = -1;
     char trail[160] = "";
     size_t o = 0;
-    for (int t = 0; t < 10000; t += 50) {
+    for (int t = 0; t < GONE_MAX_MS + 10000; t += 50) {
         int running = sceLncUtilGetAppIdOfRunningBigApp();
         if (running != last && o < sizeof trail) {
             o += snprintf(trail + o, sizeof trail - o, " %d ms: 0x%x", t, (unsigned)running);
@@ -582,10 +587,16 @@ int main(void)
             noApp = t;
             break;
         }
+        if (gone >= 0 && t - gone >= 10000)
+            break; /* gone, with an app id still reported: go on */
+        if (gone < 0 && t >= GONE_MAX_MS)
+            break;
+        if (gone < 0 && t == 10000)
+            say("%s pid %d still there 10 s after SIGKILL; waiting up to %d s", title, pid, GONE_MAX_MS / 1000);
         usleep(50 * 1000);
     }
     if (gone < 0) {
-        say("%s pid %d still there 10 s after SIGKILL", title, pid);
+        say("%s pid %d still there %d s after SIGKILL: not %s", title, pid, GONE_MAX_MS / 1000, closeOnly ? "waiting longer" : "starting it again");
         return 1;
     }
     if (closeOnly) {

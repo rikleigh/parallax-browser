@@ -14,7 +14,11 @@
  * frame asked. Private browsing works on a copy that goes when it ends.
  *
  * What was blocked on the page shown (how many, the last address) is kept
- * for Settings, until the next page loads.
+ * for Settings, until the next page loads, in memory only: nothing of it is
+ * written. Private browsing's start and end forget it, and another device
+ * asking during private browsing is not told it (ps5wk_popups_json). The
+ * log lines about it are browserui.c's: the address only in development
+ * builds, and none at all while private browsing is on (titlelog.c).
  */
 #define SPIKE_NAME "ps5browser"
 #include "common/spike.h"
@@ -204,7 +208,10 @@ void ps5wk_popups_set_private(gboolean enabled)
 
 char* ps5wk_popups_json(const char* uri, gboolean savedOnly)
 {
-    char* site = ps5wk_adblock_site_for_uri(uri);
+    /* savedOnly is another device during private browsing: nothing of the
+     * private pages, whatever uri says (the caller passes none then too), so
+     * no site row, no count and no address that was blocked. */
+    char* site = savedOnly ? NULL : ps5wk_adblock_site_for_uri(uri);
     GString* out = g_string_new("\"popups\":{\"site\":");
     g_mutex_lock(&lock);
     GPtrArray* from = savedOnly ? sites : list();

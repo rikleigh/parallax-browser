@@ -1,0 +1,88 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPFS fill</title>
+<pre id="out">running…</pre>
+<script>
+// Writes ?gb= GB (default 3) to one file in the origin private file system, in ?chunkmb= MB writes
+// (default 64; or ?chunkkb= KB, for writes below a megabyte), to see the per-site storage quota (patches-radv 0152: min(60% of the disk, 20 GiB,
+// half the free space); the development build logs "[storage] quota for ..."). A write past the
+// quota must fail with QuotaExceededError (or similar) and leave the browser working.
+// ?mode=sync (default): a worker with createSyncAccessHandle; ?mode=writable: createWritable() on
+// the main thread (a FileSystemWritableStream, whose swap file lives in the temporary folder until
+// close()). ?name= the file (default fill.bin). ?hold=1 (writable mode): leave the stream open at the end, not closed. ?clear=1: delete
+// every file of the origin's OPFS root and stop. Logs "OPFS ..." and "OPFS DONE".
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); out.textContent = lines.join('\n'); console.log('OPFS ' + s); }
+const q = new URLSearchParams(location.search);
+const name = q.get('name') || 'fill.bin';
+const gb = +(q.get('gb') || 3), chunkMB = q.get('chunkkb') ? +q.get('chunkkb') / 1024 : +(q.get('chunkmb') || 64), mode = q.get('mode') || 'sync';
+const mb = (n) => (n / 1048576).toFixed(0) + ' MB';
+async function estimate(label) {
+  try { const e = await navigator.storage.estimate(); say(`${label}: estimate usage ${mb(e.usage)}, quota ${mb(e.quota)}`); }
+  catch (e) { say(`${label}: estimate failed: ${e}`); }
+}
+const workerSource = `
+onmessage = async (e) => {
+  const { gb, chunkMB, name } = e.data;
+  const root = await navigator.storage.getDirectory();
+  const file = await root.getFileHandle(name, { create: true });
+  let h;
+  try { h = await file.createSyncAccessHandle(); } catch (err) { postMessage({ done: true, written: 0, size: 0, error: 'createSyncAccessHandle: ' + err.name + ': ' + err.message, t: 0 }); return; }
+  h.truncate(0);
+  const chunk = new Uint8Array(Math.round(chunkMB * 1048576));
+  for (let i = 0; i < chunk.length; i += 4096) chunk[i] = i & 255;
+  const total = Math.round(gb * 1024 / chunkMB), every = Math.max(4, Math.round(256 / chunkMB));
+  const t0 = performance.now();
+  let written = 0, error = '';
+  for (let i = 0; i < total; i++) {
+    try {
+      const n = h.write(chunk, { at: written });
+      written += n;
+      if (n !== chunk.length) { error = 'short write ' + n; break; }
+    } catch (err) { error = err.name + ': ' + err.message; break; }
+    if (i % every == every - 1) postMessage({ progress: written, t: performance.now() - t0 });
+  }
+  try { h.flush(); } catch (err) { error = error || ('flush: ' + err.name); }
+  const size = h.getSize();
+  h.close();
+  postMessage({ done: true, written, size, error, t: performance.now() - t0 });
+};`;
+(async () => {
+  const root = await navigator.storage.getDirectory();
+  if (q.get('clear') === '1') {
+    try { for await (const [n] of root.entries()) { await root.removeEntry(n); say(n + ' removed'); } } catch (e) { say('remove: ' + e); }
+    await estimate('after');
+    say('DONE'); return;
+  }
+  await estimate('before');
+  say(`writing ${gb} GB in ${chunkMB >= 1 ? chunkMB + ' MB' : chunkMB * 1024 + ' KB'} writes (${mode})`);
+  if (mode === 'sync') {
+    const w = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+    w.onmessage = async (e) => {
+      const d = e.data;
+      if (!d.done) { say(`  ${mb(d.progress)} at ${(d.progress / 1048576 / (d.t / 1000)).toFixed(0)} MB/s`); return; }
+      say(`wrote ${mb(d.written)} in ${(d.t / 1000).toFixed(1)} s, file size ${mb(d.size)}${d.error ? '; stopped: ' + d.error : ''}`);
+      await estimate('after');
+      say('DONE');
+    };
+    w.onerror = (e) => { say('worker error ' + e.message); say('DONE'); };
+    w.postMessage({ gb, chunkMB, name });
+    return;
+  }
+  const file = await root.getFileHandle(name, { create: true });
+  const s = await file.createWritable();
+  const chunk = new Uint8Array(Math.round(chunkMB * 1048576));
+  const total = Math.round(gb * 1024 / chunkMB), wEvery = Math.max(4, Math.round(256 / chunkMB)), t0 = performance.now();
+  let written = 0, error = '';
+  for (let i = 0; i < total; i++) {
+    try { await s.write(chunk); written += chunk.length; } catch (err) { error = err.name + ': ' + err.message; break; }
+    if (i % wEvery == wEvery - 1) say(`  ${mb(written)}`);
+  }
+  say(`wrote ${mb(written)} in ${((performance.now() - t0) / 1000).toFixed(1)} s${error ? '; stopped: ' + error : ''}`);
+  if (q.get('hold') === '1') { say('stream left open (hold=1)'); window.heldStream = s; say('DONE'); return; }
+  try { await s.close(); say('closed'); } catch (err) { say('close: ' + err.name + ': ' + err.message); }
+  await estimate('after');
+  say('DONE');
+})().catch(e => { say('error ' + e); say('DONE'); });
+</script>

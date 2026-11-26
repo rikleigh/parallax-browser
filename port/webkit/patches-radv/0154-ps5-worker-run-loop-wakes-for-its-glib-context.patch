@@ -1,19 +1,20 @@
 diff --git a/Source/WTF/wtf/glib/RunLoopGLib.cpp b/Source/WTF/wtf/glib/RunLoopGLib.cpp
-index 892eed01be..03cc233984 100644
+index 892eed01be..045ab6b843 100644
 --- a/Source/WTF/wtf/glib/RunLoopGLib.cpp
 +++ b/Source/WTF/wtf/glib/RunLoopGLib.cpp
-@@ -32,7 +32,10 @@
+@@ -31,8 +31,11 @@
+ 
  #include <glib.h>
  #include <wtf/BubbleSort.h>
++#include <wtf/HashMap.h>
  #include <wtf/MainThread.h>
 +#include <wtf/NeverDestroyed.h>
  #include <wtf/SafeStrerror.h>
 +#include <wtf/SharedTask.h>
-+#include <wtf/Vector.h>
  #include <wtf/glib/RunLoopSourcePriority.h>
  
  #if OS(LINUX) || OS(FREEBSD)
-@@ -138,6 +141,47 @@ GSourceFuncs RunLoop::s_runLoopSourceFunctions = {
+@@ -138,6 +141,76 @@ GSourceFuncs RunLoop::s_runLoopSourceFunctions = {
      nullptr, // closure_marshall
  };
  
@@ -23,68 +24,126 @@ index 892eed01be..03cc233984 100644
 +// context, so a wakeUp() or a timer started from another thread reached it only when the next
 +// message or DOM timer came (a 20 ms Atomics.waitAsync timeout in a worker took 1 to 2 s beside a
 +// 1 s interval: nfsu2.xyz's reads, 2026-11-25). Kept out of RunLoop.h, which everything includes.
-+static Lock ps5WakeUpObserversLock;
-+static std::atomic<unsigned> ps5WakeUpObserverCount { 0 };
++//
++// wakeUp() and TimerBase::start() run on every thread all the time, so what they check is one
++// atomic flag in their run loop's own source (the observer lives just after RunLoopSource in the
++// same allocation): no global lock, no list, and only a run loop whose thread is waiting this way
++// takes its own lock. The task runs under that lock, and clearing takes it too, so once
++// ps5SetRunLoopWakeUpObserver(runLoop, nullptr) returns the task is not running and will not run
++// (it holds a raw pointer to the WorkerDedicatedRunLoop). No wake-up is lost between the waiting
++// thread's look at its context and its wait: it sets the flag before it takes the context's lock
++// to look, and wakeUp() and start() set the ready time under that lock before they read the flag,
++// so either the look sees the ready time or the notifier sees the flag and posts the task.
++// The setter, which runs only on the waiting thread, finds the observer by run loop in a small
++// map (it cannot reach m_source from outside RunLoop).
 +struct PS5WakeUpObserver {
-+    RunLoop* runLoop;
-+    RefPtr<SharedTask<void()>> task;
++    std::atomic<bool> isSet { false };
++    Lock lock;
++    RefPtr<SharedTask<void()>> task WTF_GUARDED_BY_LOCK(lock);
 +};
-+static Vector<PS5WakeUpObserver>& ps5WakeUpObservers() WTF_REQUIRES_LOCK(ps5WakeUpObserversLock)
++
++struct PS5RunLoopWorkSource {
++    RunLoopSource runLoopSource;
++    PS5WakeUpObserver wakeUpObserver;
++};
++
++static PS5WakeUpObserver& ps5WakeUpObserver(GSource* runLoopWorkSource)
 +{
-+    static NeverDestroyed<Vector<PS5WakeUpObserver>> observers;
++    return reinterpret_cast<PS5RunLoopWorkSource*>(runLoopWorkSource)->wakeUpObserver;
++}
++
++static Lock ps5WakeUpObserversLock;
++static HashMap<const RunLoop*, PS5WakeUpObserver*>& ps5WakeUpObservers() WTF_REQUIRES_LOCK(ps5WakeUpObserversLock)
++{
++    static NeverDestroyed<HashMap<const RunLoop*, PS5WakeUpObserver*>> observers;
 +    return observers;
 +}
 +
 +WTF_EXPORT_PRIVATE void ps5SetRunLoopWakeUpObserver(RunLoop&, RefPtr<SharedTask<void()>>&&);
 +void ps5SetRunLoopWakeUpObserver(RunLoop& runLoop, RefPtr<SharedTask<void()>>&& task)
 +{
-+    Locker locker { ps5WakeUpObserversLock };
-+    auto& observers = ps5WakeUpObservers();
-+    observers.removeAllMatching([&](auto& observer) { return observer.runLoop == &runLoop; });
-+    if (task)
-+        observers.append({ &runLoop, WTF::move(task) });
-+    ps5WakeUpObserverCount.store(observers.size());
++    PS5WakeUpObserver* observer;
++    {
++        Locker locker { ps5WakeUpObserversLock };
++        observer = ps5WakeUpObservers().get(&runLoop);
++    }
++    if (!observer)
++        return;
++    RefPtr<SharedTask<void()>> previous;
++    {
++        Locker locker { observer->lock };
++        previous = std::exchange(observer->task, WTF::move(task));
++        observer->isSet.store(!!observer->task);
++    }
 +}
 +
-+static void ps5NotifyWakeUpObserver(RunLoop& runLoop)
++static void ps5NotifyWakeUpObserver(GSource* runLoopWorkSource)
 +{
-+    Locker locker { ps5WakeUpObserversLock };
-+    for (auto& observer : ps5WakeUpObservers()) {
-+        if (observer.runLoop == &runLoop) {
-+            observer.task->run();
-+            return;
-+        }
-+    }
++    auto& observer = ps5WakeUpObserver(runLoopWorkSource);
++    if (!observer.isSet.load()) [[likely]]
++        return;
++    Locker locker { observer.lock };
++    if (observer.task)
++        observer.task->run();
 +}
 +#endif
 +
  RunLoop::RunLoop()
  {
      m_mainContext = g_main_context_get_thread_default();
-@@ -268,6 +312,10 @@ void RunLoop::stop()
+@@ -145,7 +218,16 @@ RunLoop::RunLoop()
+         m_mainContext = isMainThread() ? g_main_context_default() : adoptGRef(g_main_context_new());
+     ASSERT(m_mainContext);
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    m_source = adoptGRef(g_source_new(&RunLoop::s_runLoopSourceFunctions, sizeof(PS5RunLoopWorkSource)));
++    new (&ps5WakeUpObserver(m_source.get())) PS5WakeUpObserver;
++    {
++        Locker locker { ps5WakeUpObserversLock };
++        ps5WakeUpObservers().add(this, &ps5WakeUpObserver(m_source.get()));
++    }
++#else
+     m_source = adoptGRef(g_source_new(&RunLoop::s_runLoopSourceFunctions, sizeof(RunLoopSource)));
++#endif
+     auto& runLoopSource = *reinterpret_cast<RunLoopSource*>(m_source.get());
+     runLoopSource.runLoop = this;
+ #if HAVE(TIMERFD)
+@@ -163,6 +245,13 @@ RunLoop::RunLoop()
+ 
+ RunLoop::~RunLoop()
+ {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    {
++        Locker locker { ps5WakeUpObserversLock };
++        ps5WakeUpObservers().remove(this);
++    }
++    ps5WakeUpObserver(m_source.get()).~PS5WakeUpObserver();
++#endif
+     g_source_destroy(m_source.get());
+     m_shouldStop = true;
+ }
+@@ -268,6 +357,9 @@ void RunLoop::stop()
  void RunLoop::wakeUp()
  {
      g_source_set_ready_time(m_source.get(), 0);
 +#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
-+    if (ps5WakeUpObserverCount.load()) [[unlikely]]
-+        ps5NotifyWakeUpObserver(*this);
++    ps5NotifyWakeUpObserver(m_source.get());
 +#endif
  }
  
  RunLoop::CycleResult RunLoop::cycle(RunLoopMode)
-@@ -423,6 +471,10 @@ void RunLoop::TimerBase::start(Seconds interval, bool repeat)
+@@ -423,6 +515,9 @@ void RunLoop::TimerBase::start(Seconds interval, bool repeat)
      m_interval = interval;
      m_isRepeating = repeat;
      updateReadyTime();
 +#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
-+    if (ps5WakeUpObserverCount.load()) [[unlikely]]
-+        ps5NotifyWakeUpObserver(m_runLoop.get());
++    ps5NotifyWakeUpObserver(m_runLoop->m_source.get()); // the run loop's own source, not the timer's
 +#endif
  }
  
  void RunLoop::TimerBase::stop()
 diff --git a/Source/WebCore/workers/WorkerRunLoop.cpp b/Source/WebCore/workers/WorkerRunLoop.cpp
-index a29215534d..f249500f2a 100644
+index a29215534d..65b0c1caed 100644
 --- a/Source/WebCore/workers/WorkerRunLoop.cpp
 +++ b/Source/WebCore/workers/WorkerRunLoop.cpp
 @@ -62,6 +62,15 @@
@@ -133,7 +192,26 @@ index a29215534d..f249500f2a 100644
  #if USE(CF)
      CFAbsoluteTime nextCFRunLoopTimerFireDate = CFRunLoopGetNextTimerFireDate(RetainPtr { CFRunLoopGetCurrent() }.get(), kCFRunLoopDefaultMode);
      double timeUntilNextCFRunLoopTimerInSeconds = nextCFRunLoopTimerFireDate - CFAbsoluteTimeGetCurrent();
-@@ -316,6 +348,9 @@ WorkerDedicatedRunLoop::RunInModeResult WorkerDedicatedRunLoop::runInMode(Worker
+@@ -300,8 +332,18 @@ WorkerDedicatedRunLoop::RunInModeResult WorkerDedicatedRunLoop::runInMode(Worker
+     }
+ #endif
+ 
++#if USE(GLIB) && OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: whether the shared timer's own deadline bounds the wait. The context's sources (above)
++    // end it too, and a wait they end must not fire the shared timer (below).
++    Seconds sharedTimerDelay = Seconds::infinity();
++    if (predicate.isDefaultMode() && m_sharedTimer->isActive()) {
++        sharedTimerDelay = protect(m_sharedTimer)->fireTimeDelay();
++        timeoutDelay = std::min(timeoutDelay, sharedTimerDelay);
++    }
++#else
+     if (predicate.isDefaultMode() && m_sharedTimer->isActive())
+         timeoutDelay = std::min(timeoutDelay, protect(m_sharedTimer)->fireTimeDelay());
++#endif
+ 
+     if (script) {
+         script->releaseHeapAccess();
+@@ -316,6 +358,9 @@ WorkerDedicatedRunLoop::RunInModeResult WorkerDedicatedRunLoop::runInMode(Worker
      }
      MessageQueueWaitResult result;
      auto task = m_messageQueue.waitForMessageFilteredWithTimeout(result, predicate, timeoutDelay);
@@ -143,3 +221,18 @@ index a29215534d..f249500f2a 100644
      if (script) {
          script->acquireHeapAccess();
          script->removeTimerSetNotification(timerAddedTask);
+@@ -345,6 +390,14 @@ WorkerDedicatedRunLoop::RunInModeResult WorkerDedicatedRunLoop::runInMode(Worker
+         break;
+ 
+     case MessageQueueTimeout:
++#if USE(GLIB) && OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: a wait that ended at a GLib source's deadline (a waitAsync timeout, a RunLoop timer)
++        // only returns: the next runInMode() dispatches the context at its top. Upstream a timeout
++        // can only be the shared timer's, and firing it for another one would run due DOM timers
++        // early, and in a nested mode (a worker's synchronous XHR) inside that loop.
++        if (sharedTimerDelay > timeoutDelay)
++            break;
++#endif
+         if (!context->isClosing() && !isBeingDebugged()) {
+             runInModeResult.firedSharedTimer = true;
+             protect(m_sharedTimer)->fire();

@@ -132,9 +132,22 @@ target_compile_definitions(ps5browser PRIVATE LOG_HOST="${PS5WK_LOG_HOST}" LOG_P
 # ProsperoStore folder, the test's yes) only in development builds, the ones
 # that log to a Mac; never in a release (make-release.sh builds with no log
 # host, and checks).
+# PS5WK_DEBUG_BUILD: debug aids (files in /data/ps5webkit that change what
+# pages see or log, such as debug-userscript.js and debug-dialogs) and the
+# page and link addresses in the log lines that have them, also only in
+# development builds; a release has neither the code nor the file names.
+# WebKit's patches and package.sh (dheap, heapprof) use the same macro.
 if (PS5WK_LOG_HOST)
     target_compile_definitions(ps5browser PRIVATE PS5WK_UPDATE_TESTING=1)
     set_property(SOURCE ${PS5_APPS_DIR}/child/update-job.c APPEND PROPERTY COMPILE_DEFINITIONS PS5WK_UPDATE_TESTING=1)
+    target_compile_definitions(ps5browser PRIVATE PS5WK_DEBUG_BUILD=1)
+    target_compile_definitions(ps5wk-child PRIVATE PS5WK_DEBUG_BUILD=1)
+    # The disk write test (common/writetest.c; POST /debug/write-test): the
+    # title's and, as the task "writetest", a payload's, which alone has
+    # libc.a's raw system calls (posix_fadvise, rctl).
+    target_sources(ps5browser PRIVATE ${PS5_APPS_DIR}/common/writetest.c)
+    target_sources(ps5wk-child PRIVATE ${PS5_APPS_DIR}/common/writetest.c)
+    set_property(TARGET ps5wk-child APPEND PROPERTY COMPILE_DEFINITIONS PS5WK_WRITETEST_SYSCALLS=1)
 endif ()
 # The crash guard (fatal signals reported to the log and crash-title.txt),
 # without its pthread_create wrapper (titlecrash.c).

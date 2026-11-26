@@ -66,6 +66,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* A page's or a link's address in the log lines of the new-window and
+ * held-X events: in development builds (PS5WK_DEBUG_BUILD,
+ * apps/CMakeLists.txt) only; a release logs the event without it. */
+#ifdef PS5WK_DEBUG_BUILD
+#define LOG_ADDRESS(uri) ((uri) ? (uri) : "(none)")
+#else
+#define LOG_ADDRESS(uri) "(address not logged)"
+#endif
+
 #define MAX_TABS 12
 #define STATE_MAX_BYTES (512 * 1024) /* a bigger saved state: address and scroll only */
 #define SESSION_DELAY_MS 2000
@@ -903,6 +912,7 @@ static gboolean setPrivate(gboolean on)
         ps5wk_downloads_watch_session(privateSession);
         ps5wk_sites_set_private(TRUE);
         ps5wk_popups_set_private(TRUE);
+        ps5wk_adblock_set_private(TRUE);
         WebKitWebView* view = sessionView(privateSession);
         normalTabs = tabs;
         normalActive = active;
@@ -924,6 +934,7 @@ static gboolean setPrivate(gboolean on)
         privateMode = FALSE;
         ps5wk_sites_set_private(FALSE);
         ps5wk_popups_set_private(FALSE);
+        ps5wk_adblock_set_private(FALSE);
         if (!tabs->len)
             g_ptr_array_add(tabs, tabNew(home, ""));
         active = normalActive >= 0 && normalActive < (int)tabs->len ? normalActive : 0;
@@ -2448,7 +2459,7 @@ static gboolean openHoveredLink(void)
     if (!link || menuOpen)
         return FALSE;
     char* uri = g_strdup(link); /* the view's own copy goes with its next hit test */
-    spike_log("browser: X held on a link: new tab for %s", uri);
+    spike_log("browser: X held on a link: new tab for %s", LOG_ADDRESS(uri));
     if (openInNewTab(uri))
         wpe_display_ps5_show_message(display, "Opened in a new tab (Options: tabs)", 2);
     g_free(uri);
@@ -2730,7 +2741,7 @@ static void popupBlocked(const char* page, const char* uri)
     static gint64 noticeAt;
     unsigned count = ps5wk_popups_blocked(page, uri);
     if (count <= 5 || !(count % 100))
-        spike_log("browser: pop-up without a press blocked (%u on this page): %s", count, uri);
+        spike_log("browser: pop-up without a press blocked (%u on this page): %s", count, LOG_ADDRESS(uri));
     gint64 now = g_get_monotonic_time();
     if (count > 1 && noticeAt && now - noticeAt < POPUP_NOTICE_EVERY_US)
         return;
@@ -2760,7 +2771,7 @@ static WebKitWebView* onCreate(WebKitWebView* view, WebKitNavigationAction* acti
         return NULL;
     }
     if (strncmp(uri, "http://", 7) && strncmp(uri, "https://", 8)) {
-        spike_log("browser: new window for %s: not http(s), ignored", uri);
+        spike_log("browser: new window for %s: not http(s), ignored", LOG_ADDRESS(uri));
         return NULL;
     }
     if (!webkit_navigation_action_is_user_gesture(action)) {
@@ -2769,9 +2780,9 @@ static WebKitWebView* onCreate(WebKitWebView* view, WebKitNavigationAction* acti
             popupBlocked(page, uri);
             return NULL;
         }
-        spike_log("browser: pop-up without a press, allowed on this site: new tab for %s", uri);
+        spike_log("browser: pop-up without a press, allowed on this site: new tab for %s", LOG_ADDRESS(uri));
     } else
-        spike_log("browser: link for a new window: new tab for %s", uri);
+        spike_log("browser: link for a new window: new tab for %s", LOG_ADDRESS(uri));
     if (openInNewTab(uri))
         wpe_display_ps5_show_message(display, "Opened in a new tab (Options: tabs)", 2);
     return NULL;

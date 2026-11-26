@@ -138,7 +138,7 @@ static const Setting settings[] = {
         "Returns memory that pages no longer use to the system. Off keeps it (the old behaviour). The network process picks it up at the next browser start.",
         NULL, 0, 0 },
     { "web_in_title", "processes", KIND_FLAG, TYPE_BOOL, "no-pages-in-browser", "1", PS5WK_SETTINGS_BROWSER, "Pages in the browser process",
-        "Runs pages inside the browser itself, which gets more of the PS5's CPU: games and heavy pages run up to twice as fast. The price: a page's work shares the browser's own thread, so on busy pages (feeds that keep adding posts) the menu, the pointer and clicks pause for up to a second now and then; a page that crashes closes the whole browser; and pages are not kept apart from the browser. Off runs each page in a separate process: slower, and without those three. While it is on, settings that need a page restart need a browser restart. Safer browsing always keeps pages in their own process.",
+        "Runs pages inside the browser itself, which gets more of the PS5's CPU: games and heavy pages run up to twice as fast. The price: a page that crashes closes the whole browser, and pages are not kept apart from the browser. Off runs each page in a separate process: slower, and without those two. While it is on, settings that need a page restart need a browser restart. Safer browsing always keeps pages in their own process.",
         NULL, 0, 0 },
     { "perf_overlay", "experimental", KIND_FLAG_ON, TYPE_BOOL, "perf-overlay", "0", 0, "Performance overlay",
         "Live numbers in a corner of the TV: frames per second, frame times, CPU, memory, GPU compositing, scrolling, video and network. Applies at once. L3 + R3 (both sticks pressed in) also turns it on or off.",

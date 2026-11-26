@@ -103,9 +103,17 @@ case "${1:-}" in
     --quit) run quit; exit ;;
     --install)
         dir="${2:?usage: launch.sh --install <titledir>}"; set -- "$(basename "$dir")"
+        # The title being replaced must not run: its open files refuse the
+        # upload part-way (FTP 550), leaving half a title.
+        ensure_launcher
+        read -r ok app running <<<"$(ask status)"
+        if [[ "$ok" == OK && "$app" != none && "$running" == "$1" ]]; then
+            echo "$1 is running: stopping it before the upload"
+            if [[ "$1" == PPSA99207 ]]; then stop_title || exit 1
+            else kill_own "$1" || exit 1; fi
+        fi
         "$ROOT/tools/upload-title.sh" "$dir" >/dev/null
         echo "uploaded $1"
-        ensure_launcher
         if ! curl -s --max-time 5 "$FTP/user/app/$1/mount.lnk" >/dev/null; then
             run register "$1" || exit 1
         fi ;;

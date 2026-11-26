@@ -1,8 +1,8 @@
 diff --git a/Source/WebGPU/WebGPUDawn/Instance.cpp b/Source/WebGPU/WebGPUDawn/Instance.cpp
-index 7aa4cb6d58..a75fc805ac 100644
+index 7aa4cb6d58..626e6bb702 100644
 --- a/Source/WebGPU/WebGPUDawn/Instance.cpp
 +++ b/Source/WebGPU/WebGPUDawn/Instance.cpp
-@@ -50,6 +50,14 @@ namespace WebGPU::Dawn {
+@@ -50,6 +50,21 @@ namespace WebGPU::Dawn {
  // How long the pump sleeps after a round that completed nothing, so that waiting for the GPU
  // does not spin a core. The messages of the Web Process wait as long.
  static constexpr auto idlePumpInterval = 100_us;
@@ -10,14 +10,21 @@ index 7aa4cb6d58..a75fc805ac 100644
 +// looks again as soon as the work queue has taken what else is waiting. Most of what a page waits
 +// for is done within tens of microseconds (a small copy and its mapAsync, an empty
 +// onSubmittedWorkDone), and the sleep, which really takes about 200 us on the console, was most
-+// of the time such a round trip took. A renderer that reads back several times a frame pays it
-+// each time. Work that takes longer than this falls back to the sleep, so a long GPU job does
-+// not spin the thread.
++// of the time such a round trip took (0.25-0.32 ms, 0.08-0.15 ms without it). A renderer that
++// reads back several times a frame pays it each time. Work that takes longer than this falls
++// back to the sleep, so a long GPU job does not spin the thread.
 +static constexpr auto quickPumpTime = 150_us;
++// A page that registers callbacks all the time would keep the window open and the work queue's
++// thread spinning, so the rounds without a sleep are paid from a budget: it fills at a quarter of
++// the time that passes, up to a millisecond, and empties by the time from such a round to the
++// next. At most a quarter of a core on average, then, and a burst of a millisecond: a renderer
++// that reads back a few times a frame uses a few percent.
++static constexpr double quickPumpShare = 0.25;
++static constexpr auto maximumQuickPumpBudget = 1_ms;
  // See ~InstanceImpl(). With the sleep between the rounds this is a tenth of a second.
  static constexpr unsigned maximumFinalPumpRounds = 1000;
  
-@@ -178,6 +186,7 @@ RefPtr<PresentationContext> InstanceImpl::createPresentationContext(const Presen
+@@ -178,6 +193,7 @@ RefPtr<PresentationContext> InstanceImpl::createPresentationContext(const Presen
  Ref<CallbackCounts> InstanceImpl::callbackRegistered()
  {
      ++m_callbackCounts->outstanding;
@@ -25,25 +32,55 @@ index 7aa4cb6d58..a75fc805ac 100644
      pumpSoon();
      return m_callbackCounts;
  }
-@@ -205,7 +214,7 @@ void InstanceImpl::pump()
+@@ -199,14 +215,31 @@ void InstanceImpl::pump()
+ {
+     m_pumpScheduled = false;
+ 
++    // The quick round budget (quickPumpShare above): the time since the last round fills it, and
++    // empties it too if that round did not sleep.
++    auto now = MonotonicTime::now();
++    if (m_lastPumpRound) {
++        auto elapsed = now - m_lastPumpRound;
++        m_quickPumpBudget += elapsed * quickPumpShare;
++        if (m_lastPumpRoundWasQuick)
++            m_quickPumpBudget -= elapsed;
++        m_quickPumpBudget = std::min(m_quickPumpBudget, maximumQuickPumpBudget);
++    }
++    m_lastPumpRound = now;
++    m_lastPumpRoundWasQuick = false;
++
+     auto completedCallbacks = m_callbackCounts->completed;
+     processEvents();
+     if (!m_callbackCounts->outstanding)
          return;
  
      // The callbacks that are left wait for the GPU.
 -    if (m_callbackCounts->completed == completedCallbacks)
-+    if (m_callbackCounts->completed == completedCallbacks && MonotonicTime::now() >= m_quickPumpUntil)
-         sleep(idlePumpInterval);
+-        sleep(idlePumpInterval);
++    if (m_callbackCounts->completed == completedCallbacks) {
++        if (now < m_quickPumpUntil && m_quickPumpBudget > 0_s)
++            m_lastPumpRoundWasQuick = true;
++        else
++            sleep(idlePumpInterval);
++    }
      pumpSoon();
  }
+ 
 diff --git a/Source/WebGPU/WebGPUDawn/Instance.h b/Source/WebGPU/WebGPUDawn/Instance.h
-index 900736d973..0a67b25898 100644
+index 900736d973..38f6fd6077 100644
 --- a/Source/WebGPU/WebGPUDawn/Instance.h
 +++ b/Source/WebGPU/WebGPUDawn/Instance.h
-@@ -102,6 +102,8 @@ private:
+@@ -102,6 +102,13 @@ private:
      const Ref<CallbackCounts> m_callbackCounts;
      bool m_pumpScheduled { false };
      bool m_isProcessingEvents { false };
-+    // Until then the pump does not sleep between its rounds. See quickPumpTime in Instance.cpp.
++    // Until then the pump does not sleep between its rounds, while m_quickPumpBudget lasts. See
++    // quickPumpTime in Instance.cpp. Like m_pumpScheduled, only on the thread that scheduleWork
++    // runs on (the RemoteGPU's work queue), which is also where callbacks are registered.
 +    MonotonicTime m_quickPumpUntil;
++    Seconds m_quickPumpBudget { 1_ms };
++    MonotonicTime m_lastPumpRound;
++    bool m_lastPumpRoundWasQuick { false };
  };
  
  // What a Dawn callback of ours owns: the completion handler (or other state) to call, and the

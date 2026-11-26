@@ -8,9 +8,12 @@
  * acceleration off) and arrive as shared-memory buffers.
  *
  * Pad (see WPEDisplayPS5.cpp for the full map):
- *   left stick: pointer, X: click (or Enter when the pointer is hidden),
+ *   left stick: pointer, X: click (or Enter when the pointer is hidden;
+ *   over a link the click goes when X comes up, and X held 0.6 s there
+ *   opens the link in a new tab, browserui.c openHoveredLink),
  *   right stick: scroll, D-pad: move between links (spatial navigation),
- *   O: back, Options: the browser menu (address bar, tabs, bookmarks,
+ *   O: back (when O comes up; held: closes the browser, browserui.c
+ *   closeHeld), Options: the browser menu (address bar, tabs, bookmarks,
  *   history: browserui.c), Square: reload,
  *   L2/R2: zoom out/in, L1/R1: previous/next field, Triangle: keyboard
  *   (also opens by itself when X on a field, the D-pad or L1/R1 focus one),
@@ -59,6 +62,7 @@
 #include <time.h>
 #include <wpe/ps5/wpe-ps5.h>
 #include "../common/crashguard.h"
+#include "../common/writetest.h" /* development builds: POST /debug/write-test */
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 
@@ -85,10 +89,12 @@ void ps5wk_heapprof_start(void) __attribute__((weak));
 void ps5wk_heapprof_snapshot(const char* why) __attribute__((weak));
 unsigned ps5wk_title_check_imports(char* out, size_t size, unsigned* total) __attribute__((weak));
 const char* ps5wk_title_build_id(void) __attribute__((weak));
-static double flexibleMB(void)
+#ifdef PS5WK_DEBUG_BUILD
+static double flexibleMB(void) /* the test URL list's lines */
 {
     return ps5wk_title_flexible_free ? ps5wk_title_flexible_free() / 1048576.0 : -1.0;
 }
+#endif
 static void memLog(const char* milestone)
 {
     if (ps5wk_title_mem_log)
@@ -330,6 +336,15 @@ static void onPerfOverlayToggled(WPEDisplayPS5* d, gboolean enabled, gpointer da
         unlink(PERF_OVERLAY_FLAG);
 }
 
+/* When the page shown started loading: the load times in the log. */
+static gint64 loadStart;
+
+/* The test URL list and the debug screenshots, down to testOnload, and
+ * testURLFinished and readTestURLs below: development builds only
+ * (PS5WK_DEBUG_BUILD, apps/CMakeLists.txt). A release reads neither
+ * test-urls.txt, test-onload.js nor debug-screenshot, and starts as when
+ * there is no list. */
+#ifdef PS5WK_DEBUG_BUILD
 /* Debug screen readback: /data/ps5webkit/debug-screenshot (a file, any
  * content) or PS5WK_SCREENSHOT=1. Frames go to /data/ps5webkit/shots as PPM
  * (port/webkit/test/fetch-shots.sh fetches and converts them). */
@@ -353,7 +368,6 @@ static void captureScreen(const char* name)
 static char** testURLs;
 static unsigned testDwell[256];
 static unsigned testURLCount, testURLIndex, testURLsLoaded;
-static gint64 loadStart;
 static guint testTimer;
 static gboolean testWaitingForLoad;
 
@@ -436,6 +450,9 @@ static gboolean testOnload(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* Debug aids: only in development builds (PS5WK_DEBUG_BUILD, those with a
+ * log host: apps/CMakeLists.txt). A release has neither the code nor the
+ * names of their files, so nothing put in /data/ps5webkit turns them on. */
 /* /data/ps5webkit/debug-dialogs (a file, any contents; read at startup): log
  * every alert()/confirm()/prompt() call in every frame, with its message and
  * the JS stack, as a console warning "[ps5wk-dialog] ...". It catches calls
@@ -467,6 +484,28 @@ static void debugDialogsInit(WebKitWebView* view)
     webkit_user_script_unref(script);
     spike_log("debug dialogs: alert/confirm/prompt calls are logged with their stack (/data/ps5webkit/debug-dialogs)");
 }
+
+/* /data/ps5webkit/debug-userscript.js (read at startup): a script that runs
+ * in every frame of every page at document start, in the page's own world,
+ * before any of the page's scripts. For trying a change to what a page sees
+ * (e.g. another navigator.vendor for one host, to learn which of a site's
+ * builds this engine can run) before it becomes a quirk in the engine. The
+ * script should check location.host itself. */
+static void debugUserScriptInit(WebKitWebView* view)
+{
+    gchar* source = NULL;
+    gsize length = 0;
+    if (!g_file_get_contents("/data/ps5webkit/debug-userscript.js", &source, &length, NULL))
+        return;
+    static const char* const allow[] = { "http://*/*", "https://*/*", "file://*/*", NULL };
+    WebKitUserScript* script = webkit_user_script_new(source, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, allow, NULL);
+    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(view), script);
+    webkit_user_script_unref(script);
+    spike_log("debug user script: %zu bytes run at document start in every frame (/data/ps5webkit/debug-userscript.js)", (size_t)length);
+    g_free(source);
+}
+#endif
 
 /* Site quirks: what one site has to be told for it to serve this browser the
  * page it can run best. A script per quirk, run at document start in every
@@ -501,27 +540,7 @@ static void siteQuirksInit(WebKitWebView* view)
     webkit_user_script_unref(script);
 }
 
-/* /data/ps5webkit/debug-userscript.js (read at startup): a script that runs
- * in every frame of every page at document start, in the page's own world,
- * before any of the page's scripts. For trying a change to what a page sees
- * (e.g. another navigator.vendor for one host, to learn which of a site's
- * builds this engine can run) before it becomes a quirk in the engine. The
- * script should check location.host itself. */
-static void debugUserScriptInit(WebKitWebView* view)
-{
-    gchar* source = NULL;
-    gsize length = 0;
-    if (!g_file_get_contents("/data/ps5webkit/debug-userscript.js", &source, &length, NULL))
-        return;
-    static const char* const allow[] = { "http://*/*", "https://*/*", "file://*/*", NULL };
-    WebKitUserScript* script = webkit_user_script_new(source, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, allow, NULL);
-    webkit_user_content_manager_add_script(webkit_web_view_get_user_content_manager(view), script);
-    webkit_user_script_unref(script);
-    spike_log("debug user script: %zu bytes run at document start in every frame (/data/ps5webkit/debug-userscript.js)", (size_t)length);
-    g_free(source);
-}
-
+#ifdef PS5WK_DEBUG_BUILD /* the test URL list (above) */
 static void testURLFinished(gboolean ok, const char* uri, const char* detail)
 {
     if (!testWaitingForLoad)
@@ -583,6 +602,7 @@ static gboolean readTestURLs(void)
     spike_log("test URL list: %u URLs", testURLCount);
     return testURLCount > 0;
 }
+#endif
 
 /* The WebProcess memory limit (apps/common/webmem.h): over it, the next
  * top-level navigation ends the WebProcess and loads the address in a new
@@ -653,6 +673,8 @@ static void onMouseTargetChanged(WebKitWebView* view, WebKitHitTestResult* hit, 
     wpe_display_ps5_set_pointer_over_link(WPE_DISPLAY_PS5(display), link != NULL);
 }
 
+static void crashNoteLoadStarted(void); /* onWebProcessTerminated's, below */
+
 static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
     (void)data;
@@ -664,6 +686,8 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
         return;
     }
     spike_log("load %s: %s", names[event], webkit_web_view_get_uri(view));
+    if (event == WEBKIT_LOAD_STARTED)
+        crashNoteLoadStarted();
     /* Tabs, history, the address bar (browserui.c). */
     ps5wk_browser_load_changed(view, event);
     /* The ad blocker's filter on or off for this page (allowed sites). */
@@ -706,11 +730,13 @@ static void onLoadChanged(WebKitWebView* view, WebKitLoadEvent event, gpointer d
         const char* title = webkit_web_view_get_title(view) ? webkit_web_view_get_title(view) : "";
         SPIKE_PASS("load", "%s \"%s\" (%.1f s after start)", webkit_web_view_get_uri(view), title, (g_get_monotonic_time() - loadStart) / 1e6);
         memLog("load finished");
+#ifdef PS5WK_DEBUG_BUILD
         if (!testURLs)
             g_timeout_add(2000, shotAfterLoad, (gpointer) "loaded");
         char detail[300];
         snprintf(detail, sizeof detail, "title \"%s\"", title);
         testURLFinished(TRUE, webkit_web_view_get_uri(view), detail);
+#endif
     }
 }
 
@@ -725,7 +751,9 @@ static gboolean onLoadFailed(WebKitWebView* view, WebKitLoadEvent event, const c
         return FALSE;
     }
     SPIKE_FAIL("load", "%s: %s", uri, error->message);
+#ifdef PS5WK_DEBUG_BUILD
     testURLFinished(FALSE, uri, error->message);
+#endif
     return FALSE;
 }
 
@@ -737,9 +765,23 @@ static gboolean memTimer(gpointer data)
 }
 
 /* A page whose WebProcess keeps crashing would reload forever: after the
- * second crash on the same address within 30 s, show an error page instead. */
+ * second crash on the same address with no navigation in between but the
+ * browser's own reload, or within 30 s whatever came between, show an error
+ * page instead. 30 s alone let a page that took longer to crash reload
+ * without end (2026-11-26), under the 6-in-2-minutes cap. */
 static char* lastCrashURI;
 static gint64 lastCrashTime;
+static gboolean crashReloadPending; /* the reload below has not started yet */
+static gboolean navigatedSinceCrash; /* a load started since that was not that reload */
+
+/* onLoadChanged: a load of the page shown started. */
+static void crashNoteLoadStarted(void)
+{
+    if (crashReloadPending)
+        crashReloadPending = FALSE;
+    else
+        navigatedSinceCrash = TRUE;
+}
 
 static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminationReason reason, gpointer data)
 {
@@ -779,10 +821,13 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
         spike_log("[mem] WebProcess restart: the old one is gone");
         return;
     }
-    gboolean again = uri && lastCrashURI && !strcmp(uri, lastCrashURI) && now - lastCrashTime < 30 * G_USEC_PER_SEC;
+    gboolean again = uri && lastCrashURI && !strcmp(uri, lastCrashURI)
+        && (!navigatedSinceCrash || now - lastCrashTime < 30 * G_USEC_PER_SEC);
     g_free(lastCrashURI);
     lastCrashURI = g_strdup(uri ? uri : "");
     lastCrashTime = now;
+    navigatedSinceCrash = FALSE;
+    crashReloadPending = FALSE;
     ps5wk_settings_applied(PS5WK_SETTINGS_PAGE); /* the next WebProcess reads child.env */
     if (memRestarting && restartTargetURI && ++restartFailures <= 3) {
         /* The new WebProcess of a restart ended before the page committed
@@ -803,13 +848,15 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     }
     if (!again) {
         SPIKE_FAIL("webprocess", "terminated (reason %d); reloading", reason);
+        crashReloadPending = TRUE;
         webkit_web_view_reload(view);
         return;
     }
     memRestarting = FALSE; /* the error page below is not the restarted page */
     settingsRestart = FALSE;
     g_clear_pointer(&restartTargetURI, g_free);
-    SPIKE_FAIL("webprocess", "terminated (reason %d) again on %s within 30 s; showing an error page", reason, lastCrashURI);
+    SPIKE_FAIL("webprocess", "terminated (reason %d) again on %s (the second crash with no navigation between, or within 30 s); showing an error page",
+        reason, lastCrashURI);
     char* escaped = g_markup_escape_text(lastCrashURI, -1);
     char* html = g_strdup_printf("<!doctype html><html><head><meta charset=\"utf-8\"><title>Page crashed</title>"
         "<style>body{font-family:sans-serif;background:#01001a;color:#f4f2ff;margin:64px;font-size:24px}"
@@ -825,6 +872,7 @@ static void onWebProcessTerminated(WebKitWebView* view, WebKitWebProcessTerminat
     g_free(escaped);
     /* The error page itself must not count as the page crashing again. */
     lastCrashTime = 0;
+    navigatedSinceCrash = TRUE;
 }
 
 char* ps5wk_home_url(void)
@@ -1466,7 +1514,9 @@ static gboolean headerValue(const char* headers, const char* name, char* out, si
  *   POST /restart?scope=page|browser   page: a new WebProcess for the page
  *       shown (reads child.env); browser: the title starts again
  *   POST /restart?scope=crash   test only: SIGKILL to the WebProcess, which
- *       then looks like a crash to WebKit (the page reloads as after one)
+ *       then looks like a crash to WebKit (the page reloads as after one).
+ *       With pages in the browser process there is none: a development
+ *       build crashes the title 1 s later, a release says why not (409)
  *   POST /clear?what=cookies|cache|all WebKit's website data
  *   POST /adblock?do=update            the ad blocker's lists, now (adblock.c)
  *   POST /adblock?do=allow|block&site=<host>   ads allowed on a site (and
@@ -1566,7 +1616,12 @@ static gboolean onScriptDialog(WebKitWebView* view, WebKitScriptDialog* dialog, 
     if (webkit_script_dialog_get_dialog_type(dialog) != WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM)
         return FALSE;
     webkit_script_dialog_confirm_set_confirmed(dialog, TRUE);
+#ifdef PS5WK_DEBUG_BUILD
     spike_log("browser: %s asked to stay (beforeunload); leaving it", webkit_web_view_get_uri(view) ? webkit_web_view_get_uri(view) : "the page");
+#else
+    (void)view; /* a release logs no page addresses here (browserui.c LOG_ADDRESS) */
+    spike_log("browser: the page asked to stay (beforeunload); leaving it");
+#endif
     return TRUE;
 }
 
@@ -2052,6 +2107,10 @@ static char* settingsState(const char* message, gboolean trusted)
     return state;
 }
 
+#ifdef PS5WK_DEBUG_BUILD
+static gboolean crashTitleIn(unsigned seconds, const char* why); /* the crash test, below */
+#endif
+
 /* A route thread (the link server's, or a parallax:// request's): the routes
  * above. Replies at once: what needs the main loop is queued there, and its
  * result shows in /settings.json ("status"). trusted: the PS5's own page
@@ -2199,15 +2258,34 @@ static void settingsServe(PushOut* client, const char* from, gboolean trusted, g
             ps5wk_settings_set_status("Restarting the page…");
             g_idle_add(restartPageOnMain, NULL);
             settingsReplyJSON(client, 200, TRUE, "Restarting the page.");
+        } else if (!strcmp(path, "/restart") && scope && !strcmp(scope, "crash") && inTitleWeb) {
+            /* Pages in the browser process: no WebProcess of their own to
+             * kill. A development build crashes the title itself (the crash
+             * report, the end, "the last run crashed" at the next start). */
+#ifdef PS5WK_DEBUG_BUILD
+            gboolean crashing = crashTitleIn(1, "POST /restart?scope=crash, pages in the browser process");
+            spike_log("settings: crash test asked by %s: %s", from, crashing ? "the title crashes in 1 s" : "no thread to crash it");
+            settingsReplyJSON(client, crashing ? 200 : 503, crashing,
+                crashing ? "Pages run in the browser process: the browser itself crashes in 1 s." : "Couldn't start the crash test.");
+#else
+            spike_log("settings: crash test asked by %s: pages run in the browser process, nothing to kill", from);
+            settingsReplyJSON(client, 409, FALSE,
+                "Pages run in the browser process, so there is no separate WebProcess to kill. Turn off \"Pages in the browser process\" to test a page crash.");
+#endif
         } else if (!strcmp(path, "/restart") && scope && !strcmp(scope, "crash")) {
             /* Crash-recovery tests (COMPOSITING-PLAN.md, M6): the WebProcess
              * pid from its memory status file (written every 5 s). */
             int webPid = 0;
             double committed = 0, limit = 0;
             ps5wk_webmem_over(&webPid, &committed, &limit);
-            int rc = webPid > 0 ? kill(webPid, SIGKILL) : -1;
-            spike_log("settings: crash test asked by %s: kill(%d, SIGKILL) = %d (errno %d)", from, webPid, rc, rc ? errno : 0);
-            settingsReplyJSON(client, rc ? 503 : 200, !rc, rc ? "No WebProcess to kill." : "WebProcess killed.");
+            if (webPid <= 0) {
+                spike_log("settings: crash test asked by %s: no WebProcess pid known yet (its status file comes every 5 s)", from);
+                settingsReplyJSON(client, 503, FALSE, "No WebProcess to kill yet: try again in a few seconds.");
+            } else {
+                int rc = kill(webPid, SIGKILL);
+                spike_log("settings: crash test asked by %s: kill(%d, SIGKILL) = %d (errno %d)", from, webPid, rc, rc ? errno : 0);
+                settingsReplyJSON(client, rc ? 503 : 200, !rc, rc ? "The WebProcess couldn't be killed." : "WebProcess killed.");
+            }
         } else if (!strcmp(path, "/restart") && scope && !strcmp(scope, "browser")) {
             const char* error = restartBrowser(from);
             if (!error)
@@ -2385,6 +2463,195 @@ static gboolean serveDownloadFile(PushOut* client, const char* from, const char*
     pthread_detach(thread);
     return TRUE;
 }
+
+#ifdef PS5WK_DEBUG_BUILD
+/* The disk write test (apps/common/writetest.c, which lists what a test can
+ * vary): development builds only.
+ *   POST /debug/write-test   dir= mb= chunk= sync= direct= ... (query or form)
+ *        proc=title (default): in this process, on thread=new (default, a
+ *        thread of its own) or thread=main (the main loop, which stops for
+ *        the whole test); proc=payload: in a ps5wk-child task payload.
+ *        probe=1: while the test runs, the main loop also does one small
+ *        write a second as the browser's own saves do (4 KB, fsync, rename)
+ *        and logs how long each took.
+ *   GET /debug/write-test    {"running":…,"lines":[…]}: the last test's lines
+ * The lines are in the log too ("[writetest] ..."). One test at a time. */
+static GMutex writeTestLock;
+static GString* writeTestLines;
+static gboolean writeTestRunning;
+static char* writeTestSpec;
+static guint writeTestProbeTimer;
+static unsigned writeTestProbes, writeTestProbesSlow;
+static double writeTestProbeLongest, writeTestProbeTotal;
+
+static void writeTestKeep(const char* line)
+{
+    g_mutex_lock(&writeTestLock);
+    if (writeTestLines && writeTestLines->len < 256 * 1024) {
+        g_string_append(writeTestLines, line);
+        g_string_append_c(writeTestLines, '\n');
+    }
+    g_mutex_unlock(&writeTestLock);
+}
+
+static void writeTestSay(const char* line, void* data)
+{
+    (void)data;
+    spike_log("%s", line);
+    writeTestKeep(line);
+}
+
+static gboolean writeTestProbe(gpointer data)
+{
+    (void)data;
+    double seconds = ps5wk_write_test_probe(writeTestSpec);
+    writeTestProbes++;
+    if (seconds < 0 || seconds >= 0.05) {
+        char line[160];
+        writeTestProbesSlow++;
+        snprintf(line, sizeof line, "[writetest] main loop probe %u: a 4 KB write, fsync and rename %s%.3f s", writeTestProbes,
+            seconds < 0 ? "FAILED after " : "took ", seconds < 0 ? 0.0 : seconds);
+        writeTestSay(line, NULL);
+    }
+    if (seconds > 0) {
+        writeTestProbeTotal += seconds;
+        writeTestProbeLongest = MAX(writeTestProbeLongest, seconds);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean writeTestEndOnMain(gpointer data)
+{
+    (void)data;
+    if (writeTestProbeTimer) {
+        g_source_remove(writeTestProbeTimer);
+        writeTestProbeTimer = 0;
+        char line[200];
+        snprintf(line, sizeof line, "[writetest] main loop probes: %u, %u of 50 ms or more, longest %.3f s, average %.3f s", writeTestProbes,
+            writeTestProbesSlow, writeTestProbeLongest, writeTestProbes ? writeTestProbeTotal / writeTestProbes : 0.0);
+        writeTestSay(line, NULL);
+    }
+    g_mutex_lock(&writeTestLock);
+    writeTestRunning = FALSE;
+    g_mutex_unlock(&writeTestLock);
+    return G_SOURCE_REMOVE;
+}
+
+static void* writeTestThread(void* data)
+{
+    (void)data;
+    ps5wk_write_test(writeTestSpec, "title thread", writeTestSay, NULL);
+    g_idle_add(writeTestEndOnMain, NULL);
+    return NULL;
+}
+
+static gboolean writeTestOnMain(gpointer data)
+{
+    (void)data;
+    ps5wk_write_test(writeTestSpec, "title main", writeTestSay, NULL);
+    return writeTestEndOnMain(NULL);
+}
+
+static void writeTestPayloadOutput(const char* line, gpointer data)
+{
+    (void)data;
+    writeTestKeep(line); /* the task's relay logs it */
+}
+
+static void writeTestPayloadEnded(gboolean launched, gpointer data)
+{
+    (void)data;
+    if (!launched)
+        writeTestSay("[writetest] the payload did not start", NULL);
+    g_idle_add(writeTestEndOnMain, NULL);
+}
+
+static void writeTestServe(PushOut* client, const char* from, gboolean get, const char* query, const char* body)
+{
+    if (get) {
+        g_mutex_lock(&writeTestLock);
+        GString* reply = g_string_new(NULL);
+        g_string_append_printf(reply, "{\"ok\":true,\"running\":%s,\"lines\":[", writeTestRunning ? "true" : "false");
+        char** lines = g_strsplit(writeTestLines ? writeTestLines->str : "", "\n", -1);
+        for (unsigned i = 0, listed = 0; lines[i]; i++) {
+            if (!*lines[i])
+                continue;
+            char* quoted = jsonString(lines[i]);
+            g_string_append_printf(reply, "%s%s", listed++ ? "," : "", quoted);
+            g_free(quoted);
+        }
+        g_strfreev(lines);
+        g_mutex_unlock(&writeTestLock);
+        g_string_append(reply, "]}\n");
+        pushReply(client, 200, "application/json", reply->str);
+        g_string_free(reply, TRUE);
+        return;
+    }
+    g_mutex_lock(&writeTestLock);
+    gboolean busy = writeTestRunning;
+    if (!busy) {
+        writeTestRunning = TRUE;
+        if (!writeTestLines)
+            writeTestLines = g_string_new(NULL);
+        g_string_truncate(writeTestLines, 0);
+    }
+    g_mutex_unlock(&writeTestLock);
+    if (busy) {
+        settingsReplyJSON(client, 409, FALSE, "a write test is running: GET /debug/write-test shows it");
+        return;
+    }
+    /* Only the test's own keys go on (to a payload's launch header and the
+     * log): never the PIN. */
+    GString* spec = g_string_new(NULL);
+    for (const char* const* key = ps5wk_write_test_keys; *key; key++) {
+        char* value = query ? formValue(query, *key) : NULL;
+        if (!value && body)
+            value = formValue(body, *key);
+        if (value) {
+            char* escaped = g_uri_escape_string(value, "/", FALSE);
+            g_string_append_printf(spec, "%s%s=%s", spec->len ? "&" : "", *key, escaped);
+            g_free(escaped);
+        }
+        g_free(value);
+    }
+    if (!spec->len)
+        g_string_append(spec, "mb=3072");
+    char* proc = query ? formValue(query, "proc") : NULL;
+    if (!proc && body)
+        proc = formValue(body, "proc");
+    char* probe = query ? formValue(query, "probe") : NULL;
+    if (!probe && body)
+        probe = formValue(body, "probe");
+    char* thread = formValue(spec->str, "thread");
+    g_free(writeTestSpec);
+    writeTestSpec = g_string_free(spec, FALSE);
+    const gboolean payload = proc && !strcmp(proc, "payload");
+    const gboolean onMain = !payload && thread && !strcmp(thread, "main");
+    spike_log("[writetest] asked by %s: %s in %s", from, writeTestSpec, payload ? "a payload" : onMain ? "the title, on the main loop" : "the title, on a thread of its own");
+    writeTestProbes = writeTestProbesSlow = 0;
+    writeTestProbeLongest = writeTestProbeTotal = 0;
+    if (probe && !strcmp(probe, "1") && !onMain)
+        writeTestProbeTimer = g_timeout_add(1000, writeTestProbe, NULL);
+    gboolean started = TRUE;
+    pthread_t test;
+    if (payload)
+        started = strlen(writeTestSpec) < 240 && wpe_process_manager_get_default()
+            && wpe_process_manager_ps5_run_task(wpe_process_manager_get_default(), "writetest", writeTestSpec, writeTestPayloadOutput, writeTestPayloadEnded, NULL);
+    else if (onMain)
+        g_idle_add(writeTestOnMain, NULL);
+    else if (!pthread_create(&test, NULL, writeTestThread, NULL))
+        pthread_detach(test);
+    else
+        started = FALSE;
+    if (!started)
+        g_idle_add(writeTestEndOnMain, NULL);
+    settingsReplyJSON(client, started ? 200 : 503, started,
+        started ? "Write test started: its lines are in the log ([writetest]) and in GET /debug/write-test." : "The write test couldn't start.");
+    g_free(thread);
+    g_free(probe);
+    g_free(proc);
+}
+#endif
 
 /* TRUE: the client socket is someone else's now (a file transfer). */
 static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, const char* method, char* target, const char* headers,
@@ -2569,6 +2836,16 @@ static gboolean pushRoute(PushOut* client, const char* from, gboolean trusted, c
             pushReply(client, code, "application/json", reply);
             g_free(reply);
         }
+#ifdef PS5WK_DEBUG_BUILD
+    } else if (!strcmp(path, "/debug/write-test") && (get || post)) {
+        /* The disk write test (above): the settings' rules. */
+        if (!pinOK && !trusted)
+            settingsReplyJSON(client, 403, FALSE, "wrong or missing PIN");
+        else if (windDownStart && post)
+            settingsReplyJSON(client, 503, FALSE, "the browser is closing");
+        else
+            writeTestServe(client, from, get, query, body);
+#endif
     } else if (g_str_has_prefix(path, "/downloads/") && get) {
         /* A finished download, to another device: the PIN as for /open. */
         if (client->fd < 0)
@@ -3481,8 +3758,12 @@ static void* stallWatch(void* data)
  * the last start is that run's crash. */
 /* Test knob: /data/ps5webkit/crash-title-test, read at start, makes the
  * title fault 10 s later (a null write on a thread of its own), to check that
- * the crash report reaches the log and crash-title.txt (stack line included).
- * Delete the knob after: every start crashes while it is there. */
+ * the crash report reaches the log and crash-title.txt (stack line included)
+ * and that the title ends after it. Delete the knob after: every start
+ * crashes while it is there. POST /restart?scope=crash with pages in the
+ * browser process does the same, 1 s after the reply. Development builds
+ * only (PS5WK_DEBUG_BUILD). */
+#ifdef PS5WK_DEBUG_BUILD
 /* Three calls deep, so the report's stack line has return addresses of ours. */
 static __attribute__((noinline)) int crashTestDepth(volatile int* target, int depth)
 {
@@ -3496,22 +3777,30 @@ static __attribute__((noinline)) int crashTestDepth(volatile int* target, int de
 
 static void* crashTestThread(void* data)
 {
-    sleep(10);
-    spike_log("crash test: /data/ps5webkit/crash-title-test is there: a null write, three calls deep");
-    crashTestDepth((volatile int*)data, 3);
+    sleep(GPOINTER_TO_UINT(data));
+    spike_log("crash test: a null write, three calls deep");
+    crashTestDepth((volatile int*)NULL, 3);
     return NULL;
+}
+
+/* The title faults in seconds, on a thread of its own. FALSE: no thread. */
+static gboolean crashTitleIn(unsigned seconds, const char* why)
+{
+    pthread_t thread;
+    spike_log("crash test: the title faults in %u s (%s)", seconds, why);
+    if (pthread_create(&thread, NULL, crashTestThread, GUINT_TO_POINTER(seconds)))
+        return FALSE;
+    pthread_detach(thread);
+    return TRUE;
 }
 
 static void startCrashTest(void)
 {
     struct stat knob;
-    pthread_t thread;
-    if (stat("/data/ps5webkit/crash-title-test", &knob))
-        return;
-    spike_log("crash test: the title faults in 10 s (/data/ps5webkit/crash-title-test)");
-    if (!pthread_create(&thread, NULL, crashTestThread, NULL))
-        pthread_detach(thread);
+    if (!stat("/data/ps5webkit/crash-title-test", &knob))
+        crashTitleIn(10, "/data/ps5webkit/crash-title-test");
 }
+#endif
 
 static gboolean titleCrashedLastRun(void)
 {
@@ -3539,7 +3828,9 @@ int main(int argc, char** argv)
     const gboolean lastRunCrashed = titleCrashedLastRun();
     ps5wk_crash_guard_report_file("/data/ps5webkit/crash-title.txt");
     ps5wk_crash_guard_install("title");
+#ifdef PS5WK_DEBUG_BUILD
     startCrashTest();
+#endif
     loadStart = g_get_monotonic_time();
     startedAt = g_get_real_time() / G_USEC_PER_SEC;
     signal(SIGPIPE, SIG_IGN);
@@ -3640,6 +3931,7 @@ int main(int argc, char** argv)
     ps5wk_settings_init("/data/ps5webkit", ps5wk_profile_dir(), pushNormalize);
     ps5wk_settings_set_pages_in_browser(inTitleWeb);
 
+#ifdef PS5WK_DEBUG_BUILD
     /* open(), not access(): access() said no for an existing file here. */
     int flag = open("/data/ps5webkit/debug-screenshot", O_RDONLY);
     if (flag >= 0)
@@ -3665,6 +3957,7 @@ int main(int argc, char** argv)
         setenv("PS5WK_SCREENSHOT_DIR", SHOT_DIR, 1);
         spike_log("debug screenshots on: %s", SHOT_DIR);
     }
+#endif
 
     GError* error = NULL;
     display = wpe_display_ps5_new();
@@ -3765,9 +4058,11 @@ int main(int argc, char** argv)
     ps5wk_adblock_init(webView);
     ps5wk_popups_init();
     ps5wk_updates_init(WPE_DISPLAY_PS5(display));
-    debugDialogsInit(webView);
     siteQuirksInit(webView);
+#ifdef PS5WK_DEBUG_BUILD
+    debugDialogsInit(webView);
     debugUserScriptInit(webView);
+#endif
     wpe_display_ps5_set_perf_overlay_callback(WPE_DISPLAY_PS5(display), onPerfOverlayToggled, NULL);
 
     memLog("web view created");
@@ -3775,12 +4070,15 @@ int main(int argc, char** argv)
 
     char* start = startURLFromLaunch(argc, argv);
     char* home = homeURL();
+#ifdef PS5WK_DEBUG_BUILD
     if (readTestURLs()) {
         if (start)
             spike_log("test URL list wins over the start URL %s", start);
         ps5wk_browser_start(NULL, home, TRUE);
         loadNextTestURL();
-    } else {
+    } else
+#endif
+    {
         /* The saved tabs come back; a start link opens in a new tab. After
          * a crash, the start page does (in a new tab): the shown page may
          * be what crashed the browser (pages in the browser process), and

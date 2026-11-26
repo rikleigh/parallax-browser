@@ -205,7 +205,11 @@ static int seg_unmap(void *p, size_t len)
 #define DEFAULT_GRANULARITY ((size_t)2 << 20)
 #define DEFAULT_MMAP_THRESHOLD ((size_t)1 << 20)
 #define DEFAULT_TRIM_THRESHOLD ((size_t)-1) /* tails can't be unmapped; whole segments still are */
+#ifdef PS5WK_DEBUG_BUILD
+#define NO_MALLINFO 0 /* mspace_mallinfo, for dheap_in_use */
+#else
 #define NO_MALLINFO 1
+#endif
 #define NO_MALLOC_STATS 1
 #define LACKS_SYS_MMAN_H 1
 #define MALLOC_FAILURE_ACTION errno = ENOMEM;
@@ -290,40 +294,63 @@ void dheap_trim(void)
 
 /* -- the wrapped family ------------------------------------------------------- */
 
-/* Bytes in the heap's live blocks (their usable sizes): with S.mapped it
- * tells live data from free space the segments keep. */
-static atomic_size_t in_use;
-
+#ifdef PS5WK_DEBUG_BUILD
+/* Bytes in the heap's allocated chunks (their headers and dlmalloc's own
+ * records included): with S.mapped it tells live data from free space the
+ * segments keep. Counted when asked, by mspace_mallinfo, which walks every
+ * chunk of an arena with the arena locked, stalling that arena's threads for
+ * the walk (milliseconds to tens of them): development builds only, for the
+ * [mem] log and heap snapshots. The wrappers used to keep a running total
+ * instead, one counter that every allocation and free on every thread wrote
+ * to. */
 size_t dheap_in_use(void)
 {
-    return atomic_load_explicit(&in_use, memory_order_relaxed);
+    size_t sum = 0;
+    for (int i = 0; i < DHEAP_ARENAS; i++)
+        if (atomic_load_explicit(&arena_state[i], memory_order_acquire) == 2)
+            sum += mspace_mallinfo(arenas[i]).uordblks;
+    return sum;
 }
+#endif
 
-/* The heap profiler's hooks (apps/title/heapprof.c): unset, nothing is
- * called. Only for blocks of this heap, never libc's fallbacks. */
+#ifdef PS5WK_DEBUG_BUILD
+/* The heap profiler's hooks (apps/title/heapprof.c), in development builds
+ * only (package.sh defines PS5WK_DEBUG_BUILD when there is a log host): a
+ * release has neither the profiler nor these. Unset, the wrappers load the
+ * pointer and nothing more. Only for blocks of this heap, never libc's
+ * fallbacks. A free is reported before the block goes back, while no other
+ * thread can be given its address, so a report of the address's next
+ * allocation always comes after it. */
 void (*volatile dheap_hook_alloc)(void *p, size_t usable);
 void (*volatile dheap_hook_free)(void *p, size_t usable);
 
+/* p: a block of this heap, or NULL. */
 static void *note_alloc(void *p)
 {
-    if (p && dheap_owns(p)) {
-        const size_t usable = mspace_usable_size(p);
-        atomic_fetch_add_explicit(&in_use, usable, memory_order_relaxed);
-        void (*hook)(void *, size_t) = dheap_hook_alloc;
-        if (hook)
-            hook(p, usable);
-    }
+    void (*hook)(void *, size_t) = dheap_hook_alloc;
+    if (hook && p)
+        hook(p, mspace_usable_size(p));
+    return p;
+}
+
+/* p: a block of this heap, about to go back. */
+static void note_free(void *p)
+{
+    void (*hook)(void *, size_t) = dheap_hook_free;
+    if (hook)
+        hook(p, mspace_usable_size(p));
+}
+#else
+static void *note_alloc(void *p)
+{
     return p;
 }
 
 static void note_free(void *p)
 {
-    const size_t usable = mspace_usable_size(p);
-    atomic_fetch_sub_explicit(&in_use, usable, memory_order_relaxed);
-    void (*hook)(void *, size_t) = dheap_hook_free;
-    if (hook)
-        hook(p, usable);
+    (void)p;
 }
+#endif
 
 void *__real_calloc(size_t n, size_t size);
 void *__real_realloc(void *p, size_t size);
@@ -375,21 +402,42 @@ void *__wrap_realloc(void *p, size_t size)
         __wrap_free(p);
         return NULL;
     }
-    /* As a free and a new allocation. The hook hears of the free first,
-     * while no other thread can have the address yet. */
-    const size_t before = mspace_usable_size(p);
-    void (*hook)(void *, size_t) = dheap_hook_free;
-    if (hook)
-        hook(p, before);
-    void *q = mspace_realloc(arenas[0], p, size); /* FOOTERS: the block's own arena */
-    if (q) {
-        atomic_fetch_sub_explicit(&in_use, before, memory_order_relaxed);
-        return note_alloc(q);
+    void *q;
+#ifdef PS5WK_DEBUG_BUILD
+    void (*hook_free)(void *, size_t) = dheap_hook_free;
+#else
+    void (*const hook_free)(void *, size_t) = NULL; /* the branch below compiles out */
+#endif
+    if (!hook_free) {
+        q = mspace_realloc(arenas[0], p, size); /* FOOTERS: the block's own arena */
+        if (q)
+            return note_alloc(q);
+    } else {
+        /* With the profiler on, what mspace_realloc does in steps the hooks
+         * can follow: mspace_realloc frees a moved block inside, where the
+         * free can't be reported before another thread is given the address,
+         * and reporting it before the call was wrong when the call failed. A
+         * block resized in place is reported as freed and allocated again;
+         * a moved one is copied and freed as by __wrap_free. */
+        const size_t before = mspace_usable_size(p);
+        if (mspace_realloc_in_place(arenas[0], p, size)) {
+            hook_free(p, before);
+            return note_alloc(p);
+        }
+        mspace m = arena();
+        q = m ? mspace_malloc(m, size) : NULL;
+        if (q) {
+            memcpy(q, p, before < size ? before : size);
+            note_free(p);
+            mspace_free(arenas[0], p);
+            return note_alloc(q);
+        }
     }
-    /* Heap exhausted: move the block to libc. */
+    /* Heap exhausted: move the block to libc. If libc has none either, p
+     * stays as it was (and, to the hooks, still allocated). */
     q = fallback(__real_malloc(size));
     if (q) {
-        size_t old = mspace_usable_size(p);
+        const size_t old = mspace_usable_size(p);
         memcpy(q, p, old < size ? old : size);
         __wrap_free(p);
     }

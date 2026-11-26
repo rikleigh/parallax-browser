@@ -13,6 +13,19 @@
  *
  * SA_NODEFER: a fault inside the handler re-enters it and exits at once
  * (_exit(71)) rather than being fatal with the signal blocked.
+ *
+ * The browser title (titlecrash.c, PS5WK_CRASHGUARD_TITLE) does not end
+ * with _exit: after the report it SIGKILLs itself, with _exit only if that
+ * returns. On 2026-11-26 a title that aborted (a page out of JS heap, pages
+ * in the browser process) reached _exit(70) and stayed alive, its main loop
+ * dead, for 3 minutes in 2 of 3 runs, until the launcher's SIGKILL; a
+ * SIGSEGV ended at once. A title that ends itself is handled oddly by the
+ * system (spikes/common/title_exit.c: only a SIGKILL ends a GPU title
+ * cleanly), and kill() is a plain system call where libkernel's _exit may
+ * not be. A watchdog thread, started at install and woken by the handler's
+ * first byte down a pipe, SIGKILLs the title WATCHDOG_S seconds later
+ * whatever the handler is doing (a lock the crashed thread holds, a write
+ * that blocks).
  */
 #include "crashguard.h"
 
@@ -22,8 +35,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 // The image's address range, from symbols the linker defines: __ehdr_start
@@ -142,6 +157,17 @@ static void flush(line_t* line)
         reportText[reportLength++] = line->text[i];
 }
 
+#ifdef PS5WK_CRASHGUARD_TITLE
+// One line of the report with text after the tag.
+static void reportLine(const char* text)
+{
+    line_t l;
+    startLine(&l);
+    put(&l, text);
+    flush(&l);
+}
+#endif
+
 // What the log hasn't had yet, to the log.
 static void sendReport(void)
 {
@@ -152,10 +178,84 @@ static void sendReport(void)
     }
 }
 
+#ifdef PS5WK_CRASHGUARD_TITLE
+#define WATCHDOG_S 8 /* the report takes a second or two: the log's hook waits up to 1.5 s */
+static int watchdogPipe[2] = { -1, -1 };
+
+static void sleepSeconds(int seconds)
+{
+    struct timespec left = { seconds, 0 };
+    while (nanosleep(&left, &left) && errno == EINTR)
+        ;
+}
+
+// SIGKILL to ourselves, then _exit only if it came back (async-signal-safe).
+static void endNow(int code)
+{
+    kill(getpid(), SIGKILL);
+    sleepSeconds(2);
+    _exit(code);
+}
+
+static void* watchdog(void* data)
+{
+    (void)data;
+    char byte;
+    ssize_t n;
+    while ((n = read(watchdogPipe[0], &byte, 1)) < 0 && errno == EINTR)
+        ;
+    if (n != 1)
+        return NULL; // only the handler writes; anything else: no watchdog
+    sleepSeconds(WATCHDOG_S);
+    reportLine("the crash handler has not ended the title: SIGKILL from the watchdog");
+    endNow(72);
+    return NULL;
+}
+
+static void startWatchdog(void)
+{
+    if (watchdogPipe[0] >= 0 || pipe(watchdogPipe))
+        return;
+    for (int i = 0; i < 2; i++)
+        fcntl(watchdogPipe[i], F_SETFD, FD_CLOEXEC);
+    // No signal for this thread (the stall sampler's, the crash signals of
+    // other threads): it only waits.
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, &old);
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, watchdog, NULL))
+        pthread_detach(thread);
+    else {
+        close(watchdogPipe[0]);
+        close(watchdogPipe[1]);
+        watchdogPipe[0] = watchdogPipe[1] = -1;
+    }
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+static void wakeWatchdog(void)
+{
+    if (watchdogPipe[1] >= 0) {
+        ssize_t ignored = write(watchdogPipe[1], "!", 1);
+        (void)ignored;
+    }
+}
+#else
+static void endNow(int code)
+{
+    _exit(code);
+}
+#endif
+
 static void finish(int code)
 {
     sendReport();
-    _exit(code);
+#ifdef PS5WK_CRASHGUARD_TITLE
+    reportLine("report done: SIGKILL to the title");
+    sendReport();
+#endif
+    endNow(code);
 }
 
 // Whether the page holding address can be read. Without the pipe, only sp's
@@ -231,7 +331,7 @@ static void handler(int sig, siginfo_t* info, void* context)
         // A fault in the report itself. Once: the partial stack line, and
         // the report to the log; a fault in that ends here.
         if (inHandler > 1)
-            _exit(71);
+            endNow(71);
         inHandler = 2;
         if (scanning) {
             scanning = 0;
@@ -241,6 +341,9 @@ static void handler(int sig, siginfo_t* info, void* context)
         finish(71);
     }
     inHandler = 1;
+#ifdef PS5WK_CRASHGUARD_TITLE
+    wakeWatchdog();
+#endif
 
     // The PS5 kernel's ucontext is not the SDK header's: FreeBSD's mcontext
     // starts at +0x40, not +0x10 (test/sigctx/sigctx.c on 13.60: rip +0xe0,
@@ -376,6 +479,9 @@ void ps5wk_crash_guard_install(const char* tag)
     // This function's own bytes: readable or not, as all of .text is.
     codeReadable = probePipe[1] >= 0 && pageReadable((uintptr_t)&ps5wk_crash_guard_install);
     ps5wk_crash_guard_thread();
+#ifdef PS5WK_CRASHGUARD_TITLE
+    startWatchdog();
+#endif
     static const int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS };
     for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++) {
         struct sigaction action;

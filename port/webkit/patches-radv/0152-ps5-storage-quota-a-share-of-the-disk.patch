@@ -1,30 +1,135 @@
 diff --git a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
-index 107a034c98..32ec695031 100644
+index 107a034c98..2f19291165 100644
 --- a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
 +++ b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
-@@ -783,6 +783,10 @@ OriginQuotaManager::Parameters NetworkStorageManager::originQuotaManagerParamete
+@@ -104,6 +104,26 @@ static constexpr auto persistedFileName = "persisted"_s;
+ static constexpr Seconds originLastModificationTimeUpdateInterval = 30_s;
+ static constexpr auto lastTimeBasedEvictionTimestampFileName = "lastTimeBasedEvictionTimestamp"_s;
+ static constexpr Seconds defaultTimeBasedEvictionInterval = 7 * 24_h;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: /data is the console's internal drive, which games, their saves and system updates share,
++// so the shares of it (WebsiteDataStore::defaultOriginQuotaRatio(), 0.6, and
++// defaultTotalQuotaRatio(), 0.8) are bounded by what can be given up for web data:
++// - a site gets at most 8 GiB, and at most half of what is free on the drive when its quota is
++//   set (when its storage is first opened in this run, or again after it was idle). This is the
++//   hard bound: past it writes fail with a quota error. A game that keeps ~1.7 GB in OPFS
++//   (nfsu2.xyz's preload) fits as long as the drive has a few GB free.
++// - all sites together at most 32 GiB, and at most what they held at the first eviction check
++//   of the run (the first write) plus half of what was free then. Past that WebKit evicts the
++//   least recently used sites (NetworkStorageManager::performQuotaBasedEviction()), except those in
++//   use or persisted, so this bounds what sites leave behind rather than what open ones write.
++// So no one site can fill the drive, and a site whose quota is set after others have written gets
++// half of what they left. navigator.storage.estimate() never reports more than the site's quota:
++// upstream reports min(quota, a standard figure) to keep the disk size from identifying the user,
++// the standard figure being WebsiteDataStore::defaultStandardVolumeCapacity() (16 GiB here) times
++// the ratio, 9830 MB, doubled while the usage is over half of it (OriginQuotaManager::reportedQuota()).
++static constexpr uint64_t ps5OriginQuotaCap = 8 * GB;
++static constexpr uint64_t ps5TotalQuotaCap = 32 * GB;
++#endif
+ 
+ // FIXME: Remove this if rdar://104754030 is fixed.
+ static HashMap<String, ThreadSafeWeakPtr<NetworkStorageManager>>& LEGACY_NODELETE activePaths()
+@@ -462,6 +482,9 @@ void NetworkStorageManager::spaceGrantedForOrigin(const WebCore::ClientOrigin& o
+             m_totalQuota = *m_totalQuotaRatio * *volumeCapacity;
+         else
+             return;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        m_totalQuota = std::min(*m_totalQuota, ps5TotalQuotaCap); // and the free space: donePrepareForEviction()
++#endif
+     }
+ 
+     if (m_totalUsage)
+@@ -569,6 +592,19 @@ void NetworkStorageManager::donePrepareForEviction(const std::optional<HashMap<W
+     }
+ 
+     m_totalUsage = totalUsage;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: the first time the usage is known, what the sites hold plus half of what is free on the
++    // drive (ps5TotalQuotaCap above).
++    if (m_totalQuota && !m_ps5TotalQuotaBoundByFreeSpace && !m_volumeCapacityOverride) {
++        m_ps5TotalQuotaBoundByFreeSpace = true;
++        auto freeSpace = FileSystem::volumeFreeSpace(m_path);
++        if (freeSpace)
++            m_totalQuota = std::min(*m_totalQuota, totalUsage + *freeSpace / 2);
++        WTFLogAlways("[storage] total quota for all sites: %.1f MB (%s; they hold %.1f MB, %.1f MB free)", *m_totalQuota / 1048576.0,
++            freeSpace && *m_totalQuota == totalUsage + *freeSpace / 2 ? "what they hold plus half the free space" : *m_totalQuota == ps5TotalQuotaCap ? "the cap for all sites" : "a share of the volume",
++            totalUsage / 1048576.0, freeSpace ? *freeSpace / 1048576.0 : -1.0);
++    }
++#endif
+     performQuotaBasedEviction(WTF::move(originRecords));
+ }
+ 
+@@ -757,6 +793,9 @@ OriginQuotaManager::Parameters NetworkStorageManager::originQuotaManagerParamete
+     };
+     // Use double for multiplication to preserve precision.
+     double quota = m_defaultOriginQuota;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    const char* ps5Bound = "the fixed default: no ratio, or the volume size unknown";
++#endif
+     double standardReportedQuota = m_standardVolumeCapacity ? *m_standardVolumeCapacity : 0.0;
+     if (m_originQuotaRatio && m_originQuotaRatioEnabled) {
+         std::optional<uint64_t> volumeCapacity;
+@@ -767,6 +806,20 @@ OriginQuotaManager::Parameters NetworkStorageManager::originQuotaManagerParamete
+         if (volumeCapacity) {
+             quota = m_originQuotaRatio.value() * volumeCapacity.value();
+             increaseQuotaFunction = { };
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++            // PS5: ps5OriginQuotaCap above.
++            ps5Bound = "a share of the volume";
++            if (quota > ps5OriginQuotaCap) {
++                quota = ps5OriginQuotaCap;
++                ps5Bound = "the cap for one site";
++            }
++            if (!m_volumeCapacityOverride) {
++                if (auto freeSpace = FileSystem::volumeFreeSpace(m_path); freeSpace && quota > *freeSpace / 2.0) {
++                    quota = *freeSpace / 2.0;
++                    ps5Bound = "half the free space";
++                }
++            }
++#endif
+         }
+         standardReportedQuota *= m_originQuotaRatio.value();
+     }
+@@ -783,6 +836,10 @@ OriginQuotaManager::Parameters NetworkStorageManager::originQuotaManagerParamete
      // Use std::ceil instead of implicit conversion to make result more definitive.
      uint64_t roundedQuota = std::ceil(quota);
      uint64_t roundedStandardReportedQuota = std::ceil(standardReportedQuota);
 +#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
-+    WTFLogAlways("[storage] quota for %s: %.1f MB (%s)", origin.clientOrigin.toString().utf8().data(), roundedQuota / 1048576.0,
-+        increaseQuotaFunction ? "the fixed default: no ratio, or the volume size unknown" : "a share of the volume");
++    WTFLogAlways("[storage] quota for %s: %.1f MB (%s%s)", origin.clientOrigin.toString().utf8().data(), roundedQuota / 1048576.0,
++        ps5Bound, origin.topOrigin != origin.clientOrigin ? ", a third party's share of it" : "");
 +#endif
      return { roundedQuota, roundedStandardReportedQuota, WTF::move(increaseQuotaFunction), WTF::move(notifySpaceGrantedFunction) };
  }
  
+diff --git a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h
+index 99e2e9bdde..c93a40dca3 100644
+--- a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h
++++ b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h
+@@ -346,6 +346,9 @@ private:
+     std::optional<Seconds> m_lastModificationTimeUpdateIntervalOverride;
+     std::optional<uint64_t> m_totalUsage;
+     std::optional<uint64_t> m_totalQuota;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    bool m_ps5TotalQuotaBoundByFreeSpace { false }; // PS5: ps5TotalQuotaCap in NetworkStorageManager.cpp
++#endif
+     bool m_isEvictionScheduled { false };
+     UnifiedOriginStorageLevel m_unifiedOriginStorageLevel;
+     const Markable<IPC::Connection::UniqueID> m_parentConnection;
 diff --git a/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp b/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp
-index f7f2e3886a..f28f248efa 100644
+index f7f2e3886a..2313e4cf31 100644
 --- a/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp
 +++ b/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp
-@@ -2726,6 +2726,20 @@ void WebsiteDataStore::removeRecentSearches(WallTime, CompletionHandler<void()>&
+@@ -2726,6 +2726,23 @@ void WebsiteDataStore::removeRecentSearches(WallTime, CompletionHandler<void()>&
      completionHandler();
  }
  
 +#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
 +// PS5: a share of /data, as Safari gives a browser app, instead of the fixed 1 GiB per site.
-+// Web games keep their data in OPFS/IndexedDB (nfsu2.xyz's preload needs about 1.7 GB), and
-+// /data holds hundreds of GB. Past the total share WebKit evicts the least recently used sites.
++// Web games keep their data in OPFS/IndexedDB (nfsu2.xyz's preload needs about 1.7 GB). Past the
++// total share WebKit evicts the least recently used sites. /data is the console's own drive,
++// shared with games, saves and system updates, so the NetworkProcess bounds both shares by an
++// absolute cap (8 GiB a site, 32 GiB for all) and by the free space (ps5OriginQuotaCap in
++// NetworkStorageManager.cpp).
 +std::optional<double> WebsiteDataStore::defaultOriginQuotaRatio()
 +{
 +    return 0.6;
@@ -38,7 +143,7 @@ index f7f2e3886a..f28f248efa 100644
  std::optional<double> WebsiteDataStore::defaultOriginQuotaRatio()
  {
      return std::nullopt;
-@@ -2735,6 +2749,7 @@ std::optional<double> WebsiteDataStore::defaultTotalQuotaRatio()
+@@ -2735,6 +2752,7 @@ std::optional<double> WebsiteDataStore::defaultTotalQuotaRatio()
  {
      return std::nullopt;
  }

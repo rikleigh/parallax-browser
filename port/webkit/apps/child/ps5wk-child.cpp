@@ -16,6 +16,7 @@
 #include "../common/profiler.h"
 #include "../common/watchdog.h"
 #include "../common/ps5locks.h"
+#include "../common/writetest.h" // development builds: the "writetest" task
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1046,6 +1047,19 @@ static void probePlatformCosts()
     pthread_attr_destroy(&attributes);
 }
 
+#ifdef PS5WK_DEBUG_BUILD
+// The disk write test as a task payload (main, below).
+static const char* writeTestSpec;
+static void writeTestSay(const char* line, void*)
+{
+    printf("%s\n", line);
+}
+static void* writeTestThread(void*)
+{
+    return ps5wk_write_test(writeTestSpec, "payload thread", writeTestSay, nullptr) ? &writeTestSpec : nullptr;
+}
+#endif
+
 int main(int, char**)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1114,6 +1128,26 @@ int main(int, char**)
         fflush(stderr);
         _exit(result);
     }
+#ifdef PS5WK_DEBUG_BUILD
+    // The disk write test (apps/common/writetest.c; the title's
+    // POST /debug/write-test with proc=payload): the same writes from a
+    // payload process. thread=new: on a thread of its own, not the main one.
+    if (!strcmp(type, "writetest")) {
+        ps5wk_crash_guard_install("writetest");
+        writeTestSpec = path;
+        int result = 0;
+        pthread_t thread;
+        if (strstr(path, "thread=new") && !pthread_create(&thread, nullptr, writeTestThread, nullptr)) {
+            void* threadResult = nullptr;
+            pthread_join(thread, &threadResult);
+            result = threadResult ? 1 : 0;
+        } else
+            result = ps5wk_write_test(path, "payload main", writeTestSay, nullptr) ? 1 : 0;
+        fflush(stdout);
+        fflush(stderr);
+        _exit(result);
+    }
+#endif
     bool network = !strcmp(type, "network");
     char tag[32];
     snprintf(tag, sizeof(tag), "%s%llu", network ? "network" : "web", processIdentifier);

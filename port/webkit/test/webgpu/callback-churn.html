@@ -1,0 +1,60 @@
+<!doctype html>
+<!-- A page that keeps WebGPU callbacks pending all the time: ?chains=N (default 8) chains, each an
+     empty submit then await onSubmittedWorkDone(), again at once, for ?seconds=S (default 60).
+     ?map=1 adds a chain of mapAsync(READ)/unmap read-backs. Before patches-radv 0158's budget the
+     Dawn pump's quick rounds kept the work-queue thread at 100% of a core while callbacks were
+     registered continuously; check the CPU with the perf overlay or the title profiler while this
+     runs. Logs "CBCHURN <n> callbacks in <s> s (<rate>/s)" every 5 s and "CBCHURN DONE". -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGPU callback churn</title>
+<style>
+  body { background: #111; color: #eee; font: 22px/1.35 sans-serif; margin: 40px; }
+  #out { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>WebGPU callback churn</h1>
+<div id="out">starting…</div>
+<script>
+'use strict';
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); if (lines.length > 30) lines.splice(0, 1); out.textContent = lines.join('\n'); console.log('CBCHURN ' + s); }
+const q = new URLSearchParams(location.search);
+const chains = +(q.get('chains') || 8), seconds = +(q.get('seconds') || 60), withMap = q.get('map') === '1';
+(async () => {
+  if (!navigator.gpu) { say('no navigator.gpu'); say('DONE'); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = adapter && await adapter.requestDevice();
+  if (!device) { say('no device'); say('DONE'); return; }
+  const readable = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  let count = 0, stop = false;
+  const start = performance.now();
+  async function chain() {
+    while (!stop) { device.queue.submit([]); await device.queue.onSubmittedWorkDone(); count++; }
+  }
+  async function mapChain() {
+    while (!stop) { await readable.mapAsync(GPUMapMode.READ); readable.unmap(); count++; }
+  }
+  say(`${chains} chains of onSubmittedWorkDone${withMap ? ' + a mapAsync chain' : ''} for ${seconds} s`);
+  const all = [];
+  for (let i = 0; i < chains; i++) all.push(chain());
+  if (withMap) all.push(mapChain());
+  let last = 0, lastT = start;
+  const timer = setInterval(() => {
+    const t = performance.now();
+    say(`${count} callbacks in ${((t - start) / 1000).toFixed(0)} s (${Math.round((count - last) * 1000 / (t - lastT))}/s now)`);
+    last = count; lastT = t;
+  }, 5000);
+  await new Promise(r => setTimeout(r, seconds * 1000));
+  stop = true;
+  await Promise.all(all);
+  clearInterval(timer);
+  const total = (performance.now() - start) / 1000;
+  say(`DONE ${count} callbacks in ${total.toFixed(1)} s (${Math.round(count / total)}/s); now idle`);
+})().catch(e => { say('error ' + e); say('DONE'); });
+</script>
+</body>
+</html>

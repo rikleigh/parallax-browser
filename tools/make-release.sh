@@ -79,6 +79,32 @@ for hook in update-test-yes update-source update-store-root PS5WK_UPDATE_TESTING
     fi
 done
 
+# No debug tools or diagnostic logs: a development build's only
+# (PS5WK_DEBUG_BUILD, defined with a log host; radv's debug patches only with
+# RADV_DEBUG_PATCHES=1, port/deps/radv/build-radv.sh). The heap profiler, the
+# debug user script and dialogs, the test-URL runs and screenshots, the
+# title's crash test (crash-title-test, /restart?scope=crash's), the disk
+# write test (POST /debug/write-test and the child's "writetest" task), the
+# radv submit log.
+# WebKit's (patches-radv 0159: PS5WKDebugBuild.h from the log host): the
+# querySelector and Atomics stats, the timers and storage-quota logs, the
+# stream-stall stamps, the WebGPU callback latency log; 0160's
+# opfs-backend-write-min.
+for marker in heap-profile '[heapprof]' debug-userscript debug-dialogs '[ps5wk-dialog]' test-urls.txt test-onload \
+    debug-screenshot crash-title-test 'crash test:' /debug/write-test '[writetest]' ps5wk-write-test \
+    radv-submit-log 'radv/ps5: submit' \
+    PS5WK_QSA_STATS '[qsa]' PS5WK_ATOMICS_LOG '[atomics]' '[timers]' '[storage] quota for' \
+    '[storage] total quota for all sites' 'no stream threads yet' webgpu-latency-log '[webgpu] title: latency' \
+    opfs-backend-write-min; do
+    # Options before -e and the path: BSD grep takes anything after a "--"
+    # as a file name.
+    if grep -rlaF --include='*.bin' --include='*.elf' -e "$marker" "$TITLE" >/dev/null; then
+        echo "the debug-only \"$marker\" is in the title: $(grep -rlaF --include='*.bin' --include='*.elf' -e "$marker" "$TITLE" | tr '\n' ' ')" >&2
+        [[ $marker == radv* ]] && echo "(radv was built with RADV_DEBUG_PATCHES=1: run port/deps/radv/build-radv.sh without it)" >&2
+        exit 1
+    fi
+done
+
 [[ -f $TITLE/runtime/runtime-version ]] || { echo "the title has no runtime/ (NO_RUNTIME set?)" >&2; exit 1; }
 cmp -s "$stage/start.html" "$TITLE/runtime/start.html" || { echo "the title's start page isn't the release one" >&2; exit 1; }
 

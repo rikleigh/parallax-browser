@@ -1,0 +1,162 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPFS sync access handle: reads and writes</title>
+<pre id="out">running…</pre>
+<script>
+// What a FileSystemSyncAccessHandle's write() must do whatever writes the bytes: with pages in the
+// browser process, writes of 64 KB or more are written by the NetworkProcess (patches-radv 0160) and
+// smaller ones by the page's own descriptor, and both must land where one descriptor would have put
+// them. A worker writes patterned data in sizes on both sides of 64 KB and of the 16 MB pieces, with
+// and without { at }, reads everything back and compares every byte. ?mb= the size of the big write
+// (default 40). Needs a secure origin (http://127.0.0.1 counts). Logs "OPFSRW PASS|FAIL <check>" and
+// "OPFSRW DONE <passed>/<checks>"; ?report=1 also posts each line to the server's /log.
+// On the console (2026-11-26) it ends 19/20 with either writer, and without 0160: "the gap before it
+// reads as zeros" fails (the partly written 64 KB blocks at both ends of a gap read back as other
+// data). With pages in their own process, about one run in four stops with NotFoundError while
+// reading the File from getFile() (15/17), also without 0160. README, "The title's own file writes".
+const out = document.getElementById('out');
+const lines = [];
+const report = new URLSearchParams(location.search).get('report') === '1';
+function say(s) {
+  lines.push(s); out.textContent = lines.join('\n'); console.log('OPFSRW ' + s);
+  if (report) fetch('/log?msg=' + encodeURIComponent('OPFSRW ' + s), { method: 'POST' }).catch(() => {});
+}
+const bigMB = +(new URLSearchParams(location.search).get('mb') || 40);
+const workerSource = `
+let passed = 0, checks = 0;
+function check(name, ok, detail) { checks++; if (ok) passed++; postMessage({ line: (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ': ' + detail : '') }); }
+// Bytes that depend on where they are in the file: a wrong offset shows.
+function pattern(offset, length) {
+  const b = new Uint8Array(length);
+  for (let i = 0; i < length; i++) { const p = offset + i; b[i] = (p * 31 + (p >>> 8) * 7 + (p >>> 16) * 13 + (p >>> 24)) & 255; }
+  return b;
+}
+function same(a, b) { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; }
+onmessage = async (e) => {
+  let step = 'getDirectory()';
+  try {
+    const KB = 1024, MB = 1048576, big = e.data.bigMB * MB;
+    const root = await navigator.storage.getDirectory();
+    step = 'getFileHandle()';
+    const file = await root.getFileHandle('sync-rw.bin', { create: true });
+    step = 'createSyncAccessHandle()';
+    let h = await file.createSyncAccessHandle();
+    step = 'the writes';
+    h.truncate(0);
+    check('empty after truncate(0)', h.getSize() === 0, 'size ' + h.getSize());
+
+    // The cursor: a large write, then a small one, then a large one, none with { at }.
+    let n = h.write(pattern(0, 200 * KB));
+    check('200 KB write at the cursor', n === 200 * KB, 'returned ' + n);
+    n = h.write(pattern(200 * KB, 10));
+    check('10 byte write follows it', n === 10 && h.getSize() === 200 * KB + 10, 'returned ' + n + ', size ' + h.getSize());
+    n = h.write(pattern(200 * KB + 10, 70 * KB));
+    check('70 KB write follows that', n === 70 * KB && h.getSize() === 270 * KB + 10, 'returned ' + n + ', size ' + h.getSize());
+    let back = new Uint8Array(270 * KB + 10);
+    n = h.read(back, { at: 0 });
+    check('the three read back', n === back.length && same(back, pattern(0, back.length)), 'read ' + n);
+
+    // Just under, at and just over 64 KB, each at its own place.
+    for (const size of [65535, 65536, 65537]) {
+      const at = 1 * MB + size * 3;
+      n = h.write(pattern(at, size), { at });
+      back = new Uint8Array(size);
+      const r = h.read(back, { at });
+      check(size + ' byte write with { at }', n === size && r === size && same(back, pattern(at, size)), 'wrote ' + n + ', read ' + r);
+    }
+
+    // A read with no { at } starts where the last write ended.
+    n = h.write(pattern(2 * MB, 300 * KB), { at: 2 * MB });
+    h.write(pattern(2 * MB + 300 * KB, 100 * KB), { at: 2 * MB + 300 * KB });
+    h.write(pattern(2 * MB + 100 * KB, 100 * KB), { at: 2 * MB + 100 * KB }); // the cursor is now at 2 MB + 200 KB
+    back = new Uint8Array(50 * KB);
+    n = h.read(back);
+    check('read at the cursor after a large write', n === 50 * KB && same(back, pattern(2 * MB + 200 * KB, 50 * KB)), 'read ' + n);
+
+    // One write larger than the pieces it travels in, at an odd offset.
+    const at = 3 * MB + 5;
+    const t0 = performance.now();
+    n = h.write(pattern(at, big), { at });
+    const seconds = (performance.now() - t0) / 1000;
+    check((big / MB) + ' MB write at an odd offset', n === big && h.getSize() === at + big, 'returned ' + n + ', size ' + h.getSize() + ', ' + (big / MB / seconds).toFixed(0) + ' MB/s');
+    let ok = true, readTotal = 0;
+    for (let done = 0; done < big; done += 8 * MB) {
+      const size = Math.min(8 * MB, big - done);
+      back = new Uint8Array(size);
+      const r = h.read(back, { at: at + done });
+      readTotal += r;
+      if (r !== size || !same(back, pattern(at + done, size))) { ok = false; break; }
+    }
+    check('it reads back', ok, 'read ' + readTotal);
+    // The file ended at 2 MB + 400 KB before that write: what lies between was never written.
+    back = new Uint8Array(at - (2 * MB + 400 * KB));
+    n = h.read(back, { at: 2 * MB + 400 * KB });
+    let nonZero = 0, first = -1, last = -1;
+    const perBlock = new Map(); // of 64 KB of the file
+    for (let i = 0; i < back.length; i++) if (back[i]) {
+      nonZero++; if (first < 0) first = i; last = i;
+      const block = Math.floor((2 * MB + 400 * KB + i) / (64 * KB));
+      perBlock.set(block, (perBlock.get(block) || 0) + 1);
+    }
+    if (nonZero) postMessage({ line: 'gap: bytes that are not zero per 64 KB block of the file: ' + Array.from(perBlock, ([k, v]) => k + ':' + v).join(' ') });
+    check('the gap before it reads as zeros', n === back.length && !nonZero, nonZero ? nonZero + ' of ' + back.length + ' bytes are not zero, from ' + (2 * MB + 400 * KB + first) + ' to ' + (2 * MB + 400 * KB + last)
+      + ' (the write began at ' + at + '); the first are ' + Array.from(back.subarray(first, first + 8)).join(' ') + ', the pattern there would be ' + Array.from(pattern(2 * MB + 400 * KB + first, 8)).join(' ') : 'read ' + n);
+
+    // A SharedArrayBuffer's bytes, and a view that is part of a buffer.
+    if (self.SharedArrayBuffer) {
+      const shared = new Uint8Array(new SharedArrayBuffer(128 * KB));
+      shared.set(pattern(100 * MB, 128 * KB));
+      n = h.write(shared, { at: 100 * MB });
+      back = new Uint8Array(128 * KB);
+      h.read(back, { at: 100 * MB });
+      check('a SharedArrayBuffer write', n === 128 * KB && same(back, pattern(100 * MB, 128 * KB)), 'returned ' + n);
+    }
+    const whole = pattern(101 * MB - 1000, 200 * KB + 2000);
+    n = h.write(whole.subarray(1000, 1000 + 200 * KB), { at: 101 * MB });
+    back = new Uint8Array(200 * KB);
+    h.read(back, { at: 101 * MB });
+    check('a subarray write', n === 200 * KB && same(back, pattern(101 * MB, 200 * KB)), 'returned ' + n);
+    n = h.write(new Uint8Array(0), { at: 5 });
+    check('an empty write', n === 0, 'returned ' + n);
+
+    // truncate() and a large write past the new end; the gap reads as zeros.
+    h.truncate(1 * MB);
+    n = h.write(pattern(4 * MB, 1 * MB), { at: 4 * MB });
+    back = new Uint8Array(64 * KB);
+    h.read(back, { at: 2 * MB });
+    check('a large write past the end after truncate()', n === 1 * MB && h.getSize() === 5 * MB && back.every((v) => v === 0), 'returned ' + n + ', size ' + h.getSize());
+
+    // After flush() and close(), another handle and the File see the same bytes.
+    h.flush();
+    h.close();
+    step = 'getFile()';
+    const blob = await file.getFile();
+    step = 'reading the File';
+    const tail = new Uint8Array(await blob.slice(4 * MB, 5 * MB).arrayBuffer());
+    check('getFile() after close()', blob.size === 5 * MB && same(tail, pattern(4 * MB, 1 * MB)), 'size ' + blob.size);
+    step = 'the second createSyncAccessHandle()';
+    h = await file.createSyncAccessHandle();
+    step = 'the second handle';
+    back = new Uint8Array(1 * MB);
+    n = h.read(back, { at: 4 * MB });
+    check('a second handle reads it', n === 1 * MB && same(back, pattern(4 * MB, 1 * MB)), 'read ' + n);
+    n = h.write(pattern(0, 300 * KB), { at: 0 });
+    back = new Uint8Array(300 * KB);
+    h.read(back, { at: 0 });
+    check('and writes over it', n === 300 * KB && same(back, pattern(0, 300 * KB)) && h.getSize() === 5 * MB, 'returned ' + n);
+    h.close();
+    let closedError = '';
+    try { h.write(pattern(0, 100 * KB), { at: 0 }); } catch (err) { closedError = err.name; }
+    check('a write after close() throws', closedError === 'InvalidStateError', closedError || 'no exception');
+    step = 'removeEntry()';
+    await root.removeEntry('sync-rw.bin');
+  } catch (err) {
+    check('no exception', false, err.name + ': ' + err.message + ' (in ' + step + ')');
+  }
+  postMessage({ done: true, passed, checks });
+};`;
+const w = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+w.onmessage = (e) => { if (e.data.done) say(`DONE ${e.data.passed}/${e.data.checks}`); else say(e.data.line); };
+w.onerror = (e) => { say('FAIL worker error ' + e.message); say('DONE 0/0'); };
+w.postMessage({ bigMB });
+</script>

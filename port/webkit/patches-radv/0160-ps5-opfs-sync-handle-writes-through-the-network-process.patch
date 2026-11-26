@@ -1,0 +1,395 @@
+diff --git a/Source/WebCore/Modules/filesystem/FileSystemFileHandle.cpp b/Source/WebCore/Modules/filesystem/FileSystemFileHandle.cpp
+index f52b99c589..a4cd355fa0 100644
+--- a/Source/WebCore/Modules/filesystem/FileSystemFileHandle.cpp
++++ b/Source/WebCore/Modules/filesystem/FileSystemFileHandle.cpp
+@@ -130,6 +130,24 @@ std::optional<uint64_t> FileSystemFileHandle::requestNewCapacityForSyncAccessHan
+     return protect(downcast<WorkerFileSystemStorageConnection>(connection()))->requestNewCapacityForSyncAccessHandle(identifier(), accessHandleIdentifier, newCapacity);
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++uint64_t FileSystemFileHandle::minimumSizeOfSyncAccessHandleWriteThroughBackend()
++{
++    if (isClosed())
++        return 0;
++
++    return protect(connection())->minimumSizeOfSyncAccessHandleWriteThroughBackend();
++}
++
++std::optional<uint64_t> FileSystemFileHandle::writeForSyncAccessHandle(FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> data)
++{
++    if (isClosed())
++        return std::nullopt;
++
++    return protect(downcast<WorkerFileSystemStorageConnection>(connection()))->writeForSyncAccessHandle(identifier(), accessHandleIdentifier, offset, data);
++}
++#endif
++
+ void FileSystemFileHandle::registerSyncAccessHandle(FileSystemSyncAccessHandleIdentifier identifier, FileSystemSyncAccessHandle& handle)
+ {
+     if (isClosed())
+diff --git a/Source/WebCore/Modules/filesystem/FileSystemFileHandle.h b/Source/WebCore/Modules/filesystem/FileSystemFileHandle.h
+index 0f7b3db7fa..cbd7ebd644 100644
+--- a/Source/WebCore/Modules/filesystem/FileSystemFileHandle.h
++++ b/Source/WebCore/Modules/filesystem/FileSystemFileHandle.h
+@@ -48,6 +48,10 @@ public:
+     void createSyncAccessHandle(DOMPromiseDeferred<IDLInterface<FileSystemSyncAccessHandle>>&&);
+     void closeSyncAccessHandle(FileSystemSyncAccessHandleIdentifier);
+     std::optional<uint64_t> requestNewCapacityForSyncAccessHandle(FileSystemSyncAccessHandleIdentifier, uint64_t newCapacity);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    uint64_t minimumSizeOfSyncAccessHandleWriteThroughBackend();
++    std::optional<uint64_t> writeForSyncAccessHandle(FileSystemSyncAccessHandleIdentifier, uint64_t offset, std::span<const uint8_t>);
++#endif
+     void registerSyncAccessHandle(FileSystemSyncAccessHandleIdentifier, FileSystemSyncAccessHandle&);
+     void unregisterSyncAccessHandle(FileSystemSyncAccessHandleIdentifier);
+ 
+diff --git a/Source/WebCore/Modules/filesystem/FileSystemStorageConnection.h b/Source/WebCore/Modules/filesystem/FileSystemStorageConnection.h
+index 9661ebd4bf..f38c724df7 100644
+--- a/Source/WebCore/Modules/filesystem/FileSystemStorageConnection.h
++++ b/Source/WebCore/Modules/filesystem/FileSystemStorageConnection.h
+@@ -84,6 +84,19 @@ public:
+     virtual void createSyncAccessHandle(FileSystemHandleIdentifier, GetAccessHandleCallback&&) = 0;
+     virtual void closeSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, EmptyCallback&&) = 0;
+     virtual void requestNewCapacityForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t newCapacity, RequestCapacityCallback&&) = 0;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5, pages in the browser process: the console holds the title's own
++    // file writes back (to about 2 MB/s once it has written about 1.3 GB,
++    // each write() call counting as about 64 KB more than its bytes), but
++    // not a payload's. A sync access handle's writes of at least this many
++    // bytes are therefore written by the backend (the NetworkProcess, which
++    // writes a writable stream's too); 0: the page's process writes them
++    // all itself, as upstream.
++    virtual uint64_t minimumSizeOfSyncAccessHandleWriteThroughBackend() const { return 0; }
++    // The bytes written at offset, or nothing on failure.
++    using WriteForSyncAccessHandleCallback = CompletionHandler<void(std::optional<uint64_t>&&)>;
++    virtual void writeForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t, std::span<const uint8_t>, WriteForSyncAccessHandleCallback&& callback) { callback(std::nullopt); }
++#endif
+     virtual void registerSyncAccessHandle(FileSystemSyncAccessHandleIdentifier, ScriptExecutionContextIdentifier) = 0;
+     virtual void unregisterSyncAccessHandle(FileSystemSyncAccessHandleIdentifier) = 0;
+     virtual void invalidateAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier) = 0;
+diff --git a/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp b/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp
+index 3d9f3661d8..326cb640b8 100644
+--- a/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp
++++ b/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp
+@@ -162,6 +162,20 @@ ExceptionOr<unsigned long long> FileSystemSyncAccessHandle::write(BufferSource&&
+     if (!requestSpaceForWrite(*options.at, buffer.byteLength()))
+         return Exception { ExceptionCode::QuotaExceededError };
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // Pages in the browser process: the backend writes
++    // (FileSystemStorageConnection.h). The handle's own descriptor is still
++    // what reads, truncates and flushes, and its cursor ends up where its
++    // own write() would have left it.
++    if (auto minimumSize = m_source->minimumSizeOfSyncAccessHandleWriteThroughBackend(); minimumSize && buffer.byteLength() >= minimumSize) {
++        auto written = m_source->writeForSyncAccessHandle(m_identifier, *options.at, buffer.span());
++        if (!written)
++            return Exception { ExceptionCode::InvalidStateError, "Failed to write to file"_s };
++        m_file.seek(*options.at + *written, FileSystem::FileSeekOrigin::Beginning);
++        return *written;
++    }
++#endif
++
+     auto result = m_file.write(buffer.span());
+     if (!result)
+         return Exception { ExceptionCode::InvalidStateError, "Failed to write to file"_s };
+diff --git a/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp b/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp
+index 9bc5bb3f4e..46b0d2ffbd 100644
+--- a/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp
++++ b/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp
+@@ -508,6 +508,62 @@ void WorkerFileSystemStorageConnection::requestNewCapacityForSyncAccessHandle(Fi
+     return callback(std::nullopt);
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++uint64_t WorkerFileSystemStorageConnection::minimumSizeOfSyncAccessHandleWriteThroughBackend() const
++{
++    // On the worker thread: the main thread's connection answers from a flag
++    // set once at start.
++    return m_mainThreadConnection ? m_mainThreadConnection->minimumSizeOfSyncAccessHandleWriteThroughBackend() : 0;
++}
++
++// As requestNewCapacityForSyncAccessHandle: the main thread sends, this
++// thread waits for the answer. data stays the caller's until then. In pieces:
++// each goes to the backend as one IPC message, copied on the way.
++std::optional<uint64_t> WorkerFileSystemStorageConnection::writeForSyncAccessHandle(FileSystemHandleIdentifier identifier, FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> data)
++{
++    RefPtr scope = m_scope.get();
++    if (!scope)
++        return std::nullopt;
++
++    if (!m_mainThreadConnection)
++        return std::nullopt;
++
++    static constexpr size_t maximumPieceSize = 16 * MB;
++    uint64_t written = 0;
++    while (written < data.size()) {
++        auto piece = data.subspan(written, std::min<size_t>(data.size() - written, maximumPieceSize));
++        BinarySemaphore semaphore;
++        std::optional<uint64_t> pieceWritten;
++        callOnMainThread([mainThreadConnection = m_mainThreadConnection, identifier, accessHandleIdentifier, pieceOffset = offset + written, piece, &pieceWritten, &semaphore]() {
++            auto mainThreadCallback = [&pieceWritten, &semaphore](auto result) {
++                pieceWritten = result;
++                semaphore.signal();
++            };
++            mainThreadConnection->writeForSyncAccessHandle(identifier, accessHandleIdentifier, pieceOffset, piece, WTF::move(mainThreadCallback));
++        });
++        {
++            JSC::VMBlockingScope blockingScope(scope->vm());
++            semaphore.wait();
++        }
++        if (!pieceWritten) {
++            if (!written)
++                return std::nullopt;
++            break;
++        }
++        written += *pieceWritten;
++        if (*pieceWritten < piece.size())
++            break;
++    }
++    return written;
++}
++
++void WorkerFileSystemStorageConnection::writeForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t, std::span<const uint8_t>, WriteForSyncAccessHandleCallback&& callback)
++{
++    ASSERT_NOT_REACHED();
++    return callback(std::nullopt);
++}
++#endif
++
+ void WorkerFileSystemStorageConnection::addGlobalIdentifierReference(ClientOrigin&& origin, FileSystemHandleGlobalIdentifier globalIdentifier)
+ {
+     callOnMainThread([mainThreadConnection = m_mainThreadConnection, origin = crossThreadCopy(WTF::move(origin)), globalIdentifier] mutable {
+diff --git a/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.h b/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.h
+index 7a5bb469d0..5e93771b17 100644
+--- a/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.h
++++ b/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.h
+@@ -49,6 +49,10 @@ public:
+     void registerSyncAccessHandle(FileSystemSyncAccessHandleIdentifier, FileSystemSyncAccessHandle&);
+     void closeSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier);
+     std::optional<uint64_t> requestNewCapacityForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t newCapacity);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    uint64_t minimumSizeOfSyncAccessHandleWriteThroughBackend() const final;
++    std::optional<uint64_t> writeForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t offset, std::span<const uint8_t>);
++#endif
+     using CallbackIdentifier = WorkerFileSystemStorageConnectionCallbackIdentifier;
+     void didIsSameEntry(CallbackIdentifier, ExceptionOr<bool>&&);
+     void didGetHandle(CallbackIdentifier, ExceptionOr<Ref<FileSystemHandleCloseScope>>&&);
+@@ -83,6 +87,9 @@ private:
+     void unregisterSyncAccessHandle(FileSystemSyncAccessHandleIdentifier) final;
+     void invalidateAccessHandle(FileSystemSyncAccessHandleIdentifier) final;
+     void requestNewCapacityForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t, RequestCapacityCallback&&) final;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    void writeForSyncAccessHandle(FileSystemHandleIdentifier, FileSystemSyncAccessHandleIdentifier, uint64_t, std::span<const uint8_t>, WriteForSyncAccessHandleCallback&&) final;
++#endif
+     void createWritable(ScriptExecutionContextIdentifier, FileSystemHandleIdentifier, bool keepExistingData, StreamCallback&&) final;
+     void closeWritable(FileSystemHandleIdentifier, FileSystemWritableFileStreamIdentifier, FileSystemWriteCloseReason, VoidCallback&&) final;
+     void executeCommandForWritable(FileSystemHandleIdentifier, FileSystemWritableFileStreamIdentifier, FileSystemWriteCommandType, std::optional<uint64_t> position, std::optional<uint64_t> size, std::span<const uint8_t> dataBytes, bool hasDataError, VoidCallback&&) final;
+diff --git a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
+index 6003b7cbfd..2bd0b9b36c 100644
+--- a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
++++ b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
+@@ -241,6 +241,7 @@ std::expected<FileSystemSyncAccessHandleInfo, FileSystemStorageError> FileSystem
+     ASSERT(!m_activeSyncAccessHandle);
+     m_activeSyncAccessHandle = SyncAccessHandleInfo { WebCore::FileSystemSyncAccessHandleIdentifier::generate() };
+     uint64_t initialCapacity = valueOrDefault(FileSystem::fileSize(m_path));
++    m_activeSyncAccessHandle->initialSize = initialCapacity;
+     return FileSystemSyncAccessHandleInfo { m_activeSyncAccessHandle->identifier, WTF::move(*ipcHandle), initialCapacity };
+ }
+ 
+@@ -259,6 +260,34 @@ std::optional<FileSystemStorageError> FileSystemStorageHandle::closeSyncAccessHa
+     return std::nullopt;
+ }
+ 
++// PS5: the page's process is the title, whose own writes the console holds
++// back; this process (a payload) writes them for it. Only inside what the
++// page may write: the capacity it was granted (the quota) or the size the
++// file had. The descriptor is this process's own (the page has the one made
++// with the handle), opened at the first such write.
++std::optional<uint64_t> FileSystemStorageHandle::writeForSyncAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> dataBytes)
++{
++    if (!isActiveSyncAccessHandle(accessHandleIdentifier))
++        return std::nullopt;
++
++    CheckedUint64 end = offset;
++    end += dataBytes.size();
++    if (end.hasOverflowed() || end.value() > std::max(m_activeSyncAccessHandle->capacity, m_activeSyncAccessHandle->initialSize))
++        return std::nullopt;
++
++    auto& handle = m_activeSyncAccessHandle->writeHandle;
++    if (!handle) {
++        handle = FileSystem::openFile(m_path, FileSystem::FileOpenMode::ReadWrite);
++        if (!handle)
++            return std::nullopt;
++    }
++
++    if (!handle.seek(offset, FileSystem::FileSeekOrigin::Beginning))
++        return std::nullopt;
++
++    return handle.write(dataBytes);
++}
++
+ std::expected<WebCore::FileSystemWritableFileStreamIdentifier, FileSystemStorageError> FileSystemStorageHandle::createWritable(bool keepExistingData)
+ {
+     RefPtr manager = m_manager.get();
+diff --git a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.h b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.h
+index a1b5771a48..3933508b7b 100644
+--- a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.h
++++ b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.h
+@@ -81,6 +81,7 @@ public:
+ 
+     std::expected<FileSystemSyncAccessHandleInfo, FileSystemStorageError> createSyncAccessHandle();
+     std::optional<FileSystemStorageError> closeSyncAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier);
++    std::optional<uint64_t> writeForSyncAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier, uint64_t offset, std::span<const uint8_t>);
+     std::optional<WebCore::FileSystemSyncAccessHandleIdentifier> LEGACY_NODELETE activeSyncAccessHandle();
+ 
+     std::expected<WebCore::FileSystemWritableFileStreamIdentifier, FileSystemStorageError> createWritable(bool keepExistingData);
+@@ -102,6 +103,11 @@ private:
+     struct SyncAccessHandleInfo {
+         WebCore::FileSystemSyncAccessHandleIdentifier identifier;
+         uint64_t capacity { 0 };
++        // PS5 (writeForSyncAccessHandle): the file's size when the handle was
++        // made, which the page may fill again without asking for capacity,
++        // and this process's own descriptor for the page's larger writes.
++        uint64_t initialSize { 0 };
++        FileSystem::FileHandle writeHandle { };
+     };
+     struct FileHandleWithPath {
+         FileSystem::FileHandle handle;
+diff --git a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
+index 65249b7413..8dce8707b6 100644
+--- a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
++++ b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.cpp
+@@ -1322,6 +1322,21 @@ void NetworkStorageManager::requestNewCapacityForSyncAccessHandle(IPC::Connectio
+     handle->requestNewCapacityForSyncAccessHandle(accessHandleIdentifier, newCapacity, WTF::move(completionHandler));
+ }
+ 
++// PS5: a sync access handle's write, from a page in the browser process
++// (WebFileSystemStorageConnection::writeForSyncAccessHandle).
++void NetworkStorageManager::writeForSyncAccessHandle(IPC::Connection& connection, WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> dataBytes, CompletionHandler<void(std::optional<uint64_t>)>&& completionHandler)
++{
++    ASSERT(!RunLoop::isMain());
++
++    RefPtr handle = m_fileSystemStorageHandleRegistry->getHandle(identifier);
++    if (!handle)
++        return completionHandler(std::nullopt);
++
++    MESSAGE_CHECK_COMPLETION(canConnectionAccessFileSystemHandle(connection.uniqueID(), *handle), connection, completionHandler(std::nullopt));
++
++    completionHandler(handle->writeForSyncAccessHandle(accessHandleIdentifier, offset, dataBytes));
++}
++
+ void NetworkStorageManager::createWritable(IPC::Connection& connection, WebCore::FileSystemHandleIdentifier identifier, bool keepExistingData, CompletionHandler<void(std::expected<WebCore::FileSystemWritableFileStreamIdentifier, FileSystemStorageError>)>&& completionHandler)
+ {
+     ASSERT(!RunLoop::isMain());
+diff --git a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h
+index c93a40dca3..00f0b05d00 100644
+--- a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h
++++ b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.h
+@@ -217,6 +217,7 @@ private:
+     void createSyncAccessHandle(IPC::Connection&, WebCore::FileSystemHandleIdentifier, CompletionHandler<void(std::expected<FileSystemSyncAccessHandleInfo, FileSystemStorageError>)>&&);
+     void closeSyncAccessHandle(IPC::Connection&, WebCore::FileSystemHandleIdentifier, WebCore::FileSystemSyncAccessHandleIdentifier, CompletionHandler<void()>&&);
+     void requestNewCapacityForSyncAccessHandle(IPC::Connection&, WebCore::FileSystemHandleIdentifier, WebCore::FileSystemSyncAccessHandleIdentifier, uint64_t newCapacity, CompletionHandler<void(std::optional<uint64_t>)>&&);
++    void writeForSyncAccessHandle(IPC::Connection&, WebCore::FileSystemHandleIdentifier, WebCore::FileSystemSyncAccessHandleIdentifier, uint64_t offset, std::span<const uint8_t> dataBytes, CompletionHandler<void(std::optional<uint64_t>)>&&);
+     void createWritable(IPC::Connection&, WebCore::FileSystemHandleIdentifier, bool keepExistingData, CompletionHandler<void(std::expected<WebCore::FileSystemWritableFileStreamIdentifier, FileSystemStorageError>)>&&);
+     void closeWritable(IPC::Connection&, WebCore::FileSystemHandleIdentifier, WebCore::FileSystemWritableFileStreamIdentifier, WebCore::FileSystemWriteCloseReason, CompletionHandler<void(std::optional<FileSystemStorageError>)>&&);
+     void executeCommandForWritable(IPC::Connection&, WebCore::FileSystemHandleIdentifier, WebCore::FileSystemWritableFileStreamIdentifier, WebCore::FileSystemWriteCommandType, std::optional<uint64_t> position, std::optional<uint64_t> size, std::span<const uint8_t> dataBytes, bool hasDataError, CompletionHandler<void(std::optional<FileSystemStorageError>)>&&);
+diff --git a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.messages.in b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.messages.in
+index 3ab9ac4a27..b11ea9cae4 100644
+--- a/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.messages.in
++++ b/Source/WebKit/NetworkProcess/storage/NetworkStorageManager.messages.in
+@@ -45,6 +45,7 @@
+     [EnabledBy=FileSystemEnabled] CreateSyncAccessHandle(WebCore::FileSystemHandleIdentifier identifier) -> (std::expected<WebKit::FileSystemSyncAccessHandleInfo, WebKit::FileSystemStorageError> result)
+     [EnabledBy=FileSystemEnabled] CloseSyncAccessHandle(WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier) -> ()
+     [EnabledBy=FileSystemEnabled] RequestNewCapacityForSyncAccessHandle(WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t newCapacity) -> (std::optional<uint64_t> result)
++    [EnabledBy=FileSystemEnabled] WriteForSyncAccessHandle(WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> dataBytes) -> (std::optional<uint64_t> written)
+     [EnabledBy=FileSystemWritableStreamEnabled && FileSystemEnabled] CreateWritable(WebCore::FileSystemHandleIdentifier identifier, bool keepExistingData) -> (std::expected<WebCore::FileSystemWritableFileStreamIdentifier, WebKit::FileSystemStorageError> result)
+     [EnabledBy=FileSystemWritableStreamEnabled && FileSystemEnabled] CloseWritable(WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemWritableFileStreamIdentifier streamIdentifier, enum:bool WebCore::FileSystemWriteCloseReason reason) -> (std::optional<WebKit::FileSystemStorageError> result)
+     [EnabledBy=FileSystemWritableStreamEnabled && FileSystemEnabled] ExecuteCommandForWritable(WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemWritableFileStreamIdentifier streamIdentifier, enum:uint8_t WebCore::FileSystemWriteCommandType type, std::optional<uint64_t> position, std::optional<uint64_t> size, std::span<const uint8_t> dataBytes, bool hasDataError) ->  (std::optional<WebKit::FileSystemStorageError> result)
+diff --git a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+index 839e724e9d..744d98adf1 100644
+--- a/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
++++ b/Source/WebKit/Scripts/webkit/opaque_ipc_types.tracking.in
+@@ -152,6 +152,7 @@
+     [Legacy] MessageParam NetworkSocketChannel.SendString message
+ 
+     [Legacy] MessageParam NetworkStorageManager.ExecuteCommandForWritable dataBytes
++    [Legacy] MessageParam NetworkStorageManager.WriteForSyncAccessHandle dataBytes
+ 
+     [Legacy] MessageParam NetworkTransportSession.SendDatagram datagram
+     [Legacy] MessageParam NetworkTransportSession.StreamSendBytes bytes
+diff --git a/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.cpp b/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.cpp
+index 0808c0c87c..fa452d9d68 100644
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.cpp
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.cpp
+@@ -26,7 +26,11 @@
+ #include "config.h"
+ #include "WebFileSystemStorageConnection.h"
+ 
++#include "AuxiliaryProcess.h"
+ #include "NetworkStorageManagerMessages.h"
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include "PS5WKDebugBuild.h"
++#endif
+ #include <WebCore/ClientOrigin.h>
+ #include <WebCore/ExceptionOr.h>
+ #include <WebCore/FileSystemDirectoryHandle.h>
+@@ -329,4 +333,45 @@ void WebFileSystemStorageConnection::requestNewCapacityForSyncAccessHandle(WebCo
+     connection->sendWithAsyncReply(Messages::NetworkStorageManager::RequestNewCapacityForSyncAccessHandle(identifier, accessHandleIdentifier, newCapacity), WTF::move(completionHandler));
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// Pages in the browser process (PS5WebProcessInTitle.cpp): this process is
++// the title, whose own file writes the console holds back; the
++// NetworkProcess, a payload, writes at the disk's speed. Every write goes to
++// it, small ones too: the console counts each write() call of the title as
++// about 64 KB more than its bytes, and a write costs the disk about a
++// millisecond in either process, more than the round trip.
++// Called on worker threads too: a flag set once at start.
++uint64_t WebFileSystemStorageConnection::minimumSizeOfSyncAccessHandleWriteThroughBackend() const
++{
++    if (!AuxiliaryProcess::ps5WebProcessIsInTitle())
++        return 0;
++#if PS5WK_DEBUG_BUILD
++    // Development builds, for measuring both ways: /data/ps5webkit/opfs-backend-write-min
++    // holds another size in bytes (0: the title writes everything itself). Read once.
++    static const uint64_t minimumSize = [] {
++        unsigned long long size = 1;
++        if (FILE* file = fopen("/data/ps5webkit/opfs-backend-write-min", "r")) {
++            if (fscanf(file, "%llu", &size) != 1)
++                size = 1;
++            fclose(file);
++            WTFLogAlways("[storage] opfs-backend-write-min: sync access handle writes of %llu bytes or more go to the NetworkProcess (0: none)", size);
++        }
++        return static_cast<uint64_t>(size);
++    }();
++    return minimumSize;
++#else
++    return 1;
++#endif
++}
++
++void WebFileSystemStorageConnection::writeForSyncAccessHandle(WebCore::FileSystemHandleIdentifier identifier, WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> dataBytes, WriteForSyncAccessHandleCallback&& completionHandler)
++{
++    RefPtr connection = m_connection;
++    if (!connection)
++        return completionHandler(std::nullopt);
++
++    connection->sendWithAsyncReply(Messages::NetworkStorageManager::WriteForSyncAccessHandle(identifier, accessHandleIdentifier, offset, dataBytes), WTF::move(completionHandler));
++}
++#endif
++
+ } // namespace WebKit
+diff --git a/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.h b/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.h
+index f62c459d66..e8125f6bb7 100644
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.h
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebFileSystemStorageConnection.h
+@@ -76,6 +76,10 @@ private:
+     void createSyncAccessHandle(WebCore::FileSystemHandleIdentifier, WebCore::FileSystemStorageConnection::GetAccessHandleCallback&&) final;
+     void closeSyncAccessHandle(WebCore::FileSystemHandleIdentifier, WebCore::FileSystemSyncAccessHandleIdentifier, EmptyCallback&&) final;
+     void requestNewCapacityForSyncAccessHandle(WebCore::FileSystemHandleIdentifier, WebCore::FileSystemSyncAccessHandleIdentifier, uint64_t newCapacity, RequestCapacityCallback&& completionHandler) final;
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    uint64_t minimumSizeOfSyncAccessHandleWriteThroughBackend() const final;
++    void writeForSyncAccessHandle(WebCore::FileSystemHandleIdentifier, WebCore::FileSystemSyncAccessHandleIdentifier, uint64_t offset, std::span<const uint8_t>, WriteForSyncAccessHandleCallback&&) final;
++#endif
+     void registerSyncAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier, WebCore::ScriptExecutionContextIdentifier) final;
+     void unregisterSyncAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier) final;
+     void invalidateAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier) final;

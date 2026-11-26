@@ -8,6 +8,14 @@
 # fork's platform headers (ps5platform/*.h: AGC, kernel, VideoOut
 # declarations) are added to the include path.
 # Output: build/radv-ps5/install/{lib/libvulkan_radeon.ps5.a,include/vulkan}
+#
+# Patches: port/deps/patches/radv/*.patch always. Debug aids (the AGC submit
+# timing log, 0001-ps5-submit-timing-log.patch: /data/ps5webkit/radv-submit-log)
+# are in port/deps/patches/radv-debug/ and applied only with
+#   RADV_DEBUG_PATCHES=1 port/deps/radv/build-radv.sh
+# RADV is not rebuilt for each release (tools/make-release.sh links whatever
+# build/radv-ps5 holds), so a release must come from a RADV built without
+# them; building again without RADV_DEBUG_PATCHES=1 takes them out.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$ROOT/env.sh"
@@ -29,19 +37,36 @@ export PATH="$VENV/bin:$BREW/opt/bison/bin:$PATH"
 
 if [[ ${1:-} == --clean ]]; then rm -rf "$SRC" "$BLD" "$CLC" "$W/sdkfork"; fi
 mkdir -p "$W"
-# The fork at its pinned revision, then port/deps/patches/radv/*.patch on top.
-# The stamp holds both: a new or changed patch extracts the source again.
-PATCHES="$ROOT/port/deps/patches/radv"
-STAMP="$MESA_REV $(cat "$PATCHES"/*.patch 2>/dev/null | shasum | cut -c1-12)"
+# The fork at its pinned revision, then port/deps/patches/radv/*.patch on top,
+# then, only with RADV_DEBUG_PATCHES=1, port/deps/patches/radv-debug/*.patch
+# (see the header). The stamp holds the revision, the patches and that
+# choice: a new or changed patch, or switching RADV_DEBUG_PATCHES, extracts
+# the source again, and builds it from scratch: git archive gives the files
+# the commit's dates, older than the objects, so ninja would keep the old
+# objects (a patch taken out would stay compiled in).
+RADV_DEBUG_PATCHES="${RADV_DEBUG_PATCHES:-0}"
+PATCH_DIRS=("$ROOT/port/deps/patches/radv")
+if [[ $RADV_DEBUG_PATCHES == 1 ]]; then
+    PATCH_DIRS+=("$ROOT/port/deps/patches/radv-debug")
+fi
+PATCH_FILES=()
+for d in "${PATCH_DIRS[@]}"; do
+    for p in "$d"/*.patch; do
+        if [[ -f $p ]]; then
+            PATCH_FILES+=("$p")
+        fi
+    done
+done
+STAMP="$MESA_REV debug-patches=$RADV_DEBUG_PATCHES $(cat ${PATCH_FILES[@]+"${PATCH_FILES[@]}"} /dev/null | shasum | cut -c1-12)"
 if [[ ! -f $SRC/.revision || $(<"$SRC/.revision") != "$STAMP" ]]; then
-    rm -rf "$SRC"; mkdir -p "$SRC"
+    rm -rf "$SRC" "$BLD"; mkdir -p "$SRC"
     git -C "$MESA_FORK" archive "$MESA_REV" | tar -x -C "$SRC"
-    for p in "$PATCHES"/*.patch; do
-        [[ -f $p ]] || continue
+    for p in ${PATCH_FILES[@]+"${PATCH_FILES[@]}"}; do
         patch -s -d "$SRC" -p1 < "$p" || { echo "radv: $p does not apply" >&2; exit 1; }
     done
     echo "$STAMP" > "$SRC/.revision"
 fi
+echo "radv: debug patches $([[ $RADV_DEBUG_PATCHES == 1 ]] && echo on || echo off) (RADV_DEBUG_PATCHES=$RADV_DEBUG_PATCHES)"
 if [[ ! -f $W/sdkfork/.revision ]]; then
     rm -rf "$W/sdkfork"; mkdir -p "$W/sdkfork"
     git -C "$SDK_FORK" archive "$SDK_FORK_REV" platform include | tar -x -C "$W/sdkfork"

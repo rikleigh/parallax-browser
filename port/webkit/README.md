@@ -279,7 +279,7 @@ names them; a group the page doesn't know becomes a heading under Advanced.
 | Offer VP9 video (default on; off makes YouTube send H.264) | `PS5WK_MEDIA_VP9=0` when off | page restart |
 | GPU compositing (default on; includes async scrolling) | `/data/ps5webkit/no-compositing` when off | page restart |
 | Hardware video decoding (default on) | `/data/ps5webkit/no-hwdec` when off | browser restart |
-| Pages in the browser process (default on since 2026-11-25; never with Safer browsing): the first WebProcess runs in the title, which gets more CPU (games up to twice as fast), at the price of pauses in the browser's UI on busy pages, a page crash ending the browser, and pages not kept apart from it (`spikes/14-webprocess-in-title/stage3.md`). The page settings above are then browser-restart settings | `/data/ps5webkit/no-pages-in-browser` when off (`pages-in-browser`, which turned it on while it was off by default, is no longer read) | browser restart |
+| Pages in the browser process (default on since 2026-11-25; never with Safer browsing): the first WebProcess runs in the title, which gets more CPU (games up to twice as fast), at the price of a page crash ending the browser and pages not kept apart from it (`spikes/14-webprocess-in-title/stage3.md`). The page settings above are then browser-restart settings | `/data/ps5webkit/no-pages-in-browser` when off (`pages-in-browser`, which turned it on while it was off by default, is no longer read) | browser restart |
 | Sound (default on; off = volume 0) | `/data/ps5webkit/audio-silent` when off | browser restart |
 | Link server on the network (default on) | `/data/ps5webkit/push-off` when off | browser restart |
 | Home page (empty = the built-in start page; also □ on the menu's Home button) | `home-url.txt` in the PS5 user's folder (see *Users and storage*) | none: the next start, Home and new tabs use it |
@@ -402,11 +402,14 @@ and the A/B and logging lines in child.env (`PS5WK_PAINT_ASYNC`,
 `PS5WK_FD_TRACE`, `PS5WK_DECODER_THREADS`, `PS5WK_MEDIA_AV1`, `PS5WK_HWDEC`,
 `PS5WK_PROCESS_SWAPS`, `PS5WK_STILL_FRAME`, `PS5WK_MEDIA_SUSPEND_PREROLLED`,
 `PS5WK_WC_LAYER_LOG`). They still work in child.env,
-and the page leaves them alone. Also not exposed: the GPU compositing knobs
+and the page leaves them alone. `test-urls.txt`, `test-onload.js` and
+`debug-screenshot` work in development builds only (*Build*). Also not exposed: the GPU compositing knobs
 `wc-async-scroll` (above), `wc-gl-cap` (the GL texture cap in MB, default
 160), `wc-scroll-log`, `wc-frame-log`, `wc-scene-stats`, `wc-fan-draws`,
 `pad-scroll-test`, the decoder budget's `vdec-budget` (*Step 2b* below) and
-`POST /restart?scope=crash` (kills the WebProcess, for crash-recovery tests).
+`POST /restart?scope=crash` (kills the WebProcess, for crash-recovery tests;
+with pages in the browser process there is none, so a development build
+crashes the title 1 s later and a release replies 409 with why not).
 
 The ad blocker has its own section in Settings and its own notes in
 ADBLOCK.md; the performance overlay (Settings > *Performance overlay*,
@@ -476,6 +479,132 @@ else the NetworkProcess's `datafree-<pid>`): the first version called
 soon as Settings opened. The webpage cache holds at most 250 MB per user (100 MB
 with under 4 GB free; patch 0076; it was up to 1 GB for the one shared
 cache).
+
+### The title's own file writes are held back (2026-11-26)
+
+The console limits what the title process itself writes to disk, and not
+what a payload writes. Measured on firmware 13.60 with the write test below:
+plain `write()` to a file in `/data/ps5webkit`, from a thread of the title.
+
+| Written by this title process so far (64 MB writes) | Speed |
+| --- | --- |
+| up to about 1.3 GB (1.2 to 1.4 GB from run to run) | 235-250 MB/s |
+| the next 0.5 to 0.6 GB | 22 and 32 MB/s by turns |
+| the next 0.3 to 0.4 GB | 10-11 MB/s |
+| from about 2.25 GB | 1.9-2.3 MB/s: each 64 MB `write()` takes about 30 s |
+
+3 GB took 467 s (486 s through a page's sync access handle). The same test
+in a ps5wk-child task payload: 12.8 s, 239 MB/s, level to the end.
+
+- **It is the process.** A second file in a slowed process starts slowed, as
+  does writing over a file's existing blocks. The main loop's thread, a
+  thread of its own, `pwrite()`, a file opened again every 256 MB and
+  `ftruncate()` first all give the same staircase. A payload reports uid 1
+  as the title does. Only a new title process is fast again.
+- **The thread sleeps in `write()`**: 0.03 s of CPU per 64 MB. The waits
+  come in units of 0.86 s (64 MB writes took 1.12, 1.98 and 2.84 s at the
+  first stage).
+- **`fsync`, `fdatasync`, `O_DIRECT` and `O_SYNC` change nothing.** A sync
+  after every 64 MB took 0 to 10 ms: the bytes are on their way when
+  `write()` returns. `posix_fadvise` is ENOSYS, in a payload too (a title
+  can't call it at all: a raw system call in libc.a).
+- **A `write()` call counts as about 64 KB more than its bytes.** 64 KB
+  writes slowed after 0.65 GB (10,000 calls) and reached 1.0 MB/s at
+  1.2 GB; 4 KB writes slowed after 72-76 MB (19,000 calls) and fell to
+  0.6 MB/s. Bytes written to `/dev/null` don't count (8 GB, then 512 MB to
+  a file at full speed).
+- **Writing slowly stays clear of it; once slowed, waiting helps little.**
+  1 MB writes paced to 18 MB/s ran to 1.8 GB (100 s) without slowing.
+  After a 1.5 GB write that had just slowed, the next write 120 s later
+  began slowed again: at most 150 MB had come back (1 MB/s or less).
+  Deleting the file or reading it back (2.1 GB/s: reads aren't held back)
+  gives nothing back.
+- **Everything else the title writes waits too.** While a thread was
+  slowed, a 4 KB write, `fsync` and rename on the main loop (what the
+  browser's own saves do, `browserdata.c` `writeFileAtomically`) took 0.13
+  to 0.94 s at the first stage and up to 5.8 s at the last (1.0 s on
+  average over 62 of them; 0.03 s while a payload wrote 3 GB instead). That
+  fits the 3 to 11 s the main loop stopped for when such a page was left.
+- **Every write costs about a millisecond here, in any process**: 4 KB
+  writes run at 4.5 MB/s (0.9 ms each), 16 KB at 11.5, 64 KB at 18.7
+  (3.4 ms), 1 MB at 150, 64 MB at 240 MB/s; a payload's 4 KB, 64 KB and
+  64 MB writes run at the same speeds. `/data` is a nullfs mount of
+  `/user/data` with 64 KB blocks.
+- Not known: what in the kernel does it. The title can't read the `vfs.*`
+  sysctls or `statfs` its folders, and `rctl_get_racct` gave errno 2.
+
+What it hit: sync access handles of pages in the browser process, and
+through them the title's saves. Writable streams, IndexedDB, the cache,
+cookies and downloads are written by payloads (the download service and the
+updater are payloads because of this limit).
+
+**The fix (patches-radv 0160).** With pages in the browser process, every
+`write()` of a `FileSystemSyncAccessHandle` goes to the NetworkProcess
+(`NetworkStorageManager::WriteForSyncAccessHandle`), as a writable stream's
+writes do. The worker hands each piece (16 MB at most) to the main thread
+and waits for the answer, as it already does when it asks for more
+capacity. The NetworkProcess writes through a descriptor of its own, only
+inside the capacity the page was granted or the size the file had. Reads,
+`truncate()`, `flush()` and `getSize()` stay on the page's own descriptor,
+whose cursor follows each write. A WebProcess payload writes for itself, as
+before. Measured on the console:
+
+| | Before | With 0160 |
+| --- | --- | --- |
+| 3 GB in 64 MB writes, pages in the browser process | 467-486 s | 14.5 s (212 MB/s), three times in one title process |
+| the title's own writes after those 9 GB | | 1 GB at 246 MB/s: its allowance untouched |
+| 9 GB against the 8 GiB quota | | QuotaExceededError at 8192 MB after 38.6 s; the link server answered in 0.03 s throughout |
+| leaving the page 1 GB into a write | the main loop stopped for 3 to 11 s | the next page shown 0.3 s later, no `[stall]` line |
+| 4 KB / 16 KB / 64 KB / 1 MB writes, before any slowing | 0.88 / 1.37 / 3.3 ms / 160 MB/s | 1.00 / 1.66 / 3.8 ms / 142 MB/s |
+| 3 GB with pages in their own process | 12.6 s | 12.6 s |
+
+Small writes take 12 to 21% longer through the NetworkProcess than the
+title's own did before they were slowed (timed to 0.1 s over 16 to 128 MB);
+they go that way too because each call uses up the title's allowance as
+64 KB would. Development builds:
+`/data/ps5webkit/opfs-backend-write-min` (read at start) holds another
+smallest size in bytes that goes to the NetworkProcess, `0` for none (the
+title writes everything, as before 0160).
+
+`test/browser/opfs-sync-rw.html` checks that writes land where one
+descriptor would put them (sizes on both sides of 64 KB and 16 MB, with
+and without `{ at }`, shared buffers, `truncate()`, a second handle,
+`getFile()`): 19 of 20 with either writer. Two things it shows are not
+0160's, and are the same without it and in a WebProcess payload:
+
+- **Bytes a file never had written are not always zero.** After a write
+  that starts past the end of the file, the rest of the 64 KB block the old
+  end was in, and the start of the block the write begins in, read back as
+  other data, different from run to run (49,000 bytes in the test). Whole
+  blocks in between read as zeros. Not looked into further: it may be what
+  the disk blocks held before.
+- **Reading the `File` from `getFile()` right after writing sometimes fails**
+  with NotFoundError: 4 of 16 runs without 0160 and 3 of 16 with it, pages
+  in their own process.
+
+Also seen: a 1 GB writable stream took about a minute from its last write
+to closed (its file is copied into place then).
+
+**Not changed: the browser's saves still run on the main loop.** They only
+wait when something has used up the title's allowance, which pages no
+longer can through OPFS. Moving them means a writer thread with a queue in
+`browserdata.c` (and `settings.c` `writeAtomically`), the newest contents
+per file winning, and a flush before every way out: the wind-down, the
+restart for an update, `POST /browser/save`, and the relaunch that reads
+`session.json`. That is more than one place to get wrong.
+
+**The write test** (development builds only; `apps/common/writetest.c`
+lists what it can vary): `POST /debug/write-test` on the link server writes
+N MB to `ps5wk-write-test.bin` in a folder with plain `write()` and logs a
+`[writetest]` line per 64 MB: MB/s, the time in `write()` and `fsync`, and
+the writing thread's CPU time and context switches. `proc=payload` runs the
+same test in a ps5wk-child task payload, `thread=main` on the main loop,
+`probe=1` also times one small save a second on the main loop.
+`GET /debug/write-test` gives the lines.
+
+    port/webkit/test/browser/write-test.sh run mb=3072               # a fresh title, 3 GB from a thread of it
+    port/webkit/test/browser/write-test.sh run proc=payload mb=3072  # the same from a payload
+    port/webkit/test/browser/write-test.sh matrix base               # both, and a payload with the title's uid
 
 ## Tabs, bookmarks, history
 
@@ -632,7 +761,11 @@ no sandboxed frame, so both work there. Only http(s) links, only with the
 pointer shown (a link focused with the D-pad is not known to the browser
 when it is in another site's frame), and no `Referer` is sent. The link is
 the one WebKit's hit test reports (`mouse-target-changed`, frames included),
-kept with each tab's view. Test page: `test/input/hold-link.html`.
+kept with each tab's view. Test page: `test/input/hold-link.html`. So that
+the hold can be told from a click, X over such a link now clicks when it
+comes back up, not when it goes down (`wpe_display_ps5_set_pointer_over_link`;
+moved off the link before then, it is an ordinary press). Off links, and the
+touchpad's press, click as before.
 
 **Pop-ups** (2026-11-25). A page that opens
 a new window by itself, without a press (`window.open()` from a timer or at
@@ -641,7 +774,8 @@ window by script), gets none, and a notice says so: "Pop-up blocked", and
 under it "To allow pop-ups on example.com: Options, then Settings". The
 notice comes once for a page, then at most every 30 s; the log has the
 first five and every 100th (`browser: pop-up without a press blocked (N on
-this page): <address>`). While that page is shown, Settings (the menu's ⚙)
+this page): <address>`; the address in development builds only, see
+*Build*). While that page is shown, Settings (the menu's ⚙)
 opens on **Ads & privacy** with *Allow pop-ups on example.com* focused
 (`parallax://settings#ads/popSiteButton`); the row shows how many were
 blocked and the last address. An allowed site's pop-ups open in a new tab
@@ -1648,6 +1782,16 @@ BLD=$PWD/toolchain/wpe-webkit/build-cpu port/webkit/apps/title/package.sh
   `titlert.c` sends stdout to `/download0/ps5browser.log`, and
   `titleradv.c` has what RADV needs from the title. The libSceAgc stub is
   the SDK's.
+- **Development and release builds** (2026-11-26): a build configured with
+  a log host (`PS5WK_LOG_HOST`) is a development build. `apps/CMakeLists.txt`
+  then defines `PS5WK_DEBUG_BUILD=1` for ps5browser and ps5wk-child, next
+  to `PS5WK_UPDATE_TESTING`; WebKit's patches and `package.sh` (dheap,
+  heapprof) use the same macro. Only a development build has the debug
+  aids that files in `/data/ps5webkit` turn on (`debug-userscript.js`,
+  `debug-dialogs`, `debug-screenshot`, the test URL list `test-urls.txt`
+  with `test-onload.js`, ...), and only it puts page and link addresses in the
+  new-window, held-X and beforeunload log lines (a release logs the event
+  without them). `tools/make-release.sh` builds with no log host.
 
 ## Patches (`patches/`, applied in order by `build.sh src`)
 
@@ -4084,7 +4228,15 @@ results load).
   handlers on an alternate signal stack (every thread gets one through
   `--wrap=pthread_create`) print one report and `_exit(70)`, so a crashing
   payload no longer reaches the system crash reporter (suspected in two
-  console power-offs after WebProcess crashes):
+  console power-offs after WebProcess crashes). The browser title has the
+  same handlers (`apps/title/titlecrash.c`) but ends with a SIGKILL of its
+  own after the report, with `_exit` only if that comes back: on
+  2026-11-26 an aborted title (a page out of JS heap, pages in the browser
+  process) reached `_exit(70)` and stayed, its main loop dead, for minutes.
+  A watchdog thread, woken by the handler, SIGKILLs it 8 s later if the
+  handler hasn't ended it (`... the crash handler has not ended the title:
+  SIGKILL from the watchdog`); the report's last line is otherwise
+  `report done: SIGKILL to the title`:
 
       [crash web5 pid 145] signal 11 (SIGSEGV) code 1 addr 0x... pc 0x... (elf +0x...) sp 0x... thread 0x...
       [crash web5 pid 145] stack: +0x... +0x...   (stack words after a call instruction, innermost first)
@@ -4131,7 +4283,9 @@ results load).
   compositing). Fixed in 0014; `ps5wk-shot` keeps the watch page up for 30 s
   showing the player's "Your browser can't play this video". The title
   shows an error page instead of reloading after a second WebProcess crash
-  on the same address within 30 s.
+  on the same address with no navigation in between but its own reload, or
+  within 30 s (2026-11-26: the 30 s alone let a page that took longer to
+  crash reload without end).
   Still open: `Error receiving data: Bad file descriptor` (and the earlier
   `Connection reset by peer`) on YouTube's main document in the title, both
   at the moment a swapped-out WebProcess died and the NetworkProcess saw its

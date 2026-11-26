@@ -1,32 +1,96 @@
+diff --git a/Source/JavaScriptCore/runtime/ArrayBuffer.h b/Source/JavaScriptCore/runtime/ArrayBuffer.h
+index f917b69579..4eb9d90ec9 100644
+--- a/Source/JavaScriptCore/runtime/ArrayBuffer.h
++++ b/Source/JavaScriptCore/runtime/ArrayBuffer.h
+@@ -108,6 +108,32 @@ public:
+ 
+     BufferMemoryHandle* memoryHandle() const { return m_memoryHandle.get(); }
+ 
++    // PS5: which one object counts these bytes as its heap's extra memory. Every agent a shared
++    // buffer or shared WebAssembly memory is posted to wraps it in objects of its own heap, and
++    // when each of them counted it a game's 2 GB shared memory weighed 2 GB in each of ~20 worker
++    // heaps (nfsu2.xyz, 2026-11-24); when none did, a page that keeps making and dropping large
++    // shared buffers gave no heap a reason to collect them. So the first object to report them
++    // claims them: the creator's, since nothing else can see the contents before it does (a shared
++    // WebAssembly memory claims them when it adopts its memory, a SharedArrayBuffer when its
++    // buffer is first referenced from its heap). The others count only themselves. The claimer
++    // gives the claim back when it is destroyed, and one of the others takes it over the next time
++    // its heap measures it (a full collection, or a visit of the memory), so the bytes stay counted
++    // in one heap after the creator's goes away. The owner is only compared, never followed.
++    bool claimGCAccounting(const void* owner)
++    {
++        const void* current = m_gcAccountingOwner.load(std::memory_order_relaxed);
++        if (current == owner)
++            return true;
++        if (current)
++            return false;
++        return m_gcAccountingOwner.compare_exchange_strong(current, owner);
++    }
++    void releaseGCAccounting(const void* owner)
++    {
++        const void* expected = owner;
++        m_gcAccountingOwner.compare_exchange_strong(expected, nullptr);
++    }
++
+     static constexpr ptrdiff_t offsetOfSizeInBytes() { return OBJECT_OFFSETOF(SharedArrayBufferContents, m_sizeInBytes); }
+     
+ private:
+@@ -135,6 +161,7 @@ private:
+     size_t m_maxByteLength;
+     bool m_hasMaxByteLength : 1 { false };
+     Mode m_mode : 1 { Mode::Default };
++    std::atomic<const void*> m_gcAccountingOwner { nullptr }; // PS5: see claimGCAccounting()
+ };
+ 
+ class ArrayBufferContents final {
 diff --git a/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp b/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp
-index 9f38559bea..422d721646 100644
+index 9f38559bea..bb4fa16f8e 100644
 --- a/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp
 +++ b/Source/JavaScriptCore/wasm/js/JSWebAssemblyMemory.cpp
-@@ -274,6 +274,18 @@ JSObject* JSWebAssemblyMemory::type(JSGlobalObject* globalObject)
- }
+@@ -40,6 +40,25 @@ namespace JSC {
  
+ const ClassInfo JSWebAssemblyMemory::s_info = { "WebAssembly.Memory"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSWebAssemblyMemory) };
  
 +// PS5: a shared memory (WebAssembly threads) is wrapped by a JSWebAssemblyMemory in every worker
 +// it is posted to, and each wrapper counted the whole memory as its heap's extra memory: a game's
 +// 2 GB shared memory made each of its ~20 workers' heaps look 2-4 GB, so each collected only after
 +// close to 1 GB of its own garbage (MarkedBlocks), and the title's heap grew ~400 MB a minute
-+// (nfsu2.xyz, 2026-11-24). No one heap's collection can free a shared memory (every worker holding
-+// it keeps it alive), so it is left out of the GC's accounting. Non-shared memories are counted
-+// as before.
-+static bool countsAsExtraMemory(const Wasm::Memory& memory)
++// (nfsu2.xyz, 2026-11-24). Counted nowhere, a page that keeps making and dropping shared memories
++// gave no heap a reason to collect them. Now one wrapper or buffer in the process counts it, the
++// one that claimed its contents (SharedArrayBufferContents::claimGCAccounting()): the creator's
++// wrapper, which claims them in adopt(), before the memory can be posted. A wrapper that comes
++// later takes the claim over when it visits the memory after the claimer is destroyed. The
++// memory's own buffers do not count it again. Non-shared memories are counted as before.
++static bool countsAsExtraMemory(JSWebAssemblyMemory* wrapper)
 +{
-+    return memory.sharingMode() != MemorySharingMode::Shared;
++    auto& memory = wrapper->memory();
++    if (memory.sharingMode() != MemorySharingMode::Shared)
++        return true;
++    auto* shared = memory.shared();
++    return !shared || shared->claimGCAccounting(wrapper);
 +}
 +
- void JSWebAssemblyMemory::growSuccessCallback(VM& vm, PageCount oldPageCount, PageCount newPageCount)
+ JSWebAssemblyMemory* JSWebAssemblyMemory::create(VM& vm, Structure* structure)
  {
-     if (m_buffer) {
-@@ -296,14 +308,16 @@ void JSWebAssemblyMemory::growSuccessCallback(VM& vm, PageCount oldPageCount, Pa
+     auto* memory = new (NotNull, allocateCell<JSWebAssemblyMemory>(vm)) JSWebAssemblyMemory(vm, structure);
+@@ -51,6 +70,11 @@ void JSWebAssemblyMemory::adopt(Ref<Wasm::Memory>&& memory)
+ {
+     m_memory.swap(memory);
+     ASSERT(m_memory->refCount() == 1);
++    // PS5: the creator of a shared memory adopts it before anything can post it, so it claims the
++    // contents and its heap is told of the whole memory now (countsAsExtraMemory() above). Every
++    // later adopter of the same contents finds them claimed and reports nothing.
++    if (m_memory->sharingMode() == MemorySharingMode::Shared && m_memory->shared() && countsAsExtraMemory(this))
++        heap()->reportExtraMemoryAllocated(this, m_memory->size());
+ }
+ 
+ Structure* JSWebAssemblyMemory::createStructure(VM& vm, JSGlobalObject* globalObject, JSValue prototype)
+@@ -296,19 +320,24 @@ void JSWebAssemblyMemory::growSuccessCallback(VM& vm, PageCount oldPageCount, Pa
          }
      }
  
 -    vm.heap.reportExtraMemoryAllocated(this, newPageCount.bytes() - oldPageCount.bytes());
-+    if (countsAsExtraMemory(memory()))
++    if (countsAsExtraMemory(this))
 +        vm.heap.reportExtraMemoryAllocated(this, newPageCount.bytes() - oldPageCount.bytes());
  }
  
@@ -35,17 +99,25 @@ index 9f38559bea..422d721646 100644
      Base::finishCreation(vm);
      ASSERT(inherits(info()));
 -    vm.heap.reportExtraMemoryAllocated(this, memory().size());
-+    if (countsAsExtraMemory(memory()))
++    if (countsAsExtraMemory(this))
 +        vm.heap.reportExtraMemoryAllocated(this, memory().size());
  }
  
  void JSWebAssemblyMemory::destroy(JSCell* cell)
-@@ -320,7 +334,8 @@ void JSWebAssemblyMemory::visitChildrenImpl(JSCell* cell, Visitor& visitor)
+ {
+     auto memory = static_cast<JSWebAssemblyMemory*>(cell);
++    // PS5: another wrapper of a shared memory can count it now (countsAsExtraMemory()).
++    if (auto* shared = memory->memory().shared())
++        shared->releaseGCAccounting(memory);
+     memory->JSWebAssemblyMemory::~JSWebAssemblyMemory();
+ }
+ 
+@@ -320,7 +349,8 @@ void JSWebAssemblyMemory::visitChildrenImpl(JSCell* cell, Visitor& visitor)
  
      Base::visitChildren(thisObject, visitor);
      visitor.append(thisObject->m_bufferWrapper);
 -    visitor.reportExtraMemoryVisited(thisObject->memory().size());
-+    if (countsAsExtraMemory(thisObject->memory()))
++    if (countsAsExtraMemory(thisObject))
 +        visitor.reportExtraMemoryVisited(thisObject->memory().size());
  }
  

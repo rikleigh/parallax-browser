@@ -1,0 +1,156 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shared buffer churn</title>
+<pre id="out">running…</pre>
+<script>
+// Whether the garbage collector sees large shared buffers that a page keeps making and dropping
+// (patches-radv 0145, 0146). A shared buffer's bytes count in one heap only, the creator's: before,
+// they counted in no heap at all (so nothing made a collection happen and the memory grew until the
+// process ran out), and before that in every heap it was posted to. Here the main thread makes
+// ?n= shared buffers of ?mb= MB each, touches every page of each so the memory is really used,
+// keeps the last ?keep= alive and drops the rest. ?kind=sab makes SharedArrayBuffers, ?kind=memory
+// shared WebAssembly memories, ?kind=both (the default) alternates. Meanwhile a worker holds one
+// long-lived shared memory of ?holdmb= MB that the main thread made and posted to it, and writes to
+// it every second; with ?workerchurn=1 the worker also churns buffers of its own.
+//
+// What to look for: "collected" (a FinalizationRegistry count of the dropped buffers whose
+// collection has been seen) keeps up with "made", and the WebProcess's memory (the title's memory
+// log) stays flat instead of growing by ?mb= for each one. Without the fix the count stays near 0
+// and the page dies after a few GB. The worker's lines show that its heap, which holds the big
+// memory, does not collect all the time either. Log lines: "SABCHURN ...", "SABCHURN DONE" at the end.
+//
+// It needs crossOriginIsolated (to post the memory to the worker, and for the SharedArrayBuffer
+// global): serve it with Cross-Origin-Opener-Policy: same-origin and
+// Cross-Origin-Embedder-Policy: require-corp, e.g. from port/webkit/test/browser on the Mac:
+//   python3 - <<'EOF'
+//   import http.server as h
+//   class H(h.SimpleHTTPRequestHandler):
+//       def end_headers(self):
+//           self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+//           self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+//           self.send_header("Cache-Control", "no-store")
+//           super().end_headers()
+//   h.ThreadingHTTPServer(("", 8772), H).serve_forever()
+//   EOF
+// The headers are not enough on their own: crossOriginIsolated also needs a secure context, and
+// http://<mac>:8772/ is not one (crossOriginIsolated stays false there). Load the page over https,
+// or from a loopback origin on the console, http://127.0.0.1:<port>/sab-churn.html, with a relay
+// on the console that forwards that port to the Mac's server. From file:// or plain http (not
+// isolated) the main thread's churn still runs, with the worker skipped.
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); if (lines.length > 60) lines.splice(1, 1); out.textContent = lines.join('\n'); console.log('SABCHURN ' + s); }
+
+const params = new URLSearchParams(location.search);
+const MB = 1 << 20;
+const mb = Number(params.get('mb') || 64);
+const n = Number(params.get('n') || 300);
+const keep = Number(params.get('keep') || 2);
+const kind = params.get('kind') || 'both';
+const holdmb = Number(params.get('holdmb') || 1024);
+const workerChurn = params.get('workerchurn') === '1';
+const PAGE = 64 * 1024; // a WebAssembly page
+
+// Shared code for the main thread and the worker (stringified into the worker).
+function churnSetup(say) {
+    let SAB = typeof SharedArrayBuffer === 'function' ? SharedArrayBuffer : null;
+    if (!SAB) {
+        try { SAB = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }).buffer.constructor; } catch (e) { }
+    }
+    let collected = 0;
+    const registry = new FinalizationRegistry(() => { collected++; });
+    function make(kindNow, bytes) {
+        let buffer, holder;
+        if (kindNow === 'memory') {
+            const pages = Math.ceil(bytes / 65536);
+            holder = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+            buffer = holder.buffer;
+        } else {
+            if (!SAB) throw new Error('no SharedArrayBuffer constructor');
+            holder = buffer = new SAB(bytes);
+        }
+        const u8 = new Uint8Array(buffer);
+        for (let i = 0; i < u8.length; i += 4096) u8[i] = 1;
+        registry.register(holder, 0);
+        return holder;
+    }
+    return { make, collected: () => collected, hasSAB: !!SAB };
+}
+
+const workerSource = `
+const say = s => postMessage(s);
+${churnSetup.toString()}
+let held, view;
+onmessage = async e => {
+    if (e.data.memory) {
+        held = e.data.memory;
+        view = new Int32Array(held.buffer);
+        say('worker: holds a shared memory of ' + (held.buffer.byteLength / ${MB}) + ' MB');
+        let tick = 0;
+        setInterval(() => { for (let i = 0; i < view.length; i += 1024) view[i] = tick; tick++; }, 1000);
+        return;
+    }
+    if (e.data.churn) {
+        const c = churnSetup(say);
+        const live = [];
+        const t0 = performance.now();
+        for (let i = 1; i <= e.data.n; i++) {
+            live.push(c.make(i & 1 ? 'sab' : 'memory', e.data.mb * ${MB}));
+            if (live.length > e.data.keep) live.shift();
+            if (i % 10 === 0) {
+                say('worker: made ' + i + ' (' + (i * e.data.mb) + ' MB), collected ' + c.collected() + ', ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s');
+                await new Promise(r => setTimeout(r, 0));
+            }
+        }
+        say('worker: churn done, collected ' + c.collected() + ' of ' + e.data.n);
+    }
+};
+`;
+
+(async () => {
+    say(`crossOriginIsolated ${self.crossOriginIsolated}, SharedArrayBuffer ${typeof SharedArrayBuffer}; ${n} x ${mb} MB, kind ${kind}, keep ${keep}, worker holds ${holdmb} MB${workerChurn ? ', worker churns too' : ''}`);
+    let worker = null;
+    if (self.crossOriginIsolated) {
+        try {
+            const pages = Math.ceil(holdmb * MB / PAGE);
+            const memory = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+            new Int32Array(memory.buffer).fill(7); // the whole memory in use
+            worker = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+            worker.onerror = e => say('worker error: ' + e.message);
+            worker.onmessage = e => say(e.data);
+            worker.postMessage({ memory });
+            if (workerChurn)
+                worker.postMessage({ churn: true, n, mb, keep });
+        } catch (e) {
+            say('no long-lived shared memory in a worker: ' + e);
+        }
+    } else
+        say('not cross-origin isolated: the worker part is skipped (see the comment at the top for how to serve this page)');
+
+    const c = churnSetup(say);
+    if (!c.hasSAB && kind !== 'memory')
+        say('no SharedArrayBuffer constructor: only shared memories');
+    const live = [];
+    const t0 = performance.now();
+    try {
+        for (let i = 1; i <= n; i++) {
+            const kindNow = kind === 'both' ? (i & 1 ? 'sab' : 'memory') : kind;
+            live.push(c.make(!c.hasSAB ? 'memory' : kindNow, mb * MB));
+            if (live.length > keep)
+                live.shift();
+            if (i % 10 === 0) {
+                say(`main: made ${i} (${i * mb} MB), collected ${c.collected()}, ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+                await new Promise(r => setTimeout(r, 0));
+            }
+        }
+    } catch (e) {
+        say('main: stopped: ' + e);
+    }
+    // Let the last collections and their finalizers come.
+    for (let s = 0; s < 5; s++) {
+        await new Promise(r => setTimeout(r, 1000));
+        say(`main: after ${s + 1} s, collected ${c.collected()} of ${n}`);
+    }
+    say('DONE');
+})();
+</script>

@@ -1,8 +1,8 @@
 diff --git a/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h b/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h
-index 1bd8c6f472..c63fc14f0b 100644
+index 1bd8c6f472..78e079ce26 100644
 --- a/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h
 +++ b/Source/JavaScriptCore/heap/GCIncomingRefCountedSetInlines.h
-@@ -30,6 +30,21 @@
+@@ -30,6 +30,24 @@
  
  namespace JSC {
  
@@ -10,12 +10,15 @@ index 1bd8c6f472..c63fc14f0b 100644
 +// shared WebAssembly memory's buffer) is referenced from every worker it is posted to, and counting
 +// its whole length in each of their heaps made a game's 2 GB shared memory a 2 GB "allocation" in
 +// each of ~20 workers: each then collected only after close to 1 GB of its own garbage (nfsu2.xyz,
-+// 2026-11-24). No one heap's collection can free it, so it counts as its object only.
++// 2026-11-24). Its bytes count in one heap only, that of the object that claimed them (usually the
++// creator's, see SharedArrayBufferContents::claimGCAccounting()); elsewhere it counts as its object.
++// A buffer that was not the claimer takes the claim over here once the claimer is gone, at its
++// heap's next full collection (sweep() measures every buffer again then).
 +template<typename T>
 +inline size_t gcIncomingSizeEstimateInBytes(const T* object)
 +{
-+    if constexpr (requires { object->isShared(); }) {
-+        if (object->isShared())
++    if constexpr (requires { object->countsItsBytesInGCAccounting(); }) {
++        if (!object->countsItsBytesInGCAccounting())
 +            return sizeof(T);
 +    }
 +    return object->gcSizeEstimateInBytes();
@@ -24,7 +27,7 @@ index 1bd8c6f472..c63fc14f0b 100644
  template<typename T>
  GCIncomingRefCountedSet<T>::GCIncomingRefCountedSet()
      : m_bytes(0)
-@@ -57,7 +72,7 @@ bool GCIncomingRefCountedSet<T>::addReference(JSCell* cell, T* object)
+@@ -57,7 +75,7 @@ bool GCIncomingRefCountedSet<T>::addReference(JSCell* cell, T* object)
      }
      object->m_needsFilteringIncomingReferences = true;
      m_vector.append(object);
@@ -33,7 +36,7 @@ index 1bd8c6f472..c63fc14f0b 100644
      ASSERT(object->isDeferred());
      ASSERT(object->numberOfIncomingReferences());
      return true;
-@@ -84,7 +99,7 @@ void GCIncomingRefCountedSet<T>::sweep(VM& vm, CollectionScope collectionScope)
+@@ -84,7 +102,7 @@ void GCIncomingRefCountedSet<T>::sweep(VM& vm, CollectionScope collectionScope)
  
      size_t preciseBytes = 0;
      m_vector.removeAllMatching([&](T* object) {
@@ -43,7 +46,7 @@ index 1bd8c6f472..c63fc14f0b 100644
          ASSERT(object->numberOfIncomingReferences());
          if (!filter(object)) {
 diff --git a/Source/JavaScriptCore/heap/Heap.cpp b/Source/JavaScriptCore/heap/Heap.cpp
-index f1b51e2d7f..b4a5d2db9e 100644
+index f1b51e2d7f..bf084635b4 100644
 --- a/Source/JavaScriptCore/heap/Heap.cpp
 +++ b/Source/JavaScriptCore/heap/Heap.cpp
 @@ -666,7 +666,7 @@ void Heap::addReference(JSCell* cell, ArrayBuffer* buffer)
@@ -51,7 +54,52 @@ index f1b51e2d7f..b4a5d2db9e 100644
      if (m_arrayBuffers.addReference(cell, buffer)) {
          collectIfNecessaryOrDefer();
 -        didAllocate(buffer->gcSizeEstimateInBytes());
-+        didAllocate(gcIncomingSizeEstimateInBytes(buffer)); // PS5: shared buffers as their object (GCIncomingRefCountedSetInlines.h)
++        didAllocate(gcIncomingSizeEstimateInBytes(buffer)); // PS5: a shared buffer's bytes in one heap only (GCIncomingRefCountedSetInlines.h)
      }
  }
  
+diff --git a/Source/JavaScriptCore/runtime/ArrayBuffer.cpp b/Source/JavaScriptCore/runtime/ArrayBuffer.cpp
+index 7e21d6b8ae..9be4f095d6 100644
+--- a/Source/JavaScriptCore/runtime/ArrayBuffer.cpp
++++ b/Source/JavaScriptCore/runtime/ArrayBuffer.cpp
+@@ -658,7 +658,13 @@ RefPtr<ArrayBuffer> ArrayBuffer::tryCreateShared(VM& vm, size_t numElements, uns
+     return createShared(SharedArrayBufferContents::create({ memory, sizeInBytes.value() }, maxByteLength, WTF::move(handle), nullptr, SharedArrayBufferContents::Mode::Default));
+ }
+ 
+-ArrayBuffer::~ArrayBuffer() { }
++ArrayBuffer::~ArrayBuffer()
++{
++    // PS5: gives back the claim on shared contents, so that another heap's buffer on them can count
++    // them (SharedArrayBufferContents::claimGCAccounting()).
++    if (auto* shared = m_contents.m_shared.get())
++        shared->releaseGCAccounting(this);
++}
+ 
+ std::expected<int64_t, GrowFailReason> SharedArrayBufferContents::grow(VM& vm, size_t newByteLength, bool requirePageMultiple)
+ {
+diff --git a/Source/JavaScriptCore/runtime/ArrayBuffer.h b/Source/JavaScriptCore/runtime/ArrayBuffer.h
+index 4eb9d90ec9..48e8180f61 100644
+--- a/Source/JavaScriptCore/runtime/ArrayBuffer.h
++++ b/Source/JavaScriptCore/runtime/ArrayBuffer.h
+@@ -335,6 +335,8 @@ public:
+     inline bool isResizableNonShared() const { return m_contents.isResizableNonShared(); }
+ 
+     inline size_t gcSizeEstimateInBytes() const;
++    // PS5: false for a shared buffer whose bytes another object counts (SharedArrayBufferContents::claimGCAccounting()).
++    inline bool countsItsBytesInGCAccounting() const;
+ 
+     JS_EXPORT_PRIVATE RefPtr<ArrayBuffer> slice(double begin, double end) const;
+     JS_EXPORT_PRIVATE RefPtr<ArrayBuffer> slice(double begin) const;
+@@ -436,6 +438,12 @@ size_t ArrayBuffer::gcSizeEstimateInBytes() const
+     return sizeof(ArrayBuffer) + byteLength();
+ }
+ 
++bool ArrayBuffer::countsItsBytesInGCAccounting() const
++{
++    SharedArrayBufferContents* shared = m_contents.m_shared.get();
++    return !shared || shared->claimGCAccounting(this);
++}
++
+ void ArrayBuffer::pin()
+ {
+     m_pinCount++;

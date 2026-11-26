@@ -3,7 +3,10 @@
  * ps5wk-shot). A payload that dies from a signal is crash-reported by the
  * system (a core of a ~600 MB process), which is the prime suspect for two
  * console shutdowns. The handlers print one report to stderr (the elfldr
- * connection, relayed to the title log) and _exit(70) instead.
+ * connection, relayed to the title log) and _exit(70) instead. In the
+ * browser title (titlecrash.c) the report also goes to its log and the
+ * title then SIGKILLs itself, watched by a thread that does it anyway if the
+ * handler hangs (crashguard.c).
  */
 #pragma once
 

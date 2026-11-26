@@ -1,5 +1,12 @@
 # Spike 14, stage 3: pages in the browser process by default (2026-11-16)
 
+**2026-11-26: the first con below no longer applies.** The owner reports
+that busy pages no longer make the menu, the pointer and clicks pause since
+everything draws on RADV (0.3.0: no ps5-opengl). Not measured again with
+the stall log here. The other two cons stand: a page that crashes ends the
+browser, and pages are not kept apart from it. Settings, the READMEs and
+the release notes no longer name the pauses.
+
 **2026-11-25: the default again.** Pages run in the browser process unless
 Settings' "Pages in the browser process" is off
 (`/data/ps5webkit/no-pages-in-browser`). Safer browsing always uses

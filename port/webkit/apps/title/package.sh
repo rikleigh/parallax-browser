@@ -79,14 +79,27 @@ fi
 # in direct memory, memory report).
 rm -f "$W/obj/app_heap.o"
 D10="$ROOT/spikes/10-title-dmem"
+# Debug aids only in a development build, one with a log host (the release,
+# tools/make-release.sh, packages with PS5WK_LOG_HOST empty), as CMake's
+# PS5WK_DEBUG_BUILD for ps5browser and ps5wk-child: the heap profiler
+# (heapprof.c), dheap's hooks for it, and profiler.c's in-malloc backtraces.
+DEBUG_FLAGS=()
+if [[ -n ${PS5WK_LOG_HOST:-} ]]; then
+    DEBUG_FLAGS=(-DPS5WK_DEBUG_BUILD=1)
+fi
 # 32-byte blocks: WebKit's TZone types fall back to plain malloc here (bmalloc
 # through the system heap) whatever their alignment, and clang stores to
 # 32-byte-aligned types with vmovaps ymm: JSC's Lexer at a 16-byte address
 # was a SIGBUS (code 3, pc = addr) in the title's first JavaScript (adblock.c).
-prospero-clang -std=gnu11 -O2 "${TF[@]}" -DMALLOC_ALIGNMENT=32 -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
-prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
-# The heap profiler (off unless /data/ps5webkit/heap-profile exists).
-prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/heapprof.c" -o "$W/obj/heapprof.o"
+prospero-clang -std=gnu11 -O2 "${TF[@]}" ${DEBUG_FLAGS[@]+"${DEBUG_FLAGS[@]}"} -DMALLOC_ALIGNMENT=32 -I"$D10" -c "$D10/dheap.c" -o "$W/obj/dheap.o"
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" ${DEBUG_FLAGS[@]+"${DEBUG_FLAGS[@]}"} -I"$ROOT/spikes" -I"$D10" -c "$HERE/titlemem.c" -o "$W/obj/titlemem.o"
+# The heap profiler (development builds; off unless
+# /data/ps5webkit/heap-profile exists). Removed otherwise: the link takes
+# every object in $W/obj, and a development build may have left one there.
+rm -f "$W/obj/heapprof.o"
+if (( ${#DEBUG_FLAGS[@]} )); then
+    prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" "${DEBUG_FLAGS[@]}" -I"$ROOT/spikes" -I"$D10" -c "$HERE/heapprof.c" -o "$W/obj/heapprof.o"
+fi
 # The system keyboard: libSceImeDialog's imports, bound once titleime.c
 # loads the module, and a link-only libSceCommonDialog stub for
 # sceCommonDialogInitialize, which the SDK's stubs lack (commondialog-stub.c).
@@ -103,7 +116,7 @@ prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/titlesys.c" -o "$W/obj/
 prospero-clang -std=gnu11 -O2 -Wall -fno-omit-frame-pointer "${TF[@]}" -c "$HERE/titleabort.c" -o "$W/obj/titleabort.o"
 # The sampling profiler (off unless /data/ps5webkit/title-profile exists;
 # ps5browser.c startTitleProfiler).
-prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/../common/profiler.c" -o "$W/obj/profiler.o"
+prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" ${DEBUG_FLAGS[@]+"${DEBUG_FLAGS[@]}"} -c "$HERE/../common/profiler.c" -o "$W/obj/profiler.o"
 prospero-clang -std=gnu11 -O2 -Wall "${TF[@]}" -c "$HERE/../common/ps5unwind.c" -o "$W/obj/ps5unwind.o"
 cp "$SYS/lib/libc.a" "$W/libc-title.a"
 /opt/homebrew/opt/llvm@18/bin/llvm-ar d "$W/libc-title.a" syscalls.o

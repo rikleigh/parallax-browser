@@ -442,12 +442,23 @@ static gboolean scriptingOn;
 static gboolean scriptingDisabled;   /* AB_SCRIPTING_OFF_FLAG */
 static guint siteLookups;
 static double siteLookupMS;          /* the slowest */
-/* Under abLock (/settings.json reads them on the link server's thread). */
+/* Under abLock (/settings.json reads them on the link server's thread).
+ * Never a private page's (private browsing: an ephemeral network session),
+ * and cleared when private browsing starts and ends
+ * (ps5wk_adblock_set_private); /settings.json reports them only for the
+ * page it is asked about. */
 static char* lastSite;               /* the last top-level host set up */
 static guint lastCalls[2], lastCSS, lastProcedurals;
 static AbSiteDataInfo siteInfo;      /* version points into siteData */
 static char* siteInfoVersion;
 static guint sitesSetUp;
+
+/* lock held: no last site. */
+static void forgetLastSite(void)
+{
+    g_clear_pointer(&lastSite, g_free);
+    lastCalls[0] = lastCalls[1] = lastCSS = lastProcedurals = 0;
+}
 
 static void siteEntryFree(gpointer data)
 {
@@ -542,7 +553,7 @@ static void scriptingOff(const char* why)
     scriptingOn = FALSE;
     g_mutex_lock(&abLock);
     sitesSetUp = 0;
-    g_clear_pointer(&lastSite, g_free);
+    forgetLastSite();
     g_mutex_unlock(&abLock);
     spike_log("[adblock] cosmetic filters and scriptlets off (%s); %u site(s) removed", why, hosts);
 }
@@ -591,8 +602,10 @@ static gboolean evictOldest(const char* keep)
     return blocked;
 }
 
-/* Main loop: user content for frames at host below the page at topHost. */
-static void siteSetUp(const char* host, const char* topHost, gboolean mainFrame)
+/* Main loop: user content for frames at host below the page at topHost.
+ * privatePage: a view of private browsing (its host is set up all the same,
+ * but not kept as the last site). */
+static void siteSetUp(const char* host, const char* topHost, gboolean mainFrame, gboolean privatePage)
 {
     const char* variant = strcmp(host, topHost) && ab_site_data_has_ancestor_rules(siteData, topHost) ? topHost : NULL;
     SiteEntry* entry = g_hash_table_lookup(siteEntries, host);
@@ -636,7 +649,9 @@ static void siteSetUp(const char* host, const char* topHost, gboolean mainFrame)
         genericRebuild();
     g_mutex_lock(&abLock);
     sitesSetUp = g_hash_table_size(siteEntries);
-    if (mainFrame) {
+    if (mainFrame && privatePage)
+        forgetLastSite();
+    else if (mainFrame) {
         g_free(lastSite);
         lastSite = g_strdup(host);
         lastCalls[0] = scripts.calls[0];
@@ -682,12 +697,22 @@ static gboolean onDecidePolicyScripting(WebKitWebView* view, WebKitPolicyDecisio
         char* why = g_strdup_printf("allowed site %s shown", allowed);
         scriptingOff(why);
         g_free(why);
-    } else if (scriptingOnNow())
-        siteSetUp(host, topHost, mainFrame);
+    } else if (scriptingOnNow()) {
+        WebKitNetworkSession* session = webkit_web_view_get_network_session(view);
+        siteSetUp(host, topHost, mainFrame, session && webkit_network_session_is_ephemeral(session));
+    }
     g_free(allowed);
     g_free(host);
     g_free(topHost);
     return FALSE;
+}
+
+void ps5wk_adblock_set_private(gboolean enabled)
+{
+    (void)enabled; /* either way, the last site was the other session's */
+    g_mutex_lock(&abLock);
+    forgetLastSite();
+    g_mutex_unlock(&abLock);
 }
 
 void ps5wk_adblock_connect_view(WebKitWebView* view)
@@ -1491,8 +1516,12 @@ char* ps5wk_adblock_json(const char* uri)
     appendJSONString(out, siteInfoVersion);
     g_string_append_printf(out, ",\"hosts\":%u,\"calls\":%u,\"isolatedCalls\":%u,\"cosmetics\":%u,\"procedurals\":%u,\"bytes\":%zu,\"sitesSetUp\":%u,\"site\":",
         siteInfo.hosts, siteInfo.calls[0], siteInfo.calls[1], siteInfo.cosmetics, siteInfo.procedurals, siteInfo.bytes + siteInfo.indexBytes, sitesSetUp);
-    appendJSONString(out, lastSite);
-    g_string_append_printf(out, ",\"siteCalls\":%u,\"siteIsolatedCalls\":%u,\"siteCSS\":%u,\"siteProcedurals\":%u}", lastCalls[0], lastCalls[1], lastCSS, lastProcedurals);
+    /* The last site set up only when it is the page asked about (the page
+     * shown, or none: another device during private browsing). */
+    const gboolean here = host && !g_strcmp0(host, lastSite);
+    appendJSONString(out, here ? lastSite : NULL);
+    g_string_append_printf(out, ",\"siteCalls\":%u,\"siteIsolatedCalls\":%u,\"siteCSS\":%u,\"siteProcedurals\":%u}", here ? lastCalls[0] : 0,
+        here ? lastCalls[1] : 0, here ? lastCSS : 0, here ? lastProcedurals : 0);
     g_string_append(out, ",\"status\":");
     appendJSONString(out, status);
     g_mutex_unlock(&abLock);

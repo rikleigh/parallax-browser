@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>held shared memory</title>
+<pre id="out">running…</pre>
+<script>
+// A long-lived shared memory posted to a worker must not be collected (or its bytes reused) while
+// the worker holds it, even after the main thread dropped every reference of its own and churns
+// enough shared buffers to make collections happen in both heaps (patches-radv 0145, 0146: a shared
+// buffer's bytes count in one heap only). The main thread makes ?holdmb= MB (default 512) shared
+// WebAssembly memory and a SharedArrayBuffer of the same size, fills them with a pattern, posts both
+// to the worker, drops them, then churns ?n= x 64 MB shared buffers (default 600) with gc pressure.
+// The worker checks the pattern in every 4 KB page of both once a second for ?seconds= (default
+// 60), and also churns. A FinalizationRegistry in the worker on its own handles must not fire.
+// Needs crossOriginIsolated (served with COOP/COEP from a secure origin). Logs "SABHELD ...".
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); if (lines.length > 40) lines.splice(1, 1); out.textContent = lines.join('\n'); console.log('SABHELD ' + s); }
+const q = new URLSearchParams(location.search);
+const holdMB = +(q.get('holdmb') || 512), n = +(q.get('n') || 600), seconds = +(q.get('seconds') || 60);
+const MB = 1 << 20;
+const workerSource = `
+let mem, sab, ok = 0, bad = 0, collected = 0;
+const registry = new FinalizationRegistry(() => { collected++; });
+function check(buffer, seed) {
+  const u = new Uint32Array(buffer);
+  let wrong = 0;
+  for (let i = 0; i < u.length; i += 1024) if (u[i] !== ((i * 2654435761 + seed) >>> 0)) wrong++;
+  return wrong;
+}
+onmessage = async (e) => {
+  mem = e.data.mem; sab = e.data.sab;
+  registry.register(mem, 'mem'); registry.register(sab, 'sab');
+  const { seconds } = e.data;
+  const churn = [];
+  for (let s = 1; s <= seconds; s++) {
+    await new Promise(r => setTimeout(r, 1000));
+    for (let k = 0; k < 4; k++) { churn.push(new SharedArrayBuffer(64 << 20)); new Uint8Array(churn[churn.length - 1])[0] = 1; if (churn.length > 2) churn.shift(); }
+    const w1 = check(mem.buffer, 1), w2 = check(sab, 2);
+    if (w1 || w2) bad++; else ok++;
+    if (s % 10 === 0 || w1 || w2) postMessage(s + ' s: pattern ' + (w1 || w2 ? 'WRONG in ' + w1 + ' + ' + w2 + ' pages' : 'intact') + ', collected handles ' + collected);
+  }
+  postMessage('DONE ' + (bad || collected ? 'FAIL' : 'PASS') + ': ' + ok + ' checks intact, ' + bad + ' wrong, handles collected ' + collected);
+};`;
+(async () => {
+  say(`crossOriginIsolated ${self.crossOriginIsolated}; hold ${holdMB} MB x2, churn ${n} x 64 MB, ${seconds} s`);
+  if (!self.crossOriginIsolated) { say('DONE skipped: not cross-origin isolated'); return; }
+  const worker = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+  worker.onmessage = (e) => say('worker: ' + e.data);
+  worker.onerror = (e) => say('worker error: ' + e.message);
+  (() => {
+    const pages = holdMB * MB / 65536;
+    const mem = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+    const sab = new SharedArrayBuffer(holdMB * MB);
+    for (const [buffer, seed] of [[mem.buffer, 1], [sab, 2]]) {
+      const u = new Uint32Array(buffer);
+      for (let i = 0; i < u.length; i += 1024) u[i] = (i * 2654435761 + seed) >>> 0;
+    }
+    worker.postMessage({ mem, sab, seconds });
+  })(); // the main thread keeps no reference
+  const live = [];
+  for (let i = 1; i <= n; i++) {
+    live.push(i & 1 ? new SharedArrayBuffer(64 * MB) : new WebAssembly.Memory({ initial: 1024, maximum: 1024, shared: true }));
+    const b = live[live.length - 1].buffer || live[live.length - 1];
+    const u = new Uint8Array(b); for (let j = 0; j < u.length; j += 4096) u[j] = 1;
+    if (live.length > 2) live.shift();
+    if (i % 100 === 0) { say(`main: churned ${i}`); await new Promise(r => setTimeout(r, 0)); }
+  }
+  say('main: churn done; the worker goes on checking');
+})();
+</script>

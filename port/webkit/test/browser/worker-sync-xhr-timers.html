@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>worker sync XHR and timers</title>
+<pre id="out">running…</pre>
+<script>
+// A worker with pending setTimeouts runs a synchronous XMLHttpRequest to a slow endpoint
+// (?slow=<url>, default /slow?ms=2000 on this page's server: a server that answers after 2 s).
+// No timer callback may run while the sync XHR is in progress (patches-radv 0154: GLib-caused
+// timeouts no longer fire the shared DOM timer). The worker records performance.now() for each
+// timer callback and for the start and end of the XHR; a callback inside [start, end] is a FAIL.
+// Timers are set for 100, 300, 600, 1000, 1500 and 1900 ms after the XHR starts (all due during
+// it), plus setInterval(50). ?rounds=N (default 3). Log lines: "SYNCXHR ...", "SYNCXHR DONE".
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); out.textContent = lines.join('\n'); console.log('SYNCXHR ' + s); }
+const q = new URLSearchParams(location.search);
+const slow = new URL(q.get('slow') || '/slow?ms=2000', location.href).href;
+const rounds = +(q.get('rounds') || 3);
+
+const workerSource = `
+const now = () => performance.now();
+onmessage = (e) => {
+    const { slow, round } = e.data;
+    const events = [];
+    const t0 = now();
+    for (const ms of [100, 300, 600, 1000, 1500, 1900])
+        setTimeout(() => events.push({ what: 'timeout ' + ms, t: now() - t0 }), ms);
+    let ticks = 0;
+    const iv = setInterval(() => { ticks++; events.push({ what: 'interval tick ' + ticks, t: now() - t0 }); }, 50);
+    // Also a promise job and a message to self, which must not run inside the XHR either.
+    Promise.resolve().then(() => events.push({ what: 'microtask', t: now() - t0 }));
+    const xhrStart = now() - t0;
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', slow + (slow.includes('?') ? '&' : '?') + 'r=' + round + '&t=' + Date.now(), false);
+    let status = 0, error = '';
+    try { xhr.send(); status = xhr.status; } catch (err) { error = String(err); }
+    const xhrEnd = now() - t0;
+    setTimeout(() => {
+        clearInterval(iv);
+        postMessage({ round, xhrStart, xhrEnd, status, error, events, ticks });
+    }, 300);
+};`;
+const worker = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+let round = 0, failed = 0;
+worker.onmessage = (e) => {
+    const r = e.data;
+    const inside = r.events.filter(ev => ev.what !== 'microtask' && ev.t >= r.xhrStart && ev.t < r.xhrEnd);
+    const timeouts = r.events.filter(ev => ev.what.startsWith('timeout'));
+    say(`round ${r.round}: sync XHR ${r.xhrStart.toFixed(1)}..${r.xhrEnd.toFixed(1)} ms (${(r.xhrEnd - r.xhrStart).toFixed(0)} ms, status ${r.status}${r.error ? ', ' + r.error : ''}); ` +
+        `timer callbacks inside it: ${inside.length}${inside.length ? ' FAIL ' + inside.map(ev => ev.what + '@' + ev.t.toFixed(1)).join(', ') : ' (ok)'}`);
+    say(`   timeouts ran at: ${timeouts.map(ev => ev.what.slice(8) + '@' + ev.t.toFixed(1)).join(' ')}; interval ticks ${r.ticks}, first at ${(r.events.find(ev => ev.what.startsWith('interval')) || { t: NaN }).t.toFixed(1)}`);
+    if (inside.length || r.status !== 200) failed++;
+    if (++round < rounds) setTimeout(() => worker.postMessage({ slow, round }), 500);
+    else say(`DONE ${failed ? 'FAIL (' + failed + ' of ' + rounds + ' rounds)' : 'PASS'}`);
+};
+say(`slow endpoint ${new URL(slow).pathname}${new URL(slow).search}, ${rounds} rounds`);
+worker.postMessage({ slow, round });
+</script>

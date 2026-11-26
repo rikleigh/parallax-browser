@@ -93,11 +93,23 @@ static unsigned dmap_find(uintptr_t a)
     return lo;
 }
 
-/* 1 if [a, a+len) lies inside one mapping (lock held). */
+/* 1 if every byte of [a, a+len) is in the table: inside one mapping, or a run
+ * of mappings each starting where the one before ends (lock held). The table
+ * never merges neighbours (each has its own physical memory), and a fixed
+ * mmap over 64 MB is committed as several, one per 64 MB piece. */
 static int dmap_contains(uintptr_t a, size_t len)
 {
+    const uintptr_t end = a + len;
     unsigned i = dmap_find(a);
-    return i < ndmaps && dmaps[i].base <= a && a + len <= dmaps[i].base + dmaps[i].len;
+    if (i >= ndmaps || dmaps[i].base > a)
+        return 0;
+    uintptr_t covered = dmaps[i].base + dmaps[i].len;
+    while (covered < end) {
+        if (++i >= ndmaps || dmaps[i].base != covered)
+            return 0;
+        covered += dmaps[i].len;
+    }
+    return 1;
 }
 
 static int dmap_overlaps(uintptr_t a, size_t len)
@@ -342,8 +354,9 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
         return __real_mmap(addr, len, prot, flags, fd, off);
     }
     if (flags & MAP_FIXED) {
-        /* libpas zero-fills by mapping fresh pages over its own: inside one
-         * of ours, clear them instead. */
+        /* libpas zero-fills by mapping fresh pages over its own: inside ours
+         * (one mapping, or the adjacent pieces of a large one), clear them
+         * instead. */
         pthread_mutex_lock(&dmap_lock);
         int inside = dmap_contains((uintptr_t)addr, len);
         pthread_mutex_unlock(&dmap_lock);
@@ -364,7 +377,9 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
          * Larger ones go in 64 MB pieces: a zeroed 512 MB ArrayBuffer
          * (nfsu2.xyz given Chrome's user agent) took flexible memory whole
          * and the next one ended the browser (2026-11-25, the same assert).
-         * A piece that cannot be committed leaves the rest to mmap. */
+         * Each piece is its own mapping in the table; a later zero fill of
+         * the whole range finds them adjacent and clears them in place. A
+         * piece that cannot be committed leaves the rest to mmap. */
         const uintptr_t a = (uintptr_t)addr;
         if (ps5wk_title_mem_exec && !(a & (PAGE - 1)) && !(len & (PAGE - 1))) {
             const size_t piece = (size_t)64 << 20;
@@ -384,9 +399,29 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
                 return addr;
             }
             if (done) {
-                spike_log("[mem] fixed mmap of %.1f MB at %p: %.1f MB in direct memory, the rest to mmap", len / 1048576.0, addr, done / 1048576.0);
                 void* rest = __real_mmap((char*)addr + done, len - done, prot, flags, fd, off);
-                return rest == MAP_FAILED ? MAP_FAILED : addr;
+                if (rest != MAP_FAILED) {
+                    spike_log("[mem] fixed mmap of %.1f MB at %p: %.1f MB in direct memory, the rest to mmap", len / 1048576.0, addr,
+                        done / 1048576.0);
+                    return addr;
+                }
+                /* The caller hears the mmap failed, so the pieces don't stay
+                 * mapped as though it worked: they leave the table, their
+                 * direct memory goes back, and their range is reserved
+                 * again, as dheap.c's segments are when unmapped, so it
+                 * stays out of reach of other mappings (it may be part of
+                 * the caller's reservation). */
+                const int err = errno;
+                pthread_mutex_lock(&dmap_lock);
+                dmap_release_range(a, done);
+                pthread_mutex_unlock(&dmap_lock);
+                void* again = addr;
+                int rc = sceKernelReserveVirtualRange(&again, done, DMEM_MAP_FIXED | DMEM_MAP_NO_OVERWRITE, PAGE);
+                spike_log("[mem] fixed mmap of %.1f MB at %p: %.1f MB in direct memory but mmap failed for the rest (errno %d); "
+                          "the pieces were given back%s",
+                    len / 1048576.0, addr, done / 1048576.0, err, rc ? " and their range could not be reserved again" : "");
+                errno = err;
+                return MAP_FAILED;
             }
         }
         unsigned long long n = __atomic_add_fetch(&fixed_passthrough, 1, __ATOMIC_RELAXED);
@@ -713,10 +748,16 @@ void ps5wk_title_mem_log(const char* milestone)
         if (budget > 0)
             snprintf(webgpu, sizeof webgpu, "; WebGPU buffers and textures %.1f MB (peak %.1f, budget %.0f, %u refused)", used, peak, budget, refused);
     }
-    spike_log("[mem] %s: flexible %.1f MB free; direct memory %.1f MB in use; direct heap %.1f MB mapped (%.1f in use, peak %.1f, %llu libc fallbacks, init %s); "
+    /* The heap's bytes in use: development builds only, since counting them
+     * locks each arena while it walks every chunk (dheap.c). */
+    char heapInUse[32] = "";
+#ifdef PS5WK_DEBUG_BUILD
+    snprintf(heapInUse, sizeof heapInUse, "%.1f in use, ", dheap_in_use() / 1048576.0);
+#endif
+    spike_log("[mem] %s: flexible %.1f MB free; direct memory %.1f MB in use; direct heap %.1f MB mapped (%speak %.1f, %llu libc fallbacks, init %s); "
               "anon mmaps %.1f MB in %u (peak %.1f MB, %llu made, %llu failed, %llu zero fills, %llu passed through; fixed mmaps outside them: %llu to direct memory, %llu to flexible, %.1f MB); "
               "thread stacks %u live, %.1f MB (%u created, %u libc)%s%s",
-        milestone, dmem_flexible_free() / 1048576.0, ps5wk_title_direct_mb(), h.mapped / 1048576.0, dheap_in_use() / 1048576.0, h.peak / 1048576.0, h.libc_fallbacks,
+        milestone, dmem_flexible_free() / 1048576.0, ps5wk_title_direct_mb(), h.mapped / 1048576.0, heapInUse, h.peak / 1048576.0, h.libc_fallbacks,
         h.init_step, (mapped - sb) / 1048576.0, n, peak / 1048576.0, dmap_count, dmap_failures, dmap_zero_fills,
         dmap_passthrough, fixed_direct, fixed_passthrough, fixed_passthrough_bytes / 1048576.0, live, sb / 1048576.0, created, threads_libc,
         webgl, webgpu);

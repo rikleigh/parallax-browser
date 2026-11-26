@@ -33,6 +33,10 @@ char* ps5wk_adblock_json(const char* uri);
 /* Main loop: the page shown is now this view's (the browser's tabs). */
 void ps5wk_adblock_set_web_view(WebKitWebView* view);
 
+/* Main loop: private browsing starts or ends (browserui.c): the last site
+ * the scripts were set up for, which /settings.json shows, is forgotten. */
+void ps5wk_adblock_set_private(gboolean enabled);
+
 /* Every web view (the browser's tabs): uBO Lite's per-site cosmetic
  * filters and scriptlets are registered for each frame about to load
  * (decide-policy; phase 2, adblock-scripting.c). */

@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>large zero fills</title>
+<pre id="out">running…</pre>
+<script>
+// Makes a ?mb= MB ArrayBuffer (default 512), touches every page, then re-zeroes it ?n= times
+// (default 6) with fill(0), and also drops it and makes a fresh one of the same size each round
+// (?fresh=0 to skip that), so libpas zero-fills the same range again by mapping over it. In the
+// title (titlemem.c) a fixed mmap over 64 MB inside its own mappings is a "zero fill" cleared in
+// place: the [mem] line's "zero fills" count should rise each round while "fixed mmaps outside
+// them: N to direct memory" stays where it was after the first allocation. Logs "ZEROFILL ...".
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); out.textContent = lines.join('\n'); console.log('ZEROFILL ' + s); }
+const q = new URLSearchParams(location.search);
+const MB = +(q.get('mb') || 512), N = +(q.get('n') || 6), fresh = q.get('fresh') !== '0';
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function touch(buf) { const u = new Uint8Array(buf); for (let i = 0; i < u.length; i += 4096) u[i] = 1; return u; }
+(async () => {
+  let buf = new ArrayBuffer(MB << 20);
+  let u = touch(buf);
+  say(`made ${MB} MB, touched`);
+  await sleep(3000);
+  for (let i = 0; i < N; i++) {
+    let t = performance.now();
+    u.fill(0);
+    say(`round ${i + 1}: fill(0) ${(performance.now() - t).toFixed(0)} ms`);
+    if (fresh) {
+      u = buf = null;
+      if (typeof gc === 'function') gc();
+      await sleep(1500);
+      t = performance.now();
+      try { buf = new ArrayBuffer(MB << 20); u = touch(buf); say(`round ${i + 1}: fresh ${MB} MB in ${(performance.now() - t).toFixed(0)} ms, first byte ${new Uint8Array(buf)[1]}`); }
+      catch (e) { say(`round ${i + 1}: fresh ${MB} MB failed: ${e}`); }
+    }
+    await sleep(4000);
+  }
+  say('DONE');
+})();
+</script>

@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>crash page</title>
+<pre id="out">running…</pre>
+<script>
+// A page that makes the WebProcess run out of memory, to test what a page crash does (with pages
+// in the browser process it ends the title; in a payload WebProcess it should end only the page).
+// ?how=heap (default): JavaScript objects kept forever, 4 MB worth every 20 ms, until the heap
+// can't grow. ?how=buffers: 64 MB ArrayBuffers, every page written, kept. ?writable=1 first
+// opens an OPFS createWritable() stream (its swap file in the temporary folder) and writes 8 MB
+// without closing it, so a crash leaves that file behind. ?delay=<s> before starting (default 2).
+// Logs "CRASHPAGE ...".
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); if (lines.length > 30) lines.splice(1, 1); out.textContent = lines.join('\n'); console.log('CRASHPAGE ' + s); }
+const q = new URLSearchParams(location.search);
+const how = q.get('how') || 'heap', delay = +(q.get('delay') || 2);
+const keep = [];
+let total = 0;
+function heapStep() {
+  const a = [];
+  for (let i = 0; i < 50000; i++) a.push({ i, s: 'x' + i + '-' + total, n: [i, i + 1] });
+  keep.push(a);
+  total += 4;
+  if (total % 256 === 0) say(`about ${total} MB of objects kept`);
+  setTimeout(heapStep, 20);
+}
+function bufferStep() {
+  try {
+    const b = new Uint8Array(64 << 20);
+    for (let i = 0; i < b.length; i += 4096) b[i] = 1;
+    keep.push(b);
+    total += 64;
+    say(`${total} MB of buffers kept`);
+  } catch (e) { say(`buffer failed at ${total} MB: ${e}; going on with objects`); setTimeout(heapStep, 20); return; }
+  setTimeout(bufferStep, 50);
+}
+(async () => {
+  if (q.get('writable') === '1') {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle('crash-left-open.bin', { create: true });
+      const s = await fh.createWritable();
+      await s.write(new Uint8Array(8 << 20));
+      window.openStream = s;
+      say('an OPFS writable stream is open with 8 MB written (not closed)');
+    } catch (e) { say('writable: ' + e); }
+  }
+  say(`${how} in ${delay} s`);
+  setTimeout(how === 'buffers' ? bufferStep : heapStep, delay * 1000);
+})();
+</script>

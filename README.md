@@ -70,8 +70,6 @@ first-class place for the modern web. It's built on WPE WebKit.
   PS5's CPU than a separate one. "Pages in the browser process" in Settings
   turns that off, and each page then runs in its own process:
   - Pro of the default: games and heavy pages run up to twice as fast.
-  - Con: busy pages make the menu, the pointer and clicks pause now and
-    then. Scrolling carries on through the pauses.
   - Con: a page that crashes closes the whole browser.
   - Con: pages are not kept apart from the browser.
 - Settings, at `parallax://settings`, for Safer browsing, the home page,
@@ -88,8 +86,9 @@ first-class place for the modern web. It's built on WPE WebKit.
 | Left stick | Move the pointer |
 | Right stick | Scroll |
 | Touchpad | Works like a laptop's. One finger moves the pointer, two fingers scroll, and a press clicks. Press and hold to drag. |
-| X | Click, or Enter when the pointer is hidden |
-| O | Back |
+| X | Click, or Enter when the pointer is hidden. Over a link the click happens when you let go. |
+| X, held on a link | Open the link in a new tab (hold for 0.6 seconds). The page gets no click. |
+| O | Back. It happens when you let go. |
 | O, held | Close the browser. A message with a bar appears; keep holding until the bar is full, or let go to stay. |
 | D-pad | Move between links |
 | L1 | Previous form field |
@@ -285,6 +284,13 @@ Mac with Apple silicon. The steps are:
    which makes uploads faster.
 
 `tools/logserver.sh` collects the browser's log on the Mac.
+
+A build with `PS5WK_LOG_HOST` set is a development build
+(`PS5WK_DEBUG_BUILD`, in `port/webkit/apps/CMakeLists.txt`). Only it has
+the debug tools that files in `/data/ps5webkit` turn on, such as
+`debug-userscript.js` and `debug-dialogs`, and only it writes the
+addresses of pages and links into some log lines. A release is built with
+no log host, so it has neither.
 
 **The RADV build** is the release build from 0.3.0
 ([spikes/15-radv-only/README.md](spikes/15-radv-only/README.md)). It

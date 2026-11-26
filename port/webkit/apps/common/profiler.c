@@ -676,6 +676,9 @@ unsigned ps5wk_backtrace_context(const void* ucontext, uintptr_t* out)
     return contextUnwind(ucontext, findThread((uintptr_t)pthread_self()), out);
 }
 
+#ifdef PS5WK_DEBUG_BUILD
+// Only the heap profiler uses these two, so like it they are in development
+// builds only (PS5WK_DEBUG_BUILD).
 // The calling thread's own stack, starting in this function (out[0]). No
 // allocation and no lock: the heap profiler calls it from inside malloc
 // (apps/title/heapprof.c). The thread's stack bounds come from the thread
@@ -708,6 +711,7 @@ size_t ps5wk_backtrace_format_pc(char* buffer, size_t size, uintptr_t pc)
         return (size_t)snprintf(buffer, size, "j:%lx", (unsigned long)pc);
     return (size_t)snprintf(buffer, size, "x%lx", (unsigned long)pc);
 }
+#endif
 
 void ps5wk_backtrace_refresh_jit(void)
 {
