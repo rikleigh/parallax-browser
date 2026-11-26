@@ -569,21 +569,56 @@ title writes everything, as before 0160).
 `test/browser/opfs-sync-rw.html` checks that writes land where one
 descriptor would put them (sizes on both sides of 64 KB and 16 MB, with
 and without `{ at }`, shared buffers, `truncate()`, a second handle,
-`getFile()`): 19 of 20 with either writer. Two things it shows are not
-0160's, and are the same without it and in a WebProcess payload:
+`getFile()`, a writable stream): before 0161-0163, 19 of 20 with either
+writer. What it showed is not 0160's, and was the same without it and in a
+WebProcess payload. Patches 0161-0163 (2026-11-26, evening):
 
-- **Bytes a file never had written are not always zero.** After a write
-  that starts past the end of the file, the rest of the 64 KB block the old
-  end was in, and the start of the block the write begins in, read back as
-  other data, different from run to run (49,000 bytes in the test). Whole
-  blocks in between read as zeros. Not looked into further: it may be what
-  the disk blocks held before.
-- **Reading the `File` from `getFile()` right after writing sometimes fails**
-  with NotFoundError: 4 of 16 runs without 0160 and 3 of 16 with it, pages
-  in their own process.
-
-Also seen: a 1 GB writable stream took about a minute from its last write
-to closed (its file is copied into place then).
+- **Bytes a file never had written were not always zero (0161).** It is the
+  file system, below WebKit: the write test's `gap=1` (below) shows it with
+  plain `write()`, `pwrite()`, a second descriptor and `ftruncate()`, from
+  the title and from a payload. When a file is given a 64 KB disk block
+  past its first 12 (the ones before are fragments, and read as zeros), the
+  parts of it nothing writes read back as whatever the block held: after a
+  file that ended 16 KB into block 38 grows past it, the other 48 KB of
+  that block, and before a write that begins 5 bytes into a new block,
+  those 5. Whole blocks in between are holes and read as zeros. The bytes
+  look random (a byte value 1 time in 256), are the same for the same file
+  in the same folder from run to run and from process to process, and
+  never held the test's marker: `PS5WK-MARKER` records in a file deleted
+  just before (256 MB synced, 8 MB not), or 8 MB of them in the same file
+  cut off with `ftruncate(0)` (synced or not), did not come back. So no
+  bytes a file had written were seen again; most likely it is what an
+  unwritten disk sector reads as through the console's disk encryption. But
+  nothing rules out other files' bytes: treat it as a leak. 0161
+  never leaves it a gap: a sync access handle's write past the end and its
+  `truncate()` to a larger size, and a writable stream's, first write zeros
+  from the old end (WTF's `FileHandle::extendWithZeros`, 4 MB writes). With
+  pages in the browser process the NetworkProcess writes them, in 64 MB
+  steps (a write of no bytes at each step's end), so they don't use up the
+  title's allowance. So `truncate()` to a larger size now costs what writing
+  that many zeros does: 1 GB in 4.7 s with pages in the browser process. Files a page made with gaps before
+  0161 keep them.
+- **Reading the `File` from `getFile()` right after writing sometimes
+  failed** with NotFoundError, pages in their own process (4 of 16 runs).
+  The File's modification time is taken when it is made and compared, to
+  the second, when it is read (WebCore's `FileStream::getSize`); here it
+  had moved by a second, backwards three times and forwards once, with
+  nothing written in between. The file system keeps whole seconds, and
+  right after another process (the WebProcess) wrote a file, what `stat()`
+  reports can still change. One process writing and stat()ing sees no such
+  change (`gap=mtime`: 3 s after the close), which is why pages in the
+  browser process, whose writes the NetworkProcess makes since 0160, didn't
+  show it. 0162 counts a second either way as unchanged.
+- **Closing a 1 GB writable stream took 62 s (0163).** At `close()` the
+  NetworkProcess copied the swap file (`TMPDIR`,
+  `/data/ps5webkit/home/tmp`) over the file with
+  `std::filesystem::copy_file`, which libc++ does through an fstream here,
+  a few KB per `write()`, and then left the 1 GB swap file there until the
+  next NetworkProcess. Now it is renamed into place, with the file's
+  permissions (else copied in 8 MB pieces), and is gone either way;
+  `createWritable({ keepExistingData: true })` copies the same quick way.
+  The page's `close()` itself had resolved at once: the minute was on the
+  storage thread, and the next storage call (`estimate()`) waited for it.
 
 **Not changed: the browser's saves still run on the main loop.** They only
 wait when something has used up the title's allowance, which pages no
@@ -600,11 +635,16 @@ N MB to `ps5wk-write-test.bin` in a folder with plain `write()` and logs a
 the writing thread's CPU time and context switches. `proc=payload` runs the
 same test in a ps5wk-child task payload, `thread=main` on the main loop,
 `probe=1` also times one small save a second on the main loop.
+`gap=1` instead makes files with gaps and counts what the gaps read back as
+(zeros, a marker, the test's own bytes or other data); `marker=<MB>` first
+writes and deletes a file of marker records; `gap=mtime` watches a file's
+modification time after a write and close.
 `GET /debug/write-test` gives the lines.
 
     port/webkit/test/browser/write-test.sh run mb=3072               # a fresh title, 3 GB from a thread of it
     port/webkit/test/browser/write-test.sh run proc=payload mb=3072  # the same from a payload
     port/webkit/test/browser/write-test.sh matrix base               # both, and a payload with the title's uid
+    port/webkit/test/browser/write-test.sh run -n gap=1 marker=256   # gaps, after a deleted marker file
 
 ## Tabs, bookmarks, history
 

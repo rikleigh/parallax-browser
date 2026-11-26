@@ -39,6 +39,24 @@
 //                     title's uid is in its "start" line)
 // thread= and proc= are the caller's (where the test runs).
 //
+// gap=<test> runs one of these instead of the speed test (2026-11-26: OPFS
+// bytes that were never written read back as other data):
+//   gap=1        files with a gap: a head written, then a write past the end
+//                (lseek and write(), pwrite(), from a second descriptor,
+//                after fsync), ftruncate() to a larger size, a small write
+//                into a hole; the gap is read back and its bytes counted:
+//                zeros, the marker below, the test's own earlier files ('H'
+//                and 'W' bytes) or other data. passes=<n> repeats them.
+//   gap=marker   only writes a marker file of marker=<MB> (default 256):
+//                16-byte records "PS5WK-MARKER" and a number (fsync first
+//                with sync=fsync), then deletes it, so its blocks are free
+//                for the next file. With gap=1, marker=<MB> does this first
+//                in the same process; sleep=<s> waits after it.
+//   gap=mtime    when the modification time of a file settles: a write,
+//                fsync and close as a page's sync access handle does, then
+//                stat() every 10 ms for 3 s (WebKit's File checks it to the
+//                second).
+//
 // A line per report: MB/s, the time in write() and its longest call, the time
 // in fsync, and of the writing thread its CPU time, block output operations
 // and context switches (getrusage): a thread held back by the kernel sleeps
@@ -72,7 +90,8 @@ int rctl_get_rules(const char* in, size_t inLength, char* out, size_t outLength)
 #endif
 
 const char* const ps5wk_write_test_keys[] = { "dir", "tag", "mb", "chunk", "report", "direct", "osync", "sync", "syncmb", "fadvise",
-    "pwrite", "reopen", "prealloc", "overwrite", "pace", "passes", "mb2", "between", "sleep", "keep", "vfs", "rctl", "uid", "thread", NULL };
+    "pwrite", "reopen", "prealloc", "overwrite", "pace", "passes", "mb2", "between", "sleep", "keep", "vfs", "rctl", "uid", "thread", "gap",
+    "marker", NULL };
 
 typedef struct {
     PS5WKWriteTestSay say;
@@ -84,7 +103,8 @@ typedef struct {
     unsigned passes, paceMS, sleepS;
     int direct, osync, fadvise, usePwrite, prealloc, overwrite, keep, vfs, null;
     long rctl, uid;
-    char sync[16], between[16];
+    char sync[16], between[16], gap[16], tag[32];
+    unsigned long long markerMB;
 } Test;
 
 static void sayf(const Test* t, const char* format, ...) __attribute__((format(printf, 2, 3)));
@@ -147,6 +167,7 @@ static void parse(Test* t, const char* spec)
         if (!isalnum((unsigned char)*c))
             *c = '_';
     }
+    snprintf(t->tag, sizeof t->tag, "%s", tag);
     if (t->null)
         snprintf(t->path, sizeof t->path, "/dev/null");
     else
@@ -174,6 +195,9 @@ static void parse(Test* t, const char* spec)
         snprintf(t->sync, sizeof t->sync, "none");
     if (!value(spec, "between", t->between, sizeof t->between))
         snprintf(t->between, sizeof t->between, "none");
+    if (!value(spec, "gap", t->gap, sizeof t->gap))
+        t->gap[0] = 0;
+    t->markerMB = number(spec, "marker", !strcmp(t->gap, "marker") ? 256 : 0, 0, 8192);
 }
 
 static double now(void)
@@ -378,6 +402,328 @@ static void readBack(const Test* t, uint8_t* chunk, size_t chunkBytes)
     sayf(t, "read back: %llu MB in %.1f s, %.1f MB/s", total >> 20, seconds, (double)total / 1048576.0 / (seconds > 0 ? seconds : 1e-9));
 }
 
+// The gap tests (gap=, at the top).
+static const char markerText[12] = { 'P', 'S', '5', 'W', 'K', '-', 'M', 'A', 'R', 'K', 'E', 'R' };
+
+// at < 0: write() at the descriptor's offset.
+static int writeAll(int fd, const uint8_t* p, size_t n, long long at)
+{
+    while (n) {
+        ssize_t w = at >= 0 ? pwrite(fd, p, n, (off_t)at) : write(fd, p, n);
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w <= 0)
+            return -1;
+        p += w;
+        n -= (size_t)w;
+        if (at >= 0)
+            at += w;
+    }
+    return 0;
+}
+
+static void gapMarker(const Test* t, uint8_t* buffer, size_t bufferBytes)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/" FILE_NAME "-marker.bin", t->dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        sayf(t, "gap marker: open %s failed: errno %d (%s)", path, errno, strerror(errno));
+        return;
+    }
+    const unsigned long long total = t->markerMB << 20;
+    unsigned long long written = 0;
+    uint32_t record = 0;
+    double start = now();
+    int failed = 0;
+    while (written < total) {
+        size_t n = bufferBytes < total - written ? bufferBytes : (size_t)(total - written);
+        for (size_t i = 0; i + 16 <= n; i += 16, record++) {
+            memcpy(buffer + i, markerText, sizeof markerText);
+            memcpy(buffer + i + 12, &record, 4);
+        }
+        if (writeAll(fd, buffer, n, -1)) {
+            failed = 1;
+            break;
+        }
+        written += n;
+    }
+    // sync=fsync: on the disk first. Without it the file is deleted before
+    // its blocks are committed, and they are free again at once (with it,
+    // later: the next files don't get them).
+    const int syncing = strcmp(t->sync, "none") != 0;
+    int synced = !syncing || !fsync(fd);
+    close(fd);
+    int removed = !unlink(path);
+    sayf(t, "gap marker: %llu MB of \"PS5WK-MARKER\" records%s to %s in %.1f s, fsync %s, %s", written >> 20, failed ? " (the write FAILED)" : "", path,
+        now() - start, !syncing ? "not asked" : synced ? "ok" : "FAILED", removed ? "deleted: its blocks are free now" : "NOT deleted");
+}
+
+typedef struct {
+    unsigned long long length, nonZero, markerSlots, markerBytes, own, other;
+    long long first;
+    uint8_t firstBytes[8];
+    char blocks[160];
+} GapCount;
+
+// Counts the bytes of data (read at fileOffset) that are not zero: in
+// 16-byte records of the marker (as they lie in a file and so in a disk
+// block), the test's own 'H' and 'W', or anything else.
+static void gapCount(const uint8_t* data, size_t length, unsigned long long fileOffset, GapCount* c)
+{
+    unsigned long long block = ~0ull, inBlock = 0;
+    size_t o = strlen(c->blocks);
+    for (size_t i = 0; i < length;) {
+        size_t slotEnd = (size_t)(((fileOffset + i) | 15) + 1 - fileOffset);
+        if (slotEnd > length)
+            slotEnd = length;
+        int marker = slotEnd - i == 16 && !((fileOffset + i) & 15) && !memcmp(data + i, markerText, sizeof markerText);
+        c->markerSlots += marker;
+        for (; i < slotEnd; i++) {
+            if (!data[i])
+                continue;
+            unsigned long long b = (fileOffset + i) >> 16;
+            if (b != block) {
+                if (inBlock && o + 24 < sizeof c->blocks)
+                    o += (size_t)snprintf(c->blocks + o, sizeof c->blocks - o, "%s%llu:%llu", o ? " " : "", block, inBlock);
+                block = b;
+                inBlock = 0;
+            }
+            inBlock++;
+            if (!c->nonZero++) {
+                c->first = (long long)(fileOffset + i);
+                memcpy(c->firstBytes, data + i, length - i < 8 ? length - i : 8);
+            }
+            if (marker)
+                c->markerBytes++;
+            else if (data[i] == 'H' || data[i] == 'W')
+                c->own++;
+            else
+                c->other++;
+        }
+    }
+    if (inBlock && o + 24 < sizeof c->blocks)
+        snprintf(c->blocks + o, sizeof c->blocks - o, "%s%llu:%llu", o ? " " : "", block, inBlock);
+    c->length += length;
+}
+
+static int gapRead(int fd, uint8_t* buffer, unsigned long long from, unsigned long long to, GapCount* c)
+{
+    while (from < to) {
+        size_t want = (size_t)(to - from);
+        ssize_t n = pread(fd, buffer, want, (off_t)from);
+        if (n <= 0)
+            return -1;
+        gapCount(buffer, (size_t)n, from, c);
+        from += (unsigned long long)n;
+    }
+    return 0;
+}
+
+static void gapDescribe(const GapCount* c, char* out, size_t size)
+{
+    if (!c->nonZero) {
+        snprintf(out, size, "all %llu bytes zero", c->length);
+        return;
+    }
+    snprintf(out, size, "%llu of %llu bytes NOT zero, from %lld (per 64 KB block: %s): marker %llu bytes in %llu records, the test's own H/W %llu, other %llu; "
+        "the first %02x %02x %02x %02x %02x %02x %02x %02x",
+        c->nonZero, c->length, c->first, c->blocks, c->markerBytes, c->markerSlots, c->own, c->other, c->firstBytes[0], c->firstBytes[1], c->firstBytes[2],
+        c->firstBytes[3], c->firstBytes[4], c->firstBytes[5], c->firstBytes[6], c->firstBytes[7]);
+}
+
+enum { GapSeekWrite, GapPwrite, GapSecondDescriptor, GapAfterFsync, GapTruncate, GapTruncateThenSmall, GapOwnMarker, GapHows };
+static const char* const gapHowNames[] = { "lseek+write", "pwrite", "pwrite from a 2nd descriptor", "fsync+close, then pwrite", "ftruncate",
+    "ftruncate, then 10 bytes into the hole", "8 MB of marker (fsync with sync=), ftruncate(0), the head, then pwrite" };
+
+// One file: head bytes of 'H', then the gap made as how says, read back
+// through the same descriptor and through a new one. 1: some gap byte is not
+// zero.
+static int gapCase(const Test* t, unsigned pass, int how, unsigned long long head, unsigned long long at, uint8_t* buffer, uint8_t* readBuffer,
+    unsigned* markerCases)
+{
+    static const size_t writeBytes = 65536, smallBytes = 10, smallAt = 100;
+    char path[512];
+    snprintf(path, sizeof path, "%s/" FILE_NAME "-gap%s.bin", t->dir, t->tag);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        sayf(t, "gap: open %s failed: errno %d (%s)", path, errno, strerror(errno));
+        return 0;
+    }
+    int failed = 0;
+    if (how == GapOwnMarker) {
+        // The file's own earlier bytes where the gap will be: marker records
+        // over its first 8 MB, on the disk (fsync), then freed.
+        for (size_t i = 0; i + 16 <= (8u << 20); i += 16) {
+            uint32_t record = (uint32_t)(i / 16);
+            memcpy(buffer + i, markerText, sizeof markerText);
+            memcpy(buffer + i + 12, &record, 4);
+        }
+        failed = writeAll(fd, buffer, 8u << 20, -1) || (strcmp(t->sync, "none") && fsync(fd)) || ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) != 0;
+    }
+    memset(buffer, 'H', (size_t)head);
+    failed = failed || writeAll(fd, buffer, (size_t)head, -1);
+    memset(buffer, 'W', writeBytes);
+    unsigned long long end = at + writeBytes;
+    if (!failed) {
+        switch (how) {
+        case GapSeekWrite:
+            failed = lseek(fd, (off_t)at, SEEK_SET) != (off_t)at || writeAll(fd, buffer, writeBytes, -1);
+            break;
+        case GapPwrite:
+        case GapOwnMarker:
+            failed = writeAll(fd, buffer, writeBytes, (long long)at);
+            break;
+        case GapSecondDescriptor: {
+            int second = open(path, O_RDWR);
+            failed = second < 0 || writeAll(second, buffer, writeBytes, (long long)at);
+            if (second >= 0)
+                close(second);
+            break;
+        }
+        case GapAfterFsync:
+            failed = fsync(fd);
+            close(fd);
+            fd = open(path, O_RDWR);
+            failed = failed || fd < 0 || writeAll(fd, buffer, writeBytes, (long long)at);
+            break;
+        case GapTruncate:
+            failed = ftruncate(fd, (off_t)end);
+            break;
+        case GapTruncateThenSmall:
+            failed = ftruncate(fd, (off_t)end) || writeAll(fd, buffer, smallBytes, (long long)(at + smallAt));
+            break;
+        }
+    }
+    if (failed || fd < 0) {
+        sayf(t, "gap pass %u, %s, head %llu, at %llu: a call FAILED: errno %d (%s)", pass, gapHowNames[how], head, at, errno, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        unlink(path);
+        return 0;
+    }
+    // What was never written: [head, at), or for an ftruncate [head, end)
+    // less the small write.
+    GapCount counts[2];
+    for (int round = 0; round < 2; round++) {
+        GapCount* c = &counts[round];
+        memset(c, 0, sizeof *c);
+        if (round) {
+            close(fd);
+            fd = open(path, O_RDONLY);
+            if (fd < 0)
+                break;
+        }
+        if (how == GapTruncate)
+            gapRead(fd, readBuffer, head, end, c);
+        else if (how == GapTruncateThenSmall) {
+            gapRead(fd, readBuffer, head, at + smallAt, c);
+            gapRead(fd, readBuffer, at + smallAt + smallBytes, end, c);
+        } else
+            gapRead(fd, readBuffer, head, at, c);
+    }
+    struct stat st;
+    memset(&st, 0, sizeof st);
+    fstat(fd, &st);
+    if (fd >= 0)
+        close(fd);
+    unlink(path);
+    char first[700], second[400];
+    gapDescribe(&counts[0], first, sizeof first);
+    if (counts[1].nonZero == counts[0].nonZero && counts[1].first == counts[0].first && !memcmp(counts[1].firstBytes, counts[0].firstBytes, 8))
+        snprintf(second, sizeof second, "the same through a new descriptor");
+    else
+        gapDescribe(&counts[1], second, sizeof second);
+    sayf(t, "gap pass %u, %s, head %llu, at %llu (file %lld bytes, %lld blocks of 512): %s; %s", pass, gapHowNames[how], head, at, (long long)st.st_size,
+        (long long)st.st_blocks, first, second);
+    if (counts[0].markerSlots || counts[1].markerSlots)
+        (*markerCases)++;
+    return counts[0].nonZero || counts[1].nonZero;
+}
+
+static void gapMtime(const Test* t, uint8_t* buffer)
+{
+    static const char* const names[] = { "1 MB write, fsync, close", "1 MB write, close", "ftruncate to 1 MB, 1 MB pwrite at 4 MB, fsync, close" };
+    char path[512];
+    snprintf(path, sizeof path, "%s/" FILE_NAME "-mtime.bin", t->dir);
+    memset(buffer, 'M', 1 << 20);
+    for (int variant = 0; variant < 3; variant++) {
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) {
+            sayf(t, "gap mtime: open %s failed: errno %d (%s)", path, errno, strerror(errno));
+            return;
+        }
+        int failed = writeAll(fd, buffer, 1 << 20, -1);
+        if (variant == 2)
+            failed = failed || ftruncate(fd, 1 << 20) || writeAll(fd, buffer, 1 << 20, 4 << 20);
+        if (variant != 1)
+            failed = failed || fsync(fd);
+        close(fd);
+        double closed = now();
+        struct stat last, st;
+        memset(&last, 0, sizeof last);
+        stat(path, &last);
+        sayf(t, "gap mtime, %s%s: right after: mtime %lld.%09ld, ctime %lld.%09ld, size %lld", names[variant], failed ? " (a call FAILED)" : "",
+            (long long)last.st_mtim.tv_sec, (long)last.st_mtim.tv_nsec, (long long)last.st_ctim.tv_sec, (long)last.st_ctim.tv_nsec, (long long)last.st_size);
+        unsigned changes = 0, secondChanges = 0;
+        double lastChange = 0;
+        while (now() - closed < 3.0) {
+            usleep(10000);
+            if (stat(path, &st))
+                continue;
+            if (st.st_mtim.tv_sec == last.st_mtim.tv_sec && st.st_mtim.tv_nsec == last.st_mtim.tv_nsec && st.st_size == last.st_size
+                && st.st_ctim.tv_sec == last.st_ctim.tv_sec && st.st_ctim.tv_nsec == last.st_ctim.tv_nsec)
+                continue;
+            changes++;
+            secondChanges += st.st_mtim.tv_sec != last.st_mtim.tv_sec;
+            lastChange = now() - closed;
+            if (changes <= 6)
+                sayf(t, "gap mtime, %s: +%.3f s: mtime %lld.%09ld, ctime %lld.%09ld, size %lld", names[variant], lastChange, (long long)st.st_mtim.tv_sec,
+                    (long)st.st_mtim.tv_nsec, (long long)st.st_ctim.tv_sec, (long)st.st_ctim.tv_nsec, (long long)st.st_size);
+            last = st;
+        }
+        sayf(t, "gap mtime, %s: %u changes in 3 s after close (%u of the second), the last at +%.3f s", names[variant], changes, secondChanges, lastChange);
+        unlink(path);
+    }
+}
+
+static int gapTests(Test* t)
+{
+    static const size_t bufferBytes = 8 << 20;
+    uint8_t* buffer = mmap(NULL, bufferBytes * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (buffer == MAP_FAILED) {
+        sayf(t, "gap: FAILED: no buffer (errno %d)", errno);
+        return -1;
+    }
+    sayf(t, "gap start: gap=%s in %s, marker %llu MB, %u pass(es); uid %d", t->gap, t->dir, t->markerMB, t->passes, (int)getuid());
+    if (t->markerMB)
+        gapMarker(t, buffer, bufferBytes);
+    if (t->markerMB && t->sleepS) {
+        sayf(t, "gap: sleeping %u s", t->sleepS);
+        sleep(t->sleepS);
+    }
+    unsigned cases = 0, dirty = 0, markerCases = 0;
+    if (!strcmp(t->gap, "mtime"))
+        gapMtime(t, buffer);
+    else if (strcmp(t->gap, "marker")) {
+        // head, at: the page's (opfs-sync-rw.html: the file ended at 2 MB +
+        // 400 KB, the write began at 3 MB + 5), a small file, an end on a
+        // block's boundary, and a gap inside one block.
+        static const unsigned long long shapes[][2] = { { 2506752, 3145733 }, { 16384, 1048581 }, { 65536, 1048581 }, { 2506752, 2506852 } };
+        for (unsigned pass = 1; pass <= t->passes; pass++) {
+            for (unsigned s = 0; s < sizeof shapes / sizeof shapes[0]; s++) {
+                for (int how = 0; how < GapHows; how++) {
+                    cases++;
+                    dirty += (unsigned)gapCase(t, pass, how, shapes[s][0], shapes[s][1], buffer, buffer + bufferBytes, &markerCases);
+                }
+            }
+        }
+    }
+    munmap(buffer, bufferBytes * 2);
+    sayf(t, "END gap: %u case(s), %u with bytes that are not zero, %u of them with the marker", cases, dirty, markerCases);
+    return 0;
+}
+
 int ps5wk_write_test(const char* spec, const char* process, PS5WKWriteTestSay say, void* data)
 {
     Test test;
@@ -411,6 +757,8 @@ int ps5wk_write_test(const char* spec, const char* process, PS5WKWriteTestSay sa
                 fs.f_mntonname, fs.f_mntfromname, (unsigned long long)fs.f_flags, (unsigned long long)fs.f_bsize, (unsigned long long)fs.f_iosize,
                 (unsigned long long)fs.f_bavail * fs.f_bsize >> 20, (unsigned long long)fs.f_blocks * fs.f_bsize >> 20);
     }
+    if (t->gap[0] && !t->null)
+        return gapTests(t);
     char vfs[900];
     if (t->vfs && !vfsState(t, vfs, sizeof vfs, 1)) {
         sayf(t, "buffer cache: no vfs.* sysctl can be read in this process (%.200s, ...): left out of the lines", vfs);

@@ -1,0 +1,242 @@
+diff --git a/Source/WTF/wtf/FileHandle.h b/Source/WTF/wtf/FileHandle.h
+index b3675206db..a4159a8e81 100644
+--- a/Source/WTF/wtf/FileHandle.h
++++ b/Source/WTF/wtf/FileHandle.h
+@@ -91,6 +91,14 @@ public:
+     WTF_EXPORT_PRIVATE std::optional<uint64_t> read(std::span<uint8_t>);
+     WTF_EXPORT_PRIVATE std::optional<Vector<uint8_t>> readAll();
+     WTF_EXPORT_PRIVATE bool truncate(int64_t offset);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // PS5: grows the file to newSize by writing zeros from its end, so no part
++    // of it is a hole or a part of a disk block nothing was written to (the
++    // console's file system hands such parts back with whatever the disk held
++    // there before: other files' bytes). Nothing if the file is already that
++    // large. The descriptor's offset is kept. False if a write failed.
++    WTF_EXPORT_PRIVATE bool extendWithZeros(uint64_t newSize);
++#endif
+     WTF_EXPORT_PRIVATE std::optional<uint64_t> size();
+ 
+     WTF_EXPORT_PRIVATE std::optional<uint64_t> seek(int64_t offset, FileSeekOrigin);
+diff --git a/Source/WTF/wtf/posix/FileHandlePOSIX.cpp b/Source/WTF/wtf/posix/FileHandlePOSIX.cpp
+index ae947fe280..34fb5fc397 100644
+--- a/Source/WTF/wtf/posix/FileHandlePOSIX.cpp
++++ b/Source/WTF/wtf/posix/FileHandlePOSIX.cpp
+@@ -70,6 +70,45 @@ bool FileHandle::truncate(int64_t offset)
+     return m_handle && !ftruncate(*m_handle, offset);
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++bool FileHandle::extendWithZeros(uint64_t newSize)
++{
++    if (!m_handle)
++        return false;
++
++    struct stat fileInfo;
++    if (fstat(*m_handle, &fileInfo) || fileInfo.st_size < 0)
++        return false;
++
++    uint64_t offset = fileInfo.st_size;
++    if (offset >= newSize)
++        return true;
++
++    // Up to 4 MB at a time: each write() costs the disk about a millisecond
++    // on the console, so small ones are slow (README, "The title's own file
++    // writes").
++    static constexpr uint64_t maximumBufferSize = 4 * 1024 * 1024;
++    size_t bufferSize = static_cast<size_t>(std::min(newSize - offset, maximumBufferSize));
++    auto* zeros = static_cast<uint8_t*>(calloc(1, bufferSize));
++    if (!zeros)
++        return false;
++    bool succeeded = true;
++    while (offset < newSize) {
++        size_t length = static_cast<size_t>(std::min<uint64_t>(newSize - offset, bufferSize));
++        auto written = ::pwrite(*m_handle, zeros, length, static_cast<off_t>(offset));
++        if (written < 0 && errno == EINTR)
++            continue;
++        if (written <= 0) {
++            succeeded = false;
++            break;
++        }
++        offset += written;
++    }
++    free(zeros);
++    return succeeded;
++}
++#endif
++
+ bool FileHandle::flush()
+ {
+     return m_handle && !fsync(*m_handle);
+diff --git a/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp b/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp
+index 326cb640b8..9b03518cb5 100644
+--- a/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp
++++ b/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.cpp
+@@ -71,6 +71,12 @@ ExceptionOr<void> FileSystemSyncAccessHandle::truncate(unsigned long long size)
+     if (size > *oldSize && !requestSpaceForNewSize(size))
+         return Exception { ExceptionCode::QuotaExceededError };
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // The new bytes are zeros written out, not ftruncate()'s (extendWithZeros).
++    if (size > *oldSize && !extendWithZeros(size))
++        return Exception { ExceptionCode::InvalidStateError, "Failed to truncate file"_s };
++#endif
++
+     auto oldOffset = m_file.seek(0, FileSystem::FileSeekOrigin::Current);
+     if (!oldOffset)
+         return Exception { ExceptionCode::InvalidStateError, "Failed to get current offset"_s };
+@@ -163,6 +169,11 @@ ExceptionOr<unsigned long long> FileSystemSyncAccessHandle::write(BufferSource&&
+         return Exception { ExceptionCode::QuotaExceededError };
+ 
+ #if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    // A write past the end: the bytes before it are zeros written out
++    // (extendWithZeros), whichever process writes.
++    if (!extendWithZeros(*options.at))
++        return Exception { ExceptionCode::InvalidStateError, "Failed to write to file"_s };
++
+     // Pages in the browser process: the backend writes
+     // (FileSystemStorageConnection.h). The handle's own descriptor is still
+     // what reads, truncates and flushes, and its cursor ends up where its
+@@ -206,6 +217,39 @@ bool FileSystemSyncAccessHandle::requestSpaceForNewSize(uint64_t newSize)
+     return newSize <= m_capacity;
+ }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++// PS5: the console's file system does not zero what a file is given and
++// nothing has written: past the end of the file, the rest of the disk block
++// its old end was in and the start of the block a write past the end begins
++// in read back as whatever that disk block held (about 49,000 bytes around a
++// gap; README, "Bytes a file never had written"). So no gap is left to it: a
++// file grows past its end only by zeros written out. The space is the
++// page's already (requestSpaceForNewSize). Where the page's writes go to the
++// backend (pages in the browser process, whose own writes the console holds
++// back) the backend writes the zeros too, in steps, each a write of no bytes
++// at the step's end.
++bool FileSystemSyncAccessHandle::extendWithZeros(uint64_t newSize)
++{
++    auto size = m_file.size();
++    if (!size)
++        return false;
++    if (newSize <= *size)
++        return true;
++
++    if (m_source->minimumSizeOfSyncAccessHandleWriteThroughBackend()) {
++        static constexpr uint64_t step = 64 * MB;
++        for (uint64_t end = *size; end < newSize;) {
++            end = std::min(newSize, end + step);
++            if (!m_source->writeForSyncAccessHandle(m_identifier, end, { }))
++                return false;
++        }
++        return true;
++    }
++
++    return m_file.extendWithZeros(newSize);
++}
++#endif
++
+ bool FileSystemSyncAccessHandle::requestSpaceForWrite(uint64_t writeOffset, uint64_t writeLength)
+ {
+     CheckedUint64 newSize = writeOffset;
+diff --git a/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.h b/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.h
+index df86115a0f..431e687391 100644
+--- a/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.h
++++ b/Source/WebCore/Modules/filesystem/FileSystemSyncAccessHandle.h
+@@ -68,6 +68,9 @@ private:
+     void closeInternal(ShouldNotifyBackend);
+     bool requestSpaceForNewSize(uint64_t newSize);
+     bool requestSpaceForWrite(uint64_t writeOffset, uint64_t writeLength);
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    bool extendWithZeros(uint64_t newSize);
++#endif
+ 
+     // ActiveDOMObject.
+     void stop() final;
+diff --git a/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp b/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp
+index 46b0d2ffbd..2ef2ba74fa 100644
+--- a/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp
++++ b/Source/WebCore/Modules/filesystem/WorkerFileSystemStorageConnection.cpp
+@@ -518,7 +518,9 @@ uint64_t WorkerFileSystemStorageConnection::minimumSizeOfSyncAccessHandleWriteTh
+ 
+ // As requestNewCapacityForSyncAccessHandle: the main thread sends, this
+ // thread waits for the answer. data stays the caller's until then. In pieces:
+-// each goes to the backend as one IPC message, copied on the way.
++// each goes to the backend as one IPC message, copied on the way. No data:
++// one message all the same (the backend fills the file with zeros up to
++// offset: FileSystemSyncAccessHandle::extendWithZeros).
+ std::optional<uint64_t> WorkerFileSystemStorageConnection::writeForSyncAccessHandle(FileSystemHandleIdentifier identifier, FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> data)
+ {
+     RefPtr scope = m_scope.get();
+@@ -530,7 +532,7 @@ std::optional<uint64_t> WorkerFileSystemStorageConnection::writeForSyncAccessHan
+ 
+     static constexpr size_t maximumPieceSize = 16 * MB;
+     uint64_t written = 0;
+-    while (written < data.size()) {
++    do {
+         auto piece = data.subspan(written, std::min<size_t>(data.size() - written, maximumPieceSize));
+         BinarySemaphore semaphore;
+         std::optional<uint64_t> pieceWritten;
+@@ -553,7 +555,7 @@ std::optional<uint64_t> WorkerFileSystemStorageConnection::writeForSyncAccessHan
+         written += *pieceWritten;
+         if (*pieceWritten < piece.size())
+             break;
+-    }
++    } while (written < data.size());
+     return written;
+ }
+ 
+diff --git a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
+index 2bd0b9b36c..90d3875686 100644
+--- a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
++++ b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
+@@ -264,7 +264,10 @@ std::optional<FileSystemStorageError> FileSystemStorageHandle::closeSyncAccessHa
+ // back; this process (a payload) writes them for it. Only inside what the
+ // page may write: the capacity it was granted (the quota) or the size the
+ // file had. The descriptor is this process's own (the page has the one made
+-// with the handle), opened at the first such write.
++// with the handle), opened at the first such write. Past the end of the
++// file, the bytes before offset are zeros written out first (WTF's
++// FileHandle::extendWithZeros); a write of no bytes only does that (the
++// page's truncate() to a larger size).
+ std::optional<uint64_t> FileSystemStorageHandle::writeForSyncAccessHandle(WebCore::FileSystemSyncAccessHandleIdentifier accessHandleIdentifier, uint64_t offset, std::span<const uint8_t> dataBytes)
+ {
+     if (!isActiveSyncAccessHandle(accessHandleIdentifier))
+@@ -282,6 +285,14 @@ std::optional<uint64_t> FileSystemStorageHandle::writeForSyncAccessHandle(WebCor
+             return std::nullopt;
+     }
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++    if (!handle.extendWithZeros(offset))
++        return std::nullopt;
++#endif
++
++    if (dataBytes.empty())
++        return 0;
++
+     if (!handle.seek(offset, FileSystem::FileSeekOrigin::Beginning))
+         return std::nullopt;
+ 
+@@ -367,6 +378,13 @@ std::optional<FileSystemStorageError> FileSystemStorageHandle::executeCommandFor
+             if (!result)
+                 return FileSystemStorageError::Unknown;
+         }
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: past the end, zeros written out before it, not a gap
++        // (FileHandle::extendWithZeros); the swap file becomes the file.
++        auto writeStart = activeWritableFile.handle.seek(0, FileSystem::FileSeekOrigin::Current);
++        if (!writeStart || !activeWritableFile.handle.extendWithZeros(*writeStart))
++            return FileSystemStorageError::Unknown;
++#endif
+ 
+         if (!activeWritableFile.handle.write(dataBytes))
+             return FileSystemStorageError::Unknown;
+@@ -387,6 +405,11 @@ std::optional<FileSystemStorageError> FileSystemStorageHandle::executeCommandFor
+         if (!size)
+             return FileSystemStorageError::MissingArgument;
+ 
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: a larger size is zeros written out, as for a write past the end.
++        if (!activeWritableFile.handle.extendWithZeros(*size))
++            return FileSystemStorageError::Unknown;
++#endif
+         bool truncated = activeWritableFile.handle.truncate(*size);
+         if (!truncated)
+             return FileSystemStorageError::Unknown;

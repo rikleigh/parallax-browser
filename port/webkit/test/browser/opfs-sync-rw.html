@@ -10,10 +10,12 @@
 // and without { at }, reads everything back and compares every byte. ?mb= the size of the big write
 // (default 40). Needs a secure origin (http://127.0.0.1 counts). Logs "OPFSRW PASS|FAIL <check>" and
 // "OPFSRW DONE <passed>/<checks>"; ?report=1 also posts each line to the server's /log.
-// On the console (2026-11-26) it ends 19/20 with either writer, and without 0160: "the gap before it
-// reads as zeros" fails (the partly written 64 KB blocks at both ends of a gap read back as other
-// data). With pages in their own process, about one run in four stops with NotFoundError while
-// reading the File from getFile() (15/17), also without 0160. README, "The title's own file writes".
+// Also truncate() to a larger size, and a writable stream's write past the end and truncate().
+// On the console (2026-11-26), before patches-radv 0161, the gap checks failed with either writer and
+// without 0160 (the console's file system leaves the unwritten parts of the 64 KB blocks at both
+// ends of a gap as whatever the disk held; 0161 writes zeros), and with pages in their own process
+// about one run in four stopped with NotFoundError while reading the File from getFile() (its
+// modification time moved by a second; 0162). README, "The title's own file writes".
 const out = document.getElementById('out');
 const lines = [];
 const report = new URLSearchParams(location.search).get('report') === '1';
@@ -119,12 +121,22 @@ onmessage = async (e) => {
     n = h.write(new Uint8Array(0), { at: 5 });
     check('an empty write', n === 0, 'returned ' + n);
 
+    // truncate() into the middle of a 64 KB block that held the big write's bytes, then to a larger
+    // size: what lies past the smaller size reads as zeros, the rest of that block too.
+    h.truncate(5 * MB + 3);
+    h.truncate(7 * MB);
+    back = new Uint8Array(2 * MB - 3);
+    n = h.read(back, { at: 5 * MB + 3 });
+    let stale = back.reduce((c, v) => c + (v !== 0), 0);
+    check('truncate() to a larger size reads as zeros', n === back.length && !stale && h.getSize() === 7 * MB, stale + ' of ' + back.length + ' bytes are not zero, size ' + h.getSize());
+
     // truncate() and a large write past the new end; the gap reads as zeros.
     h.truncate(1 * MB);
     n = h.write(pattern(4 * MB, 1 * MB), { at: 4 * MB });
-    back = new Uint8Array(64 * KB);
-    h.read(back, { at: 2 * MB });
-    check('a large write past the end after truncate()', n === 1 * MB && h.getSize() === 5 * MB && back.every((v) => v === 0), 'returned ' + n + ', size ' + h.getSize());
+    back = new Uint8Array(3 * MB);
+    h.read(back, { at: 1 * MB });
+    stale = back.reduce((c, v) => c + (v !== 0), 0);
+    check('a large write past the end after truncate()', n === 1 * MB && h.getSize() === 5 * MB && !stale, 'returned ' + n + ', size ' + h.getSize() + ', ' + stale + ' bytes of the gap not zero');
 
     // After flush() and close(), another handle and the File see the same bytes.
     h.flush();
@@ -148,6 +160,27 @@ onmessage = async (e) => {
     let closedError = '';
     try { h.write(pattern(0, 100 * KB), { at: 0 }); } catch (err) { closedError = err.name; }
     check('a write after close() throws', closedError === 'InvalidStateError', closedError || 'no exception');
+
+    // A writable stream (the NetworkProcess writes its swap file, which becomes the file at close()):
+    // a write past the end and truncate() to a larger size leave zeros, as the sync access handle.
+    step = 'createWritable()';
+    const ws = await file.createWritable();
+    step = 'the writable stream';
+    await ws.write(pattern(0, 2 * MB + 400 * KB));
+    await ws.write({ type: 'write', position: 3 * MB + 5, data: pattern(3 * MB + 5, 64 * KB) });
+    await ws.truncate(4 * MB + 7);
+    const tc = performance.now();
+    await ws.close();
+    const closeSeconds = (performance.now() - tc) / 1000;
+    step = 'getFile() after the writable stream';
+    const wf = await file.getFile();
+    step = 'reading that File';
+    const all = new Uint8Array(await wf.arrayBuffer());
+    const gapOne = all.subarray(2 * MB + 400 * KB, 3 * MB + 5), gapTwo = all.subarray(3 * MB + 5 + 64 * KB);
+    stale = gapOne.reduce((c, v) => c + (v !== 0), 0) + gapTwo.reduce((c, v) => c + (v !== 0), 0);
+    check('a writable stream: its bytes are the file at close()', wf.size === 4 * MB + 7 && same(all.subarray(0, 2 * MB + 400 * KB), pattern(0, 2 * MB + 400 * KB))
+      && same(all.subarray(3 * MB + 5, 3 * MB + 5 + 64 * KB), pattern(3 * MB + 5, 64 * KB)), 'size ' + wf.size + ', closed in ' + closeSeconds.toFixed(2) + ' s');
+    check('a writable stream: the gap and truncate() read as zeros', !stale, stale + ' of ' + (gapOne.length + gapTwo.length) + ' bytes are not zero');
     step = 'removeEntry()';
     await root.removeEntry('sync-rw.bin');
   } catch (err) {

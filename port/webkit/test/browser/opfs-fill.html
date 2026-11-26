@@ -9,7 +9,8 @@
 // quota must fail with QuotaExceededError (or similar) and leave the browser working.
 // ?mode=sync (default): a worker with createSyncAccessHandle; ?mode=writable: createWritable() on
 // the main thread (a FileSystemWritableStream, whose swap file lives in the temporary folder until
-// close()). ?name= the file (default fill.bin). ?hold=1 (writable mode): leave the stream open at the end, not closed. ?clear=1: delete
+// close()); ?mode=truncate: a worker's sync access handle truncate()s the empty file to ?gb= GB in
+// one call (patches-radv 0161 writes the zeros out). ?name= the file (default fill.bin). ?hold=1 (writable mode): leave the stream open at the end, not closed. ?clear=1: delete
 // every file of the origin's OPFS root and stop. Logs "OPFS ..." and "OPFS DONE".
 const out = document.getElementById('out');
 const lines = [];
@@ -30,6 +31,15 @@ onmessage = async (e) => {
   let h;
   try { h = await file.createSyncAccessHandle(); } catch (err) { postMessage({ done: true, written: 0, size: 0, error: 'createSyncAccessHandle: ' + err.name + ': ' + err.message, t: 0 }); return; }
   h.truncate(0);
+  if (e.data.mode === 'truncate') {
+    const t0 = performance.now();
+    let error = '';
+    try { h.truncate(Math.round(gb * 1073741824)); } catch (err) { error = err.name + ': ' + err.message; }
+    const size = h.getSize();
+    h.close();
+    postMessage({ done: true, written: size, size, error, t: performance.now() - t0 });
+    return;
+  }
   const chunk = new Uint8Array(Math.round(chunkMB * 1048576));
   for (let i = 0; i < chunk.length; i += 4096) chunk[i] = i & 255;
   const total = Math.round(gb * 1024 / chunkMB), every = Math.max(4, Math.round(256 / chunkMB));
@@ -56,8 +66,8 @@ onmessage = async (e) => {
     say('DONE'); return;
   }
   await estimate('before');
-  say(`writing ${gb} GB in ${chunkMB >= 1 ? chunkMB + ' MB' : chunkMB * 1024 + ' KB'} writes (${mode})`);
-  if (mode === 'sync') {
+  say(mode === 'truncate' ? `truncate() to ${gb} GB` : `writing ${gb} GB in ${chunkMB >= 1 ? chunkMB + ' MB' : chunkMB * 1024 + ' KB'} writes (${mode})`);
+  if (mode === 'sync' || mode === 'truncate') {
     const w = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
     w.onmessage = async (e) => {
       const d = e.data;
@@ -67,7 +77,7 @@ onmessage = async (e) => {
       say('DONE');
     };
     w.onerror = (e) => { say('worker error ' + e.message); say('DONE'); };
-    w.postMessage({ gb, chunkMB, name });
+    w.postMessage({ gb, chunkMB, name, mode });
     return;
   }
   const file = await root.getFileHandle(name, { create: true });
@@ -81,7 +91,8 @@ onmessage = async (e) => {
   }
   say(`wrote ${mb(written)} in ${((performance.now() - t0) / 1000).toFixed(1)} s${error ? '; stopped: ' + error : ''}`);
   if (q.get('hold') === '1') { say('stream left open (hold=1)'); window.heldStream = s; say('DONE'); return; }
-  try { await s.close(); say('closed'); } catch (err) { say('close: ' + err.name + ': ' + err.message); }
+  const tc = performance.now();
+  try { await s.close(); say(`closed in ${((performance.now() - tc) / 1000).toFixed(1)} s`); } catch (err) { say('close: ' + err.name + ': ' + err.message); }
   await estimate('after');
   say('DONE');
 })().catch(e => { say('error ' + e); say('DONE'); });

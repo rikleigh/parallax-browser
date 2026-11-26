@@ -1,0 +1,43 @@
+diff --git a/Source/WebCore/platform/FileStream.cpp b/Source/WebCore/platform/FileStream.cpp
+index f2bc72306e..ce2954f322 100644
+--- a/Source/WebCore/platform/FileStream.cpp
++++ b/Source/WebCore/platform/FileStream.cpp
+@@ -34,6 +34,9 @@
+ #include <wtf/FileHandle.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/text/WTFString.h>
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++#include "PS5WKDebugBuild.h"
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -50,8 +53,28 @@ long long FileStream::getSize(const String& path, std::optional<WallTime> expect
+     if (!modificationTime)
+         return -1;
+     if (expectedModificationTime) {
++#if OS(FREEBSD) && defined(PS5_PAYLOAD_SDK)
++        // PS5: right after another process wrote a file (a page's sync
++        // access handle in a WebProcess payload, then close() and getFile()),
++        // the console's file system can report its modification time a
++        // second later or earlier than it did a moment before, with nothing
++        // written in between (whole seconds only; 4 of 16 runs of
++        // opfs-sync-rw.html: the File, made between the two, failed to read
++        // with NotFoundError). So a second either way is the same time here.
++        auto expected = expectedModificationTime->secondsSinceEpoch().secondsAs<time_t>();
++        auto actual = modificationTime->secondsSinceEpoch().secondsAs<time_t>();
++        if (actual != expected) {
++#if PS5WK_DEBUG_BUILD
++            WTFLogAlways("[storage] file blob: its modification time moved by %+lld s since the File was made%s", static_cast<long long>(actual - expected),
++                actual - expected > 1 || expected - actual > 1 ? ": NotFoundError" : ", taken as unchanged");
++#endif
++            if (actual - expected > 1 || expected - actual > 1)
++                return -1;
++        }
++#else
+         if (expectedModificationTime->secondsSinceEpoch().secondsAs<time_t>() != modificationTime->secondsSinceEpoch().secondsAs<time_t>())
+             return -1;
++#endif
+     }
+ 
+     // Now get the file size.
