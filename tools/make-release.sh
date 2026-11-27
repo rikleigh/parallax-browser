@@ -89,13 +89,14 @@ done
 # WebKit's (patches-radv 0159: PS5WKDebugBuild.h from the log host): the
 # querySelector and Atomics stats, the timers and storage-quota logs, the
 # stream-stall stamps, the WebGPU callback latency log; 0160's
-# opfs-backend-write-min; 0162's file blob and 0163's writable stream logs.
+# opfs-backend-write-min; 0162's file blob and 0163's writable stream logs;
+# 0167's tile allocation failure test (PS5WK_WC_TEST_ALLOC_FAIL).
 for marker in heap-profile '[heapprof]' debug-userscript debug-dialogs '[ps5wk-dialog]' test-urls.txt test-onload \
     debug-screenshot crash-title-test 'crash test:' /debug/write-test '[writetest]' ps5wk-write-test \
     radv-submit-log 'radv/ps5: submit' \
     PS5WK_QSA_STATS '[qsa]' PS5WK_ATOMICS_LOG '[atomics]' '[timers]' '[storage] quota for' \
     '[storage] total quota for all sites' 'no stream threads yet' webgpu-latency-log '[webgpu] title: latency' \
-    opfs-backend-write-min '[storage] file blob' '[storage] writable stream closed'; do
+    opfs-backend-write-min '[storage] file blob' '[storage] writable stream closed' PS5WK_WC_TEST_ALLOC_FAIL; do
     # Options before -e and the path: BSD grep takes anything after a "--"
     # as a file name.
     if grep -rlaF --include='*.bin' --include='*.elf' -e "$marker" "$TITLE" >/dev/null; then

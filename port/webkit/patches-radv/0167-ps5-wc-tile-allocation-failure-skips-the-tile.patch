@@ -1,0 +1,258 @@
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+index 86a66226e6..45f04a2d68 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/DrawingAreaWC.h
+@@ -116,6 +116,10 @@ private:
+ #if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+     WCTilePainter* tilePainter() override { return m_tilePainter.get(); }
+ #endif
++#if defined(PS5_PAYLOAD_SDK)
++    // During the flush (m_waitDidUpdate is set): deferred to the reply.
++    void tilesLeftForNextUpdate() override { triggerRenderingUpdate(); }
++#endif
+ 
+     bool isCompositingMode();
+     void updateRendering();
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+index ac7dbbc83d..5ca5d12629 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.cpp
+@@ -47,6 +47,10 @@
+ #include <wtf/MonotonicTime.h>
+ #include <wtf/text/MakeString.h>
+ #include <wtf/TZoneMallocInlines.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include "PS5WKDebugBuild.h"
++#include <wtf/RunLoop.h>
++#endif
+ 
+ namespace WebKit {
+ using namespace WebCore;
+@@ -69,6 +73,89 @@ WCTilePaintStats& wcTilePaintStats()
+     return stats;
+ }
+ 
++// The browser title's flexible memory left (apps/title/titlemem.c): tile
++// images and arena chunks are shared memory, which a title maps from it. Not
++// defined in a payload, whose memory is not the title's.
++extern "C" size_t dmem_flexible_free(void) __attribute__((weak));
++
++namespace {
++struct WCTileMemoryCounts {
++    unsigned arenaFull { 0 };
++    unsigned imagesFailed { 0 };
++    unsigned chunksFailed { 0 };
++    uint64_t failedBytes { 0 };
++    MonotonicTime lastLine;
++    bool lineScheduled { false };
++};
++}
++
++static WCTileMemoryCounts& wcTileMemoryCounts()
++{
++    static WCTileMemoryCounts counts; // main thread only
++    return counts;
++}
++
++static void wcLogTileMemory()
++{
++    auto& counts = wcTileMemoryCounts();
++    if (!counts.arenaFull && !counts.imagesFailed && !counts.chunksFailed)
++        return;
++    char flexible[64] = "";
++    if (dmem_flexible_free)
++        snprintf(flexible, sizeof flexible, "; the title's flexible memory free: %.0f MB", dmem_flexible_free() / 1048576.0);
++    WTFLogAlways("[wc] tile memory: %u tile part(s) painted the old way (tile arena full); %u tile image(s) and %u arena chunk(s) could not be allocated (%.1f MB), those tiles wait for the next update%s", // NOLINT
++        counts.arenaFull, counts.imagesFailed, counts.chunksFailed, counts.failedBytes / 1048576.0, flexible);
++    counts.arenaFull = counts.imagesFailed = counts.chunksFailed = 0;
++    counts.failedBytes = 0;
++    counts.lastLine = MonotonicTime::now();
++}
++
++void wcNoteTileMemory(WCTileMemoryEvent event, unsigned count, uint64_t bytes)
++{
++    auto& counts = wcTileMemoryCounts();
++    switch (event) {
++    case WCTileMemoryEvent::ArenaFull:
++        counts.arenaFull += count;
++        break;
++    case WCTileMemoryEvent::ImageFailed:
++        counts.imagesFailed += count;
++        counts.failedBytes += bytes;
++        break;
++    case WCTileMemoryEvent::ChunkFailed:
++        counts.chunksFailed += count;
++        counts.failedBytes += bytes;
++        break;
++    }
++    auto sinceLine = MonotonicTime::now() - counts.lastLine;
++    if (!counts.lastLine || sinceLine >= 5_s) {
++        wcLogTileMemory();
++        return;
++    }
++    // Within 5 s of the last line: these counts go in one line when the 5 s
++    // are up, whether or not anything else happens by then.
++    if (counts.lineScheduled)
++        return;
++    counts.lineScheduled = true;
++    RunLoop::mainSingleton().dispatchAfter(5_s - sinceLine, [] {
++        wcTileMemoryCounts().lineScheduled = false;
++        wcLogTileMemory();
++    });
++}
++
++bool wcTestAllocationFails()
++{
++#if PS5WK_DEBUG_BUILD
++    static unsigned percent = [] {
++        const char* text = getenv("PS5WK_WC_TEST_ALLOC_FAIL");
++        return text ? std::min(100u, static_cast<unsigned>(strtoul(text, nullptr, 10))) : 0u;
++    }();
++    static unsigned counter; // main thread only
++    return percent && (counter++ % 100) < percent;
++#else
++    return false;
++#endif
++}
++
+ WCFlushStats& wcFlushStats()
+ {
+     static WCFlushStats stats; // main thread only
+@@ -110,7 +197,11 @@ public:
+         : m_owner(owner) { }
+ 
+     // The old way: a new ImageBuffer (and SharedMemory) per part, painted here.
+-    void paintPartIntoImageBuffer(const WCTileGrid::TileIndex& index, const IntRect& dirtyRect, WCLayerUpdateInfo& update)
++    // False when the image could not be allocated (PS5: the tile arena was
++    // full and there was no memory for a tile of its own either; it used to be
++    // a null dereference, the whole browser with pages in it): the caller
++    // leaves the part for the next update.
++    bool paintPartIntoImageBuffer(const WCTileGrid::TileIndex& index, const IntRect& dirtyRect, WCLayerUpdateInfo& update)
+     {
+         float deviceScaleFactor = m_owner.deviceScaleFactor();
+         WCTileUpdate partUpdate;
+@@ -120,8 +211,18 @@ public:
+         partUpdate.dirtyRect = scaledDirtyRect;
+ #if defined(PS5_PAYLOAD_SDK)
+         auto paintStart = MonotonicTime::now();
+-#endif
++        RefPtr<ImageBuffer> image;
++        if (!wcTestAllocationFails())
++            image = m_owner.createImageBuffer(dirtyRect.size(), deviceScaleFactor);
++        if (!image) {
++            wcNoteTileMemory(WCTileMemoryEvent::ImageFailed, 1, static_cast<uint64_t>(scaledDirtyRect.width()) * scaledDirtyRect.height() * 4);
++            return false;
++        }
++#else
+         auto image = m_owner.createImageBuffer(dirtyRect.size(), deviceScaleFactor);
++        if (!image)
++            return false;
++#endif
+         auto& context = image->context();
+         context.translate(-dirtyRect.x(), -dirtyRect.y());
+         m_owner.paintGraphicsLayerContents(context, dirtyRect);
+@@ -135,6 +236,7 @@ public:
+ #endif
+         partUpdate.backingStore.setImageBuffer(WTF::move(image));
+         update.background.tileUpdates.append(WTF::move(partUpdate));
++        return true;
+     }
+ 
+     bool paintAndFlush(WCLayerUpdateInfo& update)
+@@ -162,6 +264,7 @@ public:
+             for (auto& dirtyRect : tile.rectsToPaint())
+                 parts.append({ entry.key, dirtyRect });
+         }
++        Vector<IntRect> unpainted;
+         if (!parts.isEmpty()) {
+ #if USE(SKIA) && !ENABLE(WC_GPU_PROCESS)
+             // PS5 (WCTilePainter.h): into the shared tile arena, recorded once
+@@ -170,13 +273,29 @@ public:
+                 parts = painter->paintLayer(m_owner, parts, m_owner.deviceScaleFactor(), update.background.tileUpdates);
+ #if defined(PS5_PAYLOAD_SDK)
+                 wcTilePaintStats().arenaFallbacks += parts.size();
++                if (!parts.isEmpty())
++                    wcNoteTileMemory(WCTileMemoryEvent::ArenaFull, parts.size(), 0);
+ #endif
+             }
+ #endif
+-            for (auto& part : parts)
+-                paintPartIntoImageBuffer(part.index, part.rect, update);
++            for (auto& part : parts) {
++                if (!paintPartIntoImageBuffer(part.index, part.rect, update) && !part.rect.isEmpty())
++                    unpainted.append(part.rect);
++            }
+         }
+         m_tileGrid.clearDirtyRects();
++        // Parts with no memory to paint them in stay dirty: the tile shows
++        // what it had (or nothing yet) until the next update paints it, and
++        // the layer is flushed again in that update.
++        if (!unpainted.isEmpty()) {
++            for (auto& rect : unpainted)
++                m_tileGrid.addDirtyRect(rect);
++            m_owner.noteLayerPropertyChanged(WCLayerChange::Background, GraphicsLayerWC::DontScheduleFlush);
++#if defined(PS5_PAYLOAD_SDK)
++            if (m_owner.m_observer)
++                m_owner.m_observer->tilesLeftForNextUpdate();
++#endif
++        }
+         return repainted;
+     }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+index 090817b518..105fadcf75 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
++++ b/Source/WebKit/WebProcess/WebPage/wc/GraphicsLayerWC.h
+@@ -57,6 +57,18 @@ struct WCTilePaintStats {
+ };
+ WCTilePaintStats& wcTilePaintStats();
+ 
++// Tile memory running out, in the release log too: tile parts painted the old
++// way because the tile arena was full, tile images and arena chunks whose
++// shared memory could not be allocated. Main thread. One "[wc] tile memory"
++// line at most every 5 s, with the counts since the last one and, in the
++// title, its flexible memory left (where shared memory comes from).
++enum class WCTileMemoryEvent : uint8_t { ArenaFull, ImageFailed, ChunkFailed };
++void wcNoteTileMemory(WCTileMemoryEvent, unsigned count, uint64_t bytes);
++// Development builds only: PS5WK_WC_TEST_ALLOC_FAIL=<percent> makes that
++// share of tile images and arena chunks fail, as when memory runs out. Always
++// false in a release.
++bool wcTestAllocationFails();
++
+ // Layer tree flushes since DrawingAreaWC last took them ([render] lines).
+ struct WCFlushStats {
+     unsigned flushes { 0 };
+@@ -76,6 +88,11 @@ public:
+         virtual void commitLayerUpdateInfo(WCLayerUpdateInfo&&) = 0;
+         virtual RefPtr<WebCore::ImageBuffer> createImageBuffer(WebCore::FloatSize, float deviceScaleFactor) = 0;
+         virtual WCTilePainter* tilePainter() { return nullptr; }
++#if defined(PS5_PAYLOAD_SDK)
++        // A layer left tiles unpainted (no memory for them) during the
++        // flush: they are painted in the next rendering update.
++        virtual void tilesLeftForNextUpdate() { }
++#endif
+     };
+ 
+     // PS5 (COMPOSITING-PLAN.md, M6): tiles only for the visible rect (plus
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+index f3089ec768..c370904397 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -224,11 +224,17 @@ bool WCTileArena::addChunk(uint64_t minimumSize)
+         }
+     }
+ #endif
++#if defined(PS5_PAYLOAD_SDK)
++    if (!memory && !wcTestAllocationFails())
++#else
+     if (!memory)
++#endif
+         memory = SharedMemory::allocate(size);
+     double ms = (MonotonicTime::now() - start).milliseconds();
+ #if defined(PS5_PAYLOAD_SDK)
+     wcTilePaintStats().shmAllocations++;
++    if (!memory)
++        wcNoteTileMemory(WCTileMemoryEvent::ChunkFailed, 1, size);
+ #endif
+     if (!memory)
+         return false;
