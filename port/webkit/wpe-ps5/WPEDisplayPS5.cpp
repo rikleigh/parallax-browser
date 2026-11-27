@@ -82,6 +82,10 @@
  */
 
 static constexpr unsigned padIntervalMS = 8;
+static constexpr double stickPointerSpeed = 22.0; // px per pad interval at full deflection
+// padTick this late: the stall thread moves the left stick's pointer
+// (padStallThread). Scrolling waits for 50 ms.
+static constexpr double stallPointerAfter = 0.025;
 static constexpr double kSystemHeldEndsVR = 10.0; // seconds
 static constexpr double repeatDelay = 0.40;
 static constexpr double repeatInterval = 0.06;
@@ -124,6 +128,21 @@ struct _WPEDisplayPS5Private {
     std::atomic<double> padTickAt { 0 };
     std::atomic<bool> padTickScrolls { false };
     GMutex padReadLock { }; // scePadReadState: padTick or the stall thread
+    // The left stick's pointer, shared by padTick and the stall thread
+    // (stallPointerLock): the time up to which the stick has moved the
+    // pointer; how far the stall thread moved it that padTick has not taken
+    // yet; and where padTick left it, with the bounds it moves in (valid
+    // while padTick's last run was on a page with the stick moving the
+    // pointer, not the UI, gamepad mode, View in VR or the keyboard).
+    GMutex stallPointerLock { };
+    double stickPointerAt { 0 };
+    double stallPointerDX { 0 };
+    double stallPointerDY { 0 };
+    struct {
+        bool valid;
+        double x, y, minY, maxX, maxY;
+        int top;
+    } stallPointerBase { };
     uint32_t buttons { 0 };
     uint32_t ignoredButtons { 0 };
     uint32_t repeatingKey { 0 };
@@ -286,10 +305,20 @@ static void redraw(WPEDisplayPS5* display)
 {
     auto* priv = display->priv;
     bool visible = nowSeconds() - priv->pointerMovedAt < pointerShownFor;
+    double x = priv->pointerX, y = priv->pointerY;
+    // Moved by the stall thread and not yet taken by padTick: drawn where
+    // the stall thread left it, not back where padTick last had it.
+    g_mutex_lock(&priv->stallPointerLock);
+    if (priv->stallPointerBase.valid && (priv->stallPointerDX || priv->stallPointerDY)) {
+        x = priv->stallPointerBase.x + priv->stallPointerDX;
+        y = priv->stallPointerBase.y + priv->stallPointerDY;
+        visible = true;
+    }
+    g_mutex_unlock(&priv->stallPointerLock);
     priv->pointerWasVisible = visible;
     // The page's pointer is in view coordinates, the UI's in the screen's.
     double top = priv->uiMode ? 0 : PS5Renderer::singleton().pageTop();
-    PS5Renderer::singleton().present(visible, priv->pointerX, priv->pointerY + top);
+    PS5Renderer::singleton().present(visible, x, y + top);
 }
 
 void wpeDisplayPS5ScheduleRedraw(WPEDisplayPS5* display)
@@ -672,15 +701,96 @@ static void movePointer(WPEDisplayPS5* display, WPEView* view, double dx, double
     wpeDisplayPS5ScheduleRedraw(display);
 }
 
-// The left stick's pointer (page pointer events): moves it by the stick's
-// deflection; returns whether the pointer is shown now (and hides it when
-// its time is up).
-static bool stickPointer(WPEDisplayPS5* display, WPEView* view, double sx, double sy, double t)
+// The left stick's step since it last moved the pointer: stickPointerSpeed
+// per pad interval at full deflection, for the time that has passed (up to
+// 6 intervals), so the pointer keeps its speed when padTick runs late. With
+// pages in the title their scripts share the main thread, and at 8 ms a
+// step it crawled while a page was busy. Plus what the stall thread moved it
+// meanwhile (@stallDX, @stallDY, taken from it at the start of padTick).
+static void stickPointerStep(WPEDisplayPS5* display, double sx, double sy, double stallDX, double stallDY, double t, double* dx, double* dy)
 {
     auto* priv = display->priv;
-    if (sx || sy) {
-        const double speed = 22.0; // px per tick at full deflection
-        movePointer(display, view, sx * speed, sy * speed, t);
+    g_mutex_lock(&priv->stallPointerLock);
+    const double elapsed = t - priv->stickPointerAt;
+    priv->stickPointerAt = t;
+    g_mutex_unlock(&priv->stallPointerLock);
+    // Not on a page with the stick moving the pointer for a while (another
+    // mode, or the first run): one interval's step.
+    const double scale = elapsed > 0.25 ? 1.0 : std::clamp(elapsed / (padIntervalMS / 1000.0), 0.0, 6.0);
+    *dx = stallDX + sx * stickPointerSpeed * scale;
+    *dy = stallDY + sy * stickPointerSpeed * scale;
+}
+
+// Start of padTick: what the stall thread moved the pointer by, for
+// stickPointerStep (or dropped, if this run is not on a page with the stick
+// moving the pointer), and no stall-thread pointer until padTick says where
+// the pointer is again (publishStallPointer).
+static void takeStallPointer(WPEDisplayPS5* display, double* dx, double* dy)
+{
+    auto* priv = display->priv;
+    g_mutex_lock(&priv->stallPointerLock);
+    *dx = priv->stallPointerDX;
+    *dy = priv->stallPointerDY;
+    priv->stallPointerDX = priv->stallPointerDY = 0;
+    priv->stallPointerBase.valid = false;
+    g_mutex_unlock(&priv->stallPointerLock);
+}
+
+// After padTick moved the page's pointer: where it is and the bounds it
+// moves in (movePointer's), for the stall thread. A hidden pointer that
+// never moved starts at the centre, as movePointer starts it.
+static void publishStallPointer(WPEDisplayPS5* display, WPEView* view, double t)
+{
+    auto* priv = display->priv;
+    const int width = wpe_view_get_width(view), height = wpe_view_get_height(view);
+    if (width <= 0 || height <= 0)
+        return;
+    const int top = PS5Renderer::singleton().pageTop();
+    double x = priv->pointerX, y = priv->pointerY;
+    if (t - priv->pointerMovedAt >= pointerShownFor && !x && !y) {
+        x = width / 2.0;
+        y = height / 2.0;
+    }
+    g_mutex_lock(&priv->stallPointerLock);
+    priv->stallPointerBase = { true, x, y, priv->pointerDown ? 0.0 : -static_cast<double>(top), width - 1.0, height - 1.0, top };
+    g_mutex_unlock(&priv->stallPointerLock);
+}
+
+// The stall thread: the left stick at @sx, @sy moves the drawn pointer
+// while padTick is late; padTick sends the page the move when it runs.
+// Returns whether it moved, and where to draw it (@x, @y, screen pixels).
+static bool stallPointerMove(WPEDisplayPS5* display, double sx, double sy, double t, double* x, double* y)
+{
+    auto* priv = display->priv;
+    bool moved = false;
+    g_mutex_lock(&priv->stallPointerLock);
+    auto& base = priv->stallPointerBase;
+    if (base.valid) {
+        const double elapsed = t - priv->stickPointerAt;
+        priv->stickPointerAt = t;
+        if (sx || sy) {
+            const double scale = std::clamp(elapsed / (padIntervalMS / 1000.0), 0.0, 6.0);
+            const double nx = std::clamp(base.x + priv->stallPointerDX + sx * stickPointerSpeed * scale, 0.0, base.maxX);
+            const double ny = std::clamp(base.y + priv->stallPointerDY + sy * stickPointerSpeed * scale, base.minY, base.maxY);
+            priv->stallPointerDX = nx - base.x;
+            priv->stallPointerDY = ny - base.y;
+            *x = nx;
+            *y = ny + base.top;
+            moved = true;
+        }
+    }
+    g_mutex_unlock(&priv->stallPointerLock);
+    return moved;
+}
+
+// The left stick's pointer (page pointer events): moves it by the stick's
+// step (stickPointerStep); returns whether the pointer is shown now (and
+// hides it when its time is up).
+static bool stickPointer(WPEDisplayPS5* display, WPEView* view, double dx, double dy, double t)
+{
+    auto* priv = display->priv;
+    if (dx || dy) {
+        movePointer(display, view, dx, dy, t);
         return true;
     }
     bool pointerVisible = t - priv->pointerMovedAt < pointerShownFor;
@@ -1097,8 +1207,12 @@ static void padScrollTestTick(WPEDisplayPS5* display)
 // would send it, to the page's scrolling tree on the render thread
 // (ps5wk_title_stall_scroll, WebKit: only while the stick was scrolling that
 // page frame-locked within the last second; clamped at the painted edge
-// there). Nothing else of the pad is read here; padTick goes on as before
-// when the main thread is back. One log line per stall it scrolled in.
+// there). The left stick's pointer the same way, once padTick is
+// stallPointerAfter late: drawn where the stick takes it (stallPointerMove),
+// and the page gets the move when padTick runs again (stickPointerStep), so
+// hover and clicks land where it is shown. Nothing else of the pad is read
+// here; padTick goes on as before when the main thread is back. One log line
+// per stall the pad's thread acted in.
 extern "C" bool ps5wk_title_stall_scroll(double wpeDeltaX, double wpeDeltaY) __attribute__((weak));
 
 static void* padStallThread(void* data)
@@ -1106,24 +1220,29 @@ static void* padStallThread(void* data)
     auto* display = static_cast<WPEDisplayPS5*>(data);
     auto* priv = display->priv;
     double lastSent = 0, stallFrom = 0;
-    unsigned events = 0;
+    unsigned events = 0, pointerSteps = 0;
     double pixels = 0;
     for (;;) {
         g_usleep(padIntervalMS * 1000);
         double t = nowSeconds();
         double tickAt = priv->padTickAt.load(std::memory_order_relaxed);
-        if (t - tickAt < 0.05 || !priv->padTickScrolls.load(std::memory_order_relaxed)) {
-            if (events)
-                PS5_LOG("pad: the main thread was stuck %.0f ms; the stick scrolled the page from the pad's thread meanwhile (%u steps, %.0f px)",
-                    (tickAt - stallFrom) * 1000, events, pixels);
-            events = 0;
-            pixels = 0;
+        const bool scrolls = t - tickAt >= 0.05 && priv->padTickScrolls.load(std::memory_order_relaxed);
+        if (!scrolls)
             lastSent = 0;
+        if (t - tickAt < stallPointerAfter) {
+            if (events || pointerSteps)
+                PS5_LOG("pad: the main thread was stuck %.0f ms; from the pad's thread meanwhile the right stick scrolled the page (%u steps, %.0f px) "
+                        "and the left stick moved the pointer (%u steps)",
+                    (tickAt - stallFrom) * 1000, events, pixels, pointerSteps);
+            events = 0;
+            pointerSteps = 0;
+            pixels = 0;
+            stallFrom = 0;
             continue;
         }
-        if (!events && !lastSent)
+        if (!stallFrom)
             stallFrom = tickAt;
-        double rx = 0, ry = 0;
+        double rx = 0, ry = 0, lx = 0, ly = 0;
         if (s_padScrollTest.on) {
             if (!padScrollTestStick(t, &rx, &ry))
                 rx = ry = 0;
@@ -1134,9 +1253,18 @@ static void* padStallThread(void* data)
             g_mutex_unlock(&priv->padReadLock);
             if (readResult || (pad.buttons & PS5_PAD_INTERCEPTED))
                 continue;
+            lx = stickValue(pad.sticks[0]);
+            ly = stickValue(pad.sticks[1]);
             rx = stickValue(pad.sticks[2]);
             ry = stickValue(pad.sticks[3]);
         }
+        double pointerX = 0, pointerY = 0;
+        if (stallPointerMove(display, lx, ly, t, &pointerX, &pointerY)) {
+            PS5Renderer::singleton().present(true, pointerX, pointerY);
+            pointerSteps++;
+        }
+        if (!scrolls)
+            continue;
         double since = lastSent ? t - lastSent : t - tickAt - 0.05 + padIntervalMS / 1000.0;
         lastSent = t;
         if (!rx && !ry)
@@ -1326,6 +1454,8 @@ static void padTick(WPEDisplayPS5* display)
     auto* priv = display->priv;
     priv->padTickAt.store(nowSeconds(), std::memory_order_relaxed);
     priv->padTickScrolls.store(false, std::memory_order_relaxed);
+    double stallDX = 0, stallDY = 0;
+    takeStallPointer(display, &stallDX, &stallDY);
     pollTextDialog(display);
     padScrollTestTick(display);
 
@@ -1472,9 +1602,12 @@ static void padTick(WPEDisplayPS5* display)
 
     // Left stick and the touchpad: pointer. Right stick and two fingers on
     // the touchpad: scroll under the pointer (or the centre).
-    bool pointerVisible = stickPointer(display, view, stickValue(data.sticks[0]), stickValue(data.sticks[1]), t);
+    double stickDX = 0, stickDY = 0;
+    stickPointerStep(display, stickValue(data.sticks[0]), stickValue(data.sticks[1]), stallDX, stallDY, t, &stickDX, &stickDY);
+    bool pointerVisible = stickPointer(display, view, stickDX, stickDY, t);
     if (touchPointer(display, view, touch, t))
         pointerVisible = true;
+    publishStallPointer(display, view, t);
     stickScroll(display, view, stickValue(data.sticks[2]), stickValue(data.sticks[3]), pointerVisible);
     priv->padTickScrolls.store(!priv->pendingText, std::memory_order_relaxed);
 
