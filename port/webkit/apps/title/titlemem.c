@@ -204,6 +204,12 @@ static void dmap_release_range(uintptr_t a, size_t len)
 }
 
 int ps5wk_title_mem_exec;
+/* Set when the title runs a WebProcess (ps5browser.c's setUpInTitleWeb),
+ * with or without the JIT. WebKit's SharedMemory::allocateInProcess
+ * (patches-radv 0168) then puts the tile arena in anonymous mmaps, so direct
+ * memory above, instead of shm objects, which a title pays for from its
+ * flexible memory (8 MB per 8 MB chunk, 2026-11-27). */
+int ps5wk_title_web_in_process;
 int __wrap_munmap(void* addr, size_t len);
 
 /* WebAssembly memories of the WebProcess in the title (JSC's
@@ -456,6 +462,18 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
         spike_log("[mem] anonymous mmap of %.1f MB (align 0x%zx, prot %d) -> direct memory at %p", size / 1048576.0,
             align, prot, p);
     return p;
+}
+
+/* 1 if [addr, addr+len) is direct memory mapped here (in the table), 0 if
+ * not: an anonymous mmap that found no direct memory went to flexible. For
+ * WebKit's SharedMemory::allocateInProcess (patches-radv 0168). */
+int ps5wk_title_mem_is_direct(const void* addr, size_t len);
+int ps5wk_title_mem_is_direct(const void* addr, size_t len)
+{
+    pthread_mutex_lock(&dmap_lock);
+    int direct = dmap_contains((uintptr_t)addr, len);
+    pthread_mutex_unlock(&dmap_lock);
+    return direct;
 }
 
 int __wrap_munmap(void* addr, size_t len)

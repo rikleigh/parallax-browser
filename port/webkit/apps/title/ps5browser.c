@@ -3379,6 +3379,7 @@ static void startTitleProfiler(void)
  * whole title (one set of JSC options per process). */
 int ps5wk_web_process_in_title_start(int fd, uint64_t processIdentifier);
 extern int ps5wk_title_mem_exec __attribute__((weak)); /* titlemem.c (the title package; not the payload-style ELF) */
+extern int ps5wk_title_web_in_process __attribute__((weak)); /* titlemem.c */
 extern int ps5wk_title_access_fix __attribute__((weak)); /* titlesys.c (the title package) */
 
 /* KEY=VALUE lines of an env file, as ps5wk-child.cpp's readEnvFile reads
@@ -3451,6 +3452,8 @@ static void setUpInTitleWeb(void)
     setenv("JSC_maximumOMGCandidateCost", "2000000", 0);
     if (&ps5wk_title_mem_exec)
         ps5wk_title_mem_exec = jit;
+    if (&ps5wk_title_web_in_process)
+        ps5wk_title_web_in_process = 1;
     /* fontconfig finds its fonts.conf with access() (titlesys.c). */
     if (&ps5wk_title_access_fix)
         ps5wk_title_access_fix = 1;

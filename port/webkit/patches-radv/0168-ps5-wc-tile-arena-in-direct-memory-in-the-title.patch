@@ -1,0 +1,279 @@
+diff --git a/Source/WebCore/platform/SharedMemory.h b/Source/WebCore/platform/SharedMemory.h
+index 68f798ab3b..e1c4c67b70 100644
+--- a/Source/WebCore/platform/SharedMemory.h
++++ b/Source/WebCore/platform/SharedMemory.h
+@@ -119,6 +119,15 @@ public:
+ 
+     // FIXME: Change these factory functions to return Ref<SharedMemory> and crash on failure.
+     WEBCORE_EXPORT static RefPtr<SharedMemory> allocate(size_t);
++#if defined(PS5_PAYLOAD_SDK)
++    // Memory for this process's own use only: in the title with its
++    // WebProcess (the WebProcess's tile arena, which only the title's
++    // drawing-area proxy maps), an anonymous mapping (the title's direct
++    // memory) whose handles map() resolves to the same pages; anywhere else,
++    // allocate(). A handle of it sent to another process maps nothing there.
++    WEBCORE_EXPORT static RefPtr<SharedMemory> allocateInProcess(size_t);
++    bool isInProcess() const { return m_isInProcess; }
++#endif
+     WEBCORE_EXPORT static RefPtr<SharedMemory> copyBuffer(const WebCore::FragmentedSharedBuffer&);
+     WEBCORE_EXPORT static RefPtr<SharedMemory> map(Handle&&, Protection, CopyOnWrite = CopyOnWrite::No);
+ #if USE(UNIX_DOMAIN_SOCKETS)
+@@ -161,6 +170,9 @@ private:
+ #if USE(UNIX_DOMAIN_SOCKETS)
+     UnixFileDescriptor m_fileDescriptor;
+     bool m_isWrappingMap { false };
++#if defined(PS5_PAYLOAD_SDK)
++    bool m_isInProcess { false };
++#endif
+ #elif OS(DARWIN)
+     MachSendRight m_sendRight;
+ #elif OS(WINDOWS)
+diff --git a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+index 70bb0b170e..a5172d1f70 100644
+--- a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
++++ b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+@@ -39,6 +39,11 @@
+ #include <unistd.h>
+ #include <wtf/Assertions.h>
+ #include <wtf/CryptographicallyRandomNumber.h>
++#if defined(PS5_PAYLOAD_SDK)
++#include <wtf/Lock.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/Vector.h>
++#endif
+ #include <wtf/SafeStrerror.h>
+ #include <wtf/UniStdExtras.h>
+ #include <wtf/text/CString.h>
+@@ -143,6 +148,122 @@ RefPtr<SharedMemory> SharedMemory::allocate(size_t size)
+     return instance;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++// The title with its WebProcess: the tile arena's chunks are shm objects
++// that the WebProcess half makes and the drawing-area proxy half maps, and a
++// title pays for shm from its flexible memory (~260 MB, shared with the video
++// decoders and the libc heap): each 8 MB chunk took 8 MB of it, the 64 MB
++// arena a quarter, and the tiles painted the old way past it (one shm object
++// each) the rest (2026-11-27). An anonymous mapping is the title's direct
++// memory instead (apps/title/titlemem.c). The handle still needs a file
++// descriptor for IPC: an empty shm object (no pages), whose inode names the
++// region here; map() looks it up and returns the same pages. The region
++// keeps its own descriptor open while it lives, so no other object can get
++// its inode, and goes when the last SharedMemory on it does. A handle that
++// arrives after that (or in another process) finds nothing, and its empty
++// object maps nothing (the size check below).
++extern "C" int ps5wk_title_web_in_process __attribute__((weak)); // apps/title/titlemem.c
++extern "C" int ps5wk_title_mem_is_direct(const void*, size_t) __attribute__((weak)); // apps/title/titlemem.c
++
++namespace {
++struct InProcessRegion {
++    uint64_t device;
++    uint64_t inode;
++    void* data;
++    size_t size;
++    size_t mappedSize;
++    unsigned references;
++    UnixFileDescriptor token;
++};
++}
++
++static Lock inProcessLock;
++static Vector<InProcessRegion>& inProcessRegions() WTF_REQUIRES_LOCK(inProcessLock)
++{
++    static NeverDestroyed<Vector<InProcessRegion>> regions;
++    return regions;
++}
++
++RefPtr<SharedMemory> SharedMemory::allocateInProcess(size_t size)
++{
++    if (!&ps5wk_title_web_in_process || !ps5wk_title_web_in_process || !size)
++        return allocate(size);
++    auto token = createSharedMemory();
++    struct stat status;
++    if (!token || fstat(token.value(), &status) || !status.st_ino)
++        return allocate(size);
++    UnixFileDescriptor kept { token.value(), UnixFileDescriptor::Duplicate };
++    if (!kept)
++        return allocate(size);
++    // titlemem.c maps in 64 KiB units and releases what munmap is given.
++    const size_t mappedSize = (size + 0xffff) & ~static_cast<size_t>(0xffff);
++    void* data = mmap(nullptr, mappedSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (data == MAP_FAILED)
++        return nullptr;
++    // No direct memory left: titlemem.c mapped flexible memory, which costs
++    // the same as shm, so it may as well be shm (and say so in the log).
++    if (ps5wk_title_mem_is_direct && !ps5wk_title_mem_is_direct(data, mappedSize)) {
++        munmap(data, mappedSize);
++        return allocate(size);
++    }
++    {
++        Locker locker { inProcessLock };
++        auto& regions = inProcessRegions();
++        if (regions.containsIf([&](auto& region) { return region.device == static_cast<uint64_t>(status.st_dev) && region.inode == static_cast<uint64_t>(status.st_ino); })) {
++            munmap(data, mappedSize);
++            return allocate(size);
++        }
++        regions.append({ static_cast<uint64_t>(status.st_dev), static_cast<uint64_t>(status.st_ino), data, size, mappedSize, 1, WTF::move(kept) });
++    }
++    RefPtr<SharedMemory> instance = adoptRef(new SharedMemory());
++    instance->m_data = data;
++    instance->m_fileDescriptor = WTF::move(token);
++    instance->m_size = size;
++    instance->m_isInProcess = true;
++    return instance;
++}
++
++// The pages of the region the descriptor names, with a reference taken for
++// the caller, if it is one of ours and holds size bytes; else null.
++static void* takeInProcessRegion(int fileDescriptor, size_t size)
++{
++    Locker locker { inProcessLock };
++    auto& regions = inProcessRegions();
++    if (regions.isEmpty())
++        return nullptr;
++    // Our tokens are empty; a real shm object a handle names never is.
++    struct stat status;
++    if (fstat(fileDescriptor, &status) || !status.st_ino || status.st_size)
++        return nullptr;
++    auto index = regions.findIf([&](auto& region) { return region.device == static_cast<uint64_t>(status.st_dev) && region.inode == static_cast<uint64_t>(status.st_ino); });
++    if (index == notFound || size > regions[index].size)
++        return nullptr;
++    regions[index].references++;
++    return regions[index].data;
++}
++
++static void releaseInProcess(void* data)
++{
++    void* unmap = nullptr;
++    size_t unmapSize = 0;
++    UnixFileDescriptor token;
++    {
++        Locker locker { inProcessLock };
++        auto& regions = inProcessRegions();
++        auto index = regions.findIf([&](auto& region) { return region.data == data; });
++        if (index == notFound)
++            return;
++        if (--regions[index].references)
++            return;
++        unmap = regions[index].data;
++        unmapSize = regions[index].mappedSize;
++        token = WTF::move(regions[index].token);
++        regions.removeAt(index);
++    }
++    munmap(unmap, unmapSize);
++}
++#endif
++
+ RefPtr<SharedMemory> SharedMemory::map(Handle&& handle, Protection protection, CopyOnWrite copyOnWrite)
+ {
+     // Copy-on-write is not supported on this platform.
+@@ -154,6 +275,14 @@ RefPtr<SharedMemory> SharedMemory::map(Handle&& handle, Protection protection, C
+     // it is read, and on the PS5 the reader of a WebProcess's handles is the title (its GPU
+     // side: WebGPU's writeBuffer and writeTexture). An object the sender shrinks afterwards
+     // still gets past this.
++    if (void* data = takeInProcessRegion(handle.m_handle.value(), handle.size())) {
++        // The same pages, writable: the protection asked for is not applied.
++        RefPtr<SharedMemory> instance = adoptRef(new SharedMemory());
++        instance->m_data = data;
++        instance->m_size = handle.size();
++        instance->m_isInProcess = true;
++        return instance;
++    }
+     struct stat status;
+     if (!fstat(handle.m_handle.value(), &status) && status.st_size >= 0 && static_cast<uint64_t>(status.st_size) < handle.size())
+         return nullptr;
+@@ -185,6 +314,12 @@ SharedMemory::~SharedMemory()
+         UNUSED_VARIABLE(wrapped);
+         return;
+     }
++#if defined(PS5_PAYLOAD_SDK)
++    if (m_isInProcess) {
++        releaseInProcess(m_data);
++        return;
++    }
++#endif
+ 
+     munmap(m_data, m_size);
+ }
+diff --git a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+index c370904397..036bb8c6a3 100644
+--- a/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
++++ b/Source/WebKit/WebProcess/WebPage/wc/WCTilePainter.cpp
+@@ -181,9 +181,21 @@ static uint64_t arenaChunkSize()
+     return bytes;
+ }
+ 
++#if defined(PS5_PAYLOAD_SDK)
++extern "C" int ps5wk_title_web_in_process __attribute__((weak)); // apps/title/titlemem.c
++#endif
++
++// 64 MB; 128 MB in the title, where the chunks are direct memory
++// (SharedMemory::allocateInProcess) and every tile part past the arena is an
++// shm object paid for from the title's flexible memory.
+ static uint64_t arenaMaxSize()
+ {
+-    static uint64_t bytes = static_cast<uint64_t>(envUnsigned("PS5WK_WC_ARENA_MB", 64, 8, 512)) << 20;
++    unsigned defaultMB = 64;
++#if defined(PS5_PAYLOAD_SDK)
++    if (&ps5wk_title_web_in_process && ps5wk_title_web_in_process)
++        defaultMB = 128;
++#endif
++    static uint64_t bytes = static_cast<uint64_t>(envUnsigned("PS5WK_WC_ARENA_MB", defaultMB, 8, 512)) << 20;
+     return bytes;
+ }
+ 
+@@ -213,6 +225,7 @@ bool WCTileArena::addChunk(uint64_t minimumSize)
+     const char* how = "allocated";
+     auto start = MonotonicTime::now();
+ #if defined(PS5_PAYLOAD_SDK)
++    bool fromSpare = false;
+     // A chunk made ahead of time on a background thread, if one is ready
+     // and big enough (the allocation itself can take long on the console).
+     {
+@@ -221,20 +234,26 @@ bool WCTileArena::addChunk(uint64_t minimumSize)
+             memory = WTF::move(m_spare);
+             size = memory->size();
+             how = "taken from the spare";
++            fromSpare = true;
+         }
+     }
+ #endif
+ #if defined(PS5_PAYLOAD_SDK)
++    // Only the drawing-area proxy maps the chunks: in the title, that is
++    // this process, and the chunks are its direct memory.
+     if (!memory && !wcTestAllocationFails())
++        memory = SharedMemory::allocateInProcess(size);
+ #else
+     if (!memory)
+-#endif
+         memory = SharedMemory::allocate(size);
++#endif
+     double ms = (MonotonicTime::now() - start).milliseconds();
+ #if defined(PS5_PAYLOAD_SDK)
+     wcTilePaintStats().shmAllocations++;
+     if (!memory)
+         wcNoteTileMemory(WCTileMemoryEvent::ChunkFailed, 1, size);
++    else if (memory->isInProcess() && !fromSpare)
++        how = "allocated in direct memory";
+ #endif
+     if (!memory)
+         return false;
+@@ -257,7 +276,8 @@ bool WCTileArena::addChunk(uint64_t minimumSize)
+ // one on a background thread, if the arena may still grow, so that a later
+ // burst of tiles doesn't wait for shm_open/ftruncate/mmap on the main thread.
+ // Off by default (PS5WK_WC_ARENA_SPARE=1 turns it on): measured at 0.02 ms
+-// for an 8 MB chunk on the console, the allocation is not what stalls.
++// for an 8 MB chunk in a payload and 0.7 ms in the title (direct memory,
++// zeroed; shm took 0.85 ms there), the allocation is not what stalls.
+ void WCTileArena::prepareSpare()
+ {
+     static const bool enabled = envUnsigned("PS5WK_WC_ARENA_SPARE", 0, 0, 1);
+@@ -272,7 +292,7 @@ void WCTileArena::prepareSpare()
+     }
+     Thread::create("WCTileArenaSpare"_s, [this, size] {
+         auto start = MonotonicTime::now();
+-        RefPtr memory = SharedMemory::allocate(size);
++        RefPtr memory = SharedMemory::allocateInProcess(size);
+         double ms = (MonotonicTime::now() - start).milliseconds();
+         Locker locker { m_spareLock };
+         m_spare = WTF::move(memory);

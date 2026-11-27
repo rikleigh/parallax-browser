@@ -333,7 +333,8 @@ Changes (`toolchain/wpe-webkit/src-wc`, branch `ps5-wc`, commits 8af4f0f1d2, 2f6
   their live pixels.
 - **Shared-memory tile arena** (`WCTileArena` in `WCTilePainter.cpp`): per
   WebProcess, 8 MB `SharedMemory` chunks (`PS5WK_WC_ARENA_CHUNK_MB`), up to
-  64 MB (`PS5WK_WC_ARENA_MB`); first-fit 64-byte aligned slots; chunks beyond
+  64 MB (`PS5WK_WC_ARENA_MB`; 128 MB in the title, whose chunks are direct
+  memory, `SharedMemory::allocateInProcess`, patch 0168); first-fit 64-byte aligned slots; chunks beyond
   the first are freed after 5 s empty and unused. A chunk goes once to each
   drawing-area proxy (`WCUpdateInfo::tileArenaChunks`, read-only handle,
   mapped once in the title and kept; freed ones in `removedTileArenaChunks`).
