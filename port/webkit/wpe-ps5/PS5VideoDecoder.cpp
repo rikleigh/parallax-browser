@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <deque>
 #include <errno.h>
+#include <fcntl.h>
 #include <glib.h>
 #include <map>
 #include <memory>
@@ -36,6 +37,13 @@
 #include <vector>
 
 #define DLOG(...) g_message("[vdec] " __VA_ARGS__)
+
+#if __has_include("PS5WKDebugBuild.h")
+#include "PS5WKDebugBuild.h"
+#endif
+#ifndef PS5WK_DEBUG_BUILD
+#define PS5WK_DEBUG_BUILD 0
+#endif
 
 static const ps5wk_vdec_backend* backend;
 
@@ -137,6 +145,11 @@ struct Decoder {
 
     // Stats (decoder thread).
     uint64_t aus { 0 }, pictures { 0 }, hidden { 0 }, errors { 0 }, skipped { 0 }, noPTS { 0 }, longWaits { 0 };
+    // VP9 pictures the hardware skipped with no error (sendPicture: a later
+    // one came out first), all and since the last keyframe; resets at a
+    // keyframe because of them (processAU).
+    uint64_t skippedByHardware { 0 }, keyframeResets { 0 };
+    unsigned skippedSinceKeyframe { 0 };
     uint64_t recoveries { 0 }, flagged { 0 };
     uint64_t lostPictures { 0 }; // guarded by lock: held pictures older than one presented (never released)
     int64_t windowStartUS { 0 };
@@ -144,6 +157,30 @@ struct Decoder {
     double windowCallMS { 0 }, windowCallMaxMS { 0 }, windowSlotWaitMS { 0 };
     unsigned windowCalls { 0 };
     int firstRC { 0 };
+#if PS5WK_DEBUG_BUILD
+    // VP9 decode calls that gave no picture, or another frame's (debugVP9Output),
+    // by frame kind (vp9KindNames); this window and in all.
+    static constexpr int vp9Kinds = 6;
+    uint64_t vp9Calls[vp9Kinds] { }, vp9NoPicture[vp9Kinds] { }, vp9OtherPicture[vp9Kinds] { };
+    uint64_t vp9WindowCalls[vp9Kinds] { }, vp9WindowNoPicture[vp9Kinds] { }, vp9WindowOtherPicture[vp9Kinds] { };
+    unsigned vp9Reported { 0 }, vp9FrameIndex { 0 }, vp9FrameCount { 0 };
+    uint32_t vp9LastKey { 0 };
+    // Shown VP9 frames whose picture has not come back yet (debugVP9Output):
+    // a picture of a later key means these are lost.
+    struct VP9Pending {
+        int kind, refresh;
+        unsigned size, frameIndex, frameCount, sinceKeyframe;
+        double slotWaitMS, sinceCallMS;
+        int64_t sentAt;
+    };
+    std::map<uint32_t, VP9Pending> vp9Pending;
+    uint64_t vp9Lost { 0 }, vp9WindowLost { 0 }, vp9WindowLostByKind[vp9Kinds] { };
+    unsigned vp9SinceKeyframe { 0 };
+    int64_t vp9LastCallAt { 0 };
+    uint32_t vp9Epoch { 0 };
+    int vp9LastWidth { 0 };
+    unsigned vp9HeadersLogged { 0 };
+#endif
 
     // What this decoder counts against the decoder budget (openHardware).
     bool budgeted { false };
@@ -215,8 +252,16 @@ static void sendPicture(Decoder& d, uint32_t key, uint32_t epoch, uint32_t statu
         d.outstanding.erase(it);
         // Display order: access units with an earlier PTS won't come out any more.
         if (slot) {
-            for (auto o = d.outstanding.begin(); o != d.outstanding.end();)
-                o = o->second < msg.pts_ns ? d.outstanding.erase(o) : std::next(o);
+            for (auto o = d.outstanding.begin(); o != d.outstanding.end();) {
+                if (o->second < msg.pts_ns) {
+                    if (d.codec == PS5WK_VCODEC_VP9) {
+                        d.skippedByHardware++;
+                        d.skippedSinceKeyframe++;
+                    }
+                    o = d.outstanding.erase(o);
+                } else
+                    o = std::next(o);
+            }
         }
     }
     send(d, msg);
@@ -729,6 +774,323 @@ static void handlePicture(Decoder& d, const ps5wk_vdec_picture& pic, int passed,
     sendPicture(d, key, epoch, 0, &copy);
 }
 
+#if PS5WK_DEBUG_BUILD
+// Debug builds: which VP9 frames the decoder gives no picture for (or another
+// frame's picture), to find why a stream can lose pictures with no error.
+// From the uncompressed header (VP9 spec 6.2): its kind, refresh flags, size;
+// the rest (full) when /data/ps5webkit/debug-vp9-headers asks for every
+// frame's header (debugVP9Output).
+struct VP9Header {
+    int kind { 5 }; // vp9KindNames
+    int mapIndex { -1 }, refresh { -1 }, width { 0 }, height { 0 };
+    bool errorResilient { false };
+    bool full { false }; // parsed to header_size_in_bytes
+    int resetContext { 0 }, refIndex[3] { -1, -1, -1 }, signBias { 0 }, sizeFromRef { -1 }, renderDifferent { 0 }, highPrecisionMV { 0 };
+    int interpFilter { -1 }, refreshContext { 0 }, parallelMode { 0 }, contextIndex { 0 };
+    int filterLevel { 0 }, sharpness { 0 }, deltaEnabled { 0 }, deltaUpdate { 0 }, baseQ { 0 }, deltaQ { 0 };
+    int segEnabled { 0 }, segUpdateMap { 0 }, segTemporal { 0 }, segUpdateData { 0 }, tileColsLog2 { 0 }, tileRowsLog2 { 0 }, headerSize { 0 };
+};
+static const char* const vp9KindNames[] = { "key", "inter", "hidden", "intra-only", "show-existing", "unparsed" };
+
+static VP9Header parseVP9Header(const uint8_t* p, size_t n, int widthHint = 0)
+{
+    VP9Header h;
+    size_t bit = 0;
+    bool over = false;
+    auto read = [&](int bits) {
+        unsigned v = 0;
+        for (int i = 0; i < bits; i++, bit++) {
+            if (bit / 8 >= n) {
+                over = true;
+                return 0u;
+            }
+            v = (v << 1) | ((p[bit / 8] >> (7 - bit % 8)) & 1);
+        }
+        return v;
+    };
+    if (read(2) != 2)
+        return h;
+    unsigned profile = read(1);
+    profile |= read(1) << 1;
+    if (profile == 3)
+        read(1);
+    if (read(1)) {
+        h.mapIndex = static_cast<int>(read(3));
+        h.kind = over ? 5 : 4;
+        return h;
+    }
+    bool key = !read(1), show = read(1);
+    h.errorResilient = read(1);
+    auto colorConfig = [&] {
+        if (profile >= 2)
+            read(1);
+        unsigned colorSpace = read(3);
+        if (colorSpace != 7) {
+            read(1);
+            if (profile == 1 || profile == 3)
+                read(3);
+        } else if (profile == 1 || profile == 3)
+            read(1);
+    };
+    auto frameSize = [&] {
+        h.width = static_cast<int>(read(16)) + 1;
+        h.height = static_cast<int>(read(16)) + 1;
+    };
+    auto renderSize = [&] {
+        h.renderDifferent = static_cast<int>(read(1));
+        if (h.renderDifferent)
+            read(32);
+    };
+    bool intraOnly = false;
+    if (key) {
+        read(24);
+        colorConfig();
+        frameSize();
+        renderSize();
+        h.refresh = 0xff;
+        h.kind = 0;
+    } else {
+        intraOnly = show ? false : read(1);
+        if (!h.errorResilient)
+            h.resetContext = static_cast<int>(read(2));
+        if (intraOnly) {
+            read(24);
+            if (profile > 0)
+                colorConfig();
+            h.refresh = static_cast<int>(read(8));
+            frameSize();
+            renderSize();
+            h.kind = 3;
+        } else {
+            h.refresh = static_cast<int>(read(8));
+            h.kind = show ? 1 : 2;
+            for (int i = 0; i < 3; i++) {
+                h.refIndex[i] = static_cast<int>(read(3));
+                h.signBias |= static_cast<int>(read(1)) << i;
+            }
+            for (int i = 0; i < 3 && h.sizeFromRef < 0; i++)
+                if (read(1))
+                    h.sizeFromRef = i;
+            if (h.sizeFromRef < 0)
+                frameSize();
+            renderSize();
+            h.highPrecisionMV = static_cast<int>(read(1));
+            h.interpFilter = read(1) ? 4 : static_cast<int>(read(2)); // 4: switchable
+        }
+    }
+    const bool overBasic = over; // the fields above: what the counts and the old log lines use
+    if (h.errorResilient) {
+        h.refreshContext = 0;
+        h.parallelMode = 1;
+    } else {
+        h.refreshContext = static_cast<int>(read(1));
+        h.parallelMode = static_cast<int>(read(1));
+    }
+    h.contextIndex = static_cast<int>(read(2));
+    // loop_filter_params
+    h.filterLevel = static_cast<int>(read(6));
+    h.sharpness = static_cast<int>(read(3));
+    h.deltaEnabled = static_cast<int>(read(1));
+    if (h.deltaEnabled) {
+        h.deltaUpdate = static_cast<int>(read(1));
+        if (h.deltaUpdate)
+            for (int i = 0; i < 6; i++)
+                if (read(1))
+                    read(7);
+    }
+    // quantization_params
+    h.baseQ = static_cast<int>(read(8));
+    for (int i = 0; i < 3; i++)
+        if (read(1)) {
+            read(5);
+            h.deltaQ |= 1 << i;
+        }
+    // segmentation_params
+    h.segEnabled = static_cast<int>(read(1));
+    if (h.segEnabled) {
+        h.segUpdateMap = static_cast<int>(read(1));
+        if (h.segUpdateMap) {
+            for (int i = 0; i < 7; i++)
+                if (read(1))
+                    read(8);
+            h.segTemporal = static_cast<int>(read(1));
+            if (h.segTemporal)
+                for (int i = 0; i < 3; i++)
+                    if (read(1))
+                        read(8);
+        }
+        h.segUpdateData = static_cast<int>(read(1));
+        if (h.segUpdateData) {
+            read(1);
+            static const int bits[4] = { 8, 6, 2, 0 }, sign[4] = { 1, 1, 0, 0 };
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 4; j++)
+                    if (read(1)) {
+                        read(bits[j]);
+                        if (sign[j])
+                            read(1);
+                    }
+        }
+    }
+    // tile_info: the column limits come from the width (a size from a
+    // reference: the hint, the last size seen).
+    int width = h.width ? h.width : widthHint;
+    if (width) {
+        int sb64Cols = (((width + 7) >> 3) + 7) >> 3, minLog2 = 0, maxLog2 = 1;
+        while ((64 << minLog2) < sb64Cols)
+            minLog2++;
+        while ((sb64Cols >> maxLog2) >= 4)
+            maxLog2++;
+        maxLog2--;
+        h.tileColsLog2 = minLog2;
+        while (h.tileColsLog2 < maxLog2 && read(1))
+            h.tileColsLog2++;
+        h.tileRowsLog2 = static_cast<int>(read(1));
+        if (h.tileRowsLog2)
+            h.tileRowsLog2 += static_cast<int>(read(1));
+        h.headerSize = static_cast<int>(read(16));
+        h.full = !over;
+    }
+    (void)intraOnly;
+    if (overBasic)
+        h.kind = 5;
+    return h;
+}
+
+static void debugVP9Output(Decoder& d, const uint8_t* data, size_t size, uint64_t pts, const ps5wk_vdec_picture& pic, int rc,
+    unsigned frameIndex, unsigned frameCount)
+{
+    VP9Header h = parseVP9Header(data, size, d.vp9LastWidth);
+    if (h.width)
+        d.vp9LastWidth = h.width;
+    // /data/ps5webkit/debug-vp9-headers: every frame's header, the first 700
+    // frames of each decoder (a stream that loses pictures at the same frame
+    // every time: what that frame and the ones before it have).
+    // open(), not access() or g_file_test: in the title access() says no for a file that exists (ps5browser.c).
+    static const bool logHeaders = [] {
+        int fd = open("/data/ps5webkit/debug-vp9-headers", O_RDONLY);
+        if (fd < 0)
+            return false;
+        close(fd);
+        return true;
+    }();
+    if (logHeaders && d.vp9HeadersLogged < 700) {
+        d.vp9HeadersLogged++;
+        char sz[40] = "";
+        if (h.width)
+            snprintf(sz, sizeof sz, " %dx%d", h.width, h.height);
+        else if (h.sizeFromRef >= 0)
+            snprintf(sz, sizeof sz, " size of ref %d", h.sizeFromRef);
+        DLOG("vp9 header: decoder %u: key %u%s %u/%u %s %zu B%s%s; refresh 0x%02x refs %d,%d,%d bias %d; reset ctx %d, ctx %d refresh %d parallel %d; "
+             "mv hp %d filter %d; lf %d sharp %d delta %d/%d; q %d dq %d; seg %d map %d temporal %d data %d; tiles 2^%d x 2^%d; header %d B%s",
+            d.id, static_cast<unsigned>(static_cast<uint32_t>(pts)), (pts & hiddenFlag) ? " (hidden)" : "", frameIndex + 1, frameCount,
+            vp9KindNames[h.kind], size, sz, h.renderDifferent ? " render size differs" : "", h.refresh < 0 ? 0 : h.refresh, h.refIndex[0],
+            h.refIndex[1], h.refIndex[2], h.signBias, h.resetContext, h.contextIndex, h.refreshContext, h.parallelMode, h.highPrecisionMV,
+            h.interpFilter, h.filterLevel, h.sharpness, h.deltaEnabled, h.deltaUpdate, h.baseQ, h.deltaQ, h.segEnabled, h.segUpdateMap,
+            h.segTemporal, h.segUpdateData, h.tileColsLog2, h.tileRowsLog2, h.headerSize, h.full ? "" : " (header cut short)");
+    }
+    d.vp9Calls[h.kind]++;
+    d.vp9WindowCalls[h.kind]++;
+    const bool none = !pic.valid, other = pic.valid && pic.has_pts && pic.pts != pts;
+    if (none) {
+        d.vp9NoPicture[h.kind]++;
+        d.vp9WindowNoPicture[h.kind]++;
+    } else if (other) {
+        d.vp9OtherPicture[h.kind]++;
+        d.vp9WindowOtherPicture[h.kind]++;
+    }
+    const uint32_t key = static_cast<uint32_t>(pts);
+    if ((none || other) && (d.vp9Reported < 60 || !(d.vp9Reported % 200))) {
+        char size2[48] = "";
+        if (h.width)
+            snprintf(size2, sizeof size2, ", %dx%d", h.width, h.height);
+        char refresh[24] = "";
+        if (h.refresh >= 0)
+            snprintf(refresh, sizeof refresh, ", refresh 0x%02x", h.refresh);
+        else if (h.mapIndex >= 0)
+            snprintf(refresh, sizeof refresh, ", shows slot %d", h.mapIndex);
+        char got[64];
+        if (none)
+            snprintf(got, sizeof got, "no picture");
+        else
+            snprintf(got, sizeof got, "the picture of key %u%s", static_cast<unsigned>(static_cast<uint32_t>(pic.pts)),
+                (pic.pts & hiddenFlag) ? " (hidden)" : "");
+        DLOG("vp9 debug: decoder %u: key %u%s frame %u/%u (%s, %zu bytes%s%s%s; previous AU key %u), rc 0x%08x: %s",
+            d.id, static_cast<unsigned>(key), (pts & hiddenFlag) ? " (hidden)" : "", frameIndex + 1, frameCount, vp9KindNames[h.kind], size,
+            size2, refresh, h.errorResilient ? ", error resilient" : "", static_cast<unsigned>(d.vp9LastKey), static_cast<unsigned>(rc), got);
+    }
+    if (none || other)
+        d.vp9Reported++;
+
+    // Which frames never come back: a picture of key K means every shown frame
+    // sent before K that is still pending was lost (VP9 pictures come back in
+    // decode order; hidden frames are not tracked).
+    const int64_t now = nowUS();
+    if (d.vp9Epoch != d.epoch) { // a flush or seek: what was pending is thrown away, not lost
+        d.vp9Pending.clear();
+        d.vp9Epoch = d.epoch;
+    }
+    if (h.kind == 0)
+        d.vp9SinceKeyframe = 0;
+    if (!(pts & hiddenFlag)) {
+        d.vp9Pending[key] = { h.kind, h.refresh, static_cast<unsigned>(size), frameIndex, frameCount, d.vp9SinceKeyframe, d.lastSlotWaitMS,
+            d.vp9LastCallAt ? (now - d.vp9LastCallAt) / 1000.0 : 0.0, now };
+        d.vp9SinceKeyframe++;
+    }
+    d.vp9LastCallAt = now;
+    if (pic.valid && pic.has_pts && !(pic.pts & hiddenFlag)) {
+        const uint32_t back = static_cast<uint32_t>(pic.pts);
+        while (!d.vp9Pending.empty() && d.vp9Pending.begin()->first < back) {
+            auto [lostKey, p] = *d.vp9Pending.begin();
+            d.vp9Pending.erase(d.vp9Pending.begin());
+            d.vp9Lost++;
+            d.vp9WindowLost++;
+            d.vp9WindowLostByKind[p.kind]++;
+            if (d.vp9Lost <= 80 || !(d.vp9Lost % 100))
+                DLOG("vp9 debug: decoder %u: key %u lost (%s, %u bytes, refresh 0x%02x, frame %u/%u of its AU, %u shown frames after the keyframe; "
+                     "its call waited %.1f ms for a slot and came %.1f ms after the one before); the picture of key %u came back %.1f ms after this frame was sent "
+                     "(%llu lost so far)",
+                    d.id, static_cast<unsigned>(lostKey), vp9KindNames[p.kind], p.size, p.refresh < 0 ? 0 : p.refresh, p.frameIndex + 1, p.frameCount,
+                    p.sinceKeyframe, p.slotWaitMS, p.sinceCallMS, static_cast<unsigned>(back), (now - p.sentAt) / 1000.0,
+                    (unsigned long long)d.vp9Lost);
+        }
+        d.vp9Pending.erase(back);
+    }
+    // A decoder reset after errors: what was pending never comes back.
+    if (d.vp9Pending.size() > 64)
+        d.vp9Pending.erase(d.vp9Pending.begin());
+}
+
+static void logVP9Window(Decoder& d)
+{
+    uint64_t calls = 0;
+    for (auto c : d.vp9WindowCalls)
+        calls += c;
+    if (calls) {
+        std::string line;
+        auto list = [&](const uint64_t* v) {
+            std::string s;
+            for (int k = 0; k < Decoder::vp9Kinds; k++)
+                s += (k ? "/" : "") + std::to_string(v[k]);
+            return s;
+        };
+        uint64_t none = 0, other = 0;
+        for (int k = 0; k < Decoder::vp9Kinds; k++) {
+            none += d.vp9NoPicture[k];
+            other += d.vp9OtherPicture[k];
+        }
+        DLOG("vp9 debug: decoder %u, this window by kind (key/inter/hidden/intra-only/show-existing/unparsed): calls %s, no picture %s, "
+             "another's picture %s; lost %s (%llu); in all %llu without a picture, %llu with another's, %llu lost",
+            d.id, list(d.vp9WindowCalls).c_str(), list(d.vp9WindowNoPicture).c_str(), list(d.vp9WindowOtherPicture).c_str(),
+            list(d.vp9WindowLostByKind).c_str(), (unsigned long long)d.vp9WindowLost, (unsigned long long)none, (unsigned long long)other,
+            (unsigned long long)d.vp9Lost);
+    }
+    for (int k = 0; k < Decoder::vp9Kinds; k++)
+        d.vp9WindowCalls[k] = d.vp9WindowNoPicture[k] = d.vp9WindowOtherPicture[k] = d.vp9WindowLostByKind[k] = 0;
+    d.vp9WindowLost = 0;
+}
+#endif
+
 static void logStats(Decoder& d)
 {
     int64_t now = nowUS();
@@ -751,12 +1113,16 @@ static void logStats(Decoder& d)
         g_mutex_unlock(&d.lock);
         DLOG("decoder %u (pid %d): %.1f AUs/s in, %.1f pictures/s out; decode call %.2f ms avg %.2f max, waited %.0f ms for slots; "
              "%u/%zu slots held (%u pinned), %zu AUs queued; so far %llu pictures, %llu hidden, %llu errors, %llu skipped, %llu without pts, "
-             "%llu resets after errors, %llu flagged, %llu lost without a release",
+             "%llu resets after errors, %llu flagged, %llu lost without a release; %llu skipped by the decoder, %llu resets at a keyframe for that",
             d.id, d.pid, d.windowAUs / seconds, d.windowPictures / seconds, d.windowCalls ? d.windowCallMS / d.windowCalls : 0.0,
             d.windowCallMaxMS, d.windowSlotWaitMS, held, d.slots.size(), pinned, queued, (unsigned long long)d.pictures,
             (unsigned long long)d.hidden, (unsigned long long)d.errors, (unsigned long long)d.skipped, (unsigned long long)d.noPTS,
-            (unsigned long long)d.recoveries, (unsigned long long)d.flagged, (unsigned long long)lost);
+            (unsigned long long)d.recoveries, (unsigned long long)d.flagged, (unsigned long long)lost, (unsigned long long)d.skippedByHardware,
+            (unsigned long long)d.keyframeResets);
     }
+#if PS5WK_DEBUG_BUILD
+    logVP9Window(d);
+#endif
     d.windowStartUS = now;
     d.windowAUs = d.windowPictures = 0;
     d.windowCallMS = d.windowCallMaxMS = d.windowSlotWaitMS = 0;
@@ -833,6 +1199,10 @@ static bool decodeUnit(Decoder& d, const uint8_t* data, size_t size, uint64_t pt
         if (pic.error && !d.flagged++)
             DLOG("decoder %u: first picture flagged with an error by the decoder (key %u)", d.id, static_cast<unsigned>(pic.pts));
     }
+#if PS5WK_DEBUG_BUILD
+    if (d.codec == PS5WK_VCODEC_VP9)
+        debugVP9Output(d, data, size, pts, pic, rc, d.vp9FrameIndex, d.vp9FrameCount);
+#endif
     handlePicture(d, pic, slot, epoch);
     return !rc;
 }
@@ -886,17 +1256,48 @@ static void processAU(Decoder& d, AccessUnit& au)
             return;
         }
         d.needKeyframe = false;
+        // Videodec2 can fall into skipping about every other VP9 picture with
+        // no error, and stays there through keyframes until the decoder is
+        // reset (2026-11-28: YouTube's 720p60, the same frame every time on a
+        // decoder reused from the video before; video jumped and smeared,
+        // and YouTube kept such players at 720p). So at a keyframe after any
+        // skipped picture: the pictures decoded so far out, then a fresh
+        // decoder from this keyframe on (drain).
+        if (keyframe && d.skippedSinceKeyframe) {
+            const unsigned skipped = d.skippedSinceKeyframe;
+            int64_t start = nowUS();
+            drain(d, au.epoch);
+            d.needKeyframe = false;
+            d.keyframeResets++;
+            if (d.keyframeResets <= 10 || !(d.keyframeResets % 50))
+                DLOG("decoder %u: %u picture(s) skipped by the decoder with no error since the last keyframe: reset at keyframe %u in %.1f ms "
+                     "(%llu resets of this kind, %llu pictures skipped so far)",
+                    d.id, skipped, au.key, (nowUS() - start) / 1000.0, (unsigned long long)d.keyframeResets,
+                    (unsigned long long)d.skippedByHardware);
+        }
+        if (keyframe)
+            d.skippedSinceKeyframe = 0;
         d.outstanding[au.key] = au.ptsNS;
         std::vector<std::pair<const uint8_t*, size_t>> frames;
         splitSuperframe(au.data.data(), au.data.size(), frames);
         bool shown = false, ok = true;
+#if PS5WK_DEBUG_BUILD
+        d.vp9FrameIndex = 0;
+        d.vp9FrameCount = static_cast<unsigned>(frames.size());
+#endif
         for (auto& [p, n] : frames) {
             bool show = vp9Shown(p, n);
             shown |= show;
             ok &= decodeUnit(d, p, n, au.key | (show ? 0 : hiddenFlag), au.ptsNS, au.epoch, keyframe);
+#if PS5WK_DEBUG_BUILD
+            d.vp9FrameIndex++;
+#endif
             if (d.hwStuck)
                 break;
         }
+#if PS5WK_DEBUG_BUILD
+        d.vp9LastKey = au.key;
+#endif
         if (!shown || !ok)
             sendPicture(d, au.key, au.epoch, shown ? 3 : 1, nullptr);
         if (d.hwStuck)
