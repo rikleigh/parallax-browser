@@ -471,7 +471,7 @@ var UBOLScripting = (function () {
             scripting: VERSION, genericSelectors: 0, genericWithExceptions: 0, genericExceptionHostsDropped: 0, generichideSites: 0,
             specificHosts: 0, cosmetics: 0, cosmeticCSS: 0, procedurals: 0, cosmeticsDropped: 0,
             calls: { main: 0, isolated: 0 }, scriptletHosts: 0, libraryItems: { main: 0, isolated: 0 }, librarySplit: {},
-            hostKeys: 0, regexes: 0, rules: 0, siteDataBytes: 0
+            hostKeys: 0, regexes: 0, regexesWithPathSkipped: 0, rules: 0, siteDataBytes: 0
         };
         function need(path) {
             var text = files[path];
@@ -661,9 +661,28 @@ var UBOLScripting = (function () {
                     for (var t = 0; t < tokens.length; t++)
                         addRef(hostnames[hi], tokens[t]);
                 }
+                /* Up to uBO Lite 2026.1026: flat triplets (needle, host
+                 * regex, refs). From 2026.1127: pairs ({ needle, hn, pn },
+                 * refs), pn a regex the frame's path must match too. This
+                 * browser registers scripts per host, so an entry with a path
+                 * is left out (counted): run on the whole host it could break
+                 * pages uBO Lite never meant it for. */
                 var rx = asArray(data.scriptletFromRegexes);
-                for (var ri = 0; ri + 2 < rx.length; ri += 3)
-                    regexLines.push(['RA', esc(rx[ri]), esc(rx[ri + 1]), tokensFor(String(rx[ri + 2])).join(',')].join('\t'));
+                if (rx.length && rx[0] !== null && typeof rx[0] === 'object') {
+                    for (var rp = 0; rp + 1 < rx.length; rp += 2) {
+                        var entry = rx[rp];
+                        if (!entry || typeof entry.needle !== 'string' || typeof entry.hn !== 'string')
+                            throw new Error(bundles[b].id + ': scriptletFromRegexes entry ' + (rp / 2) + ' has no needle and hn');
+                        if (entry.pn) {
+                            stats.regexesWithPathSkipped++;
+                            continue;
+                        }
+                        regexLines.push(['RA', esc(entry.needle), esc(entry.hn), tokensFor(String(rx[rp + 1])).join(',')].join('\t'));
+                    }
+                } else {
+                    for (var ri = 0; ri + 2 < rx.length; ri += 3)
+                        regexLines.push(['RA', esc(rx[ri]), esc(rx[ri + 1]), tokensFor(String(rx[ri + 2])).join(',')].join('\t'));
+                }
             }
         }
 

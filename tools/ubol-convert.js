@@ -237,7 +237,8 @@ async function main() {
     console.log(`cosmetic filters and scriptlets (converted in ${scriptingMS} ms): ${ss.genericSelectors} generic selectors as WebKit rules ` +
         `(${ss.genericWithExceptions} with exceptions, ${ss.generichideSites} generichide sites), ${ss.cosmetics} per-site cosmetic filters ` +
         `(${ss.procedurals} procedural, ${ss.cosmeticsDropped} dropped) on ${ss.specificHosts} host entries, scriptlet calls ` +
-        `${ss.calls.main} main + ${ss.calls.isolated} isolated on ${ss.scriptletHosts} host entries; library ${ss.librarySplit.main} ` +
+        `${ss.calls.main} main + ${ss.calls.isolated} isolated on ${ss.scriptletHosts} host entries, ${ss.regexes} host regexes ` +
+        `(${ss.regexesWithPathSkipped} with a path left out); library ${ss.librarySplit.main} ` +
         `(${ss.libraryItems.main}) / ${ss.librarySplit.isolated} (${ss.libraryItems.isolated}); site data ${(ss.siteDataBytes / 1048576).toFixed(2)} MB`);
     const allRules = scripting.rules.concat(result.rules);
     if (allRules.length > DNRToWebKit.MAX_RULES)
