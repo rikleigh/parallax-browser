@@ -4056,6 +4056,21 @@ int main(int argc, char** argv)
         spike_log("settings: %s %s", hiddenPageFeatures[i], feature ? "on" : "not found");
     }
     webkit_feature_list_unref(features);
+#ifdef PS5WK_DEBUG_BUILD
+    /* /data/ps5webkit/debug-user-agent: its first line replaces the user
+     * agent, to see what a site serves another browser. */
+    {
+        gchar* agent = NULL;
+        if (g_file_get_contents("/data/ps5webkit/debug-user-agent", &agent, NULL, NULL)) {
+            agent[strcspn(agent, "\r\n")] = 0;
+            if (*agent) {
+                webkit_settings_set_user_agent(settings, agent);
+                spike_log("settings: user agent from /data/ps5webkit/debug-user-agent: %s", agent);
+            }
+            g_free(agent);
+        }
+    }
+#endif
     char* websiteData = g_build_filename(ps5wk_profile_dir(), "browser", "data", NULL);
     char* websiteCache = g_build_filename(ps5wk_profile_dir(), "browser", "cache", NULL);
     char* cookieFile = g_build_filename(websiteData, "cookies.sqlite", NULL);
